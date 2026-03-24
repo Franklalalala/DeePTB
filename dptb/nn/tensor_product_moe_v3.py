@@ -134,14 +134,18 @@ class MOLEGlobals:
 class MOLERouterV3(nn.Module):
     def __init__(self, in_features, num_experts=48, top_k=6,
                  aux_loss_free=True,
-                 bias_update_speed=0.005):  # 修改1: 固定 Bias 更新速度，不再衰减
+                 bias_update_speed=0.005):  # API 保持不变
         super().__init__()
         self.top_k = top_k
         self.num_experts = num_experts
         self.aux_loss_free = aux_loss_free
 
-        # 固定的惩罚力度
-        self.bias_update_speed = bias_update_speed
+        # 保存初始的惩罚力度
+        self.initial_bias_update_speed = bias_update_speed
+
+        # 内设参数：最小值 (alpha) 和衰减总步数
+        self.min_bias_update_speed = 0.0001
+        self.decay_steps = 10000
 
         self.net = nn.Sequential(
             nn.Linear(in_features, 128),
@@ -152,10 +156,11 @@ class MOLERouterV3(nn.Module):
         self.register_buffer('expert_bias', torch.zeros(num_experts))
         self.register_buffer('ema_load', torch.ones(num_experts) * (top_k / num_experts))
 
-        # 修改1: 删除了 step_count 等用于衰减的 Buffer
+        # 重新引入 step_count，用于记录前向传播/训练步数以控制衰减
+        self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
 
     def forward(self, global_features, sizes=None):
-        # 修改1: 删除了 Jitter (探索噪声) 的注入逻辑，完全依赖网络的自然 Logits
+        # 完全依赖网络的自然 Logits
         logits = self.net(global_features)
         scores = torch.sigmoid(logits)
 
@@ -171,7 +176,7 @@ class MOLERouterV3(nn.Module):
             with torch.no_grad():
                 mask = F.one_hot(topk_indices, num_classes=self.num_experts).float()
 
-                # 计算负载 (保留了 V1 支持 sizes 的优秀特性)
+                # 计算负载
                 if sizes is not None:
                     weight = sizes.view(-1, 1, 1)
                     weighted_mask = mask * weight
@@ -181,20 +186,30 @@ class MOLERouterV3(nn.Module):
                     current_load = mask.sum(dim=(0, 1))
                     target_load = (scores.size(0) * self.top_k) / self.num_experts
 
-                # 使用 EMA 平滑历史负载统计，使返回的 CV 指标极其稳定
+                # 使用 EMA 平滑历史负载统计，并更新训练步数
                 if self.training:
                     self.ema_load.mul_(0.9).add_(current_load, alpha=0.1)
+                    self.step_count += 1  # 每次 training forward 增加 1 步
+
                 expert_load_cv = self.ema_load.std() / (self.ema_load.mean() + 1e-8)
 
-            # 修改1: 使用恒定力度 (0.005) 更新 Bias，持续进行负载均衡
-            if self.aux_loss_free and self.training and self.bias_update_speed > 0.0:
+            # 使用动态衰减力度更新 Bias
+            if self.aux_loss_free and self.training and self.initial_bias_update_speed > 0.0:
                 with torch.no_grad():
+                    # 计算当前步的实际 bias_update_speed (线性衰减)
+                    progress = min(1.0, self.step_count.item() / self.decay_steps)
+                    if self.initial_bias_update_speed > self.min_bias_update_speed:
+                        current_speed = self.initial_bias_update_speed - progress * (
+                                    self.initial_bias_update_speed - self.min_bias_update_speed)
+                    else:
+                        current_speed = self.initial_bias_update_speed
+
                     error = current_load - target_load
-                    self.expert_bias -= torch.sign(error) * self.bias_update_speed
+                    self.expert_bias -= torch.sign(error) * current_speed
                     # 保持 Bias 整体均值为 0，防止激活值整体漂移
                     self.expert_bias -= self.expert_bias.mean()
 
-            # 修改2: 强制 L1 归一化 (防止路由专家被共享专家 "饿死")
+            # 强制 L1 归一化 (防止路由专家被共享专家 "饿死")
             topk_scores_original = torch.gather(scores, 1, topk_indices)
             denominators = topk_scores_original.sum(dim=-1, keepdim=True) + 1e-8
             topk_probs = topk_scores_original / denominators
@@ -203,7 +218,7 @@ class MOLERouterV3(nn.Module):
             coeffs = torch.zeros_like(scores)
             coeffs.scatter_(1, topk_indices, topk_probs)
 
-            # 监控指标：计算最大概率的均值 (反映 Router 的置信度，比计算全部均值更有意义)
+            # 监控指标：计算最大概率的均值
             monitor_val = topk_probs.max(dim=-1)[0].mean().detach()
 
             return coeffs, monitor_val, expert_load_cv.detach()
@@ -214,7 +229,6 @@ class MOLERouterV3(nn.Module):
             probs = scores / denominators
             monitor_val = probs.max(dim=-1)[0].mean().detach()
             return probs, monitor_val, torch.tensor(0.0, device=scores.device)
-
 
 class MOLELinear(nn.Module):
     """

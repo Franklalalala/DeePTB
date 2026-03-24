@@ -40,6 +40,9 @@ from dptb.nn.tensor_product import (
     rotate_vector,
 )
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # 1. Base Classes & Helpers
@@ -1326,8 +1329,8 @@ class EMolESOpenequi(EMolES):
             })
             tasks.append((i, current_kwargs))
 
-        print(f"Starting parallel compilation for {n_layers} layers...")
         t_start_all = time.time()
+        logger.info(f"Starting parallel compilation for {n_layers} layers...")
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             layer_futures = [executor.submit(_create_layer_worker, task) for task in tasks]
@@ -1357,4 +1360,4 @@ class EMolESOpenequi(EMolES):
                 name, tp_module, duration = future.result()
                 setattr(self, name, tp_module)
 
-        print(f"Compilation finished in {time.time() - t_start_all:.2f}s")
+        logger.info(f"Parallel compilation finished. Total time: {time.time() - t_start_all:.2f}s")
