@@ -526,13 +526,13 @@ class HamilLossAbs(nn.Module):
 
         try:
             # =================================================================
-            # Onsite (纯张量流：彻底消灭 .any() 与索引操作带来的隐式 CUDA 同步)
+            # Onsite (纯张量流：避免显式同步与 NaN 陷阱)
             # =================================================================
             atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].flatten()
-            node_mask_orb = self.idp.mask_to_nrme[atom_types]  # (N, 107)
+            node_mask_orb = self.idp.mask_to_nrme[atom_types]
 
             if "expert_node_mask" in data:
-                node_mask_phy = data["expert_node_mask"].unsqueeze(-1)  # (N,1)
+                node_mask_phy = data["expert_node_mask"].unsqueeze(-1)
                 final_node_mask = node_mask_orb & node_mask_phy
             else:
                 final_node_mask = node_mask_orb
@@ -540,14 +540,16 @@ class HamilLossAbs(nn.Module):
             raw_pre_node = data[AtomicDataDict.NODE_FEATURES_KEY]
             raw_tgt_node = ref_data[AtomicDataDict.NODE_FEATURES_KEY]
 
-            diff_node = (raw_pre_node - raw_tgt_node) * final_node_mask
+            # 致命修正：使用 masked_fill_ 防止 NaN/Inf 污染计算图
+            diff_node = raw_pre_node - raw_tgt_node
+            diff_node.masked_fill_(~final_node_mask, 0.0)
+
             abs_node = diff_node.abs()
             sq_node = diff_node * diff_node
 
             onsite_l1_sum = abs_node.sum()
             onsite_mse_sum = sq_node.sum()
 
-            # 使用 raw_pre_node 自身的 dtype
             onsite_cnt = final_node_mask.sum().to(dtype=raw_pre_node.dtype)
             valid_node = (onsite_cnt > 0.5).to(dtype=raw_pre_node.dtype)
 
@@ -561,10 +563,10 @@ class HamilLossAbs(nn.Module):
             # Hopping (同理重构)
             # =================================================================
             edge_types = data[AtomicDataDict.EDGE_TYPE_KEY].flatten()
-            edge_mask_orb = self.idp.mask_to_erme[edge_types]  # (E, 128)
+            edge_mask_orb = self.idp.mask_to_erme[edge_types]
 
             if "expert_edge_mask" in data:
-                edge_mask_phy = data["expert_edge_mask"].unsqueeze(-1)  # (E,1)
+                edge_mask_phy = data["expert_edge_mask"].unsqueeze(-1)
                 final_edge_mask = edge_mask_orb & edge_mask_phy
             else:
                 final_edge_mask = edge_mask_orb
@@ -572,14 +574,16 @@ class HamilLossAbs(nn.Module):
             raw_pre_edge = data[AtomicDataDict.EDGE_FEATURES_KEY]
             raw_tgt_edge = ref_data[AtomicDataDict.EDGE_FEATURES_KEY]
 
-            diff_edge = (raw_pre_edge - raw_tgt_edge) * final_edge_mask
+            # 致命修正：使用 masked_fill_ 阻断 NaN
+            diff_edge = raw_pre_edge - raw_tgt_edge
+            diff_edge.masked_fill_(~final_edge_mask, 0.0)
+
             abs_edge = diff_edge.abs()
             sq_edge = diff_edge * diff_edge
 
             hopping_l1_sum = abs_edge.sum()
             hopping_mse_sum = sq_edge.sum()
 
-            # 使用 raw_pre_edge 自身的 dtype
             hopping_cnt = final_edge_mask.sum().to(dtype=raw_pre_edge.dtype)
             valid_edge = (hopping_cnt > 0.5).to(dtype=raw_pre_edge.dtype)
 
@@ -588,7 +592,7 @@ class HamilLossAbs(nn.Module):
             hopping_mse_mean = hopping_mse_sum / safe_hopping_cnt
 
             hopping_loss = 0.5 * (
-                        hopping_l1_mean + torch.sqrt(hopping_mse_mean + (1.0 - valid_edge) + 1e-12)) * valid_edge
+                    hopping_l1_mean + torch.sqrt(hopping_mse_mean + (1.0 - valid_edge) + 1e-12)) * valid_edge
 
             # ========== record strict reduce stats ==========
             self.last_onsite_l1_sum = onsite_l1_sum.detach()
@@ -688,7 +692,6 @@ class HamilLossAbs(nn.Module):
                 info = f"Sum: {tensor.sum()}" if tensor.dtype == torch.bool else "Feature Tensor"
                 print(f"{var_name}: Shape {tensor.shape}, {info}")
         print('!' * 60)
-
 
 @Loss.register("hamil_blas")
 class HamilLossBlas(nn.Module):
