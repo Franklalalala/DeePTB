@@ -168,7 +168,8 @@ class DatasetBuilder:
         dataset_type = type
         # See if we can get a OrbitalMapper.
         if basis is not None:
-            idp = OrbitalMapper(basis=basis)
+            has_soc_flag = kwargs.get('has_soc', False)
+            idp = OrbitalMapper(basis=basis, has_soc=has_soc_flag)
         else:
             idp = None
 
@@ -227,9 +228,20 @@ class DatasetBuilder:
             # We will sort the info_files here.
             # The order itself is not important, but must be consistant for the same list.
             info_files = {key: info_files[key] for key in sorted(info_files)}
-        
+            train_dip_flag = kwargs.get('train_dip', False)
+            train_w_charge_flag = kwargs.get('train_w_charge', False)
+            train_w_eps_flag = kwargs.get('train_w_eps', False)
+            train_w_homo_lumo_gap_flag = kwargs.get('train_w_homo_lumo_gap', False)
+            wave_align_flag = kwargs.get('wave_align', False)
+            train_polar_flag = kwargs.get('train_polar', False)
             for ikey in info_files:
-                info_files[ikey].update({'r_max': r_max, 'er_max': er_max, 'oer_max': oer_max})
+                info_files[ikey].update({'r_max': r_max, 'er_max': er_max, 'oer_max': oer_max,
+                                         'wave_align': wave_align_flag,
+                                         'train_w_homo_lumo_gap': train_w_homo_lumo_gap_flag,
+                                         'train_w_eps': train_w_eps_flag,
+                                         'train_w_charge': train_w_charge_flag,
+                                         'train_dip': train_dip_flag,
+                                         'train_polar': train_polar_flag})
 
             if dataset_type == "DeePHDataset":
                 dataset = DeePHE3Dataset(
