@@ -22,15 +22,18 @@ from dptb.nnops.ddp_utils import (
     configure_debug_env,
     configure_runtime_perf,
     derive_rank_log_path,
+    dist_barrier_on_current_device,
     destroy_process_group_safely,
+    init_process_group_with_device,
     is_dist_ready,
     load_multi_train_config,
+    merge_restart_train_options,
 )
 from dptb.plugins.monitor import (
     TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor,
-    DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor,
+    DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, CUDAModuleMemoryMonitor,
     TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor,
-    ScalarFieldMonitor
+    ScalarFieldMonitor, CUDAMemoryMonitor
 )
 from dptb.plugins.train_logger import Logger
 from dptb.plugins.saver import Saver
@@ -220,7 +223,7 @@ def _ddp_spawn_worker(
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
 
-    dist.init_process_group(
+    init_process_group_with_device(
         backend=backend,
         rank=rank,
         world_size=world_size,
@@ -347,15 +350,14 @@ def _multi_train_impl(
                     jdata["common_options"]["basis"] = basis
 
                 if restart:
-                    if jdata.get("train_options", None) is not None:
-                        for obj in MultiTrainer.object_keys:
-                            if jdata["train_options"].get(obj) != f["config"]["train_options"].get(obj):
-                                log.warning(f"{obj} in config file is not consistent with the checkpoint, using the one in checkpoint")
-                                jdata["train_options"][obj] = f["config"]["train_options"][obj]
-                    else:
-                        jdata["train_options"] = f["config"]["train_options"]
+                    jdata["train_options"] = merge_restart_train_options(
+                        jdata.get("train_options", None),
+                        f["config"].get("train_options", {}),
+                        logger=log,
+                    )
 
                     if jdata.get("model_options", None) is None or jdata["model_options"] != f["config"]["model_options"]:
+                        log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
                         jdata["model_options"] = f["config"]["model_options"]
                 else:
                     if jdata.get("train_options", None) is None:
@@ -531,8 +533,22 @@ def _multi_train_impl(
 
         log_field.extend(["mean_max_prob", "expert_load_cv", "train_onsite_loss", "train_hopping_loss"])
 
+        cuda_memory_enabled = (
+            bool(jdata["train_options"].get("monitor_cuda_memory", True))
+            and trainer._is_cuda_device()
+        )
+        if cuda_memory_enabled:
+            trainer.register_plugin(CUDAMemoryMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
+            log_field.extend(["cuda_peak_allocated_mb", "cuda_peak_reserved_mb"])
+
+        monitor_flag = jdata["train_options"].get("monitor_flag", False)
+        if monitor_flag and cuda_memory_enabled:
+            module_memory_output = output or "monitor_logs"
+            if distributed_expert:
+                module_memory_output = os.path.join(module_memory_output, f"rank{rank}")
+            trainer.register_plugin(CUDAModuleMemoryMonitor(module_memory_output))
+
         if trainer.is_main_process:
-            monitor_flag = jdata["train_options"].get("monitor_flag", False)
             if monitor_flag:
                 trainer.register_plugin(DeepDoctorMonitor(output, verbose_freq=1))
                 trainer.register_plugin(SO2ModuleMonitor(output))
@@ -568,7 +584,7 @@ def _multi_train_impl(
         print_multi_model_params_detailed(trainer.model, logger=log, max_depth=5)
 
     if distributed_expert and is_dist_ready():
-        dist.barrier()
+        dist_barrier_on_current_device()
 
     with entry_tagger.tag("trainer/run", device=torch.device(jdata["common_options"]["device"])):
         start_time = time.time()
@@ -576,7 +592,7 @@ def _multi_train_impl(
         end_time = time.time()
 
     if distributed_expert and is_dist_ready():
-        dist.barrier()
+        dist_barrier_on_current_device()
 
     if trainer.is_main_process:
         log.info("finished training")
