@@ -157,15 +157,99 @@ class SO2WignerBlocks:
         return self.blocks[l]
 
 
+class SO2CueqRotation:
+    """cuEquivariance direct-apply Wigner rotation state."""
+
+    __slots__ = ("alpha", "beta", "gamma")
+
+    def __init__(self, alpha, beta, gamma):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    def apply(self, l: int, x: torch.Tensor, *, transpose: bool = False) -> torch.Tensor:
+        alpha = self.alpha.to(dtype=x.dtype, device=x.device)
+        beta = self.beta.to(dtype=x.dtype, device=x.device)
+        gamma = self.gamma.to(dtype=x.dtype, device=x.device)
+        if x.ndim != 3:
+            raise ValueError(f"SO2CueqRotation expects [N, mul, 2l+1] input, got shape {tuple(x.shape)}")
+        n_edges, multiplicity, dim = x.shape
+        rotation = _get_cueq_rotation(l, x.dtype, x.device, multiplicity=multiplicity)
+        flat_x = x.reshape(n_edges, multiplicity * dim)
+        if transpose:
+            flat_out = rotation(gamma, beta, alpha, flat_x)
+        else:
+            flat_out = rotation(-alpha, -beta, -gamma, flat_x)
+        return flat_out.reshape(n_edges, multiplicity, dim)
+
+
 def batch_wigner_D_blocks(l_max, alpha, beta, gamma, _Jd):
     """Compute Wigner D as compact per-l blocks instead of a dense block-diagonal matrix."""
     return SO2WignerBlocks(wigner_D(l, alpha, beta, gamma) for l in range(l_max + 1))
 
 
+_CUEQ_ROTATION_CACHE = {}
+
+
+def _cueq_natural_irrep(l_value: int, multiplicity: int = 1) -> str:
+    parity = "e" if l_value % 2 == 0 else "o"
+    return f"{multiplicity}x{l_value}{parity}"
+
+
+def _get_cueq_rotation(l_value: int, dtype: torch.dtype, device: torch.device, multiplicity: int = 1):
+    try:
+        import cuequivariance as cue
+        import cuequivariance_torch as cuet
+    except ImportError as exc:
+        raise ImportError(
+            "so2_wigner_apply_mode='cueq_rotation' requires cuequivariance and "
+            "cuequivariance_torch to be installed."
+        ) from exc
+
+    key = (l_value, multiplicity, str(dtype), str(device))
+    rotation = _CUEQ_ROTATION_CACHE.get(key)
+    if rotation is None:
+        irreps = cue.Irreps("O3", _cueq_natural_irrep(l_value, multiplicity=multiplicity))
+        rotation = cuet.Rotation(
+            irreps,
+            layout=cue.mul_ir,
+            device=device,
+            math_dtype=dtype,
+        )
+        _CUEQ_ROTATION_CACHE[key] = rotation
+    return rotation
+
+
+def _cueq_rotation_matrix(rotation, gamma, beta, alpha, dim: int):
+    n = alpha.shape[0]
+    eye = torch.eye(dim, dtype=alpha.dtype, device=alpha.device).expand(n, dim, dim).contiguous()
+    flat_eye = eye.reshape(n * dim, dim)
+    repeated = (
+        gamma.repeat_interleave(dim),
+        beta.repeat_interleave(dim),
+        alpha.repeat_interleave(dim),
+    )
+    return rotation(repeated[0], repeated[1], repeated[2], flat_eye).reshape(n, dim, dim)
+
+
+def batch_wigner_D_cueq_blocks(l_max, alpha, beta, gamma):
+    """Compute Wigner D compact blocks with cuEquivariance Rotation."""
+    alpha, beta, gamma = torch.broadcast_tensors(alpha, beta, gamma)
+    blocks = []
+    for l_value in range(l_max + 1):
+        dim = 2 * l_value + 1
+        rotation = _get_cueq_rotation(l_value, alpha.dtype, alpha.device)
+        # cuEquivariance Rotation.forward slots are (gamma, beta, alpha).
+        # The DeePTB/e3nn block D_l(alpha,beta,gamma) matches the row-action
+        # matrix returned by cueq with slots (-alpha, -beta, -gamma).
+        blocks.append(_cueq_rotation_matrix(rotation, -alpha, -beta, -gamma, dim))
+    return SO2WignerBlocks(blocks)
+
+
 def _normalize_wigner_apply_mode(wigner_apply_mode: str) -> str:
-    if wigner_apply_mode not in ("full_dense", "compact_blocks"):
+    if wigner_apply_mode not in ("full_dense", "compact_blocks", "cueq_rotation"):
         raise ValueError(
-            "wigner_apply_mode must be 'full_dense' or 'compact_blocks', "
+            "wigner_apply_mode must be 'full_dense', 'compact_blocks', or 'cueq_rotation', "
             f"got {wigner_apply_mode!r}"
         )
     return wigner_apply_mode
@@ -174,6 +258,9 @@ def _normalize_wigner_apply_mode(wigner_apply_mode: str) -> str:
 def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
     if wigner_apply_mode == "compact_blocks":
         return batch_wigner_D_blocks(l_max, alpha, beta, gamma, _Jd)
+    if wigner_apply_mode == "cueq_rotation":
+        alpha, beta, gamma = torch.broadcast_tensors(alpha, beta, gamma)
+        return SO2CueqRotation(alpha, beta, gamma)
     return batch_wigner_D(l_max, alpha, beta, gamma, _Jd)
 
 
@@ -183,6 +270,15 @@ def _select_wigner_block(wigner_D_all, l: int, offsets, dims):
     start = offsets[l]
     dim = dims[l]
     return wigner_D_all[:, start:start + dim, start:start + dim]
+
+
+def _apply_wigner_rotation(wigner_D_all, l: int, x: torch.Tensor, offsets, dims, *, transpose: bool = False):
+    if isinstance(wigner_D_all, SO2CueqRotation):
+        return wigner_D_all.apply(l, x, transpose=transpose)
+    rot_mat = _select_wigner_block(wigner_D_all, l, offsets, dims)
+    if transpose:
+        rot_mat = rot_mat.transpose(1, 2)
+    return torch.bmm(x, rot_mat)
 
 
 # ------------------------------------------------------------------------------
@@ -677,8 +773,9 @@ class SO2_Linear(torch.nn.Module):
 
             x_parts = [x[:, sl].reshape(n, mul, 2 * l + 1) for mul, sl in group]
             x_combined = torch.cat(x_parts, dim=1)
-            rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-            transformed = torch.bmm(x_combined, rot_mat)
+            transformed = _apply_wigner_rotation(
+                wigner_D_all, l, x_combined, self.offsets, self.dims
+            )
             for part, slice_info, mul in zip(transformed.split(muls, dim=1), slices, muls):
                 x_[:, slice_info] = part.reshape(n, -1)
 
@@ -730,8 +827,9 @@ class SO2_Linear(torch.nn.Module):
             muls, slices = zip(*group)
             out_parts = [out[:, sl].reshape(n, mul, self.dims[l]) for mul, sl in group]
             out_combined = torch.cat(out_parts, dim=1)
-            rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-            rotated = torch.bmm(out_combined, rot_mat.transpose(1, 2))
+            rotated = _apply_wigner_rotation(
+                wigner_D_all, l, out_combined, self.offsets, self.dims, transpose=True
+            )
             for part, slice_info, mul in zip(rotated.split(muls, dim=1), slices, muls):
                 out[:, slice_info] = part.reshape(n, -1)
 

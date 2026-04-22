@@ -892,7 +892,7 @@ def slem():
     doc_swiglu_s2_compat_mode = "Compatibility mode for hidden `swiglu_s2`. `modern` uses the new flexible layout; `legacy_uniform_only` preserves the old behavior that falls back to Gate when irreps multiplicities are not uniform across degrees."
     doc_ffn_hidden_factor = "Expansion factor for the optional node-wise equivariant FFN. Values `<= 1.0` disable it."
     doc_ffn_apply_to_last = "Whether to also attach the node-wise FFN to the final layer. Default: `False`."
-    doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
+    doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`, `cueq_rotation`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path. `cueq_rotation` is an experimental cuEquivariance backend for A/B testing."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
