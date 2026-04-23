@@ -47,10 +47,9 @@ Yr = Xr @ Wr.T - Xi @ Wi.T
 Yi = Xr @ Wi.T + Xi @ Wr.T
 ```
 
-Limit: the scalar exact route now has Triton grouped reduce for `dWmix/dBmix`.
-The complex exact route still uses the existing torch grouped complex reduce in
-backward, so it is a correctness/perf candidate, not the final full fused
-kernel.
+Both scalar and complex exact routes now use Triton grouped reduce in backward.
+The implementation remains opt-in because the exact graph-mix route reduces
+activation/cache pressure but adds extra graph-level weight mixing work.
 
 ## Route B: Graph-Persistent Full Fusion
 
@@ -108,6 +107,21 @@ PYTHONPATH=$PWD DPTB_TRITON_LINEAR_REQUIRE=1 \
 python -m pytest dptb/tests/test_so2_triton_grouped_linear_ops.py -q --tb=short --maxfail=1
 ```
 
+Completed natlan CUDA validation:
+
+```text
+commit 0ada9ab:
+  test_grouped_complex_exact_moe_linear_cuda_uses_triton_dw_reduce
+  PASS, 2 passed, 1 warning in 16.64s
+
+commit 16149fc:
+  test_grouped_complex_moe_fused_linear_cuda_uses_triton_backward_reduce
+  test_grouped_complex_moe_fused_linear_cuda_fp32_if_available
+  test_grouped_complex_exact_moe_linear_cuda_uses_triton_dw_reduce
+  test_grouped_complex_exact_moe_linear_cuda_fp32_if_available
+  PASS, 4 passed, 1 warning in 5.64s
+```
+
 Production-like A/B should compare:
 
 ```text
@@ -122,3 +136,49 @@ route A:
   so2_m_linear_mode=triton_complex_exact_grouped_linear
 ```
 
+## Natlan Production A/B on 0422 Test Data
+
+Repository: `/home/mingkang_nt/codex/0422_tests/pr13_exact_graph_mix/DeePTB`
+
+Commit: `16149fc Use Triton reduce for complex fused MoE backward`
+
+Dataset/input base: `/home/mingkang_nt/codex/0422_tests/pr13_exact_graph_mix/prod_inputs`
+
+Each run used two L40S GPUs and stopped after the first `Epoch 1 summary`. The
+reported step time is a short-run smoke metric and includes model startup and
+first-use kernel compilation. It is useful for route comparison, not a stable
+long-run throughput number.
+
+| Batch size | Route | Allocator | Status | sec/iter | samples/s | peak allocated | peak reserved |
+|---:|---|---|---|---:|---:|---:|---:|
+| 32 | baseline | default | valid epoch summary | 6.969 | 4.592 | 28.60 GiB | 41.21 GiB |
+| 32 | exact graph mix | default | valid epoch summary | 16.148 | 1.982 | 28.23 GiB | 37.94 GiB |
+| 48 | baseline | default | OOM | - | - | - | - |
+| 48 | exact graph mix | default | OOM | - | - | - | - |
+| 48 | baseline | `expandable_segments:True` | valid epoch summary | 10.452 | 4.592 | 41.23 GiB | 43.66 GiB |
+| 48 | exact graph mix | `expandable_segments:True` | valid epoch summary | 24.223 | 1.982 | 40.70 GiB | 41.41 GiB |
+
+Observed deltas:
+
+```text
+bs32 exact vs baseline:
+  peak allocated: -0.37 GiB
+  peak reserved:  -3.27 GiB
+  throughput:     -56.8%
+
+bs48 exact vs baseline with expandable allocator:
+  peak allocated: -0.53 GiB
+  peak reserved:  -2.25 GiB
+  throughput:     -56.8%
+```
+
+The default allocator bs48 failures reported fragmentation symptoms: PyTorch
+had roughly 9.7-11.0 GiB reserved but unallocated and failed a 2.63 GiB request.
+Using `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` made bs48 run to epoch
+summary without changing the CUDA version or model math.
+
+Conclusion: this Triton exact graph-mix route is useful as a memory-saving
+exploration branch and proves bs48 can be made runnable with allocator tuning,
+but it is not a production default. The current production default should remain
+the cueq/compact path unless a later graph-persistent fusion removes the extra
+weight-mix overhead.
