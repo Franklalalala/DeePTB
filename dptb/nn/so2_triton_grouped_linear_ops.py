@@ -1432,6 +1432,37 @@ def _triton_grouped_complex_dw(x_pair: torch.Tensor,
     return grad_w
 
 
+def _triton_grouped_complex_moe_dw_dc(x_pair: torch.Tensor,
+                                      grad_out: torch.Tensor,
+                                      coefficients: torch.Tensor,
+                                      weight_experts: torch.Tensor,
+                                      rows_per_group: Sequence[int]):
+    if (
+        not _use_triton_for_linear(x_pair, weight_experts)
+        or grad_out.device.type != "cuda"
+        or coefficients.device.type != "cuda"
+        or grad_out.dtype != x_pair.dtype
+        or coefficients.dtype != x_pair.dtype
+    ):
+        if _require_triton():
+            raise RuntimeError("DPTB_TRITON_LINEAR_REQUIRE=1 but Triton grouped complex MoE reduce backend is unavailable.")
+        return _torch_grouped_complex_moe_dw_dc(x_pair, grad_out, coefficients, weight_experts, rows_per_group)
+
+    mixed_weights, _ = _mix_moe_weights_and_bias(
+        coefficients,
+        weight_experts,
+        None,
+        None,
+        None,
+    )
+    grad_mixed_w = _triton_grouped_complex_dw(x_pair, grad_out, mixed_weights, rows_per_group)
+    grad_mixed_flat = grad_mixed_w.reshape(grad_mixed_w.shape[0], -1)
+    weight_flat = weight_experts.reshape(weight_experts.shape[0], -1)
+    grad_c = grad_mixed_flat.matmul(weight_flat.transpose(0, 1))
+    grad_w = coefficients.transpose(0, 1).matmul(grad_mixed_flat).reshape_as(weight_experts)
+    return grad_w, grad_c
+
+
 def _triton_grouped_complex_moe_forward(x_pair: torch.Tensor,
                                         coefficients: torch.Tensor,
                                         weight_experts: torch.Tensor,
@@ -2008,7 +2039,7 @@ class _GroupedComplexMoEFusedLinearFn(torch.autograd.Function):
         split_sizes = tuple(int(v) for v in row_splits_tensor.detach().cpu().tolist())
         grad_out = grad_out.contiguous()
         grad_x = _triton_grouped_complex_moe_dx(grad_out, coefficients, weight_experts, split_sizes)
-        grad_w, grad_c = _torch_grouped_complex_moe_dw_dc(x_pair, grad_out, coefficients, weight_experts, split_sizes)
+        grad_w, grad_c = _triton_grouped_complex_moe_dw_dc(x_pair, grad_out, coefficients, weight_experts, split_sizes)
         return grad_x, grad_c, grad_w, None
 
 
