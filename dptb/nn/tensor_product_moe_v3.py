@@ -180,6 +180,7 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
         "streamed_m_major_ref",
         "streamed_m_major_aggressive",
         "streamed_m_major_cueq",
+        "streamed_m_major_triton_fused",
     )
     if so2_fusion_mode not in allowed:
         raise ValueError(
@@ -187,6 +188,32 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
             f"got {so2_fusion_mode!r}"
         )
     return so2_fusion_mode
+
+
+def _load_so2_triton_fused_ops():
+    try:
+        from . import so2_triton_fused_ops
+        return so2_triton_fused_ops
+    except Exception as exc:
+        if os.environ.get("DPTB_SO2_TRITON_REQUIRE", "0") == "1":
+            raise RuntimeError(
+                "DPTB_SO2_TRITON_REQUIRE=1 but dptb.nn.so2_triton_fused_ops "
+                "could not be loaded."
+            ) from exc
+        return None
+
+
+def _load_so2_triton_grouped_linear_ops():
+    try:
+        from . import so2_triton_grouped_linear_ops
+        return so2_triton_grouped_linear_ops
+    except Exception as exc:
+        if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE", "0") == "1":
+            raise RuntimeError(
+                "DPTB_TRITON_LINEAR_REQUIRE=1 but "
+                "dptb.nn.so2_triton_grouped_linear_ops could not be loaded."
+            ) from exc
+        return None
 
 
 def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
@@ -357,14 +384,28 @@ def _expand_graph_index_for_leading_dims(graph_index: torch.Tensor, x: torch.Ten
 
 
 def _normalize_mole_linear_mode(mode: str) -> str:
-    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear"}
+    allowed = {
+        "split_loop",
+        "indexed_ref",
+        "cueq_indexed_linear",
+        "triton_grouped_linear",
+        "triton_exact_grouped_linear",
+        "triton_fused_expert_linear",
+    }
     if mode not in allowed:
         raise ValueError(f"mole_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
 
 
 def _normalize_so2_m_linear_mode(mode: str) -> str:
-    allowed = {"standard", "cueq_complex_indexed_linear", "cueq_segmented_complex_indexed_linear"}
+    allowed = {
+        "standard",
+        "cueq_complex_indexed_linear",
+        "cueq_segmented_complex_indexed_linear",
+        "triton_complex_grouped_linear",
+        "triton_complex_exact_grouped_linear",
+        "triton_complex_moe_fused_linear",
+    }
     if mode not in allowed:
         raise ValueError(f"so2_m_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
@@ -664,6 +705,45 @@ class MOLELinear(nn.Module):
             flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
 
+    def _apply_split_loop_from_mixed(self, x, mixed_weights, mixed_bias, split_sizes):
+        x_split = torch.split(x, split_sizes, dim=0)
+        out_parts = []
+        for i, x_sys in enumerate(x_split):
+            w = mixed_weights[i]
+            b = mixed_bias[i] if mixed_bias is not None else None
+            out_parts.append(F.linear(x_sys, w, b))
+        return torch.cat(out_parts, dim=0)
+
+    def _apply_triton_grouped_linear(self, x, mixed_weights, mixed_bias, mole_globals: MOLEGlobals):
+        ops = _load_so2_triton_grouped_linear_ops()
+        split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
+        if ops is None:
+            return self._apply_split_loop_from_mixed(x, mixed_weights, mixed_bias, split_sizes)
+        return ops.grouped_linear_apply(x, mixed_weights, mixed_bias, split_sizes)
+
+    def _apply_triton_fused_expert_linear(self, x, mole_globals: MOLEGlobals):
+        ops = _load_so2_triton_grouped_linear_ops()
+        split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
+        if ops is None or not hasattr(ops, "grouped_moe_fused_linear"):
+            mixed_weights, mixed_bias = self._mixed_weights_and_bias(mole_globals)
+            return self._apply_split_loop_from_mixed(x, mixed_weights, mixed_bias, split_sizes)
+
+        shared_weight = self.weight_shared.sum(0) if self.num_shared_experts > 0 else None
+        shared_bias = (
+            self.bias_shared.sum(0)
+            if self.num_shared_experts > 0 and self.bias_shared is not None
+            else None
+        )
+        return ops.grouped_moe_fused_linear(
+            x,
+            mole_globals.coefficients,
+            self.weight_experts,
+            self.bias_experts,
+            shared_weight,
+            shared_bias,
+            split_sizes,
+        )
+
     def forward(self, x, mole_globals: MOLEGlobals):
         # 安全回退
         if mole_globals is None or mole_globals.coefficients is None:
@@ -678,27 +758,38 @@ class MOLELinear(nn.Module):
             return F.linear(x, w_avg, b_avg)
 
         # === 核心逻辑: 权重融合 (Weight Merging) ===
-        # 1. 混合路由专家权重
-        # coefficients: [Batch, Num_Experts]
-        # weight_experts: [Num_Experts, Out, In]
-        # mixed_weights: [Batch, Out, In]
-        mixed_weights = torch.einsum("be, eoi -> boi", mole_globals.coefficients, self.weight_experts)
+        mode = self.mole_linear_mode
+        if mode == "triton_fused_expert_linear":
+            return self._apply_triton_fused_expert_linear(x, mole_globals)
+        if mode == "triton_exact_grouped_linear":
+            ops = _load_so2_triton_grouped_linear_ops()
+            split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
+            if ops is not None and hasattr(ops, "grouped_exact_moe_linear"):
+                shared_weight = self.weight_shared.sum(0) if self.num_shared_experts > 0 else None
+                shared_bias = (
+                    self.bias_shared.sum(0)
+                    if self.num_shared_experts > 0 and self.bias_shared is not None
+                    else None
+                )
+                return ops.grouped_exact_moe_linear(
+                    x,
+                    mole_globals.coefficients,
+                    self.weight_experts,
+                    self.bias_experts,
+                    shared_weight,
+                    shared_bias,
+                    split_sizes,
+                )
+            mixed_weights, mixed_bias = self._mixed_weights_and_bias(mole_globals)
+            return self._apply_split_loop_from_mixed(x, mixed_weights, mixed_bias, split_sizes)
 
-        # 2. 【关键】融合共享专家权重
-        # 利用分配律: (W_routed + sum(W_shared)) * x
-        if self.num_shared_experts > 0:
-            mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
-
-        # 3. 处理 Bias
-        mixed_bias = None
-        if self.bias_experts is not None:
-            mixed_bias = torch.einsum("be, eo -> bo", mole_globals.coefficients, self.bias_experts)
-            if self.num_shared_experts > 0 and self.bias_shared is not None:
-                mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
+        mixed_weights, mixed_bias = self._mixed_weights_and_bias(mole_globals)
 
         # 4. 执行线性变换
         # 根据系统大小拆分 Input，因为每个系统(Graph)对应一个混合后的权重
-        mode = self.mole_linear_mode
+        if mode == "triton_grouped_linear":
+            return self._apply_triton_grouped_linear(x, mixed_weights, mixed_bias, mole_globals)
+
         if mode != "split_loop":
             graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
             if graph_index.numel() != x.shape[0]:
@@ -719,16 +810,7 @@ class MOLELinear(nn.Module):
                 f"MOLE split sizes sum to {sum(split_sizes)}, but input has {x.shape[0]} rows."
             )
 
-        x_split = torch.split(x, split_sizes, dim=0)
-        out_parts = []
-
-        # 循环执行 (虽然是 Python 循环，但通常 System 数量不多，开销可控)
-        for i, x_sys in enumerate(x_split):
-            w = mixed_weights[i]
-            b = mixed_bias[i] if mixed_bias is not None else None
-            out_parts.append(F.linear(x_sys, w, b))
-
-        return torch.cat(out_parts, dim=0)
+        return self._apply_split_loop_from_mixed(x, mixed_weights, mixed_bias, split_sizes)
 # ------------------------------------------------------------------------------
 
 class SO2_Attention(torch.nn.Module):
@@ -1007,6 +1089,14 @@ class SO2_Linear(torch.nn.Module):
                 wigner_D_all,
                 route="streamed_m_major_cueq",
             )
+        if self.so2_fusion_mode == "streamed_m_major_triton_fused":
+            return self._forward_streamed_m_major_triton_fused(
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+            )
 
         n, _ = x.shape
         if self.radial_emb:
@@ -1232,6 +1322,17 @@ class SO2_Linear(torch.nn.Module):
                 backends.append(fc.mole_linear_mode)
         return bool(backends) and all(mode == "cueq_indexed_linear" for mode in backends)
 
+    def _triton_grouped_linear_is_enabled(self) -> bool:
+        backends = []
+        if isinstance(getattr(self, "fc_m0", None), MOLELinear):
+            backends.append(self.fc_m0.mole_linear_mode)
+        for module in self.m_linear:
+            fc = getattr(module, "fc", None)
+            if isinstance(fc, MOLELinear):
+                backends.append(fc.mole_linear_mode)
+        triton_modes = {"triton_grouped_linear", "triton_exact_grouped_linear"}
+        return bool(backends) and all(mode in triton_modes for mode in backends)
+
     def _prepare_streamed_route(self, route: str):
         if route == "streamed_m_major_cueq" and not self._cueq_linear_is_enabled():
             self._warn_route_once(
@@ -1240,14 +1341,57 @@ class SO2_Linear(torch.nn.Module):
                 "cueq_indexed_linear; the route remains correct but only the grouped "
                 "streamed SO2 dataflow is active.",
             )
+        if route == "streamed_m_major_triton_fused":
+            ops = _load_so2_triton_fused_ops()
+            if ops is None:
+                self._warn_route_once(
+                    "triton_fused_ops_unavailable",
+                    "streamed_m_major_triton_fused is active but Triton fused ops "
+                    "could not be imported; falling back to the grouped streamed "
+                    "PyTorch bridge.",
+                )
+            elif not ops.triton_runtime_available():
+                self._warn_route_once(
+                    "triton_runtime_unavailable",
+                    "streamed_m_major_triton_fused is active but Triton/CUDA runtime "
+                    "is unavailable; using the torch fallback implementation.",
+                )
+            if not (self._cueq_linear_is_enabled() or self._triton_grouped_linear_is_enabled()):
+                self._warn_route_once(
+                    "triton_route_without_cueq_linear",
+                    "streamed_m_major_triton_fused is active but MOLELinear is not "
+                    "using cueq_indexed_linear, triton_grouped_linear, or "
+                    "triton_exact_grouped_linear; only the outer "
+                    "SO2 pack/scatter bridge uses the fused route.",
+                )
 
     def _make_wigner_block_cache(self, wigner_D_all) -> Dict[int, torch.Tensor]:
         if wigner_D_all is None:
             return {}
         return {
-            l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+            l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims).contiguous()
             for l in self._active_rot_l
         }
+
+    def _active_in_l_keys_by_m(self, m: int) -> Tuple[int, ...]:
+        cache = getattr(self, "_active_in_l_keys_by_m_cache", None)
+        if cache is None:
+            cache = {
+                mm: tuple(l for l in sorted(self._in_group_plans.keys()) if l >= mm)
+                for mm in range(self.m_max + 1)
+            }
+            self._active_in_l_keys_by_m_cache = cache
+        return cache[m]
+
+    def _active_out_l_keys_by_m(self, m: int) -> Tuple[int, ...]:
+        cache = getattr(self, "_active_out_l_keys_by_m_cache", None)
+        if cache is None:
+            cache = {
+                mm: tuple(l for l in sorted(self._out_group_plans.keys()) if l >= mm)
+                for mm in range(self.m_max + 1)
+            }
+            self._active_out_l_keys_by_m_cache = cache
+        return cache[m]
 
     def _gather_input_l_groups(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
         return {
@@ -1372,6 +1516,106 @@ class SO2_Linear(torch.nn.Module):
             out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
             self._accumulate_group_pair_(out_view, y_entry, entry.l, m, rot_blocks.get(entry.l))
 
+    def _assemble_grouped_m0_input_triton(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            n: int,
+            x_template: torch.Tensor,
+            ops,
+    ) -> torch.Tensor:
+        packed_by_l = {}
+        for l in self._active_in_l_keys_by_m(0):
+            packed_by_l[l] = ops.triton_pack_group_m0(
+                input_groups[l],
+                rot_blocks.get(l),
+                l,
+                self.rotate_in,
+            )
+        parts = [
+            packed_by_l[entry.l][:, entry.group_start:entry.group_start + entry.mul]
+            for entry in self._in_entries_by_m[0]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)
+
+    def _assemble_grouped_pair_input_triton(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+            n: int,
+            x_template: torch.Tensor,
+            ops,
+    ) -> torch.Tensor:
+        packed_by_l = {}
+        for l in self._active_in_l_keys_by_m(m):
+            packed_by_l[l] = ops.triton_pack_group_pair(
+                input_groups[l],
+                rot_blocks.get(l),
+                l,
+                m,
+                self.rotate_in,
+            )
+        parts = [
+            packed_by_l[entry.l][:, :, entry.group_start:entry.group_start + entry.mul]
+            for entry in self._in_entries_by_m[m]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 2, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=2)
+
+    def _accumulate_grouped_m0_output_triton_(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            y_m0: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            ops,
+    ) -> None:
+        if y_m0.numel() == 0:
+            return
+        cursor = 0
+        for entry in self._out_entries_by_m[0]:
+            y_entry = y_m0[:, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            out_view += ops.triton_scatter_group_m0(
+                y_entry,
+                rot_blocks.get(entry.l),
+                entry.l,
+                self._out_group_plans[entry.l].dims,
+                self.rotate_out,
+            )
+
+    def _accumulate_grouped_pair_output_triton_(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            y_m: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+            ops,
+    ) -> None:
+        if y_m.numel() == 0:
+            return
+        cursor = 0
+        for entry in self._out_entries_by_m[m]:
+            y_entry = y_m[:, :, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            out_view += ops.triton_scatter_group_pair(
+                y_entry,
+                rot_blocks.get(entry.l),
+                entry.l,
+                m,
+                self._out_group_plans[entry.l].dims,
+                self.rotate_out,
+            )
+
     def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
@@ -1411,6 +1655,60 @@ class SO2_Linear(torch.nn.Module):
                 linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
 
             self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+
+        out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+        return out.contiguous(), wigner_D_all
+
+    def _forward_streamed_m_major_triton_fused(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
+        ops = _load_so2_triton_fused_ops()
+        if ops is None:
+            return self._forward_streamed_m_major_grouped(
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+                route="streamed_m_major_aggressive",
+            )
+
+        self._prepare_streamed_route("streamed_m_major_triton_fused")
+        wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+        n, _ = x.shape
+        if self.radial_emb and latents is None:
+            raise ValueError("SO2_Linear Triton fused streamed path requires latents when radial_emb=True.")
+        weights = self.radial_emb(latents) if self.radial_emb else None
+        rot_blocks = self._make_wigner_block_cache(wigner_D_all)
+        input_groups = self._gather_input_l_groups(x)
+        out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+
+        for m in range(self.m_max + 1):
+            radial_weight = (
+                weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1)
+                if self.radial_emb else 1.
+            )
+
+            if m == 0:
+                inp = self._assemble_grouped_m0_input_triton(input_groups, rot_blocks, n, x, ops)
+                if self.front and self.radial_emb:
+                    y_m = self.fc_m0(inp * radial_weight.squeeze(1), mole_globals)
+                elif self.radial_emb:
+                    y_m = self.fc_m0(inp, mole_globals) * radial_weight.squeeze(1)
+                else:
+                    y_m = self.fc_m0(inp, mole_globals)
+                self._accumulate_grouped_m0_output_triton_(out_groups, y_m, rot_blocks, ops)
+                continue
+
+            x_m_in = self._assemble_grouped_pair_input_triton(input_groups, rot_blocks, m, n, x, ops)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+            elif self.radial_emb:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+                linear_output = linear_output * radial_weight
+            else:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+
+            self._accumulate_grouped_pair_output_triton_(out_groups, linear_output, rot_blocks, m, ops)
 
         out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
         return out.contiguous(), wigner_D_all
@@ -1716,17 +2014,80 @@ class SO2_m_Linear(torch.nn.Module):
         )[0]
         return flat_out.reshape(x_m.shape[0], 2, self.num_out_channel)
 
+    def _forward_triton_complex_grouped_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("triton_complex_grouped_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        mixed_weights, mixed_bias = self.fc._mixed_weights_and_bias(mole_globals)
+        if mixed_bias is not None:
+            raise RuntimeError("triton_complex_grouped_linear currently supports bias=False only.")
+
+        ops = _load_so2_triton_grouped_linear_ops()
+        if ops is None or not hasattr(ops, "grouped_complex_linear"):
+            return self._forward_standard(x_m, mole_globals)
+
+        split_sizes = _mole_split_sizes(mole_globals, x_m.shape[0])
+        return ops.grouped_complex_linear(x_m, mixed_weights, split_sizes)
+
+    def _forward_triton_complex_exact_grouped_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("triton_complex_exact_grouped_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        ops = _load_so2_triton_grouped_linear_ops()
+        if ops is None or not hasattr(ops, "grouped_complex_exact_moe_linear"):
+            return self._forward_standard(x_m, mole_globals)
+
+        shared_weight = self.fc.weight_shared.sum(0) if self.fc.num_shared_experts > 0 else None
+        split_sizes = _mole_split_sizes(mole_globals, x_m.shape[0])
+        return ops.grouped_complex_exact_moe_linear(
+            x_m,
+            mole_globals.coefficients,
+            self.fc.weight_experts,
+            shared_weight,
+            split_sizes,
+        )
+
+    def _forward_triton_complex_moe_fused_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("triton_complex_moe_fused_linear currently supports bias=False only.")
+        if self.fc.num_shared_experts != 0:
+            raise RuntimeError("triton_complex_moe_fused_linear currently supports num_shared_experts=0 only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        ops = _load_so2_triton_grouped_linear_ops()
+        if ops is None or not hasattr(ops, "grouped_complex_moe_fused_linear"):
+            return self._forward_standard(x_m, mole_globals)
+
+        split_sizes = _mole_split_sizes(mole_globals, x_m.shape[0])
+        return ops.grouped_complex_moe_fused_linear(
+            x_m,
+            mole_globals.coefficients,
+            self.fc.weight_experts,
+            split_sizes,
+        )
+
     def _forward_standard(self, x_m, mole_globals: MOLEGlobals):
         if self.is_mole:
-            x_m = self.fc(x_m, mole_globals)
+            x_proj = self.fc(x_m, mole_globals)
         else:
-            x_m = self.fc(x_m)
+            x_proj = self.fc(x_m)
 
-        x_r = x_m.narrow(2, 0, self.num_out_channel)
-        x_i = x_m.narrow(2, self.num_out_channel, self.num_out_channel)
-        x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)
-        x_m_i = x_r.narrow(1, 1, 1) + x_i.narrow(1, 0, 1)
-        return torch.cat((x_m_r, x_m_i), dim=1)
+        c = self.num_out_channel
+        out = x_proj.new_empty((x_proj.shape[0], 2, c))
+        out[:, 0, :] = x_proj[:, 0, :c] - x_proj[:, 1, c:]
+        out[:, 1, :] = x_proj[:, 1, :c] + x_proj[:, 0, c:]
+        return out
 
     def forward(self, x_m, mole_globals: MOLEGlobals):  # Added mole_globals
         # x_m ~ [N, 2, n_channels]
@@ -1734,4 +2095,10 @@ class SO2_m_Linear(torch.nn.Module):
             return self._forward_cueq_complex_indexed_linear(x_m, mole_globals)
         if self.so2_m_linear_mode == "cueq_segmented_complex_indexed_linear":
             return self._forward_cueq_segmented_complex_indexed_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "triton_complex_grouped_linear":
+            return self._forward_triton_complex_grouped_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "triton_complex_exact_grouped_linear":
+            return self._forward_triton_complex_exact_grouped_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "triton_complex_moe_fused_linear":
+            return self._forward_triton_complex_moe_fused_linear(x_m, mole_globals)
         return self._forward_standard(x_m, mole_globals)
