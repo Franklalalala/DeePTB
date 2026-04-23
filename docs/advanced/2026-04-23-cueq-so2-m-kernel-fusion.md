@@ -168,11 +168,45 @@ Setup: natlan CUDA, fp32, `B=32`, `num_experts=24`, `num_shared_experts=0`, irre
 | 16384 | streamed all cuEq | 82.92 | 1.232 | 1.432 |
 | 16384 | m0 cuEq, m>0 split | 101.34 | 1.202 | 1.461 |
 
-Final readout:
+Final module readout:
 
 - `staged all cuEq` is the best default speed setting for smaller and medium edge counts: about 23.9% faster at `E=4096`, 21.9% faster at `E=8192`, and 6.1% faster at `E=16384`, with about 0.01-0.03 GB extra peak allocated memory.
 - `streamed all cuEq` only becomes attractive at larger edge counts. At `E=16384`, it is about 19.3% faster than baseline while using about 0.03 GB more peak allocated memory and slightly less peak reserved memory in this module benchmark.
 - `m0 cuEq, m>0 split` is memory-neutral but not worth making the speed default. It is mainly a conservative fallback knob when keeping allocated memory nearly identical matters more than throughput.
+
+## Production-like bs32 A/B
+
+Setup: natlan CUDA env `dptb_p2_wigner_cu12_py310`, checkout
+`/home/mingkang_nt/codex/0422_tests/bs32_final_ab/DeePTB`, dataset
+`/home/mingkang_nt/data/0422_test`, DDP on 2 L40S GPUs, `batch_size=32`,
+`num_epoch=1`, `display_freq=2`, `validation_freq=20`, `save_freq=1000`,
+`sliding_win_size=5`, `monitor_cuda_memory=true`, `num_experts=24`,
+`top_k=24`, `num_shared_experts=0`, `mole_full_expert_fast_path=true`.
+
+Remote result file:
+
+```text
+/home/mingkang_nt/codex/0422_tests/bs32_final_ab/runs/bs32_final_ab_results.json
+```
+
+| config | result | train wall time | time reduction vs baseline | throughput speedup | peak allocated | peak reserved |
+|---|---|---:|---:|---:|---:|---:|
+| `compact_blocks + staged + split_loop` | pass | 59.390 s | baseline | baseline | 28430.6 MB | 39396.0 MB |
+| `compact_blocks + staged + cueq_indexed_linear` | pass | 56.569 s | 4.75% | 4.99% | 28428.3 MB | 41352.0 MB |
+| `compact_blocks + streamed_m_major_cueq + cueq_indexed_linear` | pass | 52.314 s | 11.91% | 13.53% | 29278.1 MB | 42192.0 MB |
+| `compact_blocks + staged + m0 cueq, m>0 split` | pass | 57.840 s | 2.61% | 2.68% | 28421.7 MB | 41342.0 MB |
+
+Production-like bs32 readout:
+
+- If the priority is pure speed and about 0.83 GB extra `peak allocated`
+  is acceptable, use `streamed_m_major_cueq + cueq_indexed_linear`.
+  It was the fastest full-model bs32 setting on this dataset: 52.314 s vs
+  59.390 s baseline.
+- If allocator headroom matters more, use staged all-cuEq. It still improves
+  bs32 wall time by 4.75% while keeping `peak allocated` essentially flat,
+  though `peak reserved` rises by about 1.91 GB.
+- The m0-only cuEq hybrid is not the right speed-first default. It keeps
+  `peak allocated` flat, but only improves wall time by 2.61%.
 
 ## Next Step
 

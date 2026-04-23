@@ -948,7 +948,6 @@ def slem():
         Argument("ffn_hidden_factor", float, optional=True, default=0.0, doc=doc_ffn_hidden_factor),
         Argument("ffn_apply_to_last", bool, optional=True, default=False, doc=doc_ffn_apply_to_last),
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
-        Argument("mole_full_expert_fast_path", bool, optional=True, default=True, doc=doc_mole_full_expert_fast_path),
         Argument("so2_fusion_mode", str, optional=True, default="staged", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_mode),
         Argument("mole_linear_m0_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_m0_mode),
