@@ -15,6 +15,23 @@ def _split_loop_linear(x, mixed_weights, mixed_bias, split_sizes):
     return torch.cat(parts, dim=0)
 
 
+def _split_loop_complex_linear(x_pair, mixed_weights, split_sizes):
+    out_parts = []
+    start = 0
+    cout = mixed_weights.shape[1] // 2
+    for graph_id, rows in enumerate(split_sizes):
+        rows = int(rows)
+        xr = x_pair[start:start + rows, 0, :]
+        xi = x_pair[start:start + rows, 1, :]
+        wr = mixed_weights[graph_id, :cout, :]
+        wi = mixed_weights[graph_id, cout:, :]
+        yr = xr.matmul(wr.transpose(0, 1)) - xi.matmul(wi.transpose(0, 1))
+        yi = xr.matmul(wi.transpose(0, 1)) + xi.matmul(wr.transpose(0, 1))
+        out_parts.append(torch.stack((yr, yi), dim=1))
+        start += rows
+    return torch.cat(out_parts, dim=0)
+
+
 @pytest.mark.parametrize("x_rank", [2, 3])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_grouped_linear_apply_matches_split_loop_cpu(x_rank, with_bias):
@@ -54,6 +71,65 @@ def test_grouped_linear_apply_matches_split_loop_cpu(x_rank, with_bias):
     torch.testing.assert_close(mixed_weights.grad, gw_ref, atol=1e-10, rtol=1e-10)
     if mixed_bias is not None:
         torch.testing.assert_close(mixed_bias.grad, gb_ref, atol=1e-10, rtol=1e-10)
+
+
+def test_grouped_complex_linear_matches_split_loop_cpu():
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    torch.manual_seed(20260423)
+    dtype = torch.float64
+    split_sizes = (3, 5, 2, 4)
+    n_rows = sum(split_sizes)
+    in_features = 7
+    out_features = 9
+
+    x0 = torch.randn(n_rows, 2, in_features, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    w0 = torch.randn(len(split_sizes), 2 * out_features, in_features, dtype=dtype, requires_grad=True)
+    w1 = w0.detach().clone().requires_grad_(True)
+
+    y_ref = _split_loop_complex_linear(x0, w0, split_sizes)
+    y_new = ops.grouped_complex_linear(x1, w1, split_sizes)
+    torch.testing.assert_close(y_new, y_ref, atol=1e-10, rtol=1e-10)
+
+    probe = torch.randn_like(y_ref)
+    (y_ref * probe).sum().backward()
+    (y_new * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(w1.grad, w0.grad, atol=1e-10, rtol=1e-10)
+
+
+def test_grouped_complex_moe_fused_linear_matches_materialized_complex_cpu():
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    torch.manual_seed(20260423)
+    dtype = torch.float64
+    split_sizes = (3, 5, 2, 4)
+    n_rows = sum(split_sizes)
+    num_experts = 6
+    in_features = 7
+    out_features = 9
+
+    x0 = torch.randn(n_rows, 2, in_features, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    c0 = torch.rand(len(split_sizes), num_experts, dtype=dtype, requires_grad=True)
+    c1 = c0.detach().clone().requires_grad_(True)
+    w0 = torch.randn(num_experts, 2 * out_features, in_features, dtype=dtype, requires_grad=True)
+    w1 = w0.detach().clone().requires_grad_(True)
+
+    mixed = torch.einsum("ge,eoi->goi", c0, w0)
+    y_ref = _split_loop_complex_linear(x0, mixed, split_sizes)
+    y_new = ops.grouped_complex_moe_fused_linear(x1, c1, w1, split_sizes)
+    torch.testing.assert_close(y_new, y_ref, atol=1e-10, rtol=1e-10)
+
+    probe = torch.randn_like(y_ref)
+    (y_ref * probe).sum().backward()
+    (y_new * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(c1.grad, c0.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(w1.grad, w0.grad, atol=1e-10, rtol=1e-10)
 
 
 @pytest.mark.parametrize("x_rank", [2, 3])
@@ -149,6 +225,231 @@ def test_grouped_linear_apply_cuda_fp32_if_available(monkeypatch):
     torch.testing.assert_close(x.grad, gx_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(mixed_weights.grad, gw_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(mixed_bias.grad, gb_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_grouped_complex_linear_cuda_fp32_if_available(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton grouped complex linear CUDA smoke requires CUDA")
+    pytest.importorskip("triton")
+
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    monkeypatch.setenv("DPTB_TRITON_LINEAR_REQUIRE", "1")
+    torch.manual_seed(20260423)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (13, 17, 19, 11)
+    n_rows = sum(split_sizes)
+    in_features = 37
+    out_features = 41
+
+    x0 = torch.randn(n_rows, 2, in_features, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    w0 = torch.randn(
+        len(split_sizes), 2 * out_features, in_features, device=device, dtype=dtype, requires_grad=True
+    )
+    w1 = w0.detach().clone().requires_grad_(True)
+
+    y_ref = _split_loop_complex_linear(x0, w0, split_sizes)
+    y_new = ops.grouped_complex_linear(x1, w1, split_sizes)
+    torch.testing.assert_close(y_new, y_ref, atol=1e-4, rtol=1e-4)
+
+    probe = torch.randn_like(y_ref)
+    (y_ref * probe).sum().backward()
+    (y_new * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(w1.grad, w0.grad, atol=1e-4, rtol=1e-4)
+
+
+def test_grouped_complex_moe_fused_linear_cuda_fp32_if_available(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton grouped complex MoE CUDA smoke requires CUDA")
+    pytest.importorskip("triton")
+
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    monkeypatch.setenv("DPTB_TRITON_LINEAR_REQUIRE", "1")
+    torch.manual_seed(20260423)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (13, 17, 19, 11)
+    n_rows = sum(split_sizes)
+    num_experts = 8
+    in_features = 37
+    out_features = 41
+
+    x0 = torch.randn(n_rows, 2, in_features, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    c0 = torch.rand(len(split_sizes), num_experts, device=device, dtype=dtype, requires_grad=True)
+    c1 = c0.detach().clone().requires_grad_(True)
+    w0 = torch.randn(num_experts, 2 * out_features, in_features, device=device, dtype=dtype, requires_grad=True)
+    w1 = w0.detach().clone().requires_grad_(True)
+
+    mixed = torch.einsum("ge,eoi->goi", c0, w0)
+    y_ref = _split_loop_complex_linear(x0, mixed, split_sizes)
+    y_new = ops.grouped_complex_moe_fused_linear(x1, c1, w1, split_sizes)
+    torch.testing.assert_close(y_new, y_ref, atol=2e-4, rtol=2e-4)
+
+    probe = torch.randn_like(y_ref)
+    (y_ref * probe).sum().backward()
+    (y_new * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(c1.grad, c0.grad, atol=3e-3, rtol=3e-4)
+    torch.testing.assert_close(w1.grad, w0.grad, atol=3e-4, rtol=3e-4)
+
+
+def test_so2_m_linear_triton_complex_grouped_matches_standard_cpu():
+    pytest.importorskip("e3nn")
+    from e3nn import o3
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_m_Linear
+
+    torch.manual_seed(20260423)
+    dtype = torch.float64
+    split_sizes = (3, 5, 2)
+    n_rows = sum(split_sizes)
+    num_experts = 5
+
+    coeffs = torch.rand(len(split_sizes), num_experts, dtype=dtype, requires_grad=True)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    coeffs.retain_grad()
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=split_sizes)
+
+    irreps_in = o3.Irreps("2x1o + 1x2e + 2x3o")
+    irreps_out = o3.Irreps("1x1o + 2x2e + 1x3o")
+    standard = SO2_m_Linear(
+        1,
+        irreps_in,
+        irreps_out,
+        num_experts=num_experts,
+        num_shared_experts=0,
+        mole_linear_mode="split_loop",
+        so2_m_linear_mode="standard",
+    ).to(dtype=dtype)
+    triton = SO2_m_Linear(
+        1,
+        irreps_in,
+        irreps_out,
+        num_experts=num_experts,
+        num_shared_experts=0,
+        mole_linear_mode="split_loop",
+        so2_m_linear_mode="triton_complex_grouped_linear",
+    ).to(dtype=dtype)
+    triton.load_state_dict(standard.state_dict(), strict=True)
+
+    x0 = torch.randn(n_rows, 2, standard.num_in_channel, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    y0 = standard(x0, globals_)
+    y1 = triton(x1, globals_)
+    torch.testing.assert_close(y1, y0, atol=1e-10, rtol=1e-10)
+
+    probe = torch.randn_like(y0)
+    (y0 * probe).sum().backward(retain_graph=True)
+    x0_grad = x0.grad.detach().clone()
+    coeff_grad = coeffs.grad.detach().clone()
+    weight_grads = {
+        name: param.grad.detach().clone()
+        for name, param in standard.named_parameters()
+        if param.grad is not None
+    }
+
+    coeffs.grad.zero_()
+    (y1 * probe).sum().backward()
+    torch.testing.assert_close(x1.grad, x0_grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(coeffs.grad, coeff_grad, atol=1e-10, rtol=1e-10)
+    for name, param in triton.named_parameters():
+        if name in weight_grads:
+            torch.testing.assert_close(param.grad, weight_grads[name], atol=1e-10, rtol=1e-10)
+
+
+def test_so2_m_linear_triton_complex_moe_fused_matches_standard_cpu():
+    pytest.importorskip("e3nn")
+    from e3nn import o3
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_m_Linear
+
+    torch.manual_seed(20260423)
+    dtype = torch.float64
+    split_sizes = (3, 5, 2)
+    n_rows = sum(split_sizes)
+    num_experts = 5
+
+    coeffs = torch.rand(len(split_sizes), num_experts, dtype=dtype, requires_grad=True)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    coeffs.retain_grad()
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=split_sizes)
+
+    irreps_in = o3.Irreps("2x1o + 1x2e + 2x3o")
+    irreps_out = o3.Irreps("1x1o + 2x2e + 1x3o")
+    standard = SO2_m_Linear(
+        1,
+        irreps_in,
+        irreps_out,
+        num_experts=num_experts,
+        num_shared_experts=0,
+        mole_linear_mode="split_loop",
+        so2_m_linear_mode="standard",
+    ).to(dtype=dtype)
+    fused = SO2_m_Linear(
+        1,
+        irreps_in,
+        irreps_out,
+        num_experts=num_experts,
+        num_shared_experts=0,
+        mole_linear_mode="split_loop",
+        so2_m_linear_mode="triton_complex_moe_fused_linear",
+    ).to(dtype=dtype)
+    fused.load_state_dict(standard.state_dict(), strict=True)
+
+    x0 = torch.randn(n_rows, 2, standard.num_in_channel, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    y0 = standard(x0, globals_)
+    y1 = fused(x1, globals_)
+    torch.testing.assert_close(y1, y0, atol=1e-10, rtol=1e-10)
+
+    probe = torch.randn_like(y0)
+    (y0 * probe).sum().backward(retain_graph=True)
+    x0_grad = x0.grad.detach().clone()
+    coeff_grad = coeffs.grad.detach().clone()
+    weight_grads = {
+        name: param.grad.detach().clone()
+        for name, param in standard.named_parameters()
+        if param.grad is not None
+    }
+
+    coeffs.grad.zero_()
+    (y1 * probe).sum().backward()
+    torch.testing.assert_close(x1.grad, x0_grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(coeffs.grad, coeff_grad, atol=1e-10, rtol=1e-10)
+    for name, param in fused.named_parameters():
+        if name in weight_grads:
+            torch.testing.assert_close(param.grad, weight_grads[name], atol=1e-10, rtol=1e-10)
+
+
+def test_so2_m_linear_triton_complex_moe_fused_rejects_shared_experts():
+    pytest.importorskip("e3nn")
+    from e3nn import o3
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_m_Linear
+
+    torch.manual_seed(20260423)
+    dtype = torch.float64
+    split_sizes = (2, 3)
+    num_experts = 4
+    coeffs = torch.rand(len(split_sizes), num_experts, dtype=dtype)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=split_sizes)
+    layer = SO2_m_Linear(
+        1,
+        o3.Irreps("1x1o + 1x2e"),
+        o3.Irreps("1x1o + 1x2e"),
+        num_experts=num_experts,
+        num_shared_experts=1,
+        mole_linear_mode="split_loop",
+        so2_m_linear_mode="triton_complex_moe_fused_linear",
+    ).to(dtype=dtype)
+    x = torch.randn(sum(split_sizes), 2, layer.num_in_channel, dtype=dtype)
+
+    with pytest.raises(RuntimeError, match="num_shared_experts=0"):
+        layer(x, globals_)
 
 
 def test_mole_linear_env_selects_triton_grouped(monkeypatch):

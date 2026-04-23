@@ -391,7 +391,13 @@ def _normalize_mole_linear_mode(mode: str) -> str:
 
 
 def _normalize_so2_m_linear_mode(mode: str) -> str:
-    allowed = {"standard", "cueq_complex_indexed_linear", "cueq_segmented_complex_indexed_linear"}
+    allowed = {
+        "standard",
+        "cueq_complex_indexed_linear",
+        "cueq_segmented_complex_indexed_linear",
+        "triton_complex_grouped_linear",
+        "triton_complex_moe_fused_linear",
+    }
     if mode not in allowed:
         raise ValueError(f"so2_m_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
@@ -1951,6 +1957,47 @@ class SO2_m_Linear(torch.nn.Module):
         )[0]
         return flat_out.reshape(x_m.shape[0], 2, self.num_out_channel)
 
+    def _forward_triton_complex_grouped_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("triton_complex_grouped_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        mixed_weights, mixed_bias = self.fc._mixed_weights_and_bias(mole_globals)
+        if mixed_bias is not None:
+            raise RuntimeError("triton_complex_grouped_linear currently supports bias=False only.")
+
+        ops = _load_so2_triton_grouped_linear_ops()
+        if ops is None or not hasattr(ops, "grouped_complex_linear"):
+            return self._forward_standard(x_m, mole_globals)
+
+        split_sizes = _mole_split_sizes(mole_globals, x_m.shape[0])
+        return ops.grouped_complex_linear(x_m, mixed_weights, split_sizes)
+
+    def _forward_triton_complex_moe_fused_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("triton_complex_moe_fused_linear currently supports bias=False only.")
+        if self.fc.num_shared_experts != 0:
+            raise RuntimeError("triton_complex_moe_fused_linear currently supports num_shared_experts=0 only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        ops = _load_so2_triton_grouped_linear_ops()
+        if ops is None or not hasattr(ops, "grouped_complex_moe_fused_linear"):
+            return self._forward_standard(x_m, mole_globals)
+
+        split_sizes = _mole_split_sizes(mole_globals, x_m.shape[0])
+        return ops.grouped_complex_moe_fused_linear(
+            x_m,
+            mole_globals.coefficients,
+            self.fc.weight_experts,
+            split_sizes,
+        )
+
     def _forward_standard(self, x_m, mole_globals: MOLEGlobals):
         if self.is_mole:
             x_proj = self.fc(x_m, mole_globals)
@@ -1969,4 +2016,8 @@ class SO2_m_Linear(torch.nn.Module):
             return self._forward_cueq_complex_indexed_linear(x_m, mole_globals)
         if self.so2_m_linear_mode == "cueq_segmented_complex_indexed_linear":
             return self._forward_cueq_segmented_complex_indexed_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "triton_complex_grouped_linear":
+            return self._forward_triton_complex_grouped_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "triton_complex_moe_fused_linear":
+            return self._forward_triton_complex_moe_fused_linear(x_m, mole_globals)
         return self._forward_standard(x_m, mole_globals)
