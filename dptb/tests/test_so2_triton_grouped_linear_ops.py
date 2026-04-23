@@ -41,6 +41,9 @@ def _split_loop_complex_linear(x_pair, mixed_weights, split_sizes):
 def test_grouped_moe_linear_matches_materialized_cpu(x_rank, with_bias, with_shared, op_name):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
+    if op_name == "grouped_moe_fused_linear" and os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("row-tile fused expert Triton path is disabled unless explicitly enabled")
+
     torch.manual_seed(20260423)
     dtype = torch.float64
     split_sizes = (3, 5, 2, 4)
@@ -192,6 +195,9 @@ def test_grouped_complex_linear_matches_split_loop_cpu():
 @pytest.mark.parametrize("with_shared", [False, True])
 def test_grouped_complex_moe_linear_matches_materialized_complex_cpu(op_name, with_shared):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    if op_name == "grouped_complex_moe_fused_linear" and os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("row-tile fused complex expert Triton path is disabled unless explicitly enabled")
 
     torch.manual_seed(20260423)
     dtype = torch.float64
