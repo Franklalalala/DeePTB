@@ -9,6 +9,7 @@ import pytest
         "streamed_m_major_aggressive",
         "streamed_m_major_cueq",
         "streamed_m_major_triton_fused",
+        "streamed_m_major_triton_grouped",
     ],
 )
 @pytest.mark.parametrize(
@@ -68,7 +69,12 @@ def test_so2_streamed_handles_out_lmax_gt_in_lmax(so2_fusion_mode, wigner_apply_
 
 @pytest.mark.parametrize(
     "env_mode",
-    ["streamed_m_major_aggressive", "streamed_m_major_cueq", "streamed_m_major_triton_fused"],
+    [
+        "streamed_m_major_aggressive",
+        "streamed_m_major_cueq",
+        "streamed_m_major_triton_fused",
+        "streamed_m_major_triton_grouped",
+    ],
 )
 def test_so2_fusion_mode_env_selects_streamed_modes(monkeypatch, env_mode):
     pytest.importorskip("torch")
@@ -88,7 +94,13 @@ def test_so2_fusion_mode_env_selects_streamed_modes(monkeypatch, env_mode):
 
 @pytest.mark.parametrize(
     "so2_fusion_mode",
-    ["staged", "streamed_m_major_aggressive", "streamed_m_major_cueq", "streamed_m_major_triton_fused"],
+    [
+        "staged",
+        "streamed_m_major_aggressive",
+        "streamed_m_major_cueq",
+        "streamed_m_major_triton_fused",
+        "streamed_m_major_triton_grouped",
+    ],
 )
 def test_so2_radial_requires_latents(so2_fusion_mode):
     torch = pytest.importorskip("torch")
