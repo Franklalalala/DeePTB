@@ -37,7 +37,8 @@ def _split_loop_complex_linear(x_pair, mixed_weights, split_sizes):
 @pytest.mark.parametrize("x_rank", [2, 3])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("with_shared", [False, True])
-def test_grouped_moe_fused_linear_matches_materialized_cpu(x_rank, with_bias, with_shared):
+@pytest.mark.parametrize("op_name", ["grouped_moe_fused_linear", "grouped_exact_moe_linear"])
+def test_grouped_moe_linear_matches_materialized_cpu(x_rank, with_bias, with_shared, op_name):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
     torch.manual_seed(20260423)
@@ -72,7 +73,7 @@ def test_grouped_moe_fused_linear_matches_materialized_cpu(x_rank, with_bias, wi
             mixed_bias = mixed_bias + sb0.unsqueeze(0)
 
     y_ref = _split_loop_linear(x0, mixed, mixed_bias, split_sizes)
-    y_new = ops.grouped_moe_fused_linear(x1, c1, w1, b1, sw1, sb1, split_sizes)
+    y_new = getattr(ops, op_name)(x1, c1, w1, b1, sw1, sb1, split_sizes)
     torch.testing.assert_close(y_new, y_ref, atol=1e-10, rtol=1e-10)
 
     probe = torch.randn_like(y_ref)
@@ -131,6 +132,35 @@ def test_grouped_linear_apply_matches_split_loop_cpu(x_rank, with_bias):
         torch.testing.assert_close(mixed_bias.grad, gb_ref, atol=1e-10, rtol=1e-10)
 
 
+def test_grouped_exact_moe_linear_does_not_save_mixed_weights():
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    torch.manual_seed(20260424)
+    dtype = torch.float64
+    split_sizes = (3, 5, 2, 4)
+    num_graphs = len(split_sizes)
+    num_experts = 7
+    in_features = 11
+    out_features = 13
+
+    x = torch.randn(sum(split_sizes), in_features, dtype=dtype, requires_grad=True)
+    coeffs = torch.rand(num_graphs, num_experts, dtype=dtype, requires_grad=True)
+    weights = torch.randn(num_experts, out_features, in_features, dtype=dtype, requires_grad=True)
+    bias = torch.randn(num_experts, out_features, dtype=dtype, requires_grad=True)
+    saved_shapes = []
+
+    def _pack(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(_pack, lambda tensor: tensor):
+        y = ops.grouped_exact_moe_linear(x, coeffs, weights, bias, None, None, split_sizes)
+        y.square().sum().backward()
+
+    assert (num_graphs, out_features, in_features) not in saved_shapes
+    assert (num_graphs, out_features) not in saved_shapes
+
+
 def test_grouped_complex_linear_matches_split_loop_cpu():
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
@@ -158,7 +188,9 @@ def test_grouped_complex_linear_matches_split_loop_cpu():
     torch.testing.assert_close(w1.grad, w0.grad, atol=1e-10, rtol=1e-10)
 
 
-def test_grouped_complex_moe_fused_linear_matches_materialized_complex_cpu():
+@pytest.mark.parametrize("op_name", ["grouped_complex_moe_fused_linear", "grouped_complex_exact_moe_linear"])
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_grouped_complex_moe_linear_matches_materialized_complex_cpu(op_name, with_shared):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
     torch.manual_seed(20260423)
@@ -175,10 +207,19 @@ def test_grouped_complex_moe_fused_linear_matches_materialized_complex_cpu():
     c1 = c0.detach().clone().requires_grad_(True)
     w0 = torch.randn(num_experts, 2 * out_features, in_features, dtype=dtype, requires_grad=True)
     w1 = w0.detach().clone().requires_grad_(True)
+    sw0 = torch.randn(2 * out_features, in_features, dtype=dtype, requires_grad=True) if with_shared else None
+    sw1 = sw0.detach().clone().requires_grad_(True) if sw0 is not None else None
 
     mixed = torch.einsum("ge,eoi->goi", c0, w0)
+    if sw0 is not None:
+        mixed = mixed + sw0.unsqueeze(0)
     y_ref = _split_loop_complex_linear(x0, mixed, split_sizes)
-    y_new = ops.grouped_complex_moe_fused_linear(x1, c1, w1, split_sizes)
+    if op_name == "grouped_complex_moe_fused_linear":
+        if with_shared:
+            pytest.skip("row-tile fused complex MoE path does not support shared weights")
+        y_new = ops.grouped_complex_moe_fused_linear(x1, c1, w1, split_sizes)
+    else:
+        y_new = ops.grouped_complex_exact_moe_linear(x1, c1, w1, sw1, split_sizes)
     torch.testing.assert_close(y_new, y_ref, atol=1e-10, rtol=1e-10)
 
     probe = torch.randn_like(y_ref)
@@ -188,11 +229,14 @@ def test_grouped_complex_moe_fused_linear_matches_materialized_complex_cpu():
     torch.testing.assert_close(x1.grad, x0.grad, atol=1e-10, rtol=1e-10)
     torch.testing.assert_close(c1.grad, c0.grad, atol=1e-10, rtol=1e-10)
     torch.testing.assert_close(w1.grad, w0.grad, atol=1e-10, rtol=1e-10)
+    if sw0 is not None:
+        torch.testing.assert_close(sw1.grad, sw0.grad, atol=1e-10, rtol=1e-10)
 
 
 @pytest.mark.parametrize("x_rank", [2, 3])
 @pytest.mark.parametrize("num_shared_experts", [0, 2])
-def test_mole_linear_triton_grouped_matches_split_loop_cpu(x_rank, num_shared_experts):
+@pytest.mark.parametrize("mole_linear_mode", ["triton_grouped_linear", "triton_exact_grouped_linear"])
+def test_mole_linear_triton_grouped_matches_split_loop_cpu(x_rank, num_shared_experts, mole_linear_mode):
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
 
     torch.manual_seed(20260423)
@@ -222,7 +266,7 @@ def test_mole_linear_triton_grouped_matches_split_loop_cpu(x_rank, num_shared_ex
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         bias=True,
-        mole_linear_mode="triton_grouped_linear",
+        mole_linear_mode=mole_linear_mode,
     ).to(dtype=dtype)
     triton.load_state_dict(base.state_dict(), strict=True)
 
