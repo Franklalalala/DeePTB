@@ -893,6 +893,11 @@ def slem():
     doc_ffn_hidden_factor = "Expansion factor for the optional node-wise equivariant FFN. Values `<= 1.0` disable it."
     doc_ffn_apply_to_last = "Whether to also attach the node-wise FFN to the final layer. Default: `False`."
     doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
+    doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
+    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_aggressive`, `streamed_m_major_cueq`. Default keeps the current staged path; `streamed_m_major_cueq` uses the grouped m-major SO2 dataflow and should be paired with `mole_linear_mode=cueq_indexed_linear` for the cuEquivariance indexed-linear backend."
+    doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. Default `None` uses the DPTB_MOLE_LINEAR_MODE environment variable or falls back to `split_loop`."
+    doc_mole_linear_m0_mode = "Optional override for the scalar m=0 MoLELinear backend inside SO2_Linear. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. Default `None` inherits `mole_linear_mode` or uses the DPTB_MOLE_LINEAR_M0_MODE environment variable."
+    doc_so2_m_linear_mode = "SO2_m_Linear backend for m>0. Supported: `standard`, `cueq_complex_indexed_linear`, `cueq_segmented_complex_indexed_linear`. The cuEq complex modes fuse the indexed MoLE linear and real/imag SO2 post-processing through cuEquivariance indexed-linear calls and require `mole_linear_mode=cueq_indexed_linear`."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
@@ -911,6 +916,7 @@ def slem():
         Argument("top_k", int, optional=True, default=4, doc="The number of experts to be used in MoE. Default: 1"),
         Argument("num_experts", int, optional=True, default=24, doc="The number of experts for MoE. Default: 8"),
         Argument("num_shared_experts", int, optional=True, default=4, doc="The number of experts for MoE. Default: 8"),
+        Argument("mole_full_expert_fast_path", bool, optional=True, default=True, doc=doc_mole_full_expert_fast_path),
         Argument("PolynomialCutoff_p", int, optional=True, default=6, doc="The order of polynomial cutoff function. Default: 6"),
         Argument("cutoff_type", str, optional=True, default="polynomial", doc="The type of cutoff function. Default: polynomial"),
         Argument("color_mode", str, optional=True, default="tp", doc="The type of color mode. Default: tp"),
@@ -942,6 +948,10 @@ def slem():
         Argument("ffn_hidden_factor", float, optional=True, default=0.0, doc=doc_ffn_hidden_factor),
         Argument("ffn_apply_to_last", bool, optional=True, default=False, doc=doc_ffn_apply_to_last),
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
+        Argument("so2_fusion_mode", str, optional=True, default="staged", doc=doc_so2_fusion_mode),
+        Argument("mole_linear_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_mode),
+        Argument("mole_linear_m0_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_m0_mode),
+        Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
 
         # ---- New norm conditioning flags ----
         Argument("norm_build_node_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_node_condition_branch),

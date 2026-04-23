@@ -1,5 +1,8 @@
 
 from e3nn.o3 import xyz_to_angles, Irreps
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import warnings
 import math
 import torch
 import torch.nn as nn
@@ -171,6 +174,21 @@ def _normalize_wigner_apply_mode(wigner_apply_mode: str) -> str:
     return wigner_apply_mode
 
 
+def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
+    allowed = (
+        "staged",
+        "streamed_m_major_ref",
+        "streamed_m_major_aggressive",
+        "streamed_m_major_cueq",
+    )
+    if so2_fusion_mode not in allowed:
+        raise ValueError(
+            f"so2_fusion_mode must be one of {allowed}, "
+            f"got {so2_fusion_mode!r}"
+        )
+    return so2_fusion_mode
+
+
 def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
     if wigner_apply_mode == "compact_blocks":
         return batch_wigner_D_blocks(l_max, alpha, beta, gamma, _Jd)
@@ -178,11 +196,90 @@ def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
 
 
 def _select_wigner_block(wigner_D_all, l: int, offsets, dims):
-    if isinstance(wigner_D_all, SO2WignerBlocks):
-        return wigner_D_all.block(l)
-    start = offsets[l]
+    if wigner_D_all is None:
+        raise ValueError(
+            f"wigner_D_all is required to select Wigner block l={l}; "
+            "enable rotation construction or pass a precomputed Wigner object."
+        )
     dim = dims[l]
+    if isinstance(wigner_D_all, SO2WignerBlocks):
+        if l >= len(wigner_D_all.blocks):
+            raise ValueError(
+                f"wigner_D_all only has {len(wigner_D_all.blocks)} compact blocks, "
+                f"but SO2 needs l={l}. Recompute Wigner D with a larger l_max."
+            )
+        block = wigner_D_all.block(l)
+        if block.shape[-2:] != (dim, dim):
+            raise ValueError(
+                f"Wigner block l={l} has shape {tuple(block.shape[-2:])}, "
+                f"expected {(dim, dim)}."
+            )
+        return block
+    start = offsets[l]
+    if wigner_D_all.shape[-2] < start + dim or wigner_D_all.shape[-1] < start + dim:
+        raise ValueError(
+            f"wigner_D_all dense shape {tuple(wigner_D_all.shape[-2:])} does not include "
+            f"block l={l}. Recompute Wigner D with l_max large enough for SO2_Linear."
+        )
     return wigner_D_all[:, start:start + dim, start:start + dim]
+
+
+@dataclass(frozen=True)
+class _SO2EntryPlan:
+    l: int
+    mul: int
+    slice_info: slice
+    group_start: int
+
+
+@dataclass(frozen=True)
+class _SO2LGroupPlan:
+    l: int
+    dims: int
+    total_mul: int
+    muls: Tuple[int, ...]
+    slices: Tuple[slice, ...]
+
+
+def _build_so2_layout_plans(irreps) -> Tuple[Tuple[_SO2EntryPlan, ...], Dict[int, _SO2LGroupPlan]]:
+    running_by_l = defaultdict(int)
+    specs_by_l: Dict[int, List[Tuple[int, slice]]] = defaultdict(list)
+    entries: List[_SO2EntryPlan] = []
+
+    for (mul, (l, _p)), slice_info in zip(irreps, irreps.slices()):
+        group_start = running_by_l[l]
+        entries.append(
+            _SO2EntryPlan(
+                l=l,
+                mul=mul,
+                slice_info=slice_info,
+                group_start=group_start,
+            )
+        )
+        running_by_l[l] += mul
+        specs_by_l[l].append((mul, slice_info))
+
+    groups: Dict[int, _SO2LGroupPlan] = {}
+    for l, specs in specs_by_l.items():
+        groups[l] = _SO2LGroupPlan(
+            l=l,
+            dims=2 * l + 1,
+            total_mul=sum(mul for mul, _ in specs),
+            muls=tuple(mul for mul, _ in specs),
+            slices=tuple(slice_info for _, slice_info in specs),
+        )
+    return tuple(entries), groups
+
+
+def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
+    n = x.shape[0]
+    parts = [
+        x[:, slice_info].reshape(n, mul, plan.dims)
+        for mul, slice_info in zip(plan.muls, plan.slices)
+    ]
+    if len(parts) == 1:
+        return parts[0].contiguous()
+    return torch.cat(parts, dim=1).contiguous()
 
 
 # ------------------------------------------------------------------------------
@@ -218,14 +315,71 @@ class MOLEGlobals:
         return tuple(int(v) for v in values.tolist())
 
 
+def _mole_split_sizes(mole_globals, n_rows: int):
+    split_sizes = getattr(mole_globals, "split_sizes", None)
+    if split_sizes is None:
+        split_sizes = (n_rows,)
+    if sum(split_sizes) != n_rows:
+        raise ValueError(
+            f"MOLE split sizes sum to {sum(split_sizes)}, but input has {n_rows} rows."
+        )
+    return split_sizes
+
+
+def _mole_graph_index(mole_globals, n_rows: int, *, device):
+    """Return sorted graph ids per row, matching the existing split-loop semantics."""
+    split_sizes = _mole_split_sizes(mole_globals, n_rows)
+    cache = getattr(mole_globals, "_graph_index_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(mole_globals, "_graph_index_cache", cache)
+
+    key = (str(device), split_sizes)
+    graph_index = cache.get(key)
+    if graph_index is None:
+        sizes = torch.tensor(split_sizes, dtype=torch.long, device=device)
+        # cuEquivariance indexed_linear requires sorted indices; the split_sizes
+        # contract means rows are graph-contiguous, matching the old split loop.
+        graph_index = torch.repeat_interleave(
+            torch.arange(len(split_sizes), dtype=torch.long, device=device), sizes
+        )
+        cache[key] = graph_index
+    return graph_index
+
+
+def _expand_graph_index_for_leading_dims(graph_index: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Expand [E] graph ids to match x.reshape(-1, in_features)."""
+    if x.ndim == 2:
+        return graph_index
+
+    expand_shape = [graph_index.shape[0]] + list(x.shape[1:-1])
+    return graph_index.reshape(-1, *([1] * (x.ndim - 2))).expand(expand_shape).reshape(-1)
+
+
+def _normalize_mole_linear_mode(mode: str) -> str:
+    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear"}
+    if mode not in allowed:
+        raise ValueError(f"mole_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
+    return mode
+
+
+def _normalize_so2_m_linear_mode(mode: str) -> str:
+    allowed = {"standard", "cueq_complex_indexed_linear", "cueq_segmented_complex_indexed_linear"}
+    if mode not in allowed:
+        raise ValueError(f"so2_m_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
+    return mode
+
+
 class MOLERouterV3(nn.Module):
     def __init__(self, in_features, num_experts=48, top_k=6,
                  aux_loss_free=True,
-                 bias_update_speed=0.005):  # 修改1: 固定 Bias 更新速度，不再衰减
+                 bias_update_speed=0.005,
+                 full_expert_fast_path: bool = True):  # 修改1: 固定 Bias 更新速度，不再衰减
         super().__init__()
         self.top_k = top_k
         self.num_experts = num_experts
         self.aux_loss_free = aux_loss_free
+        self.full_expert_fast_path = full_expert_fast_path
 
         # 固定的惩罚力度
         self.bias_update_speed = bias_update_speed
@@ -237,7 +391,8 @@ class MOLERouterV3(nn.Module):
         )
 
         self.register_buffer('expert_bias', torch.zeros(num_experts))
-        self.register_buffer('ema_load', torch.ones(num_experts) * (top_k / num_experts))
+        effective_top_k = num_experts if top_k is None else min(top_k, num_experts)
+        self.register_buffer('ema_load', torch.ones(num_experts) * (effective_top_k / num_experts))
 
         # 修改1: 删除了 step_count 等用于衰减的 Buffer
 
@@ -245,6 +400,12 @@ class MOLERouterV3(nn.Module):
         # 修改1: 删除了 Jitter (探索噪声) 的注入逻辑，完全依赖网络的自然 Logits
         logits = self.net(global_features)
         scores = torch.sigmoid(logits)
+
+        if self.full_expert_fast_path and (self.top_k is None or self.top_k >= self.num_experts):
+            denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
+            probs = scores / denominators
+            monitor_val = probs.max(dim=-1)[0].mean().detach()
+            return probs, monitor_val, torch.zeros((), dtype=scores.dtype, device=scores.device)
 
         # 加上 Bias 用于选择 Top-K (Aux-loss-free 核心机制)
         if self.aux_loss_free and self.training:
@@ -318,12 +479,18 @@ class MOLELinear(nn.Module):
             num_experts=8,
             num_shared_experts=1,
             bias=True,
+            mole_linear_mode=None,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
+        self.mole_linear_mode = _normalize_mole_linear_mode(
+            mole_linear_mode or os.environ.get("DPTB_MOLE_LINEAR_MODE", "split_loop")
+        )
+        self._cueq_indexed_linear_cache = {}
+        self._cueq_weight_order_cache = {}
 
         # 1. 路由专家权重
         self.weight_experts = nn.Parameter(torch.empty(num_experts, out_features, in_features))
@@ -355,6 +522,147 @@ class MOLELinear(nn.Module):
             nn.init.uniform_(self.weight_shared, -k, k)
             if self.bias_shared is not None:
                 nn.init.uniform_(self.bias_shared, -k, k)
+
+    def _apply_indexed_ref(self, x, mixed_weights, mixed_bias, graph_index):
+        flat_x = x.reshape(-1, self.in_features)
+        flat_graph_index = _expand_graph_index_for_leading_dims(graph_index, x)
+        flat_w = mixed_weights.index_select(0, flat_graph_index)
+        flat_out = torch.bmm(flat_w, flat_x.unsqueeze(-1)).squeeze(-1)
+        if mixed_bias is not None:
+            flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
+        return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def _mixed_weights_and_bias(self, mole_globals: MOLEGlobals):
+        mixed_weights = torch.einsum("be, eoi -> boi", mole_globals.coefficients, self.weight_experts)
+        if self.num_shared_experts > 0:
+            mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
+
+        mixed_bias = None
+        if self.bias_experts is not None:
+            mixed_bias = torch.einsum("be, eo -> bo", mole_globals.coefficients, self.bias_experts)
+            if self.num_shared_experts > 0 and self.bias_shared is not None:
+                mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
+
+        return mixed_weights, mixed_bias
+
+    def _cueq_flatten_weight(self, mixed_weights, order: str):
+        scale = math.sqrt(self.in_features)
+        if order == "io_scaled":
+            flat = mixed_weights.transpose(1, 2).contiguous() * scale
+        elif order == "oi_scaled":
+            flat = mixed_weights.contiguous() * scale
+        elif order == "io":
+            flat = mixed_weights.transpose(1, 2).contiguous()
+        elif order == "oi":
+            flat = mixed_weights.contiguous()
+        else:
+            raise ValueError(f"unknown cueq weight order {order!r}")
+        return flat.reshape(mixed_weights.shape[0], -1)
+
+    def _get_cueq_indexed_linear(self, num_graphs: int, *, dtype, device):
+        if device.type != "cuda":
+            raise RuntimeError("cueq_indexed_linear requires CUDA; use split_loop or indexed_ref on CPU.")
+        if dtype not in (torch.float32, torch.float64):
+            raise RuntimeError(
+                "cueq_indexed_linear is currently validated only for float32/float64. "
+                "Disable AMP/autocast for this experimental backend or use split_loop."
+            )
+
+        try:
+            import cuequivariance as cue
+            import cuequivariance_torch as cuet
+        except ImportError as exc:
+            raise ImportError(
+                "mole_linear_mode='cueq_indexed_linear' requires cuequivariance and "
+                "cuequivariance_torch."
+            ) from exc
+
+        key = (num_graphs, str(dtype), str(device), self.in_features, self.out_features)
+        mod = self._cueq_indexed_linear_cache.get(key)
+        if mod is None:
+            irreps_in = cue.Irreps(cue.O3, f"{self.in_features}x0e")
+            irreps_out = cue.Irreps(cue.O3, f"{self.out_features}x0e")
+            mod = cuet.Linear(
+                irreps_in,
+                irreps_out,
+                shared_weights=True,
+                internal_weights=False,
+                weight_classes=num_graphs,
+                layout=cue.ir_mul,
+                device=device,
+                dtype=dtype,
+                method="indexed_linear",
+            )
+            self._cueq_indexed_linear_cache[key] = mod
+        return mod
+
+    def _infer_cueq_weight_order(self, cue_lin, flat_x, mixed_weights, flat_graph_index):
+        cache_key = (
+            str(flat_x.device),
+            str(flat_x.dtype),
+            int(self.in_features),
+            int(self.out_features),
+            int(mixed_weights.shape[0]),
+        )
+        cached = self._cueq_weight_order_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        with torch.no_grad():
+            n_probe = min(int(flat_x.shape[0]), 64)
+            probe_x = flat_x[:n_probe]
+            probe_idx = flat_graph_index[:n_probe]
+            ref_w = mixed_weights.index_select(0, probe_idx)
+            ref = torch.bmm(ref_w, probe_x.unsqueeze(-1)).squeeze(-1)
+
+            best_order, best_err = None, None
+            for order in ("io_scaled", "oi_scaled", "io", "oi"):
+                try:
+                    weight = self._cueq_flatten_weight(mixed_weights, order)
+                    out = cue_lin(probe_x, weight=weight, weight_indices=probe_idx)
+                    err_val = float((out - ref).abs().max().detach().cpu())
+                except Exception:
+                    continue
+                if best_err is None or err_val < best_err:
+                    best_order, best_err = order, err_val
+
+        if best_order is None or best_err is None or best_err > 1e-4:
+            raise RuntimeError(
+                "Could not infer cuEquivariance scalar Linear weight order; "
+                f"best_order={best_order}, best_err={best_err}."
+            )
+
+        self._cueq_weight_order_cache[cache_key] = best_order
+        return best_order
+
+    def _expand_graph_index_cached(self, graph_index: torch.Tensor, x: torch.Tensor, mole_globals: MOLEGlobals):
+        if x.ndim == 2:
+            return graph_index
+
+        cache = getattr(mole_globals, "_expanded_graph_index_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(mole_globals, "_expanded_graph_index_cache", cache)
+
+        key = (str(x.device), int(graph_index.numel()), tuple(int(v) for v in x.shape[1:-1]))
+        cached = cache.get(key)
+        if cached is None:
+            cached = _expand_graph_index_for_leading_dims(graph_index, x)
+            cache[key] = cached
+        return cached
+
+    def _apply_cueq_indexed_linear(self, x, mixed_weights, mixed_bias, graph_index, mole_globals: MOLEGlobals):
+        flat_x = x.reshape(-1, self.in_features)
+        flat_graph_index = self._expand_graph_index_cached(graph_index, x, mole_globals)
+        num_graphs = int(mixed_weights.shape[0])
+        cue_lin = self._get_cueq_indexed_linear(num_graphs, dtype=x.dtype, device=x.device)
+
+        order = self._infer_cueq_weight_order(cue_lin, flat_x, mixed_weights, flat_graph_index)
+        flat_weight = self._cueq_flatten_weight(mixed_weights, order)
+        flat_out = cue_lin(flat_x, weight=flat_weight, weight_indices=flat_graph_index)
+        if mixed_bias is not None:
+            flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
+        return flat_out.reshape(*x.shape[:-1], self.out_features)
 
     def forward(self, x, mole_globals: MOLEGlobals):
         # 安全回退
@@ -390,6 +698,19 @@ class MOLELinear(nn.Module):
 
         # 4. 执行线性变换
         # 根据系统大小拆分 Input，因为每个系统(Graph)对应一个混合后的权重
+        mode = self.mole_linear_mode
+        if mode != "split_loop":
+            graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
+            if graph_index.numel() != x.shape[0]:
+                raise ValueError(
+                    f"MOLE graph_index has {graph_index.numel()} rows, but input has {x.shape[0]} rows."
+                )
+            if mode == "indexed_ref":
+                return self._apply_indexed_ref(x, mixed_weights, mixed_bias, graph_index)
+            if mode == "cueq_indexed_linear":
+                return self._apply_cueq_indexed_linear(x, mixed_weights, mixed_bias, graph_index, mole_globals)
+            raise AssertionError(f"unreachable mole_linear_mode={mode!r}")
+
         split_sizes = mole_globals.split_sizes
         if split_sizes is None:
             split_sizes = (x.shape[0],)
@@ -548,11 +869,19 @@ class SO2_Linear(torch.nn.Module):
             rotate_in: bool = True,
             rotate_out: bool = True,
             wigner_apply_mode: str = "compact_blocks",
+            mole_linear_mode=None,
+            mole_linear_m0_mode=None,
+            so2_fusion_mode: str = "staged",
+            so2_m_linear_mode: str = None,
     ):
         super(SO2_Linear, self).__init__()
 
         self.irreps_in = Irreps(irreps_in).simplify()
         self.irreps_out = (Irreps(f"{extra_m0_outsize}x0e") + Irreps(irreps_out)).simplify()
+        self.in_l_max = self.irreps_in.lmax
+        self.out_l_max = self.irreps_out.lmax
+        self.m_max = min(self.in_l_max, self.out_l_max)
+        self.l_max = max(self.in_l_max, self.out_l_max)
         self.radial_emb = radial_emb
         self.latent_dim = latent_dim
 
@@ -560,6 +889,18 @@ class SO2_Linear(torch.nn.Module):
         self.rotate_in = rotate_in
         self.rotate_out = rotate_out
         self.wigner_apply_mode = _normalize_wigner_apply_mode(wigner_apply_mode)
+        env_so2_fusion_mode = os.environ.get("DPTB_SO2_FUSION_MODE")
+        if env_so2_fusion_mode is not None and so2_fusion_mode in (None, "staged"):
+            so2_fusion_mode = env_so2_fusion_mode
+        self.so2_fusion_mode = _normalize_so2_fusion_mode(so2_fusion_mode)
+        env_so2_m_linear_mode = os.environ.get("DPTB_SO2_M_LINEAR_MODE")
+        if env_so2_m_linear_mode is not None and so2_m_linear_mode in (None, "standard"):
+            so2_m_linear_mode = env_so2_m_linear_mode
+        self.so2_m_linear_mode = _normalize_so2_m_linear_mode(so2_m_linear_mode or "standard")
+        env_mole_linear_m0_mode = os.environ.get("DPTB_MOLE_LINEAR_M0_MODE")
+        if env_mole_linear_m0_mode is not None and mole_linear_m0_mode is None:
+            mole_linear_m0_mode = env_mole_linear_m0_mode
+        self.mole_linear_m0_mode = _normalize_mole_linear_mode(mole_linear_m0_mode or mole_linear_mode or "split_loop")
         self.num_experts = num_experts
 
         self.m_linear = nn.ModuleList()
@@ -574,9 +915,10 @@ class SO2_Linear(torch.nn.Module):
             num_experts=num_experts,
             num_shared_experts=num_shared_experts,
             bias=True,
+            mole_linear_mode=self.mole_linear_m0_mode,
         )
 
-        for m in range(1, self.irreps_out.lmax + 1):
+        for m in range(1, self.m_max + 1):
             # 假设 SO2_m_Linear 已经支持 num_experts 参数
             self.m_linear.append(SO2_m_Linear(
                 m,
@@ -585,21 +927,23 @@ class SO2_Linear(torch.nn.Module):
                 use_interpolation=use_interpolation,
                 num_experts=num_experts,
                 num_shared_experts=num_shared_experts,
+                mole_linear_mode=mole_linear_mode,
+                so2_m_linear_mode=self.so2_m_linear_mode,
             ))
 
         # --- Mask 和 Index 构建逻辑 (保持不变) ---
-        m_in_mask = torch.zeros(self.irreps_in.lmax + 1, self.irreps_in.dim, dtype=torch.bool)
-        m_out_mask = torch.zeros(self.irreps_in.lmax + 1, self.irreps_out.dim, dtype=torch.bool)
+        m_in_mask = torch.zeros(self.m_max + 1, self.irreps_in.dim, dtype=torch.bool)
+        m_out_mask = torch.zeros(self.m_max + 1, self.irreps_out.dim, dtype=torch.bool)
         if self.irreps_in.dim <= self.irreps_out.dim:
             front = True
-            self.m_in_num = [0] * (self.irreps_in.lmax + 1)
+            self.m_in_num = [0] * (self.m_max + 1)
         else:
             front = False
-            self.m_in_num = [0] * (self.irreps_out.lmax + 1)
+            self.m_in_num = [0] * (self.m_max + 1)
         offset = 0
         for mul, (l, p) in self.irreps_in:
             start_id = offset + torch.LongTensor(list(range(mul))) * (2 * l + 1)
-            for m in range(l + 1):
+            for m in range(min(l, self.m_max) + 1):
                 m_in_mask[m, start_id + l + m] = True
                 m_in_mask[m, start_id + l - m] = True
                 if front:
@@ -608,12 +952,11 @@ class SO2_Linear(torch.nn.Module):
         offset = 0
         for mul, (l, p) in self.irreps_out:
             start_id = offset + torch.LongTensor(list(range(mul))) * (2 * l + 1)
-            for m in range(l + 1):
-                if m <= self.irreps_in.lmax:
-                    m_out_mask[m, start_id + l + m] = True
-                    m_out_mask[m, start_id + l - m] = True
-                    if not front:
-                        self.m_in_num[m] += mul
+            for m in range(min(l, self.m_max) + 1):
+                m_out_mask[m, start_id + l + m] = True
+                m_out_mask[m, start_id + l - m] = True
+                if not front:
+                    self.m_in_num[m] += mul
             offset += mul * (2 * l + 1)
         self.register_buffer("m_in_mask", m_in_mask)
         self.register_buffer("m_out_mask", m_out_mask)
@@ -621,13 +964,28 @@ class SO2_Linear(torch.nn.Module):
         if radial_emb:
             self.radial_emb = RadialFunction([latent_dim] + radial_channels + [self.m_in_index[-1]])
         self.front = front
-        self.l_max = max((l for (_, (l, _)), _ in zip(self.irreps_in, self.irreps_in.slices()) if l > 0), default=0)
         self.dims = {l: 2 * l + 1 for l in range(self.l_max + 1)}
         self.offsets = {}
         offset = 0
         for l in range(self.l_max + 1):
             self.offsets[l] = offset
             offset += self.dims[l]
+        self._in_entry_plans, self._in_group_plans = _build_so2_layout_plans(self.irreps_in)
+        self._out_entry_plans, self._out_group_plans = _build_so2_layout_plans(self.irreps_out)
+        self._in_entries_by_m = {
+            m: tuple(entry for entry in self._in_entry_plans if entry.l >= m)
+            for m in range(self.m_max + 1)
+        }
+        self._out_entries_by_m = {
+            m: tuple(entry for entry in self._out_entry_plans if entry.l >= m)
+            for m in range(self.m_max + 1)
+        }
+        self._active_rot_l = tuple(sorted({
+            entry.l for entry in self._in_entry_plans if entry.l > 0
+        } | {
+            entry.l for entry in self._out_entry_plans if entry.l > 0
+        }))
+        self._route_warned = set()
 
     def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
         """
@@ -638,8 +996,22 @@ class SO2_Linear(torch.nn.Module):
             latents: Latent features for radial embedding
             wigner_D_all: Precomputed Wigner D matrices (optional)
         """
+        if self.so2_fusion_mode in ("streamed_m_major_ref", "streamed_m_major_aggressive"):
+            return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
+        if self.so2_fusion_mode == "streamed_m_major_cueq":
+            return self._forward_streamed_m_major_grouped(
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+                route="streamed_m_major_cueq",
+            )
+
         n, _ = x.shape
         if self.radial_emb:
+            if latents is None:
+                raise ValueError("SO2_Linear requires latents when radial_emb=True.")
             weights = self.radial_emb(latents)
         x_ = torch.zeros_like(x)
 
@@ -684,7 +1056,7 @@ class SO2_Linear(torch.nn.Module):
 
         # === 3. Convolution (Linear / MoE) ===
         out = torch.zeros(n, self.irreps_out.dim, dtype=x.dtype, device=x.device)
-        for m in range(self.irreps_out.lmax + 1):
+        for m in range(self.m_max + 1):
             radial_weight = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(
                 1) if self.radial_emb else 1.
 
@@ -737,6 +1109,312 @@ class SO2_Linear(torch.nn.Module):
 
         return out.contiguous(), wigner_D_all
 
+    def _ensure_wigner_rotation(self, R, wigner_D_all):
+        if wigner_D_all is not None:
+            return wigner_D_all
+        if (self.rotate_in or self.rotate_out) and self.l_max > 0:
+            angle = xyz_to_angles(R[:, [1, 2, 0]])
+            return _make_wigner_rotation(
+                self.l_max,
+                angle[0],
+                angle[1],
+                torch.zeros_like(angle[0]),
+                self.wigner_apply_mode,
+            )
+        return None
+
+    def _direct_rotate_pack_m(self, x, m: int, wigner_D_all):
+        n, _ = x.shape
+        if m == 0:
+            parts = []
+            for (mul, (l, p)), slice_info in zip(self.irreps_in, self.irreps_in.slices()):
+                x_l = x[:, slice_info].reshape(n, mul, 2 * l + 1)
+                if l == 0 or not self.rotate_in:
+                    parts.append(x_l[:, :, l])
+                else:
+                    rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+                    parts.append(torch.einsum("ncd,nd->nc", x_l, rot_mat[:, :, l]))
+            return torch.cat(parts, dim=1)
+
+        parts = []
+        for (mul, (l, p)), slice_info in zip(self.irreps_in, self.irreps_in.slices()):
+            if l < m:
+                continue
+            x_l = x[:, slice_info].reshape(n, mul, 2 * l + 1)
+            local_rows = [l - m, l + m]
+            if not self.rotate_in:
+                pair = x_l[:, :, local_rows]
+            else:
+                rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+                pair = torch.einsum("ncd,ndp->ncp", x_l, rot_mat[:, :, local_rows])
+            parts.append(pair)
+        return torch.cat(parts, dim=1).transpose(1, 2).contiguous()
+
+    def _accumulate_m0_output(self, out, y_m0, wigner_D_all):
+        n = out.shape[0]
+        channel_start = 0
+        for (mul, (l, p)), slice_info in zip(self.irreps_out, self.irreps_out.slices()):
+            y_l = y_m0[:, channel_start:channel_start + mul]
+            channel_start += mul
+            out_l = out[:, slice_info].reshape(n, mul, 2 * l + 1)
+            if l == 0 or not self.rotate_out:
+                out_l[:, :, l] += y_l
+            else:
+                rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+                out_l += y_l.unsqueeze(-1) * rot_mat[:, :, l].unsqueeze(1)
+
+    def _accumulate_m_output(self, out, y_m, m: int, wigner_D_all):
+        n = out.shape[0]
+        channel_start = 0
+        for (mul, (l, p)), slice_info in zip(self.irreps_out, self.irreps_out.slices()):
+            if l < m:
+                continue
+            y_l = y_m[:, :, channel_start:channel_start + mul]
+            channel_start += mul
+            local_rows = [l - m, l + m]
+            out_l = out[:, slice_info].reshape(n, mul, 2 * l + 1)
+            if not self.rotate_out:
+                out_l[:, :, local_rows] += y_l.transpose(1, 2)
+            else:
+                rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+                out_l += torch.einsum("npm,ndp->nmd", y_l, rot_mat[:, :, local_rows])
+
+    def _forward_streamed_m_major_ref(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
+        wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+        n, _ = x.shape
+        if self.radial_emb and latents is None:
+            raise ValueError("SO2_Linear streamed path requires latents when radial_emb=True.")
+        weights = self.radial_emb(latents) if self.radial_emb else None
+        out = torch.zeros(n, self.irreps_out.dim, dtype=x.dtype, device=x.device)
+
+        for m in range(self.m_max + 1):
+            radial_weight = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(
+                1) if self.radial_emb else 1.
+
+            if m == 0:
+                inp = self._direct_rotate_pack_m(x, m, wigner_D_all)
+                if self.front and self.radial_emb:
+                    y_m = self.fc_m0(inp * radial_weight.squeeze(1), mole_globals)
+                elif self.radial_emb:
+                    y_m = self.fc_m0(inp, mole_globals) * radial_weight.squeeze(1)
+                else:
+                    y_m = self.fc_m0(inp, mole_globals)
+                self._accumulate_m0_output(out, y_m, wigner_D_all)
+                continue
+
+            x_m_in = self._direct_rotate_pack_m(x, m, wigner_D_all)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+            elif self.radial_emb:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+                linear_output = linear_output * radial_weight
+            else:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+
+            self._accumulate_m_output(out, linear_output, m, wigner_D_all)
+
+        return out.contiguous(), wigner_D_all
+
+    def _warn_route_once(self, key: str, message: str):
+        if key in self._route_warned:
+            return
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+        self._route_warned.add(key)
+
+    def _cueq_linear_is_enabled(self) -> bool:
+        backends = []
+        if isinstance(getattr(self, "fc_m0", None), MOLELinear):
+            backends.append(self.fc_m0.mole_linear_mode)
+        for module in self.m_linear:
+            fc = getattr(module, "fc", None)
+            if isinstance(fc, MOLELinear):
+                backends.append(fc.mole_linear_mode)
+        return bool(backends) and all(mode == "cueq_indexed_linear" for mode in backends)
+
+    def _prepare_streamed_route(self, route: str):
+        if route == "streamed_m_major_cueq" and not self._cueq_linear_is_enabled():
+            self._warn_route_once(
+                "cueq_linear_not_enabled",
+                "streamed_m_major_cueq is active but MOLELinear is not using "
+                "cueq_indexed_linear; the route remains correct but only the grouped "
+                "streamed SO2 dataflow is active.",
+            )
+
+    def _make_wigner_block_cache(self, wigner_D_all) -> Dict[int, torch.Tensor]:
+        if wigner_D_all is None:
+            return {}
+        return {
+            l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+            for l in self._active_rot_l
+        }
+
+    def _gather_input_l_groups(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
+        return {
+            l: _gather_so2_l_group(x, plan)
+            for l, plan in self._in_group_plans.items()
+        }
+
+    def _alloc_output_l_groups(self, n: int, *, dtype, device) -> Dict[int, torch.Tensor]:
+        return {
+            l: torch.zeros((n, plan.total_mul, plan.dims), dtype=dtype, device=device)
+            for l, plan in self._out_group_plans.items()
+        }
+
+    def _materialize_output_l_groups(self, out_groups: Dict[int, torch.Tensor], *, n: int, dtype, device) -> torch.Tensor:
+        out = torch.zeros((n, self.irreps_out.dim), dtype=dtype, device=device)
+        for entry in self._out_entry_plans:
+            group_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            out[:, entry.slice_info] = group_view.reshape(n, -1)
+        return out
+
+    def _pack_group_m0(self, x_group: torch.Tensor, l: int, rot_block: Optional[torch.Tensor]) -> torch.Tensor:
+        if x_group.numel() == 0:
+            return x_group.new_empty((x_group.shape[0], x_group.shape[1]))
+        if l == 0 or not self.rotate_in or rot_block is None:
+            return x_group[:, :, l]
+        return torch.einsum("ncd,nd->nc", x_group, rot_block[:, :, l])
+
+    def _pack_group_pair(self, x_group: torch.Tensor, l: int, m: int, rot_block: Optional[torch.Tensor]) -> torch.Tensor:
+        if x_group.numel() == 0:
+            return x_group.new_empty((x_group.shape[0], 2, x_group.shape[1]))
+        rows = [l - m, l + m]
+        if not self.rotate_in or rot_block is None:
+            return x_group[:, :, rows].transpose(1, 2).contiguous()
+        return torch.einsum("ncd,ndp->npc", x_group, rot_block[:, :, rows])
+
+    def _accumulate_group_m0_(self, out_group: torch.Tensor, y_group: torch.Tensor, l: int, rot_block: Optional[torch.Tensor]) -> None:
+        if y_group.numel() == 0:
+            return
+        if l == 0 or not self.rotate_out or rot_block is None:
+            out_group[:, :, l] += y_group
+            return
+        out_group += y_group.unsqueeze(-1) * rot_block[:, :, l].unsqueeze(1)
+
+    def _accumulate_group_pair_(self, out_group: torch.Tensor, y_group: torch.Tensor, l: int, m: int, rot_block: Optional[torch.Tensor]) -> None:
+        if y_group.numel() == 0:
+            return
+        rows = [l - m, l + m]
+        if not self.rotate_out or rot_block is None:
+            out_group[:, :, rows] += y_group.transpose(1, 2)
+            return
+        out_group += torch.einsum("npc,ndp->ncd", y_group, rot_block[:, :, rows])
+
+    def _assemble_grouped_m0_input(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            n: int,
+            x_template: torch.Tensor,
+    ) -> torch.Tensor:
+        packed_by_l = {}
+        for l, x_group in input_groups.items():
+            packed_by_l[l] = self._pack_group_m0(x_group, l, rot_blocks.get(l))
+
+        parts = [
+            packed_by_l[entry.l][:, entry.group_start:entry.group_start + entry.mul]
+            for entry in self._in_entries_by_m[0]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)
+
+    def _assemble_grouped_pair_input(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+            n: int,
+            x_template: torch.Tensor,
+    ) -> torch.Tensor:
+        packed_by_l = {}
+        for l, x_group in input_groups.items():
+            if l < m:
+                continue
+            packed_by_l[l] = self._pack_group_pair(x_group, l, m, rot_blocks.get(l))
+
+        parts = [
+            packed_by_l[entry.l][:, :, entry.group_start:entry.group_start + entry.mul]
+            for entry in self._in_entries_by_m[m]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 2, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=2)
+
+    def _accumulate_grouped_m0_output_(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            y_m0: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+    ) -> None:
+        cursor = 0
+        for entry in self._out_entries_by_m[0]:
+            y_entry = y_m0[:, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            self._accumulate_group_m0_(out_view, y_entry, entry.l, rot_blocks.get(entry.l))
+
+    def _accumulate_grouped_pair_output_(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            y_m: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+    ) -> None:
+        cursor = 0
+        for entry in self._out_entries_by_m[m]:
+            y_entry = y_m[:, :, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            self._accumulate_group_pair_(out_view, y_entry, entry.l, m, rot_blocks.get(entry.l))
+
+    def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
+        self._prepare_streamed_route(route)
+        wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+        n, _ = x.shape
+        if self.radial_emb and latents is None:
+            raise ValueError("SO2_Linear grouped streamed path requires latents when radial_emb=True.")
+        weights = self.radial_emb(latents) if self.radial_emb else None
+        rot_blocks = self._make_wigner_block_cache(wigner_D_all)
+        input_groups = self._gather_input_l_groups(x)
+        out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+
+        for m in range(self.m_max + 1):
+            radial_weight = (
+                weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1)
+                if self.radial_emb else 1.
+            )
+
+            if m == 0:
+                inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
+                if self.front and self.radial_emb:
+                    y_m = self.fc_m0(inp * radial_weight.squeeze(1), mole_globals)
+                elif self.radial_emb:
+                    y_m = self.fc_m0(inp, mole_globals) * radial_weight.squeeze(1)
+                else:
+                    y_m = self.fc_m0(inp, mole_globals)
+                self._accumulate_grouped_m0_output_(out_groups, y_m, rot_blocks)
+                continue
+
+            x_m_in = self._assemble_grouped_pair_input(input_groups, rot_blocks, m, n, x)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+            elif self.radial_emb:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+                linear_output = linear_output * radial_weight
+            else:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+
+            self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+
+        out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+        return out.contiguous(), wigner_D_all
+
 
 class SO2_m_Linear(torch.nn.Module):
     """
@@ -751,11 +1429,20 @@ class SO2_m_Linear(torch.nn.Module):
             use_interpolation: bool = False,
             num_experts: int = 8,  # Added
             num_shared_experts: int = 1, # Added
+            mole_linear_mode=None,
+            so2_m_linear_mode: str = None,
     ):
         super(SO2_m_Linear, self).__init__()
         self.m = m
         self.num_in_channel = sum(mul for mul, (l, p) in irreps_in if l >= m)
         self.num_out_channel = sum(mul for mul, (l, p) in irreps_out if l >= m)
+        self.so2_m_linear_mode = _normalize_so2_m_linear_mode(
+            so2_m_linear_mode or os.environ.get("DPTB_SO2_M_LINEAR_MODE", "standard")
+        )
+        self._cueq_complex_linear_cache = {}
+        self._cueq_complex_weight_order = None
+        self._cueq_segmented_complex_linear_cache = {}
+        self._cueq_segmented_complex_weight_order = None
 
         # MODIFICATION: MOLE Logic with bias=False (original was bias=False)
         if use_interpolation:
@@ -768,13 +1455,268 @@ class SO2_m_Linear(torch.nn.Module):
                 num_experts=num_experts,
                 num_shared_experts=num_shared_experts,
                 bias=False,
+                mole_linear_mode=mole_linear_mode,
             )
             with torch.no_grad():
                 self.fc.weight_experts.data.mul_(1 / math.sqrt(2))
             self.is_mole = True
 
-    def forward(self, x_m, mole_globals: MOLEGlobals):  # Added mole_globals
-        # x_m ~ [N, 2, n_channels]
+    def _complex_block_weights(self, mixed_weights: torch.Tensor) -> torch.Tensor:
+        w_real = mixed_weights[:, :self.num_out_channel, :]
+        w_imag = mixed_weights[:, self.num_out_channel:, :]
+        top = torch.cat((w_real, -w_imag), dim=2)
+        bottom = torch.cat((w_imag, w_real), dim=2)
+        return torch.cat((top, bottom), dim=1)
+
+    def _cueq_flatten_complex_weight(self, block_weights: torch.Tensor, order: str) -> torch.Tensor:
+        scale = math.sqrt(2 * self.num_in_channel)
+        if order == "io_scaled":
+            flat = block_weights.transpose(1, 2).contiguous() * scale
+        elif order == "oi_scaled":
+            flat = block_weights.contiguous() * scale
+        elif order == "io":
+            flat = block_weights.transpose(1, 2).contiguous()
+        elif order == "oi":
+            flat = block_weights.contiguous()
+        else:
+            raise ValueError(f"unknown cueq complex weight order {order!r}")
+        return flat.reshape(block_weights.shape[0], -1)
+
+    def _get_cueq_complex_linear(self, num_graphs: int, *, dtype, device):
+        if device.type != "cuda":
+            raise RuntimeError("cueq_complex_indexed_linear requires CUDA.")
+        if dtype not in (torch.float32, torch.float64):
+            raise RuntimeError(
+                "cueq_complex_indexed_linear is currently validated only for float32/float64."
+            )
+
+        try:
+            import cuequivariance as cue
+            import cuequivariance_torch as cuet
+        except ImportError as exc:
+            raise ImportError(
+                "so2_m_linear_mode='cueq_complex_indexed_linear' requires cuequivariance "
+                "and cuequivariance_torch."
+            ) from exc
+
+        key = (num_graphs, str(dtype), str(device), self.num_in_channel, self.num_out_channel)
+        mod = self._cueq_complex_linear_cache.get(key)
+        if mod is None:
+            irreps_in = cue.Irreps(cue.O3, f"{2 * self.num_in_channel}x0e")
+            irreps_out = cue.Irreps(cue.O3, f"{2 * self.num_out_channel}x0e")
+            mod = cuet.Linear(
+                irreps_in,
+                irreps_out,
+                shared_weights=True,
+                internal_weights=False,
+                weight_classes=num_graphs,
+                layout=cue.ir_mul,
+                device=device,
+                dtype=dtype,
+                method="indexed_linear",
+            )
+            self._cueq_complex_linear_cache[key] = mod
+        return mod
+
+    def _infer_cueq_complex_weight_order(self, cue_lin, flat_x, block_weights, graph_index):
+        if self._cueq_complex_weight_order is not None:
+            return self._cueq_complex_weight_order
+
+        with torch.no_grad():
+            n_probe = min(int(flat_x.shape[0]), 64)
+            probe_x = flat_x[:n_probe]
+            probe_idx = graph_index[:n_probe]
+            ref_w = block_weights.index_select(0, probe_idx)
+            ref = torch.bmm(ref_w, probe_x.unsqueeze(-1)).squeeze(-1)
+
+            best_order, best_err = None, None
+            for order in ("io_scaled", "oi_scaled", "io", "oi"):
+                try:
+                    weight = self._cueq_flatten_complex_weight(block_weights, order)
+                    out = cue_lin(probe_x, weight=weight, weight_indices=probe_idx)
+                    err_val = float((out - ref).abs().max().detach().cpu())
+                except Exception:
+                    continue
+                if best_err is None or err_val < best_err:
+                    best_order, best_err = order, err_val
+
+        if best_order is None or best_err is None or best_err > 1e-4:
+            raise RuntimeError(
+                "Could not infer cuEquivariance complex SO2_m weight order; "
+                f"best_order={best_order}, best_err={best_err}."
+            )
+
+        self._cueq_complex_weight_order = best_order
+        return best_order
+
+    def _forward_cueq_complex_indexed_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.mole_linear_mode != "cueq_indexed_linear":
+            raise RuntimeError(
+                "cueq_complex_indexed_linear requires mole_linear_mode='cueq_indexed_linear'."
+            )
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("cueq_complex_indexed_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        mixed_weights, mixed_bias = self.fc._mixed_weights_and_bias(mole_globals)
+        if mixed_bias is not None:
+            raise RuntimeError("cueq_complex_indexed_linear currently supports bias=False only.")
+
+        graph_index = _mole_graph_index(mole_globals, x_m.shape[0], device=x_m.device)
+        if graph_index.numel() != x_m.shape[0]:
+            raise ValueError(
+                f"MOLE graph_index has {graph_index.numel()} rows, but input has {x_m.shape[0]} rows."
+            )
+
+        flat_x = x_m.reshape(x_m.shape[0], 2 * self.num_in_channel)
+        block_weights = self._complex_block_weights(mixed_weights)
+        cue_lin = self._get_cueq_complex_linear(
+            int(block_weights.shape[0]),
+            dtype=x_m.dtype,
+            device=x_m.device,
+        )
+        order = self._infer_cueq_complex_weight_order(cue_lin, flat_x, block_weights, graph_index)
+        flat_weight = self._cueq_flatten_complex_weight(block_weights, order)
+        flat_out = cue_lin(flat_x, weight=flat_weight, weight_indices=graph_index)
+        return flat_out.reshape(x_m.shape[0], 2, self.num_out_channel)
+
+    def _cueq_flatten_segmented_complex_weight(self, mixed_weights: torch.Tensor, order: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        w_real = mixed_weights[:, :self.num_out_channel, :]
+        w_imag = mixed_weights[:, self.num_out_channel:, :]
+        if order == "io":
+            flat_real = w_real.transpose(1, 2).contiguous().reshape(mixed_weights.shape[0], -1)
+            flat_imag = w_imag.transpose(1, 2).contiguous().reshape(mixed_weights.shape[0], -1)
+        elif order == "oi":
+            flat_real = w_real.contiguous().reshape(mixed_weights.shape[0], -1)
+            flat_imag = w_imag.contiguous().reshape(mixed_weights.shape[0], -1)
+        else:
+            raise ValueError(f"unknown cuEq segmented complex weight order {order!r}")
+        return flat_real, flat_imag
+
+    def _get_cueq_segmented_complex_linear(self, num_graphs: int, *, dtype, device):
+        if device.type != "cuda":
+            raise RuntimeError("cueq_segmented_complex_indexed_linear requires CUDA.")
+        if dtype not in (torch.float32, torch.float64):
+            raise RuntimeError(
+                "cueq_segmented_complex_indexed_linear is currently validated only for float32/float64."
+            )
+
+        try:
+            import cuequivariance as cue
+            import cuequivariance_torch as cuet
+        except ImportError as exc:
+            raise ImportError(
+                "so2_m_linear_mode='cueq_segmented_complex_indexed_linear' requires "
+                "cuequivariance and cuequivariance_torch."
+            ) from exc
+
+        key = (num_graphs, str(dtype), str(device), self.num_in_channel, self.num_out_channel)
+        mod = self._cueq_segmented_complex_linear_cache.get(key)
+        if mod is None:
+            d = cue.SegmentedTensorProduct.from_subscripts("uv,wu,wv")
+            d.add_segment(0, (self.num_in_channel, self.num_out_channel))
+            d.add_segment(1, (2, self.num_in_channel))
+            d.add_segment(2, (2, self.num_out_channel))
+            d.add_path(0, 0, 0, c=1.0)
+
+            polynomial = cue.SegmentedPolynomial(
+                [d.operands[0], d.operands[0], d.operands[1], d.operands[1]],
+                [d.operands[2]],
+                [
+                    ((0, 2, 4), d),  # W_real * [x_real, x_imag]
+                    ((1, 3, 4), d),  # W_imag * [-x_imag, x_real]
+                ],
+            )
+            mod = cuet.SegmentedPolynomial(polynomial, method="indexed_linear")
+            self._cueq_segmented_complex_linear_cache[key] = mod
+        return mod
+
+    def _infer_cueq_segmented_complex_weight_order(self, cue_poly, x_m, mixed_weights, graph_index):
+        if self._cueq_segmented_complex_weight_order is not None:
+            return self._cueq_segmented_complex_weight_order
+
+        with torch.no_grad():
+            n_probe = min(int(x_m.shape[0]), 64)
+            probe_x = x_m[:n_probe]
+            probe_idx = graph_index[:n_probe]
+            block_weights = self._complex_block_weights(mixed_weights)
+            ref_w = block_weights.index_select(0, probe_idx)
+            ref = torch.bmm(ref_w, probe_x.reshape(n_probe, 2 * self.num_in_channel).unsqueeze(-1)).squeeze(-1)
+            probe_x_rot = torch.stack((-probe_x[:, 1], probe_x[:, 0]), dim=1)
+
+            best_order, best_err = None, None
+            for order in ("io", "oi"):
+                try:
+                    flat_real, flat_imag = self._cueq_flatten_segmented_complex_weight(mixed_weights, order)
+                    out = cue_poly(
+                        [
+                            flat_real,
+                            flat_imag,
+                            probe_x.reshape(n_probe, 2 * self.num_in_channel),
+                            probe_x_rot.reshape(n_probe, 2 * self.num_in_channel),
+                        ],
+                        input_indices={0: probe_idx, 1: probe_idx},
+                    )[0]
+                    err_val = float((out - ref).abs().max().detach().cpu())
+                except Exception:
+                    continue
+                if best_err is None or err_val < best_err:
+                    best_order, best_err = order, err_val
+
+        if best_order is None or best_err is None or best_err > 1e-4:
+            raise RuntimeError(
+                "Could not infer cuEquivariance segmented complex SO2_m weight order; "
+                f"best_order={best_order}, best_err={best_err}."
+            )
+
+        self._cueq_segmented_complex_weight_order = best_order
+        return best_order
+
+    def _forward_cueq_segmented_complex_indexed_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.mole_linear_mode != "cueq_indexed_linear":
+            raise RuntimeError(
+                "cueq_segmented_complex_indexed_linear requires mole_linear_mode='cueq_indexed_linear'."
+            )
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("cueq_segmented_complex_indexed_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        mixed_weights, mixed_bias = self.fc._mixed_weights_and_bias(mole_globals)
+        if mixed_bias is not None:
+            raise RuntimeError("cueq_segmented_complex_indexed_linear currently supports bias=False only.")
+
+        graph_index = _mole_graph_index(mole_globals, x_m.shape[0], device=x_m.device)
+        if graph_index.numel() != x_m.shape[0]:
+            raise ValueError(
+                f"MOLE graph_index has {graph_index.numel()} rows, but input has {x_m.shape[0]} rows."
+            )
+
+        cue_poly = self._get_cueq_segmented_complex_linear(
+            int(mixed_weights.shape[0]),
+            dtype=x_m.dtype,
+            device=x_m.device,
+        )
+        order = self._infer_cueq_segmented_complex_weight_order(cue_poly, x_m, mixed_weights, graph_index)
+        flat_real, flat_imag = self._cueq_flatten_segmented_complex_weight(mixed_weights, order)
+        x_rot = torch.stack((-x_m[:, 1], x_m[:, 0]), dim=1)
+        flat_out = cue_poly(
+            [
+                flat_real,
+                flat_imag,
+                x_m.reshape(x_m.shape[0], 2 * self.num_in_channel),
+                x_rot.reshape(x_m.shape[0], 2 * self.num_in_channel),
+            ],
+            input_indices={0: graph_index, 1: graph_index},
+        )[0]
+        return flat_out.reshape(x_m.shape[0], 2, self.num_out_channel)
+
+    def _forward_standard(self, x_m, mole_globals: MOLEGlobals):
         if self.is_mole:
             x_m = self.fc(x_m, mole_globals)
         else:
@@ -785,3 +1727,11 @@ class SO2_m_Linear(torch.nn.Module):
         x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)
         x_m_i = x_r.narrow(1, 1, 1) + x_i.narrow(1, 0, 1)
         return torch.cat((x_m_r, x_m_i), dim=1)
+
+    def forward(self, x_m, mole_globals: MOLEGlobals):  # Added mole_globals
+        # x_m ~ [N, 2, n_channels]
+        if self.so2_m_linear_mode == "cueq_complex_indexed_linear":
+            return self._forward_cueq_complex_indexed_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "cueq_segmented_complex_indexed_linear":
+            return self._forward_cueq_segmented_complex_indexed_linear(x_m, mole_globals)
+        return self._forward_standard(x_m, mole_globals)
