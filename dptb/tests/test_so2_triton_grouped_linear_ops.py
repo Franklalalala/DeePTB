@@ -636,6 +636,8 @@ def test_grouped_complex_moe_fused_linear_cuda_fp32_if_available(monkeypatch):
 
 
 def test_so2_m_linear_triton_complex_grouped_matches_standard_cpu():
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
     pytest.importorskip("e3nn")
     from e3nn import o3
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_m_Linear
@@ -699,6 +701,8 @@ def test_so2_m_linear_triton_complex_grouped_matches_standard_cpu():
 
 
 def test_so2_m_linear_triton_complex_moe_fused_matches_standard_cpu():
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
     pytest.importorskip("e3nn")
     from e3nn import o3
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_m_Linear
@@ -762,6 +766,8 @@ def test_so2_m_linear_triton_complex_moe_fused_matches_standard_cpu():
 
 
 def test_so2_m_linear_triton_complex_moe_fused_rejects_shared_experts():
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU validation for disabled row-tile fused path")
     pytest.importorskip("e3nn")
     from e3nn import o3
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_m_Linear
