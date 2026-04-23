@@ -597,6 +597,45 @@ def test_grouped_complex_exact_moe_linear_cuda_fp32_if_available(monkeypatch):
     torch.testing.assert_close(sw1.grad, sw0.grad, atol=3e-4, rtol=3e-4)
 
 
+def test_grouped_complex_exact_moe_linear_cuda_uses_triton_dw_reduce(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton complex exact grouped MoE reduce smoke requires CUDA")
+    pytest.importorskip("triton")
+
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    monkeypatch.setenv("DPTB_TRITON_LINEAR_REQUIRE", "1")
+
+    def _forbid_torch_complex_dw(*args, **kwargs):
+        raise AssertionError("complex exact MoE backward should use Triton grouped dW reduce")
+
+    monkeypatch.setattr(ops, "_torch_grouped_complex_dw", _forbid_torch_complex_dw)
+
+    torch.manual_seed(20260424)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (13, 17, 19, 11)
+    n_rows = sum(split_sizes)
+    num_experts = 8
+    in_features = 37
+    out_features = 41
+
+    x = torch.randn(n_rows, 2, in_features, device=device, dtype=dtype, requires_grad=True)
+    coeffs = torch.rand(len(split_sizes), num_experts, device=device, dtype=dtype, requires_grad=True)
+    weights = torch.randn(
+        num_experts,
+        2 * out_features,
+        in_features,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    shared = torch.randn(2 * out_features, in_features, device=device, dtype=dtype, requires_grad=True)
+
+    y = ops.grouped_complex_exact_moe_linear(x, coeffs, weights, shared, split_sizes)
+    (y * torch.randn_like(y)).sum().backward()
+
+
 def test_grouped_complex_moe_fused_linear_cuda_fp32_if_available(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("Triton grouped complex MoE CUDA smoke requires CUDA")

@@ -783,6 +783,78 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_DEFAULT_CONFIGS,
+        key=["N_OUT", "K_IN"],
+    )
+    @triton.jit
+    def _grouped_complex_dw_kernel(
+        x_ptr,
+        grad_ptr,
+        grad_w_ptr,
+        row_offsets_ptr,
+        row_sizes_ptr,
+        N_OUT,
+        K_IN,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        g = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        pid_k = tl.program_id(2)
+        rows = tl.load(row_sizes_ptr + g)
+        row_start = tl.load(row_offsets_ptr + g)
+
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_n = offs_n < N_OUT
+        mask_k = offs_k < K_IN
+
+        acc_r = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+        acc_i = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+        m0 = 0
+        while m0 < rows:
+            offs_m = m0 + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < rows
+            xr = tl.load(
+                x_ptr + ((row_start + offs_m[:, None]) * 2 * K_IN) + offs_k[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+            xi = tl.load(
+                x_ptr + ((row_start + offs_m[:, None]) * 2 * K_IN) + K_IN + offs_k[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+            gyr = tl.load(
+                grad_ptr + ((row_start + offs_m[:, None]) * 2 * N_OUT) + offs_n[None, :],
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+            gyi = tl.load(
+                grad_ptr + ((row_start + offs_m[:, None]) * 2 * N_OUT) + N_OUT + offs_n[None, :],
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+
+            acc_r += tl.dot(tl.trans(gyr), xr, input_precision="ieee")
+            acc_r += tl.dot(tl.trans(gyi), xi, input_precision="ieee")
+            acc_i -= tl.dot(tl.trans(gyr), xi, input_precision="ieee")
+            acc_i += tl.dot(tl.trans(gyi), xr, input_precision="ieee")
+            m0 += BLOCK_M
+
+        tl.store(
+            grad_w_ptr + g * (2 * N_OUT * K_IN) + (offs_n[:, None] * K_IN) + offs_k[None, :],
+            acc_r,
+            mask=mask_n[:, None] & mask_k[None, :],
+        )
+        tl.store(
+            grad_w_ptr + g * (2 * N_OUT * K_IN) + ((N_OUT + offs_n[:, None]) * K_IN) + offs_k[None, :],
+            acc_i,
+            mask=mask_n[:, None] & mask_k[None, :],
+        )
+
+    @triton.autotune(
+        configs=_DEFAULT_CONFIGS,
         key=["N_OUT", "K_IN", "NUM_EXPERTS"],
     )
     @triton.jit
@@ -1323,6 +1395,43 @@ def _triton_grouped_complex_dx(grad_out: torch.Tensor,
     return grad_x
 
 
+def _triton_grouped_complex_dw(x_pair: torch.Tensor,
+                               grad_out: torch.Tensor,
+                               mixed_weights: torch.Tensor,
+                               rows_per_group: Sequence[int]) -> torch.Tensor:
+    if (
+        not _use_triton_for_linear(x_pair, mixed_weights)
+        or grad_out.device.type != "cuda"
+        or grad_out.dtype != x_pair.dtype
+    ):
+        if _require_triton():
+            raise RuntimeError("DPTB_TRITON_LINEAR_REQUIRE=1 but Triton grouped complex grad_weight backend is unavailable.")
+        return _torch_grouped_complex_dw(x_pair, grad_out, mixed_weights, rows_per_group)
+
+    row_offsets, row_sizes = _meta_tensors(rows_per_group, x_pair.device)
+    n_out = int(mixed_weights.shape[1] // 2)
+    cin = int(mixed_weights.shape[2])
+    grad_w = torch.empty_like(mixed_weights)
+
+    def grid(meta):
+        return (
+            len(rows_per_group),
+            triton.cdiv(n_out, meta["BLOCK_N"]),
+            triton.cdiv(cin, meta["BLOCK_K"]),
+        )
+
+    _grouped_complex_dw_kernel[grid](
+        x_pair.contiguous(),
+        grad_out.contiguous(),
+        grad_w,
+        row_offsets,
+        row_sizes,
+        n_out,
+        cin,
+    )
+    return grad_w
+
+
 def _triton_grouped_complex_moe_forward(x_pair: torch.Tensor,
                                         coefficients: torch.Tensor,
                                         weight_experts: torch.Tensor,
@@ -1842,7 +1951,7 @@ class _GroupedComplexLinearFn(torch.autograd.Function):
         split_sizes = tuple(int(v) for v in row_splits_tensor.detach().cpu().tolist())
         grad_out = grad_out.contiguous()
         grad_x = _triton_grouped_complex_dx(grad_out, mixed_weights, split_sizes)
-        grad_w = _torch_grouped_complex_dw(x_pair, grad_out, mixed_weights, split_sizes)
+        grad_w = _triton_grouped_complex_dw(x_pair, grad_out, mixed_weights, split_sizes)
         return grad_x, grad_w, None
 
 
@@ -1975,7 +2084,7 @@ class _GroupedComplexExactMoELinearFn(torch.autograd.Function):
             None,
         )
         grad_x = _triton_grouped_complex_dx(grad_out, mixed_weights, split_sizes)
-        grad_mixed_w = _torch_grouped_complex_dw(x_pair, grad_out, mixed_weights, split_sizes)
+        grad_mixed_w = _triton_grouped_complex_dw(x_pair, grad_out, mixed_weights, split_sizes)
 
         grad_mixed_flat = grad_mixed_w.reshape(grad_mixed_w.shape[0], -1)
         weight_flat = weight_experts.reshape(weight_experts.shape[0], -1)
