@@ -59,11 +59,24 @@ pytest dptb/tests/test_so2_streamed_lmax_bounds.py \
        dptb/tests/test_mole_router_full_expert_fast_path.py -q
 ```
 
-Result:
+Result before final hardening:
 
 ```text
 53 passed, 10 warnings in 5.67s
 ```
+
+Final hardening result:
+
+```text
+58 passed, 10 warnings in 7.60s
+```
+
+The final hardening pass intentionally did not add fp16/bf16 promotion or AMP handling. It only added:
+
+- per device/dtype/shape cuEq scalar weight-order cache;
+- cached expanded graph indices for rank > 2 `MOLELinear` inputs;
+- active-l-only Wigner block selection in the grouped SO2 route;
+- single-segment no-`cat()` fast paths in grouped SO2 packing.
 
 ## Benchmark Summary
 
@@ -135,6 +148,31 @@ DPTB_MOLE_LINEAR_M0_MODE=cueq_indexed_linear
 ```
 
 At `E=16384`, this hybrid staged setting is about 2.2% faster than all-split, while adding only about 0.02 GB peak allocated memory in the module benchmark.
+
+## Final Hardening A/B
+
+Setup: natlan CUDA, fp32, `B=32`, `num_experts=24`, `num_shared_experts=0`, irreps `32x0e + ... + 32x6e`, `radial_emb=False`, forward+backward, 3 warmups, 10 measured iterations. Values below are steady-state after cuEq graph-index and weight-order caches are warm.
+
+| E | config | mean ms | peak allocated GB | peak reserved GB |
+|---:|---|---:|---:|---:|
+| 4096 | baseline staged split | 49.59 | 0.372 | 0.443 |
+| 4096 | staged all cuEq | 37.75 | 0.386 | 0.449 |
+| 4096 | streamed all cuEq | 52.90 | 0.373 | 0.465 |
+| 4096 | m0 cuEq, m>0 split | 54.88 | 0.370 | 0.455 |
+| 8192 | baseline staged split | 65.99 | 0.656 | 0.789 |
+| 8192 | staged all cuEq | 51.54 | 0.677 | 0.779 |
+| 8192 | streamed all cuEq | 59.37 | 0.663 | 0.791 |
+| 8192 | m0 cuEq, m>0 split | 63.22 | 0.656 | 0.809 |
+| 16384 | baseline staged split | 102.81 | 1.202 | 1.451 |
+| 16384 | staged all cuEq | 96.53 | 1.232 | 1.477 |
+| 16384 | streamed all cuEq | 82.92 | 1.232 | 1.432 |
+| 16384 | m0 cuEq, m>0 split | 101.34 | 1.202 | 1.461 |
+
+Final readout:
+
+- `staged all cuEq` is the best default speed setting for smaller and medium edge counts: about 23.9% faster at `E=4096`, 21.9% faster at `E=8192`, and 6.1% faster at `E=16384`, with about 0.01-0.03 GB extra peak allocated memory.
+- `streamed all cuEq` only becomes attractive at larger edge counts. At `E=16384`, it is about 19.3% faster than baseline while using about 0.03 GB more peak allocated memory and slightly less peak reserved memory in this module benchmark.
+- `m0 cuEq, m>0 split` is memory-neutral but not worth making the speed default. It is mainly a conservative fallback knob when keeping allocated memory nearly identical matters more than throughput.
 
 ## Next Step
 

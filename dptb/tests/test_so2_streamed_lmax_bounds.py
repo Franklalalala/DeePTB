@@ -192,6 +192,125 @@ def test_so2_streamed_cueq_indexed_linear_matches_staged_if_available():
     torch.testing.assert_close(lat1.grad, lat0.grad, atol=4e-4, rtol=4e-4)
 
 
+@pytest.mark.parametrize("rotate_in, rotate_out", [(False, False), (False, True)])
+def test_so2_streamed_cueq_matches_staged_without_radial_if_available(rotate_in, rotate_out):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    pytest.importorskip("cuequivariance")
+    pytest.importorskip("cuequivariance_torch")
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 aggressive cueq indexed-linear integration requires CUDA")
+
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260430)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    kwargs = dict(
+        irreps_in="3x0e + 2x1o + 1x2e",
+        irreps_out="2x0e + 1x1o + 2x2e",
+        radial_emb=False,
+        num_experts=5,
+        num_shared_experts=0,
+        rotate_in=rotate_in,
+        rotate_out=rotate_out,
+        wigner_apply_mode="compact_blocks",
+    )
+    staged = SO2_Linear(
+        **kwargs,
+        so2_fusion_mode="staged",
+        mole_linear_mode="split_loop",
+    ).to(device=device, dtype=dtype)
+    cueq = SO2_Linear(
+        **kwargs,
+        so2_fusion_mode="streamed_m_major_cueq",
+        mole_linear_mode="cueq_indexed_linear",
+    ).to(device=device, dtype=dtype)
+    cueq.load_state_dict(staged.state_dict(), strict=True)
+
+    split_sizes = (4, 3, 5)
+    n_edges = sum(split_sizes)
+    coeffs = torch.rand(len(split_sizes), kwargs["num_experts"], device=device, dtype=dtype)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=split_sizes)
+
+    x0 = torch.randn(n_edges, staged.irreps_in.dim, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    R0 = torch.randn(n_edges, 3, device=device, dtype=dtype, requires_grad=True)
+    R1 = R0.detach().clone().requires_grad_(True)
+    out0, _ = staged(x0, R0, globals_, None)
+    out1, _ = cueq(x1, R1, globals_, None)
+    torch.testing.assert_close(out1, out0, atol=3e-4, rtol=3e-4)
+
+    probe = torch.randn_like(out0)
+    (out0 * probe).mean().backward()
+    (out1 * probe).mean().backward()
+    torch.testing.assert_close(x1.grad, x0.grad, atol=4e-4, rtol=4e-4)
+    if rotate_in or rotate_out:
+        torch.testing.assert_close(R1.grad, R0.grad, atol=4e-4, rtol=4e-4)
+    else:
+        assert R0.grad is None
+        assert R1.grad is None
+
+
+def test_so2_streamed_cueq_matches_staged_with_external_wigner_cache_if_available():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    pytest.importorskip("cuequivariance")
+    pytest.importorskip("cuequivariance_torch")
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 aggressive cueq indexed-linear integration requires CUDA")
+
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260431)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    kwargs = dict(
+        irreps_in="1x0e + 2x2e",
+        irreps_out="2x0e + 2x2e",
+        radial_emb=False,
+        num_experts=5,
+        num_shared_experts=0,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+    )
+    staged = SO2_Linear(
+        **kwargs,
+        so2_fusion_mode="staged",
+        mole_linear_mode="split_loop",
+    ).to(device=device, dtype=dtype)
+    cueq = SO2_Linear(
+        **kwargs,
+        so2_fusion_mode="streamed_m_major_cueq",
+        mole_linear_mode="cueq_indexed_linear",
+    ).to(device=device, dtype=dtype)
+    cueq.load_state_dict(staged.state_dict(), strict=True)
+    assert cueq._active_rot_l == (2,)
+
+    split_sizes = (3, 4)
+    n_edges = sum(split_sizes)
+    coeffs = torch.rand(len(split_sizes), kwargs["num_experts"], device=device, dtype=dtype)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=split_sizes)
+
+    x0 = torch.randn(n_edges, staged.irreps_in.dim, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    R = torch.randn(n_edges, 3, device=device, dtype=dtype)
+    with torch.no_grad():
+        wigner_D_all = staged._ensure_wigner_rotation(R, None)
+
+    out0, _ = staged(x0, R, globals_, None, wigner_D_all=wigner_D_all)
+    out1, _ = cueq(x1, R, globals_, None, wigner_D_all=wigner_D_all)
+    torch.testing.assert_close(out1, out0, atol=3e-4, rtol=3e-4)
+
+    probe = torch.randn_like(out0)
+    (out0 * probe).mean().backward()
+    (out1 * probe).mean().backward()
+    torch.testing.assert_close(x1.grad, x0.grad, atol=4e-4, rtol=4e-4)
+
+
 @pytest.mark.parametrize(
     "so2_m_linear_mode",
     ["cueq_complex_indexed_linear", "cueq_segmented_complex_indexed_linear"],

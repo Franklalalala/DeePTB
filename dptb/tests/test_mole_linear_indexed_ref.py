@@ -159,6 +159,26 @@ def test_mole_linear_fallback_average_ignores_indexed_mode():
     torch.testing.assert_close(indexed(x, None), base(x, None), atol=1e-10, rtol=1e-10)
 
 
+def test_mole_linear_fallback_average_ignores_cueq_mode():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    torch.manual_seed(20260430)
+    dtype = torch.float64
+    base = MOLELinear(5, 3, num_experts=4, num_shared_experts=1, bias=True, mole_linear_mode="split_loop").to(dtype=dtype)
+    cueq = MOLELinear(5, 3, num_experts=4, num_shared_experts=1, bias=True, mole_linear_mode="cueq_indexed_linear").to(dtype=dtype)
+    cueq.load_state_dict(base.state_dict(), strict=True)
+
+    x = torch.randn(6, 2, 5, dtype=dtype)
+    torch.testing.assert_close(cueq(x, None), base(x, None), atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(
+        cueq(x, MOLEGlobals(coefficients=None, split_sizes=(2, 4))),
+        base(x, MOLEGlobals(coefficients=None, split_sizes=(2, 4))),
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
 def test_mole_linear_indexed_ref_matches_coefficients_grad():
     torch = pytest.importorskip("torch")
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
@@ -288,7 +308,63 @@ def test_mole_linear_cueq_indexed_smoke_if_available():
     torch.testing.assert_close(cueq.bias_experts.grad, base.bias_experts.grad, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(cueq.weight_shared.grad, base.weight_shared.grad, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(cueq.bias_shared.grad, base.bias_shared.grad, atol=2e-4, rtol=2e-4)
-    assert cueq._cueq_weight_order == "io_scaled"
+    assert set(cueq._cueq_weight_order_cache.values()) == {"io_scaled"}
+
+
+def test_mole_linear_cueq_explicit_split_sizes_and_cached_graph_index_if_available():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("cuequivariance")
+    pytest.importorskip("cuequivariance_torch")
+    if not torch.cuda.is_available():
+        pytest.skip("cueq indexed linear smoke requires CUDA")
+
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    torch.manual_seed(20260431)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (2, 4, 3)
+    misleading_sizes = torch.tensor((1, 1, 1), device=device)
+    num_experts = 5
+    in_features = 6
+    out_features = 8
+    n_edges = sum(split_sizes)
+
+    coeffs = torch.rand(len(split_sizes), num_experts, device=device, dtype=dtype)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    globals_ = MOLEGlobals(coefficients=coeffs, sizes=misleading_sizes, split_sizes=split_sizes)
+
+    base = MOLELinear(
+        in_features,
+        out_features,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="split_loop",
+    ).to(device=device, dtype=dtype)
+    cueq = MOLELinear(
+        in_features,
+        out_features,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="cueq_indexed_linear",
+    ).to(device=device, dtype=dtype)
+    cueq.load_state_dict(base.state_dict(), strict=True)
+
+    x3 = torch.randn(n_edges, 2, in_features, device=device, dtype=dtype)
+    torch.testing.assert_close(cueq(x3, globals_), base(x3, globals_), atol=2e-4, rtol=2e-4)
+    cache = getattr(globals_, "_expanded_graph_index_cache")
+    assert len(cache) == 1
+    cached_index = next(iter(cache.values()))
+    assert cached_index.shape == (n_edges * 2,)
+
+    torch.testing.assert_close(cueq(x3, globals_), base(x3, globals_), atol=2e-4, rtol=2e-4)
+    assert next(iter(cache.values())) is cached_index
+
+    x2 = torch.randn(n_edges, in_features, device=device, dtype=dtype)
+    torch.testing.assert_close(cueq(x2, globals_), base(x2, globals_), atol=2e-4, rtol=2e-4)
+    assert len(cache) == 1
 
 
 def test_mole_linear_cueq_env_smoke_if_available(monkeypatch):
