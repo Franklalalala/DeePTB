@@ -846,6 +846,7 @@ class SO2_Linear(torch.nn.Module):
             rotate_out: bool = True,
             wigner_apply_mode: str = "compact_blocks",
             mole_linear_mode=None,
+            mole_linear_m0_mode=None,
             so2_fusion_mode: str = "staged",
             so2_m_linear_mode: str = None,
     ):
@@ -872,6 +873,10 @@ class SO2_Linear(torch.nn.Module):
         if env_so2_m_linear_mode is not None and so2_m_linear_mode in (None, "standard"):
             so2_m_linear_mode = env_so2_m_linear_mode
         self.so2_m_linear_mode = _normalize_so2_m_linear_mode(so2_m_linear_mode or "standard")
+        env_mole_linear_m0_mode = os.environ.get("DPTB_MOLE_LINEAR_M0_MODE")
+        if env_mole_linear_m0_mode is not None and mole_linear_m0_mode is None:
+            mole_linear_m0_mode = env_mole_linear_m0_mode
+        self.mole_linear_m0_mode = _normalize_mole_linear_mode(mole_linear_m0_mode or mole_linear_mode or "split_loop")
         self.num_experts = num_experts
 
         self.m_linear = nn.ModuleList()
@@ -886,7 +891,7 @@ class SO2_Linear(torch.nn.Module):
             num_experts=num_experts,
             num_shared_experts=num_shared_experts,
             bias=True,
-            mole_linear_mode=mole_linear_mode,
+            mole_linear_mode=self.mole_linear_m0_mode,
         )
 
         for m in range(1, self.m_max + 1):

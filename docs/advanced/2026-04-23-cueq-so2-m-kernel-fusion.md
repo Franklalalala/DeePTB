@@ -62,7 +62,7 @@ pytest dptb/tests/test_so2_streamed_lmax_bounds.py \
 Result:
 
 ```text
-50 passed, 10 warnings in 7.06s
+53 passed, 10 warnings in 5.67s
 ```
 
 ## Benchmark Summary
@@ -83,6 +83,27 @@ Setup: fp32, `B=32`, `num_experts=24`, `num_shared_experts=0`, irreps `32x0..32x
 | 16384 | `streamed_cueq_standard` | 90.83 | 1.551 |
 | 16384 | `streamed_cueq_complex` | 90.57 | 1.598 |
 | 16384 | `streamed_cueq_segmented` | 95.81 | 1.718 |
+
+### Hybrid m0 / m>0 backend split
+
+With the new `mole_linear_m0_mode` override, the scalar m=0 path and m>0 paths can use different MoLE backends.
+
+Staged SO2 benchmark, fp32, `B=32`, `num_experts=24`:
+
+| E | config | mean ms | peak GB |
+|---:|---|---:|---:|
+| 4096 | all split | 50.99 | 0.430 |
+| 4096 | all cueq | 38.18 | 0.490 |
+| 4096 | m0 split, m>0 cueq | 52.15 | 0.479 |
+| 4096 | m0 cueq, m>0 split | 60.82 | 0.442 |
+| 8192 | all split | 70.66 | 0.778 |
+| 8192 | all cueq | 54.92 | 0.860 |
+| 8192 | m0 split, m>0 cueq | 60.45 | 0.847 |
+| 8192 | m0 cueq, m>0 split | 68.32 | 0.792 |
+| 16384 | all split | 108.70 | 1.441 |
+| 16384 | all cueq | 101.76 | 1.568 |
+| 16384 | m0 split, m>0 cueq | 104.85 | 1.549 |
+| 16384 | m0 cueq, m>0 split | 106.30 | 1.461 |
 
 ## Recommendation
 
@@ -105,6 +126,15 @@ DPTB_SO2_FUSION_MODE=streamed_m_major_cueq
 ```
 
 At `E=16384`, `streamed_cueq_standard` is about 16.6% faster than `staged_split_loop`, with about 0.11 GB more peak allocated memory in this module benchmark.
+
+If memory is tighter and you want a milder cueq setting, the new hybrid knob is:
+
+```text
+DPTB_MOLE_LINEAR_MODE=split_loop
+DPTB_MOLE_LINEAR_M0_MODE=cueq_indexed_linear
+```
+
+At `E=16384`, this hybrid staged setting is about 2.2% faster than all-split, while adding only about 0.02 GB peak allocated memory in the module benchmark.
 
 ## Next Step
 

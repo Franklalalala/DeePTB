@@ -347,3 +347,84 @@ def test_so2_m_cueq_modes_fall_back_for_interpolation_layers(so2_m_linear_mode):
     (y0 * probe).mean().backward()
     (y1 * probe).mean().backward()
     torch.testing.assert_close(x1.grad, x0.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_so2_linear_allows_m0_mole_backend_override():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import SO2_Linear
+
+    layer = SO2_Linear(
+        irreps_in="2x0e + 2x1o + 2x2e",
+        irreps_out="2x0e + 2x1o + 2x2e",
+        radial_emb=False,
+        num_experts=4,
+        num_shared_experts=0,
+        mole_linear_mode="split_loop",
+        mole_linear_m0_mode="indexed_ref",
+    )
+
+    assert layer.fc_m0.mole_linear_mode == "indexed_ref"
+    assert all(module.fc.mole_linear_mode == "split_loop" for module in layer.m_linear)
+
+
+def test_so2_linear_m0_mole_backend_env_override(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import SO2_Linear
+
+    monkeypatch.setenv("DPTB_MOLE_LINEAR_M0_MODE", "indexed_ref")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        radial_emb=False,
+        num_experts=3,
+        num_shared_experts=0,
+        mole_linear_mode="split_loop",
+    )
+
+    assert layer.fc_m0.mole_linear_mode == "indexed_ref"
+    assert all(module.fc.mole_linear_mode == "split_loop" for module in layer.m_linear)
+
+
+def test_so2_linear_m0_mole_backend_override_matches_split_loop():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260429)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    kwargs = dict(
+        irreps_in="2x0e + 2x1o + 2x2e",
+        irreps_out="2x0e + 2x1o + 2x2e",
+        radial_emb=False,
+        num_experts=4,
+        num_shared_experts=0,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="staged",
+        mole_linear_mode="split_loop",
+    )
+    base = SO2_Linear(**kwargs).to(device=device, dtype=dtype)
+    hybrid = SO2_Linear(**kwargs, mole_linear_m0_mode="indexed_ref").to(device=device, dtype=dtype)
+    hybrid.load_state_dict(base.state_dict(), strict=True)
+
+    split_sizes = (3, 4, 5)
+    coeffs = torch.rand(len(split_sizes), kwargs["num_experts"], device=device, dtype=dtype)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=split_sizes)
+
+    n_edges = sum(split_sizes)
+    x0 = torch.randn(n_edges, base.irreps_in.dim, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    R0 = torch.randn(n_edges, 3, device=device, dtype=dtype, requires_grad=True)
+    R1 = R0.detach().clone().requires_grad_(True)
+
+    out0, _ = base(x0, R0, globals_, None)
+    out1, _ = hybrid(x1, R1, globals_, None)
+    torch.testing.assert_close(out1, out0, atol=1e-10, rtol=1e-10)
+
+    probe = torch.randn_like(out0)
+    (out0 * probe).sum().backward()
+    (out1 * probe).sum().backward()
+    torch.testing.assert_close(x1.grad, x0.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(R1.grad, R0.grad, atol=1e-10, rtol=1e-10)
