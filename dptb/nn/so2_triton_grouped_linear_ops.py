@@ -24,6 +24,10 @@ def _require_triton() -> bool:
     return os.environ.get("DPTB_TRITON_LINEAR_REQUIRE", "0") == "1"
 
 
+def _enable_fused_expert_triton() -> bool:
+    return os.environ.get("DPTB_TRITON_LINEAR_ENABLE_FUSED_EXPERT", "0") == "1"
+
+
 def _use_triton_for_linear(x: torch.Tensor, mixed_weights: torch.Tensor) -> bool:
     if _force_disable_triton():
         return False
@@ -78,6 +82,10 @@ def _meta_tensors(rows_per_group: Sequence[int], device: torch.device):
     return cached
 
 
+def _empty(device: torch.device, dtype: torch.dtype):
+    return torch.empty(0, device=device, dtype=dtype)
+
+
 def _torch_grouped_linear_forward(flat_x: torch.Tensor,
                                   mixed_weights: torch.Tensor,
                                   mixed_bias: Optional[torch.Tensor],
@@ -92,6 +100,109 @@ def _torch_grouped_linear_forward(flat_x: torch.Tensor,
         out_parts.append(F.linear(xg, wg, bg))
         start += rows
     return torch.cat(out_parts, dim=0)
+
+
+def _torch_grouped_moe_forward(flat_x: torch.Tensor,
+                               coefficients: torch.Tensor,
+                               weight_experts: torch.Tensor,
+                               bias_experts: Optional[torch.Tensor],
+                               shared_weight: Optional[torch.Tensor],
+                               shared_bias: Optional[torch.Tensor],
+                               rows_per_group: Sequence[int]) -> torch.Tensor:
+    out_parts = []
+    start = 0
+    acc_dtype = torch.float32 if flat_x.dtype in (torch.float16, torch.bfloat16) else flat_x.dtype
+    weight_acc = weight_experts.to(acc_dtype)
+    bias_acc = bias_experts.to(acc_dtype) if bias_experts is not None else None
+    shared_weight_acc = shared_weight.to(acc_dtype) if shared_weight is not None else None
+    shared_bias_acc = shared_bias.to(acc_dtype) if shared_bias is not None else None
+
+    for g, rows in enumerate(rows_per_group):
+        rows = int(rows)
+        xg = flat_x[start:start + rows].to(acc_dtype)
+        coeff_g = coefficients[g].to(acc_dtype)
+        mixed_w = torch.einsum("e,eoi->oi", coeff_g, weight_acc)
+        if shared_weight_acc is not None:
+            mixed_w = mixed_w + shared_weight_acc
+
+        mixed_b = None
+        if bias_acc is not None:
+            mixed_b = torch.einsum("e,eo->o", coeff_g, bias_acc)
+            if shared_bias_acc is not None:
+                mixed_b = mixed_b + shared_bias_acc
+
+        out_parts.append(F.linear(xg, mixed_w, mixed_b).to(flat_x.dtype))
+        start += rows
+
+    return torch.cat(out_parts, dim=0)
+
+
+def _torch_grouped_moe_dx(flat_grad: torch.Tensor,
+                          coefficients: torch.Tensor,
+                          weight_experts: torch.Tensor,
+                          shared_weight: Optional[torch.Tensor],
+                          rows_per_group: Sequence[int]) -> torch.Tensor:
+    grad_parts = []
+    start = 0
+    acc_dtype = torch.float32 if flat_grad.dtype in (torch.float16, torch.bfloat16) else flat_grad.dtype
+    weight_acc = weight_experts.to(acc_dtype)
+    shared_weight_acc = shared_weight.to(acc_dtype) if shared_weight is not None else None
+
+    for g, rows in enumerate(rows_per_group):
+        rows = int(rows)
+        gog = flat_grad[start:start + rows].to(acc_dtype)
+        coeff_g = coefficients[g].to(acc_dtype)
+        mixed_w = torch.einsum("e,eoi->oi", coeff_g, weight_acc)
+        if shared_weight_acc is not None:
+            mixed_w = mixed_w + shared_weight_acc
+        grad_parts.append(gog.matmul(mixed_w).to(flat_grad.dtype))
+        start += rows
+
+    return torch.cat(grad_parts, dim=0)
+
+
+def _torch_grouped_moe_dw_db_dc(flat_x: torch.Tensor,
+                                flat_grad: torch.Tensor,
+                                coefficients: torch.Tensor,
+                                weight_experts: torch.Tensor,
+                                bias_experts: Optional[torch.Tensor],
+                                shared_weight: Optional[torch.Tensor],
+                                shared_bias: Optional[torch.Tensor],
+                                rows_per_group: Sequence[int]):
+    grad_coeff = torch.zeros_like(coefficients)
+    grad_w = torch.zeros_like(weight_experts)
+    grad_b = torch.zeros_like(bias_experts) if bias_experts is not None else None
+    grad_sw = torch.zeros_like(shared_weight) if shared_weight is not None else None
+    grad_sb = torch.zeros_like(shared_bias) if shared_bias is not None else None
+
+    start = 0
+    acc_dtype = torch.float32 if flat_grad.dtype in (torch.float16, torch.bfloat16) else flat_grad.dtype
+    weight_acc = weight_experts.to(acc_dtype)
+    bias_acc = bias_experts.to(acc_dtype) if bias_experts is not None else None
+
+    for g, rows in enumerate(rows_per_group):
+        rows = int(rows)
+        xg = flat_x[start:start + rows].to(acc_dtype)
+        gog = flat_grad[start:start + rows].to(acc_dtype)
+        coeff_g = coefficients[g].to(acc_dtype)
+
+        grad_base_w = gog.transpose(0, 1).matmul(xg)
+        grad_w += (coeff_g[:, None, None] * grad_base_w.unsqueeze(0)).to(grad_w.dtype)
+        if grad_b is not None:
+            grad_base_b = gog.sum(dim=0)
+            grad_b += (coeff_g[:, None] * grad_base_b.unsqueeze(0)).to(grad_b.dtype)
+        if grad_sw is not None:
+            grad_sw += grad_base_w.to(grad_sw.dtype)
+        if grad_sb is not None:
+            grad_sb += gog.sum(dim=0).to(grad_sb.dtype)
+
+        acts = torch.einsum("mi,eoi->meo", xg, weight_acc)
+        if bias_acc is not None:
+            acts = acts + bias_acc.unsqueeze(0)
+        grad_coeff[g] = torch.einsum("meo,mo->e", acts, gog).to(grad_coeff.dtype)
+        start += rows
+
+    return grad_coeff, grad_w, grad_b, grad_sw, grad_sb
 
 
 def _torch_grouped_complex_forward(x_pair: torch.Tensor,
@@ -749,6 +860,156 @@ if _TRITON_AVAILABLE:
             )
             tile_id += num_programs
 
+    @triton.jit
+    def _grouped_moe_forward_kernel(
+        x_ptr,
+        coeff_ptr,
+        w_ptr,
+        bias_ptr,
+        shared_w_ptr,
+        shared_b_ptr,
+        y_ptr,
+        row_offsets_ptr,
+        row_sizes_ptr,
+        num_groups: tl.constexpr,
+        N_OUT,
+        K_IN,
+        NUM_EXPERTS: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        HAS_SHARED: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        g = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_n = tl.program_id(2)
+
+        rows = tl.load(row_sizes_ptr + g)
+        row_start = tl.load(row_offsets_ptr + g)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = offs_m < rows
+        mask_n = offs_n < N_OUT
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        k0 = 0
+        while k0 < K_IN:
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < K_IN
+            x = tl.load(
+                x_ptr + (row_start + offs_m[:, None]) * K_IN + offs_k[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+
+            mixed_w = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+            for e in range(NUM_EXPERTS):
+                coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e).to(tl.float32)
+                w = tl.load(
+                    w_ptr + e * (N_OUT * K_IN) + offs_n[:, None] * K_IN + offs_k[None, :],
+                    mask=mask_n[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                mixed_w += coeff * w
+
+            if HAS_SHARED:
+                sw = tl.load(
+                    shared_w_ptr + offs_n[:, None] * K_IN + offs_k[None, :],
+                    mask=mask_n[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                mixed_w += sw
+
+            acc += tl.dot(x, tl.trans(mixed_w), input_precision="ieee")
+            k0 += BLOCK_K
+
+        if HAS_BIAS:
+            mixed_b = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for e in range(NUM_EXPERTS):
+                coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e).to(tl.float32)
+                b = tl.load(
+                    bias_ptr + e * N_OUT + offs_n,
+                    mask=mask_n,
+                    other=0.0,
+                )
+                mixed_b += coeff * b
+            if HAS_SHARED:
+                sb = tl.load(shared_b_ptr + offs_n, mask=mask_n, other=0.0)
+                mixed_b += sb
+            acc += mixed_b[None, :]
+
+        tl.store(
+            y_ptr + (row_start + offs_m[:, None]) * N_OUT + offs_n[None, :],
+            acc,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+
+    @triton.jit
+    def _grouped_moe_dx_kernel(
+        gy_ptr,
+        coeff_ptr,
+        w_ptr,
+        shared_w_ptr,
+        gx_ptr,
+        row_offsets_ptr,
+        row_sizes_ptr,
+        num_groups: tl.constexpr,
+        N_OUT,
+        K_IN,
+        NUM_EXPERTS: tl.constexpr,
+        HAS_SHARED: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        g = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        pid_k = tl.program_id(2)
+
+        rows = tl.load(row_sizes_ptr + g)
+        row_start = tl.load(row_offsets_ptr + g)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_m = offs_m < rows
+        mask_k = offs_k < K_IN
+
+        acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        n0 = 0
+        while n0 < N_OUT:
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < N_OUT
+            gy = tl.load(
+                gy_ptr + (row_start + offs_m[:, None]) * N_OUT + offs_n[None, :],
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+
+            mixed_w = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+            for e in range(NUM_EXPERTS):
+                coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e).to(tl.float32)
+                w = tl.load(
+                    w_ptr + e * (N_OUT * K_IN) + offs_n[:, None] * K_IN + offs_k[None, :],
+                    mask=mask_n[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                mixed_w += coeff * w
+            if HAS_SHARED:
+                sw = tl.load(
+                    shared_w_ptr + offs_n[:, None] * K_IN + offs_k[None, :],
+                    mask=mask_n[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                mixed_w += sw
+            acc += tl.dot(gy, mixed_w, input_precision="ieee")
+            n0 += BLOCK_N
+
+        tl.store(
+            gx_ptr + (row_start + offs_m[:, None]) * K_IN + offs_k[None, :],
+            acc,
+            mask=mask_m[:, None] & mask_k[None, :],
+        )
+
 
 def _triton_grouped_linear_forward(flat_x: torch.Tensor,
                                    mixed_weights_t: torch.Tensor,
@@ -1011,6 +1272,238 @@ def grouped_linear_apply(x: torch.Tensor,
                          split_sizes: Sequence[int]) -> torch.Tensor:
     row_splits_tensor = torch.tensor(_canonical_split_sizes(split_sizes), device=x.device, dtype=torch.long)
     return _GroupedLinearFn.apply(x, mixed_weights, mixed_bias, row_splits_tensor)
+
+
+def _triton_grouped_moe_forward(flat_x: torch.Tensor,
+                                coefficients: torch.Tensor,
+                                weight_experts: torch.Tensor,
+                                bias_experts: Optional[torch.Tensor],
+                                shared_weight: Optional[torch.Tensor],
+                                shared_bias: Optional[torch.Tensor],
+                                rows_per_group: Sequence[int]) -> torch.Tensor:
+    if not _enable_fused_expert_triton():
+        if _require_triton():
+            raise RuntimeError(
+                "DPTB_TRITON_LINEAR_REQUIRE=1 but fused-expert Triton execution is disabled. "
+                "Set DPTB_TRITON_LINEAR_ENABLE_FUSED_EXPERT=1 only for isolated experiments."
+            )
+        return _torch_grouped_moe_forward(
+            flat_x, coefficients, weight_experts, bias_experts, shared_weight, shared_bias, rows_per_group
+        )
+    if (
+        not _use_triton_for_linear(flat_x, weight_experts)
+        or coefficients.device.type != "cuda"
+        or coefficients.dtype != flat_x.dtype
+    ):
+        if _require_triton():
+            raise RuntimeError("DPTB_TRITON_LINEAR_REQUIRE=1 but Triton grouped MoE backend is unavailable.")
+        return _torch_grouped_moe_forward(
+            flat_x, coefficients, weight_experts, bias_experts, shared_weight, shared_bias, rows_per_group
+        )
+
+    row_offsets, row_sizes = _meta_tensors(rows_per_group, flat_x.device)
+    weight = weight_experts.contiguous()
+    coeff = coefficients.contiguous()
+    bias = bias_experts.contiguous() if bias_experts is not None else _empty(flat_x.device, flat_x.dtype)
+    shared_w = shared_weight.contiguous() if shared_weight is not None else _empty(flat_x.device, flat_x.dtype)
+    shared_b = shared_bias.contiguous() if shared_bias is not None else _empty(flat_x.device, flat_x.dtype)
+    n_out = int(weight.shape[1])
+    out = torch.empty((flat_x.shape[0], n_out), device=flat_x.device, dtype=flat_x.dtype)
+
+    def grid(meta):
+        block_m = meta["BLOCK_M"]
+        block_n = meta["BLOCK_N"]
+        tiles_n = triton.cdiv(n_out, block_n)
+        max_tiles_m = max(triton.cdiv(int(v), block_m) for v in rows_per_group)
+        return (len(rows_per_group), max_tiles_m, tiles_n)
+
+    _grouped_moe_forward_kernel[grid](
+        flat_x.contiguous(),
+        coeff,
+        weight,
+        bias,
+        shared_w,
+        shared_b,
+        out,
+        row_offsets,
+        row_sizes,
+        len(rows_per_group),
+        n_out,
+        int(flat_x.shape[1]),
+        NUM_EXPERTS=int(coeff.shape[1]),
+        HAS_BIAS=bias_experts is not None,
+        HAS_SHARED=shared_weight is not None,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=32,
+    )
+    return out
+
+
+def _triton_grouped_moe_dx(flat_grad: torch.Tensor,
+                           coefficients: torch.Tensor,
+                           weight_experts: torch.Tensor,
+                           shared_weight: Optional[torch.Tensor],
+                           rows_per_group: Sequence[int]) -> torch.Tensor:
+    if not _enable_fused_expert_triton():
+        if _require_triton():
+            raise RuntimeError(
+                "DPTB_TRITON_LINEAR_REQUIRE=1 but fused-expert Triton grad_x execution is disabled. "
+                "Set DPTB_TRITON_LINEAR_ENABLE_FUSED_EXPERT=1 only for isolated experiments."
+            )
+        return _torch_grouped_moe_dx(flat_grad, coefficients, weight_experts, shared_weight, rows_per_group)
+    if (
+        not _use_triton_for_linear(flat_grad, weight_experts)
+        or coefficients.device.type != "cuda"
+        or coefficients.dtype != flat_grad.dtype
+    ):
+        if _require_triton():
+            raise RuntimeError("DPTB_TRITON_LINEAR_REQUIRE=1 but Triton grouped MoE grad_x backend is unavailable.")
+        return _torch_grouped_moe_dx(flat_grad, coefficients, weight_experts, shared_weight, rows_per_group)
+
+    row_offsets, row_sizes = _meta_tensors(rows_per_group, flat_grad.device)
+    weight = weight_experts.contiguous()
+    coeff = coefficients.contiguous()
+    shared_w = shared_weight.contiguous() if shared_weight is not None else _empty(flat_grad.device, flat_grad.dtype)
+    k_in = int(weight.shape[2])
+    grad_x = torch.empty((flat_grad.shape[0], k_in), device=flat_grad.device, dtype=flat_grad.dtype)
+
+    def grid(meta):
+        block_m = meta["BLOCK_M"]
+        block_k = meta["BLOCK_K"]
+        tiles_k = triton.cdiv(k_in, block_k)
+        max_tiles_m = max(triton.cdiv(int(v), block_m) for v in rows_per_group)
+        return (len(rows_per_group), max_tiles_m, tiles_k)
+
+    _grouped_moe_dx_kernel[grid](
+        flat_grad.contiguous(),
+        coeff,
+        weight,
+        shared_w,
+        grad_x,
+        row_offsets,
+        row_sizes,
+        len(rows_per_group),
+        int(flat_grad.shape[1]),
+        k_in,
+        NUM_EXPERTS=int(coeff.shape[1]),
+        HAS_SHARED=shared_weight is not None,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=32,
+    )
+    return grad_x
+
+
+class _GroupedMoEFusedLinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,
+                x: torch.Tensor,
+                coefficients: torch.Tensor,
+                weight_experts: torch.Tensor,
+                bias_experts: torch.Tensor,
+                shared_weight: torch.Tensor,
+                shared_bias: torch.Tensor,
+                row_splits_tensor: torch.Tensor):
+        split_sizes = tuple(int(v) for v in row_splits_tensor.detach().cpu().tolist())
+        if int(sum(split_sizes)) != int(x.shape[0]):
+            raise ValueError(
+                f"split sizes sum to {sum(split_sizes)}, but x has {x.shape[0]} rows."
+            )
+        if coefficients.ndim != 2:
+            raise ValueError(f"coefficients must have shape [G, E], got {tuple(coefficients.shape)}")
+        if weight_experts.ndim != 3:
+            raise ValueError(f"weight_experts must have shape [E, O, I], got {tuple(weight_experts.shape)}")
+        if int(coefficients.shape[0]) != len(split_sizes):
+            raise ValueError(
+                f"coefficients has {coefficients.shape[0]} groups, but split_sizes has {len(split_sizes)} groups."
+            )
+        if int(coefficients.shape[1]) != int(weight_experts.shape[0]):
+            raise ValueError(
+                f"coefficients has {coefficients.shape[1]} experts, but weight_experts has "
+                f"{weight_experts.shape[0]} experts."
+            )
+        if int(weight_experts.shape[2]) != int(x.shape[-1]):
+            raise ValueError(
+                f"weight_experts in_features={weight_experts.shape[2]} does not match x last dim={x.shape[-1]}."
+            )
+
+        bias_arg = bias_experts if bias_experts.numel() > 0 else None
+        shared_w_arg = shared_weight if shared_weight.numel() > 0 else None
+        shared_b_arg = shared_bias if shared_bias.numel() > 0 else None
+        flat_x, rows_per_group, _, _ = _flatten_grouped_rows(x, split_sizes)
+        flat_out = _triton_grouped_moe_forward(
+            flat_x,
+            coefficients,
+            weight_experts,
+            bias_arg,
+            shared_w_arg,
+            shared_b_arg,
+            rows_per_group,
+        )
+
+        ctx.save_for_backward(
+            flat_x,
+            coefficients,
+            weight_experts,
+            bias_experts,
+            shared_weight,
+            shared_bias,
+            row_splits_tensor,
+        )
+        ctx.orig_shape = tuple(int(v) for v in x.shape)
+        ctx.rows_per_group = rows_per_group
+        ctx.has_bias = bias_arg is not None
+        ctx.has_shared_weight = shared_w_arg is not None
+        ctx.has_shared_bias = shared_b_arg is not None
+        return flat_out.reshape(*x.shape[:-1], weight_experts.shape[1])
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        flat_x, coefficients, weight_experts, bias_experts, shared_weight, shared_bias, row_splits_tensor = ctx.saved_tensors
+        bias_arg = bias_experts if ctx.has_bias else None
+        shared_w_arg = shared_weight if ctx.has_shared_weight else None
+        shared_b_arg = shared_bias if ctx.has_shared_bias else None
+        flat_grad = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+
+        grad_x = _triton_grouped_moe_dx(
+            flat_grad,
+            coefficients,
+            weight_experts,
+            shared_w_arg,
+            ctx.rows_per_group,
+        ).reshape(ctx.orig_shape)
+        grad_coeff, grad_w, grad_b, grad_sw, grad_sb = _torch_grouped_moe_dw_db_dc(
+            flat_x,
+            flat_grad,
+            coefficients,
+            weight_experts,
+            bias_arg,
+            shared_w_arg,
+            shared_b_arg,
+            ctx.rows_per_group,
+        )
+
+        return grad_x, grad_coeff, grad_w, grad_b, grad_sw, grad_sb, None
+
+
+def grouped_moe_fused_linear(x: torch.Tensor,
+                             coefficients: torch.Tensor,
+                             weight_experts: torch.Tensor,
+                             bias_experts: Optional[torch.Tensor],
+                             shared_weight: Optional[torch.Tensor],
+                             shared_bias: Optional[torch.Tensor],
+                             split_sizes: Sequence[int]) -> torch.Tensor:
+    row_splits_tensor = torch.tensor(_canonical_split_sizes(split_sizes), device=x.device, dtype=torch.long)
+    return _GroupedMoEFusedLinearFn.apply(
+        x,
+        coefficients,
+        weight_experts,
+        bias_experts if bias_experts is not None else _empty(x.device, x.dtype),
+        shared_weight if shared_weight is not None else _empty(x.device, x.dtype),
+        shared_bias if shared_bias is not None else _empty(x.device, x.dtype),
+        row_splits_tensor,
+    )
 
 
 class _GroupedComplexLinearFn(torch.autograd.Function):

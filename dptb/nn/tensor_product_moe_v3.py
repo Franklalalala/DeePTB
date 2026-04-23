@@ -384,7 +384,13 @@ def _expand_graph_index_for_leading_dims(graph_index: torch.Tensor, x: torch.Ten
 
 
 def _normalize_mole_linear_mode(mode: str) -> str:
-    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear", "triton_grouped_linear"}
+    allowed = {
+        "split_loop",
+        "indexed_ref",
+        "cueq_indexed_linear",
+        "triton_grouped_linear",
+        "triton_fused_expert_linear",
+    }
     if mode not in allowed:
         raise ValueError(f"mole_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
@@ -713,6 +719,29 @@ class MOLELinear(nn.Module):
             return self._apply_split_loop_from_mixed(x, mixed_weights, mixed_bias, split_sizes)
         return ops.grouped_linear_apply(x, mixed_weights, mixed_bias, split_sizes)
 
+    def _apply_triton_fused_expert_linear(self, x, mole_globals: MOLEGlobals):
+        ops = _load_so2_triton_grouped_linear_ops()
+        split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
+        if ops is None or not hasattr(ops, "grouped_moe_fused_linear"):
+            mixed_weights, mixed_bias = self._mixed_weights_and_bias(mole_globals)
+            return self._apply_split_loop_from_mixed(x, mixed_weights, mixed_bias, split_sizes)
+
+        shared_weight = self.weight_shared.sum(0) if self.num_shared_experts > 0 else None
+        shared_bias = (
+            self.bias_shared.sum(0)
+            if self.num_shared_experts > 0 and self.bias_shared is not None
+            else None
+        )
+        return ops.grouped_moe_fused_linear(
+            x,
+            mole_globals.coefficients,
+            self.weight_experts,
+            self.bias_experts,
+            shared_weight,
+            shared_bias,
+            split_sizes,
+        )
+
     def forward(self, x, mole_globals: MOLEGlobals):
         # 安全回退
         if mole_globals is None or mole_globals.coefficients is None:
@@ -727,11 +756,14 @@ class MOLELinear(nn.Module):
             return F.linear(x, w_avg, b_avg)
 
         # === 核心逻辑: 权重融合 (Weight Merging) ===
+        mode = self.mole_linear_mode
+        if mode == "triton_fused_expert_linear":
+            return self._apply_triton_fused_expert_linear(x, mole_globals)
+
         mixed_weights, mixed_bias = self._mixed_weights_and_bias(mole_globals)
 
         # 4. 执行线性变换
         # 根据系统大小拆分 Input，因为每个系统(Graph)对应一个混合后的权重
-        mode = self.mole_linear_mode
         if mode == "triton_grouped_linear":
             return self._apply_triton_grouped_linear(x, mixed_weights, mixed_bias, mole_globals)
 

@@ -186,3 +186,64 @@ Do not run production bs32/bs48 A/B for triton_complex_moe_fused_linear.
 ```
 
 The bottleneck is not merely `mixed_weights` materialization. Fusing dense 24-expert mixing into the same Triton tile introduces too much extra weight traffic and register work. The next useful Triton direction should move to a larger layout-fusion boundary only if it can also reduce surrounding pack/scatter and avoid Python/Torch reductions in backward.
+
+## Fused Expert Linear Intake From PR12 Next Package
+
+Reviewed:
+
+```text
+E:\deeptb\codex\0422\pr12_triton_next_fused_expert_patch_package\pr12_triton_next_fused_expert
+```
+
+Useful idea absorbed:
+
+```text
+mole_linear_mode=triton_fused_expert_linear
+```
+
+This is a general `MOLELinear` full-expert route. It accepts raw graph coefficients and expert banks directly instead of materializing:
+
+```text
+mixed_weights: [num_graphs, out_features, in_features]
+mixed_bias:    [num_graphs, out_features]
+```
+
+The safe default path is a PyTorch oracle/fallback that computes each graph's mixed weight locally. The actual Triton execution is guarded behind:
+
+```text
+DPTB_TRITON_LINEAR_ENABLE_FUSED_EXPERT=1
+```
+
+Reason: the package itself had no CUDA validation. In this branch, the direct Triton kernel was made compile-safe by replacing the persistent dynamic tile scanner with a simpler group-major 3D grid, and small CUDA parity passed. However, larger 8192-row MOLELinear smoke exposed an illegal-memory-access failure for module-initialized weights. Because of that, the Triton execution path is not enabled by default and should not be used in production.
+
+Validation:
+
+```text
+python -m py_compile dptb\nn\so2_triton_grouped_linear_ops.py dptb\nn\tensor_product_moe_v3.py dptb\tests\test_so2_triton_grouped_linear_ops.py dptb\utils\argcheck.py
+PASS
+
+local pytest:
+1 skipped in 0.06s
+
+natlan:
+pytest dptb/tests/test_so2_triton_grouped_linear_ops.py -q --tb=short --maxfail=1
+32 passed, 1 skipped, 1 warning in 52.15s
+```
+
+Micro signal before disabling by default:
+
+```text
+MOLELinear 2D, N=8192, n_graphs=32, rows_per_graph=256, experts=24, in=64, out=64
+
+split_loop:            mean 8.623 ms, peak allocated 43.9 MB
+triton_grouped_linear: mean 5.373 ms, peak allocated 43.9 MB
+triton_fused_expert:   illegal memory access on larger module smoke
+```
+
+Decision:
+
+```text
+Do not recommend triton_fused_expert_linear as an optimization.
+Keep it as a correctness oracle / isolated experiment only.
+Current production guidance remains unchanged.
+```
