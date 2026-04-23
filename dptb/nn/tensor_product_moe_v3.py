@@ -363,6 +363,13 @@ def _normalize_mole_linear_mode(mode: str) -> str:
     return mode
 
 
+def _normalize_so2_m_linear_mode(mode: str) -> str:
+    allowed = {"standard", "cueq_complex_indexed_linear", "cueq_segmented_complex_indexed_linear"}
+    if mode not in allowed:
+        raise ValueError(f"so2_m_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
+    return mode
+
+
 class MOLERouterV3(nn.Module):
     def __init__(self, in_features, num_experts=48, top_k=6,
                  aux_loss_free=True,
@@ -524,6 +531,19 @@ class MOLELinear(nn.Module):
         if mixed_bias is not None:
             flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def _mixed_weights_and_bias(self, mole_globals: MOLEGlobals):
+        mixed_weights = torch.einsum("be, eoi -> boi", mole_globals.coefficients, self.weight_experts)
+        if self.num_shared_experts > 0:
+            mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
+
+        mixed_bias = None
+        if self.bias_experts is not None:
+            mixed_bias = torch.einsum("be, eo -> bo", mole_globals.coefficients, self.bias_experts)
+            if self.num_shared_experts > 0 and self.bias_shared is not None:
+                mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
+
+        return mixed_weights, mixed_bias
 
     def _cueq_flatten_weight(self, mixed_weights, order: str):
         scale = math.sqrt(self.in_features)
@@ -827,6 +847,7 @@ class SO2_Linear(torch.nn.Module):
             wigner_apply_mode: str = "compact_blocks",
             mole_linear_mode=None,
             so2_fusion_mode: str = "staged",
+            so2_m_linear_mode: str = None,
     ):
         super(SO2_Linear, self).__init__()
 
@@ -847,6 +868,10 @@ class SO2_Linear(torch.nn.Module):
         if env_so2_fusion_mode is not None and so2_fusion_mode in (None, "staged"):
             so2_fusion_mode = env_so2_fusion_mode
         self.so2_fusion_mode = _normalize_so2_fusion_mode(so2_fusion_mode)
+        env_so2_m_linear_mode = os.environ.get("DPTB_SO2_M_LINEAR_MODE")
+        if env_so2_m_linear_mode is not None and so2_m_linear_mode in (None, "standard"):
+            so2_m_linear_mode = env_so2_m_linear_mode
+        self.so2_m_linear_mode = _normalize_so2_m_linear_mode(so2_m_linear_mode or "standard")
         self.num_experts = num_experts
 
         self.m_linear = nn.ModuleList()
@@ -874,6 +899,7 @@ class SO2_Linear(torch.nn.Module):
                 num_experts=num_experts,
                 num_shared_experts=num_shared_experts,
                 mole_linear_mode=mole_linear_mode,
+                so2_m_linear_mode=self.so2_m_linear_mode,
             ))
 
         # --- Mask 和 Index 构建逻辑 (保持不变) ---
@@ -1362,11 +1388,19 @@ class SO2_m_Linear(torch.nn.Module):
             num_experts: int = 8,  # Added
             num_shared_experts: int = 1, # Added
             mole_linear_mode=None,
+            so2_m_linear_mode: str = None,
     ):
         super(SO2_m_Linear, self).__init__()
         self.m = m
         self.num_in_channel = sum(mul for mul, (l, p) in irreps_in if l >= m)
         self.num_out_channel = sum(mul for mul, (l, p) in irreps_out if l >= m)
+        self.so2_m_linear_mode = _normalize_so2_m_linear_mode(
+            so2_m_linear_mode or os.environ.get("DPTB_SO2_M_LINEAR_MODE", "standard")
+        )
+        self._cueq_complex_linear_cache = {}
+        self._cueq_complex_weight_order = None
+        self._cueq_segmented_complex_linear_cache = {}
+        self._cueq_segmented_complex_weight_order = None
 
         # MODIFICATION: MOLE Logic with bias=False (original was bias=False)
         if use_interpolation:
@@ -1385,8 +1419,262 @@ class SO2_m_Linear(torch.nn.Module):
                 self.fc.weight_experts.data.mul_(1 / math.sqrt(2))
             self.is_mole = True
 
-    def forward(self, x_m, mole_globals: MOLEGlobals):  # Added mole_globals
-        # x_m ~ [N, 2, n_channels]
+    def _complex_block_weights(self, mixed_weights: torch.Tensor) -> torch.Tensor:
+        w_real = mixed_weights[:, :self.num_out_channel, :]
+        w_imag = mixed_weights[:, self.num_out_channel:, :]
+        top = torch.cat((w_real, -w_imag), dim=2)
+        bottom = torch.cat((w_imag, w_real), dim=2)
+        return torch.cat((top, bottom), dim=1)
+
+    def _cueq_flatten_complex_weight(self, block_weights: torch.Tensor, order: str) -> torch.Tensor:
+        scale = math.sqrt(2 * self.num_in_channel)
+        if order == "io_scaled":
+            flat = block_weights.transpose(1, 2).contiguous() * scale
+        elif order == "oi_scaled":
+            flat = block_weights.contiguous() * scale
+        elif order == "io":
+            flat = block_weights.transpose(1, 2).contiguous()
+        elif order == "oi":
+            flat = block_weights.contiguous()
+        else:
+            raise ValueError(f"unknown cueq complex weight order {order!r}")
+        return flat.reshape(block_weights.shape[0], -1)
+
+    def _get_cueq_complex_linear(self, num_graphs: int, *, dtype, device):
+        if device.type != "cuda":
+            raise RuntimeError("cueq_complex_indexed_linear requires CUDA.")
+        if dtype not in (torch.float32, torch.float64):
+            raise RuntimeError(
+                "cueq_complex_indexed_linear is currently validated only for float32/float64."
+            )
+
+        try:
+            import cuequivariance as cue
+            import cuequivariance_torch as cuet
+        except ImportError as exc:
+            raise ImportError(
+                "so2_m_linear_mode='cueq_complex_indexed_linear' requires cuequivariance "
+                "and cuequivariance_torch."
+            ) from exc
+
+        key = (num_graphs, str(dtype), str(device), self.num_in_channel, self.num_out_channel)
+        mod = self._cueq_complex_linear_cache.get(key)
+        if mod is None:
+            irreps_in = cue.Irreps(cue.O3, f"{2 * self.num_in_channel}x0e")
+            irreps_out = cue.Irreps(cue.O3, f"{2 * self.num_out_channel}x0e")
+            mod = cuet.Linear(
+                irreps_in,
+                irreps_out,
+                shared_weights=True,
+                internal_weights=False,
+                weight_classes=num_graphs,
+                layout=cue.ir_mul,
+                device=device,
+                dtype=dtype,
+                method="indexed_linear",
+            )
+            self._cueq_complex_linear_cache[key] = mod
+        return mod
+
+    def _infer_cueq_complex_weight_order(self, cue_lin, flat_x, block_weights, graph_index):
+        if self._cueq_complex_weight_order is not None:
+            return self._cueq_complex_weight_order
+
+        with torch.no_grad():
+            n_probe = min(int(flat_x.shape[0]), 64)
+            probe_x = flat_x[:n_probe]
+            probe_idx = graph_index[:n_probe]
+            ref_w = block_weights.index_select(0, probe_idx)
+            ref = torch.bmm(ref_w, probe_x.unsqueeze(-1)).squeeze(-1)
+
+            best_order, best_err = None, None
+            for order in ("io_scaled", "oi_scaled", "io", "oi"):
+                try:
+                    weight = self._cueq_flatten_complex_weight(block_weights, order)
+                    out = cue_lin(probe_x, weight=weight, weight_indices=probe_idx)
+                    err_val = float((out - ref).abs().max().detach().cpu())
+                except Exception:
+                    continue
+                if best_err is None or err_val < best_err:
+                    best_order, best_err = order, err_val
+
+        if best_order is None or best_err is None or best_err > 1e-4:
+            raise RuntimeError(
+                "Could not infer cuEquivariance complex SO2_m weight order; "
+                f"best_order={best_order}, best_err={best_err}."
+            )
+
+        self._cueq_complex_weight_order = best_order
+        return best_order
+
+    def _forward_cueq_complex_indexed_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.mole_linear_mode != "cueq_indexed_linear":
+            raise RuntimeError(
+                "cueq_complex_indexed_linear requires mole_linear_mode='cueq_indexed_linear'."
+            )
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("cueq_complex_indexed_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        mixed_weights, mixed_bias = self.fc._mixed_weights_and_bias(mole_globals)
+        if mixed_bias is not None:
+            raise RuntimeError("cueq_complex_indexed_linear currently supports bias=False only.")
+
+        graph_index = _mole_graph_index(mole_globals, x_m.shape[0], device=x_m.device)
+        if graph_index.numel() != x_m.shape[0]:
+            raise ValueError(
+                f"MOLE graph_index has {graph_index.numel()} rows, but input has {x_m.shape[0]} rows."
+            )
+
+        flat_x = x_m.reshape(x_m.shape[0], 2 * self.num_in_channel)
+        block_weights = self._complex_block_weights(mixed_weights)
+        cue_lin = self._get_cueq_complex_linear(
+            int(block_weights.shape[0]),
+            dtype=x_m.dtype,
+            device=x_m.device,
+        )
+        order = self._infer_cueq_complex_weight_order(cue_lin, flat_x, block_weights, graph_index)
+        flat_weight = self._cueq_flatten_complex_weight(block_weights, order)
+        flat_out = cue_lin(flat_x, weight=flat_weight, weight_indices=graph_index)
+        return flat_out.reshape(x_m.shape[0], 2, self.num_out_channel)
+
+    def _cueq_flatten_segmented_complex_weight(self, mixed_weights: torch.Tensor, order: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        w_real = mixed_weights[:, :self.num_out_channel, :]
+        w_imag = mixed_weights[:, self.num_out_channel:, :]
+        if order == "io":
+            flat_real = w_real.transpose(1, 2).contiguous().reshape(mixed_weights.shape[0], -1)
+            flat_imag = w_imag.transpose(1, 2).contiguous().reshape(mixed_weights.shape[0], -1)
+        elif order == "oi":
+            flat_real = w_real.contiguous().reshape(mixed_weights.shape[0], -1)
+            flat_imag = w_imag.contiguous().reshape(mixed_weights.shape[0], -1)
+        else:
+            raise ValueError(f"unknown cuEq segmented complex weight order {order!r}")
+        return flat_real, flat_imag
+
+    def _get_cueq_segmented_complex_linear(self, num_graphs: int, *, dtype, device):
+        if device.type != "cuda":
+            raise RuntimeError("cueq_segmented_complex_indexed_linear requires CUDA.")
+        if dtype not in (torch.float32, torch.float64):
+            raise RuntimeError(
+                "cueq_segmented_complex_indexed_linear is currently validated only for float32/float64."
+            )
+
+        try:
+            import cuequivariance as cue
+            import cuequivariance_torch as cuet
+        except ImportError as exc:
+            raise ImportError(
+                "so2_m_linear_mode='cueq_segmented_complex_indexed_linear' requires "
+                "cuequivariance and cuequivariance_torch."
+            ) from exc
+
+        key = (num_graphs, str(dtype), str(device), self.num_in_channel, self.num_out_channel)
+        mod = self._cueq_segmented_complex_linear_cache.get(key)
+        if mod is None:
+            d = cue.SegmentedTensorProduct.from_subscripts("uv,wu,wv")
+            d.add_segment(0, (self.num_in_channel, self.num_out_channel))
+            d.add_segment(1, (2, self.num_in_channel))
+            d.add_segment(2, (2, self.num_out_channel))
+            d.add_path(0, 0, 0, c=1.0)
+
+            polynomial = cue.SegmentedPolynomial(
+                [d.operands[0], d.operands[0], d.operands[1], d.operands[1]],
+                [d.operands[2]],
+                [
+                    ((0, 2, 4), d),  # W_real * [x_real, x_imag]
+                    ((1, 3, 4), d),  # W_imag * [-x_imag, x_real]
+                ],
+            )
+            mod = cuet.SegmentedPolynomial(polynomial, method="indexed_linear")
+            self._cueq_segmented_complex_linear_cache[key] = mod
+        return mod
+
+    def _infer_cueq_segmented_complex_weight_order(self, cue_poly, x_m, mixed_weights, graph_index):
+        if self._cueq_segmented_complex_weight_order is not None:
+            return self._cueq_segmented_complex_weight_order
+
+        with torch.no_grad():
+            n_probe = min(int(x_m.shape[0]), 64)
+            probe_x = x_m[:n_probe]
+            probe_idx = graph_index[:n_probe]
+            block_weights = self._complex_block_weights(mixed_weights)
+            ref_w = block_weights.index_select(0, probe_idx)
+            ref = torch.bmm(ref_w, probe_x.reshape(n_probe, 2 * self.num_in_channel).unsqueeze(-1)).squeeze(-1)
+            probe_x_rot = torch.stack((-probe_x[:, 1], probe_x[:, 0]), dim=1)
+
+            best_order, best_err = None, None
+            for order in ("io", "oi"):
+                try:
+                    flat_real, flat_imag = self._cueq_flatten_segmented_complex_weight(mixed_weights, order)
+                    out = cue_poly(
+                        [
+                            flat_real,
+                            flat_imag,
+                            probe_x.reshape(n_probe, 2 * self.num_in_channel),
+                            probe_x_rot.reshape(n_probe, 2 * self.num_in_channel),
+                        ],
+                        input_indices={0: probe_idx, 1: probe_idx},
+                    )[0]
+                    err_val = float((out - ref).abs().max().detach().cpu())
+                except Exception:
+                    continue
+                if best_err is None or err_val < best_err:
+                    best_order, best_err = order, err_val
+
+        if best_order is None or best_err is None or best_err > 1e-4:
+            raise RuntimeError(
+                "Could not infer cuEquivariance segmented complex SO2_m weight order; "
+                f"best_order={best_order}, best_err={best_err}."
+            )
+
+        self._cueq_segmented_complex_weight_order = best_order
+        return best_order
+
+    def _forward_cueq_segmented_complex_indexed_linear(self, x_m, mole_globals: MOLEGlobals):
+        if not self.is_mole or not isinstance(self.fc, MOLELinear):
+            return self._forward_standard(x_m, mole_globals)
+        if self.fc.mole_linear_mode != "cueq_indexed_linear":
+            raise RuntimeError(
+                "cueq_segmented_complex_indexed_linear requires mole_linear_mode='cueq_indexed_linear'."
+            )
+        if self.fc.bias_experts is not None:
+            raise RuntimeError("cueq_segmented_complex_indexed_linear currently supports bias=False only.")
+        if mole_globals is None or mole_globals.coefficients is None:
+            return self._forward_standard(x_m, mole_globals)
+
+        mixed_weights, mixed_bias = self.fc._mixed_weights_and_bias(mole_globals)
+        if mixed_bias is not None:
+            raise RuntimeError("cueq_segmented_complex_indexed_linear currently supports bias=False only.")
+
+        graph_index = _mole_graph_index(mole_globals, x_m.shape[0], device=x_m.device)
+        if graph_index.numel() != x_m.shape[0]:
+            raise ValueError(
+                f"MOLE graph_index has {graph_index.numel()} rows, but input has {x_m.shape[0]} rows."
+            )
+
+        cue_poly = self._get_cueq_segmented_complex_linear(
+            int(mixed_weights.shape[0]),
+            dtype=x_m.dtype,
+            device=x_m.device,
+        )
+        order = self._infer_cueq_segmented_complex_weight_order(cue_poly, x_m, mixed_weights, graph_index)
+        flat_real, flat_imag = self._cueq_flatten_segmented_complex_weight(mixed_weights, order)
+        x_rot = torch.stack((-x_m[:, 1], x_m[:, 0]), dim=1)
+        flat_out = cue_poly(
+            [
+                flat_real,
+                flat_imag,
+                x_m.reshape(x_m.shape[0], 2 * self.num_in_channel),
+                x_rot.reshape(x_m.shape[0], 2 * self.num_in_channel),
+            ],
+            input_indices={0: graph_index, 1: graph_index},
+        )[0]
+        return flat_out.reshape(x_m.shape[0], 2, self.num_out_channel)
+
+    def _forward_standard(self, x_m, mole_globals: MOLEGlobals):
         if self.is_mole:
             x_m = self.fc(x_m, mole_globals)
         else:
@@ -1397,3 +1685,11 @@ class SO2_m_Linear(torch.nn.Module):
         x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)
         x_m_i = x_r.narrow(1, 1, 1) + x_i.narrow(1, 0, 1)
         return torch.cat((x_m_r, x_m_i), dim=1)
+
+    def forward(self, x_m, mole_globals: MOLEGlobals):  # Added mole_globals
+        # x_m ~ [N, 2, n_channels]
+        if self.so2_m_linear_mode == "cueq_complex_indexed_linear":
+            return self._forward_cueq_complex_indexed_linear(x_m, mole_globals)
+        if self.so2_m_linear_mode == "cueq_segmented_complex_indexed_linear":
+            return self._forward_cueq_segmented_complex_indexed_linear(x_m, mole_globals)
+        return self._forward_standard(x_m, mole_globals)
