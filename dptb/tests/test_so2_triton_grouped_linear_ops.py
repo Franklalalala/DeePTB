@@ -41,6 +41,8 @@ def _split_loop_complex_linear(x_pair, mixed_weights, split_sizes):
 def test_grouped_moe_linear_matches_materialized_cpu(x_rank, with_bias, with_shared, op_name):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
     if op_name == "grouped_moe_fused_linear" and os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
         pytest.skip("row-tile fused expert Triton path is disabled unless explicitly enabled")
 
@@ -99,6 +101,9 @@ def test_grouped_moe_linear_matches_materialized_cpu(x_rank, with_bias, with_sha
 def test_grouped_linear_apply_matches_split_loop_cpu(x_rank, with_bias):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
+
     torch.manual_seed(20260423)
     dtype = torch.float64
     split_sizes = (3, 5, 2, 4)
@@ -138,6 +143,9 @@ def test_grouped_linear_apply_matches_split_loop_cpu(x_rank, with_bias):
 def test_grouped_exact_moe_linear_does_not_save_mixed_weights():
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("saved tensor hook guard uses CPU fallback; CUDA tests cover required Triton execution")
+
     torch.manual_seed(20260424)
     dtype = torch.float64
     split_sizes = (3, 5, 2, 4)
@@ -166,6 +174,9 @@ def test_grouped_exact_moe_linear_does_not_save_mixed_weights():
 
 def test_grouped_complex_linear_matches_split_loop_cpu():
     from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
 
     torch.manual_seed(20260423)
     dtype = torch.float64
@@ -196,6 +207,8 @@ def test_grouped_complex_linear_matches_split_loop_cpu():
 def test_grouped_complex_moe_linear_matches_materialized_complex_cpu(op_name, with_shared):
     from dptb.nn import so2_triton_grouped_linear_ops as ops
 
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
     if op_name == "grouped_complex_moe_fused_linear" and os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
         pytest.skip("row-tile fused complex expert Triton path is disabled unless explicitly enabled")
 
@@ -244,6 +257,9 @@ def test_grouped_complex_moe_linear_matches_materialized_complex_cpu(op_name, wi
 @pytest.mark.parametrize("mole_linear_mode", ["triton_grouped_linear", "triton_exact_grouped_linear"])
 def test_mole_linear_triton_grouped_matches_split_loop_cpu(x_rank, num_shared_experts, mole_linear_mode):
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
 
     torch.manual_seed(20260423)
     dtype = torch.float64
@@ -299,6 +315,9 @@ def test_mole_linear_triton_grouped_matches_split_loop_cpu(x_rank, num_shared_ex
 @pytest.mark.parametrize("num_shared_experts", [0, 2])
 def test_mole_linear_triton_fused_expert_matches_split_loop_cpu(x_rank, num_shared_experts):
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    if os.environ.get("DPTB_TRITON_LINEAR_REQUIRE") == "1":
+        pytest.skip("CPU parity uses torch fallback; CUDA tests cover required Triton execution")
 
     torch.manual_seed(20260423)
     dtype = torch.float64
@@ -388,6 +407,54 @@ def test_grouped_linear_apply_cuda_fp32_if_available(monkeypatch):
     torch.testing.assert_close(x.grad, gx_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(mixed_weights.grad, gw_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(mixed_bias.grad, gb_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_grouped_exact_moe_linear_cuda_fp32_if_available(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton exact grouped MoE CUDA smoke requires CUDA")
+    pytest.importorskip("triton")
+
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    monkeypatch.setenv("DPTB_TRITON_LINEAR_REQUIRE", "1")
+    torch.manual_seed(20260424)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (13, 17, 19, 11)
+    n_rows = sum(split_sizes)
+    num_experts = 8
+    in_features = 37
+    out_features = 41
+
+    x0 = torch.randn(n_rows, 2, in_features, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    c0 = torch.rand(len(split_sizes), num_experts, device=device, dtype=dtype, requires_grad=True)
+    c1 = c0.detach().clone().requires_grad_(True)
+    w0 = torch.randn(num_experts, out_features, in_features, device=device, dtype=dtype, requires_grad=True)
+    w1 = w0.detach().clone().requires_grad_(True)
+    b0 = torch.randn(num_experts, out_features, device=device, dtype=dtype, requires_grad=True)
+    b1 = b0.detach().clone().requires_grad_(True)
+    sw0 = torch.randn(out_features, in_features, device=device, dtype=dtype, requires_grad=True)
+    sw1 = sw0.detach().clone().requires_grad_(True)
+    sb0 = torch.randn(out_features, device=device, dtype=dtype, requires_grad=True)
+    sb1 = sb0.detach().clone().requires_grad_(True)
+
+    mixed = torch.einsum("ge,eoi->goi", c0, w0) + sw0.unsqueeze(0)
+    mixed_bias = torch.einsum("ge,eo->go", c0, b0) + sb0.unsqueeze(0)
+    y_ref = _split_loop_linear(x0, mixed, mixed_bias, split_sizes)
+    y_new = ops.grouped_exact_moe_linear(x1, c1, w1, b1, sw1, sb1, split_sizes)
+    torch.testing.assert_close(y_new, y_ref, atol=2e-4, rtol=2e-4)
+
+    probe = torch.randn_like(y_ref)
+    (y_ref * probe).sum().backward()
+    (y_new * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(c1.grad, c0.grad, atol=3e-3, rtol=3e-4)
+    torch.testing.assert_close(w1.grad, w0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(b1.grad, b0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(sw1.grad, sw0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(sb1.grad, sb0.grad, atol=3e-4, rtol=3e-4)
 
 
 def test_grouped_moe_fused_linear_cuda_fp32_if_available(monkeypatch):
@@ -487,6 +554,47 @@ def test_grouped_complex_linear_cuda_fp32_if_available(monkeypatch):
 
     torch.testing.assert_close(x1.grad, x0.grad, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(w1.grad, w0.grad, atol=1e-4, rtol=1e-4)
+
+
+def test_grouped_complex_exact_moe_linear_cuda_fp32_if_available(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("Triton complex exact grouped MoE CUDA smoke requires CUDA")
+    pytest.importorskip("triton")
+
+    from dptb.nn import so2_triton_grouped_linear_ops as ops
+
+    monkeypatch.setenv("DPTB_TRITON_LINEAR_REQUIRE", "1")
+    torch.manual_seed(20260424)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (13, 17, 19, 11)
+    n_rows = sum(split_sizes)
+    num_experts = 8
+    in_features = 37
+    out_features = 41
+
+    x0 = torch.randn(n_rows, 2, in_features, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    c0 = torch.rand(len(split_sizes), num_experts, device=device, dtype=dtype, requires_grad=True)
+    c1 = c0.detach().clone().requires_grad_(True)
+    w0 = torch.randn(num_experts, 2 * out_features, in_features, device=device, dtype=dtype, requires_grad=True)
+    w1 = w0.detach().clone().requires_grad_(True)
+    sw0 = torch.randn(2 * out_features, in_features, device=device, dtype=dtype, requires_grad=True)
+    sw1 = sw0.detach().clone().requires_grad_(True)
+
+    mixed = torch.einsum("ge,eoi->goi", c0, w0) + sw0.unsqueeze(0)
+    y_ref = _split_loop_complex_linear(x0, mixed, split_sizes)
+    y_new = ops.grouped_complex_exact_moe_linear(x1, c1, w1, sw1, split_sizes)
+    torch.testing.assert_close(y_new, y_ref, atol=2e-4, rtol=2e-4)
+
+    probe = torch.randn_like(y_ref)
+    (y_ref * probe).sum().backward()
+    (y_new * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(c1.grad, c0.grad, atol=3e-3, rtol=3e-4)
+    torch.testing.assert_close(w1.grad, w0.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(sw1.grad, sw0.grad, atol=3e-4, rtol=3e-4)
 
 
 def test_grouped_complex_moe_fused_linear_cuda_fp32_if_available(monkeypatch):
