@@ -180,6 +180,7 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
         "streamed_m_major_ref",
         "streamed_m_major_aggressive",
         "streamed_m_major_cueq",
+        "streamed_m_major_triton_fused",
     )
     if so2_fusion_mode not in allowed:
         raise ValueError(
@@ -187,6 +188,19 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
             f"got {so2_fusion_mode!r}"
         )
     return so2_fusion_mode
+
+
+def _load_so2_triton_fused_ops():
+    try:
+        from . import so2_triton_fused_ops
+        return so2_triton_fused_ops
+    except Exception as exc:
+        if os.environ.get("DPTB_SO2_TRITON_REQUIRE", "0") == "1":
+            raise RuntimeError(
+                "DPTB_SO2_TRITON_REQUIRE=1 but dptb.nn.so2_triton_fused_ops "
+                "could not be loaded."
+            ) from exc
+        return None
 
 
 def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
@@ -1007,6 +1021,14 @@ class SO2_Linear(torch.nn.Module):
                 wigner_D_all,
                 route="streamed_m_major_cueq",
             )
+        if self.so2_fusion_mode == "streamed_m_major_triton_fused":
+            return self._forward_streamed_m_major_triton_fused(
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+            )
 
         n, _ = x.shape
         if self.radial_emb:
@@ -1240,14 +1262,56 @@ class SO2_Linear(torch.nn.Module):
                 "cueq_indexed_linear; the route remains correct but only the grouped "
                 "streamed SO2 dataflow is active.",
             )
+        if route == "streamed_m_major_triton_fused":
+            ops = _load_so2_triton_fused_ops()
+            if ops is None:
+                self._warn_route_once(
+                    "triton_fused_ops_unavailable",
+                    "streamed_m_major_triton_fused is active but Triton fused ops "
+                    "could not be imported; falling back to the grouped streamed "
+                    "PyTorch bridge.",
+                )
+            elif not ops.triton_runtime_available():
+                self._warn_route_once(
+                    "triton_runtime_unavailable",
+                    "streamed_m_major_triton_fused is active but Triton/CUDA runtime "
+                    "is unavailable; using the torch fallback implementation.",
+                )
+            if not self._cueq_linear_is_enabled():
+                self._warn_route_once(
+                    "triton_route_without_cueq_linear",
+                    "streamed_m_major_triton_fused is active but MOLELinear is not "
+                    "using cueq_indexed_linear; only the outer SO2 pack/scatter bridge "
+                    "uses the fused route.",
+                )
 
     def _make_wigner_block_cache(self, wigner_D_all) -> Dict[int, torch.Tensor]:
         if wigner_D_all is None:
             return {}
         return {
-            l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+            l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims).contiguous()
             for l in self._active_rot_l
         }
+
+    def _active_in_l_keys_by_m(self, m: int) -> Tuple[int, ...]:
+        cache = getattr(self, "_active_in_l_keys_by_m_cache", None)
+        if cache is None:
+            cache = {
+                mm: tuple(l for l in sorted(self._in_group_plans.keys()) if l >= mm)
+                for mm in range(self.m_max + 1)
+            }
+            self._active_in_l_keys_by_m_cache = cache
+        return cache[m]
+
+    def _active_out_l_keys_by_m(self, m: int) -> Tuple[int, ...]:
+        cache = getattr(self, "_active_out_l_keys_by_m_cache", None)
+        if cache is None:
+            cache = {
+                mm: tuple(l for l in sorted(self._out_group_plans.keys()) if l >= mm)
+                for mm in range(self.m_max + 1)
+            }
+            self._active_out_l_keys_by_m_cache = cache
+        return cache[m]
 
     def _gather_input_l_groups(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
         return {
@@ -1372,6 +1436,106 @@ class SO2_Linear(torch.nn.Module):
             out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
             self._accumulate_group_pair_(out_view, y_entry, entry.l, m, rot_blocks.get(entry.l))
 
+    def _assemble_grouped_m0_input_triton(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            n: int,
+            x_template: torch.Tensor,
+            ops,
+    ) -> torch.Tensor:
+        packed_by_l = {}
+        for l in self._active_in_l_keys_by_m(0):
+            packed_by_l[l] = ops.triton_pack_group_m0(
+                input_groups[l],
+                rot_blocks.get(l),
+                l,
+                self.rotate_in,
+            )
+        parts = [
+            packed_by_l[entry.l][:, entry.group_start:entry.group_start + entry.mul]
+            for entry in self._in_entries_by_m[0]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)
+
+    def _assemble_grouped_pair_input_triton(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+            n: int,
+            x_template: torch.Tensor,
+            ops,
+    ) -> torch.Tensor:
+        packed_by_l = {}
+        for l in self._active_in_l_keys_by_m(m):
+            packed_by_l[l] = ops.triton_pack_group_pair(
+                input_groups[l],
+                rot_blocks.get(l),
+                l,
+                m,
+                self.rotate_in,
+            )
+        parts = [
+            packed_by_l[entry.l][:, :, entry.group_start:entry.group_start + entry.mul]
+            for entry in self._in_entries_by_m[m]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 2, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=2)
+
+    def _accumulate_grouped_m0_output_triton_(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            y_m0: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            ops,
+    ) -> None:
+        if y_m0.numel() == 0:
+            return
+        cursor = 0
+        for entry in self._out_entries_by_m[0]:
+            y_entry = y_m0[:, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            out_view += ops.triton_scatter_group_m0(
+                y_entry,
+                rot_blocks.get(entry.l),
+                entry.l,
+                self._out_group_plans[entry.l].dims,
+                self.rotate_out,
+            )
+
+    def _accumulate_grouped_pair_output_triton_(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            y_m: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+            ops,
+    ) -> None:
+        if y_m.numel() == 0:
+            return
+        cursor = 0
+        for entry in self._out_entries_by_m[m]:
+            y_entry = y_m[:, :, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+            out_view += ops.triton_scatter_group_pair(
+                y_entry,
+                rot_blocks.get(entry.l),
+                entry.l,
+                m,
+                self._out_group_plans[entry.l].dims,
+                self.rotate_out,
+            )
+
     def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
@@ -1411,6 +1575,60 @@ class SO2_Linear(torch.nn.Module):
                 linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
 
             self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+
+        out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+        return out.contiguous(), wigner_D_all
+
+    def _forward_streamed_m_major_triton_fused(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
+        ops = _load_so2_triton_fused_ops()
+        if ops is None:
+            return self._forward_streamed_m_major_grouped(
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+                route="streamed_m_major_aggressive",
+            )
+
+        self._prepare_streamed_route("streamed_m_major_triton_fused")
+        wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+        n, _ = x.shape
+        if self.radial_emb and latents is None:
+            raise ValueError("SO2_Linear Triton fused streamed path requires latents when radial_emb=True.")
+        weights = self.radial_emb(latents) if self.radial_emb else None
+        rot_blocks = self._make_wigner_block_cache(wigner_D_all)
+        input_groups = self._gather_input_l_groups(x)
+        out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+
+        for m in range(self.m_max + 1):
+            radial_weight = (
+                weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1)
+                if self.radial_emb else 1.
+            )
+
+            if m == 0:
+                inp = self._assemble_grouped_m0_input_triton(input_groups, rot_blocks, n, x, ops)
+                if self.front and self.radial_emb:
+                    y_m = self.fc_m0(inp * radial_weight.squeeze(1), mole_globals)
+                elif self.radial_emb:
+                    y_m = self.fc_m0(inp, mole_globals) * radial_weight.squeeze(1)
+                else:
+                    y_m = self.fc_m0(inp, mole_globals)
+                self._accumulate_grouped_m0_output_triton_(out_groups, y_m, rot_blocks, ops)
+                continue
+
+            x_m_in = self._assemble_grouped_pair_input_triton(input_groups, rot_blocks, m, n, x, ops)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+            elif self.radial_emb:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+                linear_output = linear_output * radial_weight
+            else:
+                linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
+
+            self._accumulate_grouped_pair_output_triton_(out_groups, linear_output, rot_blocks, m, ops)
 
         out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
         return out.contiguous(), wigner_D_all
