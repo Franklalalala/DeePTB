@@ -134,12 +134,28 @@ class ScalarOnehotTP(torch.nn.Module):
             len(self._paths) > 1
             and all(path[3] == "uvu" for path in self._paths)
             and len({path[1] for path in self._paths}) == 1
+            and len({path[7] for path in self._paths}) == 1
         )
+        if self._uvu_same_input:
+            uvu_gain_scales = []
+            for idx, path in enumerate(self._paths):
+                uvu_gain_scales.extend([scales[idx]] * path[6])
+            self._uvu_total_mul = sum(path[6] for path in self._paths)
+            self._uvu_mul2 = self._paths[0][7]
+        else:
+            uvu_gain_scales = []
+            self._uvu_total_mul = 0
+            self._uvu_mul2 = 0
         init_dtype = weight.dtype if weight is not None else torch.get_default_dtype()
         init_device = weight.device if weight is not None else None
         self.register_buffer(
             "_path_scales",
             torch.tensor(scales, dtype=init_dtype, device=init_device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_uvu_gain_scales",
+            torch.tensor(uvu_gain_scales, dtype=init_dtype, device=init_device),
             persistent=False,
         )
         self.weight = torch.nn.Parameter(torch.empty(offset, dtype=init_dtype, device=init_device))
@@ -183,13 +199,11 @@ class ScalarOnehotTP(torch.nn.Module):
         if self._uvu_same_input:
             in2_idx = self._paths[0][1]
             y_block = y_flat[:, self._in2_slices[in2_idx]]
-            weight_blocks = []
-            for idx, path in enumerate(self._paths):
-                _, _, _, _, offset, shape, _, _, _, _ = path
-                weight_blocks.append(
-                    self.weight.narrow(0, offset, math.prod(shape)).reshape(shape) * path_scales[idx]
-                )
-            gains = torch.matmul(y_block, torch.cat(weight_blocks, dim=0).transpose(0, 1))
+            packed_weight = self.weight.reshape(self._uvu_total_mul, self._uvu_mul2)
+            packed_weight = packed_weight * self._uvu_gain_scales.to(
+                dtype=x_flat.dtype, device=x_flat.device
+            ).unsqueeze(-1)
+            gains = torch.matmul(y_block, packed_weight.transpose(0, 1))
             gain_offset = 0
             for path in self._paths:
                 i_in1, _, i_out, _, _, _, mul1, _, _, ir_dim = path

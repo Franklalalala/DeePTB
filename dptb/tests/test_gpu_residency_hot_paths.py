@@ -169,6 +169,7 @@ def test_current_gpu_hot_paths_do_not_extract_cuda_scalars_in_forward():
     assert 'sizes.to("cpu").tolist()' not in tensor_product_text
     assert "sizes.to('cpu').tolist()" not in tensor_product_text
     assert "sizes.sum().item()" not in tensor_product_text
+    assert "output_size=n_rows" in tensor_product_text
     assert "torch.sum(torch.abs(data[_keys.CELL_KEY]))" not in atomic_data_text
     assert "batch.max() == 0" not in loss_text
     assert "batch.max() >= 1" not in loss_text

@@ -294,7 +294,9 @@ class MOLEGlobals:
     def __init__(self, coefficients=None, sizes=None, split_sizes=None, graph_index=None):
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.sizes = sizes  # [Batch] (Edge counts per system)
-        self.graph_index = graph_index
+        # Explicit split sizes preserve the original split-loop contract and
+        # must stay authoritative across all MOLELinear backends.
+        self.graph_index = None if split_sizes is not None else graph_index
         self._sizes_tensor = self._normalize_sizes_tensor(sizes, split_sizes)
         self.split_sizes = self._normalize_split_sizes(sizes, split_sizes)
 
@@ -367,7 +369,9 @@ def _mole_graph_index(mole_globals, n_rows: int, *, device):
         if graph_index is None:
             sizes = sizes_tensor.to(device=device, dtype=torch.long)
             graph_index = torch.repeat_interleave(
-                torch.arange(sizes.shape[0], dtype=torch.long, device=device), sizes
+                torch.arange(sizes.shape[0], dtype=torch.long, device=device),
+                sizes,
+                output_size=n_rows,
             )
             cache[key] = graph_index
         if graph_index.numel() == n_rows:
@@ -389,7 +393,9 @@ def _mole_graph_index(mole_globals, n_rows: int, *, device):
         # cuEquivariance indexed_linear requires sorted indices; the split_sizes
         # contract means rows are graph-contiguous, matching the old split loop.
         graph_index = torch.repeat_interleave(
-            torch.arange(len(split_sizes), dtype=torch.long, device=device), sizes
+            torch.arange(len(split_sizes), dtype=torch.long, device=device),
+            sizes,
+            output_size=n_rows,
         )
         cache[key] = graph_index
     return graph_index
