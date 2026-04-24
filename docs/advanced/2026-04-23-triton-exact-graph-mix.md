@@ -12,6 +12,13 @@ mole_linear_mode=triton_exact_grouped_linear
 so2_m_linear_mode=triton_complex_exact_grouped_linear
 ```
 
+Compatibility aliases are also accepted for package handoff scripts:
+
+```text
+mole_linear_mode=triton_exact_graph_mix_grouped
+so2_m_linear_mode=triton_complex_exact_graph_mix_grouped
+```
+
 The intended production experiment still keeps the outer SO2 route on the
 current best bridge:
 
@@ -87,14 +94,21 @@ here:
 Local Windows:
 
 ```text
-python -m py_compile dptb\nn\so2_triton_grouped_linear_ops.py dptb\nn\tensor_product_moe_v3.py dptb\tests\test_so2_triton_grouped_linear_ops.py dptb\utils\argcheck.py
+conda run -n dptb python -m py_compile dptb/nn/tensor_product_moe_v3.py dptb/nn/so2_triton_grouped_linear_ops.py dptb/tests/test_so2_triton_grouped_linear_ops.py
 PASS
 
-python -m pytest dptb\tests\test_so2_triton_grouped_linear_ops.py -q
-1 skipped
+conda run -n dptb pytest -q dptb/tests/test_so2_triton_grouped_linear_ops.py
+52 passed, 9 skipped
+
+conda run -n dptb pytest -q dptb/tests/test_mole_linear_indexed_ref.py
+8 passed, 4 skipped
+
+conda run -n dptb pytest -q dptb/tests/test_so2_streamed_lmax_bounds.py
+45 passed, 9 skipped
 ```
 
-The skip is expected on this local machine because torch is unavailable.
+The skips are expected on this local machine because CUDA is available but the
+`triton` Python package is not installed in the `dptb` conda environment.
 
 Required CUDA validation on natlan when shell access is available:
 

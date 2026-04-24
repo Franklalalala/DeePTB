@@ -384,6 +384,11 @@ def _expand_graph_index_for_leading_dims(graph_index: torch.Tensor, x: torch.Ten
 
 
 def _normalize_mole_linear_mode(mode: str) -> str:
+    aliases = {
+        "exact_graph_mix_grouped": "triton_exact_grouped_linear",
+        "triton_exact_graph_mix_grouped": "triton_exact_grouped_linear",
+    }
+    mode = aliases.get(mode, mode)
     allowed = {
         "split_loop",
         "indexed_ref",
@@ -398,6 +403,11 @@ def _normalize_mole_linear_mode(mode: str) -> str:
 
 
 def _normalize_so2_m_linear_mode(mode: str) -> str:
+    aliases = {
+        "complex_exact_graph_mix_grouped": "triton_complex_exact_grouped_linear",
+        "triton_complex_exact_graph_mix_grouped": "triton_complex_exact_grouped_linear",
+    }
+    mode = aliases.get(mode, mode)
     allowed = {
         "standard",
         "cueq_complex_indexed_linear",

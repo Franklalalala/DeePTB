@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 from dptb.entrypoints.train import train
+from dptb.entrypoints.multi_train import multi_train
 from dptb.entrypoints.config import config
 from dptb.entrypoints.test import _test
 from dptb.entrypoints.run import run
@@ -254,6 +255,40 @@ def main_parser() -> argparse.ArgumentParser:
         help="The output files in training.",
     )
 
+    parser_multi_train = subparsers.add_parser(
+        "multi-train",
+        parents=[parser_log],
+        help="train a multi-expert/DDP model",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser_multi_train.add_argument(
+        "INPUT",
+        help="the input parameter file in json or yaml format",
+        type=str,
+        default=None,
+    )
+    parser_multi_train.add_argument(
+        "-i",
+        "--init-model",
+        type=str,
+        default=None,
+        help="Initialize the model by the provided checkpoint.",
+    )
+    parser_multi_train.add_argument(
+        "-r",
+        "--restart",
+        type=str,
+        default=None,
+        help="Restart the training from the provided checkpoint.",
+    )
+    parser_multi_train.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default="./",
+        help="The output files in training.",
+    )
+
     parser_test = subparsers.add_parser(
         "test",
         parents=[parser_log],
@@ -463,7 +498,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    if args.command not in (None, "train", "test", "run"):
+    if args.command not in (None, "train", "multi-train", "test", "run"):
         set_log_handles(args.log_level, Path(args.log_path) if args.log_path else None)
 
     dict_args = vars(args)
@@ -477,6 +512,10 @@ def main():
     elif args.command == 'train':
         check_config_train(**dict_args)
         train(**dict_args)
+
+    elif args.command == 'multi-train':
+        check_config_train(**dict_args)
+        multi_train(**dict_args)
 
     elif args.command == 'test':
         _test(**dict_args)
