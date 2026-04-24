@@ -133,3 +133,65 @@ def test_cuda_v3_smoke_if_available(monkeypatch):
     out.square().mean().backward()
     assert out.shape == (sum(split), 32)
     assert x.grad is not None and c.grad is not None and w.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton V3 parity test")
+@pytest.mark.parametrize("bwd_mode", ("expert_loop", "v2_atomic", "torch"))
+def test_cuda_real_v3_matches_reference_forward_and_backward(monkeypatch, bwd_mode):
+    pytest.importorskip("triton")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_COMPLEX_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_BWD", bwd_mode)
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_REQUIRE", "1")
+    torch.manual_seed(301)
+    device = torch.device("cuda")
+    split = (3, 0, 4)
+    x0 = torch.randn(sum(split), 6, device=device, dtype=torch.float32)
+    c0 = torch.randn(len(split), 3, device=device, dtype=torch.float32)
+    w0 = torch.randn(3, 8, 6, device=device, dtype=torch.float32)
+    b0 = torch.randn(3, 8, device=device, dtype=torch.float32)
+    sw0 = torch.randn(8, 6, device=device, dtype=torch.float32)
+    sb0 = torch.randn(8, device=device, dtype=torch.float32)
+    gout = torch.randn(sum(split), 8, device=device, dtype=torch.float32)
+
+    args_ref = [_clone_requires_grad(t) for t in (x0, c0, w0, b0, sw0, sb0)]
+    out_ref = reference_exact_moe_linear(*args_ref, split)
+    out_ref.backward(gout)
+
+    args_v3 = [_clone_requires_grad(t) for t in (x0, c0, w0, b0, sw0, sb0)]
+    out_v3 = exact_moe_linear_v3(*args_v3, split)
+    out_v3.backward(gout)
+
+    torch.testing.assert_close(out_v3, out_ref, rtol=1e-4, atol=2e-4)
+    for got, exp in zip(args_v3, args_ref):
+        torch.testing.assert_close(got.grad, exp.grad, rtol=2e-4, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton V3 parity test")
+@pytest.mark.parametrize("bwd_mode", ("expert_loop", "v2_atomic", "torch"))
+def test_cuda_complex_v3_matches_reference_forward_and_backward(monkeypatch, bwd_mode):
+    pytest.importorskip("triton")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_COMPLEX_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_BWD", bwd_mode)
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_REQUIRE", "1")
+    torch.manual_seed(302)
+    device = torch.device("cuda")
+    split = (2, 5)
+    x0 = torch.randn(sum(split), 2, 5, device=device, dtype=torch.float32)
+    c0 = torch.randn(len(split), 3, device=device, dtype=torch.float32)
+    w0 = torch.randn(3, 2 * 7, 5, device=device, dtype=torch.float32)
+    sw0 = torch.randn(2 * 7, 5, device=device, dtype=torch.float32)
+    gout = torch.randn(sum(split), 2, 7, device=device, dtype=torch.float32)
+
+    args_ref = [_clone_requires_grad(t) for t in (x0, c0, w0, sw0)]
+    out_ref = reference_complex_exact_moe_linear(*args_ref, split)
+    out_ref.backward(gout)
+
+    args_v3 = [_clone_requires_grad(t) for t in (x0, c0, w0, sw0)]
+    out_v3 = complex_exact_moe_linear_v3(*args_v3, split)
+    out_v3.backward(gout)
+
+    torch.testing.assert_close(out_v3, out_ref, rtol=1e-4, atol=2e-4)
+    for got, exp in zip(args_v3, args_ref):
+        torch.testing.assert_close(got.grad, exp.grad, rtol=2e-4, atol=5e-4)
