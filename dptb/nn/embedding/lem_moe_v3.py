@@ -130,6 +130,11 @@ class ScalarOnehotTP(torch.nn.Module):
             offset += numel
 
         self._paths = tuple(paths)
+        self._uvu_same_input = (
+            len(self._paths) > 1
+            and all(path[3] == "uvu" for path in self._paths)
+            and len({path[1] for path in self._paths}) == 1
+        )
         init_dtype = weight.dtype if weight is not None else torch.get_default_dtype()
         init_device = weight.device if weight is not None else None
         self.register_buffer(
@@ -174,6 +179,27 @@ class ScalarOnehotTP(torch.nn.Module):
         y_flat = y.reshape(-1, y.shape[-1])
         out = x_flat.new_zeros((x_flat.shape[0], self.irreps_out.dim))
         path_scales = self._path_scales.to(dtype=x_flat.dtype, device=x_flat.device)
+
+        if self._uvu_same_input:
+            in2_idx = self._paths[0][1]
+            y_block = y_flat[:, self._in2_slices[in2_idx]]
+            weight_blocks = []
+            for idx, path in enumerate(self._paths):
+                _, _, _, _, offset, shape, _, _, _, _ = path
+                weight_blocks.append(
+                    self.weight.narrow(0, offset, math.prod(shape)).reshape(shape) * path_scales[idx]
+                )
+            gains = torch.matmul(y_block, torch.cat(weight_blocks, dim=0).transpose(0, 1))
+            gain_offset = 0
+            for path in self._paths:
+                i_in1, _, i_out, _, _, _, mul1, _, _, ir_dim = path
+                x_block = x_flat[:, self._in1_slices[i_in1]].reshape(x_flat.shape[0], mul1, ir_dim)
+                gain_block = gains.narrow(1, gain_offset, mul1).unsqueeze(-1)
+                out[:, self._out_slices[i_out]] += (x_block * gain_block).reshape(
+                    x_flat.shape[0], mul1 * ir_dim
+                )
+                gain_offset += mul1
+            return out.reshape(*leading_shape, self.irreps_out.dim)
 
         for idx, path in enumerate(self._paths):
             i_in1, i_in2, i_out, connection_mode, offset, shape, mul1, mul2, mul_out, ir_dim = path
