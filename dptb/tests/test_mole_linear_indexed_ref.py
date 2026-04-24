@@ -215,6 +215,49 @@ def test_mole_globals_explicit_split_sizes_take_precedence():
     torch.testing.assert_close(indexed(x, globals_), base(x, globals_), atol=1e-10, rtol=1e-10)
 
 
+def test_mole_globals_explicit_split_sizes_override_graph_index_for_indexed_modes():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear, _mole_graph_index
+
+    torch.manual_seed(20260428)
+    dtype = torch.float64
+    num_experts = 5
+    split_sizes = (2, 1)
+    misleading_graph_index = torch.tensor([1, 0, 0], dtype=torch.long)
+
+    coeffs = torch.rand(len(split_sizes), num_experts, dtype=dtype)
+    coeffs = coeffs / coeffs.sum(dim=-1, keepdim=True)
+    globals_ = MOLEGlobals(
+        coefficients=coeffs,
+        split_sizes=split_sizes,
+        graph_index=misleading_graph_index,
+    )
+
+    resolved = _mole_graph_index(globals_, sum(split_sizes), device=torch.device("cpu"))
+    torch.testing.assert_close(resolved, torch.tensor([0, 0, 1], dtype=torch.long))
+
+    base = MOLELinear(
+        4,
+        3,
+        num_experts=num_experts,
+        num_shared_experts=0,
+        bias=True,
+        mole_linear_mode="split_loop",
+    ).to(dtype=dtype)
+    indexed = MOLELinear(
+        4,
+        3,
+        num_experts=num_experts,
+        num_shared_experts=0,
+        bias=True,
+        mole_linear_mode="indexed_ref",
+    ).to(dtype=dtype)
+    indexed.load_state_dict(base.state_dict(), strict=True)
+
+    x = torch.randn(sum(split_sizes), 4, dtype=dtype)
+    torch.testing.assert_close(indexed(x, globals_), base(x, globals_), atol=1e-10, rtol=1e-10)
+
+
 def test_mole_globals_cuda_graph_index_avoids_split_tuple_sync():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
