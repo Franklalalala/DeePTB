@@ -38,7 +38,7 @@ from dptb.plugins.monitor import (
     TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor,
     DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, CUDAModuleMemoryMonitor,
     TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor,
-    ScalarFieldMonitor, CUDAMemoryMonitor
+    ScalarFieldMonitor, CUDAMemoryMonitor, ParamDynamicsMonitor
 )
 from dptb.plugins.train_logger import Logger
 from dptb.plugins.saver import Saver
@@ -504,7 +504,8 @@ def _multi_train_impl(
             )
 
     with entry_tagger.tag("trainer/register_plugins"):
-        log_field = ["train_loss", "train_loss_opt", "lr"]
+        train_options = jdata["train_options"]
+        log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]
 
         if validation_datasets:
             trainer.register_plugin(
@@ -530,6 +531,7 @@ def _multi_train_impl(
         trainer.register_plugin(TrainZLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ExpertLoadCVMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ScalarFieldMonitor(stat_name="train_loss_opt", interval=[(1, 'iteration'), (1, 'epoch')]))
+        trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
 
         for i in range(trainer.num_experts):
             trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_onsite", interval=[(1, 'iteration'), (1, 'epoch')]))
@@ -546,7 +548,35 @@ def _multi_train_impl(
             trainer.register_plugin(CUDAMemoryMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
             log_field.extend(["cuda_peak_allocated_mb", "cuda_peak_reserved_mb"])
 
-        monitor_flag = jdata["train_options"].get("monitor_flag", False)
+        param_dynamics_enabled = bool(train_options.get("monitor_param_dynamics", False))
+        if param_dynamics_enabled:
+            param_dynamics_freq = int(
+                train_options.get("monitor_param_dynamics_freq") or train_options["display_freq"]
+            )
+            param_dynamics_freq = max(1, param_dynamics_freq)
+            param_dynamics_tb_opt = train_options.get("monitor_param_dynamics_tensorboard", None)
+            if param_dynamics_tb_opt is None:
+                param_dynamics_tb = bool(train_options.get("use_tensorboard", False))
+            else:
+                param_dynamics_tb = bool(param_dynamics_tb_opt)
+            trainer.register_plugin(
+                ParamDynamicsMonitor(
+                    output,
+                    interval=[(param_dynamics_freq, 'iteration')],
+                    tensorboard=param_dynamics_tb,
+                    dead_patience=train_options.get("monitor_param_dynamics_dead_patience", 3),
+                    delta_eps=train_options.get("monitor_param_dynamics_delta_eps", 0.0),
+                    grad_eps=train_options.get("monitor_param_dynamics_grad_eps", 0.0),
+                    delta_norm_dead_threshold=train_options.get(
+                        "monitor_param_dynamics_delta_norm_dead_threshold", 0.0
+                    ),
+                    grad_norm_dead_threshold=train_options.get(
+                        "monitor_param_dynamics_grad_norm_dead_threshold", 0.0
+                    ),
+                )
+            )
+
+        monitor_flag = train_options.get("monitor_flag", False)
         if monitor_flag and cuda_memory_enabled:
             module_memory_output = output or "monitor_logs"
             if distributed_expert:
