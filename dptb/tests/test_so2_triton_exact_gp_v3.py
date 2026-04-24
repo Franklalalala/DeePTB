@@ -170,6 +170,39 @@ def test_cuda_real_v3_matches_reference_forward_and_backward(monkeypatch, bwd_mo
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton V3 parity test")
+def test_cuda_real_v3_expert_loop_handles_24_experts(monkeypatch):
+    pytest.importorskip("triton")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_COMPLEX_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_BWD", "expert_loop")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_EXPERT_BLOCK", "4")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_REQUIRE", "1")
+    torch.manual_seed(303)
+    device = torch.device("cuda")
+    split = (4, 3, 2)
+    num_experts = 24
+    x0 = torch.randn(sum(split), 7, device=device, dtype=torch.float32)
+    c0 = torch.randn(len(split), num_experts, device=device, dtype=torch.float32)
+    w0 = torch.randn(num_experts, 10, 7, device=device, dtype=torch.float32)
+    b0 = torch.randn(num_experts, 10, device=device, dtype=torch.float32)
+    sw0 = torch.randn(10, 7, device=device, dtype=torch.float32)
+    sb0 = torch.randn(10, device=device, dtype=torch.float32)
+    gout = torch.randn(sum(split), 10, device=device, dtype=torch.float32)
+
+    args_ref = [_clone_requires_grad(t) for t in (x0, c0, w0, b0, sw0, sb0)]
+    out_ref = reference_exact_moe_linear(*args_ref, split)
+    out_ref.backward(gout)
+
+    args_v3 = [_clone_requires_grad(t) for t in (x0, c0, w0, b0, sw0, sb0)]
+    out_v3 = exact_moe_linear_v3(*args_v3, split)
+    out_v3.backward(gout)
+
+    torch.testing.assert_close(out_v3, out_ref, rtol=1e-4, atol=2e-4)
+    for got, exp in zip(args_v3, args_ref):
+        torch.testing.assert_close(got.grad, exp.grad, rtol=2e-4, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton V3 parity test")
 @pytest.mark.parametrize("bwd_mode", ("expert_loop", "v2_atomic", "torch"))
 def test_cuda_complex_v3_matches_reference_forward_and_backward(monkeypatch, bwd_mode):
     pytest.importorskip("triton")
@@ -185,6 +218,37 @@ def test_cuda_complex_v3_matches_reference_forward_and_backward(monkeypatch, bwd
     w0 = torch.randn(3, 2 * 7, 5, device=device, dtype=torch.float32)
     sw0 = torch.randn(2 * 7, 5, device=device, dtype=torch.float32)
     gout = torch.randn(sum(split), 2, 7, device=device, dtype=torch.float32)
+
+    args_ref = [_clone_requires_grad(t) for t in (x0, c0, w0, sw0)]
+    out_ref = reference_complex_exact_moe_linear(*args_ref, split)
+    out_ref.backward(gout)
+
+    args_v3 = [_clone_requires_grad(t) for t in (x0, c0, w0, sw0)]
+    out_v3 = complex_exact_moe_linear_v3(*args_v3, split)
+    out_v3.backward(gout)
+
+    torch.testing.assert_close(out_v3, out_ref, rtol=1e-4, atol=2e-4)
+    for got, exp in zip(args_v3, args_ref):
+        torch.testing.assert_close(got.grad, exp.grad, rtol=2e-4, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton V3 parity test")
+def test_cuda_complex_v3_expert_loop_handles_24_experts(monkeypatch):
+    pytest.importorskip("triton")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_COMPLEX_EXACT_GP_V3", "1")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_BWD", "expert_loop")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_EXPERT_BLOCK", "4")
+    monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3_REQUIRE", "1")
+    torch.manual_seed(304)
+    device = torch.device("cuda")
+    split = (3, 4)
+    num_experts = 24
+    x0 = torch.randn(sum(split), 2, 6, device=device, dtype=torch.float32)
+    c0 = torch.randn(len(split), num_experts, device=device, dtype=torch.float32)
+    w0 = torch.randn(num_experts, 2 * 9, 6, device=device, dtype=torch.float32)
+    sw0 = torch.randn(2 * 9, 6, device=device, dtype=torch.float32)
+    gout = torch.randn(sum(split), 2, 9, device=device, dtype=torch.float32)
 
     args_ref = [_clone_requires_grad(t) for t in (x0, c0, w0, sw0)]
     out_ref = reference_complex_exact_moe_linear(*args_ref, split)

@@ -1,38 +1,43 @@
 # Copyright 2026.
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Triton graph-persistent exact MoE V3 overlay for DeePTB.
+"""Triton graph-persistent exact MoE V4 overlay for DeePTB.
 
-V3 builds on ``so2_triton_exact_gp_v2`` and keeps the same exact graph-mix
-semantics, but changes the aggressive backward reduce kernel.  V2 launches one
-Triton program per ``(graph, expert, row_chunk, out_tile, in_tile)``.  That is
-simple and memory-light, but it reloads the same ``x`` and ``grad_y`` tile for
-every expert.  V3 instead launches one program per
-``(graph, row_chunk, out_tile, in_tile)`` and loops over experts inside the
-program.  This keeps the no-``grad_mixed_w`` property while reducing x/grad_y
-traffic, launch tiles, and shared-weight/shared-bias atomics.
+V4 builds on the V3 exact graph-persistent path.  V3's reduce kernel already
+loads each ``x`` / ``grad_y`` tile once and loops over experts inside the
+program, but it still atomically accumulates ``grad_coeff[g, e]`` from every
+``(row_chunk, out_tile, in_tile)`` program.  That scalar atomic can become a hot
+spot when the number of row chunks and N/K tiles is large.
 
-The implementation is intentionally opt-in and can fall back to V2 or the exact
-Torch backward at runtime.
+V4 keeps the memory-light fused ``dW`` / ``dBias`` / shared-gradient atomics, but
+moves the coefficient gradient to a two-stage path:
+
+1. the main reduce kernel stores one small partial ``dCoeff`` value per
+   ``(graph, expert, tile)`` instead of atomic-adding into ``grad_coeff``;
+2. a second tiny Triton kernel reduces those partials to the final
+   ``grad_coeff``.
+
+The scratch tensor is intentionally bounded by
+``DPTB_TRITON_EXACT_GP_V4_COEFF_SCRATCH_LIMIT_MB`` and the implementation can
+fall back to V3/V2/Torch at runtime.  This route is experimental and opt-in.
 
 Environment switches
 --------------------
-DPTB_TRITON_EXACT_GP_V3=1
-    Enable real-valued V3.
-DPTB_TRITON_COMPLEX_EXACT_GP_V3=1
-    Enable complex SO2_m V3.  If unset, it inherits
-    DPTB_TRITON_EXACT_GP_V3.
-DPTB_TRITON_EXACT_GP_V3_BWD=expert_loop|v2_atomic|torch
-    Use the V3 expert-loop atomic reduce, the V2 atomic reduce, or the exact
-    Torch reduce.  ``expert_loop`` is the default.
-DPTB_TRITON_EXACT_GP_V3_REQUIRE=1
+DPTB_TRITON_EXACT_GP_V4=1
+    Enable real-valued V4.
+DPTB_TRITON_COMPLEX_EXACT_GP_V4=1
+    Enable complex SO2_m V4.  If unset, it inherits
+    DPTB_TRITON_EXACT_GP_V4.
+DPTB_TRITON_EXACT_GP_V4_BWD=split_coeff|v3_atomic|v2_atomic|torch
+    Use the two-stage coefficient reduce, V3 expert-loop atomic reduce,
+    V2 atomic reduce, or exact Torch backward.  ``split_coeff`` is the default.
+DPTB_TRITON_EXACT_GP_V4_REQUIRE=1
     Raise on CPU / non-fp32 / missing Triton instead of silently falling back.
+DPTB_TRITON_EXACT_GP_V4_COEFF_SCRATCH_LIMIT_MB=128
+    Upper bound for the temporary coefficient-partials buffer.  Set to 0 to
+    disable the limit.
 
-Tile knobs use V3 names first and fall back to V2 names for compatibility:
-DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_M, _N, _K.
-DPTB_TRITON_EXACT_GP_V3_EXPERT_BLOCK.
-    Number of experts unrolled per V3 expert-loop reduce program.  Defaults to
-    4 to keep production 24-expert specializations below CUDA launch resource
-    limits while still reusing each x/grad_y tile across several experts.
+Tile knobs use V4 names first, then V3 names, then V2 names:
+DPTB_TRITON_EXACT_GP_V4_REDUCE_BLOCK_M, _N, _K.
 """
 
 from __future__ import annotations
@@ -67,57 +72,123 @@ from .so2_triton_exact_gp_v2 import (  # type: ignore[attr-defined]
     tl,
     triton,
 )
+from .so2_triton_exact_gp_v3 import (  # type: ignore[attr-defined]
+    _launch_complex_dw_dc_expert_loop_atomic,
+    _launch_real_dw_dc_expert_loop_atomic,
+)
 
 
-def use_exact_gp_v3() -> bool:
-    """Whether the real-valued V3 route is requested."""
+def use_exact_gp_v4() -> bool:
+    """Whether the real-valued V4 route is requested."""
 
-    return _env_flag("DPTB_TRITON_EXACT_GP_V3", "0")
+    return _env_flag("DPTB_TRITON_EXACT_GP_V4", "0")
 
 
-def use_complex_exact_gp_v3() -> bool:
-    """Whether the complex V3 route is requested."""
+def use_complex_exact_gp_v4() -> bool:
+    """Whether the complex V4 route is requested."""
 
     return _env_flag(
-        "DPTB_TRITON_COMPLEX_EXACT_GP_V3",
-        os.environ.get("DPTB_TRITON_EXACT_GP_V3", "0"),
+        "DPTB_TRITON_COMPLEX_EXACT_GP_V4",
+        os.environ.get("DPTB_TRITON_EXACT_GP_V4", "0"),
     )
 
 
-def _require_v3() -> bool:
+def _require_v4() -> bool:
     return _env_flag(
-        "DPTB_TRITON_EXACT_GP_V3_REQUIRE",
-        os.environ.get("DPTB_TRITON_EXACT_GP_V2_REQUIRE", "0"),
+        "DPTB_TRITON_EXACT_GP_V4_REQUIRE",
+        os.environ.get("DPTB_TRITON_EXACT_GP_V3_REQUIRE", os.environ.get("DPTB_TRITON_EXACT_GP_V2_REQUIRE", "0")),
     )
 
 
-def _env_int_v3(name: str, v2_name: str, default: int) -> int:
-    if os.environ.get(name) not in (None, ""):
-        return _env_int(name, default)
-    return _env_int(v2_name, default)
+def _env_int_cascade(names: Sequence[str], default: int) -> int:
+    for name in names:
+        if os.environ.get(name) not in (None, ""):
+            return _env_int(name, default)
+    return int(default)
 
 
 def _bwd_mode() -> str:
-    return os.environ.get("DPTB_TRITON_EXACT_GP_V3_BWD", "expert_loop").strip().lower()
+    return os.environ.get("DPTB_TRITON_EXACT_GP_V4_BWD", "split_coeff").strip().lower()
 
 
-def _expert_block_v3(num_experts: int) -> int:
-    """Limit expert-loop unrolling in the V3 reduce kernel specialization."""
+def _scratch_limit_bytes() -> int:
+    value = os.environ.get("DPTB_TRITON_EXACT_GP_V4_COEFF_SCRATCH_LIMIT_MB", "128")
+    try:
+        mb = float(value)
+    except ValueError:
+        mb = 128.0
+    if mb <= 0:
+        return 0
+    return int(mb * 1024 * 1024)
 
-    value = _env_int("DPTB_TRITON_EXACT_GP_V3_EXPERT_BLOCK", 4)
-    return max(1, min(int(num_experts), int(value)))
+
+def _scratch_fits(num_groups: int, num_experts: int, total_tiles: int, dtype: torch.dtype) -> bool:
+    limit = _scratch_limit_bytes()
+    if limit <= 0:
+        return True
+    elem_size = torch.empty((), dtype=dtype).element_size()
+    needed = int(num_groups) * int(num_experts) * int(total_tiles) * elem_size
+    return needed <= limit
+
+
+def _reduce_blocks() -> tuple[int, int, int]:
+    block_m = _env_int_cascade(
+        (
+            "DPTB_TRITON_EXACT_GP_V4_REDUCE_BLOCK_M",
+            "DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_M",
+            "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_M",
+        ),
+        64,
+    )
+    block_n = _env_int_cascade(
+        (
+            "DPTB_TRITON_EXACT_GP_V4_REDUCE_BLOCK_N",
+            "DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_N",
+            "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_N",
+        ),
+        16,
+    )
+    block_k = _env_int_cascade(
+        (
+            "DPTB_TRITON_EXACT_GP_V4_REDUCE_BLOCK_K",
+            "DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_K",
+            "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_K",
+        ),
+        32,
+    )
+    return int(block_m), int(block_n), int(block_k)
 
 
 if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machines
 
     @triton.jit
-    def _real_dw_dc_expert_loop_atomic_kernel(
+    def _reduce_coeff_partials_kernel(
+        partial_ptr,
+        grad_c_ptr,
+        TOTAL_TILES: tl.constexpr,
+        NUM_EXPERTS: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        g = tl.program_id(0)
+        e = tl.program_id(1)
+        offs = tl.arange(0, BLOCK_T)
+        acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        base = (g * NUM_EXPERTS + e) * TOTAL_TILES
+        for t0 in range(0, TOTAL_TILES, BLOCK_T):
+            idx = t0 + offs
+            vals = tl.load(partial_ptr + base + idx, mask=idx < TOTAL_TILES, other=0.0)
+            acc += vals
+        total = tl.sum(acc, axis=0)
+        tl.store(grad_c_ptr + g * NUM_EXPERTS + e, total)
+
+    @triton.jit
+    def _real_dw_dc_split_coeff_kernel(
         x_ptr,
         gy_ptr,
         coeff_ptr,
         w_ptr,
         bias_ptr,
-        grad_c_ptr,
+        coeff_partials_ptr,
         grad_w_ptr,
         grad_b_ptr,
         grad_sw_ptr,
@@ -127,7 +198,6 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
         N_OUT: tl.constexpr,
         K_IN: tl.constexpr,
         NUM_EXPERTS: tl.constexpr,
-        EXPERT_BLOCK: tl.constexpr,
         TILES_N: tl.constexpr,
         TILES_K: tl.constexpr,
         TOTAL_TILES: tl.constexpr,
@@ -141,9 +211,6 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
         flat_pid = tl.program_id(0)
         g = flat_pid // TOTAL_TILES
         pid = flat_pid - g * TOTAL_TILES
-        expert_block_id = tl.program_id(1)
-        expert_base = expert_block_id * EXPERT_BLOCK
-        first_expert_block = expert_block_id == 0
         pid_k = pid % TILES_K
         tmp = pid // TILES_K
         pid_n = tmp % TILES_N
@@ -176,7 +243,7 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
                 grad_sw_ptr + offs_n[:, None] * K_IN + offs_k[None, :],
                 grad_mixed,
                 sem="relaxed",
-                mask=mask_nk & first_expert_block,
+                mask=mask_nk,
             )
 
         gb = tl.sum(gy, axis=0)
@@ -186,44 +253,41 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
                 grad_sb_ptr + offs_n,
                 gb,
                 sem="relaxed",
-                mask=mask_n & only_once_per_n_tile & first_expert_block,
+                mask=mask_n & only_once_per_n_tile,
             )
 
-        for expert_offset in range(EXPERT_BLOCK):
-            e = expert_base + expert_offset
-            valid_e = e < NUM_EXPERTS
-            coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e, mask=valid_e, other=0.0).to(tl.float32)
+        for e in range(NUM_EXPERTS):
+            coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e).to(tl.float32)
             w = tl.load(
                 w_ptr + e * (N_OUT * K_IN) + offs_n[:, None] * K_IN + offs_k[None, :],
-                mask=mask_nk & valid_e,
+                mask=mask_nk,
                 other=0.0,
             )
             tl.atomic_add(
                 grad_w_ptr + e * (N_OUT * K_IN) + offs_n[:, None] * K_IN + offs_k[None, :],
                 coeff * grad_mixed,
                 sem="relaxed",
-                mask=mask_nk & valid_e,
+                mask=mask_nk,
             )
-
             grad_c_sum = tl.sum(tl.sum(grad_mixed * w, axis=0), axis=0)
             if HAS_BIAS:
-                b = tl.load(bias_ptr + e * N_OUT + offs_n, mask=mask_n & valid_e, other=0.0)
+                b = tl.load(bias_ptr + e * N_OUT + offs_n, mask=mask_n, other=0.0)
                 tl.atomic_add(
                     grad_b_ptr + e * N_OUT + offs_n,
                     coeff * gb,
                     sem="relaxed",
-                    mask=mask_n & only_once_per_n_tile & valid_e,
+                    mask=mask_n & only_once_per_n_tile,
                 )
                 grad_c_sum += tl.where(only_once_per_n_tile, tl.sum(gb * b, axis=0), 0.0)
-            tl.atomic_add(grad_c_ptr + g * NUM_EXPERTS + e, grad_c_sum, sem="relaxed", mask=valid_e)
+            tl.store(coeff_partials_ptr + (g * NUM_EXPERTS + e) * TOTAL_TILES + pid, grad_c_sum)
 
     @triton.jit
-    def _complex_dw_dc_expert_loop_atomic_kernel(
+    def _complex_dw_dc_split_coeff_kernel(
         x_ptr,
         gy_ptr,
         coeff_ptr,
         w_ptr,
-        grad_c_ptr,
+        coeff_partials_ptr,
         grad_w_ptr,
         grad_sw_ptr,
         row_offsets_ptr,
@@ -231,7 +295,6 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
         N_OUT: tl.constexpr,
         K_IN: tl.constexpr,
         NUM_EXPERTS: tl.constexpr,
-        EXPERT_BLOCK: tl.constexpr,
         TILES_N: tl.constexpr,
         TILES_K: tl.constexpr,
         TOTAL_TILES: tl.constexpr,
@@ -243,9 +306,6 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
         flat_pid = tl.program_id(0)
         g = flat_pid // TOTAL_TILES
         pid = flat_pid - g * TOTAL_TILES
-        expert_block_id = tl.program_id(1)
-        expert_base = expert_block_id * EXPERT_BLOCK
-        first_expert_block = expert_block_id == 0
         pid_k = pid % TILES_K
         tmp = pid // TILES_K
         pid_n = tmp % TILES_N
@@ -294,46 +354,59 @@ if _TRITON_AVAILABLE:  # pragma: no cover - compiled only on CUDA/Triton machine
                 grad_sw_ptr + offs_n[:, None] * K_IN + offs_k[None, :],
                 grad_wr,
                 sem="relaxed",
-                mask=mask_nk & first_expert_block,
+                mask=mask_nk,
             )
             tl.atomic_add(
                 grad_sw_ptr + (N_OUT + offs_n[:, None]) * K_IN + offs_k[None, :],
                 grad_wi,
                 sem="relaxed",
-                mask=mask_nk & first_expert_block,
+                mask=mask_nk,
             )
 
-        for expert_offset in range(EXPERT_BLOCK):
-            e = expert_base + expert_offset
-            valid_e = e < NUM_EXPERTS
-            coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e, mask=valid_e, other=0.0).to(tl.float32)
+        for e in range(NUM_EXPERTS):
+            coeff = tl.load(coeff_ptr + g * NUM_EXPERTS + e).to(tl.float32)
             wr = tl.load(
                 w_ptr + e * (2 * N_OUT * K_IN) + offs_n[:, None] * K_IN + offs_k[None, :],
-                mask=mask_nk & valid_e,
+                mask=mask_nk,
                 other=0.0,
             )
             wi = tl.load(
                 w_ptr + e * (2 * N_OUT * K_IN) + (N_OUT + offs_n[:, None]) * K_IN + offs_k[None, :],
-                mask=mask_nk & valid_e,
+                mask=mask_nk,
                 other=0.0,
             )
             tl.atomic_add(
                 grad_w_ptr + e * (2 * N_OUT * K_IN) + offs_n[:, None] * K_IN + offs_k[None, :],
                 coeff * grad_wr,
                 sem="relaxed",
-                mask=mask_nk & valid_e,
+                mask=mask_nk,
             )
             tl.atomic_add(
                 grad_w_ptr + e * (2 * N_OUT * K_IN) + (N_OUT + offs_n[:, None]) * K_IN + offs_k[None, :],
                 coeff * grad_wi,
                 sem="relaxed",
-                mask=mask_nk & valid_e,
+                mask=mask_nk,
             )
             grad_c_sum = tl.sum(tl.sum(grad_wr * wr + grad_wi * wi, axis=0), axis=0)
-            tl.atomic_add(grad_c_ptr + g * NUM_EXPERTS + e, grad_c_sum, sem="relaxed", mask=valid_e)
+            tl.store(coeff_partials_ptr + (g * NUM_EXPERTS + e) * TOTAL_TILES + pid, grad_c_sum)
 
 
-def _launch_real_dw_dc_expert_loop_atomic(
+def _launch_reduce_coeff_partials(coeff_partials: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+    assert triton is not None
+    grad_c = torch.empty_like(coefficients)
+    total_tiles = int(coeff_partials.shape[2])
+    block_t = _env_int_cascade(("DPTB_TRITON_EXACT_GP_V4_COEFF_REDUCE_BLOCK_T",), 1024)
+    _reduce_coeff_partials_kernel[(int(coefficients.shape[0]), int(coefficients.shape[1]))](
+        coeff_partials,
+        grad_c,
+        TOTAL_TILES=total_tiles,
+        NUM_EXPERTS=int(coefficients.shape[1]),
+        BLOCK_T=block_t,
+    )
+    return grad_c
+
+
+def _launch_real_dw_dc_split_coeff(
     flat_x: torch.Tensor,
     flat_grad: torch.Tensor,
     coefficients: torch.Tensor,
@@ -344,9 +417,9 @@ def _launch_real_dw_dc_expert_loop_atomic(
     rows_per_group: Sequence[int],
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not _can_use_triton(flat_x, flat_grad, coefficients, weight_experts, bias_experts, shared_weight, shared_bias):
-        if _require_v3():
+        if _require_v4():
             raise RuntimeError(
-                "DPTB_TRITON_EXACT_GP_V3_REQUIRE=1 but real V3 expert-loop backward needs CUDA float32 tensors and Triton."
+                "DPTB_TRITON_EXACT_GP_V4_REQUIRE=1 but real V4 split-coeff backward needs CUDA float32 tensors and Triton."
             )
         _, grad_c, grad_w, grad_b, grad_sw, grad_sb = _real_torch_backward(
             flat_x,
@@ -362,33 +435,40 @@ def _launch_real_dw_dc_expert_loop_atomic(
 
     assert triton is not None
     row_offsets, row_sizes = _meta_tensors(rows_per_group, flat_x.device)
-    block_m = _env_int_v3("DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_M", "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_M", 64)
-    block_n = _env_int_v3("DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_N", "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_N", 16)
-    block_k = _env_int_v3("DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_K", "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_K", 32)
+    block_m, block_n, block_k = _reduce_blocks()
     n_out = int(weight_experts.shape[1])
     k_in = int(weight_experts.shape[2])
-    num_experts = int(coefficients.shape[1])
-    expert_block = _expert_block_v3(num_experts)
-    expert_blocks = _cdiv(num_experts, expert_block)
     tiles_n = _cdiv(n_out, block_n)
     tiles_k = _cdiv(k_in, block_k)
     max_chunks = max(1, max(_cdiv(int(v), block_m) for v in rows_per_group))
-    total_tiles = max_chunks * tiles_n * tiles_k
+    total_tiles = int(max_chunks * tiles_n * tiles_k)
+    if not _scratch_fits(len(rows_per_group), int(coefficients.shape[1]), total_tiles, coefficients.dtype):
+        if _require_v4():
+            raise RuntimeError(
+                "DPTB_TRITON_EXACT_GP_V4 coefficient scratch exceeds DPTB_TRITON_EXACT_GP_V4_COEFF_SCRATCH_LIMIT_MB."
+            )
+        return _launch_real_dw_dc_expert_loop_atomic(
+            flat_x, flat_grad, coefficients, weight_experts, bias_experts, shared_weight, shared_bias, rows_per_group
+        )
 
-    grad_c = torch.zeros_like(coefficients)
+    coeff_partials = torch.empty(
+        (len(rows_per_group), int(coefficients.shape[1]), total_tiles),
+        device=flat_x.device,
+        dtype=flat_x.dtype,
+    )
     grad_w = torch.zeros_like(weight_experts)
     grad_b = torch.zeros_like(bias_experts) if bias_experts is not None else None
     grad_sw = torch.zeros_like(shared_weight) if shared_weight is not None else None
     grad_sb = torch.zeros_like(shared_bias) if shared_bias is not None else None
 
-    grid = (len(rows_per_group) * total_tiles, expert_blocks)
-    _real_dw_dc_expert_loop_atomic_kernel[grid](
+    grid = (len(rows_per_group) * total_tiles,)
+    _real_dw_dc_split_coeff_kernel[grid](
         flat_x.contiguous(),
         flat_grad.contiguous(),
         coefficients.contiguous(),
         weight_experts.contiguous(),
         bias_experts.contiguous() if bias_experts is not None else _empty(flat_x.device, flat_x.dtype),
-        grad_c,
+        coeff_partials,
         grad_w,
         grad_b if grad_b is not None else _empty(flat_x.device, flat_x.dtype),
         grad_sw if grad_sw is not None else _empty(flat_x.device, flat_x.dtype),
@@ -397,8 +477,7 @@ def _launch_real_dw_dc_expert_loop_atomic(
         row_sizes,
         N_OUT=n_out,
         K_IN=k_in,
-        NUM_EXPERTS=num_experts,
-        EXPERT_BLOCK=expert_block,
+        NUM_EXPERTS=int(coefficients.shape[1]),
         TILES_N=tiles_n,
         TILES_K=tiles_k,
         TOTAL_TILES=total_tiles,
@@ -409,10 +488,11 @@ def _launch_real_dw_dc_expert_loop_atomic(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
     )
+    grad_c = _launch_reduce_coeff_partials(coeff_partials, coefficients)
     return grad_c, grad_w, grad_b, grad_sw, grad_sb
 
 
-def _launch_complex_dw_dc_expert_loop_atomic(
+def _launch_complex_dw_dc_split_coeff(
     x_pair: torch.Tensor,
     grad_out: torch.Tensor,
     coefficients: torch.Tensor,
@@ -421,9 +501,9 @@ def _launch_complex_dw_dc_expert_loop_atomic(
     split_sizes: Sequence[int],
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     if not _can_use_triton(x_pair, grad_out, coefficients, weight_experts, shared_weight):
-        if _require_v3():
+        if _require_v4():
             raise RuntimeError(
-                "DPTB_TRITON_EXACT_GP_V3_REQUIRE=1 but complex V3 expert-loop backward needs CUDA float32 tensors and Triton."
+                "DPTB_TRITON_EXACT_GP_V4_REQUIRE=1 but complex V4 split-coeff backward needs CUDA float32 tensors and Triton."
             )
         _, grad_c, grad_w, grad_sw = _complex_torch_backward(
             x_pair, grad_out, coefficients, weight_experts, shared_weight, split_sizes
@@ -432,38 +512,42 @@ def _launch_complex_dw_dc_expert_loop_atomic(
 
     assert triton is not None
     row_offsets, row_sizes = _meta_tensors(split_sizes, x_pair.device)
-    block_m = _env_int_v3("DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_M", "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_M", 64)
-    block_n = _env_int_v3("DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_N", "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_N", 16)
-    block_k = _env_int_v3("DPTB_TRITON_EXACT_GP_V3_REDUCE_BLOCK_K", "DPTB_TRITON_EXACT_GP_V2_REDUCE_BLOCK_K", 32)
+    block_m, block_n, block_k = _reduce_blocks()
     n_out = int(weight_experts.shape[1] // 2)
     k_in = int(weight_experts.shape[2])
-    num_experts = int(coefficients.shape[1])
-    expert_block = _expert_block_v3(num_experts)
-    expert_blocks = _cdiv(num_experts, expert_block)
     tiles_n = _cdiv(n_out, block_n)
     tiles_k = _cdiv(k_in, block_k)
     max_chunks = max(1, max(_cdiv(int(v), block_m) for v in split_sizes))
-    total_tiles = max_chunks * tiles_n * tiles_k
+    total_tiles = int(max_chunks * tiles_n * tiles_k)
+    if not _scratch_fits(len(split_sizes), int(coefficients.shape[1]), total_tiles, coefficients.dtype):
+        if _require_v4():
+            raise RuntimeError(
+                "DPTB_TRITON_EXACT_GP_V4 coefficient scratch exceeds DPTB_TRITON_EXACT_GP_V4_COEFF_SCRATCH_LIMIT_MB."
+            )
+        return _launch_complex_dw_dc_expert_loop_atomic(x_pair, grad_out, coefficients, weight_experts, shared_weight, split_sizes)
 
-    grad_c = torch.zeros_like(coefficients)
+    coeff_partials = torch.empty(
+        (len(split_sizes), int(coefficients.shape[1]), total_tiles),
+        device=x_pair.device,
+        dtype=x_pair.dtype,
+    )
     grad_w = torch.zeros_like(weight_experts)
     grad_sw = torch.zeros_like(shared_weight) if shared_weight is not None else None
 
-    grid = (len(split_sizes) * total_tiles, expert_blocks)
-    _complex_dw_dc_expert_loop_atomic_kernel[grid](
+    grid = (len(split_sizes) * total_tiles,)
+    _complex_dw_dc_split_coeff_kernel[grid](
         x_pair.contiguous(),
         grad_out.contiguous(),
         coefficients.contiguous(),
         weight_experts.contiguous(),
-        grad_c,
+        coeff_partials,
         grad_w,
         grad_sw if grad_sw is not None else _empty(x_pair.device, x_pair.dtype),
         row_offsets,
         row_sizes,
         N_OUT=n_out,
         K_IN=k_in,
-        NUM_EXPERTS=num_experts,
-        EXPERT_BLOCK=expert_block,
+        NUM_EXPERTS=int(coefficients.shape[1]),
         TILES_N=tiles_n,
         TILES_K=tiles_k,
         TOTAL_TILES=total_tiles,
@@ -472,10 +556,11 @@ def _launch_complex_dw_dc_expert_loop_atomic(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
     )
+    grad_c = _launch_reduce_coeff_partials(coeff_partials, coefficients)
     return grad_c, grad_w, grad_sw
 
 
-class _ExactMoELinearV3Fn(torch.autograd.Function):
+class _ExactMoELinearV4Fn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -492,10 +577,10 @@ class _ExactMoELinearV3Fn(torch.autograd.Function):
         shared_b_arg = shared_bias if shared_bias.numel() > 0 else None
         _check_real_shapes(x, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, split_sizes)
         flat_x, rows_per_group = _flatten_grouped_rows(x, split_sizes)
-        if use_exact_gp_v3() and _can_use_triton(flat_x, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg):
+        if use_exact_gp_v4() and _can_use_triton(flat_x, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg):
             flat_out = _launch_real_fwd(flat_x, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, rows_per_group)
-        elif use_exact_gp_v3() and _require_v3():
-            raise RuntimeError("DPTB_TRITON_EXACT_GP_V3_REQUIRE=1 but real V3 forward needs CUDA float32 tensors and Triton.")
+        elif use_exact_gp_v4() and _require_v4():
+            raise RuntimeError("DPTB_TRITON_EXACT_GP_V4_REQUIRE=1 but real V4 forward needs CUDA float32 tensors and Triton.")
         else:
             flat_out = reference_exact_moe_linear(
                 flat_x, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, rows_per_group
@@ -515,13 +600,17 @@ class _ExactMoELinearV3Fn(torch.autograd.Function):
         shared_w_arg = shared_weight if ctx.has_shared_weight else None
         shared_b_arg = shared_bias if ctx.has_shared_bias else None
         flat_grad = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-        use_cuda = use_exact_gp_v3() and _can_use_triton(
+        use_cuda = use_exact_gp_v4() and _can_use_triton(
             flat_x, flat_grad, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg
         )
         if use_cuda:
             grad_x = _launch_real_dx(flat_grad, coefficients, weight_experts, shared_w_arg, ctx.rows_per_group)
             mode = _bwd_mode()
-            if mode in {"expert_loop", "atomic", "v3", "v3_atomic"}:
+            if mode in {"split_coeff", "split", "v4", "v4_split_coeff"}:
+                grad_coeff, grad_w, grad_b, grad_sw, grad_sb = _launch_real_dw_dc_split_coeff(
+                    flat_x, flat_grad, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, ctx.rows_per_group
+                )
+            elif mode in {"v3", "v3_atomic", "expert_loop", "atomic"}:
                 grad_coeff, grad_w, grad_b, grad_sw, grad_sb = _launch_real_dw_dc_expert_loop_atomic(
                     flat_x, flat_grad, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, ctx.rows_per_group
                 )
@@ -534,9 +623,9 @@ class _ExactMoELinearV3Fn(torch.autograd.Function):
                     flat_x, flat_grad, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, ctx.rows_per_group
                 )
             else:
-                raise ValueError("DPTB_TRITON_EXACT_GP_V3_BWD must be expert_loop, v2_atomic, or torch")
-        elif use_exact_gp_v3() and _require_v3():
-            raise RuntimeError("DPTB_TRITON_EXACT_GP_V3_REQUIRE=1 but real V3 backward needs CUDA float32 tensors and Triton.")
+                raise ValueError("DPTB_TRITON_EXACT_GP_V4_BWD must be split_coeff, v3_atomic, v2_atomic, or torch")
+        elif use_exact_gp_v4() and _require_v4():
+            raise RuntimeError("DPTB_TRITON_EXACT_GP_V4_REQUIRE=1 but real V4 backward needs CUDA float32 tensors and Triton.")
         else:
             grad_x, grad_coeff, grad_w, grad_b, grad_sw, grad_sb = _real_torch_backward(
                 flat_x, flat_grad, coefficients, weight_experts, bias_arg, shared_w_arg, shared_b_arg, ctx.rows_per_group
@@ -544,7 +633,7 @@ class _ExactMoELinearV3Fn(torch.autograd.Function):
         return grad_x.reshape(ctx.orig_shape), grad_coeff, grad_w, grad_b, grad_sw, grad_sb, None
 
 
-def exact_moe_linear_v3(
+def exact_moe_linear_v4(
     x: torch.Tensor,
     coefficients: torch.Tensor,
     weight_experts: torch.Tensor,
@@ -553,10 +642,10 @@ def exact_moe_linear_v3(
     shared_bias: Optional[torch.Tensor],
     split_sizes: Sequence[int],
 ) -> torch.Tensor:
-    """Drop-in exact MoE linear with V3 expert-loop backward fusion."""
+    """Drop-in exact MoE linear with V4 split-coefficient backward fusion."""
 
     split_sizes = _canonical_split_sizes(split_sizes)
-    return _ExactMoELinearV3Fn.apply(
+    return _ExactMoELinearV4Fn.apply(
         x,
         coefficients,
         weight_experts,
@@ -567,7 +656,7 @@ def exact_moe_linear_v3(
     )
 
 
-class _ComplexExactMoELinearV3Fn(torch.autograd.Function):
+class _ComplexExactMoELinearV4Fn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -579,10 +668,10 @@ class _ComplexExactMoELinearV3Fn(torch.autograd.Function):
     ) -> torch.Tensor:
         shared_w_arg = shared_weight if shared_weight.numel() > 0 else None
         _check_complex_shapes(x_pair, coefficients, weight_experts, shared_w_arg, split_sizes)
-        if use_complex_exact_gp_v3() and _can_use_triton(x_pair, coefficients, weight_experts, shared_w_arg):
+        if use_complex_exact_gp_v4() and _can_use_triton(x_pair, coefficients, weight_experts, shared_w_arg):
             out = _launch_complex_fwd(x_pair, coefficients, weight_experts, shared_w_arg, split_sizes)
-        elif use_complex_exact_gp_v3() and _require_v3():
-            raise RuntimeError("DPTB_TRITON_EXACT_GP_V3_REQUIRE=1 but complex V3 forward needs CUDA float32 tensors and Triton.")
+        elif use_complex_exact_gp_v4() and _require_v4():
+            raise RuntimeError("DPTB_TRITON_EXACT_GP_V4_REQUIRE=1 but complex V4 forward needs CUDA float32 tensors and Triton.")
         else:
             out = reference_complex_exact_moe_linear(x_pair, coefficients, weight_experts, shared_w_arg, split_sizes)
         ctx.save_for_backward(x_pair.contiguous(), coefficients, weight_experts, shared_weight)
@@ -595,11 +684,15 @@ class _ComplexExactMoELinearV3Fn(torch.autograd.Function):
         x_pair, coefficients, weight_experts, shared_weight = ctx.saved_tensors
         shared_w_arg = shared_weight if ctx.has_shared_weight else None
         grad_out = grad_out.contiguous()
-        use_cuda = use_complex_exact_gp_v3() and _can_use_triton(x_pair, grad_out, coefficients, weight_experts, shared_w_arg)
+        use_cuda = use_complex_exact_gp_v4() and _can_use_triton(x_pair, grad_out, coefficients, weight_experts, shared_w_arg)
         if use_cuda:
             grad_x = _launch_complex_dx(grad_out, coefficients, weight_experts, shared_w_arg, ctx.split_sizes)
             mode = _bwd_mode()
-            if mode in {"expert_loop", "atomic", "v3", "v3_atomic"}:
+            if mode in {"split_coeff", "split", "v4", "v4_split_coeff"}:
+                grad_coeff, grad_w, grad_sw = _launch_complex_dw_dc_split_coeff(
+                    x_pair, grad_out, coefficients, weight_experts, shared_w_arg, ctx.split_sizes
+                )
+            elif mode in {"v3", "v3_atomic", "expert_loop", "atomic"}:
                 grad_coeff, grad_w, grad_sw = _launch_complex_dw_dc_expert_loop_atomic(
                     x_pair, grad_out, coefficients, weight_experts, shared_w_arg, ctx.split_sizes
                 )
@@ -612,9 +705,9 @@ class _ComplexExactMoELinearV3Fn(torch.autograd.Function):
                     x_pair, grad_out, coefficients, weight_experts, shared_w_arg, ctx.split_sizes
                 )
             else:
-                raise ValueError("DPTB_TRITON_EXACT_GP_V3_BWD must be expert_loop, v2_atomic, or torch")
-        elif use_complex_exact_gp_v3() and _require_v3():
-            raise RuntimeError("DPTB_TRITON_EXACT_GP_V3_REQUIRE=1 but complex V3 backward needs CUDA float32 tensors and Triton.")
+                raise ValueError("DPTB_TRITON_EXACT_GP_V4_BWD must be split_coeff, v3_atomic, v2_atomic, or torch")
+        elif use_complex_exact_gp_v4() and _require_v4():
+            raise RuntimeError("DPTB_TRITON_EXACT_GP_V4_REQUIRE=1 but complex V4 backward needs CUDA float32 tensors and Triton.")
         else:
             grad_x, grad_coeff, grad_w, grad_sw = _complex_torch_backward(
                 x_pair, grad_out, coefficients, weight_experts, shared_w_arg, ctx.split_sizes
@@ -622,17 +715,17 @@ class _ComplexExactMoELinearV3Fn(torch.autograd.Function):
         return grad_x, grad_coeff, grad_w, grad_sw, None
 
 
-def complex_exact_moe_linear_v3(
+def complex_exact_moe_linear_v4(
     x_pair: torch.Tensor,
     coefficients: torch.Tensor,
     weight_experts: torch.Tensor,
     shared_weight: Optional[torch.Tensor],
     split_sizes: Sequence[int],
 ) -> torch.Tensor:
-    """Drop-in exact complex MoE linear with V3 expert-loop backward fusion."""
+    """Drop-in exact complex MoE linear with V4 split-coefficient backward fusion."""
 
     split_sizes = _canonical_split_sizes(split_sizes)
-    return _ComplexExactMoELinearV3Fn.apply(
+    return _ComplexExactMoELinearV4Fn.apply(
         x_pair,
         coefficients,
         weight_experts,
