@@ -289,8 +289,8 @@ def train_options():
         Argument("monitor_param_dynamics_dead_patience", int, optional=True, default=3, doc="Number of consecutive no-gradient/no-update samples before marking a group as DEAD."),
         Argument("monitor_param_dynamics_delta_eps", float, optional=True, default=0.0, doc="Absolute element-change threshold used for delta_nonzero_fraction."),
         Argument("monitor_param_dynamics_grad_eps", float, optional=True, default=0.0, doc="Absolute gradient threshold used for grad_nonzero_fraction."),
-        Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=0.0, doc="Delta norm threshold used by parameter dynamics DEAD detection."),
-        Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=0.0, doc="Gradient norm threshold used by parameter dynamics DEAD detection."),
+        Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Delta norm threshold used by parameter dynamics DEAD detection."),
+        Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Gradient norm threshold used by parameter dynamics DEAD detection."),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 

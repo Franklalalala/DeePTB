@@ -575,10 +575,10 @@ def train(
                 delta_eps=train_options.get("monitor_param_dynamics_delta_eps", 0.0),
                 grad_eps=train_options.get("monitor_param_dynamics_grad_eps", 0.0),
                 delta_norm_dead_threshold=train_options.get(
-                    "monitor_param_dynamics_delta_norm_dead_threshold", 0.0
+                    "monitor_param_dynamics_delta_norm_dead_threshold", 1.0e-12
                 ),
                 grad_norm_dead_threshold=train_options.get(
-                    "monitor_param_dynamics_grad_norm_dead_threshold", 0.0
+                    "monitor_param_dynamics_grad_norm_dead_threshold", 1.0e-12
                 ),
             )
         )
