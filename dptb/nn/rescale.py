@@ -1,9 +1,10 @@
 import math
+import os
 import torch
 from torch_runstats.scatter import scatter
 from dptb.data import _keys
 import logging
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Tuple
 import torch.nn.functional
 from e3nn.o3 import Linear
 from e3nn.util.jit import compile_mode
@@ -459,9 +460,11 @@ class E3ElementLinear(torch.nn.Module):
         self.dtype = dtype
         shift_indices = []
         scale_indices = []
+        scale_blocks: List[Tuple[int, int, int, int]] = []
 
         count_scales= 0
         count_shift = 0
+        feature_start = 0
         for mul, ir in irreps_in:
             if str(ir) == "0e":
                 self.num_scalar += mul
@@ -473,6 +476,8 @@ class E3ElementLinear(torch.nn.Module):
             for _ in range(mul):
                 scale_indices += [count_scales] * ir.dim
                 count_scales += 1
+            scale_blocks.append((feature_start, count_scales - mul, mul, ir.dim))
+            feature_start += mul * ir.dim
 
         shift_index = torch.as_tensor(shift_indices, dtype=torch.int64, device=self.device)
         scale_index = torch.as_tensor(scale_indices, dtype=torch.int64, device=self.device)
@@ -486,6 +491,8 @@ class E3ElementLinear(torch.nn.Module):
         assert count_scales + count_shift == self.weight_numel
         self.num_scales = count_scales
         self.num_shifts = count_shift
+        self._scale_blocks = tuple(scale_blocks)
+        self._use_block_scale = os.environ.get("DPTB_E3_ELEMENT_LINEAR_MODE", "indexed_gather") == "block_view"
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor]=None):
 
@@ -502,7 +509,15 @@ class E3ElementLinear(torch.nn.Module):
             assert len(scales) == len(
                 x
             ), "in_field doesnt seem to have correct shape as scales"
-            x = scales[:,self.scale_index].reshape(x.shape[0], -1) * x
+            if self._use_block_scale:
+                out = x.clone()
+                for feature_start, scale_start, mul, ir_dim in self._scale_blocks:
+                    out.narrow(1, feature_start, mul * ir_dim).view(x.shape[0], mul, ir_dim).mul_(
+                        scales.narrow(1, scale_start, mul).unsqueeze(-1)
+                    )
+                x = out
+            else:
+                x = scales[:,self.scale_index].reshape(x.shape[0], -1) * x
         else:
             x = x
 
