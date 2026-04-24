@@ -1,6 +1,7 @@
 from typing import Optional, List, Union, Dict, Tuple
 import math
 import functools
+import os
 import torch
 from torch_runstats.scatter import scatter
 from torch import fx
@@ -34,6 +35,239 @@ from math import ceil
 import logging
 
 log = logging.getLogger(__name__)
+
+
+def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
+    mode = mode or os.environ.get("DPTB_ONEHOT_TP_MODE", "scalar_fast")
+    allowed = {"scalar_fast"}
+    if mode not in allowed:
+        raise ValueError(
+            "0422-cueq-fastest only supports onehot_tp_mode='scalar_fast'. "
+            f"Use the legacy cueq branch for e3nn/auto A/B, got {mode!r}."
+        )
+    return mode
+
+
+def _irreps_slices(irreps: o3.Irreps) -> List[slice]:
+    slices = []
+    offset = 0
+    for mul, ir in irreps:
+        width = mul * ir.dim
+        slices.append(slice(offset, offset + width))
+        offset += width
+    return slices
+
+
+def _instruction_get(instruction, name: str, index: int):
+    if hasattr(instruction, name):
+        return getattr(instruction, name)
+    return instruction[index]
+
+
+def _onehot_weight_shape(connection_mode: str, mul1: int, mul2: int, mul_out: int) -> Tuple[int, ...]:
+    if connection_mode == "uvu":
+        return (mul1, mul2)
+    if connection_mode == "uvw":
+        return (mul1, mul2, mul_out)
+    raise ValueError(f"unsupported scalar onehot TP connection mode {connection_mode!r}")
+
+
+class ScalarOnehotTP(torch.nn.Module):
+    """Fast scalar-onehot tensor product without storing an e3nn TP module."""
+
+    def __init__(
+        self,
+        irreps_in1,
+        irreps_in2,
+        irreps_out,
+        instructions,
+        *,
+        weight_shapes: Optional[List[Tuple[int, ...]]] = None,
+        path_weights: Optional[List[float]] = None,
+        weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.irreps_in1 = o3.Irreps(irreps_in1)
+        self.irreps_in2 = o3.Irreps(irreps_in2)
+        self.irreps_out = o3.Irreps(irreps_out)
+        self._in1_slices = _irreps_slices(self.irreps_in1)
+        self._in2_slices = _irreps_slices(self.irreps_in2)
+        self._out_slices = _irreps_slices(self.irreps_out)
+
+        paths = []
+        scales = []
+        offset = 0
+        for idx, instruction in enumerate(instructions):
+            has_weight = _instruction_get(instruction, "has_weight", 4)
+            if not has_weight:
+                raise ValueError("ScalarOnehotTP requires weighted instructions")
+
+            i_in1 = _instruction_get(instruction, "i_in1", 0)
+            i_in2 = _instruction_get(instruction, "i_in2", 1)
+            i_out = _instruction_get(instruction, "i_out", 2)
+            connection_mode = _instruction_get(instruction, "connection_mode", 3)
+
+            mul1, ir1 = self.irreps_in1[i_in1]
+            mul2, ir2 = self.irreps_in2[i_in2]
+            mul_out, ir_out = self.irreps_out[i_out]
+            if ir2.l != 0 or ir2.p != 1 or ir1 != ir_out:
+                raise ValueError("ScalarOnehotTP only supports scalar second input preserving irreps")
+
+            shape = (
+                tuple(weight_shapes[idx])
+                if weight_shapes is not None
+                else _onehot_weight_shape(connection_mode, mul1, mul2, mul_out)
+            )
+            numel = math.prod(shape)
+            path_weight = (
+                float(path_weights[idx])
+                if path_weights is not None
+                else float(_instruction_get(instruction, "path_weight", 5))
+            )
+            scale = path_weight / math.sqrt(ir_out.dim)
+            paths.append((i_in1, i_in2, i_out, connection_mode, offset, shape, mul1, mul2, mul_out, ir1.dim))
+            scales.append(scale)
+            offset += numel
+
+        self._paths = tuple(paths)
+        init_dtype = weight.dtype if weight is not None else torch.get_default_dtype()
+        init_device = weight.device if weight is not None else None
+        self.register_buffer(
+            "_path_scales",
+            torch.tensor(scales, dtype=init_dtype, device=init_device),
+            persistent=False,
+        )
+        self.weight = torch.nn.Parameter(torch.empty(offset, dtype=init_dtype, device=init_device))
+        if weight is None:
+            torch.nn.init.normal_(self.weight, std=1.0 / math.sqrt(max(offset, 1)))
+        else:
+            if weight.numel() != offset:
+                raise ValueError(f"ScalarOnehotTP weight has {weight.numel()} values, expected {offset}")
+            with torch.no_grad():
+                self.weight.copy_(weight.reshape(-1).to(dtype=self.weight.dtype))
+
+    @classmethod
+    def from_e3nn(cls, tp: torch.nn.Module) -> "ScalarOnehotTP":
+        weight_views = list(tp.weight_views())
+        path_weights = [float(_instruction_get(instruction, "path_weight", 5)) for instruction in tp.instructions]
+        return cls(
+            tp.irreps_in1,
+            tp.irreps_in2,
+            tp.irreps_out,
+            tp.instructions,
+            weight_shapes=[tuple(view.shape) for view in weight_views],
+            path_weights=path_weights,
+            weight=tp.weight.detach(),
+        )
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if x.shape[:-1] != y.shape[:-1]:
+            raise ValueError(f"onehot TP input shapes must share leading dims, got {x.shape} and {y.shape}")
+        if x.shape[-1] != self.irreps_in1.dim or y.shape[-1] != self.irreps_in2.dim:
+            raise ValueError(
+                f"onehot TP input dims mismatch: got x={x.shape[-1]}, y={y.shape[-1]}, "
+                f"expected x={self.irreps_in1.dim}, y={self.irreps_in2.dim}"
+            )
+
+        leading_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+        y_flat = y.reshape(-1, y.shape[-1])
+        out = x_flat.new_zeros((x_flat.shape[0], self.irreps_out.dim))
+        path_scales = self._path_scales.to(dtype=x_flat.dtype, device=x_flat.device)
+
+        for idx, path in enumerate(self._paths):
+            i_in1, i_in2, i_out, connection_mode, offset, shape, mul1, mul2, mul_out, ir_dim = path
+            weight = self.weight.narrow(0, offset, math.prod(shape)).reshape(shape)
+            x_block = x_flat[:, self._in1_slices[i_in1]].reshape(x_flat.shape[0], mul1, ir_dim)
+            y_block = y_flat[:, self._in2_slices[i_in2]].reshape(y_flat.shape[0], mul2)
+
+            if connection_mode == "uvu":
+                mixed = x_block * torch.einsum("nv,uv->nu", y_block, weight).unsqueeze(-1)
+            elif connection_mode == "uvw":
+                mixed = torch.einsum("nui,nv,uvw->nwi", x_block, y_block, weight)
+            else:
+                raise ValueError(f"unsupported scalar onehot TP connection mode {connection_mode!r}")
+
+            out[:, self._out_slices[i_out]] += (
+                mixed * path_scales[idx]
+            ).reshape(x_flat.shape[0], mul_out * ir_dim)
+
+        return out.reshape(*leading_shape, self.irreps_out.dim)
+
+
+def _scalar_onehot_tp_fast(tp: torch.nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Exact fast path for scalar-onehot tensor products.
+
+    The LEM onehot tensor products all use scalar second inputs. For these paths
+    e3nn's TP reduces to per-irrep channel scaling/mixing, so we can avoid the
+    generic tensor product dispatcher while reusing the original e3nn weights.
+    """
+    irreps_in1 = tp.irreps_in1
+    irreps_in2 = tp.irreps_in2
+    irreps_out = tp.irreps_out
+    if x.shape[:-1] != y.shape[:-1]:
+        raise ValueError(f"onehot TP input shapes must share leading dims, got {x.shape} and {y.shape}")
+    if x.shape[-1] != irreps_in1.dim or y.shape[-1] != irreps_in2.dim:
+        raise ValueError(
+            f"onehot TP input dims mismatch: got x={x.shape[-1]}, y={y.shape[-1]}, "
+            f"expected x={irreps_in1.dim}, y={irreps_in2.dim}"
+        )
+
+    leading_shape = x.shape[:-1]
+    x_flat = x.reshape(-1, x.shape[-1])
+    y_flat = y.reshape(-1, y.shape[-1])
+    out = x_flat.new_zeros((x_flat.shape[0], irreps_out.dim))
+
+    in1_slices = _irreps_slices(irreps_in1)
+    in2_slices = _irreps_slices(irreps_in2)
+    out_slices = _irreps_slices(irreps_out)
+    weight_views = iter(tp.weight_views())
+
+    for instruction in tp.instructions:
+        has_weight = _instruction_get(instruction, "has_weight", 4)
+        if not has_weight:
+            raise ValueError("scalar_fast onehot TP requires weighted instructions")
+
+        i_in1 = _instruction_get(instruction, "i_in1", 0)
+        i_in2 = _instruction_get(instruction, "i_in2", 1)
+        i_out = _instruction_get(instruction, "i_out", 2)
+        connection_mode = _instruction_get(instruction, "connection_mode", 3)
+        path_weight = _instruction_get(instruction, "path_weight", 5)
+
+        mul1, ir1 = irreps_in1[i_in1]
+        mul2, ir2 = irreps_in2[i_in2]
+        mul_out, ir_out = irreps_out[i_out]
+        if ir2.l != 0 or ir2.p != 1 or ir1 != ir_out:
+            raise ValueError("scalar_fast onehot TP only supports scalar second input preserving irreps")
+
+        weight = next(weight_views)
+        x_block = x_flat[:, in1_slices[i_in1]].reshape(x_flat.shape[0], mul1, ir1.dim)
+        y_block = y_flat[:, in2_slices[i_in2]].reshape(y_flat.shape[0], mul2)
+        path_weight = x_flat.new_tensor(path_weight)
+
+        if connection_mode == "uvu":
+            if mul_out != mul1:
+                raise ValueError("uvu scalar_fast path requires output multiplicity to match input1")
+            mixed = x_block * torch.einsum("nv,uv->nu", y_block, weight).unsqueeze(-1)
+        elif connection_mode == "uvw":
+            mixed = torch.einsum("nui,nv,uvw->nwi", x_block, y_block, weight)
+        else:
+            raise ValueError(f"unsupported scalar_fast onehot TP connection mode {connection_mode!r}")
+
+        # e3nn's real CG convention for l x 0 -> l contributes 1/sqrt(2l+1).
+        cg_scalar_norm = x_flat.new_tensor(ir_out.dim).rsqrt()
+        out[:, out_slices[i_out]] += (
+            mixed * path_weight * cg_scalar_norm
+        ).reshape(x_flat.shape[0], mul_out * ir_out.dim)
+
+    return out.reshape(*leading_shape, irreps_out.dim)
+
+
+def _apply_onehot_tp(tp: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, mode: str) -> torch.Tensor:
+    mode = _normalize_onehot_tp_mode(mode)
+    if isinstance(tp, ScalarOnehotTP):
+        return tp(x, y)
+    return _scalar_onehot_tp_fast(tp, x, y)
 
 
 @Embedding.register("lem_moe_v3")
@@ -79,6 +313,7 @@ class LemMoEV3(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "staged",
             mole_linear_mode: Optional[str] = None,
+            onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             universal: Optional[bool] = False,
@@ -130,6 +365,8 @@ class LemMoEV3(torch.nn.Module):
         if isinstance(device, str):
             device = torch.device(device)
         self.device = device
+        self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
 
         if basis is not None:
             self.idp = OrbitalMapper(basis, method="e3tb")
@@ -249,6 +486,7 @@ class LemMoEV3(torch.nn.Module):
                 so2_wigner_apply_mode=so2_wigner_apply_mode,
                 so2_fusion_mode=so2_fusion_mode,
                 mole_linear_mode=mole_linear_mode,
+                onehot_tp_mode=self.onehot_tp_mode,
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
@@ -261,16 +499,16 @@ class LemMoEV3(torch.nn.Module):
 
         self.use_out_onehot_tp = use_out_onehot_tp
         if self.use_out_onehot_tp:
-            self.out_node_ele_tp = FullyConnectedTensorProduct(
+            self.out_node_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
                 irreps_in1=self.layers[-1].irreps_out,
                 irreps_in2='95x0e',
                 irreps_out=self.idp.orbpair_irreps,
-            )
-            self.out_edge_ele_tp = FullyConnectedTensorProduct(
+            ))
+            self.out_edge_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
                 irreps_in1=self.layers[-1].irreps_out,
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.idp.orbpair_irreps,
-            )
+            ))
         self.out_edge = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
                                internal_weights=True, biases=True)
         self.out_node = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
@@ -384,8 +622,12 @@ class LemMoEV3(torch.nn.Module):
         out_edge_features = self.out_edge(edge_features)
 
         if self.use_out_onehot_tp:
-            out_node_features = out_node_features + self.out_node_ele_tp(node_features, node_one_hot)
-            out_edge_features = out_edge_features + self.out_edge_ele_tp(edge_features, edge_one_hot)
+            out_node_features = out_node_features + _apply_onehot_tp(
+                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
+            )
+            out_edge_features = out_edge_features + _apply_onehot_tp(
+                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
+            )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
         data[_keys.EDGE_FEATURES_KEY] = torch.zeros(edge_index.shape[1], self.idp.orbpair_irreps.dim, dtype=self.dtype,
@@ -717,6 +959,7 @@ class UpdateNode(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "staged",
             mole_linear_mode: Optional[str] = None,
+            onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -729,6 +972,7 @@ class UpdateNode(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.res_update = res_update
+        self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -840,12 +1084,12 @@ class UpdateNode(torch.nn.Module):
             instructions = []
             for i, (mul, ir) in enumerate(self.irreps_out):
                 instructions.append((i, 0, i, 'uvu', True))
-            self.node_onehot_tp = TensorProduct(
+            self.node_onehot_tp = ScalarOnehotTP.from_e3nn(TensorProduct(
                 irreps_in1=self.irreps_out,
                 irreps_in2=f'95x0e',
                 irreps_out=self.irreps_out,
                 instructions=instructions
-            )
+            ))
         self.use_identity_res = (self.irreps_in == self.irreps_out) and res_update
         if not self.use_identity_res:
             if res_update:
@@ -910,7 +1154,9 @@ class UpdateNode(torch.nn.Module):
             node_features = new_node_features
 
         if self.use_layer_onehot_tp:
-            onehot_tune_node_feat = self.node_onehot_tp(node_features, node_onehot)
+            onehot_tune_node_feat = _apply_onehot_tp(
+                self.node_onehot_tp, node_features, node_onehot, self.onehot_tp_mode
+            )
             node_features = node_features + onehot_tune_node_feat
 
         return node_features
@@ -941,6 +1187,7 @@ class UpdateEdge(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "staged",
             mole_linear_mode: Optional[str] = None,
+            onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -953,6 +1200,7 @@ class UpdateEdge(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.res_update = res_update
+        self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
 
         self._edge_weighter = E3ElementLinear(
             irreps_in=irreps_out,
@@ -1076,12 +1324,12 @@ class UpdateEdge(torch.nn.Module):
             instructions = []
             for i, (mul, ir) in enumerate(self.irreps_out):
                 instructions.append((i, 0, i, 'uvu', True))
-            self.edge_onehot_tp = TensorProduct(
+            self.edge_onehot_tp = ScalarOnehotTP.from_e3nn(TensorProduct(
                 irreps_in1=self.irreps_out,
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.irreps_out,
                 instructions=instructions
-            )
+            ))
 
         self.use_identity_res = (self.irreps_in == self.irreps_out) and res_update
         if not self.use_identity_res:
@@ -1165,7 +1413,9 @@ class UpdateEdge(torch.nn.Module):
                 new_latents
             )
         if self.use_layer_onehot_tp:
-            onehot_tune_edge_feat = self.edge_onehot_tp(edge_features, edge_one_hot)
+            onehot_tune_edge_feat = _apply_onehot_tp(
+                self.edge_onehot_tp, edge_features, edge_one_hot, self.onehot_tp_mode
+            )
             edge_features = edge_features + onehot_tune_edge_feat
 
         return edge_features, latents, wigner_D_all
@@ -1201,6 +1451,7 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "staged",
             mole_linear_mode: Optional[str] = None,
+            onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1243,6 +1494,7 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            onehot_tp_mode=onehot_tp_mode,
         )
 
         self.node_update = UpdateNode(
@@ -1270,6 +1522,7 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            onehot_tp_mode=onehot_tp_mode,
         )
 
         self.node_ffn = None

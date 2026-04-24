@@ -1,4 +1,9 @@
 import os
+
+# Keep the production default conservative for large, shape-varying CUDA jobs.
+# This must be set before torch is imported to reliably affect the allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import json
 import time
 import heapq

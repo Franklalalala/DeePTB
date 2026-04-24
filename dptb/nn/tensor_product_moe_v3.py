@@ -2,6 +2,7 @@
 from e3nn.o3 import xyz_to_angles, Irreps
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import logging
 import warnings
 import math
 import torch
@@ -23,6 +24,7 @@ except (FileNotFoundError, RuntimeError):
     _idx_data = {}
 
 _WIGNER_STATIC_CACHE = {}
+log = logging.getLogger(__name__)
 
 
 def build_z_rot_multi(angle_stack, mask, freq, reversed_inds, offsets, d_total: int):
@@ -574,6 +576,17 @@ class MOLELinear(nn.Module):
                 method="indexed_linear",
             )
             self._cueq_indexed_linear_cache[key] = mod
+            if os.environ.get("DPTB_CUEQ_CACHE_DIAG", "0") not in ("", "0", "false", "False"):
+                log.info(
+                    "Created cuEq indexed_linear cache entry: num_graphs=%s dtype=%s device=%s "
+                    "in=%s out=%s local_entries=%s",
+                    num_graphs,
+                    dtype,
+                    device,
+                    self.in_features,
+                    self.out_features,
+                    len(self._cueq_indexed_linear_cache),
+                )
         return mod
 
     def _infer_cueq_weight_order(self, cue_lin, flat_x, mixed_weights, flat_graph_index):

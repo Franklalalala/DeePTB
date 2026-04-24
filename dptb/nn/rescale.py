@@ -220,8 +220,8 @@ class E3PerEdgeSpeciesScaleShift(torch.nn.Module):
         self.num_scalar = 0
         self.device = device
         self.dtype = dtype
-        self.shift_index = []
-        self.scale_index = []
+        shift_indices = []
+        scale_indices = []
         self.scale_type = scale_type
         self.scales_trainable = scales_trainable
 
@@ -230,17 +230,17 @@ class E3PerEdgeSpeciesScaleShift(torch.nn.Module):
         for mul, ir in irreps_in:
             if getattr(ir, "l", None) == 0:  # 0e + 0o 都算
                 self.num_scalar += mul
-                self.shift_index += list(range(start_scalar, start_scalar + mul))
+                shift_indices += list(range(start_scalar, start_scalar + mul))
                 start_scalar += mul
             else:
-                self.shift_index += [-1] * (mul * ir.dim)
+                shift_indices += [-1] * (mul * ir.dim)
 
             for _ in range(mul):
-                self.scale_index += [start] * ir.dim
+                scale_indices += [start] * ir.dim
                 start += 1
 
-        self.shift_index = torch.as_tensor(self.shift_index, dtype=torch.long, device=device)
-        self.scale_index = torch.as_tensor(self.scale_index, dtype=torch.long, device=device)
+        self.shift_index = torch.as_tensor(shift_indices, dtype=torch.long, device=device)
+        self.scale_index = torch.as_tensor(scale_indices, dtype=torch.long, device=device)
 
         self.has_shifts = shifts is not None
         self.has_scales = (scales is not None) and (scale_type != "no_scale")
@@ -341,8 +341,8 @@ class E3PerSpeciesScaleShift(torch.nn.Module):
         self.out_field = f"shifted_{field}" if out_field is None else out_field
         self.irreps_in = irreps_in
         self.num_scalar = 0
-        self.shift_index = []
-        self.scale_index = []
+        shift_indices = []
+        scale_indices = []
         self.dtype = dtype
         self.device = device
         self.scale_type = scale_type
@@ -354,17 +354,17 @@ class E3PerSpeciesScaleShift(torch.nn.Module):
             # SOC 下既可能有 0e 也可能有 0o；它们都是 l==0 的标量通道
             if getattr(ir, "l", None) == 0:
                 self.num_scalar += mul
-                self.shift_index += list(range(start_scalar, start_scalar + mul))
+                shift_indices += list(range(start_scalar, start_scalar + mul))
                 start_scalar += mul
             else:
-                self.shift_index += [-1] * (mul * ir.dim)
+                shift_indices += [-1] * (mul * ir.dim)
 
             for _ in range(mul):
-                self.scale_index += [start] * ir.dim
+                scale_indices += [start] * ir.dim
                 start += 1
 
-        self.shift_index = torch.as_tensor(self.shift_index, dtype=torch.long, device=device)
-        self.scale_index = torch.as_tensor(self.scale_index, dtype=torch.long, device=device)
+        self.shift_index = torch.as_tensor(shift_indices, dtype=torch.long, device=device)
+        self.scale_index = torch.as_tensor(scale_indices, dtype=torch.long, device=device)
 
         # ---- shifts ----
         self.has_shifts = shifts is not None
@@ -457,25 +457,30 @@ class E3ElementLinear(torch.nn.Module):
         self.num_scalar = 0
         self.device = device
         self.dtype = dtype
-        self.shift_index = []
-        self.scale_index = []
+        shift_indices = []
+        scale_indices = []
 
         count_scales= 0
         count_shift = 0
         for mul, ir in irreps_in:
             if str(ir) == "0e":
                 self.num_scalar += mul
-                self.shift_index += list(range(count_shift, count_shift + mul))
+                shift_indices += list(range(count_shift, count_shift + mul))
                 count_shift += mul
             else:
-                self.shift_index += [-1] * mul * ir.dim
+                shift_indices += [-1] * mul * ir.dim
 
             for _ in range(mul):
-                self.scale_index += [count_scales] * ir.dim
+                scale_indices += [count_scales] * ir.dim
                 count_scales += 1
 
-        self.shift_index = torch.as_tensor(self.shift_index, dtype=torch.int64, device=self.device)
-        self.scale_index = torch.as_tensor(self.scale_index, dtype=torch.int64, device=self.device)
+        shift_index = torch.as_tensor(shift_indices, dtype=torch.int64, device=self.device)
+        scale_index = torch.as_tensor(scale_indices, dtype=torch.int64, device=self.device)
+        shift_mask = shift_index.ge(0)
+        self.register_buffer("shift_index", shift_index, persistent=False)
+        self.register_buffer("scale_index", scale_index, persistent=False)
+        self.register_buffer("shift_mask", shift_mask, persistent=False)
+        self.register_buffer("shift_source_index", shift_index[shift_mask], persistent=False)
 
         self.weight_numel = irreps_in.num_irreps + self.num_scalar
         assert count_scales + count_shift == self.weight_numel
@@ -509,7 +514,7 @@ class E3ElementLinear(torch.nn.Module):
             # bias = torch.zeros_like(x)
             # bias[:, self.shift_index.ge(0)] = shifts[:,self.shift_index[self.shift_index.ge(0)]].reshape(-1, self.num_scalar)
             # x = x + bias
-            x[:, self.shift_index.ge(0)] = shifts[:,self.shift_index[self.shift_index.ge(0)]].reshape(-1, self.num_scalar) + x[:, self.shift_index.ge(0)]
+            x[:, self.shift_mask] = shifts[:, self.shift_source_index].reshape(-1, self.num_scalar) + x[:, self.shift_mask]
         else:
             x = x
 
