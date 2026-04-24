@@ -68,6 +68,7 @@ def test_real_v3_cpu_fallback_matches_reference_forward_backward(monkeypatch):
 
 def test_real_v3_cpu_fallback_no_bias_no_shared(monkeypatch):
     monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3", "1")
+    monkeypatch.delenv("DPTB_TRITON_EXACT_GP_V3_REQUIRE", raising=False)
     torch.manual_seed(102)
     split = (1, 4)
     x = torch.randn(sum(split), 3, dtype=torch.float32, requires_grad=True)
@@ -82,6 +83,7 @@ def test_real_v3_cpu_fallback_no_bias_no_shared(monkeypatch):
 def test_complex_v3_cpu_fallback_matches_reference_forward_backward(monkeypatch):
     monkeypatch.setenv("DPTB_TRITON_EXACT_GP_V3", "1")
     monkeypatch.delenv("DPTB_TRITON_COMPLEX_EXACT_GP_V3", raising=False)
+    monkeypatch.delenv("DPTB_TRITON_EXACT_GP_V3_REQUIRE", raising=False)
     torch.manual_seed(103)
     split = (3, 2, 1)
     x0 = torch.randn(sum(split), 2, 4, dtype=torch.float64)
