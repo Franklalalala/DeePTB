@@ -894,8 +894,8 @@ def slem():
     doc_ffn_apply_to_last = "Whether to also attach the node-wise FFN to the final layer. Default: `False`."
     doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
-    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_aggressive`, `streamed_m_major_cueq`. Default keeps the current staged path; `streamed_m_major_cueq` uses the grouped m-major SO2 dataflow and should be paired with `mole_linear_mode=cueq_indexed_linear` for the cuEquivariance indexed-linear backend."
-    doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. Default `None` uses the DPTB_MOLE_LINEAR_MODE environment variable or falls back to `split_loop`."
+    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_aggressive`, `streamed_m_major_cueq`. The 0422-cueq-fastest branch defaults to `streamed_m_major_cueq`."
+    doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
 
     return [
@@ -947,8 +947,8 @@ def slem():
         Argument("ffn_hidden_factor", float, optional=True, default=0.0, doc=doc_ffn_hidden_factor),
         Argument("ffn_apply_to_last", bool, optional=True, default=False, doc=doc_ffn_apply_to_last),
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
-        Argument("so2_fusion_mode", str, optional=True, default="staged", doc=doc_so2_fusion_mode),
-        Argument("mole_linear_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_mode),
+        Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
+        Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
         Argument("onehot_tp_mode", [str, None], optional=True, default=None, doc=doc_onehot_tp_mode),
 
         # ---- New norm conditioning flags ----
