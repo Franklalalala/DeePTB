@@ -857,8 +857,8 @@ class ParamDynamicsMonitor(Plugin):
         dead_patience=3,
         delta_eps=0.0,
         grad_eps=0.0,
-        delta_norm_dead_threshold=0.0,
-        grad_norm_dead_threshold=0.0,
+        delta_norm_dead_threshold=1.0e-12,
+        grad_norm_dead_threshold=1.0e-12,
     ):
         if interval is None:
             interval = [(1, "iteration")]
