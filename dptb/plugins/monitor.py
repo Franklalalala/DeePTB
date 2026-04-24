@@ -677,6 +677,528 @@ class ScalarFieldMonitor(Monitor):
         return kwargs.get(self.stat_name, None)
 
 
+class CUDAMemoryMonitor(Plugin):
+    """
+    Track CUDA memory scalar fields supplied by Trainer.
+
+    The trainer owns CUDA allocator sampling because it can gather per-rank
+    values before rank0-only logging plugins run. This monitor normalizes those
+    fields into ``trainer.stats`` so Logger and TensorBoard can consume them.
+    """
+
+    _EXPERT_MEMORY_RE = re.compile(r"^expert_\d+_cuda_.*_mb$")
+
+    def __init__(self, interval=None, precision=1):
+        if interval is None:
+            interval = [(1, 'iteration'), (1, 'epoch')]
+        super(CUDAMemoryMonitor, self).__init__(interval)
+        self.precision = int(precision)
+        self._epoch_max = {}
+
+    @classmethod
+    def is_memory_field(cls, name):
+        return isinstance(name, str) and (
+            (name.startswith("cuda_") and name.endswith("_mb"))
+            or cls._EXPERT_MEMORY_RE.match(name) is not None
+        )
+
+    def register(self, trainer):
+        self.trainer = trainer
+        for name in (
+            "cuda_allocated_mb",
+            "cuda_reserved_mb",
+            "cuda_peak_allocated_mb",
+            "cuda_peak_reserved_mb",
+            "cuda_free_mb",
+            "cuda_total_mb",
+        ):
+            self._ensure_stat(name)
+
+    def _to_float(self, val):
+        if val is None:
+            return None
+        if torch.is_tensor(val):
+            val = val.detach()
+            if val.ndim > 0:
+                val = val.mean()
+            return float(val.item())
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _ensure_stat(self, name):
+        stat = self.trainer.stats.setdefault(name, {})
+        fmt = f":.{self.precision}f"
+        stat.setdefault("log_name", name)
+        stat.setdefault("log_format", fmt)
+        stat.setdefault("log_unit", "MB")
+        stat.setdefault("last", 0.0)
+        stat.setdefault("max", 0.0)
+        stat.setdefault("epoch_max", 0.0)
+        stat.setdefault("log_iter_fields", [
+            "{last" + fmt + "}MB",
+            "(max {max" + fmt + "}MB)",
+        ])
+        stat.setdefault("log_epoch_fields", [
+            "{epoch_max" + fmt + "}MB",
+            "(max {max" + fmt + "}MB)",
+        ])
+        return stat
+
+    def iteration(self, **kwargs):
+        for name, raw_val in kwargs.items():
+            if not self.is_memory_field(name):
+                continue
+            val = self._to_float(raw_val)
+            if val is None:
+                continue
+
+            stat = self._ensure_stat(name)
+            stat["last"] = val
+            stat["max"] = max(float(stat.get("max", val)), val)
+
+            prev_epoch = self._epoch_max.get(name)
+            self._epoch_max[name] = val if prev_epoch is None else max(prev_epoch, val)
+            stat["epoch_max"] = self._epoch_max[name]
+
+    def epoch(self, **kwargs):
+        memory_names = {
+            name for name in self.trainer.stats
+            if self.is_memory_field(name)
+        }
+        memory_names.update(
+            name for name in kwargs
+            if self.is_memory_field(name)
+        )
+
+        for name in memory_names:
+            stat = self._ensure_stat(name)
+            if name in kwargs:
+                val = self._to_float(kwargs.get(name))
+                if val is not None:
+                    stat["last"] = val
+                    stat["max"] = max(float(stat.get("max", val)), val)
+                    prev_epoch = self._epoch_max.get(name)
+                    self._epoch_max[name] = val if prev_epoch is None else max(prev_epoch, val)
+
+            epoch_val = self._epoch_max.get(name)
+            if epoch_val is None:
+                epoch_val = stat.get("last", 0.0)
+            stat["epoch_max"] = float(epoch_val)
+            self._epoch_max[name] = None
+
+
+class ParamDynamicsMonitor(Plugin):
+    """
+    Lightweight production monitor for parameter updates and gradient flow.
+
+    It does not register forward/backward hooks. Instead, it samples selected
+    module groups at a coarse interval, keeps one CPU snapshot per parameter,
+    and records real parameter deltas since the previous sample.
+    """
+
+    _EXPERT_RE = re.compile(r"(^|\.)experts\.\d+$")
+    _LAYER_RE = re.compile(r"(^|\.)layers\.\d+$")
+    _CLASS_TOKENS = (
+        "SO2_Linear",
+        "E3ElementLinear",
+        "EqV3",
+        "FFN",
+        "S2Activation",
+        "FlatSwiGLU",
+        "EAMPOpenequiEqV3",
+    )
+    _NAME_TOKENS = (
+        ".tp",
+        "tp.",
+        "node_ffn",
+        "edge_ffn",
+        "ffn",
+        "lin_post",
+        "linear_res",
+        "edge_mixer",
+        "node_mixer",
+        "ele_tp",
+        "element_linear",
+    )
+    _OUTPUT_TOKENS = (
+        "out_node",
+        "out_edge",
+        "node_prediction",
+        "edge_prediction",
+        "prediction_h",
+    )
+    _HEADER = [
+        "iter",
+        "rank",
+        "group",
+        "kind",
+        "param_count",
+        "grad_param_count",
+        "grad_norm",
+        "grad_nonzero_fraction",
+        "weight_norm",
+        "delta_norm",
+        "delta_ratio",
+        "delta_nonzero_fraction",
+        "dead_streak",
+        "status",
+        "dead",
+        "baseline",
+    ]
+
+    def __init__(
+        self,
+        output_dir,
+        interval=None,
+        tensorboard=False,
+        tensorboard_log_dir=None,
+        dead_patience=3,
+        delta_eps=0.0,
+        grad_eps=0.0,
+        delta_norm_dead_threshold=0.0,
+        grad_norm_dead_threshold=0.0,
+    ):
+        if interval is None:
+            interval = [(1, "iteration")]
+        super(ParamDynamicsMonitor, self).__init__(interval)
+        self.output_dir = output_dir or "monitor_logs"
+        self.csv_path = os.path.join(self.output_dir, "param_dynamics.csv")
+        self.tensorboard = bool(tensorboard)
+        self.tensorboard_log_dir = tensorboard_log_dir
+        self.dead_patience = max(1, int(dead_patience))
+        self.delta_eps = float(delta_eps)
+        self.grad_eps = float(grad_eps)
+        self.delta_norm_dead_threshold = float(delta_norm_dead_threshold)
+        self.grad_norm_dead_threshold = float(grad_norm_dead_threshold)
+        self.writer = None
+        self._groups = []
+        self._param_state = {}
+        self._dead_streak = {}
+        self._warned_no_groups = False
+
+    def register(self, trainer):
+        self.trainer = trainer
+        self.rank = int(getattr(trainer, "rank", 0))
+        self.world_size = int(getattr(trainer, "world_size", 1))
+        self.is_main_process = bool(getattr(trainer, "is_main_process", True))
+        self._groups = self._build_groups(trainer.model)
+        self._param_state = self._build_param_state(self._groups)
+        self._dead_streak = {group["name"]: 0 for group in self._groups}
+
+        if self.is_main_process:
+            os.makedirs(self.output_dir, exist_ok=True)
+            self._ensure_csv_header()
+            if self.tensorboard:
+                tb_dir = self.tensorboard_log_dir or os.path.join(self.output_dir, "tensorboard_logs")
+                self.writer = SummaryWriter(log_dir=tb_dir)
+
+        if not self._groups and not self._warned_no_groups:
+            log.warning("[ParamDynamicsMonitor] no trainable parameter groups found.")
+            self._warned_no_groups = True
+        else:
+            log.info(
+                "[ParamDynamicsMonitor][rank=%s] monitoring %s groups, %s unique params; csv=%s",
+                self.rank,
+                len(self._groups),
+                len(self._param_state),
+                self.csv_path,
+            )
+
+    def _iter_candidate_modules(self, model):
+        local_expert_idx = getattr(self.trainer, "local_expert_idx", None)
+        distributed_expert = bool(getattr(self.trainer, "distributed_expert", False))
+        expert_prefix = None
+        if distributed_expert and local_expert_idx is not None and hasattr(model, "experts"):
+            expert_prefix = f"experts.{int(local_expert_idx)}"
+
+        for name, module in model.named_modules():
+            if not name:
+                continue
+            if expert_prefix and name != expert_prefix and not name.startswith(expert_prefix + "."):
+                continue
+            yield name, module
+
+    def _build_groups(self, model):
+        groups = []
+        seen_names = set()
+
+        def add_group(name, kind, params):
+            unique_params = []
+            seen_param_ids = set()
+            for param in params:
+                if not getattr(param, "requires_grad", False):
+                    continue
+                param_id = id(param)
+                if param_id in seen_param_ids:
+                    continue
+                seen_param_ids.add(param_id)
+                unique_params.append(param)
+            if not unique_params or name in seen_names:
+                return
+            seen_names.add(name)
+            groups.append({"name": name, "kind": kind, "params": unique_params})
+
+        for name, module in self._iter_candidate_modules(model):
+            kind = self._group_kind(name, module)
+            if kind is None:
+                continue
+            add_group(name, kind, module.parameters(recurse=True))
+
+        union_params = []
+        union_seen = set()
+        for group in groups:
+            for param in group["params"]:
+                param_id = id(param)
+                if param_id not in union_seen:
+                    union_seen.add(param_id)
+                    union_params.append(param)
+
+        if union_params:
+            model_group_name = "model"
+            local_expert_idx = getattr(self.trainer, "local_expert_idx", None)
+            if bool(getattr(self.trainer, "distributed_expert", False)) and local_expert_idx is not None:
+                model_group_name = f"experts.{int(local_expert_idx)}"
+            if model_group_name not in seen_names:
+                groups.insert(0, {"name": model_group_name, "kind": "scope", "params": union_params})
+        else:
+            add_group("model", "scope", model.parameters(recurse=True))
+
+        return groups
+
+    def _group_kind(self, name, module):
+        class_name = module.__class__.__name__
+        if self._EXPERT_RE.search(name):
+            return "expert"
+        if self._LAYER_RE.search(name):
+            return "layer"
+        if any(token in class_name for token in self._CLASS_TOKENS):
+            return class_name
+        lowered = name.lower()
+        if any(token in lowered for token in self._OUTPUT_TOKENS):
+            return "output"
+        if any(token in lowered for token in self._NAME_TOKENS):
+            return "module"
+        return None
+
+    def _build_param_state(self, groups):
+        state = {}
+        for group in groups:
+            for param in group["params"]:
+                param_id = id(param)
+                if param_id not in state:
+                    state[param_id] = {
+                        "param": param,
+                        "numel": int(param.numel()),
+                        "prev": None,
+                    }
+        return state
+
+    def _ensure_csv_header(self):
+        needs_header = (not os.path.exists(self.csv_path)) or os.path.getsize(self.csv_path) == 0
+        if not needs_header:
+            return
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._HEADER)
+            writer.writeheader()
+
+    def _param_metrics(self):
+        metrics = {}
+        for param_id, state in self._param_state.items():
+            param = state["param"]
+            numel = state["numel"]
+            current = param.detach().float().cpu().reshape(-1).clone()
+            prev = state["prev"]
+            baseline = prev is None
+
+            if baseline:
+                delta_norm_sq = 0.0
+                delta_nonzero = 0
+            else:
+                delta = current - prev
+                delta_norm_sq = float(torch.dot(delta, delta).item())
+                delta_nonzero = int(torch.count_nonzero(delta.abs() > self.delta_eps).item())
+
+            state["prev"] = current
+            weight_norm_sq = float(torch.dot(current, current).item())
+            grad_norm_sq, grad_nonzero, has_grad = self._grad_metrics(param)
+            metrics[param_id] = {
+                "numel": numel,
+                "baseline": baseline,
+                "weight_norm_sq": weight_norm_sq,
+                "delta_norm_sq": delta_norm_sq,
+                "delta_nonzero": delta_nonzero,
+                "grad_norm_sq": grad_norm_sq,
+                "grad_nonzero": grad_nonzero,
+                "has_grad": has_grad,
+            }
+        return metrics
+
+    def _grad_metrics(self, param):
+        grad = param.grad
+        if grad is None:
+            return 0.0, 0, False
+        grad = grad.detach()
+        if grad.is_sparse:
+            values = grad.coalesce().values().float().reshape(-1)
+            if values.numel() == 0:
+                return 0.0, 0, True
+            return (
+                float(torch.dot(values, values).item()),
+                int(torch.count_nonzero(values.abs() > self.grad_eps).item()),
+                True,
+            )
+        grad = grad.float().reshape(-1)
+        return (
+            float(torch.dot(grad, grad).item()),
+            int(torch.count_nonzero(grad.abs() > self.grad_eps).item()),
+            True,
+        )
+
+    def _format_float(self, value):
+        return f"{float(value):.12g}"
+
+    def _local_rows(self, iteration):
+        metrics = self._param_metrics()
+        rows = []
+        for group in self._groups:
+            param_count = 0
+            grad_param_count = 0
+            grad_norm_sq = 0.0
+            grad_nonzero = 0
+            weight_norm_sq = 0.0
+            delta_norm_sq = 0.0
+            delta_nonzero = 0
+            baseline = True
+
+            for param in group["params"]:
+                metric = metrics[id(param)]
+                param_count += metric["numel"]
+                if metric["has_grad"]:
+                    grad_param_count += 1
+                grad_norm_sq += metric["grad_norm_sq"]
+                grad_nonzero += metric["grad_nonzero"]
+                weight_norm_sq += metric["weight_norm_sq"]
+                delta_norm_sq += metric["delta_norm_sq"]
+                delta_nonzero += metric["delta_nonzero"]
+                baseline = baseline and metric["baseline"]
+
+            grad_norm = math.sqrt(grad_norm_sq)
+            weight_norm = math.sqrt(weight_norm_sq)
+            delta_norm = math.sqrt(delta_norm_sq)
+            delta_ratio = delta_norm / (weight_norm + 1.0e-12)
+            grad_nonzero_fraction = grad_nonzero / param_count if param_count else 0.0
+            delta_nonzero_fraction = delta_nonzero / param_count if param_count else 0.0
+
+            if baseline:
+                streak = 0
+                status = "BASELINE"
+            elif (
+                grad_norm <= self.grad_norm_dead_threshold
+                and delta_norm <= self.delta_norm_dead_threshold
+            ):
+                streak = self._dead_streak.get(group["name"], 0) + 1
+                status = "DEAD" if streak >= self.dead_patience else "NO_FLOW"
+            else:
+                streak = 0
+                status = "ACTIVE"
+            self._dead_streak[group["name"]] = streak
+
+            rows.append({
+                "iter": str(int(iteration)),
+                "rank": str(self.rank),
+                "group": group["name"],
+                "kind": group["kind"],
+                "param_count": str(param_count),
+                "grad_param_count": str(grad_param_count),
+                "grad_norm": self._format_float(grad_norm),
+                "grad_nonzero_fraction": self._format_float(grad_nonzero_fraction),
+                "weight_norm": self._format_float(weight_norm),
+                "delta_norm": self._format_float(delta_norm),
+                "delta_ratio": self._format_float(delta_ratio),
+                "delta_nonzero_fraction": self._format_float(delta_nonzero_fraction),
+                "dead_streak": str(streak),
+                "status": status,
+                "dead": "1" if status == "DEAD" else "0",
+                "baseline": "1" if baseline else "0",
+            })
+        return rows
+
+    def _dist_ready(self):
+        return (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and self.world_size > 1
+        )
+
+    def _gather_rows(self, rows):
+        if not self._dist_ready():
+            return rows if self.is_main_process else []
+
+        gathered = [None for _ in range(self.world_size)] if self.rank == 0 else None
+        torch.distributed.gather_object(rows, gathered, dst=0)
+        if self.rank != 0:
+            return []
+
+        all_rows = []
+        for rank_rows in gathered:
+            if rank_rows:
+                all_rows.extend(rank_rows)
+        return all_rows
+
+    def _write_csv(self, rows):
+        if not rows:
+            return
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._HEADER)
+            writer.writerows(rows)
+
+    def _tb_group(self, row):
+        group = row["group"].replace(".", "/")
+        if self.world_size > 1:
+            return f"rank{row['rank']}/{group}"
+        return group
+
+    def _write_tensorboard(self, rows, iteration):
+        if self.writer is None or not rows:
+            return
+        for row in rows:
+            group = self._tb_group(row)
+            self.writer.add_scalar(
+                f"ParamDynamics/{group}/delta_ratio",
+                float(row["delta_ratio"]),
+                iteration,
+            )
+            self.writer.add_scalar(
+                f"ParamDynamics/{group}/grad_norm",
+                float(row["grad_norm"]),
+                iteration,
+            )
+            self.writer.add_scalar(
+                f"ParamDynamics/{group}/delta_nonzero_fraction",
+                float(row["delta_nonzero_fraction"]),
+                iteration,
+            )
+            self.writer.add_scalar(
+                f"ParamDynamicsStatus/{group}/dead",
+                float(row["dead"]),
+                iteration,
+            )
+        self.writer.flush()
+
+    def iteration(self, **kwargs):
+        if not self._groups:
+            return
+        iteration = int(kwargs.get("time", getattr(self.trainer, "iter", 0)))
+        rows = self._local_rows(iteration)
+        rows = self._gather_rows(rows)
+        if not self.is_main_process:
+            return
+        self._write_csv(rows)
+        self._write_tensorboard(rows, iteration)
+
+
 class TrainLossMonitor(Monitor):
     stat_name = 'train_loss'
 
@@ -782,6 +1304,7 @@ class TensorBoardMonitor(Plugin):
         train_loss_mean = self._get_stat('train_loss', 'epoch_mean', None)
         train_loss_opt_mean = self._get_stat('train_loss_opt', 'epoch_mean', None)
         validation_loss_mean = self._get_stat('validation_loss', 'epoch_mean', None)
+        total_grad_norm_mean = self._get_stat('total_grad_norm', 'epoch_mean', None)
 
         if lr is not None:
             self.writer.add_scalar('lr/epoch', lr, epoch)
@@ -791,6 +1314,8 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('train_loss_opt_mean/epoch', train_loss_opt_mean, epoch)
         if validation_loss_mean is not None:
             self.writer.add_scalar('validation_loss_mean/epoch', validation_loss_mean, epoch)
+        if total_grad_norm_mean is not None:
+            self.writer.add_scalar('total_grad_norm_mean/epoch', total_grad_norm_mean, epoch)
 
         if 'train_onsite_loss' in self.trainer.stats:
             self.writer.add_scalar(
@@ -854,6 +1379,7 @@ class TensorBoardMonitor(Plugin):
         train_hopping = self._get_value('train_hopping_loss', 'last', kwargs, default=None)
         mean_max_prob = self._get_value('mean_max_prob', 'last', kwargs, default=None)
         expert_load_cv = self._get_value('expert_load_cv', 'last', kwargs, default=None)
+        total_grad_norm = self._get_value('total_grad_norm', 'last', kwargs, default=None)
 
         if lr is not None:
             self.writer.add_scalar('lr_iter/iteration', lr, iteration)
@@ -869,6 +1395,8 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('mean_max_prob_iter/iteration', mean_max_prob, iteration)
         if expert_load_cv is not None:
             self.writer.add_scalar('expert_load_cv_iter/iteration', expert_load_cv, iteration)
+        if total_grad_norm is not None:
+            self.writer.add_scalar('total_grad_norm_iter/iteration', total_grad_norm, iteration)
 
         latest_avg_iter_loss = self._get_stat('train_loss', 'latest_avg_iter_loss', None)
         if latest_avg_iter_loss is not None:
