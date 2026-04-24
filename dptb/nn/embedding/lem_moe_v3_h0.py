@@ -10,7 +10,7 @@ from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
-from .lem_moe_v3 import LemMoEV3
+from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
 from .lem_moe_v3_h0_helpers import H0InitLayer
 
 
@@ -147,8 +147,12 @@ class LemMoEV3H0(LemMoEV3):
         out_edge_features = self.out_edge(edge_features)
 
         if self.use_out_onehot_tp:
-            out_node_features = out_node_features + self.out_node_ele_tp(node_features, node_one_hot)
-            out_edge_features = out_edge_features + self.out_edge_ele_tp(edge_features, edge_one_hot)
+            out_node_features = out_node_features + _apply_onehot_tp(
+                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
+            )
+            out_edge_features = out_edge_features + _apply_onehot_tp(
+                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
+            )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
         data[_keys.EDGE_FEATURES_KEY] = torch.zeros(
