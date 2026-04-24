@@ -136,6 +136,7 @@ class ScalarOnehotTP(torch.nn.Module):
             and len({path[1] for path in self._paths}) == 1
             and len({path[7] for path in self._paths}) == 1
         )
+        self._output_paths_are_unique = len({path[2] for path in self._paths}) == len(self._paths)
         if self._uvu_same_input:
             uvu_gain_scales = []
             for idx, path in enumerate(self._paths):
@@ -209,9 +210,13 @@ class ScalarOnehotTP(torch.nn.Module):
                 i_in1, _, i_out, _, _, _, mul1, _, _, ir_dim = path
                 x_block = x_flat[:, self._in1_slices[i_in1]].reshape(x_flat.shape[0], mul1, ir_dim)
                 gain_block = gains.narrow(1, gain_offset, mul1).unsqueeze(-1)
-                out[:, self._out_slices[i_out]] += (x_block * gain_block).reshape(
+                mixed = (x_block * gain_block).reshape(
                     x_flat.shape[0], mul1 * ir_dim
                 )
+                if self._output_paths_are_unique:
+                    out[:, self._out_slices[i_out]] = mixed
+                else:
+                    out[:, self._out_slices[i_out]] += mixed
                 gain_offset += mul1
             return out.reshape(*leading_shape, self.irreps_out.dim)
 

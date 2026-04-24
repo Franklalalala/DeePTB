@@ -537,7 +537,8 @@ class MOLELinear(nn.Module):
             mole_linear_mode or os.environ.get("DPTB_MOLE_LINEAR_MODE", "split_loop")
         )
         self._cueq_indexed_linear_cache = {}
-        self._cueq_weight_order = None
+        cueq_weight_order = os.environ.get("DPTB_CUEQ_WEIGHT_ORDER", "io_scaled")
+        self._cueq_weight_order = None if cueq_weight_order in ("", "auto") else cueq_weight_order
 
         # 1. 路由专家权重
         self.weight_experts = nn.Parameter(torch.empty(num_experts, out_features, in_features))
