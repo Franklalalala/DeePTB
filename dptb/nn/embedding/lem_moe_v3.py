@@ -587,7 +587,7 @@ class LemMoEV3(torch.nn.Module):
             edge_batch = batch[edge_index[0][active_edges]]  # Map edge to graph index
             num_systems = coeffs.shape[0]
             edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes)
+            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes, graph_index=edge_batch)
         # --------------------------
 
         data[_keys.EDGE_OVERLAP_KEY] = latents

@@ -215,6 +215,25 @@ def test_mole_globals_explicit_split_sizes_take_precedence():
     torch.testing.assert_close(indexed(x, globals_), base(x, globals_), atol=1e-10, rtol=1e-10)
 
 
+def test_mole_globals_cuda_graph_index_avoids_split_tuple_sync():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graph-index fast path requires CUDA")
+
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, _mole_graph_index
+
+    sizes = torch.tensor((2, 4, 3), device="cuda")
+    graph_index = torch.repeat_interleave(
+        torch.arange(sizes.numel(), device="cuda", dtype=torch.long), sizes
+    )
+    coeffs = torch.rand(sizes.numel(), 5, device="cuda")
+    globals_ = MOLEGlobals(coefficients=coeffs, sizes=sizes, graph_index=graph_index)
+
+    assert globals_.split_sizes is None
+    resolved = _mole_graph_index(globals_, int(sizes.sum().item()), device=torch.device("cuda"))
+    assert resolved.data_ptr() == graph_index.data_ptr()
+
+
 def test_mole_linear_env_selects_indexed_ref(monkeypatch):
     torch = pytest.importorskip("torch")
     from dptb.nn.tensor_product_moe_v3 import MOLELinear

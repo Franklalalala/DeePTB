@@ -291,22 +291,35 @@ def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
 class MOLEGlobals:
     """Stores routing information for the current forward pass."""
 
-    def __init__(self, coefficients=None, sizes=None, split_sizes=None):
+    def __init__(self, coefficients=None, sizes=None, split_sizes=None, graph_index=None):
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.sizes = sizes  # [Batch] (Edge counts per system)
+        self.graph_index = graph_index
+        self._sizes_tensor = self._normalize_sizes_tensor(sizes, split_sizes)
         self.split_sizes = self._normalize_split_sizes(sizes, split_sizes)
 
     @staticmethod
     def _normalize_split_sizes(sizes, split_sizes):
         if split_sizes is not None:
             if torch.is_tensor(split_sizes):
+                if split_sizes.device.type != "cpu":
+                    return None
                 return MOLEGlobals._tensor_to_split_tuple(split_sizes)
             return tuple(int(v) for v in split_sizes)
         if sizes is None:
             return None
         if torch.is_tensor(sizes):
+            if sizes.device.type != "cpu":
+                return None
             return MOLEGlobals._tensor_to_split_tuple(sizes)
         return tuple(int(v) for v in sizes)
+
+    @staticmethod
+    def _normalize_sizes_tensor(sizes, split_sizes):
+        values = split_sizes if split_sizes is not None else sizes
+        if values is None or not torch.is_tensor(values):
+            return None
+        return values.detach().reshape(-1).to(dtype=torch.long)
 
     @staticmethod
     def _tensor_to_split_tuple(values):
@@ -320,7 +333,11 @@ class MOLEGlobals:
 def _mole_split_sizes(mole_globals, n_rows: int):
     split_sizes = getattr(mole_globals, "split_sizes", None)
     if split_sizes is None:
-        split_sizes = (n_rows,)
+        sizes_tensor = getattr(mole_globals, "_sizes_tensor", None)
+        if sizes_tensor is None:
+            split_sizes = (n_rows,)
+        else:
+            split_sizes = MOLEGlobals._tensor_to_split_tuple(sizes_tensor)
     if sum(split_sizes) != n_rows:
         raise ValueError(
             f"MOLE split sizes sum to {sum(split_sizes)}, but input has {n_rows} rows."
@@ -330,6 +347,35 @@ def _mole_split_sizes(mole_globals, n_rows: int):
 
 def _mole_graph_index(mole_globals, n_rows: int, *, device):
     """Return sorted graph ids per row, matching the existing split-loop semantics."""
+    graph_index = getattr(mole_globals, "graph_index", None)
+    if graph_index is not None:
+        graph_index = graph_index.to(device=device, dtype=torch.long).reshape(-1)
+        if graph_index.numel() == n_rows:
+            return graph_index
+        raise ValueError(
+            f"MOLE graph_index has {graph_index.numel()} rows, but input has {n_rows} rows."
+        )
+
+    sizes_tensor = getattr(mole_globals, "_sizes_tensor", None)
+    if sizes_tensor is not None:
+        cache = getattr(mole_globals, "_graph_index_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(mole_globals, "_graph_index_cache", cache)
+        key = (str(device), "tensor_sizes", int(sizes_tensor.numel()))
+        graph_index = cache.get(key)
+        if graph_index is None:
+            sizes = sizes_tensor.to(device=device, dtype=torch.long)
+            graph_index = torch.repeat_interleave(
+                torch.arange(sizes.shape[0], dtype=torch.long, device=device), sizes
+            )
+            cache[key] = graph_index
+        if graph_index.numel() == n_rows:
+            return graph_index
+        raise ValueError(
+            f"MOLE sizes expand to {graph_index.numel()} rows, but input has {n_rows} rows."
+        )
+
     split_sizes = _mole_split_sizes(mole_globals, n_rows)
     cache = getattr(mole_globals, "_graph_index_cache", None)
     if cache is None:
@@ -680,14 +726,7 @@ class MOLELinear(nn.Module):
                 return self._apply_cueq_indexed_linear(x, mixed_weights, mixed_bias, graph_index)
             raise AssertionError(f"unreachable mole_linear_mode={mode!r}")
 
-        split_sizes = mole_globals.split_sizes
-        if split_sizes is None:
-            split_sizes = (x.shape[0],)
-        if sum(split_sizes) != x.shape[0]:
-            raise ValueError(
-                f"MOLE split sizes sum to {sum(split_sizes)}, but input has {x.shape[0]} rows."
-            )
-
+        split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
         x_split = torch.split(x, split_sizes, dim=0)
         out_parts = []
 
