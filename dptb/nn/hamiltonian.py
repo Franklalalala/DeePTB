@@ -25,6 +25,11 @@ def _to_device(tensor: torch.Tensor, device: Union[str, torch.device]) -> torch.
     return tensor.to(device=device)
 
 
+def _contract_cg_rme(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
+    """Contract CG basis with RME without materializing the broadcast product."""
+    return torch.einsum("nrc,ijr->ncij", rme2, cg_basis)
+
+
 class E3Hamiltonian(torch.nn.Module):
     def __init__(
         self,
@@ -394,11 +399,7 @@ class E3Hamiltonian(torch.nn.Module):
                     self._dbg(f"[DBG][EDGE]{opairtype}: rme reshape -> {tuple(rme2.shape)} (n_edge, n_rme, n_chunk)")
 
                 cg_basis = _to_device(self.cgbasis[opairtype], rme2.device)
-                HR = torch.sum(
-                    cg_basis[None, :, :, :, None] * rme2[:, None, None, :, :],
-                    dim=-2
-                )
-                HR = HR.permute(0, 3, 1, 2)  # (n_edge, n_chunk, nL, nR)
+                HR = _contract_cg_rme(cg_basis, rme2)  # (n_edge, n_chunk, nL, nR)
                 if verbose:
                     self._tensor_stats(f"[EDGE]{opairtype}.HR(before_spinproj)", HR)
 
@@ -445,11 +446,7 @@ class E3Hamiltonian(torch.nn.Module):
                         self._dbg(f"[DBG][NODE]{opairtype}: rme reshape -> {tuple(rme2.shape)} (n_node, n_rme, n_chunk)")
 
                     cg_basis = _to_device(self.cgbasis[opairtype], rme2.device)
-                    HR = torch.sum(
-                        cg_basis[None, :, :, :, None] * rme2[:, None, None, :, :],
-                        dim=-2
-                    )
-                    HR = HR.permute(0, 3, 1, 2)  # (n_node, n_chunk, nL, nR)
+                    HR = _contract_cg_rme(cg_basis, rme2)  # (n_node, n_chunk, nL, nR)
                     if verbose:
                         self._tensor_stats(f"[NODE]{opairtype}.HR(before_spinproj)", HR)
 
