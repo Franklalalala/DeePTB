@@ -180,7 +180,6 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
     allowed = (
         "staged",
         "streamed_m_major_ref",
-        "streamed_m_major_aggressive",
         "streamed_m_major_cueq",
     )
     if so2_fusion_mode not in allowed:
@@ -513,10 +512,11 @@ class MOLERouterV3(nn.Module):
 
 class MOLELinear(nn.Module):
     """
-    DeepSeek-V3 Style Expert Layer with Linear Experts.
+    Graph-level MoE linear layer.
 
-    Structure: Output = Routed_Experts(x) + Shared_Experts(x)
-    Optimization: Merges Shared Weights into Routed Weights for 0 extra inference overhead.
+    Each graph owns a mixed expert weight matrix. Production uses
+    cuEquivariance indexed_linear so each edge selects its graph weight without
+    materializing an edge-sized weight tensor.
     """
 
     def __init__(
@@ -600,7 +600,7 @@ class MOLELinear(nn.Module):
         if dtype not in (torch.float32, torch.float64):
             raise RuntimeError(
                 "cueq_indexed_linear is currently validated only for float32/float64. "
-                "Disable AMP/autocast for this experimental backend or use split_loop."
+                "Disable AMP/autocast or use split_loop."
             )
 
         try:
@@ -995,7 +995,7 @@ class SO2_Linear(torch.nn.Module):
             latents: Latent features for radial embedding
             wigner_D_all: Precomputed Wigner D matrices (optional)
         """
-        if self.so2_fusion_mode in ("streamed_m_major_ref", "streamed_m_major_aggressive"):
+        if self.so2_fusion_mode == "streamed_m_major_ref":
             return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
         if self.so2_fusion_mode == "streamed_m_major_cueq":
             return self._forward_streamed_m_major_grouped(
