@@ -6,6 +6,28 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+
+# Triton exact graph-persistent V3 overlay
+try:
+    from .so2_triton_exact_gp_v3 import (
+        complex_exact_moe_linear_v3 as _complex_exact_moe_linear_v3,
+        exact_moe_linear_v3 as _exact_moe_linear_v3,
+        use_complex_exact_gp_v3 as _use_complex_exact_gp_v3,
+        use_exact_gp_v3 as _use_exact_gp_v3,
+    )
+except Exception:  # pragma: no cover - additive experimental route must not break default imports
+    _exact_moe_linear_v3 = None
+    _complex_exact_moe_linear_v3 = None
+
+    def _use_exact_gp_v3() -> bool:
+        return os.environ.get("DPTB_TRITON_EXACT_GP_V3", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _use_complex_exact_gp_v3() -> bool:
+        return os.environ.get(
+            "DPTB_TRITON_COMPLEX_EXACT_GP_V3",
+            os.environ.get("DPTB_TRITON_EXACT_GP_V3", "0"),
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
 # Triton exact graph-persistent V2 overlay
 try:
     from .so2_triton_exact_gp_v2 import (
@@ -2258,6 +2280,20 @@ def grouped_exact_moe_linear(x: torch.Tensor,
                              shared_bias: Optional[torch.Tensor],
                              split_sizes: Sequence[int]) -> torch.Tensor:
     split_sizes = _canonical_split_sizes(split_sizes)
+    if _use_exact_gp_v3():
+        if _exact_moe_linear_v3 is None:
+            raise RuntimeError(
+                "DPTB_TRITON_EXACT_GP_V3 is enabled, but dptb.nn.so2_triton_exact_gp_v3 could not be imported."
+            )
+        return _exact_moe_linear_v3(
+            x,
+            coefficients,
+            weight_experts,
+            bias_experts,
+            shared_weight,
+            shared_bias,
+            split_sizes,
+        )
     if _use_exact_gp_v2():
         if _exact_moe_linear_v2 is None:
             raise RuntimeError(
@@ -2457,6 +2493,18 @@ def grouped_complex_exact_moe_linear(x_pair: torch.Tensor,
                                      shared_weight: Optional[torch.Tensor],
                                      split_sizes: Sequence[int]) -> torch.Tensor:
     split_sizes = _canonical_split_sizes(split_sizes)
+    if _use_complex_exact_gp_v3():
+        if _complex_exact_moe_linear_v3 is None:
+            raise RuntimeError(
+                "DPTB_TRITON_COMPLEX_EXACT_GP_V3 is enabled, but dptb.nn.so2_triton_exact_gp_v3 could not be imported."
+            )
+        return _complex_exact_moe_linear_v3(
+            x_pair,
+            coefficients,
+            weight_experts,
+            shared_weight,
+            split_sizes,
+        )
     if _use_complex_exact_gp_v2():
         if _complex_exact_moe_linear_v2 is None:
             raise RuntimeError(
