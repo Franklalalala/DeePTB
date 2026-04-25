@@ -304,11 +304,53 @@ def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
 # MOLE COMPONENTS (Added)
 # ------------------------------------------------------------------------------
 
+class MOLERouterOutput:
+    """Tuple-compatible router output with optional sparse top-k metadata."""
+
+    __slots__ = ("coefficients", "monitor_val", "expert_load_cv", "topk_indices", "topk_probs")
+
+    def __init__(
+        self,
+        coefficients,
+        monitor_val,
+        expert_load_cv,
+        *,
+        topk_indices=None,
+        topk_probs=None,
+    ):
+        self.coefficients = coefficients
+        self.monitor_val = monitor_val
+        self.expert_load_cv = expert_load_cv
+        self.topk_indices = topk_indices
+        self.topk_probs = topk_probs
+
+    def __iter__(self):
+        yield self.coefficients
+        yield self.monitor_val
+        yield self.expert_load_cv
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, index):
+        return (self.coefficients, self.monitor_val, self.expert_load_cv)[index]
+
+
 class MOLEGlobals:
     """Stores routing information for the current forward pass."""
 
-    def __init__(self, coefficients=None, sizes=None, split_sizes=None, graph_index=None):
+    def __init__(
+        self,
+        coefficients=None,
+        sizes=None,
+        split_sizes=None,
+        graph_index=None,
+        topk_indices=None,
+        topk_probs=None,
+    ):
         self.coefficients = coefficients  # [Batch, Num_Experts]
+        self.topk_indices = topk_indices  # [Batch, TopK]
+        self.topk_probs = topk_probs  # [Batch, TopK]
         self.sizes = sizes  # [Batch] (Edge counts per system)
         # Explicit split sizes preserve the original split-loop contract and
         # must stay authoritative across all MOLELinear backends.
@@ -468,7 +510,11 @@ class MOLERouterV3(nn.Module):
             denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
             probs = scores / denominators
             monitor_val = probs.max(dim=-1)[0].mean().detach()
-            return probs, monitor_val, torch.zeros((), dtype=scores.dtype, device=scores.device)
+            return MOLERouterOutput(
+                probs,
+                monitor_val,
+                torch.zeros((), dtype=scores.dtype, device=scores.device),
+            )
 
         # 加上 Bias 用于选择 Top-K (Aux-loss-free 核心机制)
         if self.aux_loss_free and self.training:
@@ -517,14 +563,24 @@ class MOLERouterV3(nn.Module):
             # 监控指标：计算最大概率的均值 (反映 Router 的置信度，比计算全部均值更有意义)
             monitor_val = topk_probs.max(dim=-1)[0].mean().detach()
 
-            return coeffs, monitor_val, expert_load_cv.detach()
+            return MOLERouterOutput(
+                coeffs,
+                monitor_val,
+                expert_load_cv.detach(),
+                topk_indices=topk_indices,
+                topk_probs=topk_probs,
+            )
 
         else:
             # Fallback 逻辑保持稳定
             denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
             probs = scores / denominators
             monitor_val = probs.max(dim=-1)[0].mean().detach()
-            return probs, monitor_val, torch.tensor(0.0, device=scores.device)
+            return MOLERouterOutput(
+                probs,
+                monitor_val,
+                torch.tensor(0.0, dtype=scores.dtype, device=scores.device),
+            )
 
 
 class MOLELinear(nn.Module):
@@ -553,6 +609,7 @@ class MOLELinear(nn.Module):
         self.mole_linear_mode = _normalize_mole_linear_mode(
             mole_linear_mode or os.environ.get("DPTB_MOLE_LINEAR_MODE", "split_loop")
         )
+        self._mole_sparse_mix = os.environ.get("DPTB_MOLE_SPARSE_MIX", "1") not in ("", "0", "false", "False")
         self._cueq_indexed_linear_cache = {}
         cueq_weight_order = os.environ.get("DPTB_CUEQ_WEIGHT_ORDER", "io_scaled")
         self._cueq_weight_order = None if cueq_weight_order in ("", "auto") else cueq_weight_order
@@ -596,6 +653,39 @@ class MOLELinear(nn.Module):
         if mixed_bias is not None:
             flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def _mix_routed_expert_weights(self, mole_globals):
+        topk_indices = getattr(mole_globals, "topk_indices", None)
+        topk_probs = getattr(mole_globals, "topk_probs", None)
+        coefficients = mole_globals.coefficients
+        if (
+            not self._mole_sparse_mix
+            or topk_indices is None
+            or topk_probs is None
+            or topk_indices.shape != topk_probs.shape
+            or topk_indices.ndim != 2
+            or topk_indices.shape[0] != coefficients.shape[0]
+            or topk_indices.shape[1] >= self.num_experts
+        ):
+            mixed_weights = torch.einsum("be, eoi -> boi", coefficients, self.weight_experts)
+            mixed_bias = None
+            if self.bias_experts is not None:
+                mixed_bias = torch.einsum("be, eo -> bo", coefficients, self.bias_experts)
+            return mixed_weights, mixed_bias
+
+        batch_size, top_k = topk_indices.shape
+        flat_indices = topk_indices.reshape(-1).to(device=self.weight_experts.device, dtype=torch.long)
+        topk_probs = topk_probs.to(device=self.weight_experts.device, dtype=self.weight_experts.dtype)
+        selected_weights = self.weight_experts.index_select(0, flat_indices)
+        selected_weights = selected_weights.reshape(batch_size, top_k, self.out_features, self.in_features)
+        mixed_weights = (selected_weights * topk_probs.reshape(batch_size, top_k, 1, 1)).sum(dim=1)
+
+        mixed_bias = None
+        if self.bias_experts is not None:
+            selected_bias = self.bias_experts.index_select(0, flat_indices)
+            selected_bias = selected_bias.reshape(batch_size, top_k, self.out_features)
+            mixed_bias = (selected_bias * topk_probs.reshape(batch_size, top_k, 1)).sum(dim=1)
+        return mixed_weights, mixed_bias
 
     def _cueq_flatten_weight(self, mixed_weights, order: str):
         scale = math.sqrt(self.in_features)
@@ -721,7 +811,7 @@ class MOLELinear(nn.Module):
         # coefficients: [Batch, Num_Experts]
         # weight_experts: [Num_Experts, Out, In]
         # mixed_weights: [Batch, Out, In]
-        mixed_weights = torch.einsum("be, eoi -> boi", mole_globals.coefficients, self.weight_experts)
+        mixed_weights, mixed_bias = self._mix_routed_expert_weights(mole_globals)
 
         # 2. 【关键】融合共享专家权重
         # 利用分配律: (W_routed + sum(W_shared)) * x
@@ -729,9 +819,7 @@ class MOLELinear(nn.Module):
             mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
 
         # 3. 处理 Bias
-        mixed_bias = None
-        if self.bias_experts is not None:
-            mixed_bias = torch.einsum("be, eo -> bo", mole_globals.coefficients, self.bias_experts)
+        if mixed_bias is not None:
             if self.num_shared_experts > 0 and self.bias_shared is not None:
                 mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
 

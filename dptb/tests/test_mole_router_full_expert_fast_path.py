@@ -96,3 +96,28 @@ def test_full_expert_fast_path_does_not_change_true_topk_behavior():
     torch.testing.assert_close(cv_fast, cv_base, atol=1e-7, rtol=1e-7)
     torch.testing.assert_close(fast_flag.expert_bias, base.expert_bias, atol=1e-7, rtol=1e-7)
     torch.testing.assert_close(fast_flag.ema_load, base.ema_load, atol=1e-7, rtol=1e-7)
+
+
+def test_true_topk_router_output_exposes_sparse_metadata():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLERouterV3
+
+    torch.manual_seed(20260426)
+    router = MOLERouterV3(
+        in_features=8,
+        num_experts=6,
+        top_k=2,
+        aux_loss_free=False,
+        full_expert_fast_path=True,
+    )
+    router.eval()
+
+    global_features = torch.randn(4, 8)
+    router_out = router(global_features)
+    coeffs, _, _ = router_out
+
+    assert router_out.topk_indices.shape == (4, 2)
+    assert router_out.topk_probs.shape == (4, 2)
+    reconstructed = torch.zeros_like(coeffs)
+    reconstructed.scatter_(1, router_out.topk_indices, router_out.topk_probs)
+    torch.testing.assert_close(reconstructed, coeffs, atol=1e-7, rtol=1e-7)
