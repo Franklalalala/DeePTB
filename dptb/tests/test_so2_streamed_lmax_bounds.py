@@ -17,6 +17,19 @@ def test_so2_streamed_grouped_source_has_flash_aggregate_and_direct_fallback():
     assert "_accumulate_direct_m0_output_" in body
 
 
+def test_so2_single_entry_l_group_stays_view():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import _build_so2_layout_plans, _gather_so2_l_group
+    from e3nn import o3
+
+    _, plans = _build_so2_layout_plans(o3.Irreps("2x1e"))
+    x = torch.randn(5, 6)
+    group = _gather_so2_l_group(x, plans[1])
+
+    assert group.shape == (5, 2, 3)
+    assert group.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+
+
 @pytest.mark.parametrize("wigner_apply_mode", ["compact_blocks", "full_dense"])
 @pytest.mark.parametrize(
     "so2_fusion_mode",

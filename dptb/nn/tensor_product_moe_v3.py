@@ -294,7 +294,7 @@ def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
         for mul, slice_info in zip(plan.muls, plan.slices)
     ]
     if len(parts) == 1:
-        return parts[0].contiguous()
+        return parts[0]
     return torch.cat(parts, dim=1).contiguous()
 
 
