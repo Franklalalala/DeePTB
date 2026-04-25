@@ -38,7 +38,11 @@ output group buffer. Output aggregation is opt-in because it can reduce repeated
 small rotation work but reintroduces the grouped output buffer. Hybrid mode is
 the intermediate benchmark target: it keeps direct output for low `l` channels
 and only aggregates output groups with `l >= DPTB_SO2_FLASH_HYBRID_L_MIN`
-(default `2`).
+(default `2`). In other words, the measured `hybrid` route keeps `l = 0` and
+`l = 1` output writes on the direct path, while `l >= 2` output groups are
+accumulated locally and rotated/materialized once. The split is by angular
+momentum order `l`, not by SO(2) order `m`; `hybrid` still rotates all input
+`l` groups once when `rotate_in` is enabled.
 
 ## Validation
 
@@ -58,6 +62,7 @@ branch: origin/0425-flash at 4f5394a
 python env: /home/mingkang_nt/anaconda3/envs/dptb_triton_gp_0424
 run root: /home/mingkang_nt/codex/so2_flash_queue_20260425_214335
 per-case limit: timeout -k 10s 590s
+hybrid threshold: DPTB_SO2_FLASH_HYBRID_L_MIN=2, so output groups with l >= 2 use grouped output aggregation
 ```
 
 Static validation passed before the training queue:
