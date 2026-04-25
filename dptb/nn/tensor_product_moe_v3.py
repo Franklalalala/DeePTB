@@ -176,6 +176,21 @@ def _normalize_wigner_apply_mode(wigner_apply_mode: str) -> str:
     return wigner_apply_mode
 
 
+def _normalize_so2_flash_aggregate_mode(value: str) -> str:
+    if value in ("", "0", "false", "False", "no", "No", "off", "OFF"):
+        return "off"
+    if value in ("1", "true", "True", "yes", "Yes", "on", "ON", "full", "aggregate"):
+        return "full"
+    if value in ("input", "input_only", "rotate_in"):
+        return "input"
+    if value in ("output", "output_only", "rotate_out"):
+        return "output"
+    raise ValueError(
+        "DPTB_SO2_FLASH_AGGREGATE must be one of 0/off, 1/full, input, output; "
+        f"got {value!r}"
+    )
+
+
 def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
     allowed = (
         "staged",
@@ -984,6 +999,10 @@ class SO2_Linear(torch.nn.Module):
             m: tuple(entry for entry in self._out_entry_plans if entry.l >= m)
             for m in range(self.m_max + 1)
         }
+        self.so2_flash_aggregate_mode = _normalize_so2_flash_aggregate_mode(
+            os.environ.get("DPTB_SO2_FLASH_AGGREGATE", "input")
+        )
+        self.so2_flash_aggregate = self.so2_flash_aggregate_mode != "off"
         self._route_warned = set()
 
     def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
@@ -1248,6 +1267,30 @@ class SO2_Linear(torch.nn.Module):
             for l in range(1, self.l_max + 1)
         }
 
+    def _rotate_input_l_groups_once(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor]:
+        if not self.rotate_in:
+            return input_groups
+        return {
+            l: (torch.bmm(group, rot_blocks[l]) if l > 0 and l in rot_blocks else group)
+            for l, group in input_groups.items()
+        }
+
+    def _rotate_output_l_groups_once(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor]:
+        if not self.rotate_out:
+            return out_groups
+        return {
+            l: (torch.bmm(group, rot_blocks[l].transpose(1, 2)) if l > 0 and l in rot_blocks else group)
+            for l, group in out_groups.items()
+        }
+
     def _gather_input_l_groups(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
         return {
             l: _gather_so2_l_group(x, plan)
@@ -1260,11 +1303,26 @@ class SO2_Linear(torch.nn.Module):
             for l, plan in self._out_group_plans.items()
         }
 
-    def _materialize_output_l_groups(self, out_groups: Dict[int, torch.Tensor], *, n: int, dtype, device) -> torch.Tensor:
+    def _materialize_output_l_groups(
+            self,
+            out_groups: Dict[int, torch.Tensor],
+            *,
+            n: int,
+            dtype,
+            device,
+            rot_blocks: Optional[Dict[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         out = torch.zeros((n, self.irreps_out.dim), dtype=dtype, device=device)
+        entries_by_l = defaultdict(list)
         for entry in self._out_entry_plans:
-            group_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
-            out[:, entry.slice_info] = group_view.reshape(n, -1)
+            entries_by_l[entry.l].append(entry)
+        for l, entries in entries_by_l.items():
+            group = out_groups[l]
+            if rot_blocks is not None and self.rotate_out and l > 0 and l in rot_blocks:
+                group = torch.bmm(group, rot_blocks[l].transpose(1, 2))
+            for entry in entries:
+                group_view = group[:, entry.group_start:entry.group_start + entry.mul, :]
+                out[:, entry.slice_info] = group_view.reshape(n, -1)
         return out
 
     def _pack_group_m0(self, x_group: torch.Tensor, l: int, rot_block: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1363,6 +1421,46 @@ class SO2_Linear(torch.nn.Module):
             out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
             self._accumulate_group_pair_(out_view, y_entry, entry.l, m, rot_blocks.get(entry.l))
 
+    def _out_entry_view(self, out: torch.Tensor, entry: _SO2EntryPlan) -> torch.Tensor:
+        n = out.shape[0]
+        return out[:, entry.slice_info].view(n, entry.mul, self.dims[entry.l])
+
+    def _accumulate_direct_m0_output_(
+            self,
+            out: torch.Tensor,
+            y_m0: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+    ) -> None:
+        cursor = 0
+        for entry in self._out_entries_by_m[0]:
+            y_entry = y_m0[:, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            self._accumulate_group_m0_(
+                self._out_entry_view(out, entry),
+                y_entry,
+                entry.l,
+                rot_blocks.get(entry.l),
+            )
+
+    def _accumulate_direct_pair_output_(
+            self,
+            out: torch.Tensor,
+            y_m: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+    ) -> None:
+        cursor = 0
+        for entry in self._out_entries_by_m[m]:
+            y_entry = y_m[:, :, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            self._accumulate_group_pair_(
+                self._out_entry_view(out, entry),
+                y_entry,
+                entry.l,
+                m,
+                rot_blocks.get(entry.l),
+            )
+
     def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
@@ -1372,7 +1470,27 @@ class SO2_Linear(torch.nn.Module):
         weights = self.radial_emb(latents) if self.radial_emb else None
         rot_blocks = self._make_wigner_block_cache(wigner_D_all)
         input_groups = self._gather_input_l_groups(x)
-        out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+        flash_mode = (
+            self.so2_flash_aggregate_mode
+            if bool(rot_blocks) and (self.rotate_in or self.rotate_out)
+            else "off"
+        )
+        rotate_input_once = self.rotate_in and flash_mode in ("input", "full")
+        aggregate_output_once = self.rotate_out and flash_mode in ("output", "full")
+        if rotate_input_once:
+            input_groups = self._rotate_input_l_groups_once(input_groups, rot_blocks)
+            pack_rot_blocks = {}
+        else:
+            pack_rot_blocks = rot_blocks
+
+        if aggregate_output_once:
+            accum_rot_blocks = {}
+            out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+            out = None
+        else:
+            accum_rot_blocks = rot_blocks
+            out_groups = None
+            out = torch.zeros((n, self.irreps_out.dim), dtype=x.dtype, device=x.device)
 
         for m in range(self.m_max + 1):
             radial_weight = (
@@ -1381,17 +1499,20 @@ class SO2_Linear(torch.nn.Module):
             )
 
             if m == 0:
-                inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
+                inp = self._assemble_grouped_m0_input(input_groups, pack_rot_blocks, n, x)
                 if self.front and self.radial_emb:
                     y_m = self.fc_m0(inp * radial_weight.squeeze(1), mole_globals)
                 elif self.radial_emb:
                     y_m = self.fc_m0(inp, mole_globals) * radial_weight.squeeze(1)
                 else:
                     y_m = self.fc_m0(inp, mole_globals)
-                self._accumulate_grouped_m0_output_(out_groups, y_m, rot_blocks)
+                if aggregate_output_once:
+                    self._accumulate_grouped_m0_output_(out_groups, y_m, accum_rot_blocks)
+                else:
+                    self._accumulate_direct_m0_output_(out, y_m, accum_rot_blocks)
                 continue
 
-            x_m_in = self._assemble_grouped_pair_input(input_groups, rot_blocks, m, n, x)
+            x_m_in = self._assemble_grouped_pair_input(input_groups, pack_rot_blocks, m, n, x)
             if self.front and self.radial_emb:
                 x_m_in = x_m_in * radial_weight
                 linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
@@ -1401,9 +1522,20 @@ class SO2_Linear(torch.nn.Module):
             else:
                 linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
 
-            self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+            if aggregate_output_once:
+                self._accumulate_grouped_pair_output_(out_groups, linear_output, accum_rot_blocks, m)
+            else:
+                self._accumulate_direct_pair_output_(out, linear_output, accum_rot_blocks, m)
 
-        out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+        if aggregate_output_once:
+            out = self._materialize_output_l_groups(
+                out_groups,
+                n=n,
+                dtype=x.dtype,
+                device=x.device,
+                rot_blocks=rot_blocks,
+            )
+
         return out.contiguous(), wigner_D_all
 
 
