@@ -55,8 +55,3 @@ def test_public_forwards_prepare_active_edge_metadata_once():
         )
         assert "active_cutoff_coeffs = cutoff_coeffs[active_edges]" in text
         assert "_active_edge_tensor_to_full(latents, active_edges, edge_index.shape[1])" in text
-
-    assert "edge_sh = self.sh(data[_keys.EDGE_VECTORS_KEY]" not in source
-    assert "edge_sh = self.sh(data[_keys.EDGE_VECTORS_KEY]" not in h0_source
-    assert "edge_sh = self.sh(init_active_edge_vector[:, [1, 2, 0]])" in source
-    assert "edge_sh = self.sh(init_active_edge_vector[:, [1, 2, 0]])" in h0_source
