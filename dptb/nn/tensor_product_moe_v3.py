@@ -1,5 +1,5 @@
 
-from e3nn.o3 import xyz_to_angles, Irreps
+from e3nn.o3 import xyz_to_angles, Irreps, SphericalHarmonics, TensorProduct
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -178,6 +178,7 @@ def _normalize_wigner_apply_mode(wigner_apply_mode: str) -> str:
 
 def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
     allowed = (
+        "flash_tp",
         "staged",
         "streamed_m_major_ref",
         "streamed_m_major_cueq",
@@ -188,6 +189,42 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
             f"got {so2_fusion_mode!r}"
         )
     return so2_fusion_mode
+
+
+def _build_flash_tp_irreps_and_instructions(irreps_in1: Irreps, irreps_in2: Irreps, irreps_out: Irreps):
+    mid_irreps = []
+    instructions = []
+    used_in1 = set()
+    target_irreps = tuple(dict.fromkeys(ir for _, ir in irreps_out))
+    for ir_out in target_irreps:
+        found = False
+        for i, (mul_in1, ir_in1) in enumerate(irreps_in1):
+            for j, (_, ir_in2) in enumerate(irreps_in2):
+                if ir_out not in tuple(ir_in1 * ir_in2):
+                    continue
+                used_in1.add(i)
+                i_out = len(mid_irreps)
+                mid_irreps.append((mul_in1, ir_out))
+                instructions.append((i, j, i_out, "uvu", True))
+                found = True
+        if not found:
+            raise ValueError(
+                "flash_tp SO2 replacement found no compatible channelwise uvu path "
+                f"for output irrep {ir_out} from irreps_in={irreps_in1}."
+            )
+
+    if not instructions:
+        raise ValueError(
+            "flash_tp SO2 replacement found no compatible channelwise uvu paths "
+            f"for irreps_in={irreps_in1}, irreps_out={irreps_out}."
+        )
+    if len(used_in1) != len(irreps_in1):
+        missing = [str(irreps_in1[i]) for i in range(len(irreps_in1)) if i not in used_in1]
+        raise ValueError(
+            "flash_tp SO2 replacement cannot include every input irrep in a uvu path; "
+            f"missing input irreps: {missing}."
+        )
+    return Irreps(mid_irreps), instructions
 
 
 def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
@@ -885,7 +922,7 @@ class SO2_Linear(torch.nn.Module):
             rotate_out: bool = True,
             wigner_apply_mode: str = "compact_blocks",
             mole_linear_mode=None,
-            so2_fusion_mode: str = "staged",
+            so2_fusion_mode: str = "flash_tp",
     ):
         super(SO2_Linear, self).__init__()
 
@@ -903,10 +940,16 @@ class SO2_Linear(torch.nn.Module):
         self.rotate_out = rotate_out
         self.wigner_apply_mode = _normalize_wigner_apply_mode(wigner_apply_mode)
         env_so2_fusion_mode = os.environ.get("DPTB_SO2_FUSION_MODE")
-        if env_so2_fusion_mode is not None and so2_fusion_mode in (None, "staged"):
+        if env_so2_fusion_mode is not None and so2_fusion_mode in (None, "flash_tp", "staged"):
             so2_fusion_mode = env_so2_fusion_mode
         self.so2_fusion_mode = _normalize_so2_fusion_mode(so2_fusion_mode)
         self.num_experts = num_experts
+        self._route_warned = set()
+        self._flash_tp_cache = {}
+
+        if self.so2_fusion_mode == "flash_tp":
+            self._init_flash_tp_replacement(radial_channels)
+            return
 
         self.m_linear = nn.ModuleList()
 
@@ -984,7 +1027,6 @@ class SO2_Linear(torch.nn.Module):
             m: tuple(entry for entry in self._out_entry_plans if entry.l >= m)
             for m in range(self.m_max + 1)
         }
-        self._route_warned = set()
 
     def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
         """
@@ -995,6 +1037,8 @@ class SO2_Linear(torch.nn.Module):
             latents: Latent features for radial embedding
             wigner_D_all: Precomputed Wigner D matrices (optional)
         """
+        if self.so2_fusion_mode == "flash_tp":
+            return self._forward_flash_tp(x, R, latents, wigner_D_all)
         if self.so2_fusion_mode == "streamed_m_major_ref":
             return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
         if self.so2_fusion_mode == "streamed_m_major_cueq":
@@ -1107,6 +1151,102 @@ class SO2_Linear(torch.nn.Module):
                 out[:, slice_info] = part.reshape(n, -1)
 
         return out.contiguous(), wigner_D_all
+
+    def _init_flash_tp_replacement(self, radial_channels):
+        irreps_sh = Irreps([(1, (l, (-1) ** l)) for l in range(self.l_max + 1)])
+        irreps_mid, instructions = _build_flash_tp_irreps_and_instructions(
+            self.irreps_in,
+            irreps_sh,
+            self.irreps_out,
+        )
+        self.flash_tp_irreps_sh = irreps_sh
+        self.flash_tp_irreps_mid = irreps_mid
+        self.flash_tp_instructions = tuple(instructions)
+        self.flash_tp_sh = SphericalHarmonics(irreps_sh, True, "component")
+        self.flash_tp_ref = TensorProduct(
+            self.irreps_in,
+            irreps_sh,
+            irreps_mid,
+            instructions,
+            shared_weights=False,
+            internal_weights=False,
+        )
+        self.flash_tp_out_project = e3nn_Linear(
+            irreps_mid,
+            self.irreps_out,
+            shared_weights=True,
+            internal_weights=True,
+            biases=True,
+        )
+        if self.latent_dim is not None:
+            channels = radial_channels or [128, 128]
+            self.flash_tp_weight_net = RadialFunction(
+                [self.latent_dim] + list(channels) + [self.flash_tp_ref.weight_numel]
+            )
+            self.register_parameter("flash_tp_shared_weight", None)
+        else:
+            self.flash_tp_weight_net = None
+            scale = 1.0 / math.sqrt(max(1, self.flash_tp_ref.weight_numel))
+            self.flash_tp_shared_weight = torch.nn.Parameter(
+                torch.randn(self.flash_tp_ref.weight_numel) * scale
+            )
+
+    def _flash_tp_weights(self, x: torch.Tensor, latents: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.flash_tp_weight_net is not None:
+            if latents is None:
+                raise ValueError("SO2_Linear flash_tp mode requires latents when latent_dim is set.")
+            return self.flash_tp_weight_net(latents)
+        return self.flash_tp_shared_weight.to(dtype=x.dtype, device=x.device).expand(x.shape[0], -1)
+
+    def _get_flash_tp_backend(self, x: torch.Tensor):
+        disabled = os.environ.get("DPTB_FLASH_TP_DISABLE", "0") not in ("", "0", "false", "False")
+        if not x.is_cuda or disabled:
+            return None
+        try:
+            import flashTP_e3nn
+        except Exception as exc:
+            if os.environ.get("DPTB_FLASH_TP_REQUIRE", "0") not in ("", "0", "false", "False"):
+                raise RuntimeError("flash_tp mode requested but flashTP_e3nn is not importable.") from exc
+            self._warn_route_once(
+                "flash_tp_missing",
+                "flashTP_e3nn is not importable; using e3nn TensorProduct fallback.",
+            )
+            return None
+
+        smem_size = os.environ.get("DPTB_FLASH_TP_SMEM_KB")
+        smem_size = int(smem_size) if smem_size not in (None, "") else None
+        block_batch = os.environ.get("DPTB_FLASH_TP_BLOCK_BATCH")
+        block_batch = (
+            [int(v.strip()) for v in block_batch.split(",")]
+            if block_batch not in (None, "")
+            else None
+        )
+        key = (str(x.device), x.dtype, smem_size, tuple(block_batch) if block_batch is not None else None)
+        backend = self._flash_tp_cache.get(key)
+        if backend is None:
+            backend = flashTP_e3nn.uvu_TP(
+                self.irreps_in,
+                self.flash_tp_irreps_sh,
+                self.flash_tp_irreps_mid,
+                list(self.flash_tp_instructions),
+                block_batch_cnt=block_batch,
+                smem_size=smem_size,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            self._flash_tp_cache[key] = backend
+        return backend
+
+    def _forward_flash_tp(self, x, R, latents=None, wigner_D_all=None):
+        sh = self.flash_tp_sh(R[:, [1, 2, 0]])
+        weights = self._flash_tp_weights(x, latents)
+        backend = self._get_flash_tp_backend(x)
+        if backend is None:
+            mid = self.flash_tp_ref(x, sh, weights)
+            return self.flash_tp_out_project(mid).contiguous(), wigner_D_all
+        edge_id = torch.arange(x.shape[0], device=x.device, dtype=torch.int32)
+        mid = backend(x, sh, weights, edge_id, edge_id)
+        return self.flash_tp_out_project(mid).contiguous(), wigner_D_all
 
     def _ensure_wigner_rotation(self, R, wigner_D_all):
         if wigner_D_all is not None:

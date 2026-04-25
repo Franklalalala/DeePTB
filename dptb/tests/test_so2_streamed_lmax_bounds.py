@@ -63,9 +63,9 @@ def test_so2_streamed_handles_out_lmax_gt_in_lmax(so2_fusion_mode, wigner_apply_
 
 @pytest.mark.parametrize(
     "env_mode",
-    ["streamed_m_major_ref", "streamed_m_major_cueq"],
+    ["flash_tp", "streamed_m_major_ref", "streamed_m_major_cueq"],
 )
-def test_so2_fusion_mode_env_selects_streamed_modes(monkeypatch, env_mode):
+def test_so2_fusion_mode_env_selects_supported_modes(monkeypatch, env_mode):
     pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     from dptb.nn.tensor_product_moe_v3 import SO2_Linear
@@ -81,7 +81,7 @@ def test_so2_fusion_mode_env_selects_streamed_modes(monkeypatch, env_mode):
     assert layer.so2_fusion_mode == env_mode
 
 
-@pytest.mark.parametrize("so2_fusion_mode", ["staged", "streamed_m_major_ref", "streamed_m_major_cueq"])
+@pytest.mark.parametrize("so2_fusion_mode", ["flash_tp", "staged", "streamed_m_major_ref", "streamed_m_major_cueq"])
 def test_so2_radial_requires_latents(so2_fusion_mode):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
@@ -120,6 +120,7 @@ def test_so2_rejects_too_small_external_wigner_dense():
         rotate_in=True,
         rotate_out=True,
         wigner_apply_mode="full_dense",
+        so2_fusion_mode="staged",
     )
     x = torch.randn(3, layer.irreps_in.dim)
     R = torch.randn(3, 3)
