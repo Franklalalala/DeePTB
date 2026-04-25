@@ -10,7 +10,7 @@ from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
-from .lem_moe_v3 import LemMoEV3, _active_edge_tensor_to_full, _apply_onehot_tp
+from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
 from .lem_moe_v3_h0_helpers import H0InitLayer
 
 
@@ -76,8 +76,7 @@ class LemMoEV3H0(LemMoEV3):
         batch = data[_keys.BATCH_KEY]
 
         global_feat = scatter_mean(node_one_hot, batch, dim=0)
-        router_out = self.router(global_feat)
-        coeffs, monitor_val, expert_load_cv = router_out
+        coeffs, monitor_val, expert_load_cv = self.router(global_feat)
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
 
@@ -107,30 +106,16 @@ class LemMoEV3H0(LemMoEV3):
         else:
             safe_node_one_hot = node_one_hot
 
-        active_edge_center = edge_index[0][active_edges]
-        active_edge_neighbor = edge_index[1][active_edges]
-        active_edge_vector = edge_vector[active_edges]
-        active_cutoff_coeffs = cutoff_coeffs[active_edges]
         edge_one_hot = edge_one_hot[active_edges]
         if precomputed_split_sizes is not None:
-            mole_globals = MOLEGlobals(
-                coefficients=coeffs,
-                split_sizes=precomputed_split_sizes,
-                topk_indices=getattr(router_out, "topk_indices", None),
-                topk_probs=getattr(router_out, "topk_probs", None),
-            )
+            mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=precomputed_split_sizes)
         else:
-            edge_batch = batch[active_edge_center]
+            edge_batch = batch[edge_index[0][active_edges]]
             num_systems = coeffs.shape[0]
             edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(
-                coefficients=coeffs,
-                sizes=edge_sizes,
-                topk_indices=getattr(router_out, "topk_indices", None),
-                topk_probs=getattr(router_out, "topk_probs", None),
-            )
+            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes)
 
-        data[_keys.EDGE_OVERLAP_KEY] = _active_edge_tensor_to_full(latents, active_edges, edge_index.shape[1])
+        data[_keys.EDGE_OVERLAP_KEY] = latents
         wigner_D_all = None
         for layer in self.layers:
             latents, node_features, edge_features, wigner_D_all = layer(
@@ -138,11 +123,11 @@ class LemMoEV3H0(LemMoEV3):
                 node_features,
                 edge_features,
                 safe_node_one_hot,
-                active_edge_center,
-                active_edge_neighbor,
-                active_edge_vector,
+                edge_index,
+                edge_vector,
                 atom_type,
-                active_cutoff_coeffs,
+                cutoff_coeffs,
+                active_edges,
                 edge_one_hot,
                 wigner_D_all,
                 mole_globals,

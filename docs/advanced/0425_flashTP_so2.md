@@ -19,13 +19,6 @@ DPTB_SO2_FLASH_AGGREGATE=1       # full input+output aggregate
 DPTB_SO2_FLASH_AGGREGATE=0       # direct-output fallback
 ```
 
-It also adds sparse graph-level MoE weight mixing:
-
-```text
-DPTB_MOLE_SPARSE_MIX=1           # default: mix only router top-k experts
-DPTB_MOLE_SPARSE_MIX=0           # fallback: dense all-expert einsum
-```
-
 FlashTP's public kernel targets `e3nn.o3.TensorProduct` channelwise `uvu`
 paths with edge scatter/reduce. DeePTB's current hot path is different:
 `SO2_Linear` decomposes irreps by SO(2) order `m`, applies MoE linear maps, and
@@ -54,18 +47,3 @@ forward values and gradients, including mixed `rotate_in`/`rotate_out` settings.
 End-to-end CUDA speed and peak memory should still be decided by Liyue A/B runs
 because the change mainly affects kernel launch and tensor materialization
 patterns.
-
-For MoE, `MOLERouterV3` keeps the dense coefficient tensor for compatibility but
-also returns the selected `topk_indices` and normalized `topk_probs`.
-`MOLELinear` consumes that metadata when available, gathers only the active
-expert weights, and falls back to the old dense `einsum` path when top-k covers
-all experts or when metadata is absent. This follows the same FlashTP pressure
-point as the SO2 route: skip inactive paths instead of materializing work for
-every possible path.
-
-The LEM v3 embedding now also keeps latent tensors active-edge-only through the
-stack. The public output contract is unchanged: `EDGE_OVERLAP_KEY` and
-`EDGE_FEATURES_KEY` are scattered back to full-edge shape at the API boundary.
-Inside the hot path, bessel inputs, spherical harmonics, latent residual updates,
-and per-layer SO2 calls are restricted to active edges, which removes repeated
-`latents[active_edges]` slices and full-edge latent `index_copy` updates.

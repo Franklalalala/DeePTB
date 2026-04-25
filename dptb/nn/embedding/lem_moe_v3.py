@@ -73,12 +73,6 @@ def _instruction_get(instruction, name: str, index: int):
     return instruction[index]
 
 
-def _active_edge_tensor_to_full(active_values: torch.Tensor, active_edges: torch.Tensor, num_edges: int) -> torch.Tensor:
-    full_shape = (num_edges,) + tuple(active_values.shape[1:])
-    full_values = active_values.new_zeros(full_shape)
-    return torch.index_copy(full_values, 0, active_edges, active_values)
-
-
 def _onehot_weight_shape(connection_mode: str, mul1: int, mul2: int, mul_out: int) -> Tuple[int, ...]:
     if connection_mode == "uvu":
         return (mul1, mul2)
@@ -602,6 +596,7 @@ class LemMoEV3(torch.nn.Module):
 
         edge_index = data[_keys.EDGE_INDEX_KEY]
         edge_vector = data[_keys.EDGE_VECTORS_KEY]
+        edge_sh = self.sh(data[_keys.EDGE_VECTORS_KEY][:, [1, 2, 0]])
         edge_length = data[_keys.EDGE_LENGTH_KEY]
 
         data = self.onehot(data)
@@ -617,8 +612,7 @@ class LemMoEV3(torch.nn.Module):
 
         # 2. Compute Routing Coefficients
         # 返回: coeffs [Batch, Num_Experts], monitor_val (mean max prob)
-        router_out = self.router(global_feat)
-        coeffs, monitor_val, expert_load_cv = router_out
+        coeffs, monitor_val, expert_load_cv = self.router(global_feat)
 
         # 不再记录 z_loss，改为记录监控指标 mean_max_prob
         # 这个值越接近 1.0 表示路由越自信，接近 0.5 (TopK=1时) 表示犹豫
@@ -634,24 +628,11 @@ class LemMoEV3(torch.nn.Module):
                 "Precomputed LEM cutoff coefficients cannot be used when edge_length requires gradients. "
                 "Set train_options.precompute_lem_cutoff_coeffs=false for force/stress/virial training."
             )
-
-        if precomputed_cutoff_coeffs is None:
-            init_cutoff_coeffs = self.init_layer.cutoff_coefficients(edge_length, bond_type)
-        else:
-            init_cutoff_coeffs = precomputed_cutoff_coeffs.to(device=edge_length.device, dtype=edge_length.dtype).reshape(-1)
-
-        if precomputed_active_edges is None:
-            init_active_edges = (init_cutoff_coeffs > 0).nonzero().squeeze(-1)
-        else:
-            init_active_edges = precomputed_active_edges.to(device=edge_length.device, dtype=torch.long).reshape(-1)
-
-        init_active_edge_vector = edge_vector[init_active_edges]
-        edge_sh = self.sh(init_active_edge_vector[:, [1, 2, 0]])
         latents, node_features, edge_features, cutoff_coeffs, active_edges = self.init_layer(edge_index, atom_type,
                                                                                              bond_type, edge_sh,
                                                                                              edge_length, edge_one_hot,
-                                                                                             init_active_edges,
-                                                                                             init_cutoff_coeffs)
+                                                                                             precomputed_active_edges,
+                                                                                             precomputed_cutoff_coeffs)
 
         n_active_nodes = node_features.shape[0]
         if n_active_nodes < num_nodes_total:
@@ -659,34 +640,19 @@ class LemMoEV3(torch.nn.Module):
         else:
             safe_node_one_hot = node_one_hot
 
-        active_edge_center = edge_index[0][active_edges]
-        active_edge_neighbor = edge_index[1][active_edges]
-        active_edge_vector = init_active_edge_vector
-        active_cutoff_coeffs = cutoff_coeffs[active_edges]
         edge_one_hot = edge_one_hot[active_edges]
 
         # Determine sizes for active edges for Weight Merging in MOLELinear
         if precomputed_split_sizes is not None:
-            mole_globals = MOLEGlobals(
-                coefficients=coeffs,
-                split_sizes=precomputed_split_sizes,
-                topk_indices=getattr(router_out, "topk_indices", None),
-                topk_probs=getattr(router_out, "topk_probs", None),
-            )
+            mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=precomputed_split_sizes)
         else:
-            edge_batch = batch[active_edge_center]  # Map edge to graph index
+            edge_batch = batch[edge_index[0][active_edges]]  # Map edge to graph index
             num_systems = coeffs.shape[0]
             edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(
-                coefficients=coeffs,
-                sizes=edge_sizes,
-                graph_index=edge_batch,
-                topk_indices=getattr(router_out, "topk_indices", None),
-                topk_probs=getattr(router_out, "topk_probs", None),
-            )
+            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes, graph_index=edge_batch)
         # --------------------------
 
-        data[_keys.EDGE_OVERLAP_KEY] = _active_edge_tensor_to_full(latents, active_edges, edge_index.shape[1])
+        data[_keys.EDGE_OVERLAP_KEY] = latents
         wigner_D_all = None
         for idx, layer in enumerate(self.layers):
             latents, node_features, edge_features, wigner_D_all = \
@@ -695,11 +661,11 @@ class LemMoEV3(torch.nn.Module):
                     node_features,
                     edge_features,
                     safe_node_one_hot,
-                    active_edge_center,
-                    active_edge_neighbor,
-                    active_edge_vector,
+                    edge_index,
+                    edge_vector,
                     atom_type,
-                    active_cutoff_coeffs,
+                    cutoff_coeffs,
+                    active_edges,
                     edge_one_hot,
                     wigner_D_all,
                     mole_globals  # Pass globals to layers
@@ -982,6 +948,8 @@ class InitLayer(torch.nn.Module):
     ):
         edge_center = edge_index[0]
 
+        edge_invariants = self.bessel(edge_length)
+
         if cutoff_coeffs is None:
             cutoff_coeffs = self.cutoff_coefficients(edge_length, bond_type)
         else:
@@ -992,18 +960,26 @@ class InitLayer(torch.nn.Module):
         else:
             active_edges = active_edges.to(device=edge_length.device, dtype=torch.long).reshape(-1)
 
-        edge_invariants = self.bessel(edge_length[active_edges])
-        active_edge_sh = edge_sh if edge_sh.shape[0] == active_edges.numel() else edge_sh[active_edges]
+        latents = torch.zeros(
+            (edge_sh.shape[0], self.two_body_latent.out_features),
+            dtype=edge_sh.dtype,
+            device=edge_sh.device,
+        )
 
         new_latents = self.two_body_latent(torch.cat([
             edge_one_hot[active_edges],
-            edge_invariants,
+            edge_invariants[active_edges],
         ], dim=-1))
-        latents = cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
-        weights_e = self.env_embed_mlp(latents)
+
+        latents = torch.index_copy(
+            latents, 0, active_edges,
+            cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
+        )
+
+        weights_e = self.env_embed_mlp(latents[active_edges])
 
         edge_features = self._env_weighter(
-            active_edge_sh, weights_e
+            edge_sh[active_edges], weights_e
         )
 
         node_features = scatter(
@@ -1187,19 +1163,22 @@ class UpdateNode(torch.nn.Module):
                     biases=True,
                 )
 
-    def forward(self, latents, node_features, edge_features, atom_type, node_onehot, active_edge_center,
-                active_edge_vector, wigner_D_all, mole_globals):  # Accept globals
+    def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
+                active_edges, wigner_D_all, mole_globals):  # Accept globals
+        edge_center = edge_index[0]
+        edge_neighbor = edge_index[1]
+
         new_node_features = node_features
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
         message, _ = self.tp(
             torch.cat(
-                [node_in[active_edge_center], edge_in],
+                [node_in[edge_center[active_edges]], edge_in],
                 dim=-1,
             ),
-            active_edge_vector,
+            edge_vector[active_edges],
             mole_globals,
-            latents,
+            latents[active_edges],
             wigner_D_all,
         )  # Pass globals
 
@@ -1207,10 +1186,10 @@ class UpdateNode(torch.nn.Module):
         message = self.lin_post(message)
         scalars = message[:, :self.irreps_out[0].dim]
 
-        weights = self.env_embed_mlps(latents)
+        weights = self.env_embed_mlps(latents[active_edges])
         new_node_features = scatter(
             self._env_weighter(message, weights),
-            active_edge_center,
+            edge_center[active_edges],
             dim=0,
         )
 
@@ -1425,8 +1404,11 @@ class UpdateEdge(torch.nn.Module):
                     biases=True,
                 )
 
-    def forward(self, latents, node_features, node_onehot, edge_features, active_edge_center, active_edge_neighbor,
-                active_edge_vector, active_cutoff_coeffs, edge_one_hot, wigner_D_all, mole_globals):  # Accept globals
+    def forward(self, latents, node_features, node_onehot, edge_features, edge_index, edge_vector, cutoff_coeffs,
+                active_edges, edge_one_hot, wigner_D_all, mole_globals):  # Accept globals
+        edge_center = edge_index[0]
+        edge_neighbor = edge_index[1]
+
         new_node_features = node_features
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
@@ -1434,15 +1416,15 @@ class UpdateEdge(torch.nn.Module):
         new_edge_features, wigner_D_all = self.tp(
             torch.cat(
                 [
-                    node_in[active_edge_center],
+                    node_in[edge_center[active_edges]],
                     edge_in,
-                    node_in[active_edge_neighbor],
+                    node_in[edge_neighbor[active_edges]],
                 ],
                 dim=-1,
             ),
-            active_edge_vector,
+            edge_vector[active_edges],
             mole_globals,
-            latents,
+            latents[active_edges],
             wigner_D_all,
         )  # Pass globals
 
@@ -1452,14 +1434,14 @@ class UpdateEdge(torch.nn.Module):
         scalars = new_edge_features[:, :self.irreps_out[0].dim]
         assert len(scalars.shape) == 2
 
-        weights = self.edge_embed_mlps(latents)
+        weights = self.edge_embed_mlps(latents[active_edges])
         new_edge_features = self._edge_weighter(new_edge_features, weights)
 
         # update latent
 
         new_latents = self.latents_mlp_1(torch.cat(
             [
-                self.ln(latents),
+                self.ln(latents[active_edges]),
                 scalars,
             ], dim=-1))
 
@@ -1469,7 +1451,7 @@ class UpdateEdge(torch.nn.Module):
                 edge_one_hot,
             ], dim=-1))
 
-        new_latents = active_cutoff_coeffs.unsqueeze(-1) * new_latents
+        new_latents = cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
 
         if self.res_update:
             update_coefficients = self._res_update_params.sigmoid()
@@ -1482,10 +1464,16 @@ class UpdateEdge(torch.nn.Module):
                 # 维度不同，必须经过 linear_res
                 edge_features = coefficient_old * self.linear_res(edge_features) + coefficient_new * new_edge_features
 
-            latents = coefficient_new * new_latents + coefficient_old * latents
+            latents = torch.index_copy(
+                latents, 0, active_edges,
+                coefficient_new * new_latents + coefficient_old * latents[active_edges]
+            )
         else:
             edge_features = new_edge_features
-            latents = new_latents
+            latents = torch.index_copy(
+                latents, 0, active_edges,
+                new_latents
+            )
         if self.use_layer_onehot_tp:
             onehot_tune_edge_feat = _apply_onehot_tp(
                 self.edge_onehot_tp, edge_features, edge_one_hot, self.onehot_tp_mode
@@ -1611,14 +1599,13 @@ class Layer(torch.nn.Module):
                 device=device,
             )
 
-    def forward(self, latents, node_features, edge_features, node_onehot, active_edge_center, active_edge_neighbor,
-                active_edge_vector, atom_type, active_cutoff_coeffs, edge_one_hot, wigner_D_all, mole_globals):
+    def forward(self, latents, node_features, edge_features, node_onehot, edge_index, edge_vector, atom_type,
+                cutoff_coeffs, active_edges, edge_one_hot, wigner_D_all, mole_globals):
         edge_features, latents, wigner_D_all = self.edge_update(latents, node_features, node_onehot, edge_features,
-                                                                active_edge_center, active_edge_neighbor,
-                                                                active_edge_vector, active_cutoff_coeffs,
+                                                                edge_index, edge_vector, cutoff_coeffs, active_edges,
                                                                 edge_one_hot, wigner_D_all, mole_globals)
-        node_features = self.node_update(latents, node_features, edge_features, atom_type, node_onehot,
-                                         active_edge_center, active_edge_vector, wigner_D_all, mole_globals)
+        node_features = self.node_update(latents, node_features, edge_features, atom_type, node_onehot, edge_index,
+                                         edge_vector, active_edges, wigner_D_all, mole_globals)
         if self.node_ffn is not None:
             node_features = self.node_ffn(node_features)
 

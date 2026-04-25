@@ -1,25 +1,9 @@
-from pathlib import Path
-
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def _clear_mole_linear_mode_env(monkeypatch):
     monkeypatch.delenv("DPTB_MOLE_LINEAR_MODE", raising=False)
-    monkeypatch.delenv("DPTB_MOLE_SPARSE_MIX", raising=False)
-
-
-def test_mole_sparse_mix_source_keeps_topk_route():
-    source = (
-        Path(__file__).resolve().parents[1]
-        / "nn"
-        / "tensor_product_moe_v3.py"
-    ).read_text(encoding="utf-8")
-
-    assert "class MOLERouterOutput" in source
-    assert "topk_indices=topk_indices" in source
-    assert "DPTB_MOLE_SPARSE_MIX" in source
-    assert "selected_weights = self.weight_experts.index_select" in source
 
 
 def _make_globals(torch, *, device, dtype, sizes=(3, 5, 2, 7), num_experts=8):
@@ -159,76 +143,6 @@ def test_mole_linear_indexed_ref_matches_split_loop_without_bias_or_shared_exper
         dtype=dtype,
         sizes=(1, 4, 6),
     )
-
-
-def test_mole_linear_sparse_topk_mix_matches_dense_forward_and_grad():
-    torch = pytest.importorskip("torch")
-    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
-
-    torch.manual_seed(20260425)
-    dtype = torch.float64
-    sizes = (2, 3, 1)
-    num_graphs = len(sizes)
-    num_experts = 7
-    top_k = 2
-    in_features = 5
-    out_features = 4
-
-    topk_indices = torch.tensor(
-        [[0, 3], [2, 5], [6, 1]],
-        dtype=torch.long,
-    )
-    topk_raw = torch.rand(num_graphs, top_k, dtype=dtype)
-    topk_probs = topk_raw / topk_raw.sum(dim=-1, keepdim=True)
-    topk_probs0 = topk_probs.detach().clone().requires_grad_(True)
-    topk_probs1 = topk_probs.detach().clone().requires_grad_(True)
-
-    coeffs0 = torch.zeros(num_graphs, num_experts, dtype=dtype).scatter(1, topk_indices, topk_probs0)
-    coeffs1 = torch.zeros(num_graphs, num_experts, dtype=dtype).scatter(1, topk_indices, topk_probs1)
-    dense_globals = MOLEGlobals(coefficients=coeffs0, split_sizes=sizes)
-    sparse_globals = MOLEGlobals(
-        coefficients=coeffs1,
-        split_sizes=sizes,
-        topk_indices=topk_indices,
-        topk_probs=topk_probs1,
-    )
-
-    dense = MOLELinear(
-        in_features,
-        out_features,
-        num_experts=num_experts,
-        num_shared_experts=1,
-        bias=True,
-        mole_linear_mode="split_loop",
-    ).to(dtype=dtype)
-    sparse = MOLELinear(
-        in_features,
-        out_features,
-        num_experts=num_experts,
-        num_shared_experts=1,
-        bias=True,
-        mole_linear_mode="split_loop",
-    ).to(dtype=dtype)
-    sparse.load_state_dict(dense.state_dict(), strict=True)
-    dense._mole_sparse_mix = False
-    sparse._mole_sparse_mix = True
-
-    x0 = torch.randn(sum(sizes), 2, in_features, dtype=dtype, requires_grad=True)
-    x1 = x0.detach().clone().requires_grad_(True)
-    y0 = dense(x0, dense_globals)
-    y1 = sparse(x1, sparse_globals)
-    torch.testing.assert_close(y1, y0, atol=1e-10, rtol=1e-10)
-
-    probe = torch.randn_like(y0)
-    (y0 * probe).sum().backward()
-    (y1 * probe).sum().backward()
-
-    torch.testing.assert_close(x1.grad, x0.grad, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(topk_probs1.grad, topk_probs0.grad, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(sparse.weight_experts.grad, dense.weight_experts.grad, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(sparse.bias_experts.grad, dense.bias_experts.grad, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(sparse.weight_shared.grad, dense.weight_shared.grad, atol=1e-10, rtol=1e-10)
-    torch.testing.assert_close(sparse.bias_shared.grad, dense.bias_shared.grad, atol=1e-10, rtol=1e-10)
 
 
 def test_mole_linear_fallback_average_ignores_indexed_mode():
