@@ -63,9 +63,10 @@ all experts or when metadata is absent. This follows the same FlashTP pressure
 point as the SO2 route: skip inactive paths instead of materializing work for
 every possible path.
 
-The LEM v3 embedding now also keeps latent tensors active-edge-only through the
-stack. The public output contract is unchanged: `EDGE_OVERLAP_KEY` and
-`EDGE_FEATURES_KEY` are scattered back to full-edge shape at the API boundary.
-Inside the hot path, bessel inputs, spherical harmonics, latent residual updates,
-and per-layer SO2 calls are restricted to active edges, which removes repeated
-`latents[active_edges]` slices and full-edge latent `index_copy` updates.
+The LEM v3 embedding, including the H0 variant, now also keeps latent tensors
+active-edge-only through the stack. The public output contract is unchanged:
+`EDGE_OVERLAP_KEY` and `EDGE_FEATURES_KEY` are scattered back to full-edge shape
+at the API boundary. Inside the hot path, bessel inputs, spherical harmonics,
+latent residual updates, and per-layer SO2 calls are restricted to active edges,
+which removes repeated `latents[active_edges]` slices and full-edge latent
+`index_copy` updates.

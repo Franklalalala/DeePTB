@@ -65,7 +65,6 @@ class LemMoEV3H0(LemMoEV3):
 
         edge_index = data[_keys.EDGE_INDEX_KEY]
         edge_vector = data[_keys.EDGE_VECTORS_KEY]
-        edge_sh = self.sh(data[_keys.EDGE_VECTORS_KEY][:, [1, 2, 0]])
         edge_length = data[_keys.EDGE_LENGTH_KEY]
 
         data = self.onehot(data)
@@ -90,6 +89,19 @@ class LemMoEV3H0(LemMoEV3):
                 "Precomputed LEM cutoff coefficients cannot be used when edge_length requires gradients. "
                 "Set train_options.precompute_lem_cutoff_coeffs=false for force/stress/virial training."
             )
+
+        if precomputed_cutoff_coeffs is None:
+            init_cutoff_coeffs = self.init_layer.base_init.cutoff_coefficients(edge_length, bond_type)
+        else:
+            init_cutoff_coeffs = precomputed_cutoff_coeffs.to(device=edge_length.device, dtype=edge_length.dtype).reshape(-1)
+
+        if precomputed_active_edges is None:
+            init_active_edges = (init_cutoff_coeffs > 0).nonzero().squeeze(-1)
+        else:
+            init_active_edges = precomputed_active_edges.to(device=edge_length.device, dtype=torch.long).reshape(-1)
+
+        init_active_edge_vector = edge_vector[init_active_edges]
+        edge_sh = self.sh(init_active_edge_vector[:, [1, 2, 0]])
         latents, node_features, edge_features, cutoff_coeffs, active_edges = self.init_layer(
             data,
             edge_index,
@@ -98,8 +110,8 @@ class LemMoEV3H0(LemMoEV3):
             edge_sh,
             edge_length,
             edge_one_hot,
-            precomputed_active_edges,
-            precomputed_cutoff_coeffs,
+            init_active_edges,
+            init_cutoff_coeffs,
         )
 
         if node_features.shape[0] < num_nodes_total:
