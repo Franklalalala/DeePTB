@@ -688,6 +688,7 @@ def embedding():
             Argument("emoles_openequi_norm_v2", dict, slem()),
             Argument("emoles_openequi_eqv3", dict, slem()),
             Argument("emoles_openequi_eqv3_ffn", dict, slem()),
+            Argument("emoles_openequi_eqv3_swiglu_s2_ffn", dict, slem()),
             Argument("emoles_openequi_nodeffn", dict, slem()),
             Argument("lem_light", dict, slem()),
             Argument("lem_light_v2", dict, slem()),
@@ -713,6 +714,20 @@ def embedding():
             Argument("lem_so2_global", dict, slem()),
             Argument("trinity", dict, slem()+[Argument("only2b", bool, optional=True, default=False, doc=doc_only2b)],),
         ],optional=True, default_tag="se2", doc=doc_method)
+
+def _apply_embedding_presets(data):
+    embedding = data.get("model_options", {}).get("embedding")
+    if not isinstance(embedding, dict):
+        return data
+
+    if embedding.get("method") == "emoles_openequi_eqv3_swiglu_s2_ffn":
+        embedding["equivariant_norm_type"] = "merged_rms"
+        embedding["hidden_edge_activation_type"] = "swiglu_s2"
+        embedding.setdefault("swiglu_s2_grid_resolution", [14, 14])
+        if float(embedding.get("ffn_hidden_factor", 0.0)) <= 1.0:
+            embedding["ffn_hidden_factor"] = 4.0
+
+    return data
 
 def se2():
     doc_rs = "The soft cutoff where the smooth function starts."
@@ -1296,6 +1311,7 @@ def normalize(data):
     data = base.normalize_value(data)
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
+    data = _apply_embedding_presets(data)
 
     # add check loss and use wannier:
 
@@ -2017,7 +2033,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_eqv3_swiglu_s2_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")
@@ -2125,6 +2141,7 @@ def normalize(data):
     data = base.normalize_value(data)
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
+    data = _apply_embedding_presets(data)
 
     # add check loss and use wannier:
 

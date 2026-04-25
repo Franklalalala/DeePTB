@@ -31,7 +31,7 @@ from .emoles import EMolES, EMolESOpenequi
 from .emoles_norm import EMolESOpenequiNorm
 from .emoles_norm_v2 import EMolESOpenequiNormV2
 from .emoles_eqv3 import EMolESOpenequiEqV3
-from .emoles_openequi_eqv3_ffn import EMolESOpenequiEqV3FFN
+from .emoles_openequi_eqv3_ffn import EMolESOpenequiEqV3FFN, EMolESOpenequiEqV3SwiGLUS2FFN
 from .emoles_openequi_nodeffn import EMolESOpenequiNodeFFN
 # from .lem_in_frame_openequi import LemInFrameOpenequi
 from .lem_moe_openequi import LemMoEOpenEqui
@@ -73,6 +73,7 @@ __all__ = [
     "EMolESOpenequiNormV2",
     "EMolESOpenequiEqV3",
     "EMolESOpenequiEqV3FFN",
+    "EMolESOpenequiEqV3SwiGLUS2FFN",
     "EMolESOpenequiNodeFFN",
     "LemSO2Local",
     "LemLocal",
