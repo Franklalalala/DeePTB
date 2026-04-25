@@ -14,6 +14,7 @@ This branch adds a tunable SO2 path-aggregation mode:
 ```text
 DPTB_SO2_FLASH_AGGREGATE=input   # default: rotate input l-groups once
 DPTB_SO2_FLASH_AGGREGATE=output  # aggregate local outputs, rotate each l once
+DPTB_SO2_FLASH_AGGREGATE=hybrid  # input aggregation plus high-l output aggregation
 DPTB_SO2_FLASH_AGGREGATE=1       # full input+output aggregate
 DPTB_SO2_FLASH_AGGREGATE=0       # direct-output fallback
 ```
@@ -34,7 +35,10 @@ The transferable FlashTP idea is path aggregation:
 The default is input-side aggregation only, so the route still writes `m`
 contributions directly into the final output tensor and avoids the per-`l`
 output group buffer. Output aggregation is opt-in because it can reduce repeated
-small rotation work but reintroduces the grouped output buffer.
+small rotation work but reintroduces the grouped output buffer. Hybrid mode is
+the intermediate benchmark target: it keeps direct output for low `l` channels
+and only aggregates output groups with `l >= DPTB_SO2_FLASH_HYBRID_L_MIN`
+(default `2`).
 
 ## Validation
 

@@ -185,8 +185,10 @@ def _normalize_so2_flash_aggregate_mode(value: str) -> str:
         return "input"
     if value in ("output", "output_only", "rotate_out"):
         return "output"
+    if value in ("hybrid", "partial", "high_l"):
+        return "hybrid"
     raise ValueError(
-        "DPTB_SO2_FLASH_AGGREGATE must be one of 0/off, 1/full, input, output; "
+        "DPTB_SO2_FLASH_AGGREGATE must be one of 0/off, 1/full, input, output, hybrid; "
         f"got {value!r}"
     )
 
@@ -1325,6 +1327,23 @@ class SO2_Linear(torch.nn.Module):
                 out[:, entry.slice_info] = group_view.reshape(n, -1)
         return out
 
+    def _materialize_output_l_groups_into_(
+            self,
+            out: torch.Tensor,
+            out_groups: Dict[int, torch.Tensor],
+            *,
+            rot_blocks: Optional[Dict[int, torch.Tensor]] = None,
+    ) -> None:
+        entries_by_l = defaultdict(list)
+        for entry in self._out_entry_plans:
+            entries_by_l[entry.l].append(entry)
+        for l, group in out_groups.items():
+            if rot_blocks is not None and self.rotate_out and l > 0 and l in rot_blocks:
+                group = torch.bmm(group, rot_blocks[l].transpose(1, 2))
+            for entry in entries_by_l[l]:
+                group_view = group[:, entry.group_start:entry.group_start + entry.mul, :]
+                out[:, entry.slice_info] = group_view.reshape(out.shape[0], -1)
+
     def _pack_group_m0(self, x_group: torch.Tensor, l: int, rot_block: Optional[torch.Tensor]) -> torch.Tensor:
         if x_group.numel() == 0:
             return x_group.new_empty((x_group.shape[0], x_group.shape[1]))
@@ -1461,6 +1480,54 @@ class SO2_Linear(torch.nn.Module):
                 rot_blocks.get(entry.l),
             )
 
+    def _accumulate_mixed_m0_output_(
+            self,
+            out: torch.Tensor,
+            out_groups: Dict[int, torch.Tensor],
+            grouped_l: set,
+            y_m0: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+    ) -> None:
+        cursor = 0
+        for entry in self._out_entries_by_m[0]:
+            y_entry = y_m0[:, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            if entry.l in grouped_l:
+                out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+                self._accumulate_group_m0_(out_view, y_entry, entry.l, None)
+            else:
+                self._accumulate_group_m0_(
+                    self._out_entry_view(out, entry),
+                    y_entry,
+                    entry.l,
+                    rot_blocks.get(entry.l),
+                )
+
+    def _accumulate_mixed_pair_output_(
+            self,
+            out: torch.Tensor,
+            out_groups: Dict[int, torch.Tensor],
+            grouped_l: set,
+            y_m: torch.Tensor,
+            rot_blocks: Dict[int, torch.Tensor],
+            m: int,
+    ) -> None:
+        cursor = 0
+        for entry in self._out_entries_by_m[m]:
+            y_entry = y_m[:, :, cursor:cursor + entry.mul]
+            cursor += entry.mul
+            if entry.l in grouped_l:
+                out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
+                self._accumulate_group_pair_(out_view, y_entry, entry.l, m, None)
+            else:
+                self._accumulate_group_pair_(
+                    self._out_entry_view(out, entry),
+                    y_entry,
+                    entry.l,
+                    m,
+                    rot_blocks.get(entry.l),
+                )
+
     def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
@@ -1475,8 +1542,15 @@ class SO2_Linear(torch.nn.Module):
             if bool(rot_blocks) and (self.rotate_in or self.rotate_out)
             else "off"
         )
-        rotate_input_once = self.rotate_in and flash_mode in ("input", "full")
+        rotate_input_once = self.rotate_in and flash_mode in ("input", "full", "hybrid")
         aggregate_output_once = self.rotate_out and flash_mode in ("output", "full")
+        hybrid_output_l = set()
+        if self.rotate_out and flash_mode == "hybrid":
+            hybrid_output_l = {
+                l
+                for l in self._out_group_plans
+                if l >= int(os.environ.get("DPTB_SO2_FLASH_HYBRID_L_MIN", "2"))
+            }
         if rotate_input_once:
             input_groups = self._rotate_input_l_groups_once(input_groups, rot_blocks)
             pack_rot_blocks = {}
@@ -1487,6 +1561,17 @@ class SO2_Linear(torch.nn.Module):
             accum_rot_blocks = {}
             out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
             out = None
+        elif hybrid_output_l:
+            accum_rot_blocks = rot_blocks
+            out_groups = {
+                l: torch.zeros(
+                    (n, self._out_group_plans[l].total_mul, self._out_group_plans[l].dims),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                for l in hybrid_output_l
+            }
+            out = torch.zeros((n, self.irreps_out.dim), dtype=x.dtype, device=x.device)
         else:
             accum_rot_blocks = rot_blocks
             out_groups = None
@@ -1508,6 +1593,8 @@ class SO2_Linear(torch.nn.Module):
                     y_m = self.fc_m0(inp, mole_globals)
                 if aggregate_output_once:
                     self._accumulate_grouped_m0_output_(out_groups, y_m, accum_rot_blocks)
+                elif hybrid_output_l:
+                    self._accumulate_mixed_m0_output_(out, out_groups, hybrid_output_l, y_m, accum_rot_blocks)
                 else:
                     self._accumulate_direct_m0_output_(out, y_m, accum_rot_blocks)
                 continue
@@ -1524,6 +1611,15 @@ class SO2_Linear(torch.nn.Module):
 
             if aggregate_output_once:
                 self._accumulate_grouped_pair_output_(out_groups, linear_output, accum_rot_blocks, m)
+            elif hybrid_output_l:
+                self._accumulate_mixed_pair_output_(
+                    out,
+                    out_groups,
+                    hybrid_output_l,
+                    linear_output,
+                    accum_rot_blocks,
+                    m,
+                )
             else:
                 self._accumulate_direct_pair_output_(out, linear_output, accum_rot_blocks, m)
 
@@ -1535,6 +1631,8 @@ class SO2_Linear(torch.nn.Module):
                 device=x.device,
                 rot_blocks=rot_blocks,
             )
+        elif hybrid_output_l:
+            self._materialize_output_l_groups_into_(out, out_groups, rot_blocks=rot_blocks)
 
         return out.contiguous(), wigner_D_all
 

@@ -11,6 +11,7 @@ def test_so2_streamed_grouped_source_has_flash_aggregate_and_direct_fallback():
 
     assert "DPTB_SO2_FLASH_AGGREGATE" in text
     assert "so2_flash_aggregate_mode" in text
+    assert "hybrid_output_l" in body
     assert "rotate_input_once" in body
     assert "aggregate_output_once" in body
     assert "_rotate_input_l_groups_once" in body
@@ -173,7 +174,7 @@ def test_so2_streamed_grouped_direct_fallback_avoids_output_group_buffer(monkeyp
     torch.testing.assert_close(out1, out0, atol=1e-10, rtol=1e-10)
 
 
-@pytest.mark.parametrize("flash_mode", ["input", "output", "1"])
+@pytest.mark.parametrize("flash_mode", ["input", "output", "1", "hybrid"])
 @pytest.mark.parametrize(
     "rotate_in, rotate_out",
     [(True, True), (True, False), (False, True), (False, False)],
