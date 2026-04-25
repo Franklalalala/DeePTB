@@ -1,6 +1,7 @@
 import logging
 import time
 import collections
+import re
 
 import torch
 from dptb.data import AtomicData
