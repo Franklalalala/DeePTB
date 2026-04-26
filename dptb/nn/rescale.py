@@ -492,7 +492,7 @@ class E3ElementLinear(torch.nn.Module):
         self.num_scales = count_scales
         self.num_shifts = count_shift
         self._scale_blocks = tuple(scale_blocks)
-        self._use_block_scale = os.environ.get("DPTB_E3_ELEMENT_LINEAR_MODE", "block_view") == "block_view"
+        self._use_block_scale = os.environ.get("DPTB_E3_ELEMENT_LINEAR_MODE", "indexed") == "block_view"
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor]=None):
 
