@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from dptb.data.transforms import OrbitalMapper
 from dptb.data import AtomicDataDict
 from dptb.utils.constants import anglrMId
@@ -8,6 +9,7 @@ from dptb.nn.tensor_product import wigner_D
 from dptb.utils.tools import float2comlex
 # 保持原有的 import，确保 get_soc_matrix_cubic_basis 可用
 from dptb.nn.sktb.socbasic import get_soc_matrix_cubic_basis
+import os
 import re
 from typing import Dict, Union, Optional
 
@@ -25,13 +27,82 @@ def _to_device(tensor: torch.Tensor, device: Union[str, torch.device]) -> torch.
     return tensor.to(device=device)
 
 
-def _contract_cg_rme(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
-    """Original broadcast contraction used for E3Hamiltonian A/B testing."""
+def _contract_cg_rme_broadcast(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
     hr = torch.sum(
         cg_basis[None, :, :, :, None] * rme2[:, None, None, :, :],
         dim=-2,
     )
     return hr.permute(0, 3, 1, 2)
+
+
+def _contract_cg_rme_einsum(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
+    return torch.einsum("nrc,ijr->ncij", rme2, cg_basis)
+
+
+def _contract_cg_rme_gemm(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
+    n_rows, n_rme, n_chunk = rme2.shape
+    n_left, n_right, cg_rme = cg_basis.shape
+    if n_rme != cg_rme:
+        raise ValueError(f"CG/RME shape mismatch: rme2={tuple(rme2.shape)}, cg_basis={tuple(cg_basis.shape)}")
+
+    x = rme2.transpose(1, 2).reshape(n_rows * n_chunk, n_rme)
+    weight = cg_basis.reshape(n_left * n_right, n_rme).contiguous()
+    out = F.linear(x, weight)
+    return out.view(n_rows, n_chunk, n_left, n_right)
+
+
+def _contract_cg_rme_tiled_broadcast(
+    cg_basis: torch.Tensor,
+    rme2: torch.Tensor,
+    tile_rows: int,
+) -> torch.Tensor:
+    n_rows, n_rme, n_chunk = rme2.shape
+    n_left, n_right, cg_rme = cg_basis.shape
+    if n_rme != cg_rme:
+        raise ValueError(f"CG/RME shape mismatch: rme2={tuple(rme2.shape)}, cg_basis={tuple(cg_basis.shape)}")
+    if tile_rows <= 0:
+        raise ValueError(f"DPTB_E3HAM_CG_TILE_ROWS must be positive, got {tile_rows}")
+
+    out = rme2.new_empty((n_rows, n_chunk, n_left, n_right))
+    for start in range(0, n_rows, tile_rows):
+        end = min(start + tile_rows, n_rows)
+        out[start:end] = _contract_cg_rme_broadcast(cg_basis, rme2[start:end])
+    return out
+
+
+def _get_e3ham_cg_tile_rows() -> int:
+    raw = os.environ.get("DPTB_E3HAM_CG_TILE_ROWS", "32768")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"DPTB_E3HAM_CG_TILE_ROWS must be an integer, got {raw!r}") from exc
+
+
+def _contract_cg_rme(
+    cg_basis: torch.Tensor,
+    rme2: torch.Tensor,
+    mode: Optional[str] = None,
+    tile_rows: Optional[int] = None,
+) -> torch.Tensor:
+    """Contract fixed CG basis with RME blocks using selectable A/B backends."""
+    mode = (mode or os.environ.get("DPTB_E3HAM_CG_CONTRACT_MODE", "gemm")).lower()
+    if mode in ("gemm", "linear"):
+        return _contract_cg_rme_gemm(cg_basis, rme2)
+    if mode == "einsum":
+        return _contract_cg_rme_einsum(cg_basis, rme2)
+    if mode in ("tiled", "tiled_broadcast", "tile_broadcast"):
+        return _contract_cg_rme_tiled_broadcast(
+            cg_basis,
+            rme2,
+            tile_rows=_get_e3ham_cg_tile_rows() if tile_rows is None else int(tile_rows),
+        )
+    if mode in ("broadcast", "original"):
+        return _contract_cg_rme_broadcast(cg_basis, rme2)
+    raise ValueError(
+        "DPTB_E3HAM_CG_CONTRACT_MODE must be one of "
+        "gemm, einsum, tiled_broadcast, or broadcast; "
+        f"got {mode!r}"
+    )
 
 
 class E3Hamiltonian(torch.nn.Module):
