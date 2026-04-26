@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from dptb.data.transforms import OrbitalMapper
 from dptb.data import AtomicDataDict
 from dptb.utils.constants import anglrMId
@@ -26,8 +27,21 @@ def _to_device(tensor: torch.Tensor, device: Union[str, torch.device]) -> torch.
 
 
 def _contract_cg_rme(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
-    """Contract CG basis with RME without materializing the broadcast product."""
-    return torch.einsum("nrc,ijr->ncij", rme2, cg_basis)
+    """Contract CG basis with RME through one large GEMM.
+
+    cg_basis: [I, J, R]
+    rme2:     [N, R, C]
+    return:   [N, C, I, J]
+    """
+    n_rows, n_rme, n_chunk = rme2.shape
+    n_left, n_right, cg_rme = cg_basis.shape
+    if n_rme != cg_rme:
+        raise ValueError(f"CG/RME shape mismatch: rme2={tuple(rme2.shape)}, cg_basis={tuple(cg_basis.shape)}")
+
+    x = rme2.transpose(1, 2).reshape(n_rows * n_chunk, n_rme)
+    weight = cg_basis.reshape(n_left * n_right, n_rme).contiguous()
+    out = F.linear(x, weight)
+    return out.view(n_rows, n_chunk, n_left, n_right)
 
 
 class E3Hamiltonian(torch.nn.Module):
