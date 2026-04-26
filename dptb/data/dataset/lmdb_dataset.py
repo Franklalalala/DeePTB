@@ -146,11 +146,6 @@ class LMDBDataset(AtomicDataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        for env in state.get("_lmdb_env_cache", {}).values():
-            try:
-                env.close()
-            except Exception:
-                pass
         state["_lmdb_env_cache"] = {}
         return state
 

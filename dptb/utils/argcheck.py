@@ -155,9 +155,19 @@ def train_options():
     "
     doc_lr_scheduler = "The learning rate scheduler tools settings, the lr scheduler is used to scales down the learning rate during the training process. Proper setting can make the training more stable and efficient. The supported lr schedular includes: `Exponential Decaying (exp)`, `Linear multiplication (linear)`, `Reduce on pleatau (rop)`, `Cyclic learning rate (cyclic)`. See more documentation on Pytorch. "
 
-    doc_batch_size = "The batch size used in training, Default: `1`"
-    doc_ref_batch_size = "The batch size used in reference data, Default: `1`"
-    doc_val_batch_size = "The batch size used in validation data, Default: `1`"
+    doc_batch_size = (
+        "The training batch size. In expert data parallel mode the default semantics are same-expert "
+        "global batch, so the per-rank DataLoader batch is batch_size / expert_data_parallel_size. "
+        "Default: `1`"
+    )
+    doc_ref_batch_size = (
+        "The reference-data batch size. In expert data parallel mode this follows the same global-batch "
+        "semantics as batch_size. Default: `1`"
+    )
+    doc_val_batch_size = (
+        "The validation batch size. In expert data parallel mode this follows the same global-batch "
+        "semantics as batch_size. Default: `1`"
+    )
     doc_max_ckpt = "The maximum number of saved checkpoints, Default: `4`"
     doc_distance_ranges = "The ranges split for distance-based MoE / expert parallelism. Default: `[[0.0, 1.0], [1.0, 2.0], [2.0, 4.0], [4.0, 6.0]]`"
 
@@ -234,14 +244,19 @@ def train_options():
         "Shortcut for setting expert_dp_backend to `ddp`. When true, expert_dp_backend is ignored. "
         "Default: `False`"
     )
+    doc_expert_dp_batch_size_semantics = (
+        "How batch_size/ref_batch_size/val_batch_size are interpreted when expert_data_parallel_size > 1. "
+        "`global` means same-expert global batch and automatically divides local DataLoader batch by "
+        "expert_data_parallel_size; `local` preserves legacy per-rank semantics. Default: `global`"
+    )
     doc_expert_dp_ddp_static_graph = (
-        "Set true when expert DDP graphs are static, enabling DDP static_graph optimization. Default: `True`"
+        "Set true when expert DDP graphs are static, enabling DDP static_graph optimization. Default: `False`"
     )
     doc_expert_dp_ddp_gradient_as_bucket_view = (
-        "Set true to let expert DDP gradients view all-reduce buckets and avoid extra bucket copies. Default: `True`"
+        "Set true to let expert DDP gradients view all-reduce buckets and avoid extra bucket copies. Default: `False`"
     )
     doc_expert_dp_ddp_find_unused_parameters = (
-        "Set true if DDP-wrapped expert forward can leave trainable parameters unused. Default: `False`"
+        "Set true if DDP-wrapped expert forward can leave trainable parameters unused. Default: `True`"
     )
     doc_expert_dp_ddp_broadcast_buffers = (
         "Set true to let DDP broadcast expert buffers at forward start. Default: `False`; DeePTB keeps its "
@@ -256,6 +271,9 @@ def train_options():
     )
     doc_expert_dp_grad_bucket_mb = (
         "Target same-expert data-parallel gradient bucket size in MiB. Default: `64`"
+    )
+    doc_expert_dp_ddp_bucket_cap_mb = (
+        "DDP bucket_cap_mb for same-expert DDP backend. Leave unset to use PyTorch's default bucket size."
     )
     doc_expert_dp_buffer_sync_mode = (
         "Same-expert data-parallel buffer synchronization implementation. "
@@ -389,10 +407,12 @@ def train_options():
         Argument("sync_expert_dp_buffers", bool, optional=True, default=True, doc=doc_sync_expert_dp_buffers),
         Argument("expert_dp_backend", str, optional=True, default="manual", doc=doc_expert_dp_backend),
         Argument("expert_dp_use_ddp", bool, optional=True, default=False, doc=doc_expert_dp_use_ddp),
-        Argument("expert_dp_ddp_static_graph", bool, optional=True, default=True, doc=doc_expert_dp_ddp_static_graph),
-        Argument("expert_dp_ddp_gradient_as_bucket_view", bool, optional=True, default=True, doc=doc_expert_dp_ddp_gradient_as_bucket_view),
-        Argument("expert_dp_ddp_find_unused_parameters", bool, optional=True, default=False, doc=doc_expert_dp_ddp_find_unused_parameters),
+        Argument("expert_dp_batch_size_semantics", str, optional=True, default="global", doc=doc_expert_dp_batch_size_semantics),
+        Argument("expert_dp_ddp_static_graph", bool, optional=True, default=False, doc=doc_expert_dp_ddp_static_graph),
+        Argument("expert_dp_ddp_gradient_as_bucket_view", bool, optional=True, default=False, doc=doc_expert_dp_ddp_gradient_as_bucket_view),
+        Argument("expert_dp_ddp_find_unused_parameters", bool, optional=True, default=True, doc=doc_expert_dp_ddp_find_unused_parameters),
         Argument("expert_dp_ddp_broadcast_buffers", bool, optional=True, default=False, doc=doc_expert_dp_ddp_broadcast_buffers),
+        Argument("expert_dp_ddp_bucket_cap_mb", (int, float), optional=True, default=None, doc=doc_expert_dp_ddp_bucket_cap_mb),
         Argument("expert_dp_grad_sync_mode", str, optional=True, default="coalesced", doc=doc_expert_dp_grad_sync_mode),
         Argument("expert_dp_grad_check_mode", str, optional=True, default="auto", doc=doc_expert_dp_grad_check_mode),
         Argument("expert_dp_grad_bucket_mb", (int, float), optional=True, default=64, doc=doc_expert_dp_grad_bucket_mb),

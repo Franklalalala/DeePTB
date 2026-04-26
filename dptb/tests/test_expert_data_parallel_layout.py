@@ -18,6 +18,16 @@ def _method_source(text, name):
     return text[start:next_method]
 
 
+def _top_level_function_source(text, name):
+    marker = f"def {name}("
+    start = text.index(marker)
+    next_function = text.find("\ndef ", start + len(marker))
+    next_class = text.find("\nclass ", start + len(marker))
+    candidates = [pos for pos in (next_function, next_class) if pos != -1]
+    end = min(candidates) if candidates else len(text)
+    return text[start:end]
+
+
 def _assert_in_order(text, snippets):
     cursor = 0
     for snippet in snippets:
@@ -145,6 +155,42 @@ def test_expert_parallel_layout_rejects_conflicting_aliases():
         )
 
 
+def test_expert_dp_global_batch_semantics_divides_local_batch():
+    text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    ns = {}
+    exec(_top_level_function_source(text, "_resolve_local_expert_dp_batch_size"), ns)
+    _resolve_local_expert_dp_batch_size = ns["_resolve_local_expert_dp_batch_size"]
+
+    assert _resolve_local_expert_dp_batch_size(
+        80,
+        expert_data_parallel_size=2,
+        semantics="global",
+    ) == 40
+    assert _resolve_local_expert_dp_batch_size(
+        80,
+        expert_data_parallel_size=2,
+        semantics="local",
+    ) == 80
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        _resolve_local_expert_dp_batch_size(
+            81,
+            expert_data_parallel_size=2,
+            semantics="global",
+        )
+
+
+def test_restart_merge_does_not_lock_expert_dp_topology():
+    text = _read_repo_text("dptb/nnops/ddp_utils.py")
+    start = text.index("RESTART_LOCKED_TRAIN_OPTION_KEYS = (")
+    end = text.index("\n)", start)
+    locked_keys = text[start:end]
+
+    assert '"expert_data_parallel_size"' not in locked_keys
+    assert '"expert_dp_size"' not in locked_keys
+    assert '"distance_ranges"' in locked_keys
+
+
 def test_multi_train_spawns_one_process_per_expert_replica():
     text = _read_repo_text("dptb/entrypoints/multi_train.py")
 
@@ -158,6 +204,10 @@ def test_multi_trainer_uses_sharded_loaders_and_same_expert_grad_sync():
     assert "DistributedSampler(" in text
     assert "num_replicas=self.expert_data_parallel_size" in text
     assert "rank=self.expert_dp_rank" in text
+    assert "def _local_expert_dp_batch_size" in text
+    assert "train_batch_size = self._local_expert_dp_batch_size(\"batch_size\")" in text
+    assert "ref_batch_size = self._local_expert_dp_batch_size(\"ref_batch_size\")" in text
+    assert "val_batch_size = self._local_expert_dp_batch_size(\"val_batch_size\")" in text
     assert "group=self.expert_dp_process_group" in text
     assert "grad_flags = torch.tensor(" in text
     assert "[1 if param.grad is not None else 0 for param in params]" in text
@@ -165,6 +215,7 @@ def test_multi_trainer_uses_sharded_loaders_and_same_expert_grad_sync():
     assert 'self.expert_dp_grad_sync_mode = str(' in text
     assert 'self.expert_dp_grad_check_mode = str(' in text
     assert 'self.expert_dp_grad_bucket_mb = float(' in text
+    assert 'self.expert_dp_batch_size_semantics = str(' in text
     assert "dist.all_reduce_coalesced(" in text
     assert "async_op=True" in text
     assert "flat = torch.cat([grad.contiguous().view(-1) for grad in bucket])" in text
@@ -289,11 +340,13 @@ def test_expert_dp_buffer_sync_uses_coalesced_float_buckets():
 
 def test_lmdb_dataset_reuses_worker_local_envs():
     text = _read_repo_text("dptb/data/dataset/lmdb_dataset.py")
+    getstate = _method_source(text, "__getstate__")
 
     assert "self._lmdb_env_cache = {}" in text
     assert "self._lmdb_path_map += [lmdb_path] * txn.stat()['entries']" in text
     assert "def __getstate__(self):" in text
     assert "state[\"_lmdb_env_cache\"] = {}" in text
+    assert "env.close()" not in getstate
     assert "def _get_lmdb_env(self, path: str):" in text
     assert "cache[path] = env" in text
     assert "def _load_data_dict(self, idx: int):" in text
@@ -303,6 +356,7 @@ def test_lmdb_dataset_reuses_worker_local_envs():
 def test_argcheck_exposes_expert_dp_sync_tuning_options():
     text = _read_repo_text("dptb/utils/argcheck.py")
 
+    assert 'Argument("expert_dp_batch_size_semantics", str, optional=True, default="global"' in text
     assert 'Argument("expert_dp_grad_sync_mode", str, optional=True, default="coalesced"' in text
     assert 'Argument("expert_dp_grad_check_mode", str, optional=True, default="auto"' in text
     assert 'Argument("expert_dp_grad_bucket_mb", (int, float), optional=True, default=64' in text
@@ -314,10 +368,11 @@ def test_argcheck_exposes_expert_dp_ddp_backend_options():
     text = _read_repo_text("dptb/utils/argcheck.py")
 
     assert 'Argument("expert_dp_backend", str, optional=True, default="manual"' in text
-    assert 'Argument("expert_dp_ddp_static_graph", bool, optional=True, default=True' in text
-    assert 'Argument("expert_dp_ddp_gradient_as_bucket_view", bool, optional=True, default=True' in text
-    assert 'Argument("expert_dp_ddp_find_unused_parameters", bool, optional=True, default=False' in text
+    assert 'Argument("expert_dp_ddp_static_graph", bool, optional=True, default=False' in text
+    assert 'Argument("expert_dp_ddp_gradient_as_bucket_view", bool, optional=True, default=False' in text
+    assert 'Argument("expert_dp_ddp_find_unused_parameters", bool, optional=True, default=True' in text
     assert 'Argument("expert_dp_ddp_broadcast_buffers", bool, optional=True, default=False' in text
+    assert 'Argument("expert_dp_ddp_bucket_cap_mb", (int, float), optional=True, default=None' in text
 
 
 def test_argcheck_exposes_a_train_option_to_enable_expert_ddp_backend():
@@ -350,6 +405,7 @@ def test_multi_trainer_wraps_local_expert_with_ddp_backend():
     assert "gradient_as_bucket_view=self.expert_dp_ddp_gradient_as_bucket_view" in text
     assert "find_unused_parameters=self.expert_dp_ddp_find_unused_parameters" in text
     assert "broadcast_buffers=self.expert_dp_ddp_broadcast_buffers" in text
+    assert "bucket_cap_mb=self.expert_dp_ddp_bucket_cap_mb" in text
     assert "self._maybe_wrap_local_expert_ddp()" in text
 
 

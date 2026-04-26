@@ -29,6 +29,36 @@ from dptb.nn.build import build_model
 log = logging.getLogger(__name__)
 
 
+def _resolve_local_expert_dp_batch_size(
+    batch_size: int,
+    *,
+    expert_data_parallel_size: int,
+    semantics: str = "global",
+    option_name: str = "batch_size",
+) -> int:
+    batch_size = int(batch_size)
+    expert_data_parallel_size = int(expert_data_parallel_size)
+    semantics = str(semantics).lower()
+    if batch_size <= 0:
+        raise ValueError(f"{option_name} must be positive, got {batch_size}")
+    if expert_data_parallel_size <= 1:
+        return batch_size
+    if semantics in ("local", "per_rank", "per-replica", "replica"):
+        return batch_size
+    if semantics not in ("global", "same_expert_global", "per_expert_global"):
+        raise ValueError(
+            "expert_dp_batch_size_semantics must be 'global' or 'local', "
+            f"got {semantics!r}"
+        )
+    if batch_size % expert_data_parallel_size != 0:
+        raise ValueError(
+            f"{option_name}={batch_size} is interpreted as same-expert global batch "
+            f"and must be divisible by expert_data_parallel_size={expert_data_parallel_size}. "
+            "Set expert_dp_batch_size_semantics='local' to opt into legacy per-rank semantics."
+        )
+    return batch_size // expert_data_parallel_size
+
+
 class _StageTagger:
     def __init__(
         self,
@@ -267,6 +297,9 @@ class MultiTrainer(Trainer):
         self.debug_profile_dir = self.train_options.get("debug_profile_dir", None)
 
         self.display_sync_freq = max(int(self.train_options.get("display_freq", 1)), 1)
+        self.expert_dp_batch_size_semantics = str(
+            self.train_options.get("expert_dp_batch_size_semantics", "global")
+        ).lower()
         self.sync_expert_dp_buffers = bool(self.train_options.get("sync_expert_dp_buffers", True))
         self.expert_dp_grad_sync_mode = str(
             self.train_options.get("expert_dp_grad_sync_mode", "coalesced")
@@ -277,17 +310,20 @@ class MultiTrainer(Trainer):
             self.expert_dp_backend = "ddp"
             self.train_options["expert_dp_backend"] = "ddp"
         self.expert_dp_ddp_static_graph = bool(
-            self.train_options.get("expert_dp_ddp_static_graph", True)
+            self.train_options.get("expert_dp_ddp_static_graph", False)
         )
         self.expert_dp_ddp_gradient_as_bucket_view = bool(
-            self.train_options.get("expert_dp_ddp_gradient_as_bucket_view", True)
+            self.train_options.get("expert_dp_ddp_gradient_as_bucket_view", False)
         )
         self.expert_dp_ddp_find_unused_parameters = bool(
-            self.train_options.get("expert_dp_ddp_find_unused_parameters", False)
+            self.train_options.get("expert_dp_ddp_find_unused_parameters", True)
         )
         self.expert_dp_ddp_broadcast_buffers = bool(
             self.train_options.get("expert_dp_ddp_broadcast_buffers", False)
         )
+        self.expert_dp_ddp_bucket_cap_mb = self.train_options.get("expert_dp_ddp_bucket_cap_mb", None)
+        if self.expert_dp_ddp_bucket_cap_mb is not None:
+            self.expert_dp_ddp_bucket_cap_mb = float(self.expert_dp_ddp_bucket_cap_mb)
         if self.expert_dp_backend not in ("manual", "ddp"):
             raise ValueError(
                 "expert_dp_backend must be 'manual' or 'ddp', "
@@ -387,10 +423,12 @@ class MultiTrainer(Trainer):
             f"expert_dp_grad_sync_mode={self.expert_dp_grad_sync_mode}, "
             f"expert_dp_grad_check_mode={self.expert_dp_grad_check_mode}, "
             f"expert_dp_grad_bucket_mb={self.expert_dp_grad_bucket_mb}, "
+            f"expert_dp_batch_size_semantics={self.expert_dp_batch_size_semantics}, "
             f"expert_dp_ddp_static_graph={self.expert_dp_ddp_static_graph}, "
             f"expert_dp_ddp_gradient_as_bucket_view={self.expert_dp_ddp_gradient_as_bucket_view}, "
             f"expert_dp_ddp_find_unused_parameters={self.expert_dp_ddp_find_unused_parameters}, "
             f"expert_dp_ddp_broadcast_buffers={self.expert_dp_ddp_broadcast_buffers}, "
+            f"expert_dp_ddp_bucket_cap_mb={self.expert_dp_ddp_bucket_cap_mb}, "
             f"expert_dp_buffer_sync_mode={self.expert_dp_buffer_sync_mode}, "
             f"expert_dp_buffer_bucket_mb={self.expert_dp_buffer_bucket_mb}, "
             f"distributed_rank0_prepare_batch={self.distributed_rank0_prepare_batch}, "
@@ -567,6 +605,14 @@ class MultiTrainer(Trainer):
             drop_last=False,
         )
 
+    def _local_expert_dp_batch_size(self, option_name: str) -> int:
+        return _resolve_local_expert_dp_batch_size(
+            self.train_options[option_name],
+            expert_data_parallel_size=self.expert_data_parallel_size,
+            semantics=self.expert_dp_batch_size_semantics,
+            option_name=option_name,
+        )
+
     def _maybe_rebuild_loaders_in_multi_trainer(self):
         worker_keys = {
             "train_num_workers", "ref_num_workers", "val_num_workers",
@@ -591,9 +637,10 @@ class MultiTrainer(Trainer):
             val_workers = 0
 
         train_sampler = self._make_expert_dp_sampler(self.train_datasets, shuffle=True)
+        train_batch_size = self._local_expert_dp_batch_size("batch_size")
         self.train_loader = self._make_loader_compat(
             dataset=self.train_datasets,
-            batch_size=self.train_options["batch_size"],
+            batch_size=train_batch_size,
             shuffle=True,
             num_workers=train_workers,
             sampler=train_sampler,
@@ -601,9 +648,10 @@ class MultiTrainer(Trainer):
 
         if self.use_reference:
             ref_sampler = self._make_expert_dp_sampler(self.reference_datasets, shuffle=True)
+            ref_batch_size = self._local_expert_dp_batch_size("ref_batch_size")
             self.reference_loader = self._make_loader_compat(
                 dataset=self.reference_datasets,
-                batch_size=self.train_options["ref_batch_size"],
+                batch_size=ref_batch_size,
                 shuffle=True,
                 num_workers=ref_workers,
                 sampler=ref_sampler,
@@ -611,9 +659,10 @@ class MultiTrainer(Trainer):
 
         if self.use_validation:
             val_sampler = self._make_expert_dp_sampler(self.validation_datasets, shuffle=False)
+            val_batch_size = self._local_expert_dp_batch_size("val_batch_size")
             self.validation_loader = self._make_loader_compat(
                 dataset=self.validation_datasets,
-                batch_size=self.train_options["val_batch_size"],
+                batch_size=val_batch_size,
                 shuffle=not self.distributed_expert,
                 num_workers=val_workers,
                 sampler=val_sampler,
@@ -621,7 +670,9 @@ class MultiTrainer(Trainer):
 
         log.info(
             f"[MultiTrainer][rank={self.rank}] rebuilt loaders in MultiTrainer: "
-            f"train_workers={train_workers}, ref_workers={ref_workers}, val_workers={val_workers}"
+            f"train_workers={train_workers}, ref_workers={ref_workers}, val_workers={val_workers}, "
+            f"global_batch_size={self.train_options['batch_size']}, local_batch_size={train_batch_size}, "
+            f"expert_dp_batch_size_semantics={self.expert_dp_batch_size_semantics}"
         )
 
     def _set_expert_dp_sampler_epoch(self, epoch: int):
@@ -800,16 +851,19 @@ class MultiTrainer(Trainer):
             find_unused_parameters=self.expert_dp_ddp_find_unused_parameters,
             gradient_as_bucket_view=self.expert_dp_ddp_gradient_as_bucket_view,
             static_graph=self.expert_dp_ddp_static_graph,
+            bucket_cap_mb=self.expert_dp_ddp_bucket_cap_mb,
         )
         log.info(
             "[MultiTrainer][rank=%s] wrapped local expert %s with DDP backend "
-            "(static_graph=%s, gradient_as_bucket_view=%s, find_unused_parameters=%s, broadcast_buffers=%s).",
+            "(static_graph=%s, gradient_as_bucket_view=%s, find_unused_parameters=%s, "
+            "broadcast_buffers=%s, bucket_cap_mb=%s).",
             self.rank,
             local_idx,
             self.expert_dp_ddp_static_graph,
             self.expert_dp_ddp_gradient_as_bucket_view,
             self.expert_dp_ddp_find_unused_parameters,
             self.expert_dp_ddp_broadcast_buffers,
+            self.expert_dp_ddp_bucket_cap_mb,
         )
 
     def _sync_local_expert_parameters(self):
