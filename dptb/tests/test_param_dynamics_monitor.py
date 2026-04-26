@@ -102,6 +102,36 @@ def test_param_dynamics_monitor_marks_dead_after_patience(tmp_path):
     assert float(dead_row["delta_norm"]) == 0.0
 
 
+def test_param_dynamics_monitor_marks_dead_from_grad_even_when_weights_move(tmp_path):
+    trainer = DummyTrainer()
+    monitor = ParamDynamicsMonitor(
+        str(tmp_path),
+        interval=[(1, "iteration")],
+        tensorboard=False,
+        dead_patience=2,
+    )
+    monitor.register(trainer)
+
+    for param in trainer.model.parameters():
+        param.grad = torch.ones_like(param)
+    monitor.iteration(time=1)
+
+    for _ in range(2):
+        with torch.no_grad():
+            trainer.model.layers[0].weight.add_(0.5)
+        for param in trainer.model.parameters():
+            param.grad = None
+        monitor.iteration(time=1)
+
+    dead_row = _read_model_rows(tmp_path)[-1]
+
+    assert dead_row["status"] == "DEAD"
+    assert dead_row["dead"] == "1"
+    assert dead_row["dead_streak"] == "2"
+    assert float(dead_row["grad_norm"]) == 0.0
+    assert float(dead_row["delta_norm"]) > 0.0
+
+
 def test_param_dynamics_monitor_uses_unique_local_expert_groups(tmp_path):
     trainer = DistributedExpertTrainer()
     monitor = ParamDynamicsMonitor(

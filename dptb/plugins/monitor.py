@@ -995,7 +995,8 @@ class ParamDynamicsMonitor(Plugin):
 
     It does not register forward/backward hooks. Instead, it samples selected
     module groups at a coarse interval, keeps one CPU snapshot per parameter,
-    and records real parameter deltas since the previous sample.
+    and records real parameter deltas since the previous sample. DEAD status is
+    based on missing gradient flow; delta metrics remain diagnostic context.
     """
 
     _EXPERT_RE = re.compile(r"(^|\.)experts\.\d+$")
@@ -1070,6 +1071,9 @@ class ParamDynamicsMonitor(Plugin):
         self.dead_patience = max(1, int(dead_patience))
         self.delta_eps = float(delta_eps)
         self.grad_eps = float(grad_eps)
+        # Kept as a constructor/config argument for compatibility. DEAD status
+        # is intentionally gradient-only so optimizer-driven deltas do not hide
+        # modules that no longer receive gradients.
         self.delta_norm_dead_threshold = float(delta_norm_dead_threshold)
         self.grad_norm_dead_threshold = float(grad_norm_dead_threshold)
         self.writer = None
@@ -1294,10 +1298,7 @@ class ParamDynamicsMonitor(Plugin):
             if baseline:
                 streak = 0
                 status = "BASELINE"
-            elif (
-                grad_norm <= self.grad_norm_dead_threshold
-                and delta_norm <= self.delta_norm_dead_threshold
-            ):
+            elif grad_norm < self.grad_norm_dead_threshold:
                 streak = self._dead_streak.get(group["name"], 0) + 1
                 status = "DEAD" if streak >= self.dead_patience else "NO_FLOW"
             else:
