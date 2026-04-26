@@ -161,12 +161,12 @@ def train_options():
         "Default: `1`"
     )
     doc_ref_batch_size = (
-        "The reference-data batch size. In expert data parallel mode this follows the same global-batch "
-        "semantics as batch_size. Default: `1`"
+        "The reference-data batch size. In expert data parallel mode the default semantics are local/per-rank "
+        "so the common default value `1` remains valid when expert_data_parallel_size > 1. Default: `1`"
     )
     doc_val_batch_size = (
-        "The validation batch size. In expert data parallel mode this follows the same global-batch "
-        "semantics as batch_size. Default: `1`"
+        "The validation batch size. In expert data parallel mode the default semantics are local/per-rank "
+        "so the common default value `1` remains valid when expert_data_parallel_size > 1. Default: `1`"
     )
     doc_max_ckpt = "The maximum number of saved checkpoints, Default: `4`"
     doc_distance_ranges = "The ranges split for distance-based MoE / expert parallelism. Default: `[[0.0, 1.0], [1.0, 2.0], [2.0, 4.0], [4.0, 6.0]]`"
@@ -245,9 +245,25 @@ def train_options():
         "Default: `False`"
     )
     doc_expert_dp_batch_size_semantics = (
-        "How batch_size/ref_batch_size/val_batch_size are interpreted when expert_data_parallel_size > 1. "
+        "Legacy default for training batch size interpretation when expert_data_parallel_size > 1. "
         "`global` means same-expert global batch and automatically divides local DataLoader batch by "
-        "expert_data_parallel_size; `local` preserves legacy per-rank semantics. Default: `global`"
+        "expert_data_parallel_size; `local` preserves per-rank semantics. Default: `global`"
+    )
+    doc_expert_dp_train_batch_size_semantics = (
+        "How batch_size is interpreted when expert_data_parallel_size > 1. Defaults to "
+        "expert_dp_batch_size_semantics, normally `global`, to preserve fixed same-expert global batch."
+    )
+    doc_expert_dp_ref_batch_size_semantics = (
+        "How ref_batch_size is interpreted when expert_data_parallel_size > 1. Default: `local`, so "
+        "reference loaders keep their configured per-rank batch unless explicitly changed to `global`."
+    )
+    doc_expert_dp_val_batch_size_semantics = (
+        "How val_batch_size is interpreted when expert_data_parallel_size > 1. Default: `local`, so "
+        "validation loaders keep their configured per-rank batch unless explicitly changed to `global`."
+    )
+    doc_expert_dp_sampler_drop_last = (
+        "Set true to make the corresponding same-expert DistributedSampler drop tail samples instead of "
+        "padding duplicate indices. Default: `False` to preserve PyTorch DistributedSampler behavior."
     )
     doc_expert_dp_ddp_static_graph = (
         "Set true when expert DDP graphs are static, enabling DDP static_graph optimization. Default: `False`"
@@ -408,6 +424,12 @@ def train_options():
         Argument("expert_dp_backend", str, optional=True, default="manual", doc=doc_expert_dp_backend),
         Argument("expert_dp_use_ddp", bool, optional=True, default=False, doc=doc_expert_dp_use_ddp),
         Argument("expert_dp_batch_size_semantics", str, optional=True, default="global", doc=doc_expert_dp_batch_size_semantics),
+        Argument("expert_dp_train_batch_size_semantics", str, optional=True, default=None, doc=doc_expert_dp_train_batch_size_semantics),
+        Argument("expert_dp_ref_batch_size_semantics", str, optional=True, default="local", doc=doc_expert_dp_ref_batch_size_semantics),
+        Argument("expert_dp_val_batch_size_semantics", str, optional=True, default="local", doc=doc_expert_dp_val_batch_size_semantics),
+        Argument("expert_dp_train_sampler_drop_last", bool, optional=True, default=False, doc=doc_expert_dp_sampler_drop_last),
+        Argument("expert_dp_ref_sampler_drop_last", bool, optional=True, default=False, doc=doc_expert_dp_sampler_drop_last),
+        Argument("expert_dp_val_sampler_drop_last", bool, optional=True, default=False, doc=doc_expert_dp_sampler_drop_last),
         Argument("expert_dp_ddp_static_graph", bool, optional=True, default=False, doc=doc_expert_dp_ddp_static_graph),
         Argument("expert_dp_ddp_gradient_as_bucket_view", bool, optional=True, default=False, doc=doc_expert_dp_ddp_gradient_as_bucket_view),
         Argument("expert_dp_ddp_find_unused_parameters", bool, optional=True, default=True, doc=doc_expert_dp_ddp_find_unused_parameters),

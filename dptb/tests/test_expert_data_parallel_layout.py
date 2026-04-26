@@ -180,6 +180,22 @@ def test_expert_dp_global_batch_semantics_divides_local_batch():
         )
 
 
+def test_expert_dp_uses_global_train_and_local_eval_batch_semantics():
+    text = _read_repo_text("dptb/nnops/multi_trainer.py")
+
+    assert 'self.expert_dp_train_batch_size_semantics = str(' in text
+    assert 'or self.expert_dp_batch_size_semantics' in text
+    assert 'self.expert_dp_ref_batch_size_semantics = str(' in text
+    assert 'self.expert_dp_val_batch_size_semantics = str(' in text
+    assert 'eval_batch_size_semantics = self.train_options.get("expert_dp_eval_batch_size_semantics", "local") or "local"' in text
+    assert 'if option_name == "batch_size":' in text
+    assert 'return self.expert_dp_train_batch_size_semantics' in text
+    assert 'if option_name == "ref_batch_size":' in text
+    assert 'return self.expert_dp_ref_batch_size_semantics' in text
+    assert 'if option_name == "val_batch_size":' in text
+    assert 'return self.expert_dp_val_batch_size_semantics' in text
+
+
 def test_restart_merge_does_not_lock_expert_dp_topology():
     text = _read_repo_text("dptb/nnops/ddp_utils.py")
     start = text.index("RESTART_LOCKED_TRAIN_OPTION_KEYS = (")
@@ -204,6 +220,7 @@ def test_multi_trainer_uses_sharded_loaders_and_same_expert_grad_sync():
     assert "DistributedSampler(" in text
     assert "num_replicas=self.expert_data_parallel_size" in text
     assert "rank=self.expert_dp_rank" in text
+    assert "drop_last=bool(drop_last)" in text
     assert "def _local_expert_dp_batch_size" in text
     assert "train_batch_size = self._local_expert_dp_batch_size(\"batch_size\")" in text
     assert "ref_batch_size = self._local_expert_dp_batch_size(\"ref_batch_size\")" in text
@@ -230,6 +247,39 @@ def test_multi_trainer_uses_sharded_loaders_and_same_expert_grad_sync():
     assert 'self.sync_expert_dp_buffers = bool(self.train_options.get("sync_expert_dp_buffers", True))' in text
     assert "or not self.sync_expert_dp_buffers" in text
     assert "self._sync_local_expert_buffers(local_idx)" in text
+
+
+def test_expert_dp_loader_fallback_never_drops_sampler():
+    text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    make_loader = _method_source(text, "_make_loader_compat")
+
+    assert 'if sampler is not None:' in make_loader
+    assert 'trial_kwargs = [kw for kw in trial_kwargs if "sampler" in kw]' in make_loader
+    assert '"refusing to fall back to an unsharded loader."' in make_loader
+    assert "raise RuntimeError(" in make_loader
+
+
+def test_multi_trainer_sets_sampler_epoch_each_epoch():
+    text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    epoch = _method_source(text, "epoch")
+    set_epoch = _method_source(text, "_set_expert_dp_sampler_epoch")
+
+    assert "self._set_expert_dp_sampler_epoch(self.ep)" in epoch
+    assert 'for loader_name in ("train_loader", "reference_loader", "validation_loader")' in set_epoch
+    assert "sampler.set_epoch(int(epoch))" in set_epoch
+
+
+def test_multi_trainer_restart_restores_plural_expert_states():
+    text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    restart = _method_source(text, "restart")
+
+    assert "def restart(cls, checkpoint, train_datasets" in restart
+    assert "distance_ranges = ckpt_train_options.get(" in restart
+    assert "distributed_expert=distributed_expert" in restart
+    assert 'ckpt.get("optimizers_state_dict", None)' in restart
+    assert 'ckpt.get("lr_schedulers_state_dict", None)' in restart
+    assert "trainer.optimizers[idx].load_state_dict(opt_states[idx])" in restart
+    assert "trainer.lr_schedulers[idx].load_state_dict(sch_states[idx])" in restart
 
 
 def test_expert_dp_buffer_switch_only_guards_buffer_sync():
@@ -357,6 +407,12 @@ def test_argcheck_exposes_expert_dp_sync_tuning_options():
     text = _read_repo_text("dptb/utils/argcheck.py")
 
     assert 'Argument("expert_dp_batch_size_semantics", str, optional=True, default="global"' in text
+    assert 'Argument("expert_dp_train_batch_size_semantics", str, optional=True, default=None' in text
+    assert 'Argument("expert_dp_ref_batch_size_semantics", str, optional=True, default="local"' in text
+    assert 'Argument("expert_dp_val_batch_size_semantics", str, optional=True, default="local"' in text
+    assert 'Argument("expert_dp_train_sampler_drop_last", bool, optional=True, default=False' in text
+    assert 'Argument("expert_dp_ref_sampler_drop_last", bool, optional=True, default=False' in text
+    assert 'Argument("expert_dp_val_sampler_drop_last", bool, optional=True, default=False' in text
     assert 'Argument("expert_dp_grad_sync_mode", str, optional=True, default="coalesced"' in text
     assert 'Argument("expert_dp_grad_check_mode", str, optional=True, default="auto"' in text
     assert 'Argument("expert_dp_grad_bucket_mb", (int, float), optional=True, default=64' in text

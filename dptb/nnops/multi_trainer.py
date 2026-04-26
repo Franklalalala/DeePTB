@@ -47,14 +47,14 @@ def _resolve_local_expert_dp_batch_size(
         return batch_size
     if semantics not in ("global", "same_expert_global", "per_expert_global"):
         raise ValueError(
-            "expert_dp_batch_size_semantics must be 'global' or 'local', "
+            f"{option_name} expert DP batch size semantics must be 'global' or 'local', "
             f"got {semantics!r}"
         )
     if batch_size % expert_data_parallel_size != 0:
         raise ValueError(
             f"{option_name}={batch_size} is interpreted as same-expert global batch "
             f"and must be divisible by expert_data_parallel_size={expert_data_parallel_size}. "
-            "Set expert_dp_batch_size_semantics='local' to opt into legacy per-rank semantics."
+            "Set the corresponding expert DP batch size semantics to 'local' to opt into per-rank semantics."
         )
     return batch_size // expert_data_parallel_size
 
@@ -300,6 +300,19 @@ class MultiTrainer(Trainer):
         self.expert_dp_batch_size_semantics = str(
             self.train_options.get("expert_dp_batch_size_semantics", "global")
         ).lower()
+        eval_batch_size_semantics = self.train_options.get("expert_dp_eval_batch_size_semantics", "local") or "local"
+        self.expert_dp_train_batch_size_semantics = str(
+            self.train_options.get("expert_dp_train_batch_size_semantics")
+            or self.expert_dp_batch_size_semantics
+        ).lower()
+        self.expert_dp_ref_batch_size_semantics = str(
+            self.train_options.get("expert_dp_ref_batch_size_semantics")
+            or eval_batch_size_semantics
+        ).lower()
+        self.expert_dp_val_batch_size_semantics = str(
+            self.train_options.get("expert_dp_val_batch_size_semantics")
+            or eval_batch_size_semantics
+        ).lower()
         self.sync_expert_dp_buffers = bool(self.train_options.get("sync_expert_dp_buffers", True))
         self.expert_dp_grad_sync_mode = str(
             self.train_options.get("expert_dp_grad_sync_mode", "coalesced")
@@ -374,6 +387,15 @@ class MultiTrainer(Trainer):
 
         self.data_persistent_workers = bool(self.train_options.get("data_persistent_workers", self.train_num_workers > 0))
         self.data_prefetch_factor = int(self.train_options.get("data_prefetch_factor", 2))
+        self.expert_dp_train_sampler_drop_last = bool(
+            self.train_options.get("expert_dp_train_sampler_drop_last", False)
+        )
+        self.expert_dp_ref_sampler_drop_last = bool(
+            self.train_options.get("expert_dp_ref_sampler_drop_last", False)
+        )
+        self.expert_dp_val_sampler_drop_last = bool(
+            self.train_options.get("expert_dp_val_sampler_drop_last", False)
+        )
 
         self._tagger = _StageTagger(
             trainer=self,
@@ -424,6 +446,12 @@ class MultiTrainer(Trainer):
             f"expert_dp_grad_check_mode={self.expert_dp_grad_check_mode}, "
             f"expert_dp_grad_bucket_mb={self.expert_dp_grad_bucket_mb}, "
             f"expert_dp_batch_size_semantics={self.expert_dp_batch_size_semantics}, "
+            f"expert_dp_train_batch_size_semantics={self.expert_dp_train_batch_size_semantics}, "
+            f"expert_dp_ref_batch_size_semantics={self.expert_dp_ref_batch_size_semantics}, "
+            f"expert_dp_val_batch_size_semantics={self.expert_dp_val_batch_size_semantics}, "
+            f"expert_dp_train_sampler_drop_last={self.expert_dp_train_sampler_drop_last}, "
+            f"expert_dp_ref_sampler_drop_last={self.expert_dp_ref_sampler_drop_last}, "
+            f"expert_dp_val_sampler_drop_last={self.expert_dp_val_sampler_drop_last}, "
             f"expert_dp_ddp_static_graph={self.expert_dp_ddp_static_graph}, "
             f"expert_dp_ddp_gradient_as_bucket_view={self.expert_dp_ddp_gradient_as_bucket_view}, "
             f"expert_dp_ddp_find_unused_parameters={self.expert_dp_ddp_find_unused_parameters}, "
@@ -584,6 +612,8 @@ class MultiTrainer(Trainer):
             {k: v for k, v in kwargs.items() if k != "pin_memory"},
             {},
         ]
+        if sampler is not None:
+            trial_kwargs = [kw for kw in trial_kwargs if "sampler" in kw]
 
         last_err = None
         for kw in trial_kwargs:
@@ -592,9 +622,14 @@ class MultiTrainer(Trainer):
             except TypeError as e:
                 last_err = e
                 continue
+        if sampler is not None:
+            raise RuntimeError(
+                "expert data parallel loaders require DataLoader sampler support; "
+                "refusing to fall back to an unsharded loader."
+            ) from last_err
         raise last_err
 
-    def _make_expert_dp_sampler(self, dataset, *, shuffle: bool):
+    def _make_expert_dp_sampler(self, dataset, *, shuffle: bool, drop_last: bool = False):
         if not self.distributed_expert or self.expert_data_parallel_size <= 1:
             return None
         return DistributedSampler(
@@ -602,14 +637,23 @@ class MultiTrainer(Trainer):
             num_replicas=self.expert_data_parallel_size,
             rank=self.expert_dp_rank,
             shuffle=shuffle,
-            drop_last=False,
+            drop_last=bool(drop_last),
         )
+
+    def _expert_dp_batch_size_semantics_for(self, option_name: str) -> str:
+        if option_name == "batch_size":
+            return self.expert_dp_train_batch_size_semantics
+        if option_name == "ref_batch_size":
+            return self.expert_dp_ref_batch_size_semantics
+        if option_name == "val_batch_size":
+            return self.expert_dp_val_batch_size_semantics
+        return self.expert_dp_batch_size_semantics
 
     def _local_expert_dp_batch_size(self, option_name: str) -> int:
         return _resolve_local_expert_dp_batch_size(
             self.train_options[option_name],
             expert_data_parallel_size=self.expert_data_parallel_size,
-            semantics=self.expert_dp_batch_size_semantics,
+            semantics=self._expert_dp_batch_size_semantics_for(option_name),
             option_name=option_name,
         )
 
@@ -636,7 +680,11 @@ class MultiTrainer(Trainer):
             ref_workers = 0
             val_workers = 0
 
-        train_sampler = self._make_expert_dp_sampler(self.train_datasets, shuffle=True)
+        train_sampler = self._make_expert_dp_sampler(
+            self.train_datasets,
+            shuffle=True,
+            drop_last=self.expert_dp_train_sampler_drop_last,
+        )
         train_batch_size = self._local_expert_dp_batch_size("batch_size")
         self.train_loader = self._make_loader_compat(
             dataset=self.train_datasets,
@@ -647,7 +695,11 @@ class MultiTrainer(Trainer):
         )
 
         if self.use_reference:
-            ref_sampler = self._make_expert_dp_sampler(self.reference_datasets, shuffle=True)
+            ref_sampler = self._make_expert_dp_sampler(
+                self.reference_datasets,
+                shuffle=True,
+                drop_last=self.expert_dp_ref_sampler_drop_last,
+            )
             ref_batch_size = self._local_expert_dp_batch_size("ref_batch_size")
             self.reference_loader = self._make_loader_compat(
                 dataset=self.reference_datasets,
@@ -658,7 +710,11 @@ class MultiTrainer(Trainer):
             )
 
         if self.use_validation:
-            val_sampler = self._make_expert_dp_sampler(self.validation_datasets, shuffle=False)
+            val_sampler = self._make_expert_dp_sampler(
+                self.validation_datasets,
+                shuffle=False,
+                drop_last=self.expert_dp_val_sampler_drop_last,
+            )
             val_batch_size = self._local_expert_dp_batch_size("val_batch_size")
             self.validation_loader = self._make_loader_compat(
                 dataset=self.validation_datasets,
@@ -672,7 +728,11 @@ class MultiTrainer(Trainer):
             f"[MultiTrainer][rank={self.rank}] rebuilt loaders in MultiTrainer: "
             f"train_workers={train_workers}, ref_workers={ref_workers}, val_workers={val_workers}, "
             f"global_batch_size={self.train_options['batch_size']}, local_batch_size={train_batch_size}, "
-            f"expert_dp_batch_size_semantics={self.expert_dp_batch_size_semantics}"
+            f"ref_batch_size={self.train_options.get('ref_batch_size')}, local_ref_batch_size={self._local_expert_dp_batch_size('ref_batch_size') if self.use_reference else None}, "
+            f"val_batch_size={self.train_options.get('val_batch_size')}, local_val_batch_size={self._local_expert_dp_batch_size('val_batch_size') if self.use_validation else None}, "
+            f"expert_dp_train_batch_size_semantics={self.expert_dp_train_batch_size_semantics}, "
+            f"expert_dp_ref_batch_size_semantics={self.expert_dp_ref_batch_size_semantics}, "
+            f"expert_dp_val_batch_size_semantics={self.expert_dp_val_batch_size_semantics}"
         )
 
     def _set_expert_dp_sampler_epoch(self, epoch: int):
