@@ -68,7 +68,9 @@ class Saver(Plugin):
     def _gather_dist_states(self):
         local_idx = self.trainer.local_expert_idx
 
-        local_expert_state = self._to_cpu_obj(self.trainer.model.experts[local_idx].state_dict())
+        local_expert_state = self._to_cpu_obj(
+            self.trainer._unwrap_expert_module(self.trainer.model.experts[local_idx]).state_dict()
+        )
 
         local_opt = self.trainer.optimizers[local_idx]
         local_sch = self.trainer.lr_schedulers[local_idx]
@@ -84,7 +86,21 @@ class Saver(Plugin):
         dist.all_gather_object(opt_states, local_opt_state)
         dist.all_gather_object(sch_states, local_sch_state)
 
-        return expert_states, opt_states, sch_states
+        dp_size = int(getattr(self.trainer, "expert_data_parallel_size", 1))
+        num_experts = int(getattr(self.trainer, "num_experts", len(expert_states)))
+        if dp_size <= 1:
+            return expert_states, opt_states, sch_states
+
+        expert_states_by_expert = [None for _ in range(num_experts)]
+        opt_states_by_expert = [None for _ in range(num_experts)]
+        sch_states_by_expert = [None for _ in range(num_experts)]
+        for expert_idx in range(num_experts):
+            src_rank = expert_idx * dp_size
+            expert_states_by_expert[expert_idx] = expert_states[src_rank]
+            opt_states_by_expert[expert_idx] = opt_states[src_rank]
+            sch_states_by_expert[expert_idx] = sch_states[src_rank]
+
+        return expert_states_by_expert, opt_states_by_expert, sch_states_by_expert
 
     def _assemble_full_model_state(self, expert_states):
         base_state = self._to_cpu_obj(self.trainer.model.state_dict())

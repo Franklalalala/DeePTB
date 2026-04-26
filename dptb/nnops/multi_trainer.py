@@ -9,6 +9,8 @@ from typing import Union, Optional, Dict, Any, List, Tuple
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
 
 from torch.profiler import profile as torch_profile, ProfilerActivity
 
@@ -18,6 +20,10 @@ from dptb.data import _keys
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nnops.trainer import Trainer
 from dptb.nnops.ddp_utils import merge_restart_train_options
+from dptb.nnops.expert_parallel_layout import (
+    rank_to_expert_parallel,
+    resolve_expert_parallel_layout,
+)
 from dptb.nn.build import build_model
 
 log = logging.getLogger(__name__)
@@ -200,7 +206,29 @@ class MultiTrainer(Trainer):
         self.distributed_expert = bool(distributed_expert)
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self.local_expert_idx = self.rank if self.distributed_expert else None
+        if self.distributed_expert:
+            layout = resolve_expert_parallel_layout(
+                num_experts=self.num_experts,
+                world_size=self.world_size,
+                train_options=self.train_options,
+            )
+            rank_info = rank_to_expert_parallel(
+                rank=self.rank,
+                num_experts=layout.num_experts,
+                expert_data_parallel_size=layout.expert_data_parallel_size,
+            )
+            self.expert_data_parallel_size = layout.expert_data_parallel_size
+            self.local_expert_idx = rank_info.local_expert_idx
+            self.expert_dp_rank = rank_info.expert_dp_rank
+            self.expert_group_ranks = rank_info.expert_group_ranks
+            self.expert_group_src_rank = self.expert_group_ranks[0]
+            self.train_options["expert_data_parallel_size"] = self.expert_data_parallel_size
+        else:
+            self.expert_data_parallel_size = 1
+            self.local_expert_idx = None
+            self.expert_dp_rank = 0
+            self.expert_group_ranks = []
+            self.expert_group_src_rank = 0
         self.is_main_process = (not self.distributed_expert) or (self.rank == 0)
         if self.distributed_expert:
             self.device = common_options["device"]
@@ -208,11 +236,6 @@ class MultiTrainer(Trainer):
 
         self.parallel_multi = bool(self.train_options.get("parallel_multi", False))
         if self.distributed_expert:
-            if self.world_size != self.num_experts:
-                raise ValueError(
-                    f"distributed_expert mode requires world_size == num_experts, "
-                    f"got world_size={self.world_size}, num_experts={self.num_experts}"
-                )
             if self.parallel_multi:
                 log.warning("distributed_expert=True: parallel_multi will be disabled.")
             self.parallel_multi = False
@@ -244,9 +267,51 @@ class MultiTrainer(Trainer):
         self.debug_profile_dir = self.train_options.get("debug_profile_dir", None)
 
         self.display_sync_freq = max(int(self.train_options.get("display_freq", 1)), 1)
+        self.sync_expert_dp_buffers = bool(self.train_options.get("sync_expert_dp_buffers", True))
+        self.expert_dp_grad_sync_mode = str(
+            self.train_options.get("expert_dp_grad_sync_mode", "coalesced")
+        ).lower()
+        self.expert_dp_use_ddp = bool(self.train_options.get("expert_dp_use_ddp", False))
+        self.expert_dp_backend = str(self.train_options.get("expert_dp_backend", "manual")).lower()
+        if self.expert_dp_use_ddp:
+            self.expert_dp_backend = "ddp"
+            self.train_options["expert_dp_backend"] = "ddp"
+        self.expert_dp_ddp_static_graph = bool(
+            self.train_options.get("expert_dp_ddp_static_graph", True)
+        )
+        self.expert_dp_ddp_gradient_as_bucket_view = bool(
+            self.train_options.get("expert_dp_ddp_gradient_as_bucket_view", True)
+        )
+        self.expert_dp_ddp_find_unused_parameters = bool(
+            self.train_options.get("expert_dp_ddp_find_unused_parameters", False)
+        )
+        self.expert_dp_ddp_broadcast_buffers = bool(
+            self.train_options.get("expert_dp_ddp_broadcast_buffers", False)
+        )
+        if self.expert_dp_backend not in ("manual", "ddp"):
+            raise ValueError(
+                "expert_dp_backend must be 'manual' or 'ddp', "
+                f"got {self.expert_dp_backend!r}"
+            )
+        self.expert_dp_grad_check_mode = str(
+            self.train_options.get("expert_dp_grad_check_mode", "auto")
+        ).lower()
+        self.expert_dp_grad_bucket_mb = float(self.train_options.get("expert_dp_grad_bucket_mb", 64))
+        self.expert_dp_buffer_sync_mode = str(
+            self.train_options.get("expert_dp_buffer_sync_mode", "coalesced")
+        ).lower()
+        self.expert_dp_buffer_bucket_mb = float(self.train_options.get("expert_dp_buffer_bucket_mb", 64))
+        self._expert_dp_coalesced_warned = False
         self.distributed_rank0_prepare_batch = bool(
             self.train_options.get("distributed_rank0_prepare_batch", False)
         )
+        if self.distributed_expert and self.expert_data_parallel_size > 1 and self.distributed_rank0_prepare_batch:
+            log.warning(
+                "expert_data_parallel_size > 1 requires independent data shards per replica; "
+                "force disable distributed_rank0_prepare_batch."
+            )
+            self.distributed_rank0_prepare_batch = False
+            self.train_options["distributed_rank0_prepare_batch"] = False
         self.precompute_lem_active_edges = bool(
             self.train_options.get("precompute_lem_active_edges", True)
         )
@@ -283,6 +348,7 @@ class MultiTrainer(Trainer):
             oom_dump=self.debug_oom_dump,
             reset_peak=self.debug_tag_reset_peak,
         )
+        self.expert_dp_process_group = self._create_expert_dp_process_group()
 
         self.log_single_model_compatible_loss = bool(
             self.train_options.get("log_single_model_compatible_loss", True)
@@ -313,7 +379,20 @@ class MultiTrainer(Trainer):
         log.info(
             f"[MultiTrainer][rank={self.rank}] num_experts={self.num_experts}, "
             f"distributed_expert={self.distributed_expert}, parallel_multi={self.parallel_multi}, "
+            f"expert_data_parallel_size={self.expert_data_parallel_size}, "
+            f"local_expert_idx={self.local_expert_idx}, expert_dp_rank={self.expert_dp_rank}, "
             f"display_sync_freq={self.display_sync_freq}, "
+            f"expert_dp_use_ddp={self.expert_dp_use_ddp}, "
+            f"expert_dp_backend={self.expert_dp_backend}, "
+            f"expert_dp_grad_sync_mode={self.expert_dp_grad_sync_mode}, "
+            f"expert_dp_grad_check_mode={self.expert_dp_grad_check_mode}, "
+            f"expert_dp_grad_bucket_mb={self.expert_dp_grad_bucket_mb}, "
+            f"expert_dp_ddp_static_graph={self.expert_dp_ddp_static_graph}, "
+            f"expert_dp_ddp_gradient_as_bucket_view={self.expert_dp_ddp_gradient_as_bucket_view}, "
+            f"expert_dp_ddp_find_unused_parameters={self.expert_dp_ddp_find_unused_parameters}, "
+            f"expert_dp_ddp_broadcast_buffers={self.expert_dp_ddp_broadcast_buffers}, "
+            f"expert_dp_buffer_sync_mode={self.expert_dp_buffer_sync_mode}, "
+            f"expert_dp_buffer_bucket_mb={self.expert_dp_buffer_bucket_mb}, "
             f"distributed_rank0_prepare_batch={self.distributed_rank0_prepare_batch}, "
             f"train_num_workers={self.train_num_workers}, ref_num_workers={self.ref_num_workers}, val_num_workers={self.val_num_workers}, "
             f"pin_memory={self.data_pin_memory}, persistent_workers={self.data_persistent_workers}, prefetch_factor={self.data_prefetch_factor}, "
@@ -329,10 +408,12 @@ class MultiTrainer(Trainer):
 
         if self.distributed_expert:
             self._materialize_local_expert_only()
+            self._sync_local_expert_parameters()
+            self._maybe_wrap_local_expert_ddp()
 
         def _make_opt_for_expert(i: int):
             opt_cfg = self._build_optimizer_cfg_for_expert(i)
-            return get_optimizer(model_param=self.model.experts[i].parameters(), **opt_cfg)
+            return get_optimizer(model_param=self._expert_parameters(i), **opt_cfg)
 
         def _make_scheduler_for_expert(i: int, opt):
             sch_cfg = self._build_lr_scheduler_cfg_for_expert(i)
@@ -446,8 +527,11 @@ class MultiTrainer(Trainer):
     # dataloader rebuild in MultiTrainer only
     # ---------------------------------------------------------------------
 
-    def _make_loader_compat(self, dataset, batch_size, shuffle, num_workers):
+    def _make_loader_compat(self, dataset, batch_size, shuffle, num_workers, sampler=None):
         kwargs = {"num_workers": int(num_workers)}
+        if sampler is not None:
+            kwargs["sampler"] = sampler
+            shuffle = False
         if kwargs["num_workers"] > 0:
             kwargs["pin_memory"] = self.data_pin_memory
             kwargs["persistent_workers"] = self.data_persistent_workers
@@ -472,6 +556,17 @@ class MultiTrainer(Trainer):
                 continue
         raise last_err
 
+    def _make_expert_dp_sampler(self, dataset, *, shuffle: bool):
+        if not self.distributed_expert or self.expert_data_parallel_size <= 1:
+            return None
+        return DistributedSampler(
+            dataset,
+            num_replicas=self.expert_data_parallel_size,
+            rank=self.expert_dp_rank,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+
     def _maybe_rebuild_loaders_in_multi_trainer(self):
         worker_keys = {
             "train_num_workers", "ref_num_workers", "val_num_workers",
@@ -495,33 +590,48 @@ class MultiTrainer(Trainer):
             ref_workers = 0
             val_workers = 0
 
+        train_sampler = self._make_expert_dp_sampler(self.train_datasets, shuffle=True)
         self.train_loader = self._make_loader_compat(
             dataset=self.train_datasets,
             batch_size=self.train_options["batch_size"],
             shuffle=True,
             num_workers=train_workers,
+            sampler=train_sampler,
         )
 
         if self.use_reference:
+            ref_sampler = self._make_expert_dp_sampler(self.reference_datasets, shuffle=True)
             self.reference_loader = self._make_loader_compat(
                 dataset=self.reference_datasets,
                 batch_size=self.train_options["ref_batch_size"],
                 shuffle=True,
                 num_workers=ref_workers,
+                sampler=ref_sampler,
             )
 
         if self.use_validation:
+            val_sampler = self._make_expert_dp_sampler(self.validation_datasets, shuffle=False)
             self.validation_loader = self._make_loader_compat(
                 dataset=self.validation_datasets,
                 batch_size=self.train_options["val_batch_size"],
                 shuffle=not self.distributed_expert,
                 num_workers=val_workers,
+                sampler=val_sampler,
             )
 
         log.info(
             f"[MultiTrainer][rank={self.rank}] rebuilt loaders in MultiTrainer: "
             f"train_workers={train_workers}, ref_workers={ref_workers}, val_workers={val_workers}"
         )
+
+    def _set_expert_dp_sampler_epoch(self, epoch: int):
+        if not self.distributed_expert or self.expert_data_parallel_size <= 1:
+            return
+        for loader_name in ("train_loader", "reference_loader", "validation_loader"):
+            loader = getattr(self, loader_name, None)
+            sampler = getattr(loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(int(epoch))
 
     # ---------------------------------------------------------------------
     # dist helpers
@@ -604,12 +714,390 @@ class MultiTrainer(Trainer):
         for idx, name in enumerate(names):
             state[name] = max(row[idx] for row in rows)
 
-        for expert_idx, row in enumerate(rows):
+        expert_rows: Dict[int, List[List[float]]] = {}
+        for rank_idx, row in enumerate(rows):
+            expert_idx = self._rank_to_expert_idx(rank_idx)
+            expert_rows.setdefault(expert_idx, []).append(row)
+            if self.expert_data_parallel_size > 1:
+                for idx, name in enumerate(names):
+                    state[f"rank_{rank_idx}_{name}"] = row[idx]
+
+        for expert_idx, grouped_rows in expert_rows.items():
             for idx, name in enumerate(names):
-                state[f"expert_{expert_idx}_{name}"] = row[idx]
+                state[f"expert_{expert_idx}_{name}"] = max(row[idx] for row in grouped_rows)
 
     def _use_cuda_stream_parallel(self):
         return (not self.distributed_expert) and self.parallel_multi and self.num_experts > 1 and self._is_cuda_device()
+
+    def _create_expert_dp_process_group(self):
+        if (
+            not self._dist_ready()
+            or self.expert_data_parallel_size <= 1
+        ):
+            return None
+
+        local_group = None
+        for expert_idx in range(self.num_experts):
+            ranks = list(range(
+                expert_idx * self.expert_data_parallel_size,
+                (expert_idx + 1) * self.expert_data_parallel_size,
+            ))
+            group = dist.new_group(ranks=ranks)
+            if expert_idx == self.local_expert_idx:
+                local_group = group
+
+        log.info(
+            f"[MultiTrainer][rank={self.rank}] expert_data_parallel group "
+            f"for expert {self.local_expert_idx}: ranks={self.expert_group_ranks}"
+        )
+        return local_group
+
+    def _rank_to_expert_idx(self, rank: int) -> int:
+        if not self.distributed_expert:
+            return int(rank)
+        return int(rank) // int(self.expert_data_parallel_size)
+
+    @staticmethod
+    def _unwrap_expert_module(expert):
+        if isinstance(expert, DistributedDataParallel):
+            return expert.module
+        return expert
+
+    def _expert_module(self, expert_idx: int):
+        return self._unwrap_expert_module(self.model.experts[expert_idx])
+
+    def _expert_parameters(self, expert_idx: int):
+        return self._expert_module(expert_idx).parameters()
+
+    def _maybe_wrap_local_expert_ddp(self):
+        if (
+            not self.distributed_expert
+            or self.expert_data_parallel_size <= 1
+            or self.expert_dp_backend != "ddp"
+            or self.expert_dp_process_group is None
+        ):
+            return
+
+        local_idx = self.local_expert_idx
+        expert = self.model.experts[local_idx]
+        if isinstance(expert, DistributedDataParallel):
+            return
+
+        device = self._device_obj()
+        if device.type == "cuda":
+            device_ids = [device.index if device.index is not None else torch.cuda.current_device()]
+            output_device = device_ids[0]
+        else:
+            device_ids = None
+            output_device = None
+
+        self.model.experts[local_idx] = DistributedDataParallel(
+            expert,
+            device_ids=device_ids,
+            output_device=output_device,
+            process_group=self.expert_dp_process_group,
+            broadcast_buffers=self.expert_dp_ddp_broadcast_buffers,
+            find_unused_parameters=self.expert_dp_ddp_find_unused_parameters,
+            gradient_as_bucket_view=self.expert_dp_ddp_gradient_as_bucket_view,
+            static_graph=self.expert_dp_ddp_static_graph,
+        )
+        log.info(
+            "[MultiTrainer][rank=%s] wrapped local expert %s with DDP backend "
+            "(static_graph=%s, gradient_as_bucket_view=%s, find_unused_parameters=%s, broadcast_buffers=%s).",
+            self.rank,
+            local_idx,
+            self.expert_dp_ddp_static_graph,
+            self.expert_dp_ddp_gradient_as_bucket_view,
+            self.expert_dp_ddp_find_unused_parameters,
+            self.expert_dp_ddp_broadcast_buffers,
+        )
+
+    def _sync_local_expert_parameters(self):
+        if (
+            not self._dist_ready()
+            or self.expert_data_parallel_size <= 1
+            or self.expert_dp_process_group is None
+        ):
+            return
+
+        expert = self._expert_module(self.local_expert_idx)
+        for tensor in list(expert.parameters()) + list(expert.buffers()):
+            dist.broadcast(
+                tensor.data,
+                src=self.expert_group_src_rank,
+                group=self.expert_dp_process_group,
+            )
+
+    def _sync_local_expert_grads(self, expert_idx: int):
+        if self.expert_dp_backend == "ddp":
+            return
+        if (
+            not self._dist_ready()
+            or self.expert_data_parallel_size <= 1
+            or self.expert_dp_process_group is None
+        ):
+            return
+
+        params = list(self._expert_parameters(expert_idx))
+        if not params:
+            return
+
+        bucket_cap_bytes = max(int(self.expert_dp_grad_bucket_mb * 1024 * 1024), 1)
+        pending_reductions = []
+
+        def enqueue_flat_bucket(bucket):
+            if not bucket:
+                return
+            if len(bucket) == 1:
+                grad = bucket[0]
+                work = dist.all_reduce(
+                    grad,
+                    op=dist.ReduceOp.SUM,
+                    group=self.expert_dp_process_group,
+                    async_op=True,
+                )
+                pending_reductions.append((work, bucket, None))
+                return
+
+            flat = torch.cat([grad.contiguous().view(-1) for grad in bucket])
+            work = dist.all_reduce(
+                flat,
+                op=dist.ReduceOp.SUM,
+                group=self.expert_dp_process_group,
+                async_op=True,
+            )
+            pending_reductions.append((work, bucket, flat))
+
+        def enqueue_coalesced_bucket(bucket):
+            if not bucket:
+                return
+            if (
+                self.expert_dp_grad_sync_mode == "coalesced"
+                and len(bucket) > 1
+                and hasattr(dist, "all_reduce_coalesced")
+            ):
+                try:
+                    work = dist.all_reduce_coalesced(
+                        bucket,
+                        op=dist.ReduceOp.SUM,
+                        group=self.expert_dp_process_group,
+                        async_op=True,
+                    )
+                    pending_reductions.append((work, bucket, None))
+                    return
+                except (TypeError, RuntimeError) as exc:
+                    if not self._expert_dp_coalesced_warned:
+                        log.warning(
+                            "expert data-parallel coalesced grad sync failed once; "
+                            "falling back to flat bucket all_reduce. error=%s",
+                            exc,
+                        )
+                        self._expert_dp_coalesced_warned = True
+            enqueue_flat_bucket(bucket)
+
+        def finish_pending_reductions():
+            scale = float(self.expert_data_parallel_size)
+            for work, bucket, flat in pending_reductions:
+                if work is not None:
+                    work.wait()
+                if flat is not None:
+                    flat.div_(scale)
+                    offset = 0
+                    for grad in bucket:
+                        numel = grad.numel()
+                        grad.copy_(flat[offset:offset + numel].view_as(grad))
+                        offset += numel
+                else:
+                    for grad in bucket:
+                        grad.div_(scale)
+            pending_reductions.clear()
+
+        def reduce_param_grads(reduce_params):
+            grad_buckets = {}
+            for param in reduce_params:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError(
+                        "expert data-parallel grad sync does not support sparse gradients; "
+                        "sparse/missing gradients can produce mismatched collectives."
+                    )
+
+                grad_bytes = grad.numel() * grad.element_size()
+                if grad_bytes >= bucket_cap_bytes:
+                    bucket_key = (grad.device, grad.dtype)
+                    enqueue_coalesced_bucket(grad_buckets.pop(bucket_key, []))
+                    enqueue_coalesced_bucket([grad])
+                    continue
+
+                bucket_key = (grad.device, grad.dtype)
+                bucket, bucket_bytes = grad_buckets.get(bucket_key, ([], 0))
+                if bucket and bucket_bytes + grad_bytes > bucket_cap_bytes:
+                    enqueue_coalesced_bucket(bucket)
+                    bucket, bucket_bytes = [], 0
+                bucket.append(grad)
+                grad_buckets[bucket_key] = (bucket, bucket_bytes + grad_bytes)
+
+            for bucket, _bucket_bytes in grad_buckets.values():
+                enqueue_coalesced_bucket(bucket)
+            finish_pending_reductions()
+
+        if self.expert_dp_grad_check_mode in ("assume_dense", "none", "off", "false"):
+            if any(param.grad is not None and param.grad.is_sparse for param in params):
+                raise RuntimeError(
+                    "expert data-parallel assume_dense grad sync does not support sparse gradients."
+                )
+            reduce_param_grads(params)
+            return
+
+        if self.expert_dp_grad_check_mode not in ("auto", "safe"):
+            raise ValueError(
+                "expert_dp_grad_check_mode must be 'auto'/'safe' or 'assume_dense'/'none', "
+                f"got {self.expert_dp_grad_check_mode!r}"
+            )
+
+        grad_status = torch.tensor(
+            [
+                sum(1 for param in params if param.grad is None),
+                sum(1 for param in params if param.grad is not None and param.grad.is_sparse),
+            ],
+            dtype=torch.int32,
+            device=params[0].device,
+        )
+        dist.all_reduce(
+            grad_status,
+            op=dist.ReduceOp.SUM,
+            group=self.expert_dp_process_group,
+        )
+        if int(grad_status[1].item()) != 0:
+            raise RuntimeError(
+                "expert data-parallel grad sync does not support sparse gradients; "
+                "set sparse=False or disable expert_data_parallel_size > 1 for this model."
+            )
+        missing_grads = grad_status[0]
+        if int(missing_grads.item()) == 0:
+            reduce_param_grads(params)
+            return
+
+        grad_flags = torch.tensor(
+            [1 if param.grad is not None else 0 for param in params],
+            dtype=torch.int32,
+            device=params[0].device,
+        )
+        dist.all_reduce(
+            grad_flags,
+            op=dist.ReduceOp.SUM,
+            group=self.expert_dp_process_group,
+        )
+
+        params_with_grads = []
+        for param, grad_count in zip(params, grad_flags.tolist()):
+            if int(grad_count) == 0:
+                continue
+            if param.grad is None:
+                param.grad = torch.zeros_like(
+                    param,
+                    memory_format=torch.preserve_format,
+                )
+            params_with_grads.append(param)
+        reduce_param_grads(params_with_grads)
+
+    def _sync_local_expert_buffers(self, expert_idx: int):
+        if (
+            not self._dist_ready()
+            or self.expert_data_parallel_size <= 1
+            or self.expert_dp_process_group is None
+            or not self.sync_expert_dp_buffers
+        ):
+            return
+        if self.expert_dp_backend == "ddp" and self.expert_dp_ddp_broadcast_buffers:
+            return
+
+        bucket_cap_bytes = max(int(self.expert_dp_buffer_bucket_mb * 1024 * 1024), 1)
+        pending_reductions = []
+
+        def enqueue_float_buffer_bucket(bucket):
+            if not bucket:
+                return
+            if (
+                self.expert_dp_buffer_sync_mode == "coalesced"
+                and len(bucket) > 1
+                and hasattr(dist, "all_reduce_coalesced")
+            ):
+                try:
+                    work = dist.all_reduce_coalesced(
+                        bucket,
+                        op=dist.ReduceOp.SUM,
+                        group=self.expert_dp_process_group,
+                        async_op=True,
+                    )
+                    pending_reductions.append((work, bucket))
+                    return
+                except (TypeError, RuntimeError) as exc:
+                    if not self._expert_dp_coalesced_warned:
+                        log.warning(
+                            "expert data-parallel coalesced buffer sync failed once; "
+                            "falling back to individual all_reduce. error=%s",
+                            exc,
+                        )
+                        self._expert_dp_coalesced_warned = True
+            for buf in bucket:
+                work = dist.all_reduce(
+                    buf,
+                    op=dist.ReduceOp.SUM,
+                    group=self.expert_dp_process_group,
+                    async_op=True,
+                )
+                pending_reductions.append((work, [buf]))
+
+        float_buckets = {}
+        for buf in self._expert_module(expert_idx).buffers():
+            if buf.is_floating_point():
+                buf_data = buf.data
+                buf_bytes = buf_data.numel() * buf_data.element_size()
+                if buf_bytes >= bucket_cap_bytes:
+                    bucket_key = (buf_data.device, buf_data.dtype)
+                    enqueue_float_buffer_bucket(float_buckets.pop(bucket_key, []))
+                    enqueue_float_buffer_bucket([buf_data])
+                    continue
+
+                bucket_key = (buf_data.device, buf_data.dtype)
+                bucket, bucket_bytes = float_buckets.get(bucket_key, ([], 0))
+                if bucket and bucket_bytes + buf_bytes > bucket_cap_bytes:
+                    enqueue_float_buffer_bucket(bucket)
+                    bucket, bucket_bytes = [], 0
+                bucket.append(buf_data)
+                float_buckets[bucket_key] = (bucket, bucket_bytes + buf_bytes)
+            else:
+                dist.broadcast(
+                    buf.data,
+                    src=self.expert_group_src_rank,
+                    group=self.expert_dp_process_group,
+                )
+        for bucket, _bucket_bytes in float_buckets.values():
+            enqueue_float_buffer_bucket(bucket)
+        scale = float(self.expert_data_parallel_size)
+        for work, bucket in pending_reductions:
+            if work is not None:
+                work.wait()
+            for buf in bucket:
+                buf.div_(scale)
+
+    def _mean_expert_dp_scalar(self, value):
+        out = self._as_scalar_tensor(value, default=0.0).clone()
+        if (
+            self._dist_ready()
+            and self.expert_data_parallel_size > 1
+            and self.expert_dp_process_group is not None
+        ):
+            dist.all_reduce(
+                out,
+                op=dist.ReduceOp.SUM,
+                group=self.expert_dp_process_group,
+            )
+            out.div_(float(self.expert_data_parallel_size))
+        return out
 
     def _all_reduce_(self, tensor: torch.Tensor, op=dist.ReduceOp.SUM, name: str = "dist/all_reduce"):
         if self._dist_ready():
@@ -1587,8 +2075,8 @@ class MultiTrainer(Trainer):
             self._all_reduce_(reduced_pack, name="dist/all_reduce(display_window_metrics_packed)")
             gathered = self._gather_display_window_expert_metrics()
 
-        world = self.world_size if self._dist_ready() else 1
-        total_steps = max(float(reduced_pack[self._P_STEP_COUNT].item()) / world, 1.0)
+        full_loss_steps = self.num_experts if self._dist_ready() else 1
+        total_steps = max(float(reduced_pack[self._P_STEP_COUNT].item()) / full_loss_steps, 1.0)
 
         train_loss_opt_mean = reduced_pack[self._P_LOSS_OPT_SUM] / total_steps
         compatible_train_loss = self._compute_compatible_loss_from_pack(reduced_pack, self.train_lossfunc)
@@ -1611,12 +2099,22 @@ class MultiTrainer(Trainer):
             "train_hopping_loss": float(global_hopping.item()),
         }
 
-        for expert_idx, vec in enumerate(gathered):
-            state[f"expert_{expert_idx}_onsite"] = float(vec[0].item())
-            state[f"expert_{expert_idx}_hopping"] = float(vec[1].item())
-            state[f"expert_{expert_idx}_lr"] = float(vec[3].item())
-            state[f"expert_{expert_idx}_active_nodes"] = float(vec[4].item())
-            state[f"expert_{expert_idx}_active_edges"] = float(vec[5].item())
+        expert_metrics: Dict[int, List[torch.Tensor]] = {}
+        for rank_idx, vec in enumerate(gathered):
+            expert_idx = self._rank_to_expert_idx(rank_idx)
+            expert_metrics.setdefault(expert_idx, []).append(vec)
+
+        for expert_idx in range(self.num_experts):
+            vecs = expert_metrics.get(expert_idx, [])
+            if not vecs:
+                continue
+            stacked = torch.stack(vecs)
+            mean_vec = stacked.mean(dim=0)
+            state[f"expert_{expert_idx}_onsite"] = float(mean_vec[0].item())
+            state[f"expert_{expert_idx}_hopping"] = float(mean_vec[1].item())
+            state[f"expert_{expert_idx}_lr"] = float(mean_vec[3].item())
+            state[f"expert_{expert_idx}_active_nodes"] = float(mean_vec[4].item())
+            state[f"expert_{expert_idx}_active_edges"] = float(mean_vec[5].item())
 
         if float(reduced_pack[self._P_CV_CNT].item()) > 0.0:
             state["expert_load_cv"] = float((reduced_pack[self._P_CV_SUM] / reduced_pack[self._P_CV_CNT]).item())
@@ -1650,6 +2148,8 @@ class MultiTrainer(Trainer):
     def _local_scheduler_step(self, metric_tensor: torch.Tensor):
         if not self.update_lr_per_iter:
             return
+        if self.distributed_expert:
+            metric_tensor = self._mean_expert_dp_scalar(metric_tensor)
 
         def _metric_float():
             if torch.is_tensor(metric_tensor):
@@ -1690,6 +2190,8 @@ class MultiTrainer(Trainer):
 
     def _step_epoch_schedulers(self):
         metric = self._get_epoch_scheduler_metric()
+        if self.distributed_expert and metric is not None:
+            metric = self._mean_expert_dp_scalar(metric)
         metric_float = None if metric is None else self._to_float_scalar(metric)
 
         def _step_one_scheduler(sch, expert_idx=None):
@@ -1763,14 +2265,20 @@ class MultiTrainer(Trainer):
         with self._tagger.tag("expert/backward", it=self.iter, expert=local_idx):
             loss_local.backward()
 
+        with self._tagger.tag("expert/sync_dp_grads", it=self.iter, expert=local_idx):
+            self._sync_local_expert_grads(local_idx)
+
         with self._tagger.tag("expert/clip_grad_norm", it=self.iter, expert=local_idx):
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.experts[local_idx].parameters(),
+                self._expert_parameters(local_idx),
                 max_norm=self.clip_grad_norm
             )
 
         with self._tagger.tag("expert/optimizer_step", it=self.iter, expert=local_idx):
             local_opt.step()
+
+        with self._tagger.tag("expert/sync_dp_buffers", it=self.iter, expert=local_idx):
+            self._sync_local_expert_buffers(local_idx)
 
         payload["grad_norm"] = grad_norm.detach() if torch.is_tensor(grad_norm) else torch.tensor(
             float(grad_norm), device=self.device, dtype=self.dtype
@@ -1922,7 +2430,7 @@ class MultiTrainer(Trainer):
 
                     with self._tagger.tag("expert/clip_grad_norm", it=self.iter, expert=expert_idx):
                         grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.experts[expert_idx].parameters(),
+                            self._expert_parameters(expert_idx),
                             max_norm=self.clip_grad_norm
                         )
 
@@ -1996,6 +2504,8 @@ class MultiTrainer(Trainer):
     # ---------------------------------------------------------------------
 
     def epoch(self) -> None:
+        self._set_expert_dp_sampler_epoch(self.ep)
+
         if self.distributed_expert and self.distributed_rank0_prepare_batch:
             train_iter = iter(self.train_loader) if self.rank == 0 else None
             ref_iter = iter(self.reference_loader) if (self.use_reference and self.rank == 0) else None

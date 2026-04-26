@@ -27,6 +27,18 @@ _WIGNER_STATIC_CACHE = {}
 log = logging.getLogger(__name__)
 
 
+def _ensure_torch_fx_symbolic_tracing_compat():
+    try:
+        import torch.fx._symbolic_trace as symbolic_trace
+    except Exception:
+        return
+    if not hasattr(symbolic_trace, "is_fx_symbolic_tracing") and hasattr(symbolic_trace, "is_fx_tracing"):
+        symbolic_trace.is_fx_symbolic_tracing = symbolic_trace.is_fx_tracing
+
+
+_ensure_torch_fx_symbolic_tracing_compat()
+
+
 def build_z_rot_multi(angle_stack, mask, freq, reversed_inds, offsets, d_total: int):
     """
     angle_stack: (3*N, )    # Input with alpha, beta, gamma stacked together

@@ -171,6 +171,12 @@ def train_options():
     doc_ddp_master_addr = "Master node address for distributed communication. Default: `127.0.0.1`"
     doc_ddp_master_port = "Master node port for distributed communication. Default: `29501`"
     doc_ddp_timeout_sec = "Timeout in seconds for distributed process group operations. Default: `1800`"
+    doc_expert_data_parallel_size = (
+        "Number of same-expert replicas in distributed expert-parallel training. "
+        "With two `distance_ranges` and `expert_data_parallel_size=2`, ranks 0/1 train "
+        "expert 0 and ranks 2/3 train expert 1, synchronizing gradients only inside each "
+        "same-expert group. Default: `1`"
+    )
 
     doc_parallel_multi = (
         "Set true to start parallel training on CUDA streams in single-process multi-expert mode. "
@@ -209,6 +215,54 @@ def train_options():
         "Set true to record CUDA allocated/reserved and peak allocated/reserved memory in regular "
         "iteration/epoch logs and TensorBoard. In distributed expert mode, per-rank values are gathered "
         "as expert_i_cuda_*_mb fields and global cuda_*_mb fields use the maximum across ranks. Default: `True`"
+    )
+    doc_sync_expert_dp_buffers = (
+        "Set true to synchronize same-expert buffers after each expert data-parallel optimizer step. "
+        "Disable only for throughput A/B when buffers are known not to affect training state. Default: `True`"
+    )
+    doc_expert_dp_grad_sync_mode = (
+        "Same-expert data-parallel gradient synchronization implementation. "
+        "`coalesced` uses torch.distributed.all_reduce_coalesced when available and falls back to flat buckets. "
+        "`flat` always uses explicit flat buckets. Default: `coalesced`"
+    )
+    doc_expert_dp_backend = (
+        "Same-expert data-parallel backend. `manual` uses DeePTB's explicit post-backward gradient sync; "
+        "`ddp` wraps the local expert in torch.nn.parallel.DistributedDataParallel with the same-expert "
+        "process group so gradient all-reduce can overlap with backward. Default: `manual`"
+    )
+    doc_expert_dp_use_ddp = (
+        "Shortcut for setting expert_dp_backend to `ddp`. When true, expert_dp_backend is ignored. "
+        "Default: `False`"
+    )
+    doc_expert_dp_ddp_static_graph = (
+        "Set true when expert DDP graphs are static, enabling DDP static_graph optimization. Default: `True`"
+    )
+    doc_expert_dp_ddp_gradient_as_bucket_view = (
+        "Set true to let expert DDP gradients view all-reduce buckets and avoid extra bucket copies. Default: `True`"
+    )
+    doc_expert_dp_ddp_find_unused_parameters = (
+        "Set true if DDP-wrapped expert forward can leave trainable parameters unused. Default: `False`"
+    )
+    doc_expert_dp_ddp_broadcast_buffers = (
+        "Set true to let DDP broadcast expert buffers at forward start. Default: `False`; DeePTB keeps its "
+        "post-step expert buffer sync path for manual parity. When true with `expert_dp_backend=ddp`, "
+        "DDP owns buffer synchronization and DeePTB skips the post-step expert buffer sync."
+    )
+    doc_expert_dp_grad_check_mode = (
+        "Same-expert data-parallel missing-gradient check mode. `auto` performs a safe tiny collective before "
+        "the dense bucket reductions; `assume_dense` skips that check for static dense expert graphs. "
+        "Use `assume_dense` only for throughput A/B after confirming every trainable expert parameter receives "
+        "a dense gradient every iteration. Default: `auto`"
+    )
+    doc_expert_dp_grad_bucket_mb = (
+        "Target same-expert data-parallel gradient bucket size in MiB. Default: `64`"
+    )
+    doc_expert_dp_buffer_sync_mode = (
+        "Same-expert data-parallel buffer synchronization implementation. "
+        "`coalesced` uses coalesced float-buffer all-reduce when available. Default: `coalesced`"
+    )
+    doc_expert_dp_buffer_bucket_mb = (
+        "Target same-expert data-parallel float-buffer bucket size in MiB. Default: `64`"
     )
 
     # ================= profiler =================
@@ -300,6 +354,8 @@ def train_options():
         Argument("ddp_master_addr", str, optional=True, default="127.0.0.1", doc=doc_ddp_master_addr),
         Argument("ddp_master_port", (str, int), optional=True, default=29501, doc=doc_ddp_master_port),
         Argument("ddp_timeout_sec", int, optional=True, default=1800, doc=doc_ddp_timeout_sec),
+        Argument("expert_data_parallel_size", int, optional=True, default=1, doc=doc_expert_data_parallel_size),
+        Argument("expert_dp_size", int, optional=True, default=1, doc=doc_expert_data_parallel_size),
         Argument("train_num_workers", int, optional=True, default=0,
                  doc="Number of DataLoader workers for train loader (implemented in MultiTrainer)."),
         Argument("ref_num_workers", int, optional=True, default=0,
@@ -330,6 +386,18 @@ def train_options():
         Argument("debug_tag_reset_peak", bool, optional=True, default=None, doc=doc_debug_tag_reset_peak),
         Argument("debug_oom_dump", bool, optional=True, default=True, doc=doc_debug_oom_dump),
         Argument("monitor_cuda_memory", bool, optional=True, default=True, doc=doc_monitor_cuda_memory),
+        Argument("sync_expert_dp_buffers", bool, optional=True, default=True, doc=doc_sync_expert_dp_buffers),
+        Argument("expert_dp_backend", str, optional=True, default="manual", doc=doc_expert_dp_backend),
+        Argument("expert_dp_use_ddp", bool, optional=True, default=False, doc=doc_expert_dp_use_ddp),
+        Argument("expert_dp_ddp_static_graph", bool, optional=True, default=True, doc=doc_expert_dp_ddp_static_graph),
+        Argument("expert_dp_ddp_gradient_as_bucket_view", bool, optional=True, default=True, doc=doc_expert_dp_ddp_gradient_as_bucket_view),
+        Argument("expert_dp_ddp_find_unused_parameters", bool, optional=True, default=False, doc=doc_expert_dp_ddp_find_unused_parameters),
+        Argument("expert_dp_ddp_broadcast_buffers", bool, optional=True, default=False, doc=doc_expert_dp_ddp_broadcast_buffers),
+        Argument("expert_dp_grad_sync_mode", str, optional=True, default="coalesced", doc=doc_expert_dp_grad_sync_mode),
+        Argument("expert_dp_grad_check_mode", str, optional=True, default="auto", doc=doc_expert_dp_grad_check_mode),
+        Argument("expert_dp_grad_bucket_mb", (int, float), optional=True, default=64, doc=doc_expert_dp_grad_bucket_mb),
+        Argument("expert_dp_buffer_sync_mode", str, optional=True, default="coalesced", doc=doc_expert_dp_buffer_sync_mode),
+        Argument("expert_dp_buffer_bucket_mb", (int, float), optional=True, default=64, doc=doc_expert_dp_buffer_bucket_mb),
 
         # profiler
         Argument("debug_profile", bool, optional=True, default=False, doc=doc_debug_profile),

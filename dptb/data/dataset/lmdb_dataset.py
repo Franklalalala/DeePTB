@@ -23,6 +23,24 @@ from dptb.data.interfaces.ham_to_feature import block_to_feature
 import pickle
 
 
+def _read_lmdb_entry(path: str, index: int):
+    db_env = lmdb.open(
+        path,
+        readonly=True,
+        lock=False,
+        readahead=False,
+        max_readers=2048,
+    )
+    try:
+        with db_env.begin(buffers=True) as txn:
+            data = txn.get(int(index).to_bytes(length=4, byteorder='big'))
+            if data is None:
+                raise IndexError(f"LMDB entry {index} not found in {path}")
+            return pickle.loads(bytes(data))
+    finally:
+        db_env.close()
+
+
 class LMDBDataset(AtomicDataset):
     def __init__(
             self,
@@ -73,14 +91,17 @@ class LMDBDataset(AtomicDataset):
         self.num_graphs = 0
         self.file_map = []
         self.index_map = []
+        self._lmdb_path_map = []
+        self._lmdb_env_cache = {}
         for file in self.info_files.keys():
             lmdb_paths = self.simple_get_lmdb_path(file)
             for lmdb_path in lmdb_paths:
-                db_env = lmdb.open(lmdb_path, readonly=True, lock=False)
-                with db_env.begin() as txn:
+                db_env = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, max_readers=2048)
+                with db_env.begin(buffers=True) as txn:
                     self.num_graphs += txn.stat()['entries']
                     self.file_map += [file] * txn.stat()['entries']
                     self.index_map += list(range(txn.stat()['entries']))
+                    self._lmdb_path_map += [lmdb_path] * txn.stat()['entries']
                 db_env.close()
 
     def len(self):
@@ -123,6 +144,56 @@ class LMDBDataset(AtomicDataset):
         # Return all existing paths
         return [path for path in candidate_paths if os.path.exists(path)]
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for env in state.get("_lmdb_env_cache", {}).values():
+            try:
+                env.close()
+            except Exception:
+                pass
+        state["_lmdb_env_cache"] = {}
+        return state
+
+    def __del__(self):
+        for env in getattr(self, "_lmdb_env_cache", {}).values():
+            try:
+                env.close()
+            except Exception:
+                pass
+
+    def _get_lmdb_env(self, path: str):
+        cache = getattr(self, "_lmdb_env_cache", None)
+        if cache is None:
+            cache = {}
+            self._lmdb_env_cache = cache
+        env = cache.get(path)
+        if env is None:
+            env = lmdb.open(
+                path,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                max_readers=2048,
+            )
+            cache[path] = env
+        return env
+
+    def _load_data_dict(self, idx: int):
+        lmdb_paths = getattr(self, "_lmdb_path_map", None)
+        if lmdb_paths is not None and len(lmdb_paths) == len(self.index_map):
+            candidate_paths = [lmdb_paths[idx]]
+        else:
+            candidate_paths = self.simple_get_lmdb_path(self.file_map[idx])
+
+        key = self.index_map[int(idx)].to_bytes(length=4, byteorder='big')
+        for lmdb_path in candidate_paths:
+            env = self._get_lmdb_env(lmdb_path)
+            with env.begin(buffers=True) as txn:
+                data = txn.get(key)
+                if data is not None:
+                    return pickle.loads(bytes(data))
+        raise IndexError(f"LMDB entry {self.index_map[int(idx)]} not found for dataset index {idx}")
+
     @property
     def raw_file_names(self):
         # TODO: this is not implemented.
@@ -143,86 +214,80 @@ class LMDBDataset(AtomicDataset):
                 extract_zip(download_path, self.raw_dir)
 
     def get(self, idx):
-        lmdb_paths = self.simple_get_lmdb_path(self.file_map[idx])
-        for lmdb_path in lmdb_paths:
-            db_env = lmdb.open(lmdb_path, readonly=True, lock=False)
-            with db_env.begin() as txn:
-                data_dict = txn.get(self.index_map[int(idx)].to_bytes(length=4, byteorder='big'))
-                data_dict = pickle.loads(data_dict)
-                cell, pos, atomic_numbers = \
-                    data_dict[AtomicDataDict.CELL_KEY], \
-                        data_dict[AtomicDataDict.POSITIONS_KEY], \
-                        data_dict[AtomicDataDict.ATOMIC_NUMBERS_KEY]
+        data_dict = self._load_data_dict(idx)
+        cell, pos, atomic_numbers = \
+            data_dict[AtomicDataDict.CELL_KEY], \
+                data_dict[AtomicDataDict.POSITIONS_KEY], \
+                data_dict[AtomicDataDict.ATOMIC_NUMBERS_KEY]
 
-                pbc = data_dict[AtomicDataDict.PBC_KEY]
+        pbc = data_dict[AtomicDataDict.PBC_KEY]
 
-                if self.get_Hamiltonian:
-                    blocks = data_dict.get("hamiltonian", None)
-                    # kk, vv = blocks.keys(), blocks.values()
-                    # vv = map(lambda x: np.frombuffer(x, np.float32).reshape, vv)
-                    # blocks = dict(zip(kk, vv))
-                    # del kk
-                    # del vv
+        if self.get_Hamiltonian:
+            blocks = data_dict.get("hamiltonian", None)
+            # kk, vv = blocks.keys(), blocks.values()
+            # vv = map(lambda x: np.frombuffer(x, np.float32).reshape, vv)
+            # blocks = dict(zip(kk, vv))
+            # del kk
+            # del vv
 
-                if self.get_overlap:
-                    overlap = data_dict.get("overlap", None)
-                    # kk, vv = overlap.keys(), overlap.values()
-                    # vv = map(lambda x: np.frombuffer(x, np.float32), vv)
-                    # overlap = dict(zip(kk, vv))
-                    # del kk
-                    # del vv
-                else:
-                    overlap = False
+        if self.get_overlap:
+            overlap = data_dict.get("overlap", None)
+            # kk, vv = overlap.keys(), overlap.values()
+            # vv = map(lambda x: np.frombuffer(x, np.float32), vv)
+            # overlap = dict(zip(kk, vv))
+            # del kk
+            # del vv
+        else:
+            overlap = False
 
-                if self.get_DM:
-                    blocks = data_dict.get("density_matrix", None)
-                    # kk, vv = blocks.keys(), blocks.values()
-                    # vv = map(lambda x: np.frombuffer(x, np.float32), vv)
-                    # blocks = dict(zip(kk, vv))
-                    # del kk
-                    # del vv
+        if self.get_DM:
+            blocks = data_dict.get("density_matrix", None)
+            # kk, vv = blocks.keys(), blocks.values()
+            # vv = map(lambda x: np.frombuffer(x, np.float32), vv)
+            # blocks = dict(zip(kk, vv))
+            # del kk
+            # del vv
 
-                if not (self.get_Hamiltonian or self.get_DM):
-                    blocks = False
+        if not (self.get_Hamiltonian or self.get_DM):
+            blocks = False
 
-                pre_node_features = data_dict.get(AtomicDataDict.NODE_FEATURES_KEY, None)
-                pre_edge_features = data_dict.get(AtomicDataDict.EDGE_FEATURES_KEY, None)
-                pre_node_overlap = data_dict.get(AtomicDataDict.NODE_OVERLAP_KEY, None)
-                pre_edge_overlap = data_dict.get(AtomicDataDict.EDGE_OVERLAP_KEY, None)
+        pre_node_features = data_dict.get(AtomicDataDict.NODE_FEATURES_KEY, None)
+        pre_edge_features = data_dict.get(AtomicDataDict.EDGE_FEATURES_KEY, None)
+        pre_node_overlap = data_dict.get(AtomicDataDict.NODE_OVERLAP_KEY, None)
+        pre_edge_overlap = data_dict.get(AtomicDataDict.EDGE_OVERLAP_KEY, None)
 
-                h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
-                node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
-                edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
+        h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
+        node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
+        edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
 
-                if self.info_files[self.file_map[idx]]['train_dip'] == True:
-                    self.info_files[self.file_map[idx]].update({'dip': data_dict['dipole_moment']})
+        if self.info_files[self.file_map[idx]]['train_dip'] == True:
+            self.info_files[self.file_map[idx]].update({'dip': data_dict['dipole_moment']})
 
-                if self.info_files[self.file_map[idx]]['train_w_charge'] == True:
-                    self.info_files[self.file_map[idx]].update({'charge': np.array(data_dict['charge'])})
+        if self.info_files[self.file_map[idx]]['train_w_charge'] == True:
+            self.info_files[self.file_map[idx]].update({'charge': np.array(data_dict['charge'])})
 
-                if self.info_files[self.file_map[idx]]['train_w_eps'] == True:
-                    self.info_files[self.file_map[idx]].update({'dielectric_constant': np.array(data_dict['dielectric_constant'])})
-                if self.info_files[self.file_map[idx]]['train_w_homo_lumo_gap'] == True:
-                    self.info_files[self.file_map[idx]].update({
-                        'GAP_eV': np.array(data_dict['GAP_eV']),
-                        'LUMO_eV': np.array(data_dict['LUMO_eV']),
-                        'HOMO_eV': np.array(data_dict['HOMO_eV']),
-                    })
+        if self.info_files[self.file_map[idx]]['train_w_eps'] == True:
+            self.info_files[self.file_map[idx]].update({'dielectric_constant': np.array(data_dict['dielectric_constant'])})
+        if self.info_files[self.file_map[idx]]['train_w_homo_lumo_gap'] == True:
+            self.info_files[self.file_map[idx]].update({
+                'GAP_eV': np.array(data_dict['GAP_eV']),
+                'LUMO_eV': np.array(data_dict['LUMO_eV']),
+                'HOMO_eV': np.array(data_dict['HOMO_eV']),
+            })
 
-                if self.info_files[self.file_map[idx]]['train_polar'] == True:
-                    self.info_files[self.file_map[idx]].update({'polar': data_dict['polarizability']})
+        if self.info_files[self.file_map[idx]]['train_polar'] == True:
+            self.info_files[self.file_map[idx]].update({'polar': data_dict['polarizability']})
 
-                if self.info_files[self.file_map[idx]]['wave_align'] == True:
-                    orbital_energies = data_dict.get('orbital_energies', 0)
-                    orbital_coefficients = data_dict.get('orbital_coefficients', 0)
-                    self.info_files[self.file_map[idx]].update(
-                        {'orbital_energies': orbital_energies, 'orbital_coefficients': orbital_coefficients})
+        if self.info_files[self.file_map[idx]]['wave_align'] == True:
+            orbital_energies = data_dict.get('orbital_energies', 0)
+            orbital_coefficients = data_dict.get('orbital_coefficients', 0)
+            self.info_files[self.file_map[idx]].update(
+                {'orbital_energies': orbital_energies, 'orbital_coefficients': orbital_coefficients})
 
-                cache_info = {}
-                for key in ['train_polar', 'train_dip', 'wave_align', 'train_w_charge', 'train_w_eps', 'train_w_homo_lumo_gap']:
-                    cache_info.update({key: self.info_files[self.file_map[idx]][key]})
-                    del self.info_files[self.file_map[idx]][key]
-            db_env.close()
+        cache_info = {}
+        for key in ['train_polar', 'train_dip', 'wave_align', 'train_w_charge', 'train_w_eps', 'train_w_homo_lumo_gap']:
+            cache_info.update({key: self.info_files[self.file_map[idx]][key]})
+            del self.info_files[self.file_map[idx]][key]
 
         atomicdata = AtomicData.from_points(
             pos=pos.reshape(-1, 3),

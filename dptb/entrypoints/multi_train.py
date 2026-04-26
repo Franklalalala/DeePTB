@@ -34,6 +34,10 @@ from dptb.nnops.ddp_utils import (
     load_multi_train_config,
     merge_restart_train_options,
 )
+from dptb.nnops.expert_parallel_layout import (
+    get_expert_data_parallel_size,
+    resolve_expert_parallel_layout,
+)
 from dptb.plugins.monitor import (
     TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor,
     DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, CUDAModuleMemoryMonitor,
@@ -429,11 +433,12 @@ def _multi_train_impl(
     )
 
     if distributed_expert:
-        if len(distance_ranges) != world_size:
-            raise ValueError(
-                f"In distributed_expert mode, world_size must equal len(distance_ranges). "
-                f"Got world_size={world_size}, len(distance_ranges)={len(distance_ranges)}"
-            )
+        layout = resolve_expert_parallel_layout(
+            num_experts=len(distance_ranges),
+            world_size=world_size,
+            train_options=jdata["train_options"],
+        )
+        jdata["train_options"]["expert_data_parallel_size"] = layout.expert_data_parallel_size
         if parallel_multi:
             log.warning("distributed_expert=True: force disable parallel_multi.")
         parallel_multi = False
@@ -623,14 +628,23 @@ def multi_train(
     )
     use_ddp = bool(train_opt.get("use_ddp", False))
 
+    expert_dp_size = get_expert_data_parallel_size(train_opt)
+
     if use_ddp and len(distance_ranges) > 1:
         if not torch.cuda.is_available():
             raise RuntimeError("use_ddp=True requires CUDA.")
-        world_size = len(distance_ranges)
+        world_size = len(distance_ranges) * expert_dp_size
+        resolve_expert_parallel_layout(
+            num_experts=len(distance_ranges),
+            world_size=world_size,
+            train_options=train_opt,
+        )
         n_gpu = torch.cuda.device_count()
         if n_gpu < world_size:
             raise RuntimeError(
-                f"Not enough GPUs for distributed_expert mode: need {world_size}, but only {n_gpu} available."
+                f"Not enough GPUs for distributed_expert mode: need {world_size} "
+                f"({len(distance_ranges)} experts * expert_data_parallel_size={expert_dp_size}), "
+                f"but only {n_gpu} available."
             )
 
         mp.spawn(
