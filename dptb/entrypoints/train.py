@@ -1,7 +1,7 @@
 from dptb.nnops.trainer import Trainer
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
-from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor
+from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor
 from dptb.plugins.train_logger import Logger
 from dptb.utils.argcheck import normalize, collect_cutoffs, chk_avg_per_iter
 from dptb.plugins.saver import Saver
@@ -531,7 +531,8 @@ def train(
         )
 
     # register the plugin in trainer, to tract training info
-    log_field = ["train_loss", "lr"]
+    train_options = jdata["train_options"]
+    log_field = ["train_loss", "lr", "total_grad_norm"]
     if validation_datasets:
         trainer.register_plugin(Validationer(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')], fast_mode=jdata["train_options"]["valid_fast"]))
 
@@ -539,6 +540,7 @@ def train(
     avg_per_iter = chk_avg_per_iter(jdata)
     trainer.register_plugin(TrainLossMonitor(sliding_win_size=jdata["train_options"]["sliding_win_size"], avg_per_iter=avg_per_iter)) # by default, avg_per_iter is false, will not be activated.
     trainer.register_plugin(LearningRateMonitor())
+    trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
 ##############################
     trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
@@ -554,7 +556,34 @@ def train(
 
     # # # 注册 Monitor
     # # # verbose_freq 控制打印频率，但 CSV 是实时记录的
-    monitor_flag = jdata["train_options"]["monitor_flag"]
+    if bool(train_options.get("monitor_param_dynamics", False)):
+        param_dynamics_freq = int(
+            train_options.get("monitor_param_dynamics_freq") or train_options["display_freq"]
+        )
+        param_dynamics_freq = max(1, param_dynamics_freq)
+        param_dynamics_tb_opt = train_options.get("monitor_param_dynamics_tensorboard", None)
+        if param_dynamics_tb_opt is None:
+            param_dynamics_tb = bool(train_options.get("use_tensorboard", False))
+        else:
+            param_dynamics_tb = bool(param_dynamics_tb_opt)
+        trainer.register_plugin(
+            ParamDynamicsMonitor(
+                output,
+                interval=[(param_dynamics_freq, 'iteration')],
+                tensorboard=param_dynamics_tb,
+                dead_patience=train_options.get("monitor_param_dynamics_dead_patience", 3),
+                delta_eps=train_options.get("monitor_param_dynamics_delta_eps", 0.0),
+                grad_eps=train_options.get("monitor_param_dynamics_grad_eps", 0.0),
+                delta_norm_dead_threshold=train_options.get(
+                    "monitor_param_dynamics_delta_norm_dead_threshold", 1.0e-12
+                ),
+                grad_norm_dead_threshold=train_options.get(
+                    "monitor_param_dynamics_grad_norm_dead_threshold", 1.0e-12
+                ),
+            )
+        )
+
+    monitor_flag = train_options["monitor_flag"]
     if monitor_flag:
         doctor = DeepDoctorMonitor(output, verbose_freq=1)
         trainer.register_plugin(doctor)
