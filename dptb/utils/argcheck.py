@@ -898,7 +898,7 @@ def slem():
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
     doc_so2_m_linear_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
-    doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
+    doc_onehot_tp_mode = "Backend for scalar onehot tensor products. Default/null uses the standard e3nn TensorProduct path; `scalar_fast` remains an explicit opt-in packed scalar path."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),

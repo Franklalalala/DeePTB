@@ -1,6 +1,25 @@
 import pytest
 
 
+def test_onehot_tp_mode_defaults_to_e3nn_and_scalar_fast_is_opt_in():
+    torch = pytest.importorskip("torch")
+    o3 = pytest.importorskip("e3nn.o3")
+    from dptb.nn.embedding.lem_moe_v3 import (
+        ScalarOnehotTP,
+        _maybe_scalar_onehot_tp,
+        _normalize_onehot_tp_mode,
+    )
+
+    irreps = o3.Irreps("2x0e + 1x1o")
+    onehot_irreps = o3.Irreps("3x0e")
+    instructions = [(i, 0, i, "uvu", True) for i, _ in enumerate(irreps)]
+    tp_ref = o3.TensorProduct(irreps, onehot_irreps, irreps, instructions)
+
+    assert _normalize_onehot_tp_mode(None) == "e3nn"
+    assert _maybe_scalar_onehot_tp(tp_ref, None) is tp_ref
+    assert isinstance(_maybe_scalar_onehot_tp(tp_ref, "scalar_fast"), ScalarOnehotTP)
+
+
 def _assert_forward_and_grad_close(torch, tp_ref, tp_fast, x, y):
     x_ref = x.detach().clone().requires_grad_(True)
     y_ref = y.detach().clone().requires_grad_(True)

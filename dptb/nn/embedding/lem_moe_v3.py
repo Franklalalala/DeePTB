@@ -38,12 +38,14 @@ log = logging.getLogger(__name__)
 
 
 def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
-    mode = mode or os.environ.get("DPTB_ONEHOT_TP_MODE", "scalar_fast")
+    mode = mode if mode not in (None, "") else os.environ.get("DPTB_ONEHOT_TP_MODE")
+    if mode in (None, "", "standard", "e3nn"):
+        return "e3nn"
     allowed = {"scalar_fast"}
     if mode not in allowed:
         raise ValueError(
-            "0422-cueq-fastest only supports onehot_tp_mode='scalar_fast'. "
-            f"Use the legacy cueq branch for e3nn/auto A/B, got {mode!r}."
+            "onehot_tp_mode supports None/'e3nn' for the default e3nn TensorProduct "
+            f"or 'scalar_fast' for the opt-in packed scalar path, got {mode!r}."
         )
     return mode
 
@@ -319,9 +321,17 @@ def _scalar_onehot_tp_fast(tp: torch.nn.Module, x: torch.Tensor, y: torch.Tensor
 
 def _apply_onehot_tp(tp: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, mode: str) -> torch.Tensor:
     mode = _normalize_onehot_tp_mode(mode)
+    if mode == "e3nn":
+        return tp(x, y)
     if isinstance(tp, ScalarOnehotTP):
         return tp(x, y)
     return _scalar_onehot_tp_fast(tp, x, y)
+
+
+def _maybe_scalar_onehot_tp(tp: torch.nn.Module, mode: str) -> torch.nn.Module:
+    if _normalize_onehot_tp_mode(mode) == "scalar_fast":
+        return ScalarOnehotTP.from_e3nn(tp)
+    return tp
 
 
 @Embedding.register("lem_moe_v3")
@@ -561,16 +571,16 @@ class LemMoEV3(torch.nn.Module):
 
         self.use_out_onehot_tp = use_out_onehot_tp
         if self.use_out_onehot_tp:
-            self.out_node_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
+            self.out_node_ele_tp = _maybe_scalar_onehot_tp(FullyConnectedTensorProduct(
                 irreps_in1=self.layers[-1].irreps_out,
                 irreps_in2='95x0e',
                 irreps_out=self.idp.orbpair_irreps,
-            ))
-            self.out_edge_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
+            ), self.onehot_tp_mode)
+            self.out_edge_ele_tp = _maybe_scalar_onehot_tp(FullyConnectedTensorProduct(
                 irreps_in1=self.layers[-1].irreps_out,
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.idp.orbpair_irreps,
-            ))
+            ), self.onehot_tp_mode)
         self.out_edge = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
                                internal_weights=True, biases=True)
         self.out_node = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
@@ -1146,12 +1156,12 @@ class UpdateNode(torch.nn.Module):
             instructions = []
             for i, (mul, ir) in enumerate(self.irreps_out):
                 instructions.append((i, 0, i, 'uvu', True))
-            self.node_onehot_tp = ScalarOnehotTP.from_e3nn(TensorProduct(
+            self.node_onehot_tp = _maybe_scalar_onehot_tp(TensorProduct(
                 irreps_in1=self.irreps_out,
                 irreps_in2=f'95x0e',
                 irreps_out=self.irreps_out,
                 instructions=instructions
-            ))
+            ), self.onehot_tp_mode)
         self.use_identity_res = (self.irreps_in == self.irreps_out) and res_update
         if not self.use_identity_res:
             if res_update:
@@ -1386,12 +1396,12 @@ class UpdateEdge(torch.nn.Module):
             instructions = []
             for i, (mul, ir) in enumerate(self.irreps_out):
                 instructions.append((i, 0, i, 'uvu', True))
-            self.edge_onehot_tp = ScalarOnehotTP.from_e3nn(TensorProduct(
+            self.edge_onehot_tp = _maybe_scalar_onehot_tp(TensorProduct(
                 irreps_in1=self.irreps_out,
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.irreps_out,
                 instructions=instructions
-            ))
+            ), self.onehot_tp_mode)
 
         self.use_identity_res = (self.irreps_in == self.irreps_out) and res_update
         if not self.use_identity_res:
