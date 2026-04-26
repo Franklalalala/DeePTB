@@ -127,6 +127,13 @@ def train_options():
 
     doc_update_lr_per_iter = "Set true to update learning rate per-step. Default: `False`."
     doc_sliding_win_size = "Sliding window size for the average of the latest iterations' loss. Used for the reduce on plateau learning rate scheduler in case of the pairing of large dataset and small batch size. Default: `50`"
+    doc_monitor_param_dynamics = (
+        "Set true to enable lightweight parameter dynamics monitoring without forward/backward hooks. "
+        "The monitor records sampled parameter update and gradient-flow metrics for key module groups."
+    )
+    doc_monitor_param_dynamics_freq = (
+        "Parameter dynamics sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
+    )
     doc_expert_lrs = (
         "Optional per-expert initial learning rates. "
         "If provided, it must be a list of floats with length == num_experts (len(distance_ranges)). "
@@ -276,6 +283,14 @@ def train_options():
 
         # training misc
         Argument("monitor_flag", bool, optional=True, default=False, doc='Set true to start monitor.'),
+        Argument("monitor_param_dynamics", bool, optional=True, default=False, doc=doc_monitor_param_dynamics),
+        Argument("monitor_param_dynamics_freq", int, optional=True, default=0, doc=doc_monitor_param_dynamics_freq),
+        Argument("monitor_param_dynamics_tensorboard", bool, optional=True, default=None, doc="Write parameter dynamics curves to TensorBoard when the monitor is enabled. Default follows use_tensorboard."),
+        Argument("monitor_param_dynamics_dead_patience", int, optional=True, default=3, doc="Number of consecutive no-gradient samples before marking a group as DEAD."),
+        Argument("monitor_param_dynamics_delta_eps", float, optional=True, default=0.0, doc="Absolute element-change threshold used for delta_nonzero_fraction."),
+        Argument("monitor_param_dynamics_grad_eps", float, optional=True, default=0.0, doc="Absolute gradient threshold used for grad_nonzero_fraction."),
+        Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Deprecated compatibility option. DEAD detection is gradient-norm based; delta metrics are diagnostic only."),
+        Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Gradient norm threshold used by parameter dynamics DEAD detection; groups below this value count as no-gradient."),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 
