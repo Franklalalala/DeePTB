@@ -26,8 +26,12 @@ def _to_device(tensor: torch.Tensor, device: Union[str, torch.device]) -> torch.
 
 
 def _contract_cg_rme(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor:
-    """Contract CG basis with RME without materializing the broadcast product."""
-    return torch.einsum("nrc,ijr->ncij", rme2, cg_basis)
+    """Original broadcast contraction used for E3Hamiltonian A/B testing."""
+    hr = torch.sum(
+        cg_basis[None, :, :, :, None] * rme2[:, None, None, :, :],
+        dim=-2,
+    )
+    return hr.permute(0, 3, 1, 2)
 
 
 class E3Hamiltonian(torch.nn.Module):
