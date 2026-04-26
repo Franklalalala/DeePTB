@@ -127,6 +127,13 @@ def train_options():
 
     doc_update_lr_per_iter = "Set true to update learning rate per-step. Default: `False`."
     doc_sliding_win_size = "Sliding window size for the average of the latest iterations' loss. Used for the reduce on plateau learning rate scheduler in case of the pairing of large dataset and small batch size. Default: `50`"
+    doc_monitor_param_dynamics = (
+        "Set true to enable lightweight parameter dynamics monitoring without forward/backward hooks. "
+        "The monitor records sampled parameter update and gradient-flow metrics for key module groups."
+    )
+    doc_monitor_param_dynamics_freq = (
+        "Parameter dynamics sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
+    )
     doc_expert_lrs = (
         "Optional per-expert initial learning rates. "
         "If provided, it must be a list of floats with length == num_experts (len(distance_ranges)). "
@@ -276,6 +283,14 @@ def train_options():
 
         # training misc
         Argument("monitor_flag", bool, optional=True, default=False, doc='Set true to start monitor.'),
+        Argument("monitor_param_dynamics", bool, optional=True, default=False, doc=doc_monitor_param_dynamics),
+        Argument("monitor_param_dynamics_freq", int, optional=True, default=0, doc=doc_monitor_param_dynamics_freq),
+        Argument("monitor_param_dynamics_tensorboard", bool, optional=True, default=None, doc="Write parameter dynamics curves to TensorBoard when the monitor is enabled. Default follows use_tensorboard."),
+        Argument("monitor_param_dynamics_dead_patience", int, optional=True, default=3, doc="Number of consecutive no-gradient samples before marking a group as DEAD."),
+        Argument("monitor_param_dynamics_delta_eps", float, optional=True, default=0.0, doc="Absolute element-change threshold used for delta_nonzero_fraction."),
+        Argument("monitor_param_dynamics_grad_eps", float, optional=True, default=0.0, doc="Absolute gradient threshold used for grad_nonzero_fraction."),
+        Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Deprecated compatibility option. DEAD detection is gradient-norm based; delta metrics are diagnostic only."),
+        Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Gradient norm threshold used by parameter dynamics DEAD detection; groups below this value count as no-gradient."),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 
@@ -894,8 +909,10 @@ def slem():
     doc_ffn_apply_to_last = "Whether to also attach the node-wise FFN to the final layer. Default: `False`."
     doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
-    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_aggressive`, `streamed_m_major_cueq`. The 0422-cueq-fastest branch defaults to `streamed_m_major_cueq`."
+    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`. The 0425-stable branch defaults to `streamed_m_major_cueq`."
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
+    doc_so2_m_linear_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
+    doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
 
     return [
@@ -949,6 +966,8 @@ def slem():
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
         Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
+        Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
+        Argument("mole_linear_m0_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_m0_mode),
         Argument("onehot_tp_mode", [str, None], optional=True, default=None, doc=doc_onehot_tp_mode),
 
         # ---- New norm conditioning flags ----

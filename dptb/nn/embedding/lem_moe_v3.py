@@ -48,6 +48,15 @@ def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
     return mode
 
 
+def _normalize_stable_standard_compat_mode(name: str, mode: Optional[str]) -> str:
+    if mode in (None, "", "standard"):
+        return "standard"
+    raise ValueError(
+        f"0425-stable accepts only {name}=None or 'standard'. "
+        f"Use the Triton experiment branch for {name}={mode!r}."
+    )
+
+
 def _irreps_slices(irreps: o3.Irreps) -> List[slice]:
     slices = []
     offset = 0
@@ -358,6 +367,8 @@ class LemMoEV3(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_m_linear_mode: Optional[str] = None,
+            mole_linear_m0_mode: Optional[str] = None,
             onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
@@ -411,6 +422,12 @@ class LemMoEV3(torch.nn.Module):
             device = torch.device(device)
         self.device = device
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
+            "so2_m_linear_mode", so2_m_linear_mode
+        )
+        self.mole_linear_m0_mode = _normalize_stable_standard_compat_mode(
+            "mole_linear_m0_mode", mole_linear_m0_mode
+        )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
 
         if basis is not None:
