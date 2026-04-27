@@ -145,6 +145,37 @@ def test_mole_linear_indexed_ref_matches_split_loop_without_bias_or_shared_exper
     )
 
 
+def test_expand_graph_index_cached_reuses_expanded_tensor():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import (
+        MOLEGlobals,
+        _expand_graph_index_cached,
+        _expand_graph_index_for_leading_dims,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    graph_index = torch.tensor([0, 0, 1, 1, 1], device=device, dtype=torch.long)
+    x = torch.randn(graph_index.numel(), 3, 4, device=device)
+    globals_ = MOLEGlobals(
+        coefficients=torch.ones(2, 4, device=device),
+        graph_index=graph_index,
+    )
+
+    expected = _expand_graph_index_for_leading_dims(graph_index, x)
+    first = _expand_graph_index_cached(graph_index, x, globals_)
+    second = _expand_graph_index_cached(graph_index, x, globals_)
+
+    torch.testing.assert_close(first, expected)
+    assert first is second
+
+    x_other_shape = torch.randn(graph_index.numel(), 2, 4, device=device)
+    third = _expand_graph_index_cached(graph_index, x_other_shape, globals_)
+    assert third is not first
+
+    x_2d = torch.randn(graph_index.numel(), 4, device=device)
+    assert _expand_graph_index_cached(graph_index, x_2d, globals_) is graph_index
+
+
 def test_mole_linear_fallback_average_ignores_indexed_mode():
     torch = pytest.importorskip("torch")
     from dptb.nn.tensor_product_moe_v3 import MOLELinear

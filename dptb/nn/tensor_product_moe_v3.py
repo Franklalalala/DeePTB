@@ -421,6 +421,33 @@ def _expand_graph_index_for_leading_dims(graph_index: torch.Tensor, x: torch.Ten
     return graph_index.reshape(-1, *([1] * (x.ndim - 2))).expand(expand_shape).reshape(-1)
 
 
+def _expand_graph_index_cached(
+        graph_index: torch.Tensor,
+        x: torch.Tensor,
+        mole_globals: MOLEGlobals,
+) -> torch.Tensor:
+    if x.ndim == 2:
+        return graph_index
+
+    cache = getattr(mole_globals, "_expanded_graph_index_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(mole_globals, "_expanded_graph_index_cache", cache)
+
+    key = (
+        str(x.device),
+        str(graph_index.device),
+        str(graph_index.dtype),
+        int(graph_index.numel()),
+        tuple(int(v) for v in x.shape[1:-1]),
+    )
+    cached = cache.get(key)
+    if cached is None:
+        cached = _expand_graph_index_for_leading_dims(graph_index, x)
+        cache[key] = cached
+    return cached
+
+
 def _normalize_mole_linear_mode(mode: str) -> str:
     allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear"}
     if mode not in allowed:
@@ -685,9 +712,9 @@ class MOLELinear(nn.Module):
         self._cueq_weight_order = best_order
         return best_order
 
-    def _apply_cueq_indexed_linear(self, x, mixed_weights, mixed_bias, graph_index):
+    def _apply_cueq_indexed_linear(self, x, mixed_weights, mixed_bias, graph_index, mole_globals: MOLEGlobals):
         flat_x = x.reshape(-1, self.in_features)
-        flat_graph_index = _expand_graph_index_for_leading_dims(graph_index, x)
+        flat_graph_index = _expand_graph_index_cached(graph_index, x, mole_globals)
         num_graphs = int(mixed_weights.shape[0])
         cue_lin = self._get_cueq_indexed_linear(num_graphs, dtype=x.dtype, device=x.device)
 
@@ -742,7 +769,7 @@ class MOLELinear(nn.Module):
             if mode == "indexed_ref":
                 return self._apply_indexed_ref(x, mixed_weights, mixed_bias, graph_index)
             if mode == "cueq_indexed_linear":
-                return self._apply_cueq_indexed_linear(x, mixed_weights, mixed_bias, graph_index)
+                return self._apply_cueq_indexed_linear(x, mixed_weights, mixed_bias, graph_index, mole_globals)
             raise AssertionError(f"unreachable mole_linear_mode={mode!r}")
 
         split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
