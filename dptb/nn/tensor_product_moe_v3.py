@@ -1023,6 +1023,11 @@ class SO2_Linear(torch.nn.Module):
             m: tuple(entry for entry in self._out_entry_plans if entry.l >= m)
             for m in range(self.m_max + 1)
         }
+        self._active_rot_l = tuple(sorted({
+            entry.l for entry in self._in_entry_plans if entry.l > 0
+        } | {
+            entry.l for entry in self._out_entry_plans if entry.l > 0
+        }))
         self._route_warned = set()
 
     def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
@@ -1284,7 +1289,7 @@ class SO2_Linear(torch.nn.Module):
             return {}
         return {
             l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-            for l in range(1, self.l_max + 1)
+            for l in self._active_rot_l
         }
 
     def _gather_input_l_groups(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
@@ -1353,7 +1358,11 @@ class SO2_Linear(torch.nn.Module):
             packed_by_l[entry.l][:, entry.group_start:entry.group_start + entry.mul]
             for entry in self._in_entries_by_m[0]
         ]
-        return torch.cat(parts, dim=1) if parts else x_template.new_empty((n, 0))
+        if not parts:
+            return x_template.new_empty((n, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)
 
     def _assemble_grouped_pair_input(
             self,
@@ -1373,7 +1382,11 @@ class SO2_Linear(torch.nn.Module):
             packed_by_l[entry.l][:, :, entry.group_start:entry.group_start + entry.mul]
             for entry in self._in_entries_by_m[m]
         ]
-        return torch.cat(parts, dim=2) if parts else x_template.new_empty((n, 2, 0))
+        if not parts:
+            return x_template.new_empty((n, 2, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=2)
 
     def _accumulate_grouped_m0_output_(
             self,
