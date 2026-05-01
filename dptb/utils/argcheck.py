@@ -233,6 +233,32 @@ def train_options():
         "iteration/epoch logs and TensorBoard. In distributed expert mode, per-rank values are gathered "
         "as expert_i_cuda_*_mb fields and global cuda_*_mb fields use the maximum across ranks. Default: `True`"
     )
+    doc_monitor_cuda_cache_memory = (
+        "Set true to log lightweight before/after CUDA memory deltas on persistent cache misses, "
+        "including Wigner static tensors and cuEquivariance indexed_linear modules. "
+        "This helps attribute stepwise memory jumps without enabling hook-heavy module tracing. "
+        "Default: unset, which follows the DPTB_CUDA_CACHE_MEMORY_DIAG environment variable."
+    )
+    doc_monitor_cuda_cache_memory_sync = (
+        "Set true to synchronize CUDA before cache-memory snapshots. More accurate but slower; "
+        "default unset follows DPTB_CUDA_CACHE_MEMORY_SYNC."
+    )
+    doc_monitor_cuda_cache_memory_min_delta_mb = (
+        "Only log cache-memory rows whose absolute allocated/reserved/peak/free delta is at least this many MiB. "
+        "Default: `0`, log every probed cache miss."
+    )
+    doc_monitor_cuda_module_memory = (
+        "Set true to record CUDA memory snapshots around selected module forward/backward hooks. "
+        "This is independent from monitor_flag, and currently targets SO2_Linear, MOLELinear, S2/FFN helpers, "
+        "and non-TorchScript TensorProduct wrappers. Default: unset, follows monitor_flag for compatibility."
+    )
+    doc_monitor_cuda_module_memory_sync = (
+        "Set true to synchronize CUDA before module-memory snapshots. More accurate but slower. Default: `False`"
+    )
+    doc_monitor_cuda_module_memory_min_delta_mb = (
+        "Only write module-memory rows whose allocated/reserved/current peak delta is at least this many MiB. "
+        "Use a positive threshold for long production runs to avoid very large CSV files. Default: `0`"
+    )
     doc_sync_expert_dp_buffers = (
         "Set true to synchronize same-expert buffers after each expert data-parallel optimizer step. "
         "Disable only for throughput A/B when buffers are known not to affect training state. Default: `True`"
@@ -435,6 +461,12 @@ def train_options():
         Argument("debug_tag_reset_peak", bool, optional=True, default=None, doc=doc_debug_tag_reset_peak),
         Argument("debug_oom_dump", bool, optional=True, default=True, doc=doc_debug_oom_dump),
         Argument("monitor_cuda_memory", bool, optional=True, default=True, doc=doc_monitor_cuda_memory),
+        Argument("monitor_cuda_cache_memory", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_memory),
+        Argument("monitor_cuda_cache_memory_sync", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_memory_sync),
+        Argument("monitor_cuda_cache_memory_min_delta_mb", (int, float), optional=True, default=0.0, doc=doc_monitor_cuda_cache_memory_min_delta_mb),
+        Argument("monitor_cuda_module_memory", bool, optional=True, default=None, doc=doc_monitor_cuda_module_memory),
+        Argument("monitor_cuda_module_memory_sync", bool, optional=True, default=False, doc=doc_monitor_cuda_module_memory_sync),
+        Argument("monitor_cuda_module_memory_min_delta_mb", (int, float), optional=True, default=0.0, doc=doc_monitor_cuda_module_memory_min_delta_mb),
         Argument("sync_expert_dp_buffers", bool, optional=True, default=True, doc=doc_sync_expert_dp_buffers),
         Argument("expert_dp_backend", str, optional=True, default="manual", doc=doc_expert_dp_backend),
         Argument("expert_dp_use_ddp", bool, optional=True, default=False, doc=doc_expert_dp_use_ddp),

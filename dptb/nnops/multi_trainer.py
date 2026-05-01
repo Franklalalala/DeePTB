@@ -15,6 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.profiler import profile as torch_profile, ProfilerActivity
 
 from dptb.utils.tools import get_lr_scheduler, get_optimizer
+from dptb.utils.cuda_cache_memory import cuda_cache_memory_context
 from dptb.data import AtomicDataset, AtomicData, DataLoader
 from dptb.data import _keys
 from dptb.data.AtomicDataDict import with_edge_vectors
@@ -1863,7 +1864,12 @@ class MultiTrainer(Trainer):
         batch_copy["expert_idx"] = int(expert_idx)
 
         with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
-            pred_batch = self.model(batch_copy)
+            with cuda_cache_memory_context(
+                iteration=self.iter,
+                stage="expert/model_forward",
+                expert=expert_idx,
+            ):
+                pred_batch = self.model(batch_copy)
 
         pred_batch["global_step"] = int(self.iter)
 
@@ -2676,7 +2682,8 @@ class MultiTrainer(Trainer):
         batch_copy = batch_dict.copy()
         batch_for_loss = batch_copy.copy()
 
-        pred_batch = self.model(batch_copy)
+        with cuda_cache_memory_context(iteration=self.iter, stage="validation/full_forward"):
+            pred_batch = self.model(batch_copy)
         pred_batch["global_step"] = int(self.iter)
         pred_batch.update(batch_info)
         batch_for_loss.update(batch_info)
