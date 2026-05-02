@@ -16,7 +16,10 @@ from dptb.data import (
 )
 from tqdm import tqdm
 from ..transforms import TypeMapper
-from ._base_datasets import AtomicDataset
+from ._base_datasets import (
+    AtomicDataset,
+    _dynamic_batch_parts_from_data,
+)
 from dptb.nn.hamiltonian import E3Hamiltonian
 import lmdb
 from dptb.data.interfaces.ham_to_feature import block_to_feature
@@ -188,6 +191,22 @@ class LMDBDataset(AtomicDataset):
                 if data is not None:
                     return pickle.loads(bytes(data))
         raise IndexError(f"LMDB entry {self.index_map[int(idx)]} not found for dataset index {idx}")
+
+    def get_dynamic_batch_cost_parts(self, idx: int) -> Dict[str, int]:
+        raw_idx = self._resolve_dynamic_batch_index(idx)
+        data_dict = self._load_data_dict(raw_idx)
+        parts = _dynamic_batch_parts_from_data(data_dict)
+        has_edge_metadata = any(
+            key in data_dict
+            for key in (
+                AtomicDataDict.EDGE_INDEX_KEY,
+                AtomicDataDict.EDGE_FEATURES_KEY,
+                AtomicDataDict.EDGE_H0_KEY,
+            )
+        )
+        if parts.get("edge", 0) <= 0 and not has_edge_metadata:
+            return _dynamic_batch_parts_from_data(self.get(raw_idx))
+        return parts
 
     @property
     def raw_file_names(self):

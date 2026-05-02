@@ -3,6 +3,9 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+from dptb.data.dataset._base_datasets import AtomicInMemoryDataset
+from dptb.data.dataset.lmdb_dataset import LMDBDataset
+from dptb.data import AtomicDataDict
 from dptb.data.dataloader import (
     AtomicDataCostEstimator,
     DataLoader,
@@ -11,7 +14,7 @@ from dptb.data.dataloader import (
     split_batch_for_oom,
 )
 from dptb.nnops.multi_trainer import MultiTrainer
-from dptb.utils.torch_geometric import Data
+from dptb.utils.torch_geometric import Batch, Data
 
 
 class ToyDataset:
@@ -162,6 +165,33 @@ def test_dynamic_sampler_uses_metadata_costs_and_manual_invalidation():
 
     assert list(sampler) == [[0], [1]]
     assert dataset.item_reads == 0
+
+
+def test_dynamic_metadata_parts_are_normalized_when_dataset_returns_partial_parts():
+    dataset = MetadataCostDataset([2, 2])
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        dynamic_batch={
+            "enabled": True,
+            "mode": "env",
+            "max_cost": 100,
+        },
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.__dptb_item_parts__[0] == {
+        "graph": 1,
+        "node": 2,
+        "edge": 0,
+        "env": 0,
+        "onsitenv": 0,
+        "kpoint": 0,
+        "eig_band_square": 0,
+    }
+    assert batch.__dptb_item_costs__ == [1, 1]
 
 
 def test_dynamic_sampler_dataset_cost_version_invalidates_cost_cache():
@@ -316,6 +346,24 @@ def test_dynamic_sampler_padding_uses_deterministic_non_last_sources(caplog):
     assert sampler.padding_events[-1] == sampler.last_padding_stats
 
 
+def test_dynamic_sampler_padding_events_are_bounded():
+    dataset = ToyDataset([1])
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=1,
+        mode="node",
+        max_samples=1,
+        shuffle=False,
+        seed=123,
+    )
+
+    for _ in range(1030):
+        sampler._pad_batches([[0]], 2, reason="num_steps")
+
+    assert len(sampler.padding_events) == 1024
+    assert sampler.padding_events[-1] == sampler.last_padding_stats
+
+
 def test_dynamic_sampler_world_size_padding_keeps_equal_rank_lengths():
     dataset = ToyDataset([1, 1, 1])
     common = dict(
@@ -384,6 +432,64 @@ def test_split_batch_for_oom_bisects_and_preserves_metadata():
     assert right.__dptb_item_costs__ == [4, 5]
     assert left.num_graphs == 2
     assert right.num_graphs == 2
+
+
+def test_atomic_inmemory_dataset_exposes_dynamic_batch_cost_parts_without_get_example():
+    data_list = [
+        Data(
+            pos=torch.zeros((2, 3)),
+            edge_index=torch.zeros((2, 3), dtype=torch.long),
+            env_index=torch.zeros((2, 4), dtype=torch.long),
+            onsitenv_index=torch.zeros((2, 5), dtype=torch.long),
+            kpoint=torch.zeros((2, 3)),
+            eigenvalue=torch.zeros((2, 3)),
+        ),
+        Data(
+            pos=torch.zeros((4, 3)),
+            edge_index=torch.zeros((2, 6), dtype=torch.long),
+            env_index=torch.zeros((2, 7), dtype=torch.long),
+            onsitenv_index=torch.zeros((2, 8), dtype=torch.long),
+            kpoint=torch.zeros((1, 3)),
+            eigenvalue=torch.zeros((1, 3)),
+        ),
+    ]
+    dataset = AtomicInMemoryDataset.__new__(AtomicInMemoryDataset)
+    dataset.data = Batch.from_data_list(data_list)
+    dataset._indices = None
+
+    assert dataset.get_dynamic_batch_cost_parts(1) == {
+        "graph": 1,
+        "node": 4,
+        "edge": 6,
+        "env": 7,
+        "onsitenv": 8,
+        "kpoint": 1,
+        "eig_band_square": 9,
+    }
+
+
+def test_lmdb_dataset_exposes_dynamic_batch_cost_parts_from_entry_metadata():
+    dataset = LMDBDataset.__new__(LMDBDataset)
+    dataset._indices = None
+    dataset.num_graphs = 1
+    data_dict = {
+        AtomicDataDict.POSITIONS_KEY: torch.zeros((3, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: torch.ones(3, dtype=torch.long),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.zeros((5, 4)),
+        AtomicDataDict.KPOINT_KEY: torch.zeros((2, 3)),
+        AtomicDataDict.ENERGY_EIGENVALUE_KEY: torch.zeros((2, 6)),
+    }
+    dataset._load_data_dict = lambda idx: data_dict
+
+    assert dataset.get_dynamic_batch_cost_parts(0) == {
+        "graph": 1,
+        "node": 3,
+        "edge": 5,
+        "env": 0,
+        "onsitenv": 0,
+        "kpoint": 2,
+        "eig_band_square": 72,
+    }
 
 
 class _DummyTagger:
@@ -656,7 +762,8 @@ def test_multitrainer_dynamic_batch_cfg_disabled_returns_none():
     assert _dynamic_batch_cfg_probe(dynamic_batch_enabled=False) is None
 
 
-def test_multitrainer_dynamic_batch_cfg_ignores_global_dist_by_default(monkeypatch):
+def test_multitrainer_dynamic_batch_cfg_ignores_global_dist_by_default(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="dptb.nnops.multi_trainer")
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
@@ -666,6 +773,7 @@ def test_multitrainer_dynamic_batch_cfg_ignores_global_dist_by_default(monkeypat
 
     assert cfg["rank"] == 0
     assert cfg["world_size"] == 1
+    assert any("ordinary DDP should set dynamic_batch.use_global_dist=true" in record.message for record in caplog.records)
 
 
 def test_multitrainer_dynamic_batch_cfg_can_opt_into_global_dist(monkeypatch):

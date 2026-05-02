@@ -630,6 +630,19 @@ class MultiTrainer(Trainer):
             cfg["rank"] = torch.distributed.get_rank()
             cfg["world_size"] = torch.distributed.get_world_size()
         else:
+            if (
+                not self.distributed_expert
+                and torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and not bool(cfg.get("use_global_dist", False))
+                and not getattr(self, "_warned_dynamic_batch_global_dist_unsharded", False)
+            ):
+                log.warning(
+                    "dynamic_batch is using rank=0/world_size=1 while torch.distributed "
+                    "is initialized. This is intentional for expert-shared batches; "
+                    "ordinary DDP should set dynamic_batch.use_global_dist=true."
+                )
+                self._warned_dynamic_batch_global_dist_unsharded = True
             cfg["rank"] = 0
             cfg["world_size"] = 1
         return cfg

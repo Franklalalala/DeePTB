@@ -1,6 +1,7 @@
 import logging
 import math
 import random
+from collections import deque
 from typing import Any, Dict, Iterator, List, Optional
 
 import torch
@@ -10,6 +11,17 @@ from dptb.utils.torch_geometric import Batch, Data, Dataset
 
 
 log = logging.getLogger(__name__)
+
+
+DYNAMIC_BATCH_PART_KEYS = (
+    "graph",
+    "node",
+    "edge",
+    "env",
+    "onsitenv",
+    "kpoint",
+    "eig_band_square",
+)
 
 
 def _data_keys(data: Any):
@@ -144,6 +156,7 @@ class AtomicDataCostEstimator:
         return self.from_parts(parts)
 
     def from_parts(self, parts: Dict[str, int]) -> int:
+        parts = normalize_cost_parts(parts)
         if self.mode == "node":
             value = parts["node"]
         elif self.mode == "edge":
@@ -155,6 +168,23 @@ class AtomicDataCostEstimator:
         else:
             value = sum(self.weights.get(k, 0.0) * v for k, v in parts.items())
         return max(1, int(math.ceil(float(value))))
+
+
+def normalize_cost_parts(parts: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    out = {key: 0 for key in DYNAMIC_BATCH_PART_KEYS}
+    out["graph"] = 1
+    if not parts:
+        return out
+    for key, value in dict(parts).items():
+        key = str(key)
+        if key not in out:
+            continue
+        try:
+            out[key] = int(value)
+        except (TypeError, ValueError):
+            out[key] = 0
+    out["graph"] = max(1, int(out.get("graph", 1)))
+    return out
 
 
 class _IndexedDataset:
@@ -171,18 +201,19 @@ class _IndexedDataset:
 def _metadata_cost_parts(dataset, idx: int, estimator: AtomicDataCostEstimator, data=None):
     get_parts = getattr(dataset, "get_dynamic_batch_cost_parts", None)
     if callable(get_parts):
-        parts = {str(k): int(v) for k, v in dict(get_parts(int(idx))).items()}
+        parts = normalize_cost_parts(get_parts(int(idx)))
         return estimator.from_parts(parts), parts
 
     get_cost = getattr(dataset, "get_dynamic_batch_cost", None)
     if callable(get_cost):
         cost = max(1, int(math.ceil(float(get_cost(int(idx))))))
-        parts = dict(estimator.parts(data)) if data is not None else {"graph": 1}
+        parts = normalize_cost_parts(estimator.parts(data) if data is not None else None)
         return cost, parts
 
     if data is None:
         data = dataset[int(idx)]
     parts = estimator.parts(data)
+    parts = normalize_cost_parts(parts)
     return estimator.from_parts(parts), parts
 
 
@@ -197,12 +228,13 @@ def _attach_dynamic_metadata(
 ) -> Batch:
     batch.__dptb_sample_indices__ = list(sample_indices) if sample_indices is not None else None
     batch.__dptb_item_costs__ = [int(v) for v in item_costs]
-    batch.__dptb_item_parts__ = [dict(p) for p in item_parts]
+    batch.__dptb_item_parts__ = [normalize_cost_parts(p) for p in item_parts]
     batch.__dptb_batch_cost__ = int(sum(item_costs))
     batch.__dptb_batch_num_graphs__ = int(len(item_costs))
     batch.__dptb_batch_max_item_cost__ = int(max(item_costs)) if item_costs else 0
-    batch.__dptb_batch_num_nodes__ = int(sum(p.get("node", 0) for p in item_parts))
-    batch.__dptb_batch_num_edges__ = int(sum(p.get("edge", 0) for p in item_parts))
+    normalized_parts = batch.__dptb_item_parts__
+    batch.__dptb_batch_num_nodes__ = int(sum(p.get("node", 0) for p in normalized_parts))
+    batch.__dptb_batch_num_edges__ = int(sum(p.get("edge", 0) for p in normalized_parts))
     batch.__dptb_dynamic_batch_mode__ = str(mode)
     batch.__dptb_dynamic_batch_cost_weights__ = dict(cost_weights)
     return batch
@@ -331,7 +363,7 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
         self._cached_batches_key = None
         self._cached_batches: Optional[List[List[int]]] = None
         self._cost_cache_signature = self._cost_signature()
-        self.padding_events: List[Dict[str, Any]] = []
+        self.padding_events = deque(maxlen=1024)
         self.last_padding_stats: Optional[Dict[str, Any]] = None
 
     def set_epoch(self, epoch: int) -> None:
