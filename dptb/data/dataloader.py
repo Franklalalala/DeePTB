@@ -141,6 +141,9 @@ class AtomicDataCostEstimator:
 
     def __call__(self, data: Data) -> int:
         parts = self.parts(data)
+        return self.from_parts(parts)
+
+    def from_parts(self, parts: Dict[str, int]) -> int:
         if self.mode == "node":
             value = parts["node"]
         elif self.mode == "edge":
@@ -163,6 +166,24 @@ class _IndexedDataset:
 
     def __getitem__(self, idx):
         return int(idx), self.dataset[idx]
+
+
+def _metadata_cost_parts(dataset, idx: int, estimator: AtomicDataCostEstimator, data=None):
+    get_parts = getattr(dataset, "get_dynamic_batch_cost_parts", None)
+    if callable(get_parts):
+        parts = {str(k): int(v) for k, v in dict(get_parts(int(idx))).items()}
+        return estimator.from_parts(parts), parts
+
+    get_cost = getattr(dataset, "get_dynamic_batch_cost", None)
+    if callable(get_cost):
+        cost = max(1, int(math.ceil(float(get_cost(int(idx))))))
+        parts = dict(estimator.parts(data)) if data is not None else {"graph": 1}
+        return cost, parts
+
+    if data is None:
+        data = dataset[int(idx)]
+    parts = estimator.parts(data)
+    return estimator.from_parts(parts), parts
 
 
 def _attach_dynamic_metadata(
@@ -193,10 +214,19 @@ def _collate_dynamic_data_list(
     sample_indices: Optional[List[int]],
     cost_estimator: AtomicDataCostEstimator,
     exclude_keys: List[str],
+    metadata_dataset=None,
 ) -> Batch:
     batch = Batch.from_data_list(data_list, exclude_keys=set(exclude_keys)).contiguous()
-    item_costs = [cost_estimator(data) for data in data_list]
-    item_parts = [cost_estimator.parts(data) for data in data_list]
+    if metadata_dataset is not None and sample_indices is not None:
+        cost_and_parts = [
+            _metadata_cost_parts(metadata_dataset, idx, cost_estimator, data=data)
+            for idx, data in zip(sample_indices, data_list)
+        ]
+        item_costs = [int(cost) for cost, _parts in cost_and_parts]
+        item_parts = [dict(parts) for _cost, parts in cost_and_parts]
+    else:
+        item_costs = [cost_estimator(data) for data in data_list]
+        item_parts = [cost_estimator.parts(data) for data in data_list]
     return _attach_dynamic_metadata(
         batch,
         sample_indices=sample_indices,
@@ -220,6 +250,8 @@ def split_batch_for_oom(batch: Batch, exclude_keys: Optional[List[str]] = None):
     exclude_keys = exclude_keys or []
     left_indices = sample_indices[:mid] if sample_indices is not None else None
     right_indices = sample_indices[mid:] if sample_indices is not None else None
+    item_costs = getattr(batch, "__dptb_item_costs__", None)
+    item_parts = getattr(batch, "__dptb_item_parts__", None)
     left = _collate_dynamic_data_list(
         data_list[:mid],
         sample_indices=left_indices,
@@ -232,6 +264,23 @@ def split_batch_for_oom(batch: Batch, exclude_keys: Optional[List[str]] = None):
         cost_estimator=estimator,
         exclude_keys=exclude_keys,
     )
+    if item_costs is not None and item_parts is not None:
+        _attach_dynamic_metadata(
+            left,
+            sample_indices=left_indices,
+            item_costs=[int(v) for v in item_costs[:mid]],
+            item_parts=[dict(p) for p in item_parts[:mid]],
+            mode=mode,
+            cost_weights=estimator.weights,
+        )
+        _attach_dynamic_metadata(
+            right,
+            sample_indices=right_indices,
+            item_costs=[int(v) for v in item_costs[mid:]],
+            item_parts=[dict(p) for p in item_parts[mid:]],
+            mode=mode,
+            cost_weights=estimator.weights,
+        )
     return left, right
 
 
@@ -281,6 +330,9 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
         self._warned_oversized = set()
         self._cached_batches_key = None
         self._cached_batches: Optional[List[List[int]]] = None
+        self._cost_cache_signature = self._cost_signature()
+        self.padding_events: List[Dict[str, Any]] = []
+        self.last_padding_stats: Optional[Dict[str, Any]] = None
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -288,10 +340,23 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
     def step_epoch(self, epoch: int) -> None:
         self.set_epoch(epoch)
 
-    def _cache_key(self):
-        weights_key = tuple(
-            sorted((str(k), float(v)) for k, v in self.cost_estimator.weights.items())
+    def _dataset_cost_version(self):
+        dataset_version = getattr(self.dataset, "dynamic_batch_cost_version", None)
+        if callable(dataset_version):
+            dataset_version = dataset_version()
+        return dataset_version
+
+    def _weights_key(self):
+        return tuple(sorted((str(k), float(v)) for k, v in self.cost_estimator.weights.items()))
+
+    def _cost_signature(self):
+        return (
+            self._dataset_cost_version(),
+            self.cost_estimator.mode,
+            self._weights_key(),
         )
+
+    def _cache_key(self):
         return (
             self.epoch,
             len(self.dataset),
@@ -305,14 +370,23 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
             self.rank,
             self.world_size,
             self.num_steps,
-            self.cost_estimator.mode,
-            weights_key,
+            self._cost_signature(),
         )
+
+    def invalidate_cache(self, *, clear_costs: bool = False) -> None:
+        self._cached_batches_key = None
+        self._cached_batches = None
+        if clear_costs:
+            self._cost_cache.clear()
+            self._cost_cache_signature = self._cost_signature()
 
     def _cost(self, idx: int) -> int:
         idx = int(idx)
+        cost_signature = self._cost_signature()
+        if cost_signature != self._cost_cache_signature:
+            self.invalidate_cache(clear_costs=True)
         if idx not in self._cost_cache:
-            self._cost_cache[idx] = self.cost_estimator(self.dataset[idx])
+            self._cost_cache[idx] = _metadata_cost_parts(self.dataset, idx, self.cost_estimator)[0]
         return self._cost_cache[idx]
 
     def _ordered_indices(self) -> List[int]:
@@ -353,6 +427,19 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
         selected_sources = pad_sources[:need]
         for source_idx in selected_sources:
             batches.append(list(batches[source_idx]))
+
+        stats = {
+            "reason": str(reason),
+            "original_len": int(original_len),
+            "target_len": int(target_len),
+            "added": int(need),
+            "source_indices": list(selected_sources),
+            "epoch": int(self.epoch),
+            "rank": int(self.rank),
+            "world_size": int(self.world_size),
+        }
+        self.last_padding_stats = stats
+        self.padding_events.append(stats)
 
         source_preview = selected_sources[:16]
         source_suffix = "..." if len(selected_sources) > len(source_preview) else ""
@@ -493,11 +580,12 @@ def resolve_dynamic_batch_options(
         )
         generator = torch.Generator()
         generator.manual_seed(int(opts.get("seed", 0)))
+        indexed_dataset = _IndexedDataset(dataset)
         fixed_loader = torch.utils.data.DataLoader(
-            dataset,
+            indexed_dataset,
             batch_size=int(batch_size),
             shuffle=bool(shuffle),
-            collate_fn=Collater.for_dataset(dataset, cost_estimator=estimator),
+            collate_fn=Collater.for_dataset(indexed_dataset, cost_estimator=estimator),
             generator=generator,
             num_workers=0,
         )
@@ -538,9 +626,11 @@ class Collater(object):
 
     def __init__(
         self,
+        dataset=None,
         exclude_keys: List[str] = [],
         cost_estimator: Optional[AtomicDataCostEstimator] = None,
     ):
+        self.dataset = dataset
         self._exclude_keys = set(exclude_keys)
         self._cost_estimator = cost_estimator
 
@@ -553,6 +643,7 @@ class Collater(object):
     ):
         """Construct a collater appropriate to ``dataset``."""
         return cls(
+            dataset=dataset,
             exclude_keys=exclude_keys,
             cost_estimator=cost_estimator,
         )
@@ -569,6 +660,7 @@ class Collater(object):
                 sample_indices=sample_indices,
                 cost_estimator=self._cost_estimator,
                 exclude_keys=self.exclude_keys,
+                metadata_dataset=getattr(self.dataset, "dataset", self.dataset),
             )
         return Batch.from_data_list(batch, exclude_keys=self._exclude_keys)
 
@@ -654,6 +746,11 @@ class DataLoader(torch.utils.data.DataLoader):
         )
         self.dynamic_batch_options = None
         self.dynamic_batch_sampler = None
+
+    def invalidate_dynamic_batch_cache(self, *, clear_costs: bool = False) -> None:
+        sampler = getattr(self, "dynamic_batch_sampler", None)
+        if sampler is not None and hasattr(sampler, "invalidate_cache"):
+            sampler.invalidate_cache(clear_costs=clear_costs)
 
 
 class PartialSampler(Sampler[int]):

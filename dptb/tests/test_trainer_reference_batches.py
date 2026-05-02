@@ -46,10 +46,19 @@ class RecordingLoss:
         self.events = events
         self.model = model
         self.calls = []
+        self.last_onsite_loss = None
+        self.last_hopping_loss = None
+        self.last_z_loss = None
+        self.expert_load_cv = None
 
     def __call__(self, batch, batch_for_loss):
         self.calls.append(batch["name"])
         self.events.append(f"{self.name}_loss:{batch['name']}")
+        prefix = 10.0 if self.name == "train" else 20.0
+        self.last_onsite_loss = torch.tensor(prefix + 1.0)
+        self.last_hopping_loss = torch.tensor(prefix + 2.0)
+        self.last_z_loss = torch.tensor(prefix + 3.0)
+        self.expert_load_cv = torch.tensor(prefix + 4.0)
         if self.name == "reference":
             assert self.model.weight.grad is not None
             assert "train_backward:train" in self.events
@@ -121,6 +130,11 @@ def test_iteration_uses_reference_loss_and_backwards_train_before_reference(monk
     assert loss.item() == pytest.approx(5.0)
     assert observed_states[0][2]["batch_cost"] == 7
     assert observed_states[0][2]["batch_num_nodes"] == 2
+    assert observed_states[0][2]["train_onsite_loss"].item() == pytest.approx(11.0)
+    assert observed_states[0][2]["ref_onsite_loss"].item() == pytest.approx(21.0)
+    assert observed_states[0][2]["ref_hopping_loss"].item() == pytest.approx(22.0)
+    assert observed_states[0][2]["ref_mean_max_prob"].item() == pytest.approx(23.0)
+    assert observed_states[0][2]["ref_expert_load_cv"].item() == pytest.approx(24.0)
 
 
 def test_iteration_without_reference_keeps_single_train_backward(monkeypatch):

@@ -140,7 +140,7 @@ class Trainer(BaseTrainer):
         batch_for_loss.update(batch_info)
         return lossfunc(batch, batch_for_loss)
 
-    def _loss_component_state(self, lossfunc):
+    def _loss_component_state(self, lossfunc, *, prefix="train"):
         loss_obj = lossfunc
         for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
             inner = getattr(loss_obj, attr, None)
@@ -155,13 +155,13 @@ class Trainer(BaseTrainer):
         expert_load_cv = getattr(loss_obj, "expert_load_cv", None)
 
         if onsite_comp is not None:
-            state["train_onsite_loss"] = onsite_comp
+            state[f"{prefix}_onsite_loss"] = onsite_comp
         if hopping_comp is not None:
-            state["train_hopping_loss"] = hopping_comp
+            state[f"{prefix}_hopping_loss"] = hopping_comp
         if expert_load_cv is not None:
-            state["expert_load_cv"] = expert_load_cv
+            state["expert_load_cv" if prefix == "train" else f"{prefix}_expert_load_cv"] = expert_load_cv
         if z_loss_comp is not None:
-            state["mean_max_prob"] = z_loss_comp
+            state["mean_max_prob" if prefix == "train" else f"{prefix}_mean_max_prob"] = z_loss_comp
         return state
 
     def iteration(self, batch, ref_batch=None):
@@ -178,11 +178,13 @@ class Trainer(BaseTrainer):
         loss.backward()
         del loss
 
+        ref_component_state = {}
         if ref_batch is not None:
             reference_lossfunc = getattr(self, "reference_lossfunc", self.train_lossfunc)
             ref_loss = self._loss_on_batch(ref_batch, reference_lossfunc)
             loss_for_log = loss_for_log + ref_loss.detach()
             ref_loss.backward()
+            ref_component_state = self._loss_component_state(reference_lossfunc, prefix="ref")
             del ref_loss
 
         total_norm = torch.nn.utils.clip_grad_norm_(
@@ -207,6 +209,7 @@ class Trainer(BaseTrainer):
         }
         state.update(dynamic_batch_state)
         state.update(self._loss_component_state(self.train_lossfunc))
+        state.update(ref_component_state)
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1

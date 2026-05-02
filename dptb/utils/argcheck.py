@@ -141,7 +141,8 @@ def dynamic_batch_options():
         Argument("drop_oversized", bool, optional=True, default=False),
         Argument("seed", [int, None], optional=True, default=None),
         Argument("num_steps", [int, None], optional=True, default=None),
-        Argument("oom_fallback", bool, optional=True, default=True),
+        Argument("use_global_dist", bool, optional=True, default=False),
+        Argument("oom_fallback", bool, optional=True, default=False),
         Argument("oom_shrink_factor", (int, float), optional=True, default=0.8),
         Argument("cost_weights", dict, optional=True, default={}, sub_fields=weight_args),
     ]

@@ -402,7 +402,7 @@ class MultiTrainer(Trainer):
         dynamic_batch_cfg = self.train_options.get("dynamic_batch", None)
         self.dynamic_batch_options = dynamic_batch_cfg if isinstance(dynamic_batch_cfg, dict) else {}
         self.dynamic_batch_enabled = bool(self.dynamic_batch_options.get("enabled", False))
-        self.dynamic_batch_oom_fallback = bool(self.dynamic_batch_options.get("oom_fallback", True))
+        self.dynamic_batch_oom_fallback = bool(self.dynamic_batch_options.get("oom_fallback", False))
         self.dynamic_batch_oom_shrink_factor = float(self.dynamic_batch_options.get("oom_shrink_factor", 0.8))
         if self.dynamic_batch_enabled and self.dynamic_batch_oom_fallback and self.distributed_expert:
             log.warning(
@@ -621,6 +621,14 @@ class MultiTrainer(Trainer):
         if self.distributed_expert and (not self.distributed_rank0_prepare_batch) and self.expert_data_parallel_size > 1:
             cfg["rank"] = self.expert_dp_rank
             cfg["world_size"] = self.expert_data_parallel_size
+        elif (
+            bool(cfg.get("use_global_dist", False))
+            and not self.distributed_expert
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            cfg["rank"] = torch.distributed.get_rank()
+            cfg["world_size"] = torch.distributed.get_world_size()
         else:
             cfg["rank"] = 0
             cfg["world_size"] = 1
@@ -2719,6 +2727,7 @@ class MultiTrainer(Trainer):
         if self._t_last_iter_end is not None and self.debug_tags and (self.iter % self.debug_tag_freq == 0):
             log.info(f"[TAG][it={self.iter}][data_wait(outside_iteration)] dt={(t_now - self._t_last_iter_end):.4f}s")
 
+        optimizer_step_started = False
         try:
             with self._maybe_profile_iteration(self.iter):
                 if self.distributed_expert:
@@ -2815,6 +2824,7 @@ class MultiTrainer(Trainer):
                         )
 
                     with self._tagger.tag("expert/optimizer_step", it=self.iter, expert=expert_idx):
+                        optimizer_step_started = True
                         self.optimizers[expert_idx].step()
 
                     payload["grad_norm"] = grad_norm.detach() if torch.is_tensor(grad_norm) else torch.tensor(
@@ -2880,6 +2890,7 @@ class MultiTrainer(Trainer):
                     and not self.distributed_rank0_prepare_batch
                     and ref_batch is None
                     and getattr(batch, "num_graphs", 0) > 1
+                    and not optimizer_step_started
                 )
                 if can_retry:
                     log.warning(

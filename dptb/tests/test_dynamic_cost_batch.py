@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-
+import pytest
 import torch
 
 from dptb.data.dataloader import (
@@ -31,6 +31,30 @@ class ToyDataset:
             kpoint=torch.zeros((2, 3), dtype=torch.float32),
             eigenvalue=torch.zeros((1, 4), dtype=torch.float32),
         )
+
+
+class MetadataCostDataset(ToyDataset):
+    def __init__(self, node_counts):
+        super().__init__(node_counts)
+        self.item_reads = 0
+        self.dynamic_batch_cost_version = 0
+
+    def __getitem__(self, idx):
+        self.item_reads += 1
+        return super().__getitem__(idx)
+
+    def get_dynamic_batch_cost_parts(self, idx):
+        return {"graph": 1, "node": int(self.node_counts[idx])}
+
+
+class CallableVersionDataset(MetadataCostDataset):
+    def __init__(self, node_counts):
+        super().__init__(node_counts)
+        del self.dynamic_batch_cost_version
+        self.version_value = 0
+
+    def dynamic_batch_cost_version(self):
+        return self.version_value
 
 
 def test_cost_estimator_uses_deeptb_graph_terms():
@@ -119,6 +143,143 @@ def test_dynamic_sampler_caches_epoch_batches_for_len_and_iter():
     assert calls["make"] == 4
 
 
+def test_dynamic_sampler_uses_metadata_costs_and_manual_invalidation():
+    dataset = MetadataCostDataset([2, 2])
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=10,
+        mode="node",
+        shuffle=False,
+    )
+
+    assert list(sampler) == [[0, 1]]
+    assert dataset.item_reads == 0
+
+    dataset.node_counts[0] = 20
+    assert list(sampler) == [[0, 1]]
+
+    sampler.invalidate_cache(clear_costs=True)
+
+    assert list(sampler) == [[0], [1]]
+    assert dataset.item_reads == 0
+
+
+def test_dynamic_sampler_dataset_cost_version_invalidates_cost_cache():
+    dataset = MetadataCostDataset([2, 2])
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=10,
+        mode="node",
+        shuffle=False,
+    )
+
+    assert list(sampler) == [[0, 1]]
+
+    dataset.node_counts[0] = 20
+    dataset.dynamic_batch_cost_version += 1
+
+    assert list(sampler) == [[0], [1]]
+    assert dataset.item_reads == 0
+
+
+def test_dynamic_sampler_callable_cost_version_invalidates_cost_cache():
+    dataset = CallableVersionDataset([2, 2])
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=10,
+        mode="node",
+        shuffle=False,
+    )
+
+    assert list(sampler) == [[0, 1]]
+
+    dataset.node_counts[0] = 20
+    dataset.version_value += 1
+
+    assert list(sampler) == [[0], [1]]
+    assert dataset.item_reads == 0
+
+
+def test_dynamic_sampler_cost_cache_invalidates_when_estimator_signature_changes():
+    dataset = MetadataCostDataset([2, 2])
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=10,
+        mode="node",
+        shuffle=False,
+        cost_weights={"node": 1.0},
+    )
+
+    assert list(sampler) == [[0, 1]]
+
+    sampler.cost_estimator.mode = "cost"
+    sampler.cost_estimator.weights["node"] = 10.0
+
+    assert list(sampler) == [[0], [1]]
+
+
+def test_dynamic_loader_metadata_costs_drive_batch_metadata():
+    dataset = MetadataCostDataset([2, 2])
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+    )
+
+    batch = next(iter(loader))
+
+    assert dataset.item_reads == 2
+    assert batch.__dptb_item_costs__ == [2, 2]
+    assert batch.__dptb_batch_cost__ == 4
+
+    dataset.node_counts[0] = 20
+    dataset.dynamic_batch_cost_version += 1
+    loader.invalidate_dynamic_batch_cache(clear_costs=True)
+    batch = next(iter(loader))
+
+    assert batch.__dptb_item_costs__[0] == 20
+    assert batch.__dptb_batch_cost__ == 22
+
+
+def test_dynamic_batch_calibration_uses_metadata_cost_getter():
+    dataset = MetadataCostDataset([2, 20, 4, 6])
+
+    opts = resolve_dynamic_batch_options(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        dynamic_batch={
+            "enabled": True,
+            "mode": "node",
+            "calibrate": True,
+            "calibration_batches": 10,
+            "calibration_quantile": 1.0,
+        },
+    )
+
+    assert opts["calibration_batch_costs"] == [22, 10]
+    assert opts["max_cost"] == 22
+
+
+def test_dynamic_loader_forwards_invalidate_dynamic_batch_cache():
+    dataset = MetadataCostDataset([2, 2])
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 10},
+    )
+
+    assert list(loader.dynamic_batch_sampler) == [[0, 1]]
+    dataset.node_counts[0] = 20
+    assert list(loader.dynamic_batch_sampler) == [[0, 1]]
+
+    loader.invalidate_dynamic_batch_cache(clear_costs=True)
+
+    assert list(loader.dynamic_batch_sampler) == [[0], [1]]
+
+
 def test_dynamic_sampler_padding_uses_deterministic_non_last_sources(caplog):
     dataset = ToyDataset([1, 1, 1])
     caplog.set_level(logging.INFO, logger="dptb.data.dataloader")
@@ -150,6 +311,9 @@ def test_dynamic_sampler_padding_uses_deterministic_non_last_sources(caplog):
         )
     ) == batches
     assert any("num_steps" in record.message for record in caplog.records)
+    assert sampler.last_padding_stats["reason"] == "num_steps"
+    assert sampler.last_padding_stats["added"] == 3
+    assert sampler.padding_events[-1] == sampler.last_padding_stats
 
 
 def test_dynamic_sampler_world_size_padding_keeps_equal_rank_lengths():
@@ -216,6 +380,8 @@ def test_split_batch_for_oom_bisects_and_preserves_metadata():
     assert right.__dptb_sample_indices__ == [2, 3]
     assert left.__dptb_batch_cost__ == 5
     assert right.__dptb_batch_cost__ == 9
+    assert left.__dptb_item_costs__ == [2, 3]
+    assert right.__dptb_item_costs__ == [4, 5]
     assert left.num_graphs == 2
     assert right.num_graphs == 2
 
@@ -239,22 +405,12 @@ class _CountingSGD(torch.optim.SGD):
         return super().step(closure=closure)
 
 
-def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
-    dataset = ToyDataset([2, 3, 4, 5])
-    batch = next(iter(DataLoader(
-        dataset,
-        batch_size=4,
-        shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
-    )))
-
+def _make_microbatch_fallback_trainer(param, opt, observed_states):
     trainer = MultiTrainer.__new__(MultiTrainer)
-    param = torch.nn.Parameter(torch.tensor(1.0))
-    opt = _CountingSGD([param])
-    observed_states = []
-
     trainer.distributed_expert = False
     trainer.distributed_rank0_prepare_batch = False
+    trainer.ref_batch = None
+    trainer.reference_batch = None
     trainer.distance_ranges = [(0.0, 1.0)]
     trainer.num_experts = 1
     trainer.dtype = torch.float32
@@ -266,6 +422,10 @@ def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
     trainer.dynamic_batch_oom_shrink_factor = 0.8
     trainer.model = torch.nn.Linear(1, 1)
     trainer._tagger = _DummyTagger()
+    trainer._maybe_profile_iteration = lambda iteration: _DummyTagger().tag()
+    trainer._t_last_iter_end = None
+    trainer.debug_tags = False
+    trainer.debug_tag_freq = 1
     trainer.train_loader = type(
         "Loader",
         (),
@@ -274,36 +434,9 @@ def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
             "dynamic_batch_options": {"max_cost": 100},
         },
     )()
-
     trainer._is_cuda_device = lambda: False
     trainer._reset_cuda_memory_peak = lambda: None
     trainer._expert_parameters = lambda expert_idx: [param]
-    trainer._prepare_batch_bundle = lambda micro_batch, with_lengths=True: (
-        {"cost": torch.tensor(float(micro_batch.__dptb_batch_cost__))},
-        {},
-    )
-
-    def _build_train_payload(batch_dict, batch_info, expert_idx, range_dis):
-        loss = param * batch_dict["cost"]
-        return {
-            "loss": loss,
-            "expert_onsite": loss.detach(),
-            "expert_hopping": loss.detach(),
-            "onsite_weighted_sum": loss.detach(),
-            "hopping_weighted_sum": loss.detach(),
-            "active_nodes": torch.tensor(1.0),
-            "active_edges": torch.tensor(1.0),
-            "onsite_l1_sum": None,
-            "onsite_mse_sum": None,
-            "onsite_cnt": None,
-            "hopping_l1_sum": None,
-            "hopping_mse_sum": None,
-            "hopping_cnt": None,
-            "z_values": [],
-            "load_cv_values": [],
-        }
-
-    trainer._build_train_payload = _build_train_payload
     trainer._to_float_scalar = lambda x: float(x.detach().item() if torch.is_tensor(x) else x)
     trainer._to_int_scalar = lambda x: int(x.detach().item() if torch.is_tensor(x) else x)
     trainer._compute_stitched_loss_by_reduce = lambda payloads, criterion: None
@@ -311,6 +444,50 @@ def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
     trainer._add_cuda_memory_state = lambda state, metrics: None
     trainer._gather_cuda_memory_metrics = lambda: {}
     trainer.call_plugins = lambda queue_name, time, **state: observed_states.append(state)
+    return trainer
+
+
+def _build_cost_payload(param, batch_dict, batch_info, expert_idx, range_dis):
+    loss = param * batch_dict["cost"]
+    return {
+        "loss": loss,
+        "expert_onsite": loss.detach(),
+        "expert_hopping": loss.detach(),
+        "onsite_weighted_sum": loss.detach(),
+        "hopping_weighted_sum": loss.detach(),
+        "active_nodes": torch.tensor(1.0),
+        "active_edges": torch.tensor(1.0),
+        "onsite_l1_sum": None,
+        "onsite_mse_sum": None,
+        "onsite_cnt": None,
+        "hopping_l1_sum": None,
+        "hopping_mse_sum": None,
+        "hopping_cnt": None,
+        "z_values": [],
+        "load_cv_values": [],
+    }
+
+
+def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
+    dataset = ToyDataset([2, 3, 4, 5])
+    batch = next(iter(DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+    )))
+
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    opt = _CountingSGD([param])
+    observed_states = []
+    trainer = _make_microbatch_fallback_trainer(param, opt, observed_states)
+    trainer._prepare_batch_bundle = lambda micro_batch, with_lengths=True: (
+        {"cost": torch.tensor(float(micro_batch.__dptb_batch_cost__))},
+        {},
+    )
+    trainer._build_train_payload = lambda batch_dict, batch_info, expert_idx, range_dis, **kwargs: (
+        _build_cost_payload(param, batch_dict, batch_info, expert_idx, range_dis)
+    )
 
     trainer._run_single_process_microbatch_fallback(batch)
 
@@ -320,6 +497,106 @@ def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
     assert observed_states[0]["dynamic_batch_oom_fallback"] == 1
     assert observed_states[0]["dynamic_batch_microbatches"] == 2
     assert observed_states[0]["batch_cost"] == 14
+
+
+def test_multitrainer_iteration_oom_fallback_enters_production_catch():
+    dataset = ToyDataset([2, 3, 4, 5])
+    batch = next(iter(DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+    )))
+
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    opt = _CountingSGD([param])
+    observed_states = []
+    prepare_calls = {"count": 0}
+    trainer = _make_microbatch_fallback_trainer(param, opt, observed_states)
+    trainer.dynamic_batch_enabled = True
+    trainer.dynamic_batch_oom_fallback = True
+
+    def _prepare_batch_bundle(micro_batch, with_lengths=True):
+        prepare_calls["count"] += 1
+        if prepare_calls["count"] == 1:
+            raise RuntimeError("CUDA out of memory")
+        return {"cost": torch.tensor(float(micro_batch.__dptb_batch_cost__))}, {}
+
+    trainer._prepare_batch_bundle = _prepare_batch_bundle
+
+    trainer._build_train_payload = lambda batch_dict, batch_info, expert_idx, range_dis, **kwargs: (
+        _build_cost_payload(param, batch_dict, batch_info, expert_idx, range_dis)
+    )
+
+    loss = trainer.iteration(batch)
+
+    assert loss.item() == pytest.approx(106.0 / 14.0)
+    assert prepare_calls["count"] == 3
+    assert opt.step_calls == 1
+    assert trainer.iter == 8
+    assert trainer.train_loader.batch_sampler.max_cost == 80
+    assert observed_states[0]["dynamic_batch_oom_fallback"] == 1
+
+
+def test_multitrainer_iteration_oom_fallback_disabled_reraises():
+    dataset = ToyDataset([2, 3, 4, 5])
+    batch = next(iter(DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+    )))
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    opt = _CountingSGD([param])
+    trainer = _make_microbatch_fallback_trainer(param, opt, [])
+    trainer.dynamic_batch_enabled = True
+    trainer.dynamic_batch_oom_fallback = False
+    trainer._prepare_batch_bundle = lambda micro_batch, with_lengths=True: (
+        (_ for _ in ()).throw(RuntimeError("CUDA out of memory"))
+    )
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        trainer.iteration(batch)
+
+    assert opt.step_calls == 0
+
+
+def test_multitrainer_iteration_oom_after_optimizer_step_does_not_retry():
+    dataset = ToyDataset([2, 3, 4, 5])
+    batch = next(iter(DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+    )))
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    opt = _CountingSGD([param])
+    trainer = _make_microbatch_fallback_trainer(param, opt, [])
+    trainer.dynamic_batch_enabled = True
+    trainer.dynamic_batch_oom_fallback = True
+    fallback_calls = {"count": 0}
+    trainer._prepare_batch_bundle = lambda micro_batch, with_lengths=True: (
+        {"cost": torch.tensor(float(micro_batch.__dptb_batch_cost__))},
+        {},
+    )
+    trainer._build_train_payload = lambda batch_dict, batch_info, expert_idx, range_dis, **kwargs: (
+        _build_cost_payload(param, batch_dict, batch_info, expert_idx, range_dis)
+    )
+    trainer._local_scheduler_step = lambda metric: (
+        (_ for _ in ()).throw(RuntimeError("CUDA out of memory after optimizer"))
+    )
+
+    def _fallback(batch):
+        fallback_calls["count"] += 1
+        return torch.tensor(0.0)
+
+    trainer._run_single_process_microbatch_fallback = _fallback
+
+    with pytest.raises(RuntimeError, match="out of memory after optimizer"):
+        trainer.iteration(batch)
+
+    assert opt.step_calls == 1
+    assert fallback_calls["count"] == 0
 
 
 def _dynamic_batch_cfg_probe(**overrides):
@@ -377,3 +654,30 @@ def test_multitrainer_dynamic_batch_cfg_keeps_rank0_prepare_unsharded():
 
 def test_multitrainer_dynamic_batch_cfg_disabled_returns_none():
     assert _dynamic_batch_cfg_probe(dynamic_batch_enabled=False) is None
+
+
+def test_multitrainer_dynamic_batch_cfg_ignores_global_dist_by_default(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+    cfg = _dynamic_batch_cfg_probe(distributed_expert=False)
+
+    assert cfg["rank"] == 0
+    assert cfg["world_size"] == 1
+
+
+def test_multitrainer_dynamic_batch_cfg_can_opt_into_global_dist(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+    cfg = _dynamic_batch_cfg_probe(
+        distributed_expert=False,
+        dynamic_batch_options={"use_global_dist": True},
+    )
+
+    assert cfg["rank"] == 2
+    assert cfg["world_size"] == 4
