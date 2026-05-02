@@ -168,7 +168,7 @@ def activation_recompute_options():
         Argument("checkpoint_node_tp", bool, optional=True, default=True),
         Argument("checkpoint_edge_tp", bool, optional=True, default=True),
         Argument("use_reentrant", bool, optional=True, default=False),
-        Argument("preserve_rng_state", bool, optional=True, default=True),
+        Argument("preserve_rng_state", bool, optional=True, default=False),
     ]
     return Argument(
         "activation_recompute",
