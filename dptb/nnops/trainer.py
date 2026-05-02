@@ -69,8 +69,12 @@ class Trainer(BaseTrainer):
         else:
             self.use_validation = False
 
-        self.train_loader = DataLoader(dataset=self.train_datasets, batch_size=train_options["batch_size"],
-                                       shuffle=True)
+        self.train_loader = DataLoader(
+            dataset=self.train_datasets,
+            batch_size=train_options["batch_size"],
+            shuffle=True,
+            dynamic_batch=train_options.get("dynamic_batch", None),
+        )
 
         if self.use_reference:
             self.reference_loader = DataLoader(dataset=self.reference_datesets,
@@ -104,6 +108,16 @@ class Trainer(BaseTrainer):
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         batch = batch.to(self.device)
+        dynamic_batch_state = {}
+        for attr, key in (
+            ("__dptb_batch_cost__", "batch_cost"),
+            ("__dptb_batch_num_graphs__", "batch_num_graphs"),
+            ("__dptb_batch_num_nodes__", "batch_num_nodes"),
+            ("__dptb_batch_num_edges__", "batch_num_edges"),
+            ("__dptb_batch_max_item_cost__", "batch_max_item_cost"),
+        ):
+            if hasattr(batch, attr):
+                dynamic_batch_state[key] = getattr(batch, attr)
 
         # ... (原有 batch 处理逻辑保持不变) ...
         batch_info = {
@@ -174,6 +188,7 @@ class Trainer(BaseTrainer):
             "lr": self.optimizer.state_dict()["param_groups"][0]['lr'],
             "total_grad_norm": total_norm.item()
         }
+        state.update(dynamic_batch_state)
 
         # 只有在 lossfunc 真正提供了分量时才塞进 state，避免对别的 loss 类出错
         if onsite_comp is not None:
@@ -213,6 +228,9 @@ class Trainer(BaseTrainer):
         return trainer
 
     def epoch(self) -> None:
+        batch_sampler = getattr(self.train_loader, "batch_sampler", None)
+        if hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(int(self.ep))
         for ibatch in self.train_loader:
             if self.use_reference:
                 self.iteration(ibatch, next(iter(self.reference_loader)))

@@ -111,6 +111,51 @@ def common_options():
     return Argument("common_options", dict, optional=False, sub_fields=args, sub_variants=[], doc=doc_common_options)
 
 
+def dynamic_batch_options():
+    doc = (
+        "Dynamic DeePTB graph-cost batching. When enabled, batch_size remains "
+        "the maximum number of samples per batch, while max_cost caps the total "
+        "graph cost. If max_cost is omitted and calibrate is true, DeePTB first "
+        "scans fixed-batch CPU dataloader batches and derives max_cost from the "
+        "requested calibration quantile."
+    )
+    weight_args = [
+        Argument("graph", (int, float), optional=True, default=1.0),
+        Argument("node", (int, float), optional=True, default=1.0),
+        Argument("edge", (int, float), optional=True, default=1.0),
+        Argument("env", (int, float), optional=True, default=1.0),
+        Argument("onsitenv", (int, float), optional=True, default=1.0),
+        Argument("kpoint", (int, float), optional=True, default=0.0),
+        Argument("eig_band_square", (int, float), optional=True, default=0.0),
+    ]
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument("mode", str, optional=True, default="cost"),
+        Argument("max_cost", [int, float, None], optional=True, default=None),
+        Argument("max_samples", [int, None], optional=True, default=None),
+        Argument("calibrate", bool, optional=True, default=False),
+        Argument("calibration_batches", int, optional=True, default=1000),
+        Argument("calibration_quantile", (int, float), optional=True, default=0.90),
+        Argument("bucket_size", int, optional=True, default=0),
+        Argument("drop_last", bool, optional=True, default=False),
+        Argument("drop_oversized", bool, optional=True, default=False),
+        Argument("seed", [int, None], optional=True, default=None),
+        Argument("num_steps", [int, None], optional=True, default=None),
+        Argument("oom_fallback", bool, optional=True, default=True),
+        Argument("oom_shrink_factor", (int, float), optional=True, default=0.8),
+        Argument("cost_weights", dict, optional=True, default={}, sub_fields=weight_args),
+    ]
+    return Argument(
+        "dynamic_batch",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def train_options():
     doc_num_epoch = "Total number of training epochs. It is worth noted, if the model is reloaded with `-r` or `--restart` option, epoch which have been trained will counted from the time that the checkpoint is saved."
     doc_save_freq = "Frequency, or every how many iteration to saved the current model into checkpoints, The name of checkpoint is formulated as `latest|best_dptb|nnsk_b<bond_cutoff>_c<sk_cutoff>_w<sk_decay_w>`. Default: `10`"
@@ -392,6 +437,7 @@ def train_options():
 
         # data / batch
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
+        dynamic_batch_options(),
         Argument("ref_batch_size", int, optional=True, default=1, doc=doc_ref_batch_size),
         Argument("val_batch_size", int, optional=True, default=1, doc=doc_val_batch_size),
 

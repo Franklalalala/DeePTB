@@ -18,7 +18,15 @@ from .dataset import (
     ABACUSInMemoryDataset,
     DefaultDataset
 )
-from .dataloader import DataLoader, Collater, PartialSampler
+from .dataloader import (
+    AtomicDataCostEstimator,
+    DataLoader,
+    Collater,
+    DynamicCostBatchSampler,
+    PartialSampler,
+    resolve_dynamic_batch_options,
+    split_batch_for_oom,
+)
 from .build import build_dataset
 from .interfaces import block_to_feature, feature_to_block
 from .transforms import OrbitalMapper
@@ -41,7 +49,11 @@ __all__ = [
     DefaultDataset,
     DataLoader,
     Collater,
+    AtomicDataCostEstimator,
+    DynamicCostBatchSampler,
     PartialSampler,
+    resolve_dynamic_batch_options,
+    split_batch_for_oom,
     OrbitalMapper,
     build_dataset,
     _NODE_FIELDS,
