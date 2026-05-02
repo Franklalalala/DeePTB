@@ -3,6 +3,7 @@ import time
 import logging
 import copy
 import heapq
+import math
 import os
 from typing import Union, Optional, Dict, Any, List, Tuple
 
@@ -15,6 +16,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.profiler import profile as torch_profile, ProfilerActivity
 
 from dptb.utils.tools import get_lr_scheduler, get_optimizer
+from dptb.utils.cuda_cache_memory import cuda_cache_memory_context
 from dptb.data import AtomicDataset, AtomicData, DataLoader
 from dptb.data import _keys
 from dptb.data.AtomicDataDict import with_edge_vectors
@@ -198,6 +200,13 @@ class MultiTrainer(Trainer):
     _P_GRAD_NORM_SUM = 15
     _P_STEP_COUNT = 16
     _PACK_LEN = 17
+    _DB_NUM_GRAPHS_SUM = 0
+    _DB_COST_SUM = 1
+    _DB_NUM_NODES_SUM = 2
+    _DB_NUM_EDGES_SUM = 3
+    _DB_MAX_ITEM_COST_SUM = 4
+    _DB_STEP_COUNT = 5
+    _DB_PACK_LEN = 6
 
     def __init__(
         self,
@@ -396,6 +405,18 @@ class MultiTrainer(Trainer):
         self.expert_dp_val_sampler_drop_last = bool(
             self.train_options.get("expert_dp_val_sampler_drop_last", False)
         )
+        dynamic_batch_cfg = self.train_options.get("dynamic_batch", None)
+        self.dynamic_batch_options = dynamic_batch_cfg if isinstance(dynamic_batch_cfg, dict) else {}
+        self.dynamic_batch_enabled = bool(self.dynamic_batch_options.get("enabled", False))
+        self.dynamic_batch_oom_fallback = bool(self.dynamic_batch_options.get("oom_fallback", False))
+        self.dynamic_batch_oom_shrink_factor = float(self.dynamic_batch_options.get("oom_shrink_factor", 0.8))
+        if self.dynamic_batch_enabled and self.dynamic_batch_oom_fallback and self.distributed_rank0_prepare_batch:
+            log.warning(
+                "dynamic_batch OOM skip fallback is disabled for distributed_rank0_prepare_batch in this version; "
+                "dynamic cost batching remains enabled."
+            )
+            self.dynamic_batch_oom_fallback = False
+            self.dynamic_batch_options["oom_fallback"] = False
 
         self._tagger = _StageTagger(
             trainer=self,
@@ -462,6 +483,7 @@ class MultiTrainer(Trainer):
             f"distributed_rank0_prepare_batch={self.distributed_rank0_prepare_batch}, "
             f"train_num_workers={self.train_num_workers}, ref_num_workers={self.ref_num_workers}, val_num_workers={self.val_num_workers}, "
             f"pin_memory={self.data_pin_memory}, persistent_workers={self.data_persistent_workers}, prefetch_factor={self.data_prefetch_factor}, "
+            f"dynamic_batch_enabled={self.dynamic_batch_enabled}, dynamic_batch_oom_fallback={self.dynamic_batch_oom_fallback}, "
             f"log_single_model_compatible_loss={self.log_single_model_compatible_loss}, "
             f"mode={self.log_single_model_compatible_loss_mode}, "
             f"expert_lrs={'(default optimizer.lr)' if self.expert_lrs is None else self.expert_lrs}, "
@@ -593,8 +615,43 @@ class MultiTrainer(Trainer):
     # dataloader rebuild in MultiTrainer only
     # ---------------------------------------------------------------------
 
-    def _make_loader_compat(self, dataset, batch_size, shuffle, num_workers, sampler=None):
+    def _dynamic_batch_cfg_for_train_loader(self):
+        if not self.dynamic_batch_enabled:
+            return None
+        cfg = copy.deepcopy(self.dynamic_batch_options)
+        if self.distributed_expert and (not self.distributed_rank0_prepare_batch) and self.expert_data_parallel_size > 1:
+            cfg["rank"] = self.expert_dp_rank
+            cfg["world_size"] = self.expert_data_parallel_size
+        elif (
+            bool(cfg.get("use_global_dist", False))
+            and not self.distributed_expert
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            cfg["rank"] = torch.distributed.get_rank()
+            cfg["world_size"] = torch.distributed.get_world_size()
+        else:
+            if (
+                not self.distributed_expert
+                and torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and not bool(cfg.get("use_global_dist", False))
+                and not getattr(self, "_warned_dynamic_batch_global_dist_unsharded", False)
+            ):
+                log.warning(
+                    "dynamic_batch is using rank=0/world_size=1 while torch.distributed "
+                    "is initialized. This is intentional for expert-shared batches; "
+                    "ordinary DDP should set dynamic_batch.use_global_dist=true."
+                )
+                self._warned_dynamic_batch_global_dist_unsharded = True
+            cfg["rank"] = 0
+            cfg["world_size"] = 1
+        return cfg
+
+    def _make_loader_compat(self, dataset, batch_size, shuffle, num_workers, sampler=None, dynamic_batch=None):
         kwargs = {"num_workers": int(num_workers)}
+        if dynamic_batch is not None:
+            sampler = None
         if sampler is not None:
             kwargs["sampler"] = sampler
             shuffle = False
@@ -618,7 +675,13 @@ class MultiTrainer(Trainer):
         last_err = None
         for kw in trial_kwargs:
             try:
-                return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle, **kw)
+                return DataLoader(
+                    dataset=dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    dynamic_batch=dynamic_batch,
+                    **kw,
+                )
             except TypeError as e:
                 last_err = e
                 continue
@@ -665,6 +728,7 @@ class MultiTrainer(Trainer):
         need_rebuild = (
             self.distributed_expert or
             self.distributed_rank0_prepare_batch or
+            self.dynamic_batch_enabled or
             any(k in self.train_options for k in worker_keys)
         )
 
@@ -680,7 +744,8 @@ class MultiTrainer(Trainer):
             ref_workers = 0
             val_workers = 0
 
-        train_sampler = self._make_expert_dp_sampler(
+        train_dynamic_batch = self._dynamic_batch_cfg_for_train_loader()
+        train_sampler = None if train_dynamic_batch is not None else self._make_expert_dp_sampler(
             self.train_datasets,
             shuffle=True,
             drop_last=self.expert_dp_train_sampler_drop_last,
@@ -692,6 +757,7 @@ class MultiTrainer(Trainer):
             shuffle=True,
             num_workers=train_workers,
             sampler=train_sampler,
+            dynamic_batch=train_dynamic_batch,
         )
 
         if self.use_reference:
@@ -732,17 +798,19 @@ class MultiTrainer(Trainer):
             f"val_batch_size={self.train_options.get('val_batch_size')}, local_val_batch_size={self._local_expert_dp_batch_size('val_batch_size') if self.use_validation else None}, "
             f"expert_dp_train_batch_size_semantics={self.expert_dp_train_batch_size_semantics}, "
             f"expert_dp_ref_batch_size_semantics={self.expert_dp_ref_batch_size_semantics}, "
-            f"expert_dp_val_batch_size_semantics={self.expert_dp_val_batch_size_semantics}"
+            f"expert_dp_val_batch_size_semantics={self.expert_dp_val_batch_size_semantics}, "
+            f"dynamic_batch={getattr(self.train_loader, 'dynamic_batch_options', None)}"
         )
 
     def _set_expert_dp_sampler_epoch(self, epoch: int):
-        if not self.distributed_expert or self.expert_data_parallel_size <= 1:
-            return
         for loader_name in ("train_loader", "reference_loader", "validation_loader"):
             loader = getattr(self, loader_name, None)
             sampler = getattr(loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(int(epoch))
+            batch_sampler = getattr(loader, "batch_sampler", None)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(int(epoch))
 
     # ---------------------------------------------------------------------
     # dist helpers
@@ -1863,7 +1931,12 @@ class MultiTrainer(Trainer):
         batch_copy["expert_idx"] = int(expert_idx)
 
         with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
-            pred_batch = self.model(batch_copy)
+            with cuda_cache_memory_context(
+                iteration=self.iter,
+                stage="expert/model_forward",
+                expert=expert_idx,
+            ):
+                pred_batch = self.model(batch_copy)
 
         pred_batch["global_step"] = int(self.iter)
 
@@ -2109,6 +2182,7 @@ class MultiTrainer(Trainer):
     def _reset_display_window_buffers(self):
         dev = self._device_obj()
         self._display_window_pack_local = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=dev)
+        self._display_window_dynamic_batch_pack_local = torch.zeros((self._DB_PACK_LEN,), dtype=self.dtype, device=dev)
         self._display_window_expert_onsite_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_hopping_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_nodes_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
@@ -2149,8 +2223,26 @@ class MultiTrainer(Trainer):
         vec[self._P_STEP_COUNT] = 1.0
         return vec
 
-    def _update_display_window_local(self, payload: Dict[str, Any], current_local_lr: float):
+    def _make_dynamic_batch_pack(self, dynamic_batch_state: Optional[Dict[str, Any]]) -> torch.Tensor:
+        vec = torch.zeros((self._DB_PACK_LEN,), dtype=self.dtype, device=self.device)
+        if not dynamic_batch_state:
+            return vec
+        vec[self._DB_NUM_GRAPHS_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_num_graphs", 0.0))
+        vec[self._DB_COST_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_cost", 0.0))
+        vec[self._DB_NUM_NODES_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_num_nodes", 0.0))
+        vec[self._DB_NUM_EDGES_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_num_edges", 0.0))
+        vec[self._DB_MAX_ITEM_COST_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_max_item_cost", 0.0))
+        vec[self._DB_STEP_COUNT] = 1.0
+        return vec
+
+    def _update_display_window_local(
+        self,
+        payload: Dict[str, Any],
+        current_local_lr: float,
+        dynamic_batch_state: Optional[Dict[str, Any]] = None,
+    ):
         self._display_window_pack_local += self._make_step_pack(payload)
+        self._display_window_dynamic_batch_pack_local += self._make_dynamic_batch_pack(dynamic_batch_state)
         self._display_window_expert_onsite_sum_local += self._as_scalar_tensor(payload["expert_onsite"], default=0.0)
         self._display_window_expert_hopping_sum_local += self._as_scalar_tensor(payload["expert_hopping"], default=0.0)
         self._display_window_expert_active_nodes_sum_local += self._as_scalar_tensor(payload["active_nodes"], default=0.0)
@@ -2186,7 +2278,9 @@ class MultiTrainer(Trainer):
         with self._tagger.tag("display/window_reduce", it=time_idx, extra=f"freq={self.display_sync_freq}"):
             cuda_memory_metrics = self._gather_cuda_memory_metrics()
             reduced_pack = self._display_window_pack_local.clone()
+            reduced_dynamic_pack = self._display_window_dynamic_batch_pack_local.clone()
             self._all_reduce_(reduced_pack, name="dist/all_reduce(display_window_metrics_packed)")
+            self._all_reduce_(reduced_dynamic_pack, name="dist/all_reduce(display_window_dynamic_batch_packed)")
             gathered = self._gather_display_window_expert_metrics()
 
         full_loss_steps = self.num_experts if self._dist_ready() else 1
@@ -2234,6 +2328,15 @@ class MultiTrainer(Trainer):
             state["expert_load_cv"] = float((reduced_pack[self._P_CV_SUM] / reduced_pack[self._P_CV_CNT]).item())
         if float(reduced_pack[self._P_Z_CNT].item()) > 0.0:
             state["mean_max_prob"] = float((reduced_pack[self._P_Z_SUM] / reduced_pack[self._P_Z_CNT]).item())
+
+        dynamic_batch_steps = float(reduced_dynamic_pack[self._DB_STEP_COUNT].item())
+        if dynamic_batch_steps > 0.0:
+            denom = reduced_dynamic_pack[self._DB_STEP_COUNT].clamp_min(1.0)
+            state["batch_num_graphs"] = float((reduced_dynamic_pack[self._DB_NUM_GRAPHS_SUM] / denom).item())
+            state["batch_cost"] = float((reduced_dynamic_pack[self._DB_COST_SUM] / denom).item())
+            state["batch_num_nodes"] = float((reduced_dynamic_pack[self._DB_NUM_NODES_SUM] / denom).item())
+            state["batch_num_edges"] = float((reduced_dynamic_pack[self._DB_NUM_EDGES_SUM] / denom).item())
+            state["batch_max_item_cost"] = float((reduced_dynamic_pack[self._DB_MAX_ITEM_COST_SUM] / denom).item())
 
         self._add_cuda_memory_state(state, cuda_memory_metrics)
 
@@ -2352,32 +2455,50 @@ class MultiTrainer(Trainer):
         batch_dict,
         batch_info,
         ref_batch_dict=None,
-        ref_batch_info=None
+        ref_batch_info=None,
+        original_batch=None,
     ):
+        dynamic_batch_state = self._dynamic_batch_state_from_batch(original_batch)
         with self._tagger.tag("iteration/entry", it=self.iter):
             self.model.train()
 
         local_idx = self.local_expert_idx
         local_opt = self.optimizers[local_idx]
 
-        with self._tagger.tag("iteration/zero_grad(local)", it=self.iter, expert=local_idx):
-            local_opt.zero_grad(set_to_none=True)
+        local_oom_exc = None
+        try:
+            with self._tagger.tag("iteration/zero_grad(local)", it=self.iter, expert=local_idx):
+                local_opt.zero_grad(set_to_none=True)
 
-        with self._tagger.tag("expert/build_payload(fwd+loss)", it=self.iter, expert=local_idx):
-            payload = self._build_train_payload(
-                batch_dict=batch_dict,
-                batch_info=batch_info,
-                expert_idx=local_idx,
-                range_dis=self.distance_ranges[local_idx],
-                ref_batch_dict=ref_batch_dict,
-                ref_batch_info=ref_batch_info,
-                criterion=self.train_lossfunc,
-            )
+            with self._tagger.tag("expert/build_payload(fwd+loss)", it=self.iter, expert=local_idx):
+                payload = self._build_train_payload(
+                    batch_dict=batch_dict,
+                    batch_info=batch_info,
+                    expert_idx=local_idx,
+                    range_dis=self.distance_ranges[local_idx],
+                    ref_batch_dict=ref_batch_dict,
+                    ref_batch_info=ref_batch_info,
+                    criterion=self.train_lossfunc,
+                )
 
-        loss_local = payload["loss"]
+            loss_local = payload["loss"]
 
-        with self._tagger.tag("expert/backward", it=self.iter, expert=local_idx):
-            loss_local.backward()
+            with self._tagger.tag("expert/backward", it=self.iter, expert=local_idx):
+                loss_local.backward()
+        except RuntimeError as exc:
+            if not self._is_cuda_oom(exc):
+                raise
+            local_oom_exc = exc
+
+        if local_oom_exc is not None:
+            if self._maybe_skip_dynamic_batch_after_oom(
+                original_batch,
+                local_oom=True,
+                where="distributed_fwd_bwd",
+                ref_batch=ref_batch_dict,
+            ):
+                return None
+            raise local_oom_exc
 
         with self._tagger.tag("expert/sync_dp_grads", it=self.iter, expert=local_idx):
             self._sync_local_expert_grads(local_idx)
@@ -2406,7 +2527,11 @@ class MultiTrainer(Trainer):
         self._local_scheduler_step(local_sched_metric)
 
         current_local_lr = float(local_opt.param_groups[0]['lr'])
-        self._update_display_window_local(payload, current_local_lr)
+        self._update_display_window_local(
+            payload,
+            current_local_lr,
+            dynamic_batch_state=dynamic_batch_state,
+        )
 
         if self._should_flush_display_window_now(self.iter):
             state = self._flush_display_window(time_idx=self.iter)
@@ -2420,20 +2545,39 @@ class MultiTrainer(Trainer):
         return loss_local.detach()
 
     def _iteration_distributed_expert(self, batch, ref_batch=None):
-        with self._tagger.tag("iteration/prepare_batch", it=self.iter):
-            batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
-
+        local_oom_exc = None
+        batch_dict = None
+        batch_info = None
         ref_batch_dict = None
         ref_batch_info = None
-        if ref_batch is not None:
-            with self._tagger.tag("iteration/prepare_ref_batch", it=self.iter):
-                ref_batch_dict, ref_batch_info = self._prepare_batch_bundle(ref_batch, with_lengths=True)
+        try:
+            with self._tagger.tag("iteration/prepare_batch", it=self.iter):
+                batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
+
+            if ref_batch is not None:
+                with self._tagger.tag("iteration/prepare_ref_batch", it=self.iter):
+                    ref_batch_dict, ref_batch_info = self._prepare_batch_bundle(ref_batch, with_lengths=True)
+        except RuntimeError as exc:
+            if not self._is_cuda_oom(exc):
+                raise
+            local_oom_exc = exc
+
+        if local_oom_exc is not None:
+            if self._maybe_skip_dynamic_batch_after_oom(
+                batch,
+                local_oom=True,
+                where="distributed_prepare_batch",
+                ref_batch=ref_batch,
+            ):
+                return None
+            raise local_oom_exc
 
         return self._iteration_distributed_expert_prepared(
             batch_dict=batch_dict,
             batch_info=batch_info,
             ref_batch_dict=ref_batch_dict,
-            ref_batch_info=ref_batch_info
+            ref_batch_info=ref_batch_info,
+            original_batch=batch,
         )
 
     def _iteration_distributed_expert_shared(self, batch, ref_batch=None):
@@ -2447,8 +2591,100 @@ class MultiTrainer(Trainer):
             batch_dict=batch_dict,
             batch_info=batch_info,
             ref_batch_dict=ref_batch_dict,
-            ref_batch_info=ref_batch_info
+            ref_batch_info=ref_batch_info,
+            original_batch=batch,
         )
+
+    # ---------------------------------------------------------------------
+    # dynamic batch OOM fallback helpers
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        oom_cls = getattr(torch, "OutOfMemoryError", None)
+        if oom_cls is not None and isinstance(exc, oom_cls):
+            return True
+        return "out of memory" in str(exc).lower()
+
+    @staticmethod
+    def _dynamic_batch_state_from_batch(batch) -> Dict[str, Any]:
+        if batch is None:
+            return {}
+        state = {}
+        for attr, key in (
+            ("__dptb_batch_cost__", "batch_cost"),
+            ("__dptb_batch_num_graphs__", "batch_num_graphs"),
+            ("__dptb_batch_num_nodes__", "batch_num_nodes"),
+            ("__dptb_batch_num_edges__", "batch_num_edges"),
+            ("__dptb_batch_max_item_cost__", "batch_max_item_cost"),
+        ):
+            if hasattr(batch, attr):
+                state[key] = getattr(batch, attr)
+        return state
+
+    def _clear_after_oom(self):
+        for opt in getattr(self, "optimizers", []):
+            if opt is not None:
+                opt.zero_grad(set_to_none=True)
+        if self._is_cuda_device():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def _shrink_dynamic_batch_after_oom(self, batch):
+        sampler = getattr(self.train_loader, "batch_sampler", None)
+        if sampler is None or not hasattr(sampler, "max_cost"):
+            return
+        old_max = int(sampler.max_cost)
+        new_max = max(1, int(math.floor(old_max * self.dynamic_batch_oom_shrink_factor)))
+        sampler.max_cost = new_max
+        opts = getattr(self.train_loader, "dynamic_batch_options", None)
+        if isinstance(opts, dict):
+            opts["max_cost"] = new_max
+            if "max_edge" in opts:
+                opts["max_edge"] = new_max
+        log.warning(
+            "dynamic_batch OOM fallback shrank runtime max_cost from %s to %s after batch_cost=%s",
+            old_max,
+            new_max,
+            getattr(batch, "__dptb_batch_cost__", None),
+        )
+
+    def _can_skip_dynamic_batch_after_oom(self, ref_batch=None, optimizer_step_started: bool = False) -> bool:
+        return (
+            self.dynamic_batch_enabled
+            and self.dynamic_batch_oom_fallback
+            and not self.distributed_rank0_prepare_batch
+            and ref_batch is None
+            and not optimizer_step_started
+        )
+
+    def _handle_dynamic_batch_oom_skip(self, batch, *, local_oom: bool, where: str):
+        self._clear_after_oom()
+        self._reset_cuda_memory_peak()
+        self._shrink_dynamic_batch_after_oom(batch)
+        log.warning(
+            "dynamic_batch OOM fallback skipped iter=%s rank=%s where=%s local_oom=%s "
+            "batch_cost=%s num_graphs=%s",
+            self.iter,
+            getattr(self, "rank", 0),
+            where,
+            bool(local_oom),
+            getattr(batch, "__dptb_batch_cost__", None),
+            getattr(batch, "num_graphs", None),
+        )
+        if self.distributed_expert:
+            self.iter += 1
+        return None
+
+    def _maybe_skip_dynamic_batch_after_oom(self, batch, *, local_oom: bool, where: str, ref_batch=None) -> bool:
+        if not self._can_skip_dynamic_batch_after_oom(ref_batch=ref_batch):
+            return False
+        if not local_oom:
+            return False
+        self._handle_dynamic_batch_oom_skip(batch, local_oom=local_oom, where=where)
+        return True
 
     # ---------------------------------------------------------------------
     # public iteration
@@ -2459,6 +2695,7 @@ class MultiTrainer(Trainer):
         if self._t_last_iter_end is not None and self.debug_tags and (self.iter % self.debug_tag_freq == 0):
             log.info(f"[TAG][it={self.iter}][data_wait(outside_iteration)] dt={(t_now - self._t_last_iter_end):.4f}s")
 
+        optimizer_step_started = False
         try:
             with self._maybe_profile_iteration(self.iter):
                 if self.distributed_expert:
@@ -2468,6 +2705,7 @@ class MultiTrainer(Trainer):
 
                 # single-process fallback
                 self._reset_cuda_memory_peak()
+                dynamic_batch_state = self._dynamic_batch_state_from_batch(batch)
                 with self._tagger.tag("iteration/entry", it=self.iter):
                     self.model.train()
 
@@ -2542,6 +2780,11 @@ class MultiTrainer(Trainer):
                     with self._tagger.tag("expert/backward", it=self.iter, expert=expert_idx):
                         loss_expert.backward()
 
+                    payload["loss_detached"] = loss_expert.detach()
+                    del payload["loss"]
+                    payload_list.append(payload)
+
+                for expert_idx, payload in enumerate(payload_list):
                     with self._tagger.tag("expert/clip_grad_norm", it=self.iter, expert=expert_idx):
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self._expert_parameters(expert_idx),
@@ -2549,14 +2792,12 @@ class MultiTrainer(Trainer):
                         )
 
                     with self._tagger.tag("expert/optimizer_step", it=self.iter, expert=expert_idx):
+                        optimizer_step_started = True
                         self.optimizers[expert_idx].step()
 
                     payload["grad_norm"] = grad_norm.detach() if torch.is_tensor(grad_norm) else torch.tensor(
                         float(grad_norm), device=self.device, dtype=self.dtype
                     )
-                    payload["loss_detached"] = loss_expert.detach()
-                    del payload["loss"]
-                    payload_list.append(payload)
 
                 with self._tagger.tag("iteration/collect_payloads", it=self.iter):
                     for expert_idx, payload in enumerate(payload_list):
@@ -2595,6 +2836,7 @@ class MultiTrainer(Trainer):
                     state["expert_load_cv"] = sum(expert_load_cv_values) / len(expert_load_cv_values)
                 if z_metric_values:
                     state["mean_max_prob"] = sum(z_metric_values) / len(z_metric_values)
+                state.update(dynamic_batch_state)
 
                 self._add_cuda_memory_state(state, self._gather_cuda_memory_metrics())
 
@@ -2607,8 +2849,24 @@ class MultiTrainer(Trainer):
                 return total_loss_opt
 
         except RuntimeError as e:
-            if "out of memory" in str(e).lower():
+            if self._is_cuda_oom(e):
                 self._tagger.dump_cuda_mem_summary(where="iteration() top-level")
+                can_skip = (
+                    not self.distributed_expert
+                    and self._can_skip_dynamic_batch_after_oom(
+                        ref_batch=ref_batch,
+                        optimizer_step_started=optimizer_step_started,
+                    )
+                )
+                if can_skip:
+                    log.warning(
+                        "dynamic_batch caught CUDA OOM at iter=%s; skip current batch.",
+                        self.iter,
+                    )
+                    self._handle_dynamic_batch_oom_skip(batch, local_oom=True, where="single_process")
+                    return None
+                else:
+                    self._clear_after_oom()
             raise
         finally:
             self._t_last_iter_end = time.perf_counter()
@@ -2676,7 +2934,8 @@ class MultiTrainer(Trainer):
         batch_copy = batch_dict.copy()
         batch_for_loss = batch_copy.copy()
 
-        pred_batch = self.model(batch_copy)
+        with cuda_cache_memory_context(iteration=self.iter, stage="validation/full_forward"):
+            pred_batch = self.model(batch_copy)
         pred_batch["global_step"] = int(self.iter)
         pred_batch.update(batch_info)
         batch_for_loss.update(batch_info)

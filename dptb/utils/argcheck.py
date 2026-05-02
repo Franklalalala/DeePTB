@@ -111,6 +111,55 @@ def common_options():
     return Argument("common_options", dict, optional=False, sub_fields=args, sub_variants=[], doc=doc_common_options)
 
 
+def dynamic_batch_options():
+    doc = (
+        "Dynamic DeePTB graph-cost batching. When enabled, batch_size remains "
+        "the maximum number of samples per batch, while max_cost caps the total "
+        "graph cost. If max_cost is omitted and calibrate is true, DeePTB first "
+        "scans fixed-batch CPU dataloader batches and derives max_cost from the "
+        "requested calibration quantile."
+    )
+    weight_args = [
+        Argument("graph", (int, float), optional=True, default=1.0),
+        Argument("node", (int, float), optional=True, default=1.0),
+        Argument("edge", (int, float), optional=True, default=1.0),
+        Argument("env", (int, float), optional=True, default=1.0),
+        Argument("onsitenv", (int, float), optional=True, default=1.0),
+        Argument("kpoint", (int, float), optional=True, default=0.0),
+        Argument("eig_band_square", (int, float), optional=True, default=0.0),
+    ]
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument("mode", str, optional=True, default="cost"),
+        Argument("max_cost", [int, float, None], optional=True, default=None),
+        Argument("max_edge", [int, float, None], optional=True, default=None),
+        Argument("max_samples", [int, None], optional=True, default=None),
+        Argument("min_samples", int, optional=True, default=2),
+        Argument("calibrate", bool, optional=True, default=False),
+        Argument("calibration_batches", int, optional=True, default=1000),
+        Argument("calibration_quantile", (int, float), optional=True, default=0.95),
+        Argument("bucket_size", int, optional=True, default=0),
+        Argument("packing_strategy", str, optional=True, default="random_evict"),
+        Argument("drop_last", bool, optional=True, default=False),
+        Argument("drop_oversized", bool, optional=True, default=False),
+        Argument("seed", [int, None], optional=True, default=None),
+        Argument("num_steps", [int, None], optional=True, default=None),
+        Argument("use_global_dist", bool, optional=True, default=False),
+        Argument("oom_fallback", bool, optional=True, default=False),
+        Argument("oom_shrink_factor", (int, float), optional=True, default=0.8),
+        Argument("cost_weights", dict, optional=True, default={}, sub_fields=weight_args),
+    ]
+    return Argument(
+        "dynamic_batch",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def train_options():
     doc_num_epoch = "Total number of training epochs. It is worth noted, if the model is reloaded with `-r` or `--restart` option, epoch which have been trained will counted from the time that the checkpoint is saved."
     doc_save_freq = "Frequency, or every how many iteration to saved the current model into checkpoints, The name of checkpoint is formulated as `latest|best_dptb|nnsk_b<bond_cutoff>_c<sk_cutoff>_w<sk_decay_w>`. Default: `10`"
@@ -232,6 +281,32 @@ def train_options():
         "Set true to record CUDA allocated/reserved and peak allocated/reserved memory in regular "
         "iteration/epoch logs and TensorBoard. In distributed expert mode, per-rank values are gathered "
         "as expert_i_cuda_*_mb fields and global cuda_*_mb fields use the maximum across ranks. Default: `True`"
+    )
+    doc_monitor_cuda_cache_memory = (
+        "Set true to log lightweight before/after CUDA memory deltas on persistent cache misses, "
+        "including Wigner static tensors and cuEquivariance indexed_linear modules. "
+        "This helps attribute stepwise memory jumps without enabling hook-heavy module tracing. "
+        "Default: unset, which follows the DPTB_CUDA_CACHE_MEMORY_DIAG environment variable."
+    )
+    doc_monitor_cuda_cache_memory_sync = (
+        "Set true to synchronize CUDA before cache-memory snapshots. More accurate but slower; "
+        "default unset follows DPTB_CUDA_CACHE_MEMORY_SYNC."
+    )
+    doc_monitor_cuda_cache_memory_min_delta_mb = (
+        "Only log cache-memory rows whose absolute allocated/reserved/peak/free delta is at least this many MiB. "
+        "Default: `0`, log every probed cache miss."
+    )
+    doc_monitor_cuda_module_memory = (
+        "Set true to record CUDA memory snapshots around selected module forward/backward hooks. "
+        "This is independent from monitor_flag, and currently targets SO2_Linear, MOLELinear, S2/FFN helpers, "
+        "and non-TorchScript TensorProduct wrappers. Default: unset, follows monitor_flag for compatibility."
+    )
+    doc_monitor_cuda_module_memory_sync = (
+        "Set true to synchronize CUDA before module-memory snapshots. More accurate but slower. Default: `False`"
+    )
+    doc_monitor_cuda_module_memory_min_delta_mb = (
+        "Only write module-memory rows whose allocated/reserved/current peak delta is at least this many MiB. "
+        "Use a positive threshold for long production runs to avoid very large CSV files. Default: `0`"
     )
     doc_sync_expert_dp_buffers = (
         "Set true to synchronize same-expert buffers after each expert data-parallel optimizer step. "
@@ -366,6 +441,7 @@ def train_options():
 
         # data / batch
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
+        dynamic_batch_options(),
         Argument("ref_batch_size", int, optional=True, default=1, doc=doc_ref_batch_size),
         Argument("val_batch_size", int, optional=True, default=1, doc=doc_val_batch_size),
 
@@ -435,6 +511,12 @@ def train_options():
         Argument("debug_tag_reset_peak", bool, optional=True, default=None, doc=doc_debug_tag_reset_peak),
         Argument("debug_oom_dump", bool, optional=True, default=True, doc=doc_debug_oom_dump),
         Argument("monitor_cuda_memory", bool, optional=True, default=True, doc=doc_monitor_cuda_memory),
+        Argument("monitor_cuda_cache_memory", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_memory),
+        Argument("monitor_cuda_cache_memory_sync", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_memory_sync),
+        Argument("monitor_cuda_cache_memory_min_delta_mb", (int, float), optional=True, default=0.0, doc=doc_monitor_cuda_cache_memory_min_delta_mb),
+        Argument("monitor_cuda_module_memory", bool, optional=True, default=None, doc=doc_monitor_cuda_module_memory),
+        Argument("monitor_cuda_module_memory_sync", bool, optional=True, default=False, doc=doc_monitor_cuda_module_memory_sync),
+        Argument("monitor_cuda_module_memory_min_delta_mb", (int, float), optional=True, default=0.0, doc=doc_monitor_cuda_module_memory_min_delta_mb),
         Argument("sync_expert_dp_buffers", bool, optional=True, default=True, doc=doc_sync_expert_dp_buffers),
         Argument("expert_dp_backend", str, optional=True, default="manual", doc=doc_expert_dp_backend),
         Argument("expert_dp_use_ddp", bool, optional=True, default=False, doc=doc_expert_dp_use_ddp),

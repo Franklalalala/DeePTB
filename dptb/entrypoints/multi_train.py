@@ -47,6 +47,10 @@ from dptb.plugins.monitor import (
 from dptb.plugins.train_logger import Logger
 from dptb.plugins.saver import Saver
 from dptb.utils.argcheck import collect_cutoffs, chk_avg_per_iter
+from dptb.utils.cuda_cache_memory import (
+    configure_cuda_cache_memory_monitor,
+    cuda_cache_memory_monitor_enabled,
+)
 from dptb.utils.tools import setup_seed, j_must_have
 from dptb.utils.loggers import set_log_handles
 
@@ -452,6 +456,12 @@ def _multi_train_impl(
         jdata["train_options"].get("log_single_model_compatible_loss_mode", "reduce")
     )
 
+    configure_cuda_cache_memory_monitor(
+        enabled=jdata["train_options"].get("monitor_cuda_cache_memory", None),
+        sync=jdata["train_options"].get("monitor_cuda_cache_memory_sync", None),
+        min_delta_mb=jdata["train_options"].get("monitor_cuda_cache_memory_min_delta_mb", 0.0),
+    )
+
     log.info(f"[MultiTrainer][rank={rank}] distributed_expert = {distributed_expert}")
     log.info(f"[MultiTrainer][rank={rank}] parallel_multi = {parallel_multi}")
     log.info(f"[MultiTrainer][rank={rank}] distributed_rank0_prepare_batch = {jdata['train_options'].get('distributed_rank0_prepare_batch', False)}")
@@ -461,6 +471,11 @@ def _multi_train_impl(
         f"{jdata['train_options']['log_single_model_compatible_loss']}, "
         f"mode={jdata['train_options']['log_single_model_compatible_loss_mode']}"
     )
+    if cuda_cache_memory_monitor_enabled():
+        log.info(
+            "[CUDA cache memory] enabled: cache misses will log rank/iter/stage and "
+            "allocated/reserved/peak/free memory deltas"
+        )
 
     if restart:
         with entry_tagger.tag("trainer/restart"):
@@ -582,11 +597,20 @@ def _multi_train_impl(
             )
 
         monitor_flag = train_options.get("monitor_flag", False)
-        if monitor_flag and cuda_memory_enabled:
+        cuda_module_memory_enabled = train_options.get("monitor_cuda_module_memory", None)
+        if cuda_module_memory_enabled is None:
+            cuda_module_memory_enabled = monitor_flag
+        if cuda_module_memory_enabled and cuda_memory_enabled:
             module_memory_output = output or "monitor_logs"
             if distributed_expert:
                 module_memory_output = os.path.join(module_memory_output, f"rank{rank}")
-            trainer.register_plugin(CUDAModuleMemoryMonitor(module_memory_output))
+            trainer.register_plugin(
+                CUDAModuleMemoryMonitor(
+                    module_memory_output,
+                    cuda_sync=train_options.get("monitor_cuda_module_memory_sync", False),
+                    min_delta_mb=train_options.get("monitor_cuda_module_memory_min_delta_mb", 0.0),
+                )
+            )
 
         if trainer.is_main_process:
             if monitor_flag:
