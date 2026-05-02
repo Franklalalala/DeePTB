@@ -279,12 +279,35 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
         self.epoch = 0
         self._cost_cache: Dict[int, int] = {}
         self._warned_oversized = set()
+        self._cached_batches_key = None
+        self._cached_batches: Optional[List[List[int]]] = None
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def step_epoch(self, epoch: int) -> None:
         self.set_epoch(epoch)
+
+    def _cache_key(self):
+        weights_key = tuple(
+            sorted((str(k), float(v)) for k, v in self.cost_estimator.weights.items())
+        )
+        return (
+            self.epoch,
+            len(self.dataset),
+            self.max_cost,
+            self.max_samples,
+            self.shuffle,
+            self.drop_last,
+            self.drop_oversized,
+            self.bucket_size,
+            self.seed,
+            self.rank,
+            self.world_size,
+            self.num_steps,
+            self.cost_estimator.mode,
+            weights_key,
+        )
 
     def _cost(self, idx: int) -> int:
         idx = int(idx)
@@ -305,6 +328,48 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
                 out.extend(chunk)
             indices = out
         return indices
+
+    def _padding_rng(self, reason: str) -> random.Random:
+        reason_offset = 1009 if reason == "num_steps" else 2003
+        return random.Random(self.seed + self.epoch * 104729 + reason_offset)
+
+    def _pad_batches(self, batches: List[List[int]], target_len: int, *, reason: str) -> List[List[int]]:
+        if len(batches) >= target_len or not batches:
+            return batches
+
+        original_len = len(batches)
+        need = int(target_len) - original_len
+        rng = self._padding_rng(reason)
+        pad_sources: List[int] = []
+        source_indices = list(range(original_len))
+
+        while len(pad_sources) < need:
+            shuffled = list(source_indices)
+            rng.shuffle(shuffled)
+            if original_len > 1 and not pad_sources and shuffled[0] == original_len - 1:
+                shuffled.append(shuffled.pop(0))
+            pad_sources.extend(shuffled)
+
+        selected_sources = pad_sources[:need]
+        for source_idx in selected_sources:
+            batches.append(list(batches[source_idx]))
+
+        source_preview = selected_sources[:16]
+        source_suffix = "..." if len(selected_sources) > len(source_preview) else ""
+        log.info(
+            "dynamic_batch padded %s batches from %s to %s for %s; "
+            "epoch=%s rank=%s world_size=%s source_indices=%s%s",
+            need,
+            original_len,
+            target_len,
+            reason,
+            self.epoch,
+            self.rank,
+            self.world_size,
+            source_preview,
+            source_suffix,
+        )
+        return batches
 
     def _make_global_batches(self) -> List[List[int]]:
         batches: List[List[int]] = []
@@ -359,10 +424,9 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
 
         flush(force_tail=False)
         if self.num_steps is not None:
-            if batches:
-                while len(batches) < self.num_steps * self.world_size:
-                    batches.append(list(batches[-1]))
-            batches = batches[: self.num_steps * self.world_size]
+            target_len = self.num_steps * self.world_size
+            batches = self._pad_batches(batches, target_len, reason="num_steps")
+            batches = batches[:target_len]
         return batches
 
     def _shard_for_rank(self, batches: List[List[int]]) -> List[List[int]]:
@@ -374,15 +438,28 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
             keep = (len(batches) // self.world_size) * self.world_size
             batches = batches[:keep]
         else:
-            while len(batches) % self.world_size != 0:
-                batches.append(list(batches[-1]))
+            remainder = len(batches) % self.world_size
+            if remainder:
+                batches = self._pad_batches(
+                    batches,
+                    len(batches) + (self.world_size - remainder),
+                    reason="world_size",
+                )
         return batches[self.rank :: self.world_size]
 
+    def _batches_for_epoch(self) -> List[List[int]]:
+        key = self._cache_key()
+        if self._cached_batches_key != key or self._cached_batches is None:
+            self._cached_batches = self._shard_for_rank(self._make_global_batches())
+            self._cached_batches_key = key
+        return self._cached_batches
+
     def __iter__(self) -> Iterator[List[int]]:
-        yield from self._shard_for_rank(self._make_global_batches())
+        for batch in self._batches_for_epoch():
+            yield list(batch)
 
     def __len__(self) -> int:
-        return len(self._shard_for_rank(self._make_global_batches()))
+        return len(self._batches_for_epoch())
 
 
 def resolve_dynamic_batch_options(

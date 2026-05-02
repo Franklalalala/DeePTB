@@ -409,6 +409,8 @@ class MultiTrainer(Trainer):
                 "dynamic_batch OOM fallback is disabled for distributed_expert in this version; "
                 "dynamic cost batching remains enabled."
             )
+            self.dynamic_batch_oom_fallback = False
+            self.dynamic_batch_options["oom_fallback"] = False
 
         self._tagger = _StageTagger(
             trainer=self,

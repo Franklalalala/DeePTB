@@ -106,14 +106,9 @@ class Trainer(BaseTrainer):
             log.info("The skints loss function is used for training, the model.transform is then set to False.")
             self.model.transform = False
 
-    def iteration(self, batch, ref_batch=None):
-        '''
-        conduct one step forward computation, used in train, test and validation.
-        '''
-        self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        batch = batch.to(self.device)
-        dynamic_batch_state = {}
+    @staticmethod
+    def _dynamic_batch_state_from_batch(batch):
+        state = {}
         for attr, key in (
             ("__dptb_batch_cost__", "batch_cost"),
             ("__dptb_batch_num_graphs__", "batch_num_graphs"),
@@ -122,43 +117,73 @@ class Trainer(BaseTrainer):
             ("__dptb_batch_max_item_cost__", "batch_max_item_cost"),
         ):
             if hasattr(batch, attr):
-                dynamic_batch_state[key] = getattr(batch, attr)
+                state[key] = getattr(batch, attr)
+        return state
 
-        # ... (原有 batch 处理逻辑保持不变) ...
-        batch_info = {
+    @staticmethod
+    def _batch_info(batch):
+        return {
             "__slices__": batch.__slices__,
             "__cumsum__": batch.__cumsum__,
             "__cat_dims__": batch.__cat_dims__,
             "__num_nodes_list__": batch.__num_nodes_list__,
             "__data_class__": batch.__data_class__,
         }
+
+    def _loss_on_batch(self, batch, lossfunc):
+        batch = batch.to(self.device)
+        batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
         batch = self.model(batch)
         batch.update(batch_info)
         batch_for_loss.update(batch_info)
+        return lossfunc(batch, batch_for_loss)
 
-        loss = self.train_lossfunc(batch, batch_for_loss)
+    def _loss_component_state(self, lossfunc):
+        loss_obj = lossfunc
+        for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
+            inner = getattr(loss_obj, attr, None)
+            if isinstance(inner, nn.Module):
+                loss_obj = inner
+                break
+
+        state = {}
+        onsite_comp = getattr(loss_obj, "last_onsite_loss", None)
+        hopping_comp = getattr(loss_obj, "last_hopping_loss", None)
+        z_loss_comp = getattr(loss_obj, "last_z_loss", None)
+        expert_load_cv = getattr(loss_obj, "expert_load_cv", None)
+
+        if onsite_comp is not None:
+            state["train_onsite_loss"] = onsite_comp
+        if hopping_comp is not None:
+            state["train_hopping_loss"] = hopping_comp
+        if expert_load_cv is not None:
+            state["expert_load_cv"] = expert_load_cv
+        if z_loss_comp is not None:
+            state["mean_max_prob"] = z_loss_comp
+        return state
+
+    def iteration(self, batch, ref_batch=None):
+        '''
+        conduct one step forward computation, used in train, test and validation.
+        '''
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        dynamic_batch_state = self._dynamic_batch_state_from_batch(batch)
+
+        loss = self._loss_on_batch(batch, self.train_lossfunc)
+        loss_for_log = loss.detach()
+        loss.backward()
+        del loss
 
         if ref_batch is not None:
-            # ... (原有 ref_batch 处理逻辑保持不变) ...
-            ref_batch = ref_batch.to(self.device)
-            batch_info_ref = {
-                "__slices__": ref_batch.__slices__,
-                "__cumsum__": ref_batch.__cumsum__,
-                "__cat_dims__": ref_batch.__cat_dims__,
-                "__num_nodes_list__": ref_batch.__num_nodes_list__,
-                "__data_class__": ref_batch.__data_class__,
-            }
-            ref_batch = AtomicData.to_AtomicDataDict(ref_batch)
-            ref_batch_for_loss = ref_batch.copy()
-            ref_batch = self.model(ref_batch)
-            ref_batch.update(batch_info_ref)
-            ref_batch_for_loss.update(batch_info_ref)
-            loss += self.train_lossfunc(ref_batch, ref_batch_for_loss)
-
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+            reference_lossfunc = getattr(self, "reference_lossfunc", self.train_lossfunc)
+            ref_loss = self._loss_on_batch(ref_batch, reference_lossfunc)
+            loss_for_log = loss_for_log + ref_loss.detach()
+            ref_loss.backward()
+            del ref_loss
 
         total_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
@@ -174,41 +199,19 @@ class Trainer(BaseTrainer):
             else:
                 self.lr_scheduler.step()
 
-        # 找到 Loss wrapper 内部真正的 loss 模块
-        loss_obj = self.train_lossfunc
-        for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
-            inner = getattr(loss_obj, attr, None)
-            if isinstance(inner, nn.Module):
-                loss_obj = inner
-                break
-
-        onsite_comp = getattr(loss_obj, "last_onsite_loss", None)
-        hopping_comp = getattr(loss_obj, "last_hopping_loss", None)
-        z_loss_comp = getattr(loss_obj, "last_z_loss", None)
-        expert_load_cv = getattr(loss_obj, "expert_load_cv", None)
-
         state = {
             'field': 'iteration',
-            "train_loss": loss.detach(),
+            "train_loss": loss_for_log,
             "lr": self.optimizer.state_dict()["param_groups"][0]['lr'],
             "total_grad_norm": total_norm.item()
         }
         state.update(dynamic_batch_state)
-
-        # 只有在 lossfunc 真正提供了分量时才塞进 state，避免对别的 loss 类出错
-        if onsite_comp is not None:
-            state["train_onsite_loss"] = onsite_comp
-        if hopping_comp is not None:
-            state["train_hopping_loss"] = hopping_comp
-        if expert_load_cv is not None:
-            state["expert_load_cv"] = expert_load_cv
-        if z_loss_comp is not None:
-            state["mean_max_prob"] = z_loss_comp
+        state.update(self._loss_component_state(self.train_lossfunc))
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1
 
-        return loss.detach()
+        return loss_for_log
 
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
@@ -236,9 +239,19 @@ class Trainer(BaseTrainer):
         batch_sampler = getattr(self.train_loader, "batch_sampler", None)
         if hasattr(batch_sampler, "set_epoch"):
             batch_sampler.set_epoch(int(self.ep))
+        if self.use_reference:
+            ref_batch_sampler = getattr(self.reference_loader, "batch_sampler", None)
+            if hasattr(ref_batch_sampler, "set_epoch"):
+                ref_batch_sampler.set_epoch(int(self.ep))
+        reference_iter = iter(self.reference_loader) if self.use_reference else None
         for ibatch in self.train_loader:
             if self.use_reference:
-                self.iteration(ibatch, next(iter(self.reference_loader)))
+                try:
+                    ref_batch = next(reference_iter)
+                except StopIteration:
+                    reference_iter = iter(self.reference_loader)
+                    ref_batch = next(reference_iter)
+                self.iteration(ibatch, ref_batch)
             else:
                 self.iteration(ibatch)
 

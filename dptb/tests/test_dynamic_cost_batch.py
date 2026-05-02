@@ -1,9 +1,12 @@
-import torch
+import logging
 from contextlib import contextmanager
+
+import torch
 
 from dptb.data.dataloader import (
     AtomicDataCostEstimator,
     DataLoader,
+    DynamicCostBatchSampler,
     resolve_dynamic_batch_options,
     split_batch_for_oom,
 )
@@ -77,6 +80,98 @@ def test_dynamic_loader_caps_cost_and_keeps_batch_size_as_max_samples():
     assert batches[0].__dptb_batch_num_nodes__ == 9
     assert batches[0].__dptb_batch_max_item_cost__ == 5
     assert batches[1].__dptb_batch_cost__ == 12
+
+
+def test_dynamic_sampler_caches_epoch_batches_for_len_and_iter():
+    dataset = ToyDataset([1, 1, 1, 1])
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=2,
+        mode="node",
+        max_samples=2,
+        shuffle=False,
+    )
+    calls = {"make": 0}
+    make_global_batches = sampler._make_global_batches
+
+    def _counted_make_global_batches():
+        calls["make"] += 1
+        return make_global_batches()
+
+    sampler._make_global_batches = _counted_make_global_batches
+
+    assert len(sampler) == 2
+    assert list(sampler) == [[0, 1], [2, 3]]
+    assert len(sampler) == 2
+    assert calls["make"] == 1
+
+    sampler.max_cost = 3
+    assert len(sampler) == 2
+    assert calls["make"] == 2
+
+    sampler.set_epoch(1)
+
+    assert len(sampler) == 2
+    assert calls["make"] == 3
+
+    dataset.node_counts.append(1)
+    assert len(sampler) == 3
+    assert calls["make"] == 4
+
+
+def test_dynamic_sampler_padding_uses_deterministic_non_last_sources(caplog):
+    dataset = ToyDataset([1, 1, 1])
+    caplog.set_level(logging.INFO, logger="dptb.data.dataloader")
+    sampler = DynamicCostBatchSampler(
+        dataset,
+        max_cost=1,
+        mode="node",
+        max_samples=1,
+        shuffle=False,
+        seed=123,
+        num_steps=6,
+    )
+
+    batches = list(sampler)
+
+    assert len(batches) == 6
+    assert batches[:3] == [[0], [1], [2]]
+    assert batches[3:] != [[2], [2], [2]]
+    assert len({tuple(batch) for batch in batches[3:]}) > 1
+    assert list(
+        DynamicCostBatchSampler(
+            dataset,
+            max_cost=1,
+            mode="node",
+            max_samples=1,
+            shuffle=False,
+            seed=123,
+            num_steps=6,
+        )
+    ) == batches
+    assert any("num_steps" in record.message for record in caplog.records)
+
+
+def test_dynamic_sampler_world_size_padding_keeps_equal_rank_lengths():
+    dataset = ToyDataset([1, 1, 1])
+    common = dict(
+        dataset=dataset,
+        max_cost=1,
+        mode="node",
+        max_samples=1,
+        shuffle=False,
+        seed=123,
+        world_size=2,
+    )
+
+    rank0 = list(DynamicCostBatchSampler(rank=0, **common))
+    rank1 = list(DynamicCostBatchSampler(rank=1, **common))
+
+    assert len(rank0) == len(rank1) == 2
+    assert rank0 != rank1
+    assert {(0,), (1,), (2,)}.issubset(
+        {tuple(batch) for batch in rank0 + rank1}
+    )
 
 
 def test_calibration_derives_quantile_from_fixed_batch_totals():
@@ -225,3 +320,60 @@ def test_multitrainer_microbatch_fallback_accumulates_one_optimizer_step():
     assert observed_states[0]["dynamic_batch_oom_fallback"] == 1
     assert observed_states[0]["dynamic_batch_microbatches"] == 2
     assert observed_states[0]["batch_cost"] == 14
+
+
+def _dynamic_batch_cfg_probe(**overrides):
+    trainer = MultiTrainer.__new__(MultiTrainer)
+    trainer.dynamic_batch_enabled = overrides.pop("dynamic_batch_enabled", True)
+    trainer.dynamic_batch_options = {
+        "enabled": True,
+        "max_cost": 100,
+        "rank": 99,
+        "world_size": 99,
+    }
+    trainer.dynamic_batch_options.update(overrides.pop("dynamic_batch_options", {}))
+    trainer.distributed_expert = overrides.pop("distributed_expert", False)
+    trainer.distributed_rank0_prepare_batch = overrides.pop(
+        "distributed_rank0_prepare_batch", False
+    )
+    trainer.expert_data_parallel_size = overrides.pop("expert_data_parallel_size", 1)
+    trainer.expert_dp_rank = overrides.pop("expert_dp_rank", 0)
+    assert not overrides
+    return trainer._dynamic_batch_cfg_for_train_loader()
+
+
+def test_multitrainer_dynamic_batch_cfg_keeps_expert_parallel_unsharded():
+    cfg = _dynamic_batch_cfg_probe(
+        distributed_expert=True,
+        expert_data_parallel_size=1,
+    )
+
+    assert cfg["rank"] == 0
+    assert cfg["world_size"] == 1
+
+
+def test_multitrainer_dynamic_batch_cfg_shards_expert_dp_replicas():
+    cfg = _dynamic_batch_cfg_probe(
+        distributed_expert=True,
+        expert_data_parallel_size=2,
+        expert_dp_rank=1,
+    )
+
+    assert cfg["rank"] == 1
+    assert cfg["world_size"] == 2
+
+
+def test_multitrainer_dynamic_batch_cfg_keeps_rank0_prepare_unsharded():
+    cfg = _dynamic_batch_cfg_probe(
+        distributed_expert=True,
+        distributed_rank0_prepare_batch=True,
+        expert_data_parallel_size=2,
+        expert_dp_rank=1,
+    )
+
+    assert cfg["rank"] == 0
+    assert cfg["world_size"] == 1
+
+
+def test_multitrainer_dynamic_batch_cfg_disabled_returns_none():
+    assert _dynamic_batch_cfg_probe(dynamic_batch_enabled=False) is None
