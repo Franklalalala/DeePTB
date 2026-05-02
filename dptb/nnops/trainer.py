@@ -10,6 +10,7 @@ from dptb.plugins.monitor import Plugin
 from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
+from dptb.nn.activation_recompute import configure_activation_recompute
 from dptb.nnops.loss import Loss
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,10 @@ class Trainer(BaseTrainer):
 
         # init the object
         self.model = model.to(self.device)
+        self.activation_recompute_state = configure_activation_recompute(
+            self.model,
+            train_options.get("activation_recompute", None),
+        )
         self.optimizer = get_optimizer(model_param=self.model.parameters(), **train_options["optimizer"])
         self.lr_scheduler = get_lr_scheduler(optimizer=self.optimizer, **train_options["lr_scheduler"])
         self.update_lr_per_iter = train_options["update_lr_per_iter"]
