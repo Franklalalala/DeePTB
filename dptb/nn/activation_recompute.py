@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -161,11 +162,22 @@ def clone_mole_globals_for_recompute(
         split_sizes=split_sizes,
         graph_index=None if split_sizes is not None else graph_index,
     )
-    if graph_index is not None and (
-        split_sizes is None or _graph_index_matches_split_sizes(graph_index, split_sizes)
-    ):
+    if graph_index is not None:
+        if _validate_recompute_graph_index() and not _graph_index_matches_split_sizes(
+            graph_index, split_sizes
+        ):
+            raise ValueError(
+                "MOLE graph_index is inconsistent with split_sizes during "
+                "activation recompute."
+            )
         out.graph_index = graph_index
     return out
+
+
+def _validate_recompute_graph_index() -> bool:
+    return os.environ.get(
+        "DPTB_ACTIVATION_RECOMPUTE_VALIDATE_GRAPH_INDEX", "0"
+    ) not in ("", "0", "false", "False")
 
 
 def _graph_index_matches_split_sizes(graph_index: torch.Tensor, split_sizes: Any) -> bool:

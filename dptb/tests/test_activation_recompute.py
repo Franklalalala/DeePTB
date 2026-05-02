@@ -252,7 +252,7 @@ def test_clone_mole_globals_for_recompute_preserves_graph_index_with_split_sizes
     assert cloned.graph_index is graph_index
 
 
-def test_clone_mole_globals_for_recompute_drops_inconsistent_graph_index():
+def test_clone_mole_globals_for_recompute_preserves_graph_index_without_hot_path_validation():
     coefficients = torch.randn(2, 4, requires_grad=True)
     sizes = torch.tensor([2, 3], dtype=torch.long)
     graph_index = torch.tensor([0, 1, 0, 1, 1], dtype=torch.long)
@@ -267,7 +267,92 @@ def test_clone_mole_globals_for_recompute_drops_inconsistent_graph_index():
     )
 
     assert cloned.split_sizes == (2, 3)
-    assert cloned.graph_index is None
+    assert cloned.graph_index is graph_index
+
+
+def test_clone_mole_globals_for_recompute_validates_graph_index_only_when_enabled(monkeypatch):
+    coefficients = torch.randn(2, 4, requires_grad=True)
+    sizes = torch.tensor([2, 3], dtype=torch.long)
+    graph_index = torch.tensor([0, 1, 0, 1, 1], dtype=torch.long)
+    src = MOLEGlobals(coefficients=coefficients, split_sizes=(2, 3))
+
+    monkeypatch.setenv("DPTB_ACTIVATION_RECOMPUTE_VALIDATE_GRAPH_INDEX", "1")
+
+    with pytest.raises(ValueError, match="graph_index is inconsistent"):
+        clone_mole_globals_for_recompute(
+            src,
+            coefficients=coefficients,
+            sizes=sizes,
+            split_sizes=(2, 3),
+            graph_index=graph_index,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for cueq_indexed_linear")
+def test_checkpoint_so2_linear_actual_cueq_indexed_matches_plain_forward_and_grads():
+    pytest.importorskip("cuequivariance")
+    pytest.importorskip("cuequivariance_torch")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    module = SO2_Linear(
+        "1x1e",
+        "1x1e",
+        num_experts=2,
+        num_shared_experts=1,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+        mole_linear_mode="cueq_indexed_linear",
+    ).to(device)
+    module.train()
+
+    x_base = torch.randn(4, 3, device=device)
+    edge_vector_base = torch.randn(4, 3, device=device)
+    coefficients_base = torch.randn(2, 2, device=device)
+    sizes = torch.tensor([2, 2], dtype=torch.long, device=device)
+    graph_index = torch.tensor([0, 0, 1, 1], dtype=torch.long, device=device)
+
+    def _run(enabled):
+        module.zero_grad(set_to_none=True)
+        x = x_base.clone().requires_grad_(True)
+        edge_vector = edge_vector_base.clone().requires_grad_(True)
+        coefficients = coefficients_base.clone().requires_grad_(True)
+        mole_globals = MOLEGlobals(
+            coefficients=coefficients,
+            sizes=sizes,
+            graph_index=graph_index,
+        )
+        out, _ = checkpoint_so2_linear_call(
+            module,
+            x,
+            edge_vector,
+            mole_globals,
+            enabled=enabled,
+        )
+        loss = out.square().sum()
+        loss.backward()
+        param_grads = [
+            param.grad.detach().clone()
+            for param in module.parameters()
+            if param.grad is not None
+        ]
+        return (
+            out.detach(),
+            x.grad.detach(),
+            edge_vector.grad.detach(),
+            coefficients.grad.detach(),
+            param_grads,
+        )
+
+    plain = _run(False)
+    recomputed = _run(True)
+
+    for lhs, rhs in zip(plain[:4], recomputed[:4]):
+        torch.testing.assert_close(lhs, rhs, rtol=1e-5, atol=1e-6)
+    assert len(plain[4]) == len(recomputed[4])
+    for lhs, rhs in zip(plain[4], recomputed[4]):
+        torch.testing.assert_close(lhs, rhs, rtol=1e-5, atol=1e-6)
 
 
 class UpdateNode(torch.nn.Module):
