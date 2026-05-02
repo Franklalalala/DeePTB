@@ -25,6 +25,7 @@ from .lem_moe_v3_plugins import (
 )
 # Note: Modified SO2_Linear and MOLE classes imported here
 from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3
+from dptb.nn.activation_recompute import checkpoint_so2_linear_call
 import math
 from dptb.data.transforms import OrbitalMapper
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
@@ -1163,6 +1164,19 @@ class UpdateNode(torch.nn.Module):
                     biases=True,
                 )
 
+    def _run_tp(self, x, edge_vector, mole_globals, latents, wigner_D_all):
+        return checkpoint_so2_linear_call(
+            self.tp,
+            x,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+            enabled=bool(getattr(self, "_activation_recompute_enabled", False)),
+            use_reentrant=bool(getattr(self, "_activation_recompute_use_reentrant", False)),
+            preserve_rng_state=bool(getattr(self, "_activation_recompute_preserve_rng_state", True)),
+        )
+
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
                 active_edges, wigner_D_all, mole_globals):  # Accept globals
         edge_center = edge_index[0]
@@ -1171,7 +1185,7 @@ class UpdateNode(torch.nn.Module):
         new_node_features = node_features
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
-        message, _ = self.tp(
+        message, _ = self._run_tp(
             torch.cat(
                 [node_in[edge_center[active_edges]], edge_in],
                 dim=-1,
@@ -1404,6 +1418,19 @@ class UpdateEdge(torch.nn.Module):
                     biases=True,
                 )
 
+    def _run_tp(self, x, edge_vector, mole_globals, latents, wigner_D_all):
+        return checkpoint_so2_linear_call(
+            self.tp,
+            x,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+            enabled=bool(getattr(self, "_activation_recompute_enabled", False)),
+            use_reentrant=bool(getattr(self, "_activation_recompute_use_reentrant", False)),
+            preserve_rng_state=bool(getattr(self, "_activation_recompute_preserve_rng_state", True)),
+        )
+
     def forward(self, latents, node_features, node_onehot, edge_features, edge_index, edge_vector, cutoff_coeffs,
                 active_edges, edge_one_hot, wigner_D_all, mole_globals):  # Accept globals
         edge_center = edge_index[0]
@@ -1413,7 +1440,7 @@ class UpdateEdge(torch.nn.Module):
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
 
-        new_edge_features, wigner_D_all = self.tp(
+        new_edge_features, wigner_D_all = self._run_tp(
             torch.cat(
                 [
                     node_in[edge_center[active_edges]],
