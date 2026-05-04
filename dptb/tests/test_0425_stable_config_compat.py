@@ -11,6 +11,15 @@ def test_argcheck_accepts_standard_legacy_route_keys():
     assert "mole_linear_m0_mode" in names
 
 
+def test_argcheck_accepts_activation_recompute_options():
+    pytest.importorskip("dargs")
+    from dptb.utils.argcheck import train_options
+
+    names = set(train_options().sub_fields)
+
+    assert "activation_recompute" in names
+
+
 def test_stable_legacy_route_key_guard_accepts_only_standard():
     pytest.importorskip("torch")
     pytest.importorskip("e3nn.o3")
