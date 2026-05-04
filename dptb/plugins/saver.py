@@ -1,3 +1,4 @@
+import gc
 import shutil
 from dptb.plugins.base_plugin import Plugin
 import logging
@@ -53,6 +54,84 @@ class Saver(Plugin):
 
     def _is_main(self):
         return bool(getattr(self.trainer, "is_main_process", True))
+
+    def _barrier_on_current_device(self):
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if torch.cuda.is_available():
+            try:
+                dist.barrier(device_ids=[torch.cuda.current_device()])
+                return
+            except TypeError:
+                pass
+        dist.barrier()
+
+    def _trainer_cuda_device(self):
+        if not torch.cuda.is_available():
+            return None
+        try:
+            raw_device = getattr(self.trainer, "device", None)
+            if raw_device is None:
+                raw_device = torch.cuda.current_device()
+            device = torch.device(raw_device)
+        except Exception:
+            device = torch.device(torch.cuda.current_device())
+        if device.type != "cuda":
+            return None
+        return device
+
+    @staticmethod
+    def _cuda_memory_mb(device):
+        mb = 1024 ** 2
+        try:
+            return (
+                torch.cuda.memory_allocated(device) / mb,
+                torch.cuda.memory_reserved(device) / mb,
+            )
+        except Exception:
+            return None, None
+
+    def _clear_cuda_cache_after_iteration_save(self, name):
+        device = self._trainer_cuda_device()
+        if device is None:
+            return
+
+        self._barrier_on_current_device()
+        allocated_before, reserved_before = self._cuda_memory_mb(device)
+
+        try:
+            torch.cuda.synchronize(device)
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            log.warning(
+                "[CUDA Cache Clear][rank=%s] after save_freq checkpoint %s failed: %s",
+                getattr(self.trainer, "rank", 0),
+                name,
+                e,
+            )
+            self._barrier_on_current_device()
+            return
+        try:
+            torch.cuda.synchronize(device)
+        except Exception:
+            pass
+
+        allocated_after, reserved_after = self._cuda_memory_mb(device)
+        log.info(
+            "[CUDA Cache Clear][rank=%s] after save_freq checkpoint %s: "
+            "allocated %.1f -> %.1f MB, reserved %.1f -> %.1f MB",
+            getattr(self.trainer, "rank", 0),
+            name,
+            allocated_before if allocated_before is not None else float("nan"),
+            allocated_after if allocated_after is not None else float("nan"),
+            reserved_before if reserved_before is not None else float("nan"),
+            reserved_after if reserved_after is not None else float("nan"),
+        )
+        self._barrier_on_current_device()
 
     def _to_cpu_obj(self, obj):
         if torch.is_tensor(obj):
@@ -160,6 +239,8 @@ class Saver(Plugin):
                 if not os.path.exists(latest_ckpt_abs_path):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
                 self._safe_link_or_copy(latest_ckpt_abs_path, latest_symlink)
+
+        self._clear_cuda_cache_after_iteration_save(name)
 
     def epoch(self, **kwargs):
         updated_loss = self.trainer.stats.get('validation_loss')

@@ -19,9 +19,10 @@ import torch.nn as nn
 # 确保导入你的 SO2_Linear 类定义，以便 isinstance 判断
 from dptb.nn.tensor_product import SO2_Linear
 try:
-    from dptb.nn.tensor_product_moe_v3 import SO2_Linear as MOE_SO2_Linear
+    from dptb.nn.tensor_product_moe_v3 import MOLELinear, SO2_Linear as MOE_SO2_Linear
 except Exception:
     MOE_SO2_Linear = None
+    MOLELinear = None
 
 try:
     from dptb.nn.embedding.eqv3_grid_helpers import EqV3StyleNodeFFN, FlatSwiGLUS2Merge
@@ -49,6 +50,31 @@ def _is_s2_activation_module(module):
     return (
         (isinstance(FlatSwiGLUS2Merge, type) and isinstance(module, FlatSwiGLUS2Merge))
         or module.__class__.__name__ == "FlatSwiGLUS2Merge"
+    )
+
+
+def _is_mole_linear_module(module):
+    return (
+        (isinstance(MOLELinear, type) and isinstance(module, MOLELinear))
+        or module.__class__.__name__ == "MOLELinear"
+    )
+
+
+def _is_torchscript_module(module):
+    return module.__class__.__name__ in {"RecursiveScriptModule", "ScriptModule"}
+
+
+def _is_tensor_product_module(module):
+    class_name = module.__class__.__name__
+    if "TensorProduct" not in class_name or _is_torchscript_module(module):
+        return False
+    module_name = getattr(module.__class__, "__module__", "")
+    return (
+        module_name.startswith("e3nn.")
+        or module_name.startswith("dptb.")
+        or module_name.startswith("openequivariance")
+        or module_name.startswith("cuequivariance")
+        or module_name.startswith("cuequivariance_torch")
     )
 
 
@@ -386,11 +412,12 @@ class CUDAModuleMemoryMonitor(Plugin):
     show which SO2/S2-related module first observes a new global peak.
     """
 
-    def __init__(self, log_dir="monitor_logs", buffer_size=20, cuda_sync=False):
+    def __init__(self, log_dir="monitor_logs", buffer_size=20, cuda_sync=False, min_delta_mb=0.0):
         super(CUDAModuleMemoryMonitor, self).__init__([(1, 'iteration')])
         self.log_dir = log_dir
         self.buffer_size = int(buffer_size)
         self.cuda_sync = bool(cuda_sync)
+        self.min_delta_mb = float(min_delta_mb)
         self.buffer = []
 
         if not os.path.exists(self.log_dir):
@@ -454,13 +481,21 @@ class CUDAModuleMemoryMonitor(Plugin):
             return "EqV3StyleNodeFFN"
         if _is_s2_activation_module(module):
             return "FlatSwiGLUS2Merge"
+        if _is_mole_linear_module(module):
+            return "MOLELinear"
+        if _is_tensor_product_module(module):
+            return module.__class__.__name__
         return module.__class__.__name__
 
     def _should_monitor(self, module):
+        # TorchScript modules reject Python forward hooks. Their memory deltas
+        # are still visible through enclosing SO2/MOLE modules and cache probes.
         return (
             _is_so2_linear_module(module)
             or _is_eqv3_ffn_module(module)
             or _is_s2_activation_module(module)
+            or _is_mole_linear_module(module)
+            or _is_tensor_product_module(module)
         )
 
     def _record(self, module, name, kind, phase, pre):
@@ -469,6 +504,17 @@ class CUDAModuleMemoryMonitor(Plugin):
             return
         peak_alloc_delta = post["peak_alloc"] - pre["peak_alloc"]
         peak_reserved_delta = post["peak_reserved"] - pre["peak_reserved"]
+        alloc_delta = post["alloc"] - pre["alloc"]
+        reserved_delta = post["reserved"] - pre["reserved"]
+        if self.min_delta_mb > 0.0:
+            max_delta = max(
+                abs(alloc_delta),
+                abs(reserved_delta),
+                max(peak_alloc_delta, 0.0),
+                max(peak_reserved_delta, 0.0),
+            )
+            if max_delta < self.min_delta_mb:
+                return
         self.buffer.append([
             getattr(self.trainer, "iter", 0),
             name,
@@ -476,10 +522,10 @@ class CUDAModuleMemoryMonitor(Plugin):
             phase,
             f"{pre['alloc']:.1f}",
             f"{post['alloc']:.1f}",
-            f"{post['alloc'] - pre['alloc']:.1f}",
+            f"{alloc_delta:.1f}",
             f"{pre['reserved']:.1f}",
             f"{post['reserved']:.1f}",
-            f"{post['reserved'] - pre['reserved']:.1f}",
+            f"{reserved_delta:.1f}",
             f"{pre['peak_alloc']:.1f}",
             f"{post['peak_alloc']:.1f}",
             f"{peak_alloc_delta:.1f}",
@@ -521,13 +567,28 @@ class CUDAModuleMemoryMonitor(Plugin):
             if not self._should_monitor(module):
                 continue
             kind = self._module_kind(module)
-            module.register_forward_pre_hook(self._make_forward_pre_hook(name, kind))
-            module.register_forward_hook(self._make_forward_hook(name, kind))
-            if hasattr(module, "register_full_backward_pre_hook"):
-                module.register_full_backward_pre_hook(self._make_backward_pre_hook(name, kind))
-            module.register_full_backward_hook(self._make_backward_hook(name, kind))
+            handles = []
+            try:
+                handles.append(module.register_forward_pre_hook(self._make_forward_pre_hook(name, kind)))
+                handles.append(module.register_forward_hook(self._make_forward_hook(name, kind)))
+                if hasattr(module, "register_full_backward_pre_hook"):
+                    handles.append(module.register_full_backward_pre_hook(self._make_backward_pre_hook(name, kind)))
+                handles.append(module.register_full_backward_hook(self._make_backward_hook(name, kind)))
+            except Exception as exc:
+                for handle in handles:
+                    try:
+                        handle.remove()
+                    except Exception:
+                        pass
+                log.warning(
+                    "[CUDA Module Memory Monitor] skip hook for %s (%s): %s",
+                    name,
+                    kind,
+                    exc,
+                )
+                continue
             count += 1
-        log.info(f"[CUDA Module Memory Monitor] hooked {count} SO2/S2 modules; csv={self.csv_path}")
+        log.info(f"[CUDA Module Memory Monitor] hooked {count} SO2/S2/TP modules; csv={self.csv_path}")
 
     def iteration(self, **kwargs):
         self._flush()

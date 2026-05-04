@@ -13,6 +13,7 @@ import os
 import torch.nn.functional as F
 from collections import defaultdict
 from .tensor_product import InterpolationBlock, RadialFunction
+from dptb.utils.cuda_cache_memory import cuda_cache_memory_probe
 
 # Load helpers (Keep original logic)
 try:
@@ -85,33 +86,39 @@ def _get_wigner_static(l_max: int, device: torch.device, dtype: torch.dtype):
     if cached is not None:
         return cached
 
-    idx_data = {
-        k: (v.to(device=device) if isinstance(v, torch.Tensor) else v)
-        for k, v in _idx_data.items()
+    metadata = {
+        "l_max": int(l_max),
+        "local_entries_before": len(_WIGNER_STATIC_CACHE),
     }
-    sizes = idx_data["sizes"][:l_max + 1]
-    offsets = idx_data["offsets"][:l_max + 1]
-    mask = idx_data["mask"][:l_max + 1]
-    freq = idx_data["freq"][:l_max + 1]
-    reversed_inds = idx_data["reversed_inds"][:l_max + 1]
+    with cuda_cache_memory_probe("wigner_static", key, device=device, metadata=metadata, logger=log):
+        idx_data = {
+            k: (v.to(device=device) if isinstance(v, torch.Tensor) else v)
+            for k, v in _idx_data.items()
+        }
+        sizes = idx_data["sizes"][:l_max + 1]
+        offsets = idx_data["offsets"][:l_max + 1]
+        mask = idx_data["mask"][:l_max + 1]
+        freq = idx_data["freq"][:l_max + 1]
+        reversed_inds = idx_data["reversed_inds"][:l_max + 1]
 
-    dims = [2 * l + 1 for l in range(l_max + 1)]
-    d_total = sum(dims)
-    J_full_small = torch.zeros(d_total, d_total, dtype=dtype, device=device)
-    for l, dim in enumerate(dims):
-        start = l * l
-        J_full_small[start:start + dim, start:start + dim] = _Jd[l].to(dtype=dtype, device=device)
+        dims = [2 * l + 1 for l in range(l_max + 1)]
+        d_total = sum(dims)
+        J_full_small = torch.zeros(d_total, d_total, dtype=dtype, device=device)
+        for l, dim in enumerate(dims):
+            start = l * l
+            J_full_small[start:start + dim, start:start + dim] = _Jd[l].to(dtype=dtype, device=device)
 
-    cached = {
-        "sizes": sizes,
-        "offsets": offsets,
-        "mask": mask,
-        "freq": freq,
-        "reversed_inds": reversed_inds,
-        "J_full_small": J_full_small,
-        "d_total": d_total,
-    }
-    _WIGNER_STATIC_CACHE[key] = cached
+        cached = {
+            "sizes": sizes,
+            "offsets": offsets,
+            "mask": mask,
+            "freq": freq,
+            "reversed_inds": reversed_inds,
+            "J_full_small": J_full_small,
+            "d_total": d_total,
+        }
+        _WIGNER_STATIC_CACHE[key] = cached
+        metadata["local_entries_after"] = len(_WIGNER_STATIC_CACHE)
     return cached
 
 
@@ -654,20 +661,34 @@ class MOLELinear(nn.Module):
         key = (num_graphs, str(dtype), str(device), self.in_features, self.out_features)
         mod = self._cueq_indexed_linear_cache.get(key)
         if mod is None:
-            irreps_in = cue.Irreps(cue.O3, f"{self.in_features}x0e")
-            irreps_out = cue.Irreps(cue.O3, f"{self.out_features}x0e")
-            mod = cuet.Linear(
-                irreps_in,
-                irreps_out,
-                shared_weights=True,
-                internal_weights=False,
-                weight_classes=num_graphs,
-                layout=cue.ir_mul,
+            metadata = {
+                "num_graphs": int(num_graphs),
+                "in_features": int(self.in_features),
+                "out_features": int(self.out_features),
+                "local_entries_before": len(self._cueq_indexed_linear_cache),
+            }
+            with cuda_cache_memory_probe(
+                "cueq_indexed_linear",
+                key,
                 device=device,
-                dtype=dtype,
-                method="indexed_linear",
-            )
-            self._cueq_indexed_linear_cache[key] = mod
+                metadata=metadata,
+                logger=log,
+            ):
+                irreps_in = cue.Irreps(cue.O3, f"{self.in_features}x0e")
+                irreps_out = cue.Irreps(cue.O3, f"{self.out_features}x0e")
+                mod = cuet.Linear(
+                    irreps_in,
+                    irreps_out,
+                    shared_weights=True,
+                    internal_weights=False,
+                    weight_classes=num_graphs,
+                    layout=cue.ir_mul,
+                    device=device,
+                    dtype=dtype,
+                    method="indexed_linear",
+                )
+                self._cueq_indexed_linear_cache[key] = mod
+                metadata["local_entries_after"] = len(self._cueq_indexed_linear_cache)
             if os.environ.get("DPTB_CUEQ_CACHE_DIAG", "0") not in ("", "0", "false", "False"):
                 log.info(
                     "Created cuEq indexed_linear cache entry: num_graphs=%s dtype=%s device=%s "
