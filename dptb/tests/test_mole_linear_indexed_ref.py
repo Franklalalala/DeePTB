@@ -1,4 +1,6 @@
 import pytest
+import sys
+import types
 
 
 @pytest.fixture(autouse=True)
@@ -395,6 +397,54 @@ def test_mole_linear_cueq_env_smoke_if_available(monkeypatch):
 
     monkeypatch.setenv("DPTB_MOLE_LINEAR_MODE", "cueq_indexed_linear")
     assert MOLELinear(3, 3).mole_linear_mode == "cueq_indexed_linear"
+
+
+def test_mole_linear_cueq_cache_key_tracks_num_graphs(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLELinear
+    from dptb.utils import cuda_cache_memory as probe
+
+    constructed = []
+
+    class FakeIrreps:
+        def __init__(self, group, spec):
+            self.group = group
+            self.spec = spec
+
+    class FakeLinear:
+        def __init__(self, *args, **kwargs):
+            constructed.append(kwargs["weight_classes"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cuequivariance",
+        types.SimpleNamespace(O3=object(), Irreps=FakeIrreps, ir_mul=object()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cuequivariance_torch",
+        types.SimpleNamespace(Linear=FakeLinear),
+    )
+    probe.reset_cuda_cache_event_stats()
+    probe.configure_cuda_cache_memory_monitor(enabled=False, event_enabled=True)
+
+    layer = MOLELinear(4, 5, mole_linear_mode="cueq_indexed_linear")
+    first = layer._get_cueq_indexed_linear(16, dtype=torch.float32, device=torch.device("cuda:0"))
+    second = layer._get_cueq_indexed_linear(16, dtype=torch.float32, device=torch.device("cuda:0"))
+    third = layer._get_cueq_indexed_linear(15, dtype=torch.float32, device=torch.device("cuda:0"))
+
+    assert first is second
+    assert third is not first
+    assert constructed == [16, 15]
+    stats = probe.cuda_cache_event_stats_snapshot()
+    key16 = "cueq_indexed_linear|num_graphs=16|dtype=torch.float32|device=cuda:0|in_features=4|out_features=5"
+    key15 = "cueq_indexed_linear|num_graphs=15|dtype=torch.float32|device=cuda:0|in_features=4|out_features=5"
+    assert stats[key16]["hits"] == 1
+    assert stats[key16]["misses"] == 1
+    assert stats[key15]["misses"] == 1
+
+    probe.reset_cuda_cache_event_stats()
+    probe.configure_cuda_cache_memory_monitor(enabled=False, event_enabled=False)
 
 
 def test_mole_linear_cueq_rejects_amp_dtype_if_available():

@@ -296,6 +296,15 @@ def train_options():
         "Only log cache-memory rows whose absolute allocated/reserved/peak/free delta is at least this many MiB. "
         "Default: `0`, log every probed cache miss."
     )
+    doc_monitor_cuda_cache_events = (
+        "Set true to log pure-Python persistent cache hit/miss events, including cuEq indexed_linear "
+        "num_graphs keys. This does not query CUDA memory or synchronize. Default: unset, follows "
+        "DPTB_CUDA_CACHE_EVENT_DIAG."
+    )
+    doc_monitor_cuda_cache_event_summary_interval = (
+        "When cache event monitoring is enabled, log hit summaries every N events per cache key. "
+        "Set 0 to log only misses. Default: `0`."
+    )
     doc_monitor_cuda_module_memory = (
         "Set true to record CUDA memory snapshots around selected module forward/backward hooks. "
         "This is independent from monitor_flag, and currently targets SO2_Linear, MOLELinear, S2/FFN helpers, "
@@ -514,6 +523,8 @@ def train_options():
         Argument("monitor_cuda_cache_memory", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_memory),
         Argument("monitor_cuda_cache_memory_sync", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_memory_sync),
         Argument("monitor_cuda_cache_memory_min_delta_mb", (int, float), optional=True, default=0.0, doc=doc_monitor_cuda_cache_memory_min_delta_mb),
+        Argument("monitor_cuda_cache_events", bool, optional=True, default=None, doc=doc_monitor_cuda_cache_events),
+        Argument("monitor_cuda_cache_event_summary_interval", int, optional=True, default=0, doc=doc_monitor_cuda_cache_event_summary_interval),
         Argument("monitor_cuda_module_memory", bool, optional=True, default=None, doc=doc_monitor_cuda_module_memory),
         Argument("monitor_cuda_module_memory_sync", bool, optional=True, default=False, doc=doc_monitor_cuda_module_memory_sync),
         Argument("monitor_cuda_module_memory_min_delta_mb", (int, float), optional=True, default=0.0, doc=doc_monitor_cuda_module_memory_min_delta_mb),

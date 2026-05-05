@@ -750,6 +750,7 @@ def test_multitrainer_iteration_oom_fallback_skips_batch_without_step():
     assert trainer.iter == 7
     assert trainer.train_loader.batch_sampler.max_cost == 80
     assert observed_states == []
+    assert trainer.dynamic_batch_oom_skipped_iters == 1
 
 
 def test_multitrainer_iteration_oom_fallback_disabled_reraises():
@@ -841,6 +842,18 @@ def test_multitrainer_distributed_oom_fallback_does_not_sync_without_local_oom(m
     assert trainer.train_loader.batch_sampler.max_cost == 100
 
 
+def test_multitrainer_distributed_oom_fallback_disabled_for_expert_dp_replicas():
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    opt = _CountingSGD([param])
+    trainer = _make_oom_skip_fallback_trainer(param, opt, [])
+    trainer.distributed_expert = True
+    trainer.expert_data_parallel_size = 2
+    trainer.dynamic_batch_enabled = True
+    trainer.dynamic_batch_oom_fallback = True
+
+    assert trainer._can_skip_dynamic_batch_after_oom() is False
+
+
 def test_multitrainer_distributed_oom_fallback_skips_after_local_oom(monkeypatch):
     dataset = ToyDataset([2, 3, 4, 5])
     batch = next(iter(DataLoader(
@@ -858,7 +871,8 @@ def test_multitrainer_distributed_oom_fallback_skips_after_local_oom(monkeypatch
     trainer.local_expert_idx = 0
     trainer.rank = 0
     trainer.world_size = 2
-    trainer.iter = 1
+    trainer.iter = 2
+    trainer.display_sync_freq = 1000
     trainer._dist_ready = lambda: True
     trainer._prepare_batch_bundle = lambda batch, with_lengths=True: (
         {"cost": torch.tensor(float(batch.__dptb_batch_cost__))},
@@ -877,8 +891,9 @@ def test_multitrainer_distributed_oom_fallback_skips_after_local_oom(monkeypatch
 
     assert loss is None
     assert opt.step_calls == 0
-    assert trainer.iter == 2
+    assert trainer.iter == 3
     assert trainer.train_loader.batch_sampler.max_cost == 80
+    assert trainer.dynamic_batch_oom_skipped_iters == 1
 
 
 def _dynamic_batch_cfg_probe(**overrides):
