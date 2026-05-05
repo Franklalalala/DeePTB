@@ -13,7 +13,7 @@ import os
 import torch.nn.functional as F
 from collections import defaultdict
 from .tensor_product import InterpolationBlock, RadialFunction
-from dptb.utils.cuda_cache_memory import cuda_cache_memory_probe
+from dptb.utils.cuda_cache_memory import cuda_cache_memory_probe, record_cuda_cache_event
 
 # Load helpers (Keep original logic)
 try:
@@ -660,46 +660,65 @@ class MOLELinear(nn.Module):
 
         key = (num_graphs, str(dtype), str(device), self.in_features, self.out_features)
         mod = self._cueq_indexed_linear_cache.get(key)
-        if mod is None:
-            metadata = {
-                "num_graphs": int(num_graphs),
-                "in_features": int(self.in_features),
-                "out_features": int(self.out_features),
-                "local_entries_before": len(self._cueq_indexed_linear_cache),
-            }
-            with cuda_cache_memory_probe(
+        metadata = {
+            "num_graphs": int(num_graphs),
+            "dtype": str(dtype),
+            "device": str(device),
+            "in_features": int(self.in_features),
+            "out_features": int(self.out_features),
+            "local_entries_before": len(self._cueq_indexed_linear_cache),
+        }
+        if mod is not None:
+            metadata["local_entries_after"] = len(self._cueq_indexed_linear_cache)
+            record_cuda_cache_event(
                 "cueq_indexed_linear",
                 key,
-                device=device,
+                "hit",
                 metadata=metadata,
                 logger=log,
-            ):
-                irreps_in = cue.Irreps(cue.O3, f"{self.in_features}x0e")
-                irreps_out = cue.Irreps(cue.O3, f"{self.out_features}x0e")
-                mod = cuet.Linear(
-                    irreps_in,
-                    irreps_out,
-                    shared_weights=True,
-                    internal_weights=False,
-                    weight_classes=num_graphs,
-                    layout=cue.ir_mul,
-                    device=device,
-                    dtype=dtype,
-                    method="indexed_linear",
-                )
-                self._cueq_indexed_linear_cache[key] = mod
-                metadata["local_entries_after"] = len(self._cueq_indexed_linear_cache)
-            if os.environ.get("DPTB_CUEQ_CACHE_DIAG", "0") not in ("", "0", "false", "False"):
-                log.info(
-                    "Created cuEq indexed_linear cache entry: num_graphs=%s dtype=%s device=%s "
-                    "in=%s out=%s local_entries=%s",
-                    num_graphs,
-                    dtype,
-                    device,
-                    self.in_features,
-                    self.out_features,
-                    len(self._cueq_indexed_linear_cache),
-                )
+            )
+            return mod
+
+        record_cuda_cache_event(
+            "cueq_indexed_linear",
+            key,
+            "miss",
+            metadata=metadata,
+            logger=log,
+        )
+        with cuda_cache_memory_probe(
+            "cueq_indexed_linear",
+            key,
+            device=device,
+            metadata=metadata,
+            logger=log,
+        ):
+            irreps_in = cue.Irreps(cue.O3, f"{self.in_features}x0e")
+            irreps_out = cue.Irreps(cue.O3, f"{self.out_features}x0e")
+            mod = cuet.Linear(
+                irreps_in,
+                irreps_out,
+                shared_weights=True,
+                internal_weights=False,
+                weight_classes=num_graphs,
+                layout=cue.ir_mul,
+                device=device,
+                dtype=dtype,
+                method="indexed_linear",
+            )
+            self._cueq_indexed_linear_cache[key] = mod
+            metadata["local_entries_after"] = len(self._cueq_indexed_linear_cache)
+        if os.environ.get("DPTB_CUEQ_CACHE_DIAG", "0") not in ("", "0", "false", "False"):
+            log.info(
+                "Created cuEq indexed_linear cache entry: num_graphs=%s dtype=%s device=%s "
+                "in=%s out=%s local_entries=%s",
+                num_graphs,
+                dtype,
+                device,
+                self.in_features,
+                self.out_features,
+                len(self._cueq_indexed_linear_cache),
+            )
         return mod
 
     def _infer_cueq_weight_order(self, cue_lin, flat_x, mixed_weights, flat_graph_index):
@@ -734,9 +753,17 @@ class MOLELinear(nn.Module):
         return best_order
 
     def _apply_cueq_indexed_linear(self, x, mixed_weights, mixed_bias, graph_index, mole_globals: MOLEGlobals):
+        num_graphs = int(mixed_weights.shape[0])
+        if num_graphs == 1:
+            # cuEq's indexed_linear only consumes weight_indices when weight_classes > 1.
+            return F.linear(
+                x,
+                mixed_weights[0],
+                mixed_bias[0] if mixed_bias is not None else None,
+            )
+
         flat_x = x.reshape(-1, self.in_features)
         flat_graph_index = _expand_graph_index_cached(graph_index, x, mole_globals)
-        num_graphs = int(mixed_weights.shape[0])
         cue_lin = self._get_cueq_indexed_linear(num_graphs, dtype=x.dtype, device=x.device)
 
         order = self._infer_cueq_weight_order(cue_lin, flat_x, mixed_weights, flat_graph_index)

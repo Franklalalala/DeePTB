@@ -49,6 +49,7 @@ from dptb.plugins.saver import Saver
 from dptb.utils.argcheck import collect_cutoffs, chk_avg_per_iter
 from dptb.utils.cuda_cache_memory import (
     configure_cuda_cache_memory_monitor,
+    cuda_cache_event_monitor_enabled,
     cuda_cache_memory_monitor_enabled,
 )
 from dptb.utils.tools import setup_seed, j_must_have
@@ -460,6 +461,8 @@ def _multi_train_impl(
         enabled=jdata["train_options"].get("monitor_cuda_cache_memory", None),
         sync=jdata["train_options"].get("monitor_cuda_cache_memory_sync", None),
         min_delta_mb=jdata["train_options"].get("monitor_cuda_cache_memory_min_delta_mb", 0.0),
+        event_enabled=jdata["train_options"].get("monitor_cuda_cache_events", None),
+        event_summary_interval=jdata["train_options"].get("monitor_cuda_cache_event_summary_interval", 0),
     )
 
     log.info(f"[MultiTrainer][rank={rank}] distributed_expert = {distributed_expert}")
@@ -475,6 +478,10 @@ def _multi_train_impl(
         log.info(
             "[CUDA cache memory] enabled: cache misses will log rank/iter/stage and "
             "allocated/reserved/peak/free memory deltas"
+        )
+    if cuda_cache_event_monitor_enabled():
+        log.info(
+            "[CUDA cache events] enabled: cache hit/miss events will log rank/iter/stage and cache keys without CUDA sync"
         )
 
     if restart:

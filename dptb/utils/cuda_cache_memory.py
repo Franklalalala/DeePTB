@@ -22,8 +22,12 @@ _CONFIG = {
     "enabled": None,
     "sync": None,
     "min_delta_mb": 0.0,
+    "event_enabled": None,
+    "event_summary_interval": 0,
 }
 _CONTEXT = threading.local()
+_EVENT_LOCK = threading.Lock()
+_EVENT_STATS: Dict[str, Dict[str, Any]] = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -38,6 +42,8 @@ def configure_cuda_cache_memory_monitor(
     enabled: Optional[bool] = None,
     sync: Optional[bool] = None,
     min_delta_mb: Optional[float] = None,
+    event_enabled: Optional[bool] = None,
+    event_summary_interval: Optional[int] = None,
 ) -> None:
     """Configure process-local cache memory probing.
 
@@ -48,8 +54,11 @@ def configure_cuda_cache_memory_monitor(
 
     _CONFIG["enabled"] = None if enabled is None else bool(enabled)
     _CONFIG["sync"] = None if sync is None else bool(sync)
+    _CONFIG["event_enabled"] = None if event_enabled is None else bool(event_enabled)
     if min_delta_mb is not None:
         _CONFIG["min_delta_mb"] = float(min_delta_mb)
+    if event_summary_interval is not None:
+        _CONFIG["event_summary_interval"] = max(int(event_summary_interval), 0)
 
 
 def cuda_cache_memory_monitor_enabled() -> bool:
@@ -57,6 +66,13 @@ def cuda_cache_memory_monitor_enabled() -> bool:
     if configured is not None:
         return bool(configured)
     return _env_flag("DPTB_CUDA_CACHE_MEMORY_DIAG", False)
+
+
+def cuda_cache_event_monitor_enabled() -> bool:
+    configured = _CONFIG.get("event_enabled")
+    if configured is not None:
+        return bool(configured)
+    return _env_flag("DPTB_CUDA_CACHE_EVENT_DIAG", False)
 
 
 def _cuda_cache_memory_sync_enabled() -> bool:
@@ -150,6 +166,94 @@ def _json_value(value: Any) -> str:
 
 def _format_float(value: float) -> str:
     return f"{float(value):.1f}"
+
+
+def reset_cuda_cache_event_stats() -> None:
+    with _EVENT_LOCK:
+        _EVENT_STATS.clear()
+
+
+def cuda_cache_event_stats_snapshot() -> Dict[str, Dict[str, Any]]:
+    with _EVENT_LOCK:
+        return json.loads(json.dumps(_EVENT_STATS, default=str))
+
+
+def _event_stats_key(cache_name: str, metadata: Optional[Mapping[str, Any]]) -> str:
+    if not metadata:
+        return str(cache_name)
+    parts = [str(cache_name)]
+    for key in ("num_graphs", "dtype", "device", "in_features", "out_features"):
+        if key in metadata:
+            parts.append(f"{key}={metadata[key]}")
+    return "|".join(parts)
+
+
+def record_cuda_cache_event(
+    cache_name: str,
+    cache_key: Any,
+    event: str,
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[Dict[str, str]]:
+    """Record a pure-Python cache hit/miss event without querying CUDA state."""
+
+    if not cuda_cache_event_monitor_enabled():
+        return None
+
+    event = str(event)
+    metadata = dict(metadata or {})
+    row: Dict[str, str] = {
+        "rank": os.environ.get("RANK", ""),
+        "local_rank": os.environ.get("LOCAL_RANK", ""),
+        "iter": "" if _current_context().get("iteration") is None else str(_current_context().get("iteration")),
+        "stage": "" if _current_context().get("stage") is None else str(_current_context().get("stage")),
+        "expert": "" if _current_context().get("expert") is None else str(_current_context().get("expert")),
+        "cache": str(cache_name),
+        "event": event,
+        "key": _json_value(cache_key),
+    }
+    for key, value in metadata.items():
+        row[f"meta_{key}"] = _json_value(value)
+
+    summary_interval = int(_CONFIG.get("event_summary_interval") or 0)
+    should_log = event != "hit"
+    summary: Optional[Dict[str, Any]] = None
+    with _EVENT_LOCK:
+        stats_key = _event_stats_key(str(cache_name), metadata)
+        stats = _EVENT_STATS.setdefault(
+            stats_key,
+            {
+                "cache": str(cache_name),
+                "total": 0,
+                "hits": 0,
+                "misses": 0,
+                "num_graphs": {},
+            },
+        )
+        stats["total"] += 1
+        if event == "hit":
+            stats["hits"] += 1
+        elif event == "miss":
+            stats["misses"] += 1
+        if "num_graphs" in metadata:
+            ng = str(metadata["num_graphs"])
+            stats["num_graphs"][ng] = int(stats["num_graphs"].get(ng, 0)) + 1
+        if summary_interval > 0 and stats["total"] % summary_interval == 0:
+            should_log = True
+            summary = dict(stats)
+            summary["num_graphs"] = dict(stats["num_graphs"])
+
+    if summary is not None:
+        row["summary_total"] = str(summary["total"])
+        row["summary_hits"] = str(summary["hits"])
+        row["summary_misses"] = str(summary["misses"])
+        row["summary_num_graphs"] = _json_value(summary["num_graphs"])
+
+    if should_log:
+        message = " ".join(f"{key}={value}" for key, value in row.items())
+        (logger or log).info("[CUDA_CACHE_EVENT] %s", message)
+    return row
 
 
 def _cache_memory_row(

@@ -206,7 +206,15 @@ class MultiTrainer(Trainer):
     _DB_NUM_EDGES_SUM = 3
     _DB_MAX_ITEM_COST_SUM = 4
     _DB_STEP_COUNT = 5
-    _DB_PACK_LEN = 6
+    _DB_OOM_SKIPPED_COUNT = 6
+    _DB_PACK_LEN = 7
+    _DYNAMIC_BATCH_STATE_ATTRS = (
+        ("__dptb_batch_cost__", "batch_cost"),
+        ("__dptb_batch_num_graphs__", "batch_num_graphs"),
+        ("__dptb_batch_num_nodes__", "batch_num_nodes"),
+        ("__dptb_batch_num_edges__", "batch_num_edges"),
+        ("__dptb_batch_max_item_cost__", "batch_max_item_cost"),
+    )
 
     def __init__(
         self,
@@ -408,15 +416,7 @@ class MultiTrainer(Trainer):
         dynamic_batch_cfg = self.train_options.get("dynamic_batch", None)
         self.dynamic_batch_options = dynamic_batch_cfg if isinstance(dynamic_batch_cfg, dict) else {}
         self.dynamic_batch_enabled = bool(self.dynamic_batch_options.get("enabled", False))
-        self.dynamic_batch_oom_fallback = bool(self.dynamic_batch_options.get("oom_fallback", False))
-        self.dynamic_batch_oom_shrink_factor = float(self.dynamic_batch_options.get("oom_shrink_factor", 0.8))
-        if self.dynamic_batch_enabled and self.dynamic_batch_oom_fallback and self.distributed_rank0_prepare_batch:
-            log.warning(
-                "dynamic_batch OOM skip fallback is disabled for distributed_rank0_prepare_batch in this version; "
-                "dynamic cost batching remains enabled."
-            )
-            self.dynamic_batch_oom_fallback = False
-            self.dynamic_batch_options["oom_fallback"] = False
+        self._configure_dynamic_batch_oom_fallback()
 
         self._tagger = _StageTagger(
             trainer=self,
@@ -2188,10 +2188,16 @@ class MultiTrainer(Trainer):
         self._display_window_expert_active_nodes_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_edges_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_last_lr_local = 0.0
+        self.dynamic_batch_oom_skipped_since_display = 0
         self._reset_cuda_memory_peak()
 
     def _has_pending_display_window(self) -> bool:
-        return float(self._display_window_pack_local[self._P_STEP_COUNT].item()) > 0.0
+        if float(self._display_window_pack_local[self._P_STEP_COUNT].item()) > 0.0:
+            return True
+        return (
+            self.distributed_expert
+            and float(self._display_window_dynamic_batch_pack_local[self._DB_OOM_SKIPPED_COUNT].item()) > 0.0
+        )
 
     def _make_step_pack(self, payload: Dict[str, Any]) -> torch.Tensor:
         vec = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=self.device)
@@ -2284,7 +2290,17 @@ class MultiTrainer(Trainer):
             gathered = self._gather_display_window_expert_metrics()
 
         full_loss_steps = self.num_experts if self._dist_ready() else 1
-        total_steps = max(float(reduced_pack[self._P_STEP_COUNT].item()) / full_loss_steps, 1.0)
+        raw_total_steps = float(reduced_pack[self._P_STEP_COUNT].item()) / full_loss_steps
+        dynamic_batch_oom_skips = int(round(float(reduced_dynamic_pack[self._DB_OOM_SKIPPED_COUNT].item())))
+        if raw_total_steps <= 0.0:
+            if dynamic_batch_oom_skips > 0:
+                log.warning(
+                    "dynamic_batch OOM fallback flushed display boundary with skipped_iters=%s and no successful steps",
+                    dynamic_batch_oom_skips,
+                )
+            self._reset_display_window_buffers()
+            return None
+        total_steps = max(raw_total_steps, 1.0)
 
         train_loss_opt_mean = reduced_pack[self._P_LOSS_OPT_SUM] / total_steps
         compatible_train_loss = self._compute_compatible_loss_from_pack(reduced_pack, self.train_lossfunc)
@@ -2337,6 +2353,8 @@ class MultiTrainer(Trainer):
             state["batch_num_nodes"] = float((reduced_dynamic_pack[self._DB_NUM_NODES_SUM] / denom).item())
             state["batch_num_edges"] = float((reduced_dynamic_pack[self._DB_NUM_EDGES_SUM] / denom).item())
             state["batch_max_item_cost"] = float((reduced_dynamic_pack[self._DB_MAX_ITEM_COST_SUM] / denom).item())
+        if dynamic_batch_oom_skips > 0:
+            state["dynamic_batch_oom_skipped_iters"] = dynamic_batch_oom_skips
 
         self._add_cuda_memory_state(state, cuda_memory_metrics)
 
@@ -2606,21 +2624,60 @@ class MultiTrainer(Trainer):
             return True
         return "out of memory" in str(exc).lower()
 
-    @staticmethod
-    def _dynamic_batch_state_from_batch(batch) -> Dict[str, Any]:
+    def _disable_dynamic_batch_oom_fallback(self, message: str, *args):
+        log.warning(message, *args)
+        self.dynamic_batch_oom_fallback = False
+        if isinstance(getattr(self, "dynamic_batch_options", None), dict):
+            self.dynamic_batch_options["oom_fallback"] = False
+
+    def _configure_dynamic_batch_oom_fallback(self):
+        self.dynamic_batch_oom_fallback = bool(self.dynamic_batch_options.get("oom_fallback", False))
+        self.dynamic_batch_oom_shrink_factor = float(self.dynamic_batch_options.get("oom_shrink_factor", 0.8))
+        self.dynamic_batch_oom_skipped_iters = 0
+        self.dynamic_batch_oom_skipped_since_display = 0
+
+        if not (self.dynamic_batch_enabled and self.dynamic_batch_oom_fallback):
+            return
+        if not (0.0 < self.dynamic_batch_oom_shrink_factor < 1.0):
+            self._disable_dynamic_batch_oom_fallback(
+                "dynamic_batch OOM skip fallback is disabled because oom_shrink_factor=%s is not in (0, 1).",
+                self.dynamic_batch_oom_shrink_factor,
+            )
+            return
+        if self.distributed_rank0_prepare_batch:
+            self._disable_dynamic_batch_oom_fallback(
+                "dynamic_batch OOM skip fallback is disabled for distributed_rank0_prepare_batch in this version; "
+                "dynamic cost batching remains enabled."
+            )
+            return
+        if self._dynamic_batch_oom_requires_expert_dp_consensus():
+            self._disable_dynamic_batch_oom_fallback(
+                "dynamic_batch OOM skip fallback is disabled for expert_data_parallel_size=%s because "
+                "a no-sync fallback cannot guarantee expert-DP rank consensus; dynamic cost batching remains enabled.",
+                self.expert_data_parallel_size,
+            )
+
+    def _dynamic_batch_oom_requires_expert_dp_consensus(self) -> bool:
+        return self.distributed_expert and int(getattr(self, "expert_data_parallel_size", 1)) > 1
+
+    @classmethod
+    def _dynamic_batch_state_from_batch(cls, batch) -> Dict[str, Any]:
         if batch is None:
             return {}
-        state = {}
-        for attr, key in (
-            ("__dptb_batch_cost__", "batch_cost"),
-            ("__dptb_batch_num_graphs__", "batch_num_graphs"),
-            ("__dptb_batch_num_nodes__", "batch_num_nodes"),
-            ("__dptb_batch_num_edges__", "batch_num_edges"),
-            ("__dptb_batch_max_item_cost__", "batch_max_item_cost"),
-        ):
+        state: Dict[str, Any] = {}
+        for attr, key in cls._DYNAMIC_BATCH_STATE_ATTRS:
             if hasattr(batch, attr):
                 state[key] = getattr(batch, attr)
         return state
+
+    @classmethod
+    def _dynamic_batch_oom_log_values(cls, batch) -> Dict[str, Any]:
+        state = cls._dynamic_batch_state_from_batch(batch)
+        return {
+            "batch_cost": state.get("batch_cost"),
+            "batch_max_item_cost": state.get("batch_max_item_cost"),
+            "num_graphs": state.get("batch_num_graphs", getattr(batch, "num_graphs", None)),
+        }
 
     def _clear_after_oom(self):
         for opt in getattr(self, "optimizers", []):
@@ -2632,48 +2689,137 @@ class MultiTrainer(Trainer):
             except Exception:
                 pass
 
-    def _shrink_dynamic_batch_after_oom(self, batch):
-        sampler = getattr(self.train_loader, "batch_sampler", None)
+    def _runtime_dynamic_batch_sampler(self):
+        sampler = getattr(getattr(self, "train_loader", None), "batch_sampler", None)
         if sampler is None or not hasattr(sampler, "max_cost"):
-            return
-        old_max = int(sampler.max_cost)
-        new_max = max(1, int(math.floor(old_max * self.dynamic_batch_oom_shrink_factor)))
-        sampler.max_cost = new_max
+            return None
+        return sampler
+
+    def _set_runtime_dynamic_batch_max_cost(self, sampler, max_cost: int):
+        sampler.max_cost = int(max_cost)
         opts = getattr(self.train_loader, "dynamic_batch_options", None)
         if isinstance(opts, dict):
-            opts["max_cost"] = new_max
+            opts["max_cost"] = int(max_cost)
             if "max_edge" in opts:
-                opts["max_edge"] = new_max
+                opts["max_edge"] = int(max_cost)
+
+    def _invalidate_runtime_dynamic_batch_cache(self):
+        invalidate_cache = getattr(self.train_loader, "invalidate_dynamic_batch_cache", None)
+        if not callable(invalidate_cache):
+            return
+        try:
+            invalidate_cache(clear_costs=False)
+        except TypeError:
+            invalidate_cache()
+        except Exception:
+            log.exception("dynamic_batch OOM fallback failed to invalidate cached batches after shrink.")
+
+    def _shrink_dynamic_batch_after_oom(self, batch):
+        sampler = self._runtime_dynamic_batch_sampler()
+        if sampler is None:
+            return None, None
+        old_max = int(sampler.max_cost)
+        if old_max <= 1:
+            self._disable_dynamic_batch_oom_fallback(
+                "[DYNAMIC_BATCH_OOM_SHRINK] disabled fallback because runtime max_cost=%s cannot shrink further",
+                old_max,
+            )
+            return old_max, old_max
+        new_max = max(1, int(math.floor(old_max * self.dynamic_batch_oom_shrink_factor)))
+        if new_max >= old_max:
+            self._disable_dynamic_batch_oom_fallback(
+                "[DYNAMIC_BATCH_OOM_SHRINK] disabled fallback because shrink would not progress: "
+                "old_max_cost=%s new_max_cost=%s shrink_factor=%s",
+                old_max,
+                new_max,
+                self.dynamic_batch_oom_shrink_factor,
+            )
+            return old_max, new_max
+        self._set_runtime_dynamic_batch_max_cost(sampler, new_max)
+        self._invalidate_runtime_dynamic_batch_cache()
+        log_values = self._dynamic_batch_oom_log_values(batch)
+        batch_max_item_cost = log_values["batch_max_item_cost"]
+        if batch_max_item_cost is not None:
+            try:
+                if float(batch_max_item_cost) > float(new_max):
+                    log.warning(
+                        "[DYNAMIC_BATCH_OOM_SHRINK] current batch contains item cost %s above new_max_cost=%s; "
+                        "future iterators may still emit oversized singletons unless drop_oversized is enabled.",
+                        batch_max_item_cost,
+                        new_max,
+                    )
+            except Exception:
+                pass
         log.warning(
-            "dynamic_batch OOM fallback shrank runtime max_cost from %s to %s after batch_cost=%s",
+            "[DYNAMIC_BATCH_OOM_SHRINK] old_max_cost=%s new_max_cost=%s batch_cost=%s "
+            "batch_max_item_cost=%s applies=next_loader_iterator",
             old_max,
             new_max,
-            getattr(batch, "__dptb_batch_cost__", None),
+            log_values["batch_cost"],
+            batch_max_item_cost,
         )
+        return old_max, new_max
 
     def _can_skip_dynamic_batch_after_oom(self, ref_batch=None, optimizer_step_started: bool = False) -> bool:
         return (
             self.dynamic_batch_enabled
             and self.dynamic_batch_oom_fallback
             and not self.distributed_rank0_prepare_batch
+            and not self._dynamic_batch_oom_requires_expert_dp_consensus()
             and ref_batch is None
             and not optimizer_step_started
         )
 
+    def _record_dynamic_batch_oom_skip(self):
+        self.dynamic_batch_oom_skipped_iters = int(getattr(self, "dynamic_batch_oom_skipped_iters", 0)) + 1
+        self.dynamic_batch_oom_skipped_since_display = (
+            int(getattr(self, "dynamic_batch_oom_skipped_since_display", 0)) + 1
+        )
+        pack = getattr(self, "_display_window_dynamic_batch_pack_local", None)
+        if torch.is_tensor(pack) and pack.numel() > self._DB_OOM_SKIPPED_COUNT:
+            pack[self._DB_OOM_SKIPPED_COUNT] += 1.0
+
+    def _flush_display_window_after_oom_skip_if_needed(self, where: str):
+        if not self.distributed_expert:
+            return
+        if not self._should_flush_display_window_now(self.iter):
+            return
+        if not hasattr(self, "_display_window_pack_local"):
+            return
+        skipped_since_display = getattr(self, "dynamic_batch_oom_skipped_since_display", 0)
+        state = self._flush_display_window(time_idx=self.iter)
+        if state is not None:
+            log.warning(
+                "dynamic_batch OOM fallback joined display flush at iter=%s where=%s skipped_since_display=%s",
+                self.iter,
+                where,
+                skipped_since_display,
+            )
+            self.call_plugins(queue_name='iteration', time=self.iter, **state)
+
     def _handle_dynamic_batch_oom_skip(self, batch, *, local_oom: bool, where: str):
         self._clear_after_oom()
         self._reset_cuda_memory_peak()
-        self._shrink_dynamic_batch_after_oom(batch)
+        old_max_cost, new_max_cost = self._shrink_dynamic_batch_after_oom(batch)
+        self._record_dynamic_batch_oom_skip()
+        log_values = self._dynamic_batch_oom_log_values(batch)
         log.warning(
-            "dynamic_batch OOM fallback skipped iter=%s rank=%s where=%s local_oom=%s "
-            "batch_cost=%s num_graphs=%s",
+            "[DYNAMIC_BATCH_OOM_SKIP] iter=%s rank=%s where=%s local_oom=%s "
+            "batch_cost=%s batch_max_item_cost=%s num_graphs=%s old_max_cost=%s new_max_cost=%s "
+            "total_skipped=%s skipped_since_display=%s",
             self.iter,
             getattr(self, "rank", 0),
             where,
             bool(local_oom),
-            getattr(batch, "__dptb_batch_cost__", None),
-            getattr(batch, "num_graphs", None),
+            log_values["batch_cost"],
+            log_values["batch_max_item_cost"],
+            log_values["num_graphs"],
+            old_max_cost,
+            new_max_cost,
+            self.dynamic_batch_oom_skipped_iters,
+            self.dynamic_batch_oom_skipped_since_display,
         )
+        self._flush_display_window_after_oom_skip_if_needed(where)
         if self.distributed_expert:
             self.iter += 1
         return None
