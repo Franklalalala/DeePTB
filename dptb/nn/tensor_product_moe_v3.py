@@ -686,9 +686,17 @@ class MOLELinear(nn.Module):
         return best_order
 
     def _apply_cueq_indexed_linear(self, x, mixed_weights, mixed_bias, graph_index):
+        num_graphs = int(mixed_weights.shape[0])
+        if num_graphs == 1:
+            # cuEq's indexed_linear only consumes weight_indices when weight_classes > 1.
+            return F.linear(
+                x,
+                mixed_weights[0],
+                mixed_bias[0] if mixed_bias is not None else None,
+            )
+
         flat_x = x.reshape(-1, self.in_features)
         flat_graph_index = _expand_graph_index_for_leading_dims(graph_index, x)
-        num_graphs = int(mixed_weights.shape[0])
         cue_lin = self._get_cueq_indexed_linear(num_graphs, dtype=x.dtype, device=x.device)
 
         order = self._infer_cueq_weight_order(cue_lin, flat_x, mixed_weights, flat_graph_index)

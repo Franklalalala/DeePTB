@@ -294,6 +294,61 @@ def test_mole_linear_invalid_mode_rejected():
         MOLELinear(4, 4, mole_linear_mode="bad")
 
 
+def test_mole_linear_cueq_single_graph_matches_split_loop_without_cueq_import():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    torch.manual_seed(20260505)
+    dtype = torch.float64
+    n_rows = 7
+    num_experts = 5
+    in_features = 4
+    out_features = 6
+
+    coeffs = torch.rand(1, num_experts, dtype=dtype)
+    coeffs = (coeffs / coeffs.sum(dim=-1, keepdim=True)).detach()
+    coeffs0 = coeffs.clone().requires_grad_(True)
+    coeffs1 = coeffs.clone().requires_grad_(True)
+    globals0 = MOLEGlobals(coefficients=coeffs0, split_sizes=(n_rows,))
+    globals1 = MOLEGlobals(coefficients=coeffs1, split_sizes=(n_rows,))
+
+    base = MOLELinear(
+        in_features,
+        out_features,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="split_loop",
+    ).to(dtype=dtype)
+    cueq = MOLELinear(
+        in_features,
+        out_features,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="cueq_indexed_linear",
+    ).to(dtype=dtype)
+    cueq.load_state_dict(base.state_dict(), strict=True)
+
+    x0 = torch.randn(n_rows, 2, in_features, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    y0 = base(x0, globals0)
+    y1 = cueq(x1, globals1)
+    torch.testing.assert_close(y1, y0, atol=1e-10, rtol=1e-10)
+
+    probe = torch.randn_like(y0)
+    (y0 * probe).sum().backward()
+    (y1 * probe).sum().backward()
+
+    torch.testing.assert_close(x1.grad, x0.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(coeffs1.grad, coeffs0.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(cueq.weight_experts.grad, base.weight_experts.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(cueq.bias_experts.grad, base.bias_experts.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(cueq.weight_shared.grad, base.weight_shared.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(cueq.bias_shared.grad, base.bias_shared.grad, atol=1e-10, rtol=1e-10)
+    assert cueq._cueq_indexed_linear_cache == {}
+
+
 def test_mole_linear_cueq_indexed_smoke_if_available():
     torch = pytest.importorskip("torch")
     pytest.importorskip("cuequivariance")
