@@ -13,7 +13,7 @@ from dptb.data.dataloader import (
     resolve_dynamic_batch_options,
     split_batch_for_oom,
 )
-from dptb.nnops.multi_trainer import MultiTrainer
+from dptb.nnops.multi_trainer import MultiTrainer, _base_train_options_for_multitrainer
 from dptb.utils.argcheck import dynamic_batch_options
 from dptb.utils.torch_geometric import Batch, Data
 
@@ -368,6 +368,41 @@ def test_dynamic_batch_calibration_uses_metadata_cost_getter():
 
     assert opts["calibration_batch_costs"] == [22, 10]
     assert opts["max_cost"] == 22
+    assert dataset.item_reads == 0
+    assert dataset.metadata_reads == 4
+
+
+def test_dynamic_batch_resolved_calibration_does_not_rescan_dataset():
+    dataset = MetadataCostDataset([2, 20, 4, 6])
+
+    opts = resolve_dynamic_batch_options(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        dynamic_batch={
+            "enabled": True,
+            "mode": "node",
+            "calibrate": True,
+            "calibration_batches": 10,
+            "calibration_quantile": 1.0,
+        },
+    )
+    item_reads = dataset.item_reads
+    metadata_reads = dataset.metadata_reads
+    dataset.node_counts = [1000, 1000, 1000, 1000]
+
+    reused = resolve_dynamic_batch_options(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        dynamic_batch=opts,
+    )
+
+    assert opts["calibrated"] is True
+    assert opts["max_cost"] == 22
+    assert reused["max_cost"] == 22
+    assert dataset.item_reads == item_reads
+    assert dataset.metadata_reads == metadata_reads
 
 
 def test_dynamic_batch_max_edge_alias_uses_edge_only_calibration():
@@ -628,6 +663,166 @@ def test_lmdb_dataset_exposes_dynamic_batch_cost_parts_from_entry_metadata():
         "kpoint": 2,
         "eig_band_square": 72,
     }
+
+
+def test_lmdb_dataset_uses_raw_block_keys_for_dynamic_edge_cost_without_get():
+    dataset = LMDBDataset.__new__(LMDBDataset)
+    dataset._indices = None
+    dataset.num_graphs = 1
+    dataset.h0_key = "hamiltonian_0"
+    data_dict = {
+        AtomicDataDict.POSITIONS_KEY: torch.zeros((3, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: torch.ones(3, dtype=torch.long),
+        "hamiltonian": {
+            "0_0_0_0_0": torch.zeros((1, 1)),
+            "1_1_0_0_0": torch.zeros((1, 1)),
+            "0_1_0_0_0": torch.zeros((1, 1)),
+            "1_0_0_0_0": torch.zeros((1, 1)),
+            "0_2_1_0_0": torch.zeros((1, 1)),
+        },
+    }
+    dataset._load_data_dict = lambda idx: data_dict
+
+    def _unexpected_get(idx):
+        raise AssertionError("dynamic batch edge-cost metadata must not materialize LMDB samples")
+
+    dataset.get = _unexpected_get
+
+    assert dataset.get_dynamic_batch_cost_parts(0) == {
+        "graph": 1,
+        "node": 3,
+        "edge": 3,
+        "env": 0,
+        "onsitenv": 0,
+        "kpoint": 0,
+        "eig_band_square": 0,
+    }
+
+
+def test_lmdb_dataset_uses_raw_h0_block_keys_for_dynamic_edge_cost():
+    dataset = LMDBDataset.__new__(LMDBDataset)
+    dataset._indices = None
+    dataset.num_graphs = 1
+    dataset.h0_key = "hamiltonian_0"
+    data_dict = {
+        AtomicDataDict.POSITIONS_KEY: torch.zeros((2, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: torch.ones(2, dtype=torch.long),
+        "hamiltonian_0": {
+            "0_0_0_0_0": torch.zeros((1, 1)),
+            "1_1_0_0_0": torch.zeros((1, 1)),
+            "0_1_0_0_0": torch.zeros((1, 1)),
+            "1_0_0_0_0": torch.zeros((1, 1)),
+        },
+    }
+    dataset._load_data_dict = lambda idx: data_dict
+
+    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 2
+
+
+def test_lmdb_dataset_dynamic_cost_parts_are_cached():
+    dataset = LMDBDataset.__new__(LMDBDataset)
+    dataset._indices = None
+    dataset.num_graphs = 1
+    dataset.h0_key = "hamiltonian_0"
+    loads = {"count": 0}
+    data_dict = {
+        AtomicDataDict.POSITIONS_KEY: torch.zeros((2, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: torch.ones(2, dtype=torch.long),
+        "hamiltonian": {
+            "0_0_0_0_0": torch.zeros((1, 1)),
+            "0_1_0_0_0": torch.zeros((1, 1)),
+        },
+    }
+
+    def _load_data_dict(idx):
+        loads["count"] += 1
+        return data_dict
+
+    dataset._load_data_dict = _load_data_dict
+
+    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 1
+    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 1
+    assert loads["count"] == 1
+
+    dataset.invalidate_dynamic_batch_costs()
+    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 1
+    assert loads["count"] == 2
+
+
+def test_lmdb_dataset_h0_raw_conversion_can_override_precomputed_h0(monkeypatch):
+    dataset = LMDBDataset.__new__(LMDBDataset)
+    dataset._indices = None
+    dataset.get_Hamiltonian = False
+    dataset.get_H0 = True
+    dataset.get_overlap = False
+    dataset.get_DM = False
+    dataset.get_eigenvalues = False
+    dataset.orthogonal = False
+    dataset.h0_key = "hamiltonian_0"
+    dataset.prefer_precomputed_h0 = False
+    dataset.transform = object()
+    dataset.file_map = ["data.0000.lmdb"]
+    dataset.info_files = {
+        "data.0000.lmdb": {
+            "r_max": 1.0,
+            "er_max": None,
+            "oer_max": None,
+            "wave_align": False,
+            "train_w_homo_lumo_gap": False,
+            "train_w_eps": False,
+            "train_w_charge": False,
+            "train_dip": False,
+            "train_polar": False,
+        }
+    }
+    h0_blocks = {"0_0_0_0_0": torch.zeros((1, 1))}
+    data_dict = {
+        AtomicDataDict.CELL_KEY: torch.eye(3),
+        AtomicDataDict.POSITIONS_KEY: torch.zeros((2, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: torch.ones(2, dtype=torch.long),
+        AtomicDataDict.PBC_KEY: torch.zeros(3, dtype=torch.bool),
+        "hamiltonian_0": h0_blocks,
+        AtomicDataDict.NODE_H0_KEY: torch.full((2, 3), 9.0),
+        AtomicDataDict.EDGE_H0_KEY: torch.full((4, 3), 9.0),
+    }
+    dataset._load_data_dict = lambda idx: data_dict
+
+    def _fake_from_points(**kwargs):
+        return Data(
+            pos=torch.as_tensor(kwargs["pos"]),
+            edge_index=torch.zeros((2, 4), dtype=torch.long),
+            edge_cell_shift=torch.zeros((4, 3), dtype=torch.long),
+            atomic_numbers=torch.as_tensor(kwargs["atomic_numbers"]),
+        )
+
+    calls = []
+
+    def _fake_block_to_feature(atomicdata, type_mapper, blocks, overlap, orthogonal, **kwargs):
+        calls.append((blocks, kwargs))
+        atomicdata[kwargs["node_field"]] = torch.full((2, 3), 1.0)
+        atomicdata[kwargs["edge_field"]] = torch.full((4, 3), 2.0)
+
+    monkeypatch.setattr("dptb.data.dataset.lmdb_dataset.AtomicData.from_points", _fake_from_points)
+    monkeypatch.setattr("dptb.data.dataset.lmdb_dataset.block_to_feature", _fake_block_to_feature)
+
+    out = dataset.get(0)
+
+    assert calls == [(h0_blocks, {"node_field": AtomicDataDict.NODE_H0_KEY, "edge_field": AtomicDataDict.EDGE_H0_KEY})]
+    assert torch.equal(out[AtomicDataDict.NODE_H0_KEY], torch.full((2, 3), 1.0))
+    assert torch.equal(out[AtomicDataDict.EDGE_H0_KEY], torch.full((4, 3), 2.0))
+
+
+def test_multitrainer_base_options_disable_dynamic_batch_before_rebuild():
+    train_options = {
+        "batch_size": 4,
+        "dynamic_batch": {"enabled": True, "calibrate": True},
+    }
+
+    base_options = _base_train_options_for_multitrainer(train_options)
+
+    assert base_options["dynamic_batch"]["enabled"] is False
+    assert train_options["dynamic_batch"]["enabled"] is True
+    assert base_options["dynamic_batch"]["calibrate"] is True
 
 
 class _DummyTagger:

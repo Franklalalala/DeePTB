@@ -851,23 +851,21 @@ def resolve_dynamic_batch_options(
             mode=opts.get("mode", "cost"),
             cost_weights=opts.get("cost_weights", None),
         )
-        generator = torch.Generator()
-        generator.manual_seed(int(opts.get("seed", 0)))
-        indexed_dataset = _IndexedDataset(dataset)
-        fixed_loader = torch.utils.data.DataLoader(
-            indexed_dataset,
-            batch_size=int(batch_size),
-            shuffle=bool(shuffle),
-            collate_fn=Collater.for_dataset(indexed_dataset, cost_estimator=estimator),
-            generator=generator,
-            num_workers=0,
-        )
+        indices = list(range(len(dataset)))
+        if bool(shuffle):
+            generator = torch.Generator()
+            generator.manual_seed(int(opts.get("seed", 0)))
+            indices = torch.randperm(len(dataset), generator=generator).tolist()
         max_batches = int(opts.get("calibration_batches", 1000))
         batch_costs: List[int] = []
-        for ibatch, batch in enumerate(fixed_loader):
-            if ibatch >= max_batches:
+        fixed_batch_size = max(int(batch_size), 1)
+        for start in range(0, len(indices), fixed_batch_size):
+            if len(batch_costs) >= max_batches:
                 break
-            batch_costs.append(int(batch.__dptb_batch_cost__))
+            batch_indices = indices[start: start + fixed_batch_size]
+            batch_costs.append(
+                int(sum(_metadata_cost_parts(dataset, idx, estimator)[0] for idx in batch_indices))
+            )
         if not batch_costs:
             raise ValueError("dynamic_batch calibration found no batches.")
         q = float(opts.get("calibration_quantile", 0.95))

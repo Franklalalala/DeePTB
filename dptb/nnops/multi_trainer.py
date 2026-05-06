@@ -61,6 +61,16 @@ def _resolve_local_expert_dp_batch_size(
     return batch_size // expert_data_parallel_size
 
 
+def _base_train_options_for_multitrainer(train_options: dict) -> dict:
+    base_options = copy.deepcopy(train_options)
+    dynamic_batch = base_options.get("dynamic_batch", None)
+    if isinstance(dynamic_batch, dict) and dynamic_batch.get("enabled", False):
+        dynamic_batch = copy.deepcopy(dynamic_batch)
+        dynamic_batch["enabled"] = False
+        base_options["dynamic_batch"] = dynamic_batch
+    return base_options
+
+
 class _StageTagger:
     def __init__(
         self,
@@ -232,9 +242,10 @@ class MultiTrainer(Trainer):
         trainer_common_options = copy.deepcopy(common_options)
         if distributed_expert:
             trainer_common_options["device"] = "cpu"
+        trainer_train_options = _base_train_options_for_multitrainer(train_options)
 
         super().__init__(
-            train_options=train_options,
+            train_options=trainer_train_options,
             common_options=trainer_common_options,
             model=model,
             train_datasets=train_datasets,
@@ -242,6 +253,7 @@ class MultiTrainer(Trainer):
             validation_datasets=validation_datasets,
         )
         self.common_options = common_options
+        self.train_options = train_options
         if self.use_reference:
             self.reference_datasets = getattr(self, "reference_datesets", None)
         else:

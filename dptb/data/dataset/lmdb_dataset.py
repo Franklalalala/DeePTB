@@ -26,6 +26,34 @@ from dptb.data.interfaces.ham_to_feature import block_to_feature
 import pickle
 
 
+def _parse_lmdb_block_key(key: Any):
+    if not isinstance(key, str):
+        return None
+    parts = key.split("_")
+    if len(parts) != 5:
+        return None
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:
+        return None
+
+
+def _count_offsite_lmdb_blocks(blocks: Any) -> int:
+    if not isinstance(blocks, dict):
+        return 0
+
+    count = 0
+    for key in blocks.keys():
+        parsed = _parse_lmdb_block_key(key)
+        if parsed is None:
+            continue
+        i, j, rx, ry, rz = parsed
+        if i == j and rx == 0 and ry == 0 and rz == 0:
+            continue
+        count += 1
+    return count
+
+
 def _read_lmdb_entry(path: str, index: int):
     db_env = lmdb.open(
         path,
@@ -98,6 +126,7 @@ class LMDBDataset(AtomicDataset):
         self.index_map = []
         self._lmdb_path_map = []
         self._lmdb_env_cache = {}
+        self._dynamic_batch_cost_parts_cache = {}
         for file in self.info_files.keys():
             lmdb_paths = self.simple_get_lmdb_path(file)
             for lmdb_path in lmdb_paths:
@@ -154,6 +183,10 @@ class LMDBDataset(AtomicDataset):
         state["_lmdb_env_cache"] = {}
         return state
 
+    def invalidate_dynamic_batch_costs(self) -> None:
+        super().invalidate_dynamic_batch_costs()
+        self._dynamic_batch_cost_parts_cache = {}
+
     def __del__(self):
         for env in getattr(self, "_lmdb_env_cache", {}).values():
             try:
@@ -196,18 +229,29 @@ class LMDBDataset(AtomicDataset):
 
     def get_dynamic_batch_cost_parts(self, idx: int) -> Dict[str, int]:
         raw_idx = self._resolve_dynamic_batch_index(idx)
+        cache = getattr(self, "_dynamic_batch_cost_parts_cache", None)
+        if cache is None:
+            cache = {}
+            self._dynamic_batch_cost_parts_cache = cache
+        if raw_idx in cache:
+            return dict(cache[raw_idx])
+
         data_dict = self._load_data_dict(raw_idx)
         parts = _dynamic_batch_parts_from_data(data_dict)
-        has_edge_metadata = any(
-            key in data_dict
-            for key in (
-                AtomicDataDict.EDGE_INDEX_KEY,
-                AtomicDataDict.EDGE_FEATURES_KEY,
-                AtomicDataDict.EDGE_H0_KEY,
-            )
-        )
-        if parts.get("edge", 0) <= 0 and not has_edge_metadata:
-            return _dynamic_batch_parts_from_data(self.get(raw_idx))
+        if parts.get("edge", 0) <= 0:
+            block_keys = [
+                "hamiltonian",
+                getattr(self, "h0_key", "hamiltonian_0"),
+                "hamiltonian_0",
+                "density_matrix",
+                "overlap",
+            ]
+            for key in dict.fromkeys(block_keys):
+                edge_count = _count_offsite_lmdb_blocks(data_dict.get(key, None))
+                if edge_count > 0:
+                    parts["edge"] = edge_count
+                    break
+        cache[raw_idx] = dict(parts)
         return parts
 
     @property
