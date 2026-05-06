@@ -29,15 +29,7 @@ from dptb.data.AtomicData import _NESTED_FIELDS
 from ..transforms import TypeMapper
 
 
-_DYNAMIC_BATCH_COST_KEYS = (
-    "graph",
-    "node",
-    "edge",
-    "env",
-    "onsitenv",
-    "kpoint",
-    "eig_band_square",
-)
+_DYNAMIC_BATCH_COST_KEYS = ("block", "edge")
 
 
 def _shape0(value: Any) -> int:
@@ -82,70 +74,25 @@ def _get_value(data: Any, key: str, default=None):
         return getattr(data, key, default)
 
 
-def _eig_band_square(value: Any) -> int:
-    if value is None:
-        return 0
-    if torch.is_tensor(value):
-        if value.ndim >= 2:
-            return int(value.shape[-2] * (value.shape[-1] ** 2))
-        return int(value.numel())
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        if len(shape) >= 2:
-            return int(shape[-2] * (shape[-1] ** 2))
-        if len(shape) == 1:
-            return int(shape[0])
-    if isinstance(value, dict):
-        return int(sum(_eig_band_square(v) for v in value.values()))
-    if isinstance(value, (list, tuple)):
-        return int(sum(_eig_band_square(v) for v in value))
-    return 0
-
-
 def _normalize_dynamic_batch_cost_parts(parts: Dict[str, Any]) -> Dict[str, int]:
     out = {key: 0 for key in _DYNAMIC_BATCH_COST_KEYS}
-    out["graph"] = 1
     for key, value in dict(parts or {}).items():
         if key in out:
             out[key] = int(value)
-    out["graph"] = max(1, out["graph"])
     return out
 
 
 def _dynamic_batch_parts_from_data(data: Any) -> Dict[str, int]:
-    node = _shape0(_get_value(data, AtomicDataDict.POSITIONS_KEY, None))
-    if node <= 0:
-        node = _shape0(_get_value(data, AtomicDataDict.ATOMIC_NUMBERS_KEY, None))
-    if node <= 0:
-        node = _shape0(_get_value(data, AtomicDataDict.NODE_FEATURES_KEY, None))
-    if node <= 0:
-        node = _shape0(_get_value(data, AtomicDataDict.NODE_H0_KEY, None))
-
     edge = _index_count(_get_value(data, AtomicDataDict.EDGE_INDEX_KEY, None))
     if edge <= 0:
         edge = _shape0(_get_value(data, AtomicDataDict.EDGE_FEATURES_KEY, None))
     if edge <= 0:
         edge = _shape0(_get_value(data, AtomicDataDict.EDGE_H0_KEY, None))
 
-    env = _index_count(_get_value(data, AtomicDataDict.ENV_INDEX_KEY, None))
-    if env <= 0:
-        env = _shape0(_get_value(data, AtomicDataDict.ENV_FEATURES_KEY, None))
-
-    onsitenv = _index_count(_get_value(data, AtomicDataDict.ONSITENV_INDEX_KEY, None))
-    if onsitenv <= 0:
-        onsitenv = _shape0(_get_value(data, AtomicDataDict.ONSITENV_FEATURES_KEY, None))
-
     return _normalize_dynamic_batch_cost_parts(
         {
-            "graph": 1,
-            "node": max(1, node),
+            "block": 0,
             "edge": max(0, edge),
-            "env": max(0, env),
-            "onsitenv": max(0, onsitenv),
-            "kpoint": _shape0(_get_value(data, AtomicDataDict.KPOINT_KEY, None)),
-            "eig_band_square": _eig_band_square(
-                _get_value(data, AtomicDataDict.ENERGY_EIGENVALUE_KEY, None)
-            ),
         }
     )
 
@@ -452,41 +399,16 @@ class AtomicInMemoryDataset(AtomicDataset):
             return super().get_dynamic_batch_cost_parts(idx)
 
         raw_idx = self._resolve_dynamic_batch_index(idx)
-        node = self._slice_count(AtomicDataDict.POSITIONS_KEY, raw_idx)
-        if node <= 0:
-            node = self._slice_count(AtomicDataDict.ATOMIC_NUMBERS_KEY, raw_idx)
-        if node <= 0:
-            node = self._slice_count(AtomicDataDict.NODE_FEATURES_KEY, raw_idx)
-        if node <= 0:
-            node = self._slice_count(AtomicDataDict.NODE_H0_KEY, raw_idx)
-
         edge = self._slice_count(AtomicDataDict.EDGE_INDEX_KEY, raw_idx)
         if edge <= 0:
             edge = self._slice_count(AtomicDataDict.EDGE_FEATURES_KEY, raw_idx)
         if edge <= 0:
             edge = self._slice_count(AtomicDataDict.EDGE_H0_KEY, raw_idx)
 
-        env = self._slice_count(AtomicDataDict.ENV_INDEX_KEY, raw_idx)
-        if env <= 0:
-            env = self._slice_count(AtomicDataDict.ENV_FEATURES_KEY, raw_idx)
-
-        onsitenv = self._slice_count(AtomicDataDict.ONSITENV_INDEX_KEY, raw_idx)
-        if onsitenv <= 0:
-            onsitenv = self._slice_count(AtomicDataDict.ONSITENV_FEATURES_KEY, raw_idx)
-
-        eig_kpoints = self._slice_count(AtomicDataDict.ENERGY_EIGENVALUE_KEY, raw_idx)
-        eig_value = getattr(self.data, AtomicDataDict.ENERGY_EIGENVALUE_KEY, None)
-        eig_bands = int(eig_value.shape[-1]) if torch.is_tensor(eig_value) and eig_value.ndim >= 2 else 1
-
         return _normalize_dynamic_batch_cost_parts(
             {
-                "graph": 1,
-                "node": max(1, node),
+                "block": 0,
                 "edge": max(0, edge),
-                "env": max(0, env),
-                "onsitenv": max(0, onsitenv),
-                "kpoint": self._slice_count(AtomicDataDict.KPOINT_KEY, raw_idx),
-                "eig_band_square": int(eig_kpoints * eig_bands * eig_bands),
             }
         )
 

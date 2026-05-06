@@ -13,15 +13,7 @@ from dptb.utils.torch_geometric import Batch, Data, Dataset
 log = logging.getLogger(__name__)
 
 
-DYNAMIC_BATCH_PART_KEYS = (
-    "graph",
-    "node",
-    "edge",
-    "env",
-    "onsitenv",
-    "kpoint",
-    "eig_band_square",
-)
+DYNAMIC_BATCH_PART_KEYS = ("block", "edge")
 
 
 def _data_keys(data: Any):
@@ -79,76 +71,30 @@ def _num_index_items(x: Any) -> int:
     return 0
 
 
-def _nested_tensor_cost(x: Any, fn) -> int:
-    if x is None:
-        return 0
-    if torch.is_tensor(x):
-        return int(fn(x))
-    if isinstance(x, (list, tuple)):
-        return int(sum(_nested_tensor_cost(v, fn) for v in x))
-    if isinstance(x, dict):
-        return int(sum(_nested_tensor_cost(v, fn) for v in x.values()))
-    return 0
-
-
 class AtomicDataCostEstimator:
-    """Estimate graph cost before moving a batch to GPU."""
-
-    DEFAULT_WEIGHTS: Dict[str, float] = {
-        "graph": 1.0,
-        "node": 1.0,
-        "edge": 1.0,
-        "env": 1.0,
-        "onsitenv": 1.0,
-        "kpoint": 0.0,
-        "eig_band_square": 0.0,
-    }
+    """Estimate dynamic-batch sample cost from block-key or edge counts."""
 
     def __init__(
         self,
-        mode: str = "cost",
-        cost_weights: Optional[Dict[str, float]] = None,
+        mode: str = "block",
     ) -> None:
-        valid_modes = {"cost", "node", "edge", "env", "onsitenv"}
+        valid_modes = {"block", "edge"}
         if mode not in valid_modes:
             raise ValueError(f"dynamic_batch.mode must be one of {sorted(valid_modes)}, got {mode!r}")
         self.mode = mode
-        self.weights = dict(self.DEFAULT_WEIGHTS)
-        if cost_weights:
-            self.weights.update({str(k): float(v) for k, v in cost_weights.items()})
 
     def parts(self, data: Data) -> Dict[str, int]:
-        num_nodes = int(getattr(data, "num_nodes", 0) or 0)
-        if num_nodes <= 0:
-            for key in ("pos", "positions", "atomic_numbers", "atom_type", "atom_types", "x"):
-                num_nodes = _num_rows(_get_value(data, key, None))
-                if num_nodes > 0:
-                    break
-        num_nodes = max(int(num_nodes), 1)
-
         num_edges = int(getattr(data, "num_edges", 0) or 0)
         if num_edges <= 0:
             num_edges = _num_index_items(_get_value(data, "edge_index", None))
-
-        num_env = _num_index_items(_get_value(data, "env_index", None))
-        num_onsitenv = _num_index_items(_get_value(data, "onsitenv_index", None))
-        num_kpoints = _nested_tensor_cost(
-            _get_value(data, "kpoint", None),
-            lambda t: t.shape[0] if t.ndim >= 1 else 1,
-        )
-        eig_band_square = _nested_tensor_cost(
-            _get_value(data, "eigenvalue", None),
-            lambda t: (t.shape[-2] * (t.shape[-1] ** 2)) if t.ndim >= 2 else t.numel(),
-        )
+        if num_edges <= 0:
+            num_edges = _num_rows(_get_value(data, "edge_features", None))
+        if num_edges <= 0:
+            num_edges = _num_rows(_get_value(data, "edge_h0", None))
 
         return {
-            "graph": 1,
-            "node": int(num_nodes),
+            "block": 0,
             "edge": int(num_edges),
-            "env": int(num_env),
-            "onsitenv": int(num_onsitenv),
-            "kpoint": int(num_kpoints),
-            "eig_band_square": int(eig_band_square),
         }
 
     def __call__(self, data: Data) -> int:
@@ -157,22 +103,17 @@ class AtomicDataCostEstimator:
 
     def from_parts(self, parts: Dict[str, int]) -> int:
         parts = normalize_cost_parts(parts)
-        if self.mode == "node":
-            value = parts["node"]
+        if self.mode == "block":
+            value = parts["block"] or parts["edge"]
         elif self.mode == "edge":
-            value = parts["edge"]
-        elif self.mode == "env":
-            value = parts["env"]
-        elif self.mode == "onsitenv":
-            value = parts["onsitenv"]
+            value = parts["edge"] or parts["block"]
         else:
-            value = sum(self.weights.get(k, 0.0) * v for k, v in parts.items())
+            value = 0
         return max(1, int(math.ceil(float(value))))
 
 
 def normalize_cost_parts(parts: Optional[Dict[str, Any]]) -> Dict[str, int]:
     out = {key: 0 for key in DYNAMIC_BATCH_PART_KEYS}
-    out["graph"] = 1
     if not parts:
         return out
     for key, value in dict(parts).items():
@@ -183,7 +124,6 @@ def normalize_cost_parts(parts: Optional[Dict[str, Any]]) -> Dict[str, int]:
             out[key] = int(value)
         except (TypeError, ValueError):
             out[key] = 0
-    out["graph"] = max(1, int(out.get("graph", 1)))
     return out
 
 
@@ -239,7 +179,6 @@ def _attach_dynamic_metadata(
     item_costs: List[int],
     item_parts: List[Dict[str, int]],
     mode: str,
-    cost_weights: Dict[str, float],
 ) -> Batch:
     batch.__dptb_sample_indices__ = list(sample_indices) if sample_indices is not None else None
     batch.__dptb_item_costs__ = [int(v) for v in item_costs]
@@ -248,10 +187,9 @@ def _attach_dynamic_metadata(
     batch.__dptb_batch_num_graphs__ = int(len(item_costs))
     batch.__dptb_batch_max_item_cost__ = int(max(item_costs)) if item_costs else 0
     normalized_parts = batch.__dptb_item_parts__
-    batch.__dptb_batch_num_nodes__ = int(sum(p.get("node", 0) for p in normalized_parts))
+    batch.__dptb_batch_num_nodes__ = int(getattr(batch, "num_nodes", 0) or 0)
     batch.__dptb_batch_num_edges__ = int(sum(p.get("edge", 0) for p in normalized_parts))
     batch.__dptb_dynamic_batch_mode__ = str(mode)
-    batch.__dptb_dynamic_batch_cost_weights__ = dict(cost_weights)
     return batch
 
 
@@ -286,7 +224,6 @@ def _collate_dynamic_data_list(
         item_costs=item_costs,
         item_parts=item_parts,
         mode=cost_estimator.mode,
-        cost_weights=cost_estimator.weights,
     )
 
 
@@ -297,9 +234,8 @@ def split_batch_for_oom(batch: Batch, exclude_keys: Optional[List[str]] = None):
     data_list = batch.to_data_list()
     mid = max(1, len(data_list) // 2)
     sample_indices = getattr(batch, "__dptb_sample_indices__", None)
-    mode = getattr(batch, "__dptb_dynamic_batch_mode__", "cost")
-    cost_weights = getattr(batch, "__dptb_dynamic_batch_cost_weights__", None)
-    estimator = AtomicDataCostEstimator(mode=mode, cost_weights=cost_weights)
+    mode = getattr(batch, "__dptb_dynamic_batch_mode__", "block")
+    estimator = AtomicDataCostEstimator(mode=mode)
     exclude_keys = exclude_keys or []
     left_indices = sample_indices[:mid] if sample_indices is not None else None
     right_indices = sample_indices[mid:] if sample_indices is not None else None
@@ -324,7 +260,6 @@ def split_batch_for_oom(batch: Batch, exclude_keys: Optional[List[str]] = None):
             item_costs=[int(v) for v in item_costs[:mid]],
             item_parts=[dict(p) for p in item_parts[:mid]],
             mode=mode,
-            cost_weights=estimator.weights,
         )
         _attach_dynamic_metadata(
             right,
@@ -332,20 +267,19 @@ def split_batch_for_oom(batch: Batch, exclude_keys: Optional[List[str]] = None):
             item_costs=[int(v) for v in item_costs[mid:]],
             item_parts=[dict(p) for p in item_parts[mid:]],
             mode=mode,
-            cost_weights=estimator.weights,
         )
     return left, right
 
 
 class DynamicCostBatchSampler(Sampler[List[int]]):
-    """Yield dataset index batches capped by a DeePTB graph-cost budget."""
+    """Yield dataset index batches capped by a DeePTB block/edge budget."""
 
     def __init__(
         self,
         dataset,
         *,
         max_cost: int,
-        mode: str = "cost",
+        mode: str = "block",
         max_samples: Optional[int] = None,
         shuffle: bool = False,
         drop_last: bool = False,
@@ -354,7 +288,6 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
         packing_strategy: Optional[str] = None,
         min_samples: Optional[int] = None,
         seed: int = 0,
-        cost_weights: Optional[Dict[str, float]] = None,
         rank: int = 0,
         world_size: int = 1,
         num_steps: Optional[int] = None,
@@ -379,7 +312,7 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.num_steps = None if num_steps is None else int(num_steps)
-        self.cost_estimator = AtomicDataCostEstimator(mode=mode, cost_weights=cost_weights)
+        self.cost_estimator = AtomicDataCostEstimator(mode=mode)
         if packing_strategy is None:
             packing_strategy = "random_evict" if self.shuffle and self.max_samples is not None else "sequential"
         packing_strategy = str(packing_strategy)
@@ -418,14 +351,10 @@ class DynamicCostBatchSampler(Sampler[List[int]]):
             dataset_version = dataset_version()
         return dataset_version
 
-    def _weights_key(self):
-        return tuple(sorted((str(k), float(v)) for k, v in self.cost_estimator.weights.items()))
-
     def _cost_signature(self):
         return (
             self._dataset_cost_version(),
             self.cost_estimator.mode,
-            self._weights_key(),
         )
 
     def _cache_key(self):
@@ -820,14 +749,11 @@ def resolve_dynamic_batch_options(
 
     opts = dict(dynamic_batch)
     if opts.get("max_edge", None) is not None:
-        opts["max_cost"] = opts["max_edge"]
-        opts["mode"] = "edge"
-        opts["cost_weights"] = None
-    else:
-        opts.setdefault("mode", "edge")
-        opts.setdefault("cost_weights", None)
-        if opts.get("mode") == "edge":
-            opts["cost_weights"] = None
+        opts["max_cost"] = opts.get("max_cost", opts["max_edge"])
+    mode = str(opts.get("mode", "block"))
+    opts["mode"] = mode
+    if mode not in {"block", "edge"}:
+        raise ValueError(f"dynamic_batch.mode must be one of ['block', 'edge'], got {mode!r}")
     opts.setdefault("max_samples", batch_size)
     opts.setdefault("shuffle", shuffle)
     opts.setdefault("drop_last", False)
@@ -848,8 +774,7 @@ def resolve_dynamic_batch_options(
         if not opts.get("calibrate", False):
             raise ValueError("dynamic_batch is enabled but max_cost is not set and calibrate is false.")
         estimator = AtomicDataCostEstimator(
-            mode=opts.get("mode", "cost"),
-            cost_weights=opts.get("cost_weights", None),
+            mode=opts.get("mode", "block"),
         )
         indices = list(range(len(dataset)))
         if bool(shuffle):
@@ -872,7 +797,7 @@ def resolve_dynamic_batch_options(
         q = min(max(q, 0.0), 1.0)
         quantile = torch.quantile(torch.tensor(batch_costs, dtype=torch.float32), q)
         opts["max_cost"] = int(math.ceil(float(quantile.item())))
-        if opts.get("mode") == "edge":
+        if opts.get("mode") in {"block", "edge"}:
             opts["max_edge"] = opts["max_cost"]
         opts["calibrated"] = True
         opts["calibration_batch_costs"] = batch_costs
@@ -887,9 +812,8 @@ def resolve_dynamic_batch_options(
         )
 
     opts["max_cost"] = int(opts["max_cost"])
-    if opts.get("mode") == "edge":
+    if opts.get("mode") in {"block", "edge"}:
         opts["max_edge"] = int(opts.get("max_edge", opts["max_cost"]))
-        opts["cost_weights"] = None
     opts["max_samples"] = None if opts.get("max_samples") is None else int(opts["max_samples"])
     opts["min_samples"] = int(opts.get("min_samples", 1))
     return opts
@@ -988,7 +912,7 @@ class DataLoader(torch.utils.data.DataLoader):
             batch_sampler = DynamicCostBatchSampler(
                 dataset,
                 max_cost=resolved_dynamic_batch["max_cost"],
-                mode=resolved_dynamic_batch.get("mode", "cost"),
+                mode=resolved_dynamic_batch.get("mode", "block"),
                 max_samples=resolved_dynamic_batch.get("max_samples", batch_size),
                 shuffle=resolved_dynamic_batch.get("shuffle", shuffle),
                 drop_last=resolved_dynamic_batch.get("drop_last", False),
@@ -997,7 +921,6 @@ class DataLoader(torch.utils.data.DataLoader):
                 packing_strategy=resolved_dynamic_batch.get("packing_strategy", None),
                 min_samples=resolved_dynamic_batch.get("min_samples", None),
                 seed=resolved_dynamic_batch.get("seed", 0),
-                cost_weights=resolved_dynamic_batch.get("cost_weights", None),
                 rank=rank,
                 world_size=world_size,
                 num_steps=resolved_dynamic_batch.get("num_steps", None),

@@ -50,7 +50,7 @@ class MetadataCostDataset(ToyDataset):
 
     def get_dynamic_batch_cost_parts(self, idx):
         self.metadata_reads += 1
-        return {"graph": 1, "node": int(self.node_counts[idx])}
+        return {"block": int(self.node_counts[idx])}
 
 
 class PreferLoadedCostDataset(MetadataCostDataset):
@@ -63,7 +63,7 @@ class EdgeMetadataDataset(ToyDataset):
         self.edge_counts = list(edge_counts)
 
     def get_dynamic_batch_cost_parts(self, idx):
-        return {"graph": 1, "node": 1, "edge": int(self.edge_counts[idx])}
+        return {"edge": int(self.edge_counts[idx])}
 
 
 class CallableVersionDataset(MetadataCostDataset):
@@ -76,41 +76,30 @@ class CallableVersionDataset(MetadataCostDataset):
         return self.version_value
 
 
-def test_cost_estimator_uses_deeptb_graph_terms():
+def test_cost_estimator_uses_block_or_edge_counts_only():
     data = ToyDataset([4])[0]
-    estimator = AtomicDataCostEstimator(
-        mode="cost",
-        cost_weights={
-            "graph": 10.0,
-            "node": 2.0,
-            "edge": 3.0,
-            "env": 5.0,
-            "onsitenv": 7.0,
-            "kpoint": 11.0,
-            "eig_band_square": 0.0,
-        },
-    )
+    edge_estimator = AtomicDataCostEstimator(mode="edge")
+    block_estimator = AtomicDataCostEstimator(mode="block")
 
-    parts = estimator.parts(data)
+    parts = edge_estimator.parts(data)
 
-    assert parts["graph"] == 1
-    assert parts["node"] == 4
+    assert parts["block"] == 0
     assert parts["edge"] == 5
-    assert parts["env"] == 6
-    assert parts["onsitenv"] == 7
-    assert parts["kpoint"] == 2
-    assert estimator(data) == 10 + 2 * 4 + 3 * 5 + 5 * 6 + 7 * 7 + 11 * 2
+    assert edge_estimator(data) == 5
+    assert block_estimator(data) == 5
+    assert block_estimator.from_parts({"block": 7, "edge": 5}) == 7
+    assert edge_estimator.from_parts({"block": 7, "edge": 5}) == 5
 
 
 def test_dynamic_loader_caps_cost_and_keeps_batch_size_as_max_samples():
-    dataset = ToyDataset([4, 5, 12, 3])
+    dataset = MetadataCostDataset([4, 5, 12, 3])
     loader = DataLoader(
         dataset,
         batch_size=3,
         shuffle=False,
         dynamic_batch={
             "enabled": True,
-            "mode": "node",
+            "mode": "block",
             "max_cost": 10,
         },
     )
@@ -126,11 +115,11 @@ def test_dynamic_loader_caps_cost_and_keeps_batch_size_as_max_samples():
 
 
 def test_dynamic_sampler_caches_epoch_batches_for_len_and_iter():
-    dataset = ToyDataset([1, 1, 1, 1])
+    dataset = MetadataCostDataset([1, 1, 1, 1])
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=2,
-        mode="node",
+        mode="block",
         max_samples=2,
         shuffle=False,
     )
@@ -167,7 +156,7 @@ def test_dynamic_sampler_uses_metadata_costs_and_manual_invalidation():
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=10,
-        mode="node",
+        mode="block",
         shuffle=False,
     )
 
@@ -234,7 +223,7 @@ def test_dynamic_metadata_parts_are_normalized_when_dataset_returns_partial_part
         shuffle=False,
         dynamic_batch={
             "enabled": True,
-            "mode": "env",
+            "mode": "block",
             "max_cost": 100,
         },
     )
@@ -242,15 +231,10 @@ def test_dynamic_metadata_parts_are_normalized_when_dataset_returns_partial_part
     batch = next(iter(loader))
 
     assert batch.__dptb_item_parts__[0] == {
-        "graph": 1,
-        "node": 2,
+        "block": 2,
         "edge": 0,
-        "env": 0,
-        "onsitenv": 0,
-        "kpoint": 0,
-        "eig_band_square": 0,
     }
-    assert batch.__dptb_item_costs__ == [1, 1]
+    assert batch.__dptb_item_costs__ == [2, 2]
 
 
 def test_dynamic_sampler_dataset_cost_version_invalidates_cost_cache():
@@ -258,7 +242,7 @@ def test_dynamic_sampler_dataset_cost_version_invalidates_cost_cache():
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=10,
-        mode="node",
+        mode="block",
         shuffle=False,
     )
 
@@ -276,7 +260,7 @@ def test_dynamic_sampler_callable_cost_version_invalidates_cost_cache():
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=10,
-        mode="node",
+        mode="block",
         shuffle=False,
     )
 
@@ -289,20 +273,31 @@ def test_dynamic_sampler_callable_cost_version_invalidates_cost_cache():
     assert dataset.item_reads == 0
 
 
-def test_dynamic_sampler_cost_cache_invalidates_when_estimator_signature_changes():
-    dataset = MetadataCostDataset([2, 2])
+class BlockEdgeMetadataDataset(ToyDataset):
+    def __init__(self, block_counts, edge_counts):
+        super().__init__([1 for _ in block_counts])
+        self.block_counts = list(block_counts)
+        self.edge_counts = list(edge_counts)
+
+    def get_dynamic_batch_cost_parts(self, idx):
+        return {
+            "block": int(self.block_counts[idx]),
+            "edge": int(self.edge_counts[idx]),
+        }
+
+
+def test_dynamic_sampler_cost_cache_invalidates_when_estimator_mode_changes():
+    dataset = BlockEdgeMetadataDataset([2, 2], [20, 2])
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=10,
-        mode="node",
+        mode="block",
         shuffle=False,
-        cost_weights={"node": 1.0},
     )
 
     assert list(sampler) == [[0, 1]]
 
-    sampler.cost_estimator.mode = "cost"
-    sampler.cost_estimator.weights["node"] = 10.0
+    sampler.cost_estimator.mode = "edge"
 
     assert list(sampler) == [[0], [1]]
 
@@ -313,7 +308,7 @@ def test_dynamic_loader_metadata_costs_drive_batch_metadata():
         dataset,
         batch_size=2,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )
 
     batch = next(iter(loader))
@@ -339,15 +334,15 @@ def test_dynamic_loader_prefers_loaded_data_when_dataset_opts_in():
         dataset,
         batch_size=2,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )
 
     batch = next(iter(loader))
 
     assert dataset.item_reads == 2
     assert dataset.metadata_reads == 2
-    assert batch.__dptb_item_costs__ == [2, 2]
-    assert batch.__dptb_batch_cost__ == 4
+    assert batch.__dptb_item_costs__ == [3, 3]
+    assert batch.__dptb_batch_cost__ == 6
 
 
 def test_dynamic_batch_calibration_uses_metadata_cost_getter():
@@ -359,7 +354,7 @@ def test_dynamic_batch_calibration_uses_metadata_cost_getter():
         shuffle=False,
         dynamic_batch={
             "enabled": True,
-            "mode": "node",
+            "mode": "block",
             "calibrate": True,
             "calibration_batches": 10,
             "calibration_quantile": 1.0,
@@ -381,7 +376,7 @@ def test_dynamic_batch_resolved_calibration_does_not_rescan_dataset():
         shuffle=False,
         dynamic_batch={
             "enabled": True,
-            "mode": "node",
+            "mode": "block",
             "calibrate": True,
             "calibration_batches": 10,
             "calibration_quantile": 1.0,
@@ -405,7 +400,7 @@ def test_dynamic_batch_resolved_calibration_does_not_rescan_dataset():
     assert dataset.metadata_reads == metadata_reads
 
 
-def test_dynamic_batch_max_edge_alias_uses_edge_only_calibration():
+def test_dynamic_batch_max_edge_alias_keeps_default_block_mode():
     dataset = EdgeMetadataDataset([10, 20, 30, 40])
 
     opts = resolve_dynamic_batch_options(
@@ -415,14 +410,12 @@ def test_dynamic_batch_max_edge_alias_uses_edge_only_calibration():
         dynamic_batch={
             "enabled": True,
             "max_edge": 45,
-            "cost_weights": {"node": 999.0, "edge": 1.0},
         },
     )
 
-    assert opts["mode"] == "edge"
+    assert opts["mode"] == "block"
     assert opts["max_cost"] == 45
     assert opts["max_edge"] == 45
-    assert opts["cost_weights"] is None
 
     opts = resolve_dynamic_batch_options(
         dataset,
@@ -433,11 +426,10 @@ def test_dynamic_batch_max_edge_alias_uses_edge_only_calibration():
             "calibrate": True,
             "calibration_batches": 10,
             "calibration_quantile": 1.0,
-            "cost_weights": {"node": 999.0, "edge": 1.0},
         },
     )
 
-    assert opts["mode"] == "edge"
+    assert opts["mode"] == "block"
     assert opts["max_edge"] == 70
     assert opts["max_cost"] == 70
     assert opts["calibration_batch_costs"] == [30, 70]
@@ -471,7 +463,7 @@ def test_dynamic_loader_forwards_invalidate_dynamic_batch_cache():
         dataset,
         batch_size=2,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 10},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 10},
     )
 
     assert list(loader.dynamic_batch_sampler) == [[0, 1]]
@@ -489,7 +481,7 @@ def test_dynamic_sampler_padding_uses_deterministic_non_last_sources(caplog):
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=1,
-        mode="node",
+        mode="block",
         max_samples=1,
         shuffle=False,
         seed=123,
@@ -506,7 +498,7 @@ def test_dynamic_sampler_padding_uses_deterministic_non_last_sources(caplog):
         DynamicCostBatchSampler(
             dataset,
             max_cost=1,
-            mode="node",
+            mode="block",
             max_samples=1,
             shuffle=False,
             seed=123,
@@ -524,7 +516,7 @@ def test_dynamic_sampler_padding_events_are_bounded():
     sampler = DynamicCostBatchSampler(
         dataset,
         max_cost=1,
-        mode="node",
+        mode="block",
         max_samples=1,
         shuffle=False,
         seed=123,
@@ -542,7 +534,7 @@ def test_dynamic_sampler_world_size_padding_keeps_equal_rank_lengths():
     common = dict(
         dataset=dataset,
         max_cost=1,
-        mode="node",
+        mode="block",
         max_samples=1,
         shuffle=False,
         seed=123,
@@ -560,7 +552,7 @@ def test_dynamic_sampler_world_size_padding_keeps_equal_rank_lengths():
 
 
 def test_calibration_derives_quantile_from_fixed_batch_totals():
-    dataset = ToyDataset([1, 2, 10, 20, 5])
+    dataset = MetadataCostDataset([1, 2, 10, 20, 5])
 
     opts = resolve_dynamic_batch_options(
         dataset,
@@ -568,7 +560,7 @@ def test_calibration_derives_quantile_from_fixed_batch_totals():
         shuffle=False,
         dynamic_batch={
             "enabled": True,
-            "mode": "node",
+            "mode": "block",
             "calibrate": True,
             "calibration_batches": 10,
             "calibration_quantile": 0.5,
@@ -582,14 +574,14 @@ def test_calibration_derives_quantile_from_fixed_batch_totals():
 
 
 def test_split_batch_for_oom_bisects_and_preserves_metadata():
-    dataset = ToyDataset([2, 3, 4, 5])
+    dataset = MetadataCostDataset([2, 3, 4, 5])
     loader = DataLoader(
         dataset,
         batch_size=4,
         shuffle=False,
         dynamic_batch={
             "enabled": True,
-            "mode": "node",
+            "mode": "block",
             "max_cost": 100,
         },
     )
@@ -631,13 +623,8 @@ def test_atomic_inmemory_dataset_exposes_dynamic_batch_cost_parts_without_get_ex
     dataset._indices = None
 
     assert dataset.get_dynamic_batch_cost_parts(1) == {
-        "graph": 1,
-        "node": 4,
+        "block": 0,
         "edge": 6,
-        "env": 7,
-        "onsitenv": 8,
-        "kpoint": 1,
-        "eig_band_square": 9,
     }
 
 
@@ -655,17 +642,12 @@ def test_lmdb_dataset_exposes_dynamic_batch_cost_parts_from_entry_metadata():
     dataset._load_data_dict = lambda idx: data_dict
 
     assert dataset.get_dynamic_batch_cost_parts(0) == {
-        "graph": 1,
-        "node": 3,
+        "block": 0,
         "edge": 5,
-        "env": 0,
-        "onsitenv": 0,
-        "kpoint": 2,
-        "eig_band_square": 72,
     }
 
 
-def test_lmdb_dataset_uses_raw_block_keys_for_dynamic_edge_cost_without_get():
+def test_lmdb_dataset_uses_raw_block_keys_for_dynamic_block_cost_without_get():
     dataset = LMDBDataset.__new__(LMDBDataset)
     dataset._indices = None
     dataset.num_graphs = 1
@@ -684,22 +666,17 @@ def test_lmdb_dataset_uses_raw_block_keys_for_dynamic_edge_cost_without_get():
     dataset._load_data_dict = lambda idx: data_dict
 
     def _unexpected_get(idx):
-        raise AssertionError("dynamic batch edge-cost metadata must not materialize LMDB samples")
+        raise AssertionError("dynamic batch block-cost metadata must not materialize LMDB samples")
 
     dataset.get = _unexpected_get
 
     assert dataset.get_dynamic_batch_cost_parts(0) == {
-        "graph": 1,
-        "node": 3,
-        "edge": 3,
-        "env": 0,
-        "onsitenv": 0,
-        "kpoint": 0,
-        "eig_band_square": 0,
+        "block": 3,
+        "edge": 0,
     }
 
 
-def test_lmdb_dataset_uses_raw_h0_block_keys_for_dynamic_edge_cost():
+def test_lmdb_dataset_uses_raw_h0_block_keys_for_dynamic_block_cost():
     dataset = LMDBDataset.__new__(LMDBDataset)
     dataset._indices = None
     dataset.num_graphs = 1
@@ -716,7 +693,7 @@ def test_lmdb_dataset_uses_raw_h0_block_keys_for_dynamic_edge_cost():
     }
     dataset._load_data_dict = lambda idx: data_dict
 
-    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 2
+    assert dataset.get_dynamic_batch_cost_parts(0)["block"] == 2
 
 
 def test_lmdb_dataset_dynamic_cost_parts_are_cached():
@@ -740,12 +717,12 @@ def test_lmdb_dataset_dynamic_cost_parts_are_cached():
 
     dataset._load_data_dict = _load_data_dict
 
-    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 1
-    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 1
+    assert dataset.get_dynamic_batch_cost_parts(0)["block"] == 1
+    assert dataset.get_dynamic_batch_cost_parts(0)["block"] == 1
     assert loads["count"] == 1
 
     dataset.invalidate_dynamic_batch_costs()
-    assert dataset.get_dynamic_batch_cost_parts(0)["edge"] == 1
+    assert dataset.get_dynamic_batch_cost_parts(0)["block"] == 1
     assert loads["count"] == 2
 
 
@@ -914,7 +891,7 @@ def test_multitrainer_iteration_oom_fallback_skips_batch_without_step():
         dataset,
         batch_size=4,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )))
 
     param = torch.nn.Parameter(torch.tensor(1.0))
@@ -954,7 +931,7 @@ def test_multitrainer_iteration_oom_fallback_disabled_reraises():
         dataset,
         batch_size=4,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )))
     param = torch.nn.Parameter(torch.tensor(1.0))
     opt = _CountingSGD([param])
@@ -977,7 +954,7 @@ def test_multitrainer_iteration_oom_after_optimizer_step_does_not_retry():
         dataset,
         batch_size=4,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )))
     param = torch.nn.Parameter(torch.tensor(1.0))
     opt = _CountingSGD([param])
@@ -1007,7 +984,7 @@ def test_multitrainer_distributed_oom_fallback_does_not_sync_without_local_oom(m
         dataset,
         batch_size=4,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )))
     param = torch.nn.Parameter(torch.tensor(1.0))
     opt = _CountingSGD([param])
@@ -1055,7 +1032,7 @@ def test_multitrainer_distributed_oom_fallback_skips_after_local_oom(monkeypatch
         dataset,
         batch_size=4,
         shuffle=False,
-        dynamic_batch={"enabled": True, "mode": "node", "max_cost": 100},
+        dynamic_batch={"enabled": True, "mode": "block", "max_cost": 100},
     )))
     param = torch.nn.Parameter(torch.tensor(1.0))
     opt = _CountingSGD([param])

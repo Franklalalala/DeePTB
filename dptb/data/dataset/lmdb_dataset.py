@@ -238,19 +238,18 @@ class LMDBDataset(AtomicDataset):
 
         data_dict = self._load_data_dict(raw_idx)
         parts = _dynamic_batch_parts_from_data(data_dict)
-        if parts.get("edge", 0) <= 0:
-            block_keys = [
-                "hamiltonian",
-                getattr(self, "h0_key", "hamiltonian_0"),
-                "hamiltonian_0",
-                "density_matrix",
-                "overlap",
-            ]
-            for key in dict.fromkeys(block_keys):
-                edge_count = _count_offsite_lmdb_blocks(data_dict.get(key, None))
-                if edge_count > 0:
-                    parts["edge"] = edge_count
-                    break
+        block_keys = [
+            "hamiltonian",
+            getattr(self, "h0_key", "hamiltonian_0"),
+            "hamiltonian_0",
+            "density_matrix",
+            "overlap",
+        ]
+        for key in dict.fromkeys(block_keys):
+            block_count = _count_offsite_lmdb_blocks(data_dict.get(key, None))
+            if block_count > 0:
+                parts["block"] = block_count
+                break
         cache[raw_idx] = dict(parts)
         return parts
 

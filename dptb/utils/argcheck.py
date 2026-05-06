@@ -113,24 +113,17 @@ def common_options():
 
 def dynamic_batch_options():
     doc = (
-        "Dynamic DeePTB graph-cost batching. When enabled, batch_size remains "
+        "Dynamic DeePTB block/edge batching. When enabled, batch_size remains "
         "the maximum number of samples per batch, while max_cost caps the total "
-        "graph cost. If max_cost is omitted and calibrate is true, DeePTB first "
-        "scans fixed-batch CPU dataloader batches and derives max_cost from the "
-        "requested calibration quantile."
+        "sample cost. The default mode is block, which uses raw Hamiltonian/H0 "
+        "offsite block-key counts when available and falls back to edge counts. "
+        "The edge mode uses edge counts and falls back to block counts. If "
+        "max_cost is omitted and calibrate is true, DeePTB derives max_cost from "
+        "the requested calibration quantile over fixed-size batches."
     )
-    weight_args = [
-        Argument("graph", (int, float), optional=True, default=1.0),
-        Argument("node", (int, float), optional=True, default=1.0),
-        Argument("edge", (int, float), optional=True, default=1.0),
-        Argument("env", (int, float), optional=True, default=1.0),
-        Argument("onsitenv", (int, float), optional=True, default=1.0),
-        Argument("kpoint", (int, float), optional=True, default=0.0),
-        Argument("eig_band_square", (int, float), optional=True, default=0.0),
-    ]
     args = [
         Argument("enabled", bool, optional=True, default=False),
-        Argument("mode", str, optional=True, default="cost"),
+        Argument("mode", str, optional=True, default="block"),
         Argument("max_cost", [int, float, None], optional=True, default=None),
         Argument("max_edge", [int, float, None], optional=True, default=None),
         Argument("max_samples", [int, None], optional=True, default=None),
@@ -147,7 +140,6 @@ def dynamic_batch_options():
         Argument("use_global_dist", bool, optional=True, default=False),
         Argument("oom_fallback", bool, optional=True, default=False),
         Argument("oom_shrink_factor", (int, float), optional=True, default=0.8),
-        Argument("cost_weights", dict, optional=True, default={}, sub_fields=weight_args),
     ]
     return Argument(
         "dynamic_batch",
