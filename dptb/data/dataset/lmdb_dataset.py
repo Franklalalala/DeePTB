@@ -72,6 +72,16 @@ def _read_lmdb_entry(path: str, index: int):
         db_env.close()
 
 
+def _lmdb_tensor(value: Any, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    tensor = torch.as_tensor(value)
+    if dtype is not None:
+        tensor = tensor.to(dtype=dtype)
+    return tensor
+
+
+_ATOMICDATA_CONSTRUCTOR_OPTIONS = {"r_max", "er_max", "oer_max", "self_interaction"}
+
+
 class LMDBDataset(AtomicDataset):
     prefer_loaded_dynamic_batch_cost_parts = True
 
@@ -348,15 +358,6 @@ class LMDBDataset(AtomicDataset):
             cache_info.update({key: self.info_files[self.file_map[idx]][key]})
             del self.info_files[self.file_map[idx]][key]
 
-        atomicdata = AtomicData.from_points(
-            pos=pos.reshape(-1, 3),
-            cell=cell.reshape(3, 3),
-            atomic_numbers=atomic_numbers,
-            pbc=pbc,
-            **self.info_files[self.file_map[idx]]
-        )
-        self.info_files[self.file_map[idx]].update(cache_info)
-
         # transform blocks to atomicdata features, or use precomputed features directly
         need_main_features = bool(self.get_Hamiltonian or self.get_DM)
         need_overlap_features = bool(self.get_overlap)
@@ -365,20 +366,121 @@ class LMDBDataset(AtomicDataset):
             pre_edge_overlap is not None and (self.orthogonal or pre_node_overlap is not None)
         )
 
+        uses_pre_main = bool(has_pre_main and has_pre_overlap)
+        uses_pre_h0 = bool(
+            self.get_H0
+            and self.prefer_precomputed_h0
+            and node_h0 is not None
+            and edge_h0 is not None
+        )
+        stored_edge_index = data_dict.get(AtomicDataDict.EDGE_INDEX_KEY, None)
+        stored_edge_shift = data_dict.get(AtomicDataDict.EDGE_CELL_SHIFT_KEY, None)
+        has_stored_edge_graph = stored_edge_index is not None and stored_edge_shift is not None
+        info = self.info_files[self.file_map[idx]]
+        needs_missing_env_graph = (
+            info.get("er_max", None) is not None
+            and data_dict.get(AtomicDataDict.ENV_INDEX_KEY, None) is None
+        )
+        needs_missing_onsitenv_graph = (
+            info.get("oer_max", None) is not None
+            and data_dict.get(AtomicDataDict.ONSITENV_INDEX_KEY, None) is None
+        )
+        use_stored_edge_graph = bool(
+            has_stored_edge_graph
+            and (uses_pre_main or uses_pre_h0)
+            and not needs_missing_env_graph
+            and not needs_missing_onsitenv_graph
+        )
+
+        if use_stored_edge_graph:
+            atomicdata_kwargs = {
+                key: value
+                for key, value in info.items()
+                if key not in _ATOMICDATA_CONSTRUCTOR_OPTIONS
+            }
+            atomicdata_kwargs[AtomicDataDict.EDGE_INDEX_KEY] = _lmdb_tensor(stored_edge_index, torch.long)
+            atomicdata_kwargs[AtomicDataDict.EDGE_CELL_SHIFT_KEY] = _lmdb_tensor(
+                stored_edge_shift, torch.get_default_dtype()
+            )
+            if data_dict.get(AtomicDataDict.ENV_INDEX_KEY, None) is not None:
+                atomicdata_kwargs[AtomicDataDict.ENV_INDEX_KEY] = _lmdb_tensor(
+                    data_dict[AtomicDataDict.ENV_INDEX_KEY], torch.long
+                )
+            if data_dict.get(AtomicDataDict.ENV_CELL_SHIFT_KEY, None) is not None:
+                atomicdata_kwargs[AtomicDataDict.ENV_CELL_SHIFT_KEY] = _lmdb_tensor(
+                    data_dict[AtomicDataDict.ENV_CELL_SHIFT_KEY], torch.get_default_dtype()
+                )
+            if data_dict.get(AtomicDataDict.ONSITENV_INDEX_KEY, None) is not None:
+                atomicdata_kwargs[AtomicDataDict.ONSITENV_INDEX_KEY] = _lmdb_tensor(
+                    data_dict[AtomicDataDict.ONSITENV_INDEX_KEY], torch.long
+                )
+            if data_dict.get(AtomicDataDict.ONSITENV_CELL_SHIFT_KEY, None) is not None:
+                atomicdata_kwargs[AtomicDataDict.ONSITENV_CELL_SHIFT_KEY] = _lmdb_tensor(
+                    data_dict[AtomicDataDict.ONSITENV_CELL_SHIFT_KEY], torch.get_default_dtype()
+                )
+            atomicdata = AtomicData(
+                pos=_lmdb_tensor(pos.reshape(-1, 3), torch.get_default_dtype()),
+                cell=_lmdb_tensor(cell.reshape(3, 3), torch.get_default_dtype()),
+                atomic_numbers=_lmdb_tensor(atomic_numbers, torch.long),
+                pbc=_lmdb_tensor(pbc, torch.bool),
+                **atomicdata_kwargs,
+            )
+        else:
+            atomicdata = AtomicData.from_points(
+                pos=pos.reshape(-1, 3),
+                cell=cell.reshape(3, 3),
+                atomic_numbers=atomic_numbers,
+                pbc=pbc,
+                **info
+            )
+        self.info_files[self.file_map[idx]].update(cache_info)
+
+        num_edges = atomicdata[AtomicDataDict.EDGE_INDEX_KEY].shape[1]
+        num_nodes = atomicdata.num_nodes
+
         if has_pre_main and has_pre_overlap:
-            atomicdata[AtomicDataDict.NODE_FEATURES_KEY] = torch.as_tensor(pre_node_features)
-            atomicdata[AtomicDataDict.EDGE_FEATURES_KEY] = torch.as_tensor(pre_edge_features)
+            pre_node_features = torch.as_tensor(pre_node_features)
+            pre_edge_features = torch.as_tensor(pre_edge_features)
+            if pre_node_features.shape[0] != num_nodes or pre_edge_features.shape[0] != num_edges:
+                raise ValueError(
+                    "Precomputed LMDB feature rows do not match the active graph: "
+                    f"node_features={tuple(pre_node_features.shape)}, "
+                    f"edge_features={tuple(pre_edge_features.shape)}, "
+                    f"num_nodes={num_nodes}, num_edges={num_edges}."
+                )
+            atomicdata[AtomicDataDict.NODE_FEATURES_KEY] = pre_node_features
+            atomicdata[AtomicDataDict.EDGE_FEATURES_KEY] = pre_edge_features
             if need_overlap_features:
+                pre_edge_overlap = torch.as_tensor(pre_edge_overlap)
+                if pre_edge_overlap.shape[0] != num_edges:
+                    raise ValueError(
+                        "Precomputed LMDB edge overlap rows do not match the active graph: "
+                        f"edge_overlap={tuple(pre_edge_overlap.shape)}, num_edges={num_edges}."
+                    )
                 if not self.orthogonal:
-                    atomicdata[AtomicDataDict.NODE_OVERLAP_KEY] = torch.as_tensor(pre_node_overlap)
-                atomicdata[AtomicDataDict.EDGE_OVERLAP_KEY] = torch.as_tensor(pre_edge_overlap)
+                    pre_node_overlap = torch.as_tensor(pre_node_overlap)
+                    if pre_node_overlap.shape[0] != num_nodes:
+                        raise ValueError(
+                            "Precomputed LMDB node overlap rows do not match the active graph: "
+                            f"node_overlap={tuple(pre_node_overlap.shape)}, num_nodes={num_nodes}."
+                        )
+                    atomicdata[AtomicDataDict.NODE_OVERLAP_KEY] = pre_node_overlap
+                atomicdata[AtomicDataDict.EDGE_OVERLAP_KEY] = pre_edge_overlap
         elif self.get_Hamiltonian or self.get_DM or self.get_overlap:
             block_to_feature(atomicdata, self.type_mapper, blocks, overlap, self.orthogonal)
 
         if self.get_H0:
             if self.prefer_precomputed_h0 and node_h0 is not None and edge_h0 is not None:
-                atomicdata[AtomicDataDict.NODE_H0_KEY] = torch.as_tensor(node_h0)
-                atomicdata[AtomicDataDict.EDGE_H0_KEY] = torch.as_tensor(edge_h0)
+                node_h0 = torch.as_tensor(node_h0)
+                edge_h0 = torch.as_tensor(edge_h0)
+                if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
+                    raise ValueError(
+                        "Precomputed LMDB H0 rows do not match the active graph: "
+                        f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
+                        f"num_nodes={num_nodes}, num_edges={num_edges}."
+                    )
+                atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
+                atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
             elif h0_blocks is not None:
                 block_to_feature(
                     atomicdata,

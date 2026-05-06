@@ -789,6 +789,65 @@ def test_lmdb_dataset_h0_raw_conversion_can_override_precomputed_h0(monkeypatch)
     assert torch.equal(out[AtomicDataDict.EDGE_H0_KEY], torch.full((4, 3), 2.0))
 
 
+def test_lmdb_dataset_reuses_stored_edge_graph_for_precomputed_features(monkeypatch):
+    dataset = LMDBDataset.__new__(LMDBDataset)
+    dataset._indices = None
+    dataset.get_Hamiltonian = True
+    dataset.get_H0 = True
+    dataset.get_overlap = False
+    dataset.get_DM = False
+    dataset.get_eigenvalues = False
+    dataset.orthogonal = False
+    dataset.h0_key = "hamiltonian_0"
+    dataset.prefer_precomputed_h0 = True
+    dataset.transform = object()
+    dataset.file_map = ["data.0000.lmdb"]
+    dataset.info_files = {
+        "data.0000.lmdb": {
+            "r_max": 1.0,
+            "er_max": None,
+            "oer_max": None,
+            "wave_align": False,
+            "train_w_homo_lumo_gap": False,
+            "train_w_eps": False,
+            "train_w_charge": False,
+            "train_dip": False,
+            "train_polar": False,
+        }
+    }
+    edge_index = torch.tensor([[0, 1, 0], [1, 0, 0]], dtype=torch.long)
+    edge_shift = torch.zeros((3, 3), dtype=torch.float32)
+    data_dict = {
+        AtomicDataDict.CELL_KEY: torch.eye(3),
+        AtomicDataDict.POSITIONS_KEY: torch.zeros((2, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: torch.ones(2, dtype=torch.long),
+        AtomicDataDict.PBC_KEY: torch.ones(3, dtype=torch.bool),
+        AtomicDataDict.EDGE_INDEX_KEY: edge_index,
+        AtomicDataDict.EDGE_CELL_SHIFT_KEY: edge_shift,
+        AtomicDataDict.NODE_FEATURES_KEY: torch.full((2, 4), 1.0),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.full((3, 4), 2.0),
+        AtomicDataDict.NODE_H0_KEY: torch.full((2, 4), 3.0),
+        AtomicDataDict.EDGE_H0_KEY: torch.full((3, 4), 4.0),
+    }
+    dataset._load_data_dict = lambda idx: data_dict
+
+    monkeypatch.setattr(
+        "dptb.data.dataset.lmdb_dataset.AtomicData.from_points",
+        lambda **kwargs: pytest.fail("stored graph should skip neighbor rebuild"),
+    )
+    monkeypatch.setattr(
+        "dptb.data.dataset.lmdb_dataset.block_to_feature",
+        lambda *args, **kwargs: pytest.fail("precomputed features should skip block conversion"),
+    )
+
+    out = dataset.get(0)
+
+    assert torch.equal(out[AtomicDataDict.EDGE_INDEX_KEY], edge_index)
+    assert torch.equal(out[AtomicDataDict.EDGE_CELL_SHIFT_KEY], edge_shift)
+    assert torch.equal(out[AtomicDataDict.EDGE_FEATURES_KEY], data_dict[AtomicDataDict.EDGE_FEATURES_KEY])
+    assert torch.equal(out[AtomicDataDict.EDGE_H0_KEY], data_dict[AtomicDataDict.EDGE_H0_KEY])
+
+
 def test_multitrainer_base_options_disable_dynamic_batch_before_rebuild():
     train_options = {
         "batch_size": 4,
