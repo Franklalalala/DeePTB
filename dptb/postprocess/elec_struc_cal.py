@@ -4,7 +4,7 @@ import h5py
 import numpy as np
 from ase.io import read
 import ase
-from typing import Union, Optional
+from typing import Mapping, Optional, Union
 import torch
 import logging
 from copy import deepcopy
@@ -16,6 +16,8 @@ from dptb.nn.energy import Eigenvalues
 from dptb.utils.argcheck import get_cutoffs_from_model_options
 from dptb.utils.constants import Boltzmann, eV2J, anglrMId
 
+_ADD_H0_FEATURE_SENTINELS = {"from_data", "data", "feature", "features", "lmdb"}
+
 
 class ElecStruCal(object):
     """
@@ -24,7 +26,7 @@ class ElecStruCal(object):
 
     支持的推理 tag（kpath_kwargs 透传到 get_eigs）：
       - override_overlap: 从文件覆盖 Overlap
-      - add_h0: 从文件注入 H0，并在推理时做 H = H0 + ΔH（SOC+NextHAM 会对 ΔH 做 uu.real -> (uu.real, dd.real) 的过滤）
+      - add_h0: load H0 from an h5 file or from input node_h0/edge_h0 features, then use H = H0 + dH.
       - override_full_h: 直接从文件载入 full H（跳过模型，优先级最高）
 
     新增用于误差归因的两个 tag（需要与 add_h0 配合，且在 add_h0 之后生效）：
@@ -93,6 +95,92 @@ class ElecStruCal(object):
         else:
             blk = f["1"]
         return f, blk
+
+    # =========================================================
+    # helpers: H0 feature source handling
+    # =========================================================
+    @staticmethod
+    def _is_add_h0_file(add_h0) -> bool:
+        if not isinstance(add_h0, (str, os.PathLike)):
+            return False
+        return str(add_h0).lower() not in _ADD_H0_FEATURE_SENTINELS
+
+    @classmethod
+    def _uses_add_h0(cls, add_h0) -> bool:
+        return add_h0 is not None and add_h0 is not False
+
+    @classmethod
+    def _uses_add_h0_features(cls, add_h0) -> bool:
+        return cls._uses_add_h0(add_h0) and not cls._is_add_h0_file(add_h0)
+
+    @staticmethod
+    def _read_optional_field(data, key):
+        try:
+            if key in data:
+                return data[key]
+        except Exception:
+            pass
+        return getattr(data, key, None)
+
+    @staticmethod
+    def _read_mapping_field(mapping: Mapping, candidates):
+        for key in candidates:
+            if key in mapping:
+                return mapping[key]
+        return None
+
+    def _get_h0_feature_pair(self, data, add_h0):
+        node_candidates = (
+            AtomicDataDict.NODE_H0_KEY,
+            "node_h0",
+            "node",
+            AtomicDataDict.NODE_FEATURES_KEY,
+            "node_features",
+        )
+        edge_candidates = (
+            AtomicDataDict.EDGE_H0_KEY,
+            "edge_h0",
+            "edge",
+            AtomicDataDict.EDGE_FEATURES_KEY,
+            "edge_features",
+        )
+
+        if isinstance(add_h0, Mapping):
+            node_h0 = self._read_mapping_field(add_h0, node_candidates)
+            edge_h0 = self._read_mapping_field(add_h0, edge_candidates)
+        else:
+            node_h0 = self._read_optional_field(data, AtomicDataDict.NODE_H0_KEY)
+            edge_h0 = self._read_optional_field(data, AtomicDataDict.EDGE_H0_KEY)
+
+        return node_h0, edge_h0
+
+    def _inject_h0_features(self, data, h0_source) -> None:
+        node_h0, edge_h0 = self._get_h0_feature_pair(data, h0_source)
+        if node_h0 is None or edge_h0 is None:
+            raise RuntimeError(
+                "add_h0 requested H0 features, but node_h0/edge_h0 were not found. "
+                "Pass an h5 path as add_h0, pass add_h0=True with AtomicData carrying "
+                "node_h0 and edge_h0, or pass a mapping with node_h0/edge_h0 tensors."
+            )
+
+        data[AtomicDataDict.NODE_FEATURES_KEY] = torch.as_tensor(node_h0)
+        data[AtomicDataDict.EDGE_FEATURES_KEY] = torch.as_tensor(edge_h0)
+        self._copy_feature_h0_to_model_input(data)
+
+    @staticmethod
+    def _copy_feature_h0_to_model_input(data) -> None:
+        node_h0 = data.get(AtomicDataDict.NODE_FEATURES_KEY)
+        edge_h0 = data.get(AtomicDataDict.EDGE_FEATURES_KEY)
+        if node_h0 is None or edge_h0 is None:
+            raise RuntimeError(
+                "add_h0 prepared no node/edge H0 features for model input."
+            )
+        data[AtomicDataDict.NODE_H0_KEY] = (
+            node_h0.clone() if torch.is_tensor(node_h0) else torch.as_tensor(node_h0)
+        )
+        data[AtomicDataDict.EDGE_H0_KEY] = (
+            edge_h0.clone() if torch.is_tensor(edge_h0) else torch.as_tensor(edge_h0)
+        )
 
     # =========================================================
     # helpers: build mask_uureal if missing
@@ -309,7 +397,7 @@ class ElecStruCal(object):
         """
         构造 AtomicData，并根据 tag 写入：
           - override_overlap: 覆盖 S blocks
-          - add_h0: 写入 H0 blocks 到 EDGE/NODE_FEATURES_KEY（供 get_eigs 里 add back）
+          - add_h0: write H0 from h5 or input H0 features into EDGE/NODE_FEATURES_KEY for add-back in get_eigs
           - override_full_h: 写入 full H blocks 到 EDGE/NODE_FEATURES_KEY（用于完全跳过模型）
         """
         atomic_options = deepcopy(self.cutoffs)
@@ -338,13 +426,18 @@ class ElecStruCal(object):
             raise ValueError('data should be either a string, ase.Atoms, or AtomicData')
 
         # tag priority: override_full_h > add_h0
-        if isinstance(override_full_h, str) and isinstance(add_h0, str):
+        if isinstance(override_full_h, str) and self._uses_add_h0(add_h0):
             log.warning("[ElecStruCal] Both override_full_h and add_h0 are provided; "
                         "override_full_h will take precedence and add_h0 will be ignored.")
 
         overlaps_blk = None
         fullh_blk = None
         h0_blk = None
+        cached_h0_source = None
+        if self._uses_add_h0_features(add_h0) and not isinstance(add_h0, Mapping):
+            node_h0, edge_h0 = self._get_h0_feature_pair(data, add_h0)
+            if node_h0 is not None and edge_h0 is not None:
+                cached_h0_source = {"node_h0": node_h0, "edge_h0": edge_h0}
 
         fS = fH = None
         try:
@@ -357,7 +450,7 @@ class ElecStruCal(object):
                 if not os.path.exists(override_full_h):
                     raise FileNotFoundError(f"Full H file not found: {override_full_h}")
                 fH, fullh_blk = self._open_h5_first_block(override_full_h)
-            elif isinstance(add_h0, str):
+            elif self._is_add_h0_file(add_h0):
                 if not os.path.exists(add_h0):
                     raise FileNotFoundError(f"H0 file not found: {add_h0}")
                 fH, h0_blk = self._open_h5_first_block(add_h0)
@@ -388,6 +481,9 @@ class ElecStruCal(object):
                 else:
                     pass
 
+            if fullh_blk is None and h0_blk is None and self._uses_add_h0_features(add_h0):
+                self._inject_h0_features(data, cached_h0_source or add_h0)
+
         finally:
             if fS is not None:
                 fS.close()
@@ -398,6 +494,8 @@ class ElecStruCal(object):
             device = self.device
         data = AtomicData.to_AtomicDataDict(data.to(device))
         data = self.model.idp(data)
+        if fullh_blk is None and self._uses_add_h0(add_h0):
+            self._copy_feature_h0_to_model_input(data)
         return data
 
     # =========================================================
@@ -456,8 +554,9 @@ class ElecStruCal(object):
         # ============================
         # override_full_h branch
         # ============================
+        uses_add_h0 = self._uses_add_h0(add_h0)
         if isinstance(override_full_h, str):
-            if isinstance(add_h0, str):
+            if uses_add_h0:
                 log.warning("[ElecStruCal] override_full_h is enabled, add_h0 will be ignored.")
 
             if data.get(AtomicDataDict.EDGE_FEATURES_KEY) is None:
@@ -474,9 +573,13 @@ class ElecStruCal(object):
         # ============================
         # normal model inference branch
         # ============================
-        if isinstance(add_h0, str):
-            h0_edge = data[AtomicDataDict.EDGE_FEATURES_KEY]
-            h0_node = data[AtomicDataDict.NODE_FEATURES_KEY]
+        if uses_add_h0:
+            h0_edge = data.get(AtomicDataDict.EDGE_FEATURES_KEY)
+            h0_node = data.get(AtomicDataDict.NODE_FEATURES_KEY)
+            if h0_edge is None or h0_node is None:
+                raise RuntimeError(
+                    "add_h0 is enabled, but H0 node/edge features were not prepared before model forward."
+                )
 
         # model forward -> predicted ΔH
         data = self.model(data)
@@ -487,7 +590,7 @@ class ElecStruCal(object):
             data[AtomicDataDict.NODE_OVERLAP_KEY] = override_overlap_node
 
         # add_h0 path: filter delta in SOC NextHAM style, then add back H0
-        if isinstance(add_h0, str):
+        if uses_add_h0:
             if getattr(self.model.idp, "has_soc", False):
                 data[AtomicDataDict.EDGE_FEATURES_KEY] = self._nextham_filter_delta_soc(
                     data[AtomicDataDict.EDGE_FEATURES_KEY], self.model.idp
@@ -504,7 +607,7 @@ class ElecStruCal(object):
         # ============================
         patch_fullh_path = override_full_h_uureal or override_full_h_wo_uureal
         if patch_fullh_path:
-            if not isinstance(add_h0, str):
+            if not uses_add_h0:
                 raise ValueError("override_full_h_uureal / override_full_h_wo_uureal must be used with add_h0.")
             if not getattr(self.model.idp, "has_soc", False):
                 raise ValueError("override_full_h_uureal / override_full_h_wo_uureal are intended for SOC mode only.")
