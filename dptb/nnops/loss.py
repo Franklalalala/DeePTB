@@ -70,6 +70,18 @@ def _masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tenso
     count = mask.sum()
     return (diff.square() * mask).sum() / count.clamp_min(1.0)
 
+
+def _l1_rmse_loss_from_sums(
+    abs_sum: torch.Tensor,
+    square_sum: torch.Tensor,
+    count: torch.Tensor,
+) -> torch.Tensor:
+    valid = (count > 0.5).to(dtype=abs_sum.dtype)
+    safe_count = count.clamp_min(1.0)
+    l1_mean = abs_sum / safe_count
+    mse_mean = square_sum / safe_count
+    return 0.5 * (l1_mean + torch.sqrt(mse_mean + (1.0 - valid) + 1e-12)) * valid
+
 @Loss.register("skints")
 class DFTBskLoss(nn.Module):
     def __init__(
@@ -705,13 +717,11 @@ class HamilLossAbs(nn.Module):
 
             # 使用 raw_pre_node 自身的 dtype
             onsite_cnt = final_node_mask.sum().to(dtype=raw_pre_node.dtype)
-            valid_node = (onsite_cnt > 0.5).to(dtype=raw_pre_node.dtype)
-
-            safe_onsite_cnt = onsite_cnt.clamp_min(1.0)
-            onsite_l1_mean = onsite_l1_sum / safe_onsite_cnt
-            onsite_mse_mean = onsite_mse_sum / safe_onsite_cnt
-
-            onsite_loss = 0.5 * (onsite_l1_mean + torch.sqrt(onsite_mse_mean + (1.0 - valid_node) + 1e-12)) * valid_node
+            onsite_loss = _l1_rmse_loss_from_sums(
+                abs_sum=onsite_l1_sum,
+                square_sum=onsite_mse_sum,
+                count=onsite_cnt,
+            )
 
             # =================================================================
             # Hopping (同理重构)
@@ -741,14 +751,11 @@ class HamilLossAbs(nn.Module):
 
             # 使用 raw_pre_edge 自身的 dtype
             hopping_cnt = final_edge_mask.sum().to(dtype=raw_pre_edge.dtype)
-            valid_edge = (hopping_cnt > 0.5).to(dtype=raw_pre_edge.dtype)
-
-            safe_hopping_cnt = hopping_cnt.clamp_min(1.0)
-            hopping_l1_mean = hopping_l1_sum / safe_hopping_cnt
-            hopping_mse_mean = hopping_mse_sum / safe_hopping_cnt
-
-            hopping_loss = 0.5 * (
-                        hopping_l1_mean + torch.sqrt(hopping_mse_mean + (1.0 - valid_edge) + 1e-12)) * valid_edge
+            hopping_loss = _l1_rmse_loss_from_sums(
+                abs_sum=hopping_l1_sum,
+                square_sum=hopping_mse_sum,
+                count=hopping_cnt,
+            )
 
             # ========== record strict reduce stats ==========
             self.last_onsite_l1_sum = onsite_l1_sum.detach()
@@ -780,7 +787,11 @@ class HamilLossAbs(nn.Module):
                 w_onsite = self._current_onsite_weight()
                 total_loss = w_onsite * onsite_loss + hopping_loss
             else:
-                total_loss = 0.5 * (onsite_loss + hopping_loss)
+                total_loss = _l1_rmse_loss_from_sums(
+                    abs_sum=onsite_l1_sum + hopping_l1_sum,
+                    square_sum=onsite_mse_sum + hopping_mse_sum,
+                    count=onsite_cnt + hopping_cnt,
+                )
 
             if self.z_loss_coef > 0 and isinstance(raw_z_loss, torch.Tensor):
                 total_loss = total_loss + self.z_loss_coef * raw_z_loss
