@@ -445,7 +445,7 @@ def build_model(
         common_options.update({"device": device})
 
     distance_ranges = train_options.get("distance_ranges", None)
-    use_distance_ensemble = distance_ranges is not None and len(distance_ranges) > 1
+    use_distance_ensemble = distance_ranges is not None
 
     if use_distance_ensemble:
         log.info(f"Wrapping model with DistanceEnsembleWrapper ({len(distance_ranges)} experts)")

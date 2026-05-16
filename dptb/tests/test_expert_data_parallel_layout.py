@@ -211,7 +211,17 @@ def test_multi_train_spawns_one_process_per_expert_replica():
     text = _read_repo_text("dptb/entrypoints/multi_train.py")
 
     assert "expert_dp_size = get_expert_data_parallel_size(train_opt)" in text
-    assert "world_size = len(distance_ranges) * expert_dp_size" in text
+    assert "num_experts = len(distance_ranges)" in text
+    assert "world_size = num_experts * expert_dp_size" in text
+
+
+def test_single_expert_dp_reuses_distributed_expert_entrypoint():
+    entrypoint = _read_repo_text("dptb/entrypoints/multi_train.py")
+    build = _read_repo_text("dptb/nn/build.py")
+
+    assert "if use_ddp and (num_experts > 1 or expert_dp_size > 1):" in entrypoint
+    assert "num_experts=num_experts" in entrypoint
+    assert "use_distance_ensemble = distance_ranges is not None" in build
 
 
 def test_multi_trainer_uses_sharded_loaders_and_same_expert_grad_sync():

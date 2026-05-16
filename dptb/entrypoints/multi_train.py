@@ -690,13 +690,14 @@ def multi_train(
     use_ddp = bool(train_opt.get("use_ddp", False))
 
     expert_dp_size = get_expert_data_parallel_size(train_opt)
+    num_experts = len(distance_ranges)
 
-    if use_ddp and len(distance_ranges) > 1:
+    if use_ddp and (num_experts > 1 or expert_dp_size > 1):
         if not torch.cuda.is_available():
             raise RuntimeError("use_ddp=True requires CUDA.")
-        world_size = len(distance_ranges) * expert_dp_size
+        world_size = num_experts * expert_dp_size
         resolve_expert_parallel_layout(
-            num_experts=len(distance_ranges),
+            num_experts=num_experts,
             world_size=world_size,
             train_options=train_opt,
         )
@@ -704,7 +705,7 @@ def multi_train(
         if n_gpu < world_size:
             raise RuntimeError(
                 f"Not enough GPUs for distributed_expert mode: need {world_size} "
-                f"({len(distance_ranges)} experts * expert_data_parallel_size={expert_dp_size}), "
+                f"({num_experts} experts * expert_data_parallel_size={expert_dp_size}), "
                 f"but only {n_gpu} available."
             )
 
