@@ -628,6 +628,7 @@ class HamilLossAbs(nn.Module):
             onsite_boost_steps: int = 20000,
             onsite_boost_max: float = 100.0,
             z_loss_coef: float = 0.0,
+            element_average: bool = False,
             **kwargs,
     ):
         super(HamilLossAbs, self).__init__()
@@ -643,6 +644,7 @@ class HamilLossAbs(nn.Module):
         self.z_loss_coef = float(z_loss_coef)
         self.last_z_loss = None
         self.expert_load_cv = None
+        self.element_average = bool(element_average)
 
         self.onsite_boost = bool(onsite_boost)
         self.onsite_boost_steps = int(onsite_boost_steps)
@@ -786,12 +788,14 @@ class HamilLossAbs(nn.Module):
             if self.onsite_boost:
                 w_onsite = self._current_onsite_weight()
                 total_loss = w_onsite * onsite_loss + hopping_loss
-            else:
+            elif self.element_average:
                 total_loss = _l1_rmse_loss_from_sums(
                     abs_sum=onsite_l1_sum + hopping_l1_sum,
                     square_sum=onsite_mse_sum + hopping_mse_sum,
                     count=onsite_cnt + hopping_cnt,
                 )
+            else:
+                total_loss = 0.5 * (onsite_loss + hopping_loss)
 
             if self.z_loss_coef > 0 and isinstance(raw_z_loss, torch.Tensor):
                 total_loss = total_loss + self.z_loss_coef * raw_z_loss
@@ -954,6 +958,13 @@ class HamilLossBlas(nn.Module):
             return (1/3) * (hopping_loss + onsite_loss + overlap_loss)
         else:
             return 0.5 * (onsite_loss + hopping_loss)
+
+
+@Loss.register("hamil_abs_element_avg")
+class HamilLossAbsElementAverage(HamilLossAbs):
+    def __init__(self, *args, **kwargs):
+        kwargs["element_average"] = True
+        super().__init__(*args, **kwargs)
 
 
 @Loss.register("hamil_abs_mae")

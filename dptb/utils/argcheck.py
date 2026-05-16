@@ -1394,6 +1394,7 @@ def loss_options():
                     - `eigvals`: The mse loss predicted and labeled eigenvalues and Delta eigenvalues between different k.
                     - `hamil`: 
                     - `hamil_abs`:
+                    - `hamil_abs_element_avg`:
                     - `hamil_blas`:
                 """
     doc_train = "Loss options for training."
@@ -1512,6 +1513,7 @@ def loss_options():
         Argument("eigvals", dict, sub_fields=eigvals),
         Argument("skints", dict, sub_fields=skints),
         Argument("hamil_abs", dict, sub_fields=hamil),
+        Argument("hamil_abs_element_avg", dict, sub_fields=hamil),
         Argument("hamil_abs_mae", dict, sub_fields=hamil),
         Argument("hamil_w_num_e", dict, sub_fields=property_aux),
         Argument("wa_loss", dict, sub_fields=wa_loss_aux),
