@@ -183,13 +183,15 @@ def train_options():
     )
     doc_expert_optimizer_overrides = (
         "Optional per-expert optimizer override dictionaries. "
-        "If provided, it must be a list with length == num_experts (len(distance_ranges)). "
+        "If provided, it should be a list with length == num_experts (len(distance_ranges)); "
+        "a single item is broadcast to all experts, and identical legacy entries collapse for a single expert. "
         "Each element is merged into the shared `optimizer` config for the corresponding expert. "
         "Use `null` / `{}` to keep the shared optimizer config for one expert."
     )
     doc_expert_lr_scheduler_overrides = (
         "Optional per-expert learning-rate scheduler override dictionaries. "
-        "If provided, it must be a list with length == num_experts (len(distance_ranges)). "
+        "If provided, it should be a list with length == num_experts (len(distance_ranges)); "
+        "a single item is broadcast to all experts, and identical legacy entries collapse for a single expert. "
         "Each element is merged into the shared `lr_scheduler` config for the corresponding expert. "
         "This allows per-expert `patience`, `factor`, `min_lr`, or even scheduler `type`."
     )

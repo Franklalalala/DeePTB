@@ -575,13 +575,24 @@ class MultiTrainer(Trainer):
         if overrides is None:
             return None
         if isinstance(overrides, (list, tuple)):
+            overrides = list(overrides)
             if len(overrides) == 0:
                 return None
             if len(overrides) != self.num_experts:
-                raise ValueError(
-                    f"{field_name} length must match num_experts={self.num_experts}, "
-                    f"got len({field_name})={len(overrides)}"
-                )
+                if len(overrides) == 1 and self.num_experts > 1:
+                    overrides = overrides * self.num_experts
+                elif self.num_experts == 1 and all(item == overrides[0] for item in overrides[1:]):
+                    log.warning(
+                        "%s has %d identical entries for num_experts=1; using the first entry.",
+                        field_name,
+                        len(overrides),
+                    )
+                    overrides = overrides[:1]
+                else:
+                    raise ValueError(
+                        f"{field_name} length must match num_experts={self.num_experts} "
+                        f"(or be a single shared override), got len({field_name})={len(overrides)}"
+                    )
             parsed = []
             for idx, item in enumerate(overrides):
                 if item is None:

@@ -459,6 +459,18 @@ def test_expert_dp_use_ddp_alias_is_declared_and_mapped_to_ddp_backend():
     assert 'self.expert_dp_backend = "ddp"' in trainer_text
 
 
+def test_expert_config_overrides_support_shared_and_single_expert_legacy_entries():
+    trainer_text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    parser = _method_source(trainer_text, "_parse_expert_config_overrides")
+
+    assert "overrides = list(overrides)" in parser
+    assert "len(overrides) == 1 and self.num_experts > 1" in parser
+    assert "overrides = overrides * self.num_experts" in parser
+    assert "self.num_experts == 1 and all(item == overrides[0] for item in overrides[1:])" in parser
+    assert "overrides = overrides[:1]" in parser
+    assert "or be a single shared override" in parser
+
+
 def test_multi_trainer_wraps_local_expert_with_ddp_backend():
     text = _read_repo_text("dptb/nnops/multi_trainer.py")
 
