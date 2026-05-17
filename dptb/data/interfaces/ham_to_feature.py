@@ -450,7 +450,11 @@ def feature_to_block(data, idp, overlap: bool = False):
 
     # 确保转为 Numpy 且展平为 1D 数组 [N]
     if isinstance(atomic_numbers, torch.Tensor):
-        atomic_numbers = atomic_numbers.cpu().numpy()
+        atomic_numbers_t = atomic_numbers.to(device=device, dtype=torch.long).flatten()
+        atomic_numbers = atomic_numbers.detach().cpu().numpy()
+    else:
+        atomic_numbers = np.asarray(atomic_numbers)
+        atomic_numbers_t = torch.as_tensor(atomic_numbers, dtype=torch.long, device=device).flatten()
 
     # Force Flatten: 解决 [N, 1] 导致的 IndexError
     atomic_numbers = atomic_numbers.flatten()
@@ -557,8 +561,9 @@ def feature_to_block(data, idp, overlap: bool = False):
         edge_index = data[_keys.EDGE_INDEX_KEY]
         if edge_index.shape[1] > 0:
             edge_shift = data[_keys.EDGE_CELL_SHIFT_KEY]
-            src_atoms = atomic_numbers[edge_index[0].cpu()]
-            dst_atoms = atomic_numbers[edge_index[1].cpu()]
+            edge_index_for_types = edge_index.to(device=atomic_numbers_t.device)
+            src_atoms = atomic_numbers_t[edge_index_for_types[0]]
+            dst_atoms = atomic_numbers_t[edge_index_for_types[1]]
             edge_types_idx = idp.transform_bond(src_atoms, dst_atoms).flatten()
 
             if isinstance(edge_types_idx, torch.Tensor):

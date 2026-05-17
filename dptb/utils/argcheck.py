@@ -1397,6 +1397,7 @@ def loss_options():
                     - `hamil`: 
                     - `hamil_abs`:
                     - `hamil_abs_element_avg`:
+                    - `hamil_fullh_ao_mae`:
                     - `hamil_blas`:
                 """
     doc_train = "Loss options for training."
@@ -1506,6 +1507,19 @@ def loss_options():
         Argument("coeff_ovp", float, optional=True, default=1., doc="The coefficient of the hamiltonian penalty. Default: 1"),
     ]
 
+    fullh_ao_mae = [
+        Argument(
+            "gauge_shift",
+            bool,
+            optional=True,
+            default=False,
+            doc="Apply NextHAM-style target gauge shift using the overlap matrix before masked AO-element MAE.",
+        ),
+        Argument("threshold_min", float, optional=True, default=-100000000.0, doc="Lower absolute-value target threshold for AO-element masking."),
+        Argument("threshold_max", float, optional=True, default=100000000.0, doc="Upper absolute-value target threshold for AO-element masking."),
+        Argument("factor", float, optional=True, default=1.0, doc="Multiplicative factor applied to the AO-element MAE."),
+    ]
+
     skints = [
         Argument("skdata", str, optional=False, doc="The path to the skfile or sk database."),
     ]
@@ -1516,6 +1530,7 @@ def loss_options():
         Argument("skints", dict, sub_fields=skints),
         Argument("hamil_abs", dict, sub_fields=hamil),
         Argument("hamil_abs_element_avg", dict, sub_fields=hamil),
+        Argument("hamil_fullh_ao_mae", dict, sub_fields=fullh_ao_mae),
         Argument("hamil_abs_mae", dict, sub_fields=hamil),
         Argument("hamil_w_num_e", dict, sub_fields=property_aux),
         Argument("wa_loss", dict, sub_fields=wa_loss_aux),

@@ -82,6 +82,109 @@ def _l1_rmse_loss_from_sums(
     mse_mean = square_sum / safe_count
     return 0.5 * (l1_mean + torch.sqrt(mse_mean + (1.0 - valid) + 1e-12)) * valid
 
+
+def nextham_gauge_shift_target(
+    pred_h: torch.Tensor,
+    target_h: torch.Tensor,
+    overlap: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    numerator = torch.real(torch.sum((pred_h - target_h) * torch.conj(overlap)))
+    denominator = torch.real(torch.sum(overlap * torch.conj(overlap)))
+    delta_mu = numerator / (denominator + eps)
+    return target_h + delta_mu * overlap
+
+
+def nextham_masked_ao_mae(
+    pred_h: torch.Tensor,
+    target_h: torch.Tensor,
+    overlap: Union[torch.Tensor, None] = None,
+    mask: Union[torch.Tensor, None] = None,
+    gauge_shift: bool = False,
+    threshold_min: float = -100000000.0,
+    threshold_max: float = 100000000.0,
+    factor: float = 1.0,
+    eps: float = 1e-7,
+    gauge_eps: float = 1e-6,
+    return_shifted_target: bool = False,
+):
+    if gauge_shift:
+        if overlap is None:
+            raise ValueError("overlap is required when gauge_shift=True")
+        target_h = nextham_gauge_shift_target(
+            pred_h=pred_h,
+            target_h=target_h,
+            overlap=overlap,
+            eps=gauge_eps,
+        )
+
+    loss = (pred_h - target_h).abs()
+    if mask is None:
+        combined_mask = torch.ones_like(loss, dtype=loss.dtype, device=loss.device)
+    else:
+        combined_mask = mask.to(device=loss.device, dtype=loss.dtype)
+
+    threshold_mask = (
+        (target_h.abs() > threshold_min) & (target_h.abs() < threshold_max)
+    ).to(device=loss.device, dtype=loss.dtype)
+    combined_mask = combined_mask * threshold_mask
+    masked_loss = (loss * combined_mask * factor).sum() / (combined_mask.sum() + eps)
+
+    if return_shifted_target:
+        return target_h, masked_loss.abs()
+    return masked_loss.abs()
+
+
+@Loss.register("hamil_fullh_ao_mae")
+class HamilFullHAOMAE(nn.Module):
+    def __init__(
+        self,
+        gauge_shift: bool = False,
+        threshold_min: float = -100000000.0,
+        threshold_max: float = 100000000.0,
+        factor: float = 1.0,
+        eps: float = 1e-7,
+        gauge_eps: float = 1e-6,
+        **kwargs,
+    ):
+        super().__init__()
+        self.gauge_shift = bool(gauge_shift)
+        self.threshold_min = threshold_min
+        self.threshold_max = threshold_max
+        self.factor = factor
+        self.eps = eps
+        self.gauge_eps = gauge_eps
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        target: torch.Tensor = None,
+        overlap: torch.Tensor = None,
+        mask: torch.Tensor = None,
+        return_shifted_target: bool = False,
+    ):
+        if target is None and isinstance(input, dict):
+            target = input["target"]
+            overlap = input.get("overlap", overlap)
+            mask = input.get("mask", mask)
+            input = input["input"]
+        if target is None:
+            raise ValueError("target is required")
+
+        return nextham_masked_ao_mae(
+            pred_h=input,
+            target_h=target,
+            overlap=overlap,
+            mask=mask,
+            gauge_shift=self.gauge_shift,
+            threshold_min=self.threshold_min,
+            threshold_max=self.threshold_max,
+            factor=self.factor,
+            eps=self.eps,
+            gauge_eps=self.gauge_eps,
+            return_shifted_target=return_shifted_target,
+        )
+
 @Loss.register("skints")
 class DFTBskLoss(nn.Module):
     def __init__(
