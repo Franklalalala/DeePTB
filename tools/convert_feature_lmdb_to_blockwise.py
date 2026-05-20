@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Convert a non-SOC DeePTB/NexTHam feature LMDB into block-wise LMDB.
+"""Convert a non-SOC DeePTB feature LMDB into block-wise LMDB.
 
 Input sample schema is the current feature workflow:
     node_features / edge_features   -> delta-H feature labels

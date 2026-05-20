@@ -20,8 +20,8 @@ from dptb.data.interfaces.blockwise_tensor import (
     l1_rmse_from_components,
     mae_from_components,
 )
-from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
-from dptb.nn.blockwise_hamiltonian import DirectAOBlockDecoder, NexTHamAOBlockDecoder
+from dptb.nnops.blockwise_hamiltonian_loss import HamilBlockwiseLoss
+from dptb.nn.blockwise_hamiltonian import DirectAOBlockDecoder, StructuredAOBlockDecoder
 
 
 class FakeLiMapper:
@@ -161,7 +161,7 @@ def test_blockwise_loss_backprop_and_feature_logs():
     data[NODE_PRED_HAMIL_BLOCKS_KEY] = torch.ones((1, 7, 7), requires_grad=True)
     data[EDGE_PRED_HAMIL_BLOCKS_KEY] = torch.ones((1, 7, 7), requires_grad=True)
 
-    loss_fn = HamilBlockwiseNexTHamLoss(idp=idp, optimization="block_mae", log_feature_compatible=True)
+    loss_fn = HamilBlockwiseLoss(idp=idp, optimization="block_mae", log_feature_compatible=True)
     loss = loss_fn(data, ref)
     loss.backward()
 
@@ -203,7 +203,7 @@ def test_loss_exposes_raw_component_stats():
     data[NODE_PRED_HAMIL_BLOCKS_KEY] = torch.ones((1, 7, 7), requires_grad=True)
     data[EDGE_PRED_HAMIL_BLOCKS_KEY] = torch.ones((1, 7, 7), requires_grad=True)
 
-    loss_fn = HamilBlockwiseNexTHamLoss(idp=idp, optimization="block_mae", log_feature_compatible=True)
+    loss_fn = HamilBlockwiseLoss(idp=idp, optimization="block_mae", log_feature_compatible=True)
     loss = loss_fn(data, ref)
     assert loss.item() == 1.0
     stats = loss_fn.last_component_stats
@@ -264,7 +264,7 @@ def test_direct_ao_block_decoder_masks_invalid_padding_entries():
     assert torch.count_nonzero(edge_blocks[:, :, 7:]) == 0
 
 
-def test_nextham_ao_block_decoder_is_parameter_free_and_matches_materializer():
+def test_structured_ao_block_decoder_is_parameter_free_and_matches_materializer():
     idp = FakeLiMapper()
     data = reverse_pair_data()
     node_features = torch.randn((1, idp.reduced_matrix_element), requires_grad=True)
@@ -272,7 +272,7 @@ def test_nextham_ao_block_decoder_is_parameter_free_and_matches_materializer():
     data["node_features"] = node_features
     data["edge_features"] = edge_features
 
-    decoder = NexTHamAOBlockDecoder(
+    decoder = StructuredAOBlockDecoder(
         idp=idp,
         complete_edges=True,
         strict_complete_edges=True,

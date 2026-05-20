@@ -58,9 +58,9 @@ def _get(data: Mapping[str, Any], key: str, default=None):
         return default
 
 
-@Loss.register("hamil_blockwise_nextham")
+@Loss.register("hamil_blockwise")
 @Loss.register("hamil_block_abs")
-class HamilBlockwiseNexTHamLoss(nn.Module):
+class HamilBlockwiseLoss(nn.Module):
     """AO-block optimization loss plus old feature-level onsite/hopping logs."""
 
     def __init__(
@@ -169,7 +169,7 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         node_mae = mae_from_components(node_comp)
         edge_mae = mae_from_components(edge_comp)
         global_mae = mae_from_components(total_comp)
-        if self.optimization in {"block_mae", "mae", "nextham", "nextham_mae"}:
+        if self.optimization in {"block_mae", "mae"}:
             if self.block_reduction in {"equal", "equal_onsite_hopping", "legacy"}:
                 return 0.5 * (node_mae + edge_mae)
             return global_mae

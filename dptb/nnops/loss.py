@@ -1696,11 +1696,11 @@ class HamilLossAnalysis(object):
 
         return torch.cat(out, dim=-1).squeeze(0)
 
-# Register clean block-wise NexTHam AO-block loss without modifying legacy hamil_abs.
+# Register clean block-wise AO-block loss without modifying legacy hamil_abs.
 try:
-    from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss  # noqa: F401
+    from dptb.nnops.blockwise_hamiltonian_loss import HamilBlockwiseLoss  # noqa: F401
 except Exception as _blockwise_exc:  # pragma: no cover
     import logging as _blockwise_logging
     _blockwise_logging.getLogger(__name__).warning(
-        "Could not register hamil_blockwise_nextham: %s", _blockwise_exc
+        "Could not register hamil_blockwise: %s", _blockwise_exc
     )

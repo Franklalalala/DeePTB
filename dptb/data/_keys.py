@@ -138,7 +138,7 @@ ALLOWED_KEYS: List[str] = [
     if k.endswith("_KEY")
 ]
 
-# == AO-block fields for block-wise NexTHam workflow ==
+# == AO-block fields for block-wise Hamiltonian workflow ==
 NODE_DELTA_HAMIL_BLOCKS_KEY = "node_delta_hamil_blocks"
 EDGE_DELTA_HAMIL_BLOCKS_KEY = "edge_delta_hamil_blocks"
 NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY = "node_delta_hamil_block_shape"

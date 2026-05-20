@@ -1229,7 +1229,7 @@ def e3tb_prediction():
     doc_if_batch_normalized = "if to turn on batch normalization"
     doc_blockwise_hamiltonian = "If true, materialize E3 Hamiltonian feature predictions into AO block tensors for block-wise loss."
     doc_direct_blockwise_hamiltonian = "If true, keep the E3 Hamiltonian stage but decode AO block tensors with a learned direct block head instead of deterministic feature-to-block materialization."
-    doc_nextham_blockwise_hamiltonian = "If true, keep the E3 Hamiltonian stage and expose AO block tensors through a parameter-free NexTHAM-style structured block decoder."
+    doc_structured_blockwise_hamiltonian = "If true, keep the E3 Hamiltonian stage and expose AO block tensors through a parameter-free structured block decoder."
     doc_blockwise_complete_edges = "If true, Hermitian-complete AO edge blocks from reverse directed edges."
     doc_blockwise_strict_complete_edges = "If true, fail when Hermitian edge completion leaves unresolved AO entries."
     doc_blockwise_add_h0 = "If true, additionally expose full-H block predictions by adding precomputed H0 blocks."
@@ -1246,7 +1246,7 @@ def e3tb_prediction():
         Argument("if_batch_normalized", bool, optional=True, default=False, doc=doc_if_batch_normalized),
         Argument("blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_blockwise_hamiltonian),
         Argument("direct_blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_direct_blockwise_hamiltonian),
-        Argument("nextham_blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_nextham_blockwise_hamiltonian),
+        Argument("structured_blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_structured_blockwise_hamiltonian),
         Argument("complete_edges", bool, optional=True, default=True, doc=doc_blockwise_complete_edges),
         Argument("strict_complete_edges", bool, optional=True, default=False, doc=doc_blockwise_strict_complete_edges),
         Argument("symmetrize_onsite", bool, optional=True, default=True),
@@ -1549,7 +1549,7 @@ def loss_options():
         Argument("hamil_abs", dict, sub_fields=hamil),
         Argument("hamil_abs_element_avg", dict, sub_fields=hamil),
         Argument("hamil_abs_mae", dict, sub_fields=hamil),
-        Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
+        Argument("hamil_blockwise", dict, sub_fields=hamil_blockwise),
         Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
         Argument("hamil_w_num_e", dict, sub_fields=property_aux),
         Argument("wa_loss", dict, sub_fields=wa_loss_aux),

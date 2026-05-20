@@ -551,7 +551,7 @@ def train(
     log_field.append("train_onsite_loss")
     log_field.append("train_hopping_loss")
     train_loss_method = jdata["train_options"]["loss_options"]["train"].get("method")
-    if train_loss_method in {"hamil_blockwise_nextham", "hamil_block_abs"}:
+    if train_loss_method in {"hamil_blockwise", "hamil_block_abs"}:
         blockwise_metric_fields = [
             "train_loss_opt",
             "train_block_loss",

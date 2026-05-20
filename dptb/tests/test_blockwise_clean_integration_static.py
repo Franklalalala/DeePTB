@@ -32,7 +32,7 @@ def test_multitrainer_flush_display_window_is_not_blockwise_metric_patch_target(
 
 def test_argcheck_exposes_blockwise_loss_and_prediction_switch():
     src = _read("utils/argcheck.py")
-    assert 'Argument("hamil_blockwise_nextham"' in src
+    assert 'Argument("hamil_blockwise"' in src
     assert 'Argument("hamil_block_abs"' in src
     assert 'Argument("blockwise_hamiltonian"' in src
 
@@ -69,7 +69,7 @@ def test_blockwise_train_metrics_are_registered_for_logging():
     single_src = _read("entrypoints/train.py")
     multi_src = _read("entrypoints/multi_train.py")
     for src in (single_src, multi_src):
-        assert '"hamil_blockwise_nextham"' in src
+        assert '"hamil_blockwise"' in src
         assert '"hamil_block_abs"' in src
         assert '"train_feature_compat_loss"' in src
         assert '"train_block_onsite_loss"' in src
@@ -104,18 +104,18 @@ def test_direct_blockwise_decoder_skips_feature_to_block_materializer():
     assert "feature_tensors_to_block_tensors" not in direct_forward
 
 
-def test_nextham_style_block_decoder_is_structured_not_dense_learned_head():
+def test_structured_block_decoder_is_not_dense_learned_head():
     src = _read("nn/blockwise_hamiltonian.py")
-    assert "class NexTHamAOBlockDecoder" in src
-    assert "class NexTHamBlockwiseE3Hamiltonian" in src
-    decoder_src = src.split("class NexTHamAOBlockDecoder", 1)[1].split("class NexTHamBlockwiseE3Hamiltonian", 1)[0]
+    assert "class StructuredAOBlockDecoder" in src
+    assert "class StructuredBlockwiseE3Hamiltonian" in src
+    decoder_src = src.split("class StructuredAOBlockDecoder", 1)[1].split("class StructuredBlockwiseE3Hamiltonian", 1)[0]
     assert "nn.Linear" not in decoder_src
     assert "nn.Parameter" not in decoder_src
     assert "feature_tensors_to_block_tensors" not in decoder_src
     assert "_scatter_features_to_blocks" in decoder_src
 
 
-def test_nnenv_can_select_nextham_style_blockwise_hamiltonian_wrapper():
+def test_nnenv_can_select_structured_blockwise_hamiltonian_wrapper():
     src = _read("nn/deeptb.py")
-    assert "NexTHamBlockwiseE3Hamiltonian" in src
-    assert 'prediction_copy.get("nextham_blockwise_hamiltonian"' in src
+    assert "StructuredBlockwiseE3Hamiltonian" in src
+    assert 'prediction_copy.get("structured_blockwise_hamiltonian"' in src

@@ -309,12 +309,12 @@ def _feature_block_indices(
     return torch.cat(src_parts, dim=0), torch.cat(dst_parts, dim=0)
 
 
-class NexTHamAOBlockDecoder(nn.Module):
+class StructuredAOBlockDecoder(nn.Module):
     """Deterministically scatter structured Hamiltonian features into AO blocks.
 
-    This mirrors the final NexTHAM ``net_out -> H`` philosophy: all learnable
-    prediction stays upstream in the equivariant/RME head, while the final AO
-    block construction is fixed by orbital angular-momentum bookkeeping.
+    All learnable prediction stays upstream in the equivariant/RME head, while
+    the final AO block construction is fixed by orbital angular-momentum
+    bookkeeping and contains no trainable dense head.
     """
 
     def __init__(
@@ -403,7 +403,7 @@ class NexTHamAOBlockDecoder(nn.Module):
     def _check_feature_width(features: Optional[torch.Tensor], expected: int, name: str) -> None:
         if features is not None and int(features.shape[-1]) != int(expected):
             raise RuntimeError(
-                f"NexTHAM-style AO block decoder expected {expected} {name} features, "
+                f"Structured AO block decoder expected {expected} {name} features, "
                 f"got {int(features.shape[-1])}."
             )
 
@@ -513,8 +513,8 @@ class NexTHamAOBlockDecoder(nn.Module):
         return data
 
 
-class NexTHamBlockwiseE3Hamiltonian(nn.Module):
-    """Keep E3/RME prediction and use a parameter-free NexTHAM-style block map."""
+class StructuredBlockwiseE3Hamiltonian(nn.Module):
+    """Keep E3/RME prediction and use a parameter-free structured block map."""
 
     def __init__(
         self,
@@ -558,7 +558,7 @@ class NexTHamBlockwiseE3Hamiltonian(nn.Module):
             **kwargs,
         )
         self.idp = self.e3.idp
-        self.decoder = NexTHamAOBlockDecoder(
+        self.decoder = StructuredAOBlockDecoder(
             idp=self.idp,
             node_field=node_field,
             edge_field=edge_field,

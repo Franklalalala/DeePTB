@@ -7,7 +7,11 @@ from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
 from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian
-from dptb.nn.blockwise_hamiltonian import BlockwiseE3Hamiltonian, DirectBlockwiseE3Hamiltonian, NexTHamBlockwiseE3Hamiltonian
+from dptb.nn.blockwise_hamiltonian import (
+    BlockwiseE3Hamiltonian,
+    DirectBlockwiseE3Hamiltonian,
+    StructuredBlockwiseE3Hamiltonian,
+)
 from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
 from e3nn.o3 import Linear
@@ -113,12 +117,12 @@ class NNENV(nn.Module):
         self.prediction = prediction
 
         prediction_copy = prediction.copy()
-        self.nextham_blockwise_hamiltonian = bool(prediction_copy.get("nextham_blockwise_hamiltonian", False))
+        self.structured_blockwise_hamiltonian = bool(prediction_copy.get("structured_blockwise_hamiltonian", False))
         self.direct_blockwise_hamiltonian = bool(prediction_copy.get("direct_blockwise_hamiltonian", False))
         self.blockwise_hamiltonian = bool(
             prediction_copy.get("blockwise_hamiltonian", False)
             or self.direct_blockwise_hamiltonian
-            or self.nextham_blockwise_hamiltonian
+            or self.structured_blockwise_hamiltonian
         )
         scale_type = prediction_copy.get("scale_type")
         self.scale_type = scale_type
@@ -277,8 +281,8 @@ class NNENV(nn.Module):
                     )
 
         elif self.method == "e3tb":
-            if self.nextham_blockwise_hamiltonian:
-                hamiltonian_cls = NexTHamBlockwiseE3Hamiltonian
+            if self.structured_blockwise_hamiltonian:
+                hamiltonian_cls = StructuredBlockwiseE3Hamiltonian
             elif self.direct_blockwise_hamiltonian:
                 hamiltonian_cls = DirectBlockwiseE3Hamiltonian
             elif self.blockwise_hamiltonian:

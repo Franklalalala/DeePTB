@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Clean block-wise tensor utilities for non-SOC NexTHam-style DeePTB.
+"""Clean block-wise tensor utilities for non-SOC DeePTB.
 
 This module keeps one responsibility per function:
 

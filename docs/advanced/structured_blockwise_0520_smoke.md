@@ -1,4 +1,4 @@
-# NexTHAM-style structured blockwise decoder smoke
+# Structured blockwise decoder smoke
 
 Date: 2026-05-20
 
@@ -11,17 +11,18 @@ Branch:
 ## Design
 
 The dense direct decoder was useful as a speed upper-bound experiment, but it
-does not match NexTHAM's final Hamiltonian construction.  NexTHAM keeps the
-learnable prediction upstream and uses a parameter-free angular-momentum
-mapping to construct AO/openmx Hamiltonian blocks from `net_out`.
+does not match the reference final-Hamiltonian construction used by NexTHAM and
+QHNet.  That style keeps the learnable prediction upstream and uses a
+parameter-free angular-momentum mapping to construct AO/openmx Hamiltonian
+blocks from structured model outputs.
 
 This update adds the same design choice to the DeePTB blockwise route:
 
 ```text
-E3Hamiltonian -> structured Hamiltonian features -> NexTHamAOBlockDecoder -> AO block loss
+E3Hamiltonian -> structured Hamiltonian features -> StructuredAOBlockDecoder -> AO block loss
 ```
 
-The new `NexTHamAOBlockDecoder` has no final `nn.Linear` or `nn.Parameter`.
+The new `StructuredAOBlockDecoder` has no final `nn.Linear` or `nn.Parameter`.
 It uses the existing DeePTB E3 Hamiltonian stage for the CG/Wigner constrained
 RME-to-H feature transform, then scatters those structured features into padded
 AO blocks through precomputed orbital slice indices.  This keeps the explicit
@@ -33,14 +34,14 @@ New config switch:
 ```json
 "prediction": {
   "blockwise_hamiltonian": true,
-  "nextham_blockwise_hamiltonian": true
+  "structured_blockwise_hamiltonian": true
 }
 ```
 
 Selection priority in `NNENV` is:
 
 ```text
-nextham_blockwise_hamiltonian -> direct_blockwise_hamiltonian -> blockwise_hamiltonian -> E3Hamiltonian
+structured_blockwise_hamiltonian -> direct_blockwise_hamiltonian -> blockwise_hamiltonian -> E3Hamiltonian
 ```
 
 The previous dense `DirectAOBlockDecoder` remains only as an ablation path.
@@ -115,7 +116,7 @@ feature:
 materialized blockwise:
 /home/mingkang_nt/codex/0520_block_native_nextham_structured_20260520/runs/blockwise_materialized_20260520_204756
 
-NexTHAM-style structured blockwise:
+structured blockwise:
 /home/mingkang_nt/codex/0520_block_native_nextham_structured_20260520/runs/blockwise_nextham_structured_20260520_204827
 ```
 
@@ -127,9 +128,9 @@ Speed:
 | --- | --- | ---: | ---: | ---: | ---: |
 | feature | `E3Hamiltonian` | 8 | 11.287 s | 23.97 s | 3228.3 MB |
 | materialized blockwise | `BlockwiseE3Hamiltonian` | 8 | 19.974 s | 30.68 s | 3516.8 MB |
-| structured blockwise | `NexTHamBlockwiseE3Hamiltonian` | 8 | 11.615 s | 22.25 s | 3513.7 MB |
+| structured blockwise | `StructuredBlockwiseE3Hamiltonian` | 8 | 11.615 s | 22.25 s | 3513.7 MB |
 
-Against materialized blockwise, the NexTHAM-style structured route improves:
+Against materialized blockwise, the structured route improves:
 
 ```text
 logged DPTB wall: 19.974 -> 11.615 s, wall-time -41.9%
@@ -162,9 +163,57 @@ The structured route exactly matches the materialized blockwise metrics in this
 smoke, which is the expected result for a parameter-free replacement of the
 materializer.
 
+## Rename cleanup smoke
+
+The implementation names were cleaned up after the first smoke:
+
+```text
+config switch: structured_blockwise_hamiltonian
+loss method:   hamil_blockwise
+model path:    StructuredBlockwiseE3Hamiltonian -> StructuredAOBlockDecoder
+```
+
+Fresh natlan checkout:
+
+```text
+/home/mingkang_nt/codex/0520_block_native_cleanup_20260520/DeePTB
+```
+
+Validation:
+
+```text
+PYTHONPATH=$REPO python -m pytest \
+  dptb/tests/test_blockwise_clean_integration_static.py \
+  dptb/tests/test_blockwise_clean.py -q
+
+23 passed, 1 warning
+```
+
+Short training smoke with the new config/loss names:
+
+```text
+run: /home/mingkang_nt/codex/0520_block_native_cleanup_20260520/runs/blockwise_structured_cleanup_20260520_211453
+DPTB logged wall: 13.491 s
+process wall: 24.30 s
+max RSS: 3593936 KB
+```
+
+Epoch metrics matched the earlier structured/materialized smoke:
+
+| metric | cleanup structured smoke |
+| --- | ---: |
+| train_loss | 0.2220 |
+| train_feature_compat_loss | 2.2704 |
+| train_onsite_loss | 4.1072 |
+| train_hopping_loss | 0.4336 |
+| train_block_loss | 0.2220 |
+| train_block_element_mae | 0.2220 |
+| train_block_onsite_loss | 1.8650 |
+| train_block_hopping_loss | 0.2028 |
+
 ## Interpretation
 
-This is the better NexTHAM-aligned direction compared with the dense direct
+This is the better reference-aligned direction compared with the dense direct
 decoder.  It preserves the explicit angular-momentum constrained feature path,
 does not add learnable AO-entry parameters at the final step, and still removes
 most of the old materialized blockwise overhead.

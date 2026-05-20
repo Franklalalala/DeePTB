@@ -567,7 +567,7 @@ def _multi_train_impl(
 
         log_field.extend(["mean_max_prob", "expert_load_cv", "train_onsite_loss", "train_hopping_loss"])
         train_loss_method = jdata["train_options"]["loss_options"]["train"].get("method")
-        if train_loss_method in {"hamil_blockwise_nextham", "hamil_block_abs"}:
+        if train_loss_method in {"hamil_blockwise", "hamil_block_abs"}:
             blockwise_metric_fields = [
                 "train_block_loss",
                 "train_feature_compat_loss",
