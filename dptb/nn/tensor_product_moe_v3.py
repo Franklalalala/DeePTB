@@ -129,6 +129,17 @@ class MOLEGlobals:
     def __init__(self, coefficients=None, sizes=None):
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.sizes = sizes  # [Batch] (Edge counts per system)
+        self._per_item_expert_routing = None
+
+    def per_item_expert_routing(self):
+        if self._per_item_expert_routing is None:
+            routing = []
+            for expert_idx in range(self.coefficients.shape[1]):
+                expert_coeff = self.coefficients[:, expert_idx]
+                active_idx = torch.nonzero(expert_coeff, as_tuple=False).flatten()
+                routing.append((active_idx, expert_coeff.index_select(0, active_idx)))
+            self._per_item_expert_routing = routing
+        return self._per_item_expert_routing
 
 
 class MOLERouterV3(nn.Module):
@@ -276,6 +287,9 @@ class MOLELinear(nn.Module):
                     b_avg = b_avg + self.bias_shared.sum(0)
             return F.linear(x, w_avg, b_avg)
 
+        if mole_globals.sizes is None:
+            return self._forward_per_item(x, mole_globals)
+
         # === 核心逻辑: 权重融合 (Weight Merging) ===
         # 1. 混合路由专家权重
         # coefficients: [Batch, Num_Experts]
@@ -307,6 +321,39 @@ class MOLELinear(nn.Module):
             out_parts.append(F.linear(x_sys, w, b))
 
         return torch.cat(out_parts, dim=0)
+
+    def _forward_per_item(self, x, mole_globals):
+        coefficients = mole_globals.coefficients
+        if coefficients.shape[0] != x.shape[0]:
+            raise ValueError(
+                "Per-item MOLE coefficients must have the same leading dimension as x: "
+                f"{coefficients.shape[0]} != {x.shape[0]}"
+            )
+
+        out = x.new_zeros(x.shape[:-1] + (self.out_features,))
+        for expert_idx, (active_idx, active_coeff) in enumerate(mole_globals.per_item_expert_routing()):
+            if active_idx.numel() == 0:
+                continue
+            expert_out = F.linear(
+                x.index_select(0, active_idx),
+                self.weight_experts[expert_idx],
+                None,
+            )
+            scale_shape = (active_idx.shape[0],) + (1,) * (expert_out.dim() - 1)
+            expert_out = expert_out * active_coeff.reshape(scale_shape)
+            out.index_add_(0, active_idx, expert_out)
+
+        if self.num_shared_experts > 0:
+            out = out + F.linear(x, self.weight_shared.sum(0), None)
+
+        if self.bias_experts is not None:
+            bias = torch.einsum("ne,eo->no", coefficients, self.bias_experts)
+            if self.num_shared_experts > 0 and self.bias_shared is not None:
+                bias = bias + self.bias_shared.sum(0).unsqueeze(0)
+            bias_shape = (bias.shape[0],) + (1,) * (out.dim() - 2) + (bias.shape[-1],)
+            out = out + bias.reshape(bias_shape)
+
+        return out
 # ------------------------------------------------------------------------------
 
 class SO2_Attention(torch.nn.Module):
