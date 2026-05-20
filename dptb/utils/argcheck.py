@@ -704,9 +704,9 @@ def embedding():
             Argument("lem_moe_charge", dict, slem()),
             Argument("lem_moe_topk", dict, slem()),
             Argument("lem_moe_v3", dict, slem()),
-            Argument("lem_moe_v3_edge", dict, slem()),
+            Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
-            Argument("lem_moe_v3_edge_h0", dict, slem_h0()),
+            Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_moe", dict, slem()),
             Argument("lem_so2", dict, slem()),
             Argument("lem_so2_local", dict, slem()),
@@ -948,6 +948,30 @@ def slem_h0():
         Argument("fallback_edge_key", str, optional=True, default="edge_features", doc=doc_fallback_edge_key),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
+    ]
+
+
+def slem_edge():
+    doc_edge_router_in_features = "Input dimension for the edge-wise MoE router. Defaults to `edge_one_hot_dim`."
+    doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
+    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, dispatch from compact coefficient rows through a per-edge index. Default: `False` on this branch."
+
+    return slem() + [
+        Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
+        Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
+        Argument("edge_moe_compact_dispatch", bool, optional=True, default=False, doc=doc_edge_moe_compact_dispatch),
+    ]
+
+
+def slem_edge_h0():
+    doc_edge_router_in_features = "Input dimension for the edge-wise MoE router. Defaults to `edge_one_hot_dim`."
+    doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
+    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, dispatch from compact coefficient rows through a per-edge index. Default: `False` on this branch."
+
+    return slem_h0() + [
+        Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
+        Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
+        Argument("edge_moe_compact_dispatch", bool, optional=True, default=False, doc=doc_edge_moe_compact_dispatch),
     ]
 
 

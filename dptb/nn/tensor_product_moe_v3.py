@@ -126,9 +126,10 @@ def _z_rot_mat(angle, l):
 class MOLEGlobals:
     """Stores routing information for the current forward pass."""
 
-    def __init__(self, coefficients=None, sizes=None):
+    def __init__(self, coefficients=None, sizes=None, graph_index=None):
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.sizes = sizes  # [Batch] (Edge counts per system)
+        self.graph_index = graph_index  # [N] optional row -> coefficient-row selector
         self._per_item_expert_routing = None
 
     def per_item_expert_routing(self):
@@ -287,6 +288,9 @@ class MOLELinear(nn.Module):
                     b_avg = b_avg + self.bias_shared.sum(0)
             return F.linear(x, w_avg, b_avg)
 
+        if mole_globals.graph_index is not None:
+            return self._forward_indexed(x, mole_globals)
+
         if mole_globals.sizes is None:
             return self._forward_per_item(x, mole_globals)
 
@@ -321,6 +325,34 @@ class MOLELinear(nn.Module):
             out_parts.append(F.linear(x_sys, w, b))
 
         return torch.cat(out_parts, dim=0)
+
+    def _forward_indexed(self, x, mole_globals):
+        coefficients = mole_globals.coefficients
+        graph_index = mole_globals.graph_index
+        if graph_index.shape[0] != x.shape[0]:
+            raise ValueError(
+                "Indexed MOLE graph_index must have the same leading dimension as x: "
+                f"{graph_index.shape[0]} != {x.shape[0]}"
+            )
+        if graph_index.device != x.device:
+            graph_index = graph_index.to(device=x.device)
+
+        mixed_weights = torch.einsum("be,eoi->boi", coefficients, self.weight_experts)
+        if self.num_shared_experts > 0:
+            mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
+
+        selected_weights = mixed_weights.index_select(0, graph_index)
+        out = torch.einsum("n...i,noi->n...o", x, selected_weights)
+
+        if self.bias_experts is not None:
+            mixed_bias = torch.einsum("be,eo->bo", coefficients, self.bias_experts)
+            if self.num_shared_experts > 0 and self.bias_shared is not None:
+                mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
+            bias = mixed_bias.index_select(0, graph_index)
+            bias_shape = (bias.shape[0],) + (1,) * (out.dim() - 2) + (bias.shape[-1],)
+            out = out + bias.reshape(bias_shape)
+
+        return out
 
     def _forward_per_item(self, x, mole_globals):
         coefficients = mole_globals.coefficients
