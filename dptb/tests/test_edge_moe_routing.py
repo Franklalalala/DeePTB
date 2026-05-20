@@ -247,10 +247,6 @@ def test_mole_linear_compact_graph_index_uses_contiguous_grouped_path():
     graph_index = torch.tensor([0, 1, 0, 1])
     globals_ = MOLEGlobals(coefficients=coeffs, graph_index=graph_index)
 
-    def fail_if_old_loop_is_used(*args, **kwargs):
-        raise AssertionError("compact graph_index path should not use per-group Python F.linear loop")
-
-    globals_.indexed_groups = fail_if_old_loop_is_used
     out = layer._forward_indexed_grouped(x, globals_)
 
     expected = []
@@ -264,6 +260,57 @@ def test_mole_linear_compact_graph_index_uses_contiguous_grouped_path():
     expected = torch.stack(expected, dim=0)
 
     torch.testing.assert_close(out, expected)
+
+
+def test_mole_linear_compact_graph_index_prefers_segment_matmul(monkeypatch):
+    import sys
+    import types
+
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    calls = []
+
+    def fake_segment_matmul(inputs, ptr, other, bias=None):
+        calls.append((inputs.detach().clone(), ptr.detach().clone(), other.detach().clone()))
+        parts = []
+        for group_idx, (start, end) in enumerate(zip(ptr[:-1].tolist(), ptr[1:].tolist())):
+            part = inputs[start:end] @ other[group_idx]
+            if bias is not None:
+                part = part + bias[group_idx]
+            parts.append(part)
+        return torch.cat(parts, dim=0)
+
+    fake_ops = types.ModuleType("pyg_lib.ops")
+    fake_ops.segment_matmul = fake_segment_matmul
+    fake_pyg_lib = types.ModuleType("pyg_lib")
+    fake_pyg_lib.ops = fake_ops
+    monkeypatch.setitem(sys.modules, "pyg_lib", fake_pyg_lib)
+    monkeypatch.setitem(sys.modules, "pyg_lib.ops", fake_ops)
+
+    layer = MOLELinear(2, 1, num_experts=2, num_shared_experts=1, bias=True)
+    with torch.no_grad():
+        layer.weight_experts.copy_(torch.tensor([[[1.0, 0.0]], [[0.0, 2.0]]]))
+        layer.bias_experts.copy_(torch.tensor([[0.1], [0.2]]))
+        layer.weight_shared.copy_(torch.tensor([[[0.5, 0.5]]]))
+        layer.bias_shared.copy_(torch.tensor([[0.05]]))
+    coeffs = torch.zeros(16, 2)
+    coeffs[:, 0] = 1.0
+    coeffs[15] = torch.tensor([0.25, 0.75])
+    x = torch.arange(40, dtype=torch.float32).reshape(20, 2)
+    graph_index = torch.tensor([0] * 18 + [1, 15])
+    globals_ = MOLEGlobals(coefficients=coeffs, graph_index=graph_index)
+
+    out = layer._forward_indexed_grouped(x, globals_)
+
+    assert len(calls) == 1
+    expected = []
+    shared_w = layer.weight_shared.sum(0)
+    shared_b = layer.bias_shared.sum(0)
+    for x_edge, coeff_idx in zip(x, graph_index):
+        routed_w = torch.einsum("e,eoi->oi", coeffs[coeff_idx], layer.weight_experts)
+        routed_b = torch.einsum("e,eo->o", coeffs[coeff_idx], layer.bias_experts)
+        expected.append(_linear_expected(x_edge, routed_w + shared_w, routed_b + shared_b))
+    torch.testing.assert_close(out, torch.stack(expected, dim=0))
 
 
 def test_mole_linear_edge_level_coefficients_backpropagate():

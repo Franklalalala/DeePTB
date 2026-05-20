@@ -131,8 +131,8 @@ class MOLEGlobals:
         self.sizes = sizes  # [Batch] (Edge counts per system)
         self.graph_index = graph_index  # [N] optional row -> coefficient-row selector
         self._per_item_expert_routing = None
-        self._indexed_groups = None
         self._indexed_permutation = None
+        self._indexed_segment_ptrs = {}
 
     def per_item_expert_routing(self):
         if self._per_item_expert_routing is None:
@@ -144,23 +144,6 @@ class MOLEGlobals:
             self._per_item_expert_routing = routing
         return self._per_item_expert_routing
 
-    def indexed_groups(self, device=None):
-        graph_index = self.graph_index
-        if device is not None and graph_index.device != device:
-            graph_index = graph_index.to(device=device)
-            self.graph_index = graph_index
-            self._indexed_groups = None
-            self._indexed_permutation = None
-
-        if self._indexed_groups is None:
-            groups = []
-            for coeff_idx in range(self.coefficients.shape[0]):
-                active_idx = torch.nonzero(graph_index == coeff_idx, as_tuple=False).flatten()
-                if active_idx.numel() > 0:
-                    groups.append((coeff_idx, active_idx))
-            self._indexed_groups = groups
-        return self._indexed_groups
-
     def indexed_permutation(self, device=None):
         graph_index = self.graph_index
         if graph_index is None:
@@ -168,8 +151,8 @@ class MOLEGlobals:
         if device is not None and graph_index.device != device:
             graph_index = graph_index.to(device=device)
             self.graph_index = graph_index
-            self._indexed_groups = None
             self._indexed_permutation = None
+            self._indexed_segment_ptrs = {}
 
         if self._indexed_permutation is None:
             graph_index = graph_index.reshape(-1).to(dtype=torch.long)
@@ -192,6 +175,26 @@ class MOLEGlobals:
                 sorted_graph_index,
             )
         return self._indexed_permutation
+
+    def indexed_segment_ptr(self, inner_size=1, device=None, prefer_cpu=True):
+        _, _, group_offsets, _ = self.indexed_permutation(device=device)
+        cache_key = (int(inner_size), bool(prefer_cpu))
+        cached = self._indexed_segment_ptrs.get(cache_key)
+        if cached is not None:
+            return cached
+        ptr = group_offsets * int(inner_size) if int(inner_size) != 1 else group_offsets
+        if prefer_cpu:
+            ptr = ptr.detach().cpu()
+        self._indexed_segment_ptrs[cache_key] = ptr
+        return ptr
+
+
+def _get_pyg_segment_matmul():
+    try:
+        from pyg_lib.ops import segment_matmul
+    except (ImportError, AttributeError):
+        return None
+    return segment_matmul
 
 
 class MOLERouterV3(nn.Module):
@@ -294,8 +297,6 @@ class MOLELinear(nn.Module):
         self.out_features = out_features
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
-        self.indexed_bmm_max_padding_ratio = 8.0
-
         # 1. 路由专家权重
         self.weight_experts = nn.Parameter(torch.empty(num_experts, out_features, in_features))
         if bias:
@@ -382,21 +383,13 @@ class MOLELinear(nn.Module):
         return self._forward_indexed_grouped(x, mole_globals)
 
     def _forward_indexed_grouped(self, x, mole_globals):
-        return self._forward_indexed_contiguous_bmm(x, mole_globals)
+        return self._forward_indexed_segment_matmul(x, mole_globals)
 
-    def _forward_indexed_loop(self, x, mole_globals, mixed_weights, mixed_bias):
-        out = x.new_zeros(x.shape[:-1] + (self.out_features,))
-        for coeff_idx, active_idx in mole_globals.indexed_groups(device=x.device):
-            bias = mixed_bias[coeff_idx] if mixed_bias is not None else None
-            group_out = F.linear(
-                x.index_select(0, active_idx),
-                mixed_weights[coeff_idx],
-                bias,
-            )
-            out.index_add_(0, active_idx, group_out)
-        return out
-
-    def _forward_indexed_contiguous_bmm(self, x, mole_globals):
+    def _forward_indexed_segment_matmul(
+        self,
+        x,
+        mole_globals,
+    ):
         coefficients = mole_globals.coefficients
         graph_index = mole_globals.graph_index
         if graph_index.shape[0] != x.shape[0]:
@@ -406,6 +399,20 @@ class MOLELinear(nn.Module):
             )
         if graph_index.device != x.device:
             graph_index = graph_index.to(device=x.device)
+
+        if x.shape[0] == 0:
+            return x.new_zeros(x.shape[:-1] + (self.out_features,))
+        if x.dtype != torch.float32 or coefficients.dtype != torch.float32:
+            raise RuntimeError(
+                "Indexed edge MoE compact dispatch requires float32 pyg_lib.ops.segment_matmul; "
+                f"got x={x.dtype}, coefficients={coefficients.dtype}."
+            )
+        segment_matmul = _get_pyg_segment_matmul()
+        if segment_matmul is None:
+            raise ImportError(
+                "Indexed edge MoE compact dispatch requires pyg_lib.ops.segment_matmul. "
+                "Install a pyg-lib wheel matching the active PyTorch/CUDA build."
+            )
 
         mixed_weights = torch.einsum("be,eoi->boi", coefficients, self.weight_experts)
         if self.num_shared_experts > 0:
@@ -417,38 +424,25 @@ class MOLELinear(nn.Module):
             if self.num_shared_experts > 0 and self.bias_shared is not None:
                 mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
 
-        if x.shape[0] == 0:
+        permute_idx, unpermute_idx, group_offsets, _ = mole_globals.indexed_permutation(device=x.device)
+        if group_offsets[-1].item() == 0:
             return x.new_zeros(x.shape[:-1] + (self.out_features,))
 
-        permute_idx, unpermute_idx, group_offsets, sorted_graph_index = mole_globals.indexed_permutation(device=x.device)
-        counts = group_offsets[1:] - group_offsets[:-1]
-        max_count = int(counts.max().item()) if counts.numel() > 0 else 0
-        if max_count == 0:
-            return x.new_zeros(x.shape[:-1] + (self.out_features,))
-
-        padding_ratio = (counts.shape[0] * max_count) / max(1, int(x.shape[0]))
-        if padding_ratio > self.indexed_bmm_max_padding_ratio:
-            return self._forward_indexed_loop(x, mole_globals, mixed_weights, mixed_bias)
-
-        x_sorted = x.index_select(0, permute_idx)
         inner_shape = x.shape[1:-1]
         inner_size = math.prod(inner_shape) if inner_shape else 1
-        x_sorted = x_sorted.reshape(x.shape[0], inner_size, self.in_features)
-
-        row_positions = (
-            torch.arange(x.shape[0], device=x.device, dtype=torch.long)
-            - group_offsets.index_select(0, sorted_graph_index)
+        x_sorted = x.index_select(0, permute_idx).reshape(x.shape[0] * inner_size, self.in_features)
+        ptr = mole_globals.indexed_segment_ptr(
+            inner_size=inner_size,
+            device=x.device,
+            prefer_cpu=True,
         )
-        num_groups = coefficients.shape[0]
-        padded_x = x.new_zeros(num_groups, max_count, inner_size, self.in_features)
-        padded_x[sorted_graph_index, row_positions] = x_sorted
-        padded_x = padded_x.reshape(num_groups, max_count * inner_size, self.in_features)
-
-        padded_out = torch.bmm(padded_x, mixed_weights.transpose(1, 2))
-        if mixed_bias is not None:
-            padded_out = padded_out + mixed_bias.unsqueeze(1)
-        padded_out = padded_out.reshape(num_groups, max_count, *inner_shape, self.out_features)
-        out_sorted = padded_out[sorted_graph_index, row_positions]
+        out_sorted = segment_matmul(
+            x_sorted,
+            ptr,
+            mixed_weights.transpose(1, 2).contiguous(),
+            mixed_bias,
+        )
+        out_sorted = out_sorted.reshape(x.shape[0], *inner_shape, self.out_features)
         return out_sorted.index_select(0, unpermute_idx)
 
     def _forward_per_item(self, x, mole_globals):
