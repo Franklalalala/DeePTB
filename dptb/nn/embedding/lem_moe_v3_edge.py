@@ -18,7 +18,8 @@ class LemMoEV3Edge(LemMoEV3):
     def __init__(self, **kwargs: Any):
         edge_router_in_features = kwargs.pop("edge_router_in_features", None)
         self.edge_router_unique_types = bool(kwargs.pop("edge_router_unique_types", True))
-        self.edge_moe_compact_dispatch = bool(kwargs.pop("edge_moe_compact_dispatch", False))
+        self.edge_moe_compact_dispatch = bool(kwargs.pop("edge_moe_compact_dispatch", True))
+        self.edge_moe_compact_min_edges = int(kwargs.pop("edge_moe_compact_min_edges", 16384))
         edge_one_hot_dim = int(edge_router_in_features or kwargs.get("edge_one_hot_dim", 128))
         self.edge_router_in_features = edge_one_hot_dim
         top_k = kwargs.get("top_k", 1)
@@ -195,7 +196,14 @@ class LemMoEV3Edge(LemMoEV3):
                 sizes=counts.to(dtype=active_edge_one_hot.dtype),
             )
             num_route_tokens = coeffs.new_tensor(float(coeffs.shape[0]))
-            if self.edge_moe_compact_dispatch:
+            top_k = getattr(self.router, "top_k", None)
+            full_expert_routing = top_k is None or top_k >= self.num_experts
+            use_compact_dispatch = (
+                self.edge_moe_compact_dispatch
+                and full_expert_routing
+                and num_active_edges >= self.edge_moe_compact_min_edges
+            )
+            if use_compact_dispatch:
                 return (
                     MOLEGlobals(coefficients=coeffs, sizes=None, graph_index=inverse),
                     monitor_val,

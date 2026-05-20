@@ -954,24 +954,28 @@ def slem_h0():
 def slem_edge():
     doc_edge_router_in_features = "Input dimension for the edge-wise MoE router. Defaults to `edge_one_hot_dim`."
     doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
-    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, dispatch from compact coefficient rows through a per-edge index. Default: `False` on this branch."
+    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, enable grouped compact dispatch for full-expert large-edge batches. Default: `True`."
+    doc_edge_moe_compact_min_edges = "Minimum active-edge count before grouped compact dispatch is used. Smaller batches use the sparse per-expert path. Default: `16384`."
 
     return slem() + [
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
-        Argument("edge_moe_compact_dispatch", bool, optional=True, default=False, doc=doc_edge_moe_compact_dispatch),
+        Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
+        Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
     ]
 
 
 def slem_edge_h0():
     doc_edge_router_in_features = "Input dimension for the edge-wise MoE router. Defaults to `edge_one_hot_dim`."
     doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
-    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, dispatch from compact coefficient rows through a per-edge index. Default: `False` on this branch."
+    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, enable grouped compact dispatch for full-expert large-edge batches. Default: `True`."
+    doc_edge_moe_compact_min_edges = "Minimum active-edge count before grouped compact dispatch is used. Smaller batches use the sparse per-expert path. Default: `16384`."
 
     return slem_h0() + [
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
-        Argument("edge_moe_compact_dispatch", bool, optional=True, default=False, doc=doc_edge_moe_compact_dispatch),
+        Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
+        Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
     ]
 
 

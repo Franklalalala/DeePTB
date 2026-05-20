@@ -131,6 +131,7 @@ class MOLEGlobals:
         self.sizes = sizes  # [Batch] (Edge counts per system)
         self.graph_index = graph_index  # [N] optional row -> coefficient-row selector
         self._per_item_expert_routing = None
+        self._indexed_groups = None
 
     def per_item_expert_routing(self):
         if self._per_item_expert_routing is None:
@@ -141,6 +142,22 @@ class MOLEGlobals:
                 routing.append((active_idx, expert_coeff.index_select(0, active_idx)))
             self._per_item_expert_routing = routing
         return self._per_item_expert_routing
+
+    def indexed_groups(self, device=None):
+        graph_index = self.graph_index
+        if device is not None and graph_index.device != device:
+            graph_index = graph_index.to(device=device)
+            self.graph_index = graph_index
+            self._indexed_groups = None
+
+        if self._indexed_groups is None:
+            groups = []
+            for coeff_idx in range(self.coefficients.shape[0]):
+                active_idx = torch.nonzero(graph_index == coeff_idx, as_tuple=False).flatten()
+                if active_idx.numel() > 0:
+                    groups.append((coeff_idx, active_idx))
+            self._indexed_groups = groups
+        return self._indexed_groups
 
 
 class MOLERouterV3(nn.Module):
@@ -327,6 +344,9 @@ class MOLELinear(nn.Module):
         return torch.cat(out_parts, dim=0)
 
     def _forward_indexed(self, x, mole_globals):
+        return self._forward_indexed_grouped(x, mole_globals)
+
+    def _forward_indexed_grouped(self, x, mole_globals):
         coefficients = mole_globals.coefficients
         graph_index = mole_globals.graph_index
         if graph_index.shape[0] != x.shape[0]:
@@ -341,16 +361,21 @@ class MOLELinear(nn.Module):
         if self.num_shared_experts > 0:
             mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
 
-        selected_weights = mixed_weights.index_select(0, graph_index)
-        out = torch.einsum("n...i,noi->n...o", x, selected_weights)
-
+        mixed_bias = None
         if self.bias_experts is not None:
             mixed_bias = torch.einsum("be,eo->bo", coefficients, self.bias_experts)
             if self.num_shared_experts > 0 and self.bias_shared is not None:
                 mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
-            bias = mixed_bias.index_select(0, graph_index)
-            bias_shape = (bias.shape[0],) + (1,) * (out.dim() - 2) + (bias.shape[-1],)
-            out = out + bias.reshape(bias_shape)
+
+        out = x.new_zeros(x.shape[:-1] + (self.out_features,))
+        for coeff_idx, active_idx in mole_globals.indexed_groups(device=x.device):
+            bias = mixed_bias[coeff_idx] if mixed_bias is not None else None
+            group_out = F.linear(
+                x.index_select(0, active_idx),
+                mixed_weights[coeff_idx],
+                bias,
+            )
+            out.index_add_(0, active_idx, group_out)
 
         return out
 
