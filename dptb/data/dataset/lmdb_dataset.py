@@ -264,6 +264,49 @@ class LMDBDataset(AtomicDataset):
         cache[raw_idx] = dict(parts)
         return parts
 
+    def _attach_precomputed_h0(
+        self,
+        atomicdata: AtomicData,
+        *,
+        node_h0: Any,
+        edge_h0: Any,
+        node_h0_block_tensor: Any,
+        edge_h0_block_tensor: Any,
+        num_nodes: int,
+        num_edges: int,
+    ) -> bool:
+        if node_h0 is not None and edge_h0 is not None:
+            node_h0 = torch.as_tensor(node_h0)
+            edge_h0 = torch.as_tensor(edge_h0)
+            if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
+                raise ValueError(
+                    "Precomputed LMDB H0 rows do not match the active graph: "
+                    f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
+                    f"num_nodes={num_nodes}, num_edges={num_edges}."
+                )
+            atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
+            atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
+            return True
+
+        if node_h0_block_tensor is not None and edge_h0_block_tensor is not None:
+            node_h0, edge_h0 = block_tensors_to_feature_tensors(
+                atomicdata,
+                self.type_mapper,
+                node_blocks=torch.as_tensor(node_h0_block_tensor),
+                edge_blocks=torch.as_tensor(edge_h0_block_tensor),
+            )
+            if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
+                raise ValueError(
+                    "Precomputed LMDB H0 block rows do not match the active graph: "
+                    f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
+                    f"num_nodes={num_nodes}, num_edges={num_edges}."
+                )
+            atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
+            atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
+            return True
+
+        return False
+
     @property
     def raw_file_names(self):
         # TODO: this is not implemented.
@@ -479,37 +522,18 @@ class LMDBDataset(AtomicDataset):
             block_to_feature(atomicdata, self.type_mapper, blocks, overlap, self.orthogonal)
 
         if self.get_H0:
-            if self.prefer_precomputed_h0 and node_h0 is not None and edge_h0 is not None:
-                node_h0 = torch.as_tensor(node_h0)
-                edge_h0 = torch.as_tensor(edge_h0)
-                if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
-                    raise ValueError(
-                        "Precomputed LMDB H0 rows do not match the active graph: "
-                        f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
-                        f"num_nodes={num_nodes}, num_edges={num_edges}."
-                    )
-                atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
-                atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
-            elif (
-                self.prefer_precomputed_h0
-                and node_h0_block_tensor is not None
-                and edge_h0_block_tensor is not None
-            ):
-                node_h0, edge_h0 = block_tensors_to_feature_tensors(
+            attached_h0 = False
+            if self.prefer_precomputed_h0:
+                attached_h0 = self._attach_precomputed_h0(
                     atomicdata,
-                    self.type_mapper,
-                    node_blocks=torch.as_tensor(node_h0_block_tensor),
-                    edge_blocks=torch.as_tensor(edge_h0_block_tensor),
+                    node_h0=node_h0,
+                    edge_h0=edge_h0,
+                    node_h0_block_tensor=node_h0_block_tensor,
+                    edge_h0_block_tensor=edge_h0_block_tensor,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
                 )
-                if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
-                    raise ValueError(
-                        "Precomputed LMDB H0 block rows do not match the active graph: "
-                        f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
-                        f"num_nodes={num_nodes}, num_edges={num_edges}."
-                    )
-                atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
-                atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
-            elif h0_blocks is not None:
+            if not attached_h0 and h0_blocks is not None:
                 block_to_feature(
                     atomicdata,
                     self.type_mapper,
@@ -519,24 +543,16 @@ class LMDBDataset(AtomicDataset):
                     node_field=AtomicDataDict.NODE_H0_KEY,
                     edge_field=AtomicDataDict.EDGE_H0_KEY,
                 )
-            elif node_h0 is not None and edge_h0 is not None:
-                atomicdata[AtomicDataDict.NODE_H0_KEY] = torch.as_tensor(node_h0)
-                atomicdata[AtomicDataDict.EDGE_H0_KEY] = torch.as_tensor(edge_h0)
-            elif node_h0_block_tensor is not None and edge_h0_block_tensor is not None:
-                node_h0, edge_h0 = block_tensors_to_feature_tensors(
+            elif not attached_h0:
+                self._attach_precomputed_h0(
                     atomicdata,
-                    self.type_mapper,
-                    node_blocks=torch.as_tensor(node_h0_block_tensor),
-                    edge_blocks=torch.as_tensor(edge_h0_block_tensor),
+                    node_h0=node_h0,
+                    edge_h0=edge_h0,
+                    node_h0_block_tensor=node_h0_block_tensor,
+                    edge_h0_block_tensor=edge_h0_block_tensor,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
                 )
-                if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
-                    raise ValueError(
-                        "Precomputed LMDB H0 block rows do not match the active graph: "
-                        f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
-                        f"num_nodes={num_nodes}, num_edges={num_edges}."
-                    )
-                atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
-                atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
 
 
         # Attach precomputed AO-block fields produced by convert_feature_lmdb_to_blockwise.py.
