@@ -21,6 +21,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     mae_from_components,
 )
 from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
+from dptb.nn.blockwise_hamiltonian import DirectAOBlockDecoder
 
 
 class FakeLiMapper:
@@ -209,3 +210,28 @@ def test_loss_exposes_raw_component_stats():
     assert stats["feature_onsite_count"].item() == 31
     assert stats["feature_hopping_count"].item() == 31
     assert stats["block_total_count"].item() == 98
+
+
+def test_direct_ao_block_decoder_outputs_blocks_without_feature_materializer():
+    idp = FakeLiMapper()
+    data = reverse_pair_data()
+    data["node_features"] = torch.randn((1, 5), requires_grad=True)
+    data["edge_features"] = torch.randn((2, 6), requires_grad=True)
+
+    decoder = DirectAOBlockDecoder(
+        idp=idp,
+        node_in_features=5,
+        edge_in_features=6,
+        complete_edges=True,
+        strict_complete_edges=True,
+    )
+    out = decoder(data)
+
+    assert out[NODE_PRED_HAMIL_BLOCKS_KEY].shape == (1, 7, 7)
+    assert out[EDGE_PRED_HAMIL_BLOCKS_KEY].shape == (2, 7, 7)
+    assert torch.allclose(out[EDGE_PRED_HAMIL_BLOCKS_KEY][0], out[EDGE_PRED_HAMIL_BLOCKS_KEY][1].T)
+
+    loss = out[NODE_PRED_HAMIL_BLOCKS_KEY].sum() + out[EDGE_PRED_HAMIL_BLOCKS_KEY].sum()
+    loss.backward()
+    assert data["node_features"].grad.abs().sum() > 0
+    assert data["edge_features"].grad.abs().sum() > 0

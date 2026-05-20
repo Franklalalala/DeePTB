@@ -1228,6 +1228,7 @@ def e3tb_prediction():
     doc_activation = "activation function."
     doc_if_batch_normalized = "if to turn on batch normalization"
     doc_blockwise_hamiltonian = "If true, materialize E3 Hamiltonian feature predictions into AO block tensors for block-wise loss."
+    doc_direct_blockwise_hamiltonian = "If true, keep the E3 Hamiltonian stage but decode AO block tensors with a learned direct block head instead of deterministic feature-to-block materialization."
     doc_blockwise_complete_edges = "If true, Hermitian-complete AO edge blocks from reverse directed edges."
     doc_blockwise_strict_complete_edges = "If true, fail when Hermitian edge completion leaves unresolved AO entries."
     doc_blockwise_add_h0 = "If true, additionally expose full-H block predictions by adding precomputed H0 blocks."
@@ -1243,6 +1244,7 @@ def e3tb_prediction():
         Argument("scale_type", str, optional=True, default="scale_w_back_grad", doc=doc_scale_type),
         Argument("if_batch_normalized", bool, optional=True, default=False, doc=doc_if_batch_normalized),
         Argument("blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_blockwise_hamiltonian),
+        Argument("direct_blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_direct_blockwise_hamiltonian),
         Argument("complete_edges", bool, optional=True, default=True, doc=doc_blockwise_complete_edges),
         Argument("strict_complete_edges", bool, optional=True, default=False, doc=doc_blockwise_strict_complete_edges),
         Argument("symmetrize_onsite", bool, optional=True, default=True),

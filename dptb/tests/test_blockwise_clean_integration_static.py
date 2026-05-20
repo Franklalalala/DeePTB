@@ -43,6 +43,12 @@ def test_nnenv_can_select_blockwise_hamiltonian_wrapper():
     assert 'prediction_copy.get("blockwise_hamiltonian"' in src
 
 
+def test_nnenv_can_select_direct_blockwise_hamiltonian_wrapper():
+    src = _read("nn/deeptb.py")
+    assert "DirectBlockwiseE3Hamiltonian" in src
+    assert 'prediction_copy.get("direct_blockwise_hamiltonian"' in src
+
+
 def test_nnenv_forwards_blockwise_hamiltonian_options():
     src = _read("nn/deeptb.py")
     assert "_blockwise_ham_kwargs" in src
@@ -75,6 +81,7 @@ def test_argcheck_exposes_review_blockwise_options():
     for token in (
         'Argument("complete_edges"',
         'Argument("strict_complete_edges"',
+        'Argument("direct_blockwise_hamiltonian"',
         'Argument("add_h0"',
         'Argument("distributed_log_reduce"',
         'Argument("expose_component_sums"',
@@ -87,3 +94,11 @@ def test_trainers_expose_raw_blockwise_component_stats():
     multi_src = _read("nnops/multi_trainer.py")
     assert "last_component_stats" in trainer_src
     assert "last_component_stats" in multi_src
+
+
+def test_direct_blockwise_decoder_skips_feature_to_block_materializer():
+    src = _read("nn/blockwise_hamiltonian.py")
+    assert "class DirectAOBlockDecoder" in src
+    assert "class DirectBlockwiseE3Hamiltonian" in src
+    direct_forward = src.split("class DirectAOBlockDecoder", 1)[1].split("class DirectBlockwiseE3Hamiltonian", 1)[0]
+    assert "feature_tensors_to_block_tensors" not in direct_forward
