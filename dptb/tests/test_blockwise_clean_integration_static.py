@@ -96,6 +96,14 @@ def test_trainers_expose_raw_blockwise_component_stats():
     assert "last_component_stats" in multi_src
 
 
+def test_multitrainer_expert_masks_do_not_require_node_features():
+    src = _read("nnops/multi_trainer.py")
+    assert "def _num_nodes_from_batch_dict" in src
+    prepare_src = _function_source("nnops/multi_trainer.py", "_prepare_expert_masks")
+    assert 'batch_dict["node_features"]' not in prepare_src
+    assert "_num_nodes_from_batch_dict(batch_dict)" in prepare_src
+
+
 def test_lmdb_dataset_can_recover_h0_features_from_blockwise_tensors():
     src = _read("data/dataset/lmdb_dataset.py")
     assert "block_tensors_to_feature_tensors" in src

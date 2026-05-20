@@ -1413,6 +1413,30 @@ class MultiTrainer(Trainer):
     # batch prep
     # ---------------------------------------------------------------------
 
+    def _num_nodes_from_batch_dict(self, batch_dict) -> int:
+        for key in (
+            _keys.NODE_FEATURES_KEY,
+            _keys.ATOM_TYPE_KEY,
+            _keys.ATOMIC_NUMBERS_KEY,
+            _keys.BATCH_KEY,
+            "node_features",
+            "atom_types",
+            "atomic_numbers",
+            "batch",
+        ):
+            value = batch_dict.get(key, None)
+            if value is not None and hasattr(value, "shape") and len(value.shape) > 0:
+                return int(value.shape[0])
+
+        edge_index = batch_dict.get(_keys.EDGE_INDEX_KEY, batch_dict.get("edge_index", None))
+        if torch.is_tensor(edge_index) and edge_index.numel() > 0:
+            return int(edge_index.max().detach().item()) + 1
+
+        raise KeyError(
+            "Could not infer num_nodes for expert masks. Expected one of "
+            "node_features, atom_types, atomic_numbers, batch, or edge_index in batch_dict."
+        )
+
     def _prepare_expert_masks(self, batch_dict, range_dis, expert_idx):
         d_min, d_max = range_dis
         dist_edge = batch_dict['edge_lengths']
@@ -1422,7 +1446,7 @@ class MultiTrainer(Trainer):
         else:
             expert_edge_mask = (dist_edge >= d_min) & (dist_edge < d_max)
 
-        num_nodes = batch_dict["node_features"].shape[0]
+        num_nodes = self._num_nodes_from_batch_dict(batch_dict)
         expert_node_mask = torch.ones(num_nodes, dtype=torch.bool, device=self._device_obj())
         if d_min > 0:
             expert_node_mask.fill_(False)
