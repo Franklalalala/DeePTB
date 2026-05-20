@@ -43,6 +43,14 @@ def test_nnenv_can_select_blockwise_hamiltonian_wrapper():
     assert 'prediction_copy.get("blockwise_hamiltonian"' in src
 
 
+def test_nnenv_forwards_blockwise_hamiltonian_options():
+    src = _read("nn/deeptb.py")
+    assert "_blockwise_ham_kwargs" in src
+    assert '"strict_complete_edges"' in src
+    assert '"add_h0"' in src
+    assert "**_blockwise_ham_kwargs" in src
+
+
 def test_single_train_component_monitors_update_each_iteration():
     src = _read("entrypoints/train.py")
     assert "TrainOnsiteLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')])" in src
@@ -60,3 +68,22 @@ def test_blockwise_train_metrics_are_registered_for_logging():
         assert '"train_feature_compat_loss"' in src
         assert '"train_block_onsite_loss"' in src
         assert "ScalarFieldMonitor(stat_name=stat_name" in src
+
+
+def test_argcheck_exposes_review_blockwise_options():
+    src = _read("utils/argcheck.py")
+    for token in (
+        'Argument("complete_edges"',
+        'Argument("strict_complete_edges"',
+        'Argument("add_h0"',
+        'Argument("distributed_log_reduce"',
+        'Argument("expose_component_sums"',
+    ):
+        assert token in src
+
+
+def test_trainers_expose_raw_blockwise_component_stats():
+    trainer_src = _read("nnops/trainer.py")
+    multi_src = _read("nnops/multi_trainer.py")
+    assert "last_component_stats" in trainer_src
+    assert "last_component_stats" in multi_src

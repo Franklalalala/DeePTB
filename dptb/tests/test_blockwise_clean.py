@@ -170,3 +170,42 @@ def test_blockwise_loss_backprop_and_feature_logs():
     assert loss_fn.last_hopping_loss.item() == 1.0
     assert loss_fn.last_feature_count.item() == 62
     assert loss_fn.last_block_count.item() == 98
+
+
+def test_strict_edge_completion_rejects_missing_reverse_entries():
+    idp = FakeLiMapper()
+    data = one_edge_data()
+    edge_features = torch.ones((1, idp.reduced_matrix_element), dtype=torch.float32)
+    try:
+        feature_tensors_to_block_tensors(
+            data,
+            idp,
+            edge_features=edge_features,
+            complete_edges=True,
+            strict_complete_edges=True,
+        )
+    except RuntimeError as exc:
+        assert "Hermitian edge completion left unresolved" in str(exc)
+    else:
+        raise AssertionError("strict_complete_edges should reject missing reverse edge")
+
+
+def test_loss_exposes_raw_component_stats():
+    idp = FakeLiMapper()
+    ref = one_edge_data()
+    ref[NODE_DELTA_HAMIL_BLOCKS_KEY] = torch.zeros((1, 7, 7))
+    ref[EDGE_DELTA_HAMIL_BLOCKS_KEY] = torch.zeros((1, 7, 7))
+    ref[NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = torch.tensor([[7, 7]])
+    ref[EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = torch.tensor([[7, 7]])
+
+    data = dict(ref)
+    data[NODE_PRED_HAMIL_BLOCKS_KEY] = torch.ones((1, 7, 7), requires_grad=True)
+    data[EDGE_PRED_HAMIL_BLOCKS_KEY] = torch.ones((1, 7, 7), requires_grad=True)
+
+    loss_fn = HamilBlockwiseNexTHamLoss(idp=idp, optimization="block_mae", log_feature_compatible=True)
+    loss = loss_fn(data, ref)
+    assert loss.item() == 1.0
+    stats = loss_fn.last_component_stats
+    assert stats["feature_onsite_count"].item() == 31
+    assert stats["feature_hopping_count"].item() == 31
+    assert stats["block_total_count"].item() == 98

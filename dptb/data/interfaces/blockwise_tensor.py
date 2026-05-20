@@ -21,6 +21,11 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 
 import torch
 
+try:
+    import torch.distributed as dist
+except Exception:  # pragma: no cover
+    dist = None
+
 try:  # DeePTB runtime
     from dptb.data import _keys
 except Exception:  # pragma: no cover - standalone tests
@@ -332,6 +337,7 @@ def complete_edge_blocks_from_reverse(
     edge_blocks: Optional[torch.Tensor],
     *,
     direct_mask: Optional[torch.Tensor] = None,
+    strict: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
     """Fill missing non-canonical entries using ``H_ij(R)=H_ji(-R)^T``.
 
@@ -357,8 +363,21 @@ def complete_edge_blocks_from_reverse(
         rev_blocks = rev_blocks.conj()
     rev_mask = direct_mask.index_select(0, safe_rev).transpose(-1, -2)
     fill = (~direct_mask) & rev_mask & has_rev.view(-1, 1, 1)
+    completed_mask = direct_mask | fill
+    if strict:
+        _, edge_shapes = infer_block_shapes(data, idp, device=edge_blocks.device)
+        valid_mask = block_mask_from_shapes(edge_shapes, tuple(edge_blocks.shape[-2:]))
+        unresolved = valid_mask & (~completed_mask)
+        if bool(unresolved.any().detach().cpu().item()):
+            missing_edges = torch.nonzero(unresolved.flatten(1).any(dim=1), as_tuple=False).flatten()
+            preview = missing_edges[:8].detach().cpu().tolist()
+            raise RuntimeError(
+                "Hermitian edge completion left unresolved AO entries for "
+                f"{int(missing_edges.numel())} edge(s); first indices={preview}. "
+                "Use a symmetric directed graph or set strict_complete_edges=false."
+            )
     completed = torch.where(fill, rev_blocks, edge_blocks)
-    return completed, direct_mask | fill, rev
+    return completed, completed_mask, rev
 
 
 # -----------------------------------------------------------------------------
@@ -376,6 +395,7 @@ def feature_tensors_to_block_tensors(
     edge_pad_shape: Optional[Tuple[int, int]] = None,
     symmetrize_onsite: bool = True,
     complete_edges: bool = True,
+    strict_complete_edges: bool = False,
 ) -> BlockTensorResult:
     """Differentiably materialize non-SOC feature tensors into AO blocks."""
     ensure_non_soc_mapper(idp)
@@ -433,7 +453,9 @@ def feature_tensors_to_block_tensors(
                 sub_block[:, row, col] = part
             edge_blocks.index_copy_(0, idx, sub_block)
         if complete_edges:
-            edge_blocks, _, _ = complete_edge_blocks_from_reverse(data, idp, edge_blocks)
+            edge_blocks, _, _ = complete_edge_blocks_from_reverse(
+                data, idp, edge_blocks, strict=strict_complete_edges
+            )
 
     return BlockTensorResult(node_blocks, edge_blocks, node_shapes, edge_shapes)
 
@@ -459,6 +481,7 @@ def block_dict_to_ordered_tensors(
     dtype: Optional[torch.dtype] = None,
     missing_edge_policy: str = "error",
     complete_edges: bool = True,
+    strict_complete_edges: bool = False,
 ) -> BlockTensorResult:
     """Pack official ``feature_to_block`` dict output into LMDB-ready tensors."""
     ensure_non_soc_mapper(idp)
@@ -503,7 +526,9 @@ def block_dict_to_ordered_tensors(
             raise KeyError(f"Missing edge block key {direct} and reverse {reverse}")
         _put_padded(edge_blocks, e, block, shape)
     if complete_edges:
-        edge_blocks, _, _ = complete_edge_blocks_from_reverse(data, idp, edge_blocks)
+        edge_blocks, _, _ = complete_edge_blocks_from_reverse(
+            data, idp, edge_blocks, strict=strict_complete_edges
+        )
     return BlockTensorResult(node_blocks, edge_blocks, node_shapes, edge_shapes)
 
 
@@ -567,6 +592,44 @@ def value_components(values: torch.Tensor, *, complex_reduction: str = "modulus"
 
 def add_components(a: ComponentSums, b: ComponentSums) -> ComponentSums:
     return ComponentSums(a.abs_sum + b.abs_sum, a.square_sum + b.square_sum, a.count + b.count)
+
+
+def component_to_detached(comp: ComponentSums) -> ComponentSums:
+    """Detach a component triple while keeping device/dtype for later reducers."""
+    return ComponentSums(comp.abs_sum.detach(), comp.square_sum.detach(), comp.count.detach())
+
+
+def maybe_all_reduce_components(comp: ComponentSums) -> ComponentSums:
+    """All-reduce component sums across DDP ranks when distributed is active.
+
+    This is only meant for logging/reduction components.  It avoids logging
+    rank-local feature-compatible losses in DDP; gradients are not propagated
+    through the reduced tensors.
+    """
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return comp
+    vec = torch.stack([comp.abs_sum.detach(), comp.square_sum.detach(), comp.count.detach()])
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    return ComponentSums(vec[0], vec[1], vec[2])
+
+
+def component_state(prefix: str, comp: ComponentSums) -> Dict[str, torch.Tensor]:
+    """Return raw sums/counts for exact epoch-level reconstruction."""
+    return {
+        f"{prefix}_abs_sum": comp.abs_sum.detach(),
+        f"{prefix}_square_sum": comp.square_sum.detach(),
+        f"{prefix}_count": comp.count.detach(),
+    }
+
+
+def l1_rmse_from_raw(abs_sum: float, square_sum: float, count: float, *, eps: float = 1e-12) -> float:
+    if count <= 0:
+        return 0.0
+    return 0.5 * (abs_sum / count + float((square_sum / count + eps) ** 0.5))
+
+
+def mae_from_raw(abs_sum: float, count: float) -> float:
+    return 0.0 if count <= 0 else abs_sum / count
 
 
 def block_components(

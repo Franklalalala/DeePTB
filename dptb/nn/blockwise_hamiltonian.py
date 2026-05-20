@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Block-wise Hamiltonian decoder wrapper.
 
-``BlockwiseE3Hamiltonian`` intentionally keeps DeePTB's existing
-``E3Hamiltonian`` stage.  The old stage decodes the model's equivariant/RME
-output into DeePTB Hamiltonian feature tensors.  This wrapper then materializes
-those feature tensors into padded AO blocks for block-level loss.
-
-Only the current non-SOC path is supported in this minimal patch.
+``BlockwiseE3Hamiltonian`` keeps DeePTB's existing ``E3Hamiltonian`` stage for
+now: equivariant/RME outputs are decoded into DeePTB Hamiltonian feature tensors,
+then materialized into padded AO blocks.  This is correctness-first and enables
+block-level loss without changing the upstream equivariant head.  It is not a
+block-native head and therefore is not expected to be speed-positive by itself.
 """
 
 from __future__ import annotations
@@ -38,7 +37,8 @@ class BlockwiseE3Hamiltonian(nn.Module):
 
     Parameters are forwarded to ``E3Hamiltonian`` except for the block-specific
     output controls below.  Gradients from block loss flow through the
-    feature-to-block materialization back to the original feature/RME head.
+    differentiable feature-to-block materialization back to the original
+    feature/RME head.
     """
 
     def __init__(
@@ -57,6 +57,7 @@ class BlockwiseE3Hamiltonian(nn.Module):
         edge_pad_shape: Optional[Tuple[int, int]] = None,
         symmetrize_onsite: bool = True,
         complete_edges: bool = True,
+        strict_complete_edges: bool = False,
         add_h0: bool = False,
         full_output_node_field: str = "node_full_hamil_blocks",
         full_output_edge_field: str = "edge_full_hamil_blocks",
@@ -82,6 +83,7 @@ class BlockwiseE3Hamiltonian(nn.Module):
         self.edge_pad_shape = edge_pad_shape
         self.symmetrize_onsite = bool(symmetrize_onsite)
         self.complete_edges = bool(complete_edges)
+        self.strict_complete_edges = bool(strict_complete_edges)
         self.add_h0 = bool(add_h0)
         self.full_output_node_field = full_output_node_field
         self.full_output_edge_field = full_output_edge_field
@@ -97,6 +99,7 @@ class BlockwiseE3Hamiltonian(nn.Module):
             edge_pad_shape=self.edge_pad_shape,
             symmetrize_onsite=self.symmetrize_onsite,
             complete_edges=self.complete_edges,
+            strict_complete_edges=self.strict_complete_edges,
         )
         attach_prediction_block_tensors(
             data,
@@ -106,7 +109,6 @@ class BlockwiseE3Hamiltonian(nn.Module):
             node_shape_key=self.output_node_shape_field,
             edge_shape_key=self.output_edge_shape_field,
         )
-
         if self.add_h0:
             if packed.node_blocks is not None and NODE_H0_BLOCKS_KEY in data:
                 data[self.full_output_node_field] = data[NODE_H0_BLOCKS_KEY].to(

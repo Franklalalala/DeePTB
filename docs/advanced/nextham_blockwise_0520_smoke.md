@@ -226,3 +226,95 @@ target feature storage but does not remove model-side feature computation.
 The next speed-relevant design step is a block-native prediction head or a
 training path that avoids differentiable feature-to-block materialization on the
 forward path.
+
+## Review Update
+
+Date: 2026-05-20
+
+Review package:
+
+```text
+E:\deeptb\codex\0520_blk_loss\blockwise_nextham_review_update_pkg\blockwise_nextham_review_update_pkg
+```
+
+The follow-up patch tightens the correctness-first smoke path in three places:
+
+```text
+1. strict Hermitian edge completion
+2. raw abs/square/count component exposure for exact logging reducers
+3. forwarding prediction.* blockwise options into BlockwiseE3Hamiltonian
+```
+
+New config options accepted by `prediction` include:
+
+```text
+complete_edges
+strict_complete_edges
+symmetrize_onsite
+add_h0
+node_pad_shape / edge_pad_shape
+full_output_node_field / full_output_edge_field
+```
+
+New blockwise loss options include:
+
+```text
+distributed_log_reduce
+expose_component_sums
+```
+
+The clean liyue review worktree used for this validation was:
+
+```text
+/home/mingkang_nt/codex/nextham_blockwise_review_0520/DeePTB_0520_review_smoke
+```
+
+Validation commands and results:
+
+```text
+PYTHONPATH=$REPO /home/mingkang_nt/anaconda3/envs/dptb_triton_gp_0424/bin/python -m pytest dptb/tests/test_blockwise_clean_integration_static.py -q
+9 passed
+
+PYTHONPATH=$REPO /home/mingkang_nt/anaconda3/envs/dptb_triton_gp_0424/bin/python -m pytest dptb/tests/test_blockwise_clean.py -q
+7 passed, 1 warning
+```
+
+Strict conversion command added `--strict-edge-completion` to the earlier
+50-frame conversion smoke:
+
+```text
+converted sample:
+/home/mingkang_nt/data/nextham_blockwise_review_0520_smoke/blockwise_drop_h0keep_strict_sample/data.0000.lmdb
+
+wrote entries: 50
+delta max:     0.000e+00
+h0 max:        0.000e+00
+elapsed:       15.3 s
+```
+
+Strict blockwise smoke config:
+
+```text
+/home/mingkang_nt/data/nextham_blockwise_review_0520_smoke/input_blockwise_strict_review_cueq_smoke.json
+```
+
+Strict blockwise training run:
+
+```text
+/home/mingkang_nt/codex/nextham_blockwise_review_0520/runs/blockwise_strict_review_cueq_20260520_162341
+model: BlockwiseE3Hamiltonian
+iters: 25
+entry wall: 22.440 s
+process wall: 33.65 s
+MAX_RSS: 3215.4 MB
+epoch train_loss: 0.1827
+epoch train_feature_compat_loss: 1.1589
+epoch train_onsite_loss: 1.9654
+epoch train_hopping_loss: 0.3524
+epoch train_block_loss: 0.1827
+epoch train_block_element_mae: 0.1827
+epoch train_block_onsite_loss: 1.1085
+epoch train_block_hopping_loss: 0.1732
+```
+
+After the run, both L40S GPUs were idle at 13 MiB.

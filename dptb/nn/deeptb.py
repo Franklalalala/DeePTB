@@ -272,13 +272,23 @@ class NNENV(nn.Module):
 
         elif self.method == "e3tb":
             hamiltonian_cls = BlockwiseE3Hamiltonian if self.blockwise_hamiltonian else E3Hamiltonian
+            _blockwise_ham_kwargs = {}
+            if self.blockwise_hamiltonian:
+                for _k in (
+                    "node_pad_shape", "edge_pad_shape",
+                    "symmetrize_onsite", "complete_edges", "strict_complete_edges",
+                    "add_h0", "full_output_node_field", "full_output_edge_field",
+                ):
+                    if _k in prediction_copy:
+                        _blockwise_ham_kwargs[_k] = prediction_copy[_k]
             self.hamiltonian = hamiltonian_cls(
                 edge_field=AtomicDataDict.EDGE_FEATURES_KEY,
                 node_field=AtomicDataDict.NODE_FEATURES_KEY,
                 idp=self.embedding.idp,
                 dtype=self.dtype,
                 device=self.device,
-                soc=self.has_soc
+                soc=self.has_soc,
+                **_blockwise_ham_kwargs,
             )
 
             if overlap:

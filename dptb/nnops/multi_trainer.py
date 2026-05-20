@@ -1935,6 +1935,11 @@ class MultiTrainer(Trainer):
             ("block_hopping_loss", "last_block_hopping_loss"),
         ):
             out[key] = self._as_scalar_tensor(getattr(loss_module, attr, None), allow_none=True)
+        component_stats = getattr(loss_module, "last_component_stats", None)
+        out["component_stats"] = {
+            name: self._as_scalar_tensor(value, default=0.0)
+            for name, value in component_stats.items()
+        } if component_stats else {}
 
         return out
 
@@ -2045,6 +2050,11 @@ class MultiTrainer(Trainer):
             if ref_res["expert_load_cv"] is not None:
                 load_cv_values.append(ref_res["expert_load_cv"])
 
+        component_stats = dict(main.get("component_stats", {}))
+        if ref_batch_dict is not None:
+            for name, value in ref_res.get("component_stats", {}).items():
+                component_stats[name] = value if name not in component_stats else component_stats[name] + value
+
         active_nodes_safe = active_nodes.to(dtype=self.dtype).clamp_min(1.0)
         active_edges_safe = active_edges.to(dtype=self.dtype).clamp_min(1.0)
         expert_onsite = onsite_weighted_sum / active_nodes_safe
@@ -2066,6 +2076,10 @@ class MultiTrainer(Trainer):
             "hopping_cnt": hopping_cnt.detach() if torch.is_tensor(hopping_cnt) else None,
             "z_values": [z.detach() for z in z_values],
             "load_cv_values": [cv.detach() for cv in load_cv_values],
+            "component_stats": {
+                name: value.detach() if torch.is_tensor(value) else torch.as_tensor(value, device=self.device, dtype=self.dtype)
+                for name, value in component_stats.items()
+            },
         }
 
     # ---------------------------------------------------------------------
@@ -2897,6 +2911,7 @@ class MultiTrainer(Trainer):
                 expert_hopping_dict = {}
                 z_metric_values = []
                 expert_load_cv_values = []
+                component_stats_sum: Dict[str, torch.Tensor] = {}
 
                 reduce_payloads: List[Dict[str, Any]] = []
 
@@ -2924,6 +2939,10 @@ class MultiTrainer(Trainer):
                     for cv in payload.get("load_cv_values", []):
                         if cv is not None:
                             expert_load_cv_values.append(self._to_float_scalar(cv))
+                    for name, value in payload.get("component_stats", {}).items():
+                        if value is None:
+                            continue
+                        component_stats_sum[name] = value if name not in component_stats_sum else component_stats_sum[name] + value
 
                     reduce_payloads.append(payload)
 
@@ -3004,6 +3023,8 @@ class MultiTrainer(Trainer):
                     state["expert_load_cv"] = sum(expert_load_cv_values) / len(expert_load_cv_values)
                 if z_metric_values:
                     state["mean_max_prob"] = sum(z_metric_values) / len(z_metric_values)
+                for name, value in component_stats_sum.items():
+                    state[f"train_{name}"] = value.detach() if torch.is_tensor(value) else value
                 state.update(dynamic_batch_state)
 
                 self._add_cuda_memory_state(state, self._gather_cuda_memory_metrics())

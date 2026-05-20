@@ -239,6 +239,7 @@ def convert_one_feature_pair(
         blocks,
         start_id=args.start_id,
         complete_edges=(args.edge_complete_policy == "hermitian"),
+        strict_complete_edges=args.strict_edge_completion,
     )
     attach_block_tensors(out, packed, prefix=prefix)
     node_shape = list(torch.as_tensor(packed.node_blocks).shape) if packed.node_blocks is not None else None
@@ -354,6 +355,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtol", type=float, default=2e-5)
     parser.add_argument("--start-id", type=int, default=0, help="Block key atom index base used by feature_to_block.")
     parser.add_argument("--edge-complete-policy", choices=["hermitian", "none"], default="hermitian")
+    parser.add_argument(
+        "--strict-edge-completion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When hermitian completion is enabled, fail if reverse edges are "
+            "missing and full AO blocks would contain unresolved entries."
+        ),
+    )
     parser.add_argument("--block-dtype", choices=["auto", "float32", "float64", "complex64", "complex128"], default="float32")
     parser.add_argument("--convert-h0-blocks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--target-feature-policy", choices=["drop", "keep", "rename_shadow"], default="drop")
@@ -382,6 +392,7 @@ def main(argv=None) -> int:
         "basis": load_basis(args),
         "mapper_method": args.mapper_method,
         "strict_roundtrip": bool(args.strict_roundtrip),
+        "strict_edge_completion": bool(args.strict_edge_completion),
         "edge_complete_policy": args.edge_complete_policy,
         "target_feature_policy": args.target_feature_policy,
         "h0_feature_policy": args.h0_feature_policy,

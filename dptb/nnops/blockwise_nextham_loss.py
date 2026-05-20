@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Block-level Hamiltonian loss with feature-compatible TensorBoard metrics."""
+"""Block-level Hamiltonian loss with exact feature-compatible logging state.
+
+The optimization loss remains AO-block based.  Feature-compatible metrics are
+computed from AO-block diffs with OrbitalMapper canonical slices and are exposed
+both as scalar last_* values and as raw abs/square/count components so Trainer
+can reconstruct epoch/DDP metrics without averaging already-sqrt'ed batch losses.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -35,10 +41,13 @@ from dptb.data.interfaces.blockwise_tensor import (
     add_components,
     as_tensor,
     block_components,
+    component_state,
+    component_to_detached,
     feature_components_from_blocks,
     infer_block_shapes,
     l1_rmse_from_components,
     mae_from_components,
+    maybe_all_reduce_components,
 )
 
 
@@ -52,13 +61,7 @@ def _get(data: Mapping[str, Any], key: str, default=None):
 @Loss.register("hamil_blockwise_nextham")
 @Loss.register("hamil_block_abs")
 class HamilBlockwiseNexTHamLoss(nn.Module):
-    """AO-block optimization loss plus old feature-level onsite/hopping logs.
-
-    Default optimization is global masked AO-block MAE.  The feature-compatible
-    metrics are computed from the same AO blocks under ``torch.no_grad()`` and
-    stored in ``last_onsite_loss`` / ``last_hopping_loss`` for existing Trainer
-    logging hooks.
-    """
+    """AO-block optimization loss plus old feature-level onsite/hopping logs."""
 
     def __init__(
         self,
@@ -77,6 +80,8 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         complex_reduction: str = "modulus",
         log_feature_compatible: bool = True,
         feature_log_no_grad: bool = True,
+        distributed_log_reduce: bool = True,
+        expose_component_sums: bool = True,
         eps: float = 1e-12,
         **kwargs,
     ) -> None:
@@ -108,8 +113,12 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         self.complex_reduction = complex_reduction
         self.log_feature_compatible = bool(log_feature_compatible)
         self.feature_log_no_grad = bool(feature_log_no_grad)
+        self.distributed_log_reduce = bool(distributed_log_reduce)
+        self.expose_component_sums = bool(expose_component_sums)
         self.eps = float(eps)
+        self._clear_last_state()
 
+    def _clear_last_state(self) -> None:
         self.last_opt_loss = None
         self.last_block_loss = None
         self.last_block_element_mae = None
@@ -120,6 +129,7 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         self.last_hopping_loss = None
         self.last_block_count = None
         self.last_feature_count = None
+        self.last_component_stats: Dict[str, torch.Tensor] = {}
 
     def _predictions(self, data: Mapping[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         node = _get(data, self.pred_node_block_key, None)
@@ -150,35 +160,31 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
             edge_shape = as_tensor(edge_shape, device=pred_edge.device, dtype=torch.long)
         return node, edge, node_shape, edge_shape
 
-    def _block_loss(self, pred_node, pred_edge, target_node, target_edge, node_shape, edge_shape):
+    def _block_components(self, pred_node, pred_edge, target_node, target_edge, node_shape, edge_shape):
         node_comp = block_components(pred_node, target_node, node_shape, complex_reduction=self.complex_reduction)
         edge_comp = block_components(pred_edge, target_edge, edge_shape, complex_reduction=self.complex_reduction)
-        total_comp = add_components(node_comp, edge_comp)
+        return node_comp, edge_comp, add_components(node_comp, edge_comp)
+
+    def _loss_from_block_components(self, node_comp: ComponentSums, edge_comp: ComponentSums, total_comp: ComponentSums):
         node_mae = mae_from_components(node_comp)
         edge_mae = mae_from_components(edge_comp)
         global_mae = mae_from_components(total_comp)
-        global_l1_rmse = l1_rmse_from_components(total_comp, eps=self.eps)
-
         if self.optimization in {"block_mae", "mae", "nextham", "nextham_mae"}:
             if self.block_reduction in {"equal", "equal_onsite_hopping", "legacy"}:
-                loss = 0.5 * (node_mae + edge_mae)
-            else:
-                loss = global_mae
-        elif self.optimization in {"block_l1_rmse", "l1_rmse"}:
+                return 0.5 * (node_mae + edge_mae)
+            return global_mae
+        if self.optimization in {"block_l1_rmse", "l1_rmse"}:
             if self.block_reduction in {"equal", "equal_onsite_hopping", "legacy"}:
-                loss = 0.5 * (
+                return 0.5 * (
                     l1_rmse_from_components(node_comp, eps=self.eps)
                     + l1_rmse_from_components(edge_comp, eps=self.eps)
                 )
-            else:
-                loss = global_l1_rmse
-        elif self.optimization in {"feature", "feature_compatible", "compat"}:
-            loss = None
-        else:
-            raise ValueError(f"Unknown optimization mode: {self.optimization}")
-        return loss, node_mae, edge_mae, global_mae, total_comp
+            return l1_rmse_from_components(total_comp, eps=self.eps)
+        if self.optimization in {"feature", "feature_compatible", "compat"}:
+            return None
+        raise ValueError(f"Unknown optimization mode: {self.optimization}")
 
-    def _feature_logs(self, ref_data, pred_node, pred_edge, target_node, target_edge):
+    def _feature_components(self, ref_data, pred_node, pred_edge, target_node, target_edge):
         node_comp, edge_comp = feature_components_from_blocks(
             ref_data,
             self.idp,
@@ -188,9 +194,39 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
             target_edge,
             complex_reduction=self.complex_reduction,
         )
-        onsite = l1_rmse_from_components(node_comp, eps=self.eps)
-        hopping = l1_rmse_from_components(edge_comp, eps=self.eps)
-        return 0.5 * (onsite + hopping), onsite, hopping, add_components(node_comp, edge_comp)
+        if self.distributed_log_reduce:
+            node_comp = maybe_all_reduce_components(node_comp)
+            edge_comp = maybe_all_reduce_components(edge_comp)
+        return node_comp, edge_comp, add_components(node_comp, edge_comp)
+
+    def _record_component_stats(
+        self,
+        *,
+        block_node: ComponentSums,
+        block_edge: ComponentSums,
+        block_total: ComponentSums,
+        feature_node: Optional[ComponentSums],
+        feature_edge: Optional[ComponentSums],
+        feature_total: Optional[ComponentSums],
+    ) -> None:
+        if not self.expose_component_sums:
+            self.last_component_stats = {}
+            return
+        stats: Dict[str, torch.Tensor] = {}
+        for prefix, comp in (
+            ("block_onsite", block_node),
+            ("block_hopping", block_edge),
+            ("block_total", block_total),
+        ):
+            stats.update(component_state(prefix, comp))
+        if feature_node is not None and feature_edge is not None and feature_total is not None:
+            for prefix, comp in (
+                ("feature_onsite", feature_node),
+                ("feature_hopping", feature_edge),
+                ("feature_total", feature_total),
+            ):
+                stats.update(component_state(prefix, comp))
+        self.last_component_stats = stats
 
     def forward(self, data: Mapping[str, Any], ref_data: Optional[Mapping[str, Any]] = None):
         if ref_data is None:
@@ -198,15 +234,19 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         pred_node, pred_edge = self._predictions(data)
         target_node, target_edge, node_shape, edge_shape = self._targets(ref_data, pred_node, pred_edge)
 
-        block_loss, block_onsite, block_hopping, block_global_mae, block_comp = self._block_loss(
+        block_node_comp, block_edge_comp, block_total_comp = self._block_components(
             pred_node, pred_edge, target_node, target_edge, node_shape, edge_shape
         )
+        block_loss = self._loss_from_block_components(block_node_comp, block_edge_comp, block_total_comp)
+        block_onsite = mae_from_components(block_node_comp)
+        block_hopping = mae_from_components(block_edge_comp)
+        block_global_mae = mae_from_components(block_total_comp)
 
         need_feature = self.log_feature_compatible or self.optimization in {"feature", "feature_compatible", "compat"}
         if need_feature:
             if self.feature_log_no_grad and self.optimization not in {"feature", "feature_compatible", "compat"}:
                 with torch.no_grad():
-                    feature_total, feature_onsite, feature_hopping, feature_comp = self._feature_logs(
+                    feature_node_comp, feature_edge_comp, feature_total_comp = self._feature_components(
                         ref_data,
                         pred_node.detach(),
                         pred_edge.detach(),
@@ -214,12 +254,15 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
                         target_edge.detach(),
                     )
             else:
-                feature_total, feature_onsite, feature_hopping, feature_comp = self._feature_logs(
+                feature_node_comp, feature_edge_comp, feature_total_comp = self._feature_components(
                     ref_data, pred_node, pred_edge, target_node, target_edge
                 )
+            feature_onsite = l1_rmse_from_components(feature_node_comp, eps=self.eps)
+            feature_hopping = l1_rmse_from_components(feature_edge_comp, eps=self.eps)
+            feature_total = 0.5 * (feature_onsite + feature_hopping)
         else:
+            feature_node_comp = feature_edge_comp = feature_total_comp = None
             feature_total = feature_onsite = feature_hopping = None
-            feature_comp = None
 
         opt_loss = feature_total if self.optimization in {"feature", "feature_compatible", "compat"} else block_loss
         if opt_loss is None:
@@ -230,15 +273,24 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         self.last_block_element_mae = block_global_mae.detach()
         self.last_block_onsite_loss = block_onsite.detach()
         self.last_block_hopping_loss = block_hopping.detach()
-        self.last_block_count = block_comp.count.detach()
+        self.last_block_count = block_total_comp.count.detach()
         if feature_total is not None:
             self.last_feature_compat_loss = feature_total.detach()
             self.last_onsite_loss = feature_onsite.detach()      # historical TB onsite semantics
             self.last_hopping_loss = feature_hopping.detach()    # historical TB hopping semantics
-            self.last_feature_count = feature_comp.count.detach() if feature_comp is not None else None
+            self.last_feature_count = feature_total_comp.count.detach() if feature_total_comp is not None else None
         else:
             self.last_feature_compat_loss = None
             self.last_onsite_loss = None
             self.last_hopping_loss = None
             self.last_feature_count = None
+
+        self._record_component_stats(
+            block_node=component_to_detached(block_node_comp),
+            block_edge=component_to_detached(block_edge_comp),
+            block_total=component_to_detached(block_total_comp),
+            feature_node=component_to_detached(feature_node_comp) if feature_node_comp is not None else None,
+            feature_edge=component_to_detached(feature_edge_comp) if feature_edge_comp is not None else None,
+            feature_total=component_to_detached(feature_total_comp) if feature_total_comp is not None else None,
+        )
         return opt_loss

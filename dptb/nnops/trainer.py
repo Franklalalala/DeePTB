@@ -169,6 +169,10 @@ class Trainer(BaseTrainer):
             metric_value = getattr(loss_obj, attr_name, None)
             if metric_value is not None:
                 state[f"{prefix}_{metric_name}"] = metric_value
+        component_stats = getattr(loss_obj, "last_component_stats", None)
+        if component_stats:
+            for component_name, component_value in component_stats.items():
+                state[f"{prefix}_{component_name}"] = component_value
         return state
 
     def iteration(self, batch, ref_batch=None):

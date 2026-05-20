@@ -1228,6 +1228,9 @@ def e3tb_prediction():
     doc_activation = "activation function."
     doc_if_batch_normalized = "if to turn on batch normalization"
     doc_blockwise_hamiltonian = "If true, materialize E3 Hamiltonian feature predictions into AO block tensors for block-wise loss."
+    doc_blockwise_complete_edges = "If true, Hermitian-complete AO edge blocks from reverse directed edges."
+    doc_blockwise_strict_complete_edges = "If true, fail when Hermitian edge completion leaves unresolved AO entries."
+    doc_blockwise_add_h0 = "If true, additionally expose full-H block predictions by adding precomputed H0 blocks."
     doc_scale_type = ("Which scale method to use. Can be no_scale, "
                       "scale_wo_back_grad (the scale parameter will not engage the back grad computation graph), "
                       "scale_w_back_grad (the scale parameter will engage the back grad computation graph)")
@@ -1240,6 +1243,14 @@ def e3tb_prediction():
         Argument("scale_type", str, optional=True, default="scale_w_back_grad", doc=doc_scale_type),
         Argument("if_batch_normalized", bool, optional=True, default=False, doc=doc_if_batch_normalized),
         Argument("blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_blockwise_hamiltonian),
+        Argument("complete_edges", bool, optional=True, default=True, doc=doc_blockwise_complete_edges),
+        Argument("strict_complete_edges", bool, optional=True, default=False, doc=doc_blockwise_strict_complete_edges),
+        Argument("symmetrize_onsite", bool, optional=True, default=True),
+        Argument("add_h0", bool, optional=True, default=False, doc=doc_blockwise_add_h0),
+        Argument("node_pad_shape", list, optional=True, default=None),
+        Argument("edge_pad_shape", list, optional=True, default=None),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks"),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks"),
     ]
 
     return nn
@@ -1485,6 +1496,8 @@ def loss_options():
         Argument("complex_reduction", str, optional=True, default="modulus"),
         Argument("log_feature_compatible", bool, optional=True, default=True),
         Argument("feature_log_no_grad", bool, optional=True, default=True),
+        Argument("distributed_log_reduce", bool, optional=True, default=True),
+        Argument("expose_component_sums", bool, optional=True, default=True),
         Argument("eps", float, optional=True, default=1e-12),
     ]
 
