@@ -102,3 +102,20 @@ def test_direct_blockwise_decoder_skips_feature_to_block_materializer():
     assert "class DirectBlockwiseE3Hamiltonian" in src
     direct_forward = src.split("class DirectAOBlockDecoder", 1)[1].split("class DirectBlockwiseE3Hamiltonian", 1)[0]
     assert "feature_tensors_to_block_tensors" not in direct_forward
+
+
+def test_nextham_style_block_decoder_is_structured_not_dense_learned_head():
+    src = _read("nn/blockwise_hamiltonian.py")
+    assert "class NexTHamAOBlockDecoder" in src
+    assert "class NexTHamBlockwiseE3Hamiltonian" in src
+    decoder_src = src.split("class NexTHamAOBlockDecoder", 1)[1].split("class NexTHamBlockwiseE3Hamiltonian", 1)[0]
+    assert "nn.Linear" not in decoder_src
+    assert "nn.Parameter" not in decoder_src
+    assert "feature_tensors_to_block_tensors" not in decoder_src
+    assert "_scatter_features_to_blocks" in decoder_src
+
+
+def test_nnenv_can_select_nextham_style_blockwise_hamiltonian_wrapper():
+    src = _read("nn/deeptb.py")
+    assert "NexTHamBlockwiseE3Hamiltonian" in src
+    assert 'prediction_copy.get("nextham_blockwise_hamiltonian"' in src

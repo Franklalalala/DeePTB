@@ -21,7 +21,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     mae_from_components,
 )
 from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
-from dptb.nn.blockwise_hamiltonian import DirectAOBlockDecoder
+from dptb.nn.blockwise_hamiltonian import DirectAOBlockDecoder, NexTHamAOBlockDecoder
 
 
 class FakeLiMapper:
@@ -262,3 +262,37 @@ def test_direct_ao_block_decoder_masks_invalid_padding_entries():
     assert torch.count_nonzero(node_blocks[:, :, 7:]) == 0
     assert torch.count_nonzero(edge_blocks[:, 7:, :]) == 0
     assert torch.count_nonzero(edge_blocks[:, :, 7:]) == 0
+
+
+def test_nextham_ao_block_decoder_is_parameter_free_and_matches_materializer():
+    idp = FakeLiMapper()
+    data = reverse_pair_data()
+    node_features = torch.randn((1, idp.reduced_matrix_element), requires_grad=True)
+    edge_features = torch.randn((2, idp.reduced_matrix_element), requires_grad=True)
+    data["node_features"] = node_features
+    data["edge_features"] = edge_features
+
+    decoder = NexTHamAOBlockDecoder(
+        idp=idp,
+        complete_edges=True,
+        strict_complete_edges=True,
+    )
+    assert sum(p.numel() for p in decoder.parameters()) == 0
+
+    out = decoder(dict(data))
+    expected = feature_tensors_to_block_tensors(
+        data,
+        idp,
+        node_features=node_features,
+        edge_features=edge_features,
+        complete_edges=True,
+        strict_complete_edges=True,
+    )
+
+    assert torch.allclose(out[NODE_PRED_HAMIL_BLOCKS_KEY], expected.node_blocks)
+    assert torch.allclose(out[EDGE_PRED_HAMIL_BLOCKS_KEY], expected.edge_blocks)
+
+    loss = out[NODE_PRED_HAMIL_BLOCKS_KEY].sum() + out[EDGE_PRED_HAMIL_BLOCKS_KEY].sum()
+    loss.backward()
+    assert node_features.grad.abs().sum() > 0
+    assert edge_features.grad.abs().sum() > 0

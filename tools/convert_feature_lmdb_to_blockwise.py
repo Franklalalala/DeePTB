@@ -142,6 +142,24 @@ def feature_masks(data: Mapping[str, Any], idp, node_feat: torch.Tensor, edge_fe
     )
 
 
+def tensorize_feature_sample(data: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(data)
+    for key in (
+        "atomic_numbers",
+        "atom_types",
+        "edge_index",
+        "edge_cell_shift",
+        "edge_types",
+        NODE_FEATURES_KEY,
+        EDGE_FEATURES_KEY,
+        NODE_H0_KEY,
+        EDGE_H0_KEY,
+    ):
+        if key in out:
+            out[key] = torch.as_tensor(out[key])
+    return out
+
+
 def strict_roundtrip_check(
     sample: Dict[str, Any],
     idp,
@@ -156,6 +174,7 @@ def strict_roundtrip_check(
     check_data = dict(sample)
     check_data[NODE_FEATURES_KEY] = sample[node_key]
     check_data[EDGE_FEATURES_KEY] = sample[edge_key]
+    check_data = tensorize_feature_sample(check_data)
     out_data = dict(check_data)
     out_data.pop(NODE_FEATURES_KEY, None)
     out_data.pop(EDGE_FEATURES_KEY, None)
@@ -185,8 +204,9 @@ def strict_roundtrip_check(
 
 def feature_to_block_dict_for_keys(sample: Dict[str, Any], idp, node_key: str, edge_key: str):
     work = dict(sample)
-    work[NODE_FEATURES_KEY] = sample[node_key]
-    work[EDGE_FEATURES_KEY] = sample[edge_key]
+    work[NODE_FEATURES_KEY] = torch.as_tensor(sample[node_key])
+    work[EDGE_FEATURES_KEY] = torch.as_tensor(sample[edge_key])
+    work = tensorize_feature_sample(work)
     return feature_to_block(work, idp, overlap=False)
 
 
