@@ -96,6 +96,14 @@ def test_trainers_expose_raw_blockwise_component_stats():
     assert "last_component_stats" in multi_src
 
 
+def test_lmdb_dataset_can_recover_h0_features_from_blockwise_tensors():
+    src = _read("data/dataset/lmdb_dataset.py")
+    assert "block_tensors_to_feature_tensors" in src
+    assert "node_h0_blocks" in src
+    assert "edge_h0_blocks" in src
+    assert "uses_blockwise_targets" in src
+
+
 def test_direct_blockwise_decoder_skips_feature_to_block_materializer():
     src = _read("nn/blockwise_hamiltonian.py")
     assert "class DirectAOBlockDecoder" in src

@@ -15,6 +15,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     NODE_PRED_HAMIL_BLOCKS_KEY,
     block_components,
     block_dict_to_ordered_tensors,
+    block_tensors_to_feature_tensors,
     feature_components_from_blocks,
     feature_tensors_to_block_tensors,
     l1_rmse_from_components,
@@ -147,6 +148,30 @@ def test_feature_to_block_materializer_is_differentiable_and_completes_edges():
     loss.backward()
     assert edge_features.grad[0, pair_slice].abs().sum() > 0
     assert edge_features.grad[1, pair_slice].abs().sum() > 0
+
+
+def test_block_tensors_to_feature_tensors_roundtrips_h0_features():
+    idp = FakeLiMapper()
+    data = reverse_pair_data()
+    node_features = torch.arange(idp.reduced_matrix_element, dtype=torch.float32).reshape(1, -1)
+    edge_features = torch.arange(2 * idp.reduced_matrix_element, dtype=torch.float32).reshape(2, -1)
+
+    packed = feature_tensors_to_block_tensors(
+        data,
+        idp,
+        node_features=node_features,
+        edge_features=edge_features,
+        complete_edges=True,
+    )
+    node_h0, edge_h0 = block_tensors_to_feature_tensors(
+        data,
+        idp,
+        node_blocks=packed.node_blocks,
+        edge_blocks=packed.edge_blocks,
+    )
+
+    assert torch.equal(node_h0, node_features)
+    assert torch.equal(edge_h0, edge_features)
 
 
 def test_blockwise_loss_backprop_and_feature_logs():

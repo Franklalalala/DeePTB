@@ -23,6 +23,7 @@ from ._base_datasets import (
 from dptb.nn.hamiltonian import E3Hamiltonian
 import lmdb
 from dptb.data.interfaces.ham_to_feature import block_to_feature
+from dptb.data.interfaces.blockwise_tensor import block_tensors_to_feature_tensors
 import pickle
 
 
@@ -328,6 +329,8 @@ class LMDBDataset(AtomicDataset):
         h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
+        node_h0_block_tensor = data_dict.get("node_h0_blocks", None) if self.get_H0 else None
+        edge_h0_block_tensor = data_dict.get("edge_h0_blocks", None) if self.get_H0 else None
 
         if self.info_files[self.file_map[idx]]['train_dip'] == True:
             self.info_files[self.file_map[idx]].update({'dip': data_dict['dipole_moment']})
@@ -370,8 +373,14 @@ class LMDBDataset(AtomicDataset):
         uses_pre_h0 = bool(
             self.get_H0
             and self.prefer_precomputed_h0
-            and node_h0 is not None
-            and edge_h0 is not None
+            and (
+                (node_h0 is not None and edge_h0 is not None)
+                or (node_h0_block_tensor is not None and edge_h0_block_tensor is not None)
+            )
+        )
+        uses_blockwise_targets = bool(
+            data_dict.get("node_delta_hamil_blocks", None) is not None
+            and data_dict.get("edge_delta_hamil_blocks", None) is not None
         )
         stored_edge_index = data_dict.get(AtomicDataDict.EDGE_INDEX_KEY, None)
         stored_edge_shift = data_dict.get(AtomicDataDict.EDGE_CELL_SHIFT_KEY, None)
@@ -387,7 +396,7 @@ class LMDBDataset(AtomicDataset):
         )
         use_stored_edge_graph = bool(
             has_stored_edge_graph
-            and (uses_pre_main or uses_pre_h0)
+            and (uses_pre_main or uses_pre_h0 or uses_blockwise_targets)
             and not needs_missing_env_graph
             and not needs_missing_onsitenv_graph
         )
@@ -481,6 +490,25 @@ class LMDBDataset(AtomicDataset):
                     )
                 atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
                 atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
+            elif (
+                self.prefer_precomputed_h0
+                and node_h0_block_tensor is not None
+                and edge_h0_block_tensor is not None
+            ):
+                node_h0, edge_h0 = block_tensors_to_feature_tensors(
+                    atomicdata,
+                    self.type_mapper,
+                    node_blocks=torch.as_tensor(node_h0_block_tensor),
+                    edge_blocks=torch.as_tensor(edge_h0_block_tensor),
+                )
+                if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
+                    raise ValueError(
+                        "Precomputed LMDB H0 block rows do not match the active graph: "
+                        f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
+                        f"num_nodes={num_nodes}, num_edges={num_edges}."
+                    )
+                atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
+                atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
             elif h0_blocks is not None:
                 block_to_feature(
                     atomicdata,
@@ -494,6 +522,21 @@ class LMDBDataset(AtomicDataset):
             elif node_h0 is not None and edge_h0 is not None:
                 atomicdata[AtomicDataDict.NODE_H0_KEY] = torch.as_tensor(node_h0)
                 atomicdata[AtomicDataDict.EDGE_H0_KEY] = torch.as_tensor(edge_h0)
+            elif node_h0_block_tensor is not None and edge_h0_block_tensor is not None:
+                node_h0, edge_h0 = block_tensors_to_feature_tensors(
+                    atomicdata,
+                    self.type_mapper,
+                    node_blocks=torch.as_tensor(node_h0_block_tensor),
+                    edge_blocks=torch.as_tensor(edge_h0_block_tensor),
+                )
+                if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
+                    raise ValueError(
+                        "Precomputed LMDB H0 block rows do not match the active graph: "
+                        f"node_h0={tuple(node_h0.shape)}, edge_h0={tuple(edge_h0.shape)}, "
+                        f"num_nodes={num_nodes}, num_edges={num_edges}."
+                    )
+                atomicdata[AtomicDataDict.NODE_H0_KEY] = node_h0
+                atomicdata[AtomicDataDict.EDGE_H0_KEY] = edge_h0
 
 
         # Attach precomputed AO-block fields produced by convert_feature_lmdb_to_blockwise.py.

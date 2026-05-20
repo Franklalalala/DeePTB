@@ -460,6 +460,74 @@ def feature_tensors_to_block_tensors(
     return BlockTensorResult(node_blocks, edge_blocks, node_shapes, edge_shapes)
 
 
+def block_tensors_to_feature_tensors(
+    data: Mapping[str, Any],
+    idp: Any,
+    *,
+    node_blocks: Optional[torch.Tensor] = None,
+    edge_blocks: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Recover non-SOC DeePTB feature tensors from ordered AO blocks.
+
+    This is the inverse view used for preconverted H0 block tensors.  It only
+    reads DeePTB's canonical orbital-pair slices, so Hermitian-completed padding
+    entries do not change the feature representation consumed by H0 init.
+    """
+    ensure_non_soc_mapper(idp)
+    symbols = symbols_from_data(data, idp)
+    n_rme = int(getattr(idp, "reduced_matrix_element"))
+
+    node_features = None
+    if node_blocks is not None:
+        node_blocks = as_tensor(node_blocks)
+        if int(node_blocks.shape[0]) != len(symbols):
+            raise ValueError(
+                "H0 node block rows do not match the active graph: "
+                f"node_blocks={tuple(node_blocks.shape)}, num_nodes={len(symbols)}."
+            )
+        node_features = torch.zeros(
+            (len(symbols), n_rme),
+            dtype=node_blocks.dtype,
+            device=node_blocks.device,
+        )
+        by_symbol: Dict[str, List[int]] = {}
+        for i, symbol in enumerate(symbols):
+            by_symbol.setdefault(symbol, []).append(i)
+        for symbol, positions in by_symbol.items():
+            idx = torch.as_tensor(positions, dtype=torch.long, device=node_blocks.device)
+            sub_block = node_blocks.index_select(0, idx)
+            sub_feat = torch.zeros((idx.numel(), n_rme), dtype=node_blocks.dtype, device=node_blocks.device)
+            for row, col, feat in onsite_feature_slices(idp, symbol):
+                h, w = _slice_hw(row, col)
+                sub_feat[:, feat] = sub_block[:, row, col].reshape(idx.numel(), h * w)
+            node_features.index_copy_(0, idx, sub_feat)
+
+    edge_features = None
+    if edge_blocks is not None:
+        edge_blocks = as_tensor(edge_blocks)
+        edge_index = edge_index_from_data(data).detach().cpu()
+        n_edges = int(edge_index.shape[1])
+        if int(edge_blocks.shape[0]) != n_edges:
+            raise ValueError(
+                "H0 edge block rows do not match the active graph: "
+                f"edge_blocks={tuple(edge_blocks.shape)}, num_edges={n_edges}."
+            )
+        edge_features = torch.zeros((n_edges, n_rme), dtype=edge_blocks.dtype, device=edge_blocks.device)
+        by_pair: Dict[Tuple[str, str], List[int]] = {}
+        for e, (u, v) in enumerate(edge_index.T.tolist()):
+            by_pair.setdefault((symbols[int(u)], symbols[int(v)]), []).append(e)
+        for (sym_i, sym_j), positions in by_pair.items():
+            idx = torch.as_tensor(positions, dtype=torch.long, device=edge_blocks.device)
+            sub_block = edge_blocks.index_select(0, idx)
+            sub_feat = torch.zeros((idx.numel(), n_rme), dtype=edge_blocks.dtype, device=edge_blocks.device)
+            for row, col, feat in edge_feature_slices(idp, sym_i, sym_j):
+                h, w = _slice_hw(row, col)
+                sub_feat[:, feat] = sub_block[:, row, col].reshape(idx.numel(), h * w)
+            edge_features.index_copy_(0, idx, sub_feat)
+
+    return node_features, edge_features
+
+
 def _to_block_tensor(value: Any, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     out = value if torch.is_tensor(value) else torch.as_tensor(value)
     return out.to(dtype=dtype) if dtype is not None else out
