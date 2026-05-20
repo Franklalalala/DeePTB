@@ -29,6 +29,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     NODE_H0_BLOCKS_KEY,
     NODE_PRED_HAMIL_BLOCKS_KEY,
     attach_prediction_block_tensors,
+    block_mask_from_shapes,
     infer_block_shapes,
     mapper_max_norb,
     reverse_edge_index,
@@ -112,21 +113,38 @@ class DirectAOBlockDecoder(nn.Module):
         nn.init.normal_(self.edge_decoder.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.edge_decoder.bias)
 
+    @staticmethod
+    def _mask_to_valid_shape(
+        blocks: Optional[torch.Tensor],
+        shapes: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Zero padded AO entries outside each block's valid atom/pair shape."""
+        if blocks is None or shapes is None or blocks.numel() == 0:
+            return blocks
+        mask = block_mask_from_shapes(
+            shapes.to(device=blocks.device, dtype=torch.long),
+            tuple(blocks.shape[-2:]),
+        )
+        mask_dtype = blocks.real.dtype if blocks.is_complex() else blocks.dtype
+        return blocks * mask.to(dtype=mask_dtype, device=blocks.device)
+
     def _symmetrize_reverse_edges(self, data: Dict[str, Any], edge_blocks: torch.Tensor) -> torch.Tensor:
-        rev = reverse_edge_index(data, device=edge_blocks.device)
-        if rev.numel() == 0:
+        # Keep control-flow checks on CPU and move only index/mask tensors needed for GPU ops.
+        rev_cpu = reverse_edge_index(data)
+        if rev_cpu.numel() == 0:
             return edge_blocks
-        has_rev = rev >= 0
-        if self.strict_complete_edges and bool((~has_rev).any().detach().cpu().item()):
-            missing = torch.nonzero(~has_rev, as_tuple=False).flatten()
+        has_rev_cpu = rev_cpu >= 0
+        if self.strict_complete_edges and bool((~has_rev_cpu).any().item()):
+            missing = torch.nonzero(~has_rev_cpu, as_tuple=False).flatten()
             preview = missing[:8].detach().cpu().tolist()
             raise RuntimeError(
                 "Direct AO block edge symmetrization requires reverse directed edges; "
                 f"missing={int(missing.numel())}, first indices={preview}."
             )
-        if not bool(has_rev.any().detach().cpu().item()):
+        if not bool(has_rev_cpu.any().item()):
             return edge_blocks
-        safe_rev = rev.clamp_min(0)
+        safe_rev = rev_cpu.clamp_min(0).to(device=edge_blocks.device)
+        has_rev = has_rev_cpu.to(device=edge_blocks.device)
         reverse_blocks = edge_blocks.index_select(0, safe_rev).transpose(-1, -2)
         if reverse_blocks.is_complex():
             reverse_blocks = reverse_blocks.conj()
@@ -136,6 +154,16 @@ class DirectAOBlockDecoder(nn.Module):
     def forward(self, data: Dict[str, Any]) -> Dict[str, Any]:
         node_features = data.get(self.node_field, None)
         edge_features = data.get(self.edge_field, None)
+        if node_features is not None and int(node_features.shape[-1]) != int(self.node_decoder.in_features):
+            raise RuntimeError(
+                f"Direct AO node decoder expected {self.node_decoder.in_features} input features, "
+                f"got {int(node_features.shape[-1])}."
+            )
+        if edge_features is not None and int(edge_features.shape[-1]) != int(self.edge_decoder.in_features):
+            raise RuntimeError(
+                f"Direct AO edge decoder expected {self.edge_decoder.in_features} input features, "
+                f"got {int(edge_features.shape[-1])}."
+            )
         node_shapes, edge_shapes = infer_block_shapes(
             data,
             self.idp,
@@ -154,6 +182,7 @@ class DirectAOBlockDecoder(nn.Module):
             )
             if self.symmetrize_onsite:
                 node_blocks = 0.5 * (node_blocks + node_blocks.transpose(-1, -2))
+            node_blocks = self._mask_to_valid_shape(node_blocks, node_shapes)
 
         if edge_features is not None:
             edge_blocks = self.edge_decoder(edge_features).reshape(
@@ -163,6 +192,7 @@ class DirectAOBlockDecoder(nn.Module):
             )
             if self.complete_edges:
                 edge_blocks = self._symmetrize_reverse_edges(data, edge_blocks)
+            edge_blocks = self._mask_to_valid_shape(edge_blocks, edge_shapes)
 
         packed = BlockTensorResult(node_blocks, edge_blocks, node_shapes, edge_shapes)
 

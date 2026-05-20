@@ -235,3 +235,30 @@ def test_direct_ao_block_decoder_outputs_blocks_without_feature_materializer():
     loss.backward()
     assert data["node_features"].grad.abs().sum() > 0
     assert data["edge_features"].grad.abs().sum() > 0
+
+
+def test_direct_ao_block_decoder_masks_invalid_padding_entries():
+    idp = FakeLiMapper()
+    data = reverse_pair_data()
+    data["node_features"] = torch.randn((1, 5), requires_grad=True)
+    data["edge_features"] = torch.randn((2, 6), requires_grad=True)
+
+    decoder = DirectAOBlockDecoder(
+        idp=idp,
+        node_in_features=5,
+        edge_in_features=6,
+        node_pad_shape=(8, 8),
+        edge_pad_shape=(8, 8),
+        complete_edges=True,
+        strict_complete_edges=True,
+    )
+    out = decoder(data)
+
+    node_blocks = out[NODE_PRED_HAMIL_BLOCKS_KEY]
+    edge_blocks = out[EDGE_PRED_HAMIL_BLOCKS_KEY]
+    assert node_blocks.shape == (1, 8, 8)
+    assert edge_blocks.shape == (2, 8, 8)
+    assert torch.count_nonzero(node_blocks[:, 7:, :]) == 0
+    assert torch.count_nonzero(node_blocks[:, :, 7:]) == 0
+    assert torch.count_nonzero(edge_blocks[:, 7:, :]) == 0
+    assert torch.count_nonzero(edge_blocks[:, :, 7:]) == 0
