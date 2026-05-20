@@ -132,6 +132,7 @@ class MOLEGlobals:
         self.graph_index = graph_index  # [N] optional row -> coefficient-row selector
         self._per_item_expert_routing = None
         self._indexed_groups = None
+        self._indexed_permutation = None
 
     def per_item_expert_routing(self):
         if self._per_item_expert_routing is None:
@@ -149,6 +150,7 @@ class MOLEGlobals:
             graph_index = graph_index.to(device=device)
             self.graph_index = graph_index
             self._indexed_groups = None
+            self._indexed_permutation = None
 
         if self._indexed_groups is None:
             groups = []
@@ -158,6 +160,38 @@ class MOLEGlobals:
                     groups.append((coeff_idx, active_idx))
             self._indexed_groups = groups
         return self._indexed_groups
+
+    def indexed_permutation(self, device=None):
+        graph_index = self.graph_index
+        if graph_index is None:
+            raise ValueError("indexed_permutation requires graph_index.")
+        if device is not None and graph_index.device != device:
+            graph_index = graph_index.to(device=device)
+            self.graph_index = graph_index
+            self._indexed_groups = None
+            self._indexed_permutation = None
+
+        if self._indexed_permutation is None:
+            graph_index = graph_index.reshape(-1).to(dtype=torch.long)
+            permute_idx = torch.argsort(graph_index)
+            sorted_graph_index = graph_index.index_select(0, permute_idx)
+            unpermute_idx = torch.empty_like(permute_idx)
+            unpermute_idx.scatter_(
+                0,
+                permute_idx,
+                torch.arange(permute_idx.shape[0], device=permute_idx.device, dtype=permute_idx.dtype),
+            )
+            num_groups = int(self.coefficients.shape[0])
+            counts = torch.bincount(sorted_graph_index, minlength=num_groups)
+            group_offsets = torch.zeros(num_groups + 1, device=graph_index.device, dtype=torch.long)
+            group_offsets[1:] = torch.cumsum(counts, dim=0)
+            self._indexed_permutation = (
+                permute_idx,
+                unpermute_idx,
+                group_offsets,
+                sorted_graph_index,
+            )
+        return self._indexed_permutation
 
 
 class MOLERouterV3(nn.Module):
@@ -260,6 +294,7 @@ class MOLELinear(nn.Module):
         self.out_features = out_features
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
+        self.indexed_bmm_max_padding_ratio = 8.0
 
         # 1. 路由专家权重
         self.weight_experts = nn.Parameter(torch.empty(num_experts, out_features, in_features))
@@ -347,6 +382,21 @@ class MOLELinear(nn.Module):
         return self._forward_indexed_grouped(x, mole_globals)
 
     def _forward_indexed_grouped(self, x, mole_globals):
+        return self._forward_indexed_contiguous_bmm(x, mole_globals)
+
+    def _forward_indexed_loop(self, x, mole_globals, mixed_weights, mixed_bias):
+        out = x.new_zeros(x.shape[:-1] + (self.out_features,))
+        for coeff_idx, active_idx in mole_globals.indexed_groups(device=x.device):
+            bias = mixed_bias[coeff_idx] if mixed_bias is not None else None
+            group_out = F.linear(
+                x.index_select(0, active_idx),
+                mixed_weights[coeff_idx],
+                bias,
+            )
+            out.index_add_(0, active_idx, group_out)
+        return out
+
+    def _forward_indexed_contiguous_bmm(self, x, mole_globals):
         coefficients = mole_globals.coefficients
         graph_index = mole_globals.graph_index
         if graph_index.shape[0] != x.shape[0]:
@@ -367,17 +417,39 @@ class MOLELinear(nn.Module):
             if self.num_shared_experts > 0 and self.bias_shared is not None:
                 mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
 
-        out = x.new_zeros(x.shape[:-1] + (self.out_features,))
-        for coeff_idx, active_idx in mole_globals.indexed_groups(device=x.device):
-            bias = mixed_bias[coeff_idx] if mixed_bias is not None else None
-            group_out = F.linear(
-                x.index_select(0, active_idx),
-                mixed_weights[coeff_idx],
-                bias,
-            )
-            out.index_add_(0, active_idx, group_out)
+        if x.shape[0] == 0:
+            return x.new_zeros(x.shape[:-1] + (self.out_features,))
 
-        return out
+        permute_idx, unpermute_idx, group_offsets, sorted_graph_index = mole_globals.indexed_permutation(device=x.device)
+        counts = group_offsets[1:] - group_offsets[:-1]
+        max_count = int(counts.max().item()) if counts.numel() > 0 else 0
+        if max_count == 0:
+            return x.new_zeros(x.shape[:-1] + (self.out_features,))
+
+        padding_ratio = (counts.shape[0] * max_count) / max(1, int(x.shape[0]))
+        if padding_ratio > self.indexed_bmm_max_padding_ratio:
+            return self._forward_indexed_loop(x, mole_globals, mixed_weights, mixed_bias)
+
+        x_sorted = x.index_select(0, permute_idx)
+        inner_shape = x.shape[1:-1]
+        inner_size = math.prod(inner_shape) if inner_shape else 1
+        x_sorted = x_sorted.reshape(x.shape[0], inner_size, self.in_features)
+
+        row_positions = (
+            torch.arange(x.shape[0], device=x.device, dtype=torch.long)
+            - group_offsets.index_select(0, sorted_graph_index)
+        )
+        num_groups = coefficients.shape[0]
+        padded_x = x.new_zeros(num_groups, max_count, inner_size, self.in_features)
+        padded_x[sorted_graph_index, row_positions] = x_sorted
+        padded_x = padded_x.reshape(num_groups, max_count * inner_size, self.in_features)
+
+        padded_out = torch.bmm(padded_x, mixed_weights.transpose(1, 2))
+        if mixed_bias is not None:
+            padded_out = padded_out + mixed_bias.unsqueeze(1)
+        padded_out = padded_out.reshape(num_groups, max_count, *inner_shape, self.out_features)
+        out_sorted = padded_out[sorted_graph_index, row_positions]
+        return out_sorted.index_select(0, unpermute_idx)
 
     def _forward_per_item(self, x, mole_globals):
         coefficients = mole_globals.coefficients

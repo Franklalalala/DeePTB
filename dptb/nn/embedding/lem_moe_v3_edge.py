@@ -196,11 +196,8 @@ class LemMoEV3Edge(LemMoEV3):
                 sizes=counts.to(dtype=active_edge_one_hot.dtype),
             )
             num_route_tokens = coeffs.new_tensor(float(coeffs.shape[0]))
-            top_k = getattr(self.router, "top_k", None)
-            full_expert_routing = top_k is None or top_k >= self.num_experts
             use_compact_dispatch = (
                 self.edge_moe_compact_dispatch
-                and full_expert_routing
                 and num_active_edges >= self.edge_moe_compact_min_edges
             )
             if use_compact_dispatch:

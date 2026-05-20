@@ -194,6 +194,78 @@ def test_mole_linear_grouped_compact_graph_index_matches_expected():
     torch.testing.assert_close(out, expected)
 
 
+def test_mole_globals_caches_indexed_permutation_for_compact_groups():
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
+
+    graph_index = torch.tensor([2, 0, 2, 1, 0])
+    globals_ = MOLEGlobals(
+        coefficients=torch.zeros(3, 2),
+        graph_index=graph_index,
+    )
+
+    permute_idx, unpermute_idx, group_offsets, sorted_graph_index = globals_.indexed_permutation()
+    cached = globals_.indexed_permutation()
+
+    assert sorted_graph_index.tolist() == [0, 0, 1, 2, 2]
+    assert graph_index.index_select(0, permute_idx).tolist() == [0, 0, 1, 2, 2]
+    assert torch.arange(graph_index.numel()).index_select(0, permute_idx).index_select(0, unpermute_idx).tolist() == list(
+        range(graph_index.numel())
+    )
+    assert group_offsets.tolist() == [0, 2, 3, 5]
+    assert cached[0] is permute_idx
+    assert cached[1] is unpermute_idx
+    assert cached[2] is group_offsets
+    assert cached[3] is sorted_graph_index
+
+
+def test_mole_linear_compact_graph_index_uses_contiguous_grouped_path():
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    layer = MOLELinear(2, 1, num_experts=3, num_shared_experts=1, bias=True)
+    with torch.no_grad():
+        layer.weight_experts.copy_(
+            torch.tensor([[[1.0, 0.0]], [[0.0, 2.0]], [[-1.0, 1.0]]])
+        )
+        layer.bias_experts.copy_(torch.tensor([[0.1], [0.2], [0.3]]))
+        layer.weight_shared.copy_(torch.tensor([[[0.5, 0.5]]]))
+        layer.bias_shared.copy_(torch.tensor([[0.05]]))
+
+    x = torch.tensor(
+        [
+            [[2.0, 4.0], [3.0, 5.0]],
+            [[1.0, 3.0], [2.0, 4.0]],
+            [[5.0, 7.0], [6.0, 8.0]],
+            [[11.0, 13.0], [12.0, 14.0]],
+        ]
+    )
+    coeffs = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.25, 0.75],
+        ]
+    )
+    graph_index = torch.tensor([0, 1, 0, 1])
+    globals_ = MOLEGlobals(coefficients=coeffs, graph_index=graph_index)
+
+    def fail_if_old_loop_is_used(*args, **kwargs):
+        raise AssertionError("compact graph_index path should not use per-group Python F.linear loop")
+
+    globals_.indexed_groups = fail_if_old_loop_is_used
+    out = layer._forward_indexed_grouped(x, globals_)
+
+    expected = []
+    shared_w = layer.weight_shared.sum(0)
+    shared_b = layer.bias_shared.sum(0)
+    for x_edge, coeff_idx in zip(x, graph_index):
+        c = coeffs[coeff_idx]
+        routed_w = torch.einsum("e,eoi->oi", c, layer.weight_experts)
+        routed_b = torch.einsum("e,eo->o", c, layer.bias_experts)
+        expected.append(_linear_expected(x_edge, routed_w + shared_w, routed_b + shared_b))
+    expected = torch.stack(expected, dim=0)
+
+    torch.testing.assert_close(out, expected)
+
+
 def test_mole_linear_edge_level_coefficients_backpropagate():
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
 
@@ -272,7 +344,7 @@ def test_edge_moe_unique_type_routing_builds_compact_graph_index():
     assert float(num_route_tokens) == 2.0
 
 
-def test_edge_moe_compact_dispatch_stays_sparse_for_topk_routing():
+def test_edge_moe_compact_dispatch_keeps_topk_unique_types_compact():
     import torch.nn as nn
 
     from dptb.nn.embedding.lem_moe_v3_edge import LemMoEV3Edge
@@ -308,8 +380,8 @@ def test_edge_moe_compact_dispatch_stays_sparse_for_topk_routing():
         active_bond_type,
     )
 
-    assert globals_.graph_index is None
-    torch.testing.assert_close(globals_.coefficients, torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]))
+    assert globals_.graph_index.tolist() == [0, 0, 1]
+    torch.testing.assert_close(globals_.coefficients, torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
     assert float(num_route_tokens) == 2.0
 
 

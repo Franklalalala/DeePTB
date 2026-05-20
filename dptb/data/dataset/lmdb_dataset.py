@@ -153,6 +153,7 @@ class LMDBDataset(AtomicDataset):
                     data_dict[AtomicDataDict.CELL_KEY], \
                         data_dict[AtomicDataDict.POSITIONS_KEY], \
                         data_dict[AtomicDataDict.ATOMIC_NUMBERS_KEY]
+                atomic_numbers = atomic_numbers.reshape(-1)
 
                 pbc = data_dict[AtomicDataDict.PBC_KEY]
 
