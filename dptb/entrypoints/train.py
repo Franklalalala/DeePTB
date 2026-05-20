@@ -542,14 +542,27 @@ def train(
     trainer.register_plugin(LearningRateMonitor())
     trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
 ##############################
-    trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-    trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-    trainer.register_plugin(TrainZLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-    trainer.register_plugin(ExpertLoadCVMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
+    trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
+    trainer.register_plugin(TrainHoppingLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
+    trainer.register_plugin(TrainZLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
+    trainer.register_plugin(ExpertLoadCVMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
     log_field.append("mean_max_prob")
     log_field.append("expert_load_cv")
     log_field.append("train_onsite_loss")
     log_field.append("train_hopping_loss")
+    train_loss_method = jdata["train_options"]["loss_options"]["train"].get("method")
+    if train_loss_method in {"hamil_blockwise_nextham", "hamil_block_abs"}:
+        blockwise_metric_fields = [
+            "train_loss_opt",
+            "train_block_loss",
+            "train_feature_compat_loss",
+            "train_block_element_mae",
+            "train_block_onsite_loss",
+            "train_block_hopping_loss",
+        ]
+        for stat_name in blockwise_metric_fields:
+            trainer.register_plugin(ScalarFieldMonitor(stat_name=stat_name, interval=[(1, 'iteration'), (1, 'epoch')]))
+        log_field.extend(blockwise_metric_fields)
 ##############################
     current_bs = jdata["train_options"]["batch_size"]
     grad_log_file = os.path.join(output, f"grad_trace_bs{current_bs}.csv")

@@ -1227,6 +1227,7 @@ def e3tb_prediction():
     doc_neurons = "neurons in the neural network."
     doc_activation = "activation function."
     doc_if_batch_normalized = "if to turn on batch normalization"
+    doc_blockwise_hamiltonian = "If true, materialize E3 Hamiltonian feature predictions into AO block tensors for block-wise loss."
     doc_scale_type = ("Which scale method to use. Can be no_scale, "
                       "scale_wo_back_grad (the scale parameter will not engage the back grad computation graph), "
                       "scale_w_back_grad (the scale parameter will engage the back grad computation graph)")
@@ -1238,6 +1239,7 @@ def e3tb_prediction():
         Argument("activation", str, optional=True, default="tanh", doc=doc_activation),
         Argument("scale_type", str, optional=True, default="scale_w_back_grad", doc=doc_scale_type),
         Argument("if_batch_normalized", bool, optional=True, default=False, doc=doc_if_batch_normalized),
+        Argument("blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_blockwise_hamiltonian),
     ]
 
     return nn
@@ -1471,6 +1473,21 @@ def loss_options():
 
     ]
 
+    hamil_blockwise = [
+        Argument("pred_node_block_key", str, optional=True, default="node_hamil_blocks"),
+        Argument("pred_edge_block_key", str, optional=True, default="edge_hamil_blocks"),
+        Argument("target_node_block_key", str, optional=True, default="node_delta_hamil_blocks"),
+        Argument("target_edge_block_key", str, optional=True, default="edge_delta_hamil_blocks"),
+        Argument("target_node_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
+        Argument("target_edge_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
+        Argument("optimization", str, optional=True, default="block_mae"),
+        Argument("block_reduction", str, optional=True, default="global"),
+        Argument("complex_reduction", str, optional=True, default="modulus"),
+        Argument("log_feature_compatible", bool, optional=True, default=True),
+        Argument("feature_log_no_grad", bool, optional=True, default=True),
+        Argument("eps", float, optional=True, default=1e-12),
+    ]
+
     property_aux = [
         Argument("model_basis_name", str, optional=True, default='def2svp', doc=doc_model_basis_name),
         Argument("on_the_fly_ovp_flag", bool, optional=True, default=True, doc=doc_on_the_fly_ovp_flag),
@@ -1515,6 +1532,8 @@ def loss_options():
         Argument("hamil_abs", dict, sub_fields=hamil),
         Argument("hamil_abs_element_avg", dict, sub_fields=hamil),
         Argument("hamil_abs_mae", dict, sub_fields=hamil),
+        Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
+        Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
         Argument("hamil_w_num_e", dict, sub_fields=property_aux),
         Argument("wa_loss", dict, sub_fields=wa_loss_aux),
         Argument("dip_loss", dict, sub_fields=property_aux),

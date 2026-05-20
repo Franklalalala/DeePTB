@@ -1927,6 +1927,15 @@ class MultiTrainer(Trainer):
             v = getattr(loss_module, k, None)
             out[k] = self._as_scalar_tensor(v, default=0.0) if v is not None else None
 
+        for key, attr in (
+            ("block_loss", "last_block_loss"),
+            ("feature_compat_loss", "last_feature_compat_loss"),
+            ("block_element_mae", "last_block_element_mae"),
+            ("block_onsite_loss", "last_block_onsite_loss"),
+            ("block_hopping_loss", "last_block_hopping_loss"),
+        ):
+            out[key] = self._as_scalar_tensor(getattr(loss_module, attr, None), allow_none=True)
+
         return out
 
     # ---------------------------------------------------------------------
@@ -2371,6 +2380,7 @@ class MultiTrainer(Trainer):
         self._add_cuda_memory_state(state, cuda_memory_metrics)
 
         self._reset_display_window_buffers()
+
         return state
 
     # ---------------------------------------------------------------------

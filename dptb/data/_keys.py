@@ -137,3 +137,15 @@ ALLOWED_KEYS: List[str] = [
     for k in sys.modules[__name__].__dict__.keys()
     if k.endswith("_KEY")
 ]
+
+# == AO-block fields for block-wise NexTHam workflow ==
+NODE_DELTA_HAMIL_BLOCKS_KEY = "node_delta_hamil_blocks"
+EDGE_DELTA_HAMIL_BLOCKS_KEY = "edge_delta_hamil_blocks"
+NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY = "node_delta_hamil_block_shape"
+EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY = "edge_delta_hamil_block_shape"
+NODE_H0_BLOCKS_KEY = "node_h0_blocks"
+EDGE_H0_BLOCKS_KEY = "edge_h0_blocks"
+NODE_H0_BLOCK_SHAPE_KEY = "node_h0_block_shape"
+EDGE_H0_BLOCK_SHAPE_KEY = "edge_h0_block_shape"
+NODE_PRED_HAMIL_BLOCKS_KEY = "node_hamil_blocks"
+EDGE_PRED_HAMIL_BLOCKS_KEY = "edge_hamil_blocks"

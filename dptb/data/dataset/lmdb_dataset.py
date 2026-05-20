@@ -495,6 +495,17 @@ class LMDBDataset(AtomicDataset):
                 atomicdata[AtomicDataDict.NODE_H0_KEY] = torch.as_tensor(node_h0)
                 atomicdata[AtomicDataDict.EDGE_H0_KEY] = torch.as_tensor(edge_h0)
 
+
+        # Attach precomputed AO-block fields produced by convert_feature_lmdb_to_blockwise.py.
+        # This leaves the legacy feature path unchanged when those fields are absent.
+        for _blockwise_key in (
+            "node_delta_hamil_blocks", "edge_delta_hamil_blocks",
+            "node_delta_hamil_block_shape", "edge_delta_hamil_block_shape",
+            "node_h0_blocks", "edge_h0_blocks",
+            "node_h0_block_shape", "edge_h0_block_shape",
+        ):
+            if _blockwise_key in data_dict:
+                atomicdata[_blockwise_key] = torch.as_tensor(data_dict[_blockwise_key])
         return atomicdata
 
     def E3statistics(self, model: torch.nn.Module = None):

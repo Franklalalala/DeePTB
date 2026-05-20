@@ -7,6 +7,7 @@ from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
 from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian
+from dptb.nn.blockwise_hamiltonian import BlockwiseE3Hamiltonian
 from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
 from e3nn.o3 import Linear
@@ -112,6 +113,7 @@ class NNENV(nn.Module):
         self.prediction = prediction
 
         prediction_copy = prediction.copy()
+        self.blockwise_hamiltonian = bool(prediction_copy.get("blockwise_hamiltonian", False))
         scale_type = prediction_copy.get("scale_type")
         self.scale_type = scale_type
 
@@ -269,7 +271,8 @@ class NNENV(nn.Module):
                     )
 
         elif self.method == "e3tb":
-            self.hamiltonian = E3Hamiltonian(
+            hamiltonian_cls = BlockwiseE3Hamiltonian if self.blockwise_hamiltonian else E3Hamiltonian
+            self.hamiltonian = hamiltonian_cls(
                 edge_field=AtomicDataDict.EDGE_FEATURES_KEY,
                 node_field=AtomicDataDict.NODE_FEATURES_KEY,
                 idp=self.embedding.idp,
