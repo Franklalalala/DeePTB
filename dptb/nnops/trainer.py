@@ -113,6 +113,7 @@ class Trainer(BaseTrainer):
         ):
             if hasattr(batch, attr):
                 state[key] = getattr(batch, attr)
+
         return state
 
     @staticmethod
@@ -157,6 +158,21 @@ class Trainer(BaseTrainer):
             state["expert_load_cv" if prefix == "train" else f"{prefix}_expert_load_cv"] = expert_load_cv
         if z_loss_comp is not None:
             state["mean_max_prob" if prefix == "train" else f"{prefix}_mean_max_prob"] = z_loss_comp
+        for metric_name, attr_name in (
+            ("loss_opt", "last_opt_loss"),
+            ("block_loss", "last_block_loss"),
+            ("feature_compat_loss", "last_feature_compat_loss"),
+            ("block_element_mae", "last_block_element_mae"),
+            ("block_onsite_loss", "last_block_onsite_loss"),
+            ("block_hopping_loss", "last_block_hopping_loss"),
+        ):
+            metric_value = getattr(loss_obj, attr_name, None)
+            if metric_value is not None:
+                state[f"{prefix}_{metric_name}"] = metric_value
+        component_stats = getattr(loss_obj, "last_component_stats", None)
+        if component_stats:
+            for component_name, component_value in component_stats.items():
+                state[f"{prefix}_{component_name}"] = component_value
         return state
 
     def iteration(self, batch, ref_batch=None):

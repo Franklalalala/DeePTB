@@ -111,6 +111,18 @@ EDGE_TYPE_KEY: Final[str] = "edge_type"
 NODE_SOC_KEY: Final[str] = "node_soc"
 NODE_SOC_SWITCH_KEY: Final[str] = "node_soc_switch"
 
+# AO-block fields for block-wise NexTHam workflow.
+NODE_DELTA_HAMIL_BLOCKS_KEY: Final[str] = "node_delta_hamil_blocks"
+EDGE_DELTA_HAMIL_BLOCKS_KEY: Final[str] = "edge_delta_hamil_blocks"
+NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY: Final[str] = "node_delta_hamil_block_shape"
+EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY: Final[str] = "edge_delta_hamil_block_shape"
+NODE_H0_BLOCKS_KEY: Final[str] = "node_h0_blocks"
+EDGE_H0_BLOCKS_KEY: Final[str] = "edge_h0_blocks"
+NODE_H0_BLOCK_SHAPE_KEY: Final[str] = "node_h0_block_shape"
+EDGE_H0_BLOCK_SHAPE_KEY: Final[str] = "edge_h0_block_shape"
+NODE_PRED_HAMIL_BLOCKS_KEY: Final[str] = "node_hamil_blocks"
+EDGE_PRED_HAMIL_BLOCKS_KEY: Final[str] = "edge_hamil_blocks"
+
 PER_ATOM_ENERGY_KEY: Final[str] = "atomic_energy"
 TOTAL_ENERGY_KEY: Final[str] = "total_energy"
 FORCE_KEY: Final[str] = "forces"

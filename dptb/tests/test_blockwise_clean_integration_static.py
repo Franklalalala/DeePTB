@@ -1,0 +1,121 @@
+import ast
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _read(relpath: str) -> str:
+    return (ROOT / relpath).read_text(encoding="utf-8")
+
+
+def _function_source(relpath: str, name: str) -> str:
+    text = _read(relpath)
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return "\n".join(text.splitlines()[node.lineno - 1: node.end_lineno])
+    raise AssertionError(f"Could not find function {name} in {relpath}")
+
+
+def test_trainer_dynamic_batch_state_is_not_blockwise_metric_patch_target():
+    src = _function_source("nnops/trainer.py", "_dynamic_batch_state_from_batch")
+    assert "loss_obj" not in src
+    assert "last_block_loss" not in src
+
+
+def test_multitrainer_flush_display_window_is_not_blockwise_metric_patch_target():
+    src = _function_source("nnops/multi_trainer.py", "_flush_display_window")
+    assert "loss_obj" not in src
+    assert "last_block_loss" not in src
+
+
+def test_argcheck_exposes_blockwise_loss_and_prediction_switch():
+    src = _read("utils/argcheck.py")
+    assert 'Argument("hamil_blockwise_nextham"' in src
+    assert 'Argument("hamil_block_abs"' in src
+    assert 'Argument("blockwise_hamiltonian"' in src
+
+
+def test_blockwise_keys_are_allowed_and_registered():
+    from dptb.data import AtomicDataDict
+    from dptb.data.AtomicData import _EDGE_FIELDS, _NODE_FIELDS
+
+    node_keys = {
+        AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
+        AtomicDataDict.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+        AtomicDataDict.NODE_H0_BLOCKS_KEY,
+        AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY,
+        AtomicDataDict.NODE_PRED_HAMIL_BLOCKS_KEY,
+    }
+    edge_keys = {
+        AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
+        AtomicDataDict.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+        AtomicDataDict.EDGE_H0_BLOCKS_KEY,
+        AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY,
+        AtomicDataDict.EDGE_PRED_HAMIL_BLOCKS_KEY,
+    }
+    assert node_keys <= set(AtomicDataDict.ALLOWED_KEYS)
+    assert edge_keys <= set(AtomicDataDict.ALLOWED_KEYS)
+    assert node_keys <= _NODE_FIELDS
+    assert edge_keys <= _EDGE_FIELDS
+
+
+def test_blockwise_loss_is_registered_without_swallowing_import_errors():
+    from dptb.nnops.loss import Loss
+    from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
+
+    assert Loss._register["hamil_blockwise_nextham"] is HamilBlockwiseNexTHamLoss
+    assert Loss._register["hamil_block_abs"] is HamilBlockwiseNexTHamLoss
+
+
+def test_nnenv_can_select_blockwise_hamiltonian_wrapper():
+    src = _read("nn/deeptb.py")
+    assert "BlockwiseE3Hamiltonian" in src
+    assert 'prediction_copy.get("blockwise_hamiltonian"' in src
+
+
+def test_nnenv_forwards_blockwise_hamiltonian_options():
+    src = _read("nn/deeptb.py")
+    assert "_blockwise_ham_kwargs" in src
+    assert '"strict_complete_edges"' in src
+    assert '"add_h0"' in src
+    assert "**_blockwise_ham_kwargs" in src
+
+
+def test_single_train_component_monitors_update_each_iteration():
+    src = _read("entrypoints/train.py")
+    assert "TrainOnsiteLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')])" in src
+    assert "TrainHoppingLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')])" in src
+    assert "TrainOnsiteLossMonitor(interval=[(jdata[\"train_options\"][\"validation_freq\"], 'iteration')" not in src
+    assert "TrainHoppingLossMonitor(interval=[(jdata[\"train_options\"][\"validation_freq\"], 'iteration')" not in src
+
+
+def test_blockwise_train_metrics_are_registered_for_logging():
+    single_src = _read("entrypoints/train.py")
+    multi_src = _read("entrypoints/multi_train.py")
+    for src in (single_src, multi_src):
+        assert '"hamil_blockwise_nextham"' in src
+        assert '"hamil_block_abs"' in src
+        assert '"train_feature_compat_loss"' in src
+        assert '"train_block_onsite_loss"' in src
+        assert "ScalarFieldMonitor(stat_name=stat_name" in src
+
+
+def test_argcheck_exposes_review_blockwise_options():
+    src = _read("utils/argcheck.py")
+    for token in (
+        'Argument("complete_edges"',
+        'Argument("strict_complete_edges"',
+        'Argument("add_h0"',
+        'Argument("distributed_log_reduce"',
+        'Argument("expose_component_sums"',
+    ):
+        assert token in src
+
+
+def test_trainers_expose_raw_blockwise_component_stats():
+    trainer_src = _read("nnops/trainer.py")
+    multi_src = _read("nnops/multi_trainer.py")
+    assert "last_component_stats" in trainer_src
+    assert "last_component_stats" in multi_src

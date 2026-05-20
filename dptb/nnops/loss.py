@@ -1798,3 +1798,10 @@ class HamilLossAnalysis(object):
             out.append(tensor)
 
         return torch.cat(out, dim=-1).squeeze(0)
+
+# Register clean block-wise NexTHam AO-block loss without modifying legacy hamil_abs.
+# If blockwise_nextham_loss imported this module first to obtain Loss, that
+# module will finish registration after this import returns.
+import sys as _blockwise_sys
+if "dptb.nnops.blockwise_nextham_loss" not in _blockwise_sys.modules:
+    from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss  # noqa: F401

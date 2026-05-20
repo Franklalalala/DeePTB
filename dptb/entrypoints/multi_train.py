@@ -566,6 +566,18 @@ def _multi_train_impl(
             trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_lr", interval=[(1, 'iteration'), (1, 'epoch')]))
 
         log_field.extend(["mean_max_prob", "expert_load_cv", "train_onsite_loss", "train_hopping_loss"])
+        train_loss_method = jdata["train_options"]["loss_options"]["train"].get("method")
+        if train_loss_method in {"hamil_blockwise_nextham", "hamil_block_abs"}:
+            blockwise_metric_fields = [
+                "train_block_loss",
+                "train_feature_compat_loss",
+                "train_block_element_mae",
+                "train_block_onsite_loss",
+                "train_block_hopping_loss",
+            ]
+            for stat_name in blockwise_metric_fields:
+                trainer.register_plugin(ScalarFieldMonitor(stat_name=stat_name, interval=[(1, 'iteration'), (1, 'epoch')]))
+            log_field.extend(blockwise_metric_fields)
 
         cuda_memory_enabled = (
             bool(jdata["train_options"].get("monitor_cuda_memory", True))

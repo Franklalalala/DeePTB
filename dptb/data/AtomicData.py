@@ -61,6 +61,11 @@ _DEFAULT_NODE_FIELDS: Set[str] = {
     AtomicDataDict.PER_ATOM_ENERGY_KEY,
     AtomicDataDict.NODE_HAMILTONIAN_KEY,
     AtomicDataDict.NODE_OVERLAP_KEY,
+    AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
+    AtomicDataDict.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    AtomicDataDict.NODE_H0_BLOCKS_KEY,
+    AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY,
+    AtomicDataDict.NODE_PRED_HAMIL_BLOCKS_KEY,
     AtomicDataDict.BATCH_KEY,
     AtomicDataDict.NODE_SOC_KEY # new
 }
@@ -77,6 +82,11 @@ _DEFAULT_EDGE_FIELDS: Set[str] = {
     AtomicDataDict.EDGE_ENERGY_KEY,
     AtomicDataDict.EDGE_OVERLAP_KEY,
     AtomicDataDict.EDGE_HAMILTONIAN_KEY,
+    AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
+    AtomicDataDict.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    AtomicDataDict.EDGE_H0_BLOCKS_KEY,
+    AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY,
+    AtomicDataDict.EDGE_PRED_HAMIL_BLOCKS_KEY,
     AtomicDataDict.EDGE_TYPE_KEY,
 }
 
