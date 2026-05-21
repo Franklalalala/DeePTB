@@ -276,6 +276,32 @@ def _pack_pair_torch(
     return pair
 
 
+def _pack_pair_cuda(
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    m: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().pack_pair_fp32(
+        x.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        int(m),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
 def _scatter_pair_grad_torch(
     grad_pair: torch.Tensor,
     wigner: torch.Tensor,
@@ -307,6 +333,34 @@ def _scatter_pair_grad_torch(
     return grad_x
 
 
+def _scatter_pair_grad_cuda(
+    grad_pair: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    in_dim: int,
+    m: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_pair_grad_fp32(
+        grad_pair.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        int(in_dim),
+        int(m),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
 def _output_pair_grad_torch(
     grad_out: torch.Tensor,
     wigner: torch.Tensor,
@@ -334,6 +388,32 @@ def _output_pair_grad_torch(
             grad_pair_l = grad_l[:, :, [row0, row1]].transpose(1, 2).contiguous()
         grad_pair.index_copy_(2, idx, grad_pair_l)
     return grad_pair
+
+
+def _output_pair_grad_cuda(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    m: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().output_pair_grad_fp32(
+        grad_out.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(m),
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
 
 
 def _segmented_raw_linear_backward(
@@ -484,21 +564,35 @@ def _segmented_pair_backward(
     wigner_stride: int,
     linear_backend: str,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    del out_dim, wigner_stride
+    del out_dim
     cin = int(in_base.numel())
     cout = int(out_base.numel())
     has_radial = radial.numel() != 0
-    x_pair_no_radial = _pack_pair_torch(
-        x, wigner, in_base, in_l, offsets, compact_offsets, m, rotate_in, wigner_mode
-    )
+    use_cuda_epilogue = linear_backend.startswith("cuda_")
+    raw_backend = linear_backend[5:] if use_cuda_epilogue else linear_backend
+    if use_cuda_epilogue:
+        x_pair_no_radial = _pack_pair_cuda(
+            x, wigner, in_base, in_l, offsets, compact_offsets,
+            m, rotate_in, wigner_mode, wigner_stride
+        )
+    else:
+        x_pair_no_radial = _pack_pair_torch(
+            x, wigner, in_base, in_l, offsets, compact_offsets, m, rotate_in, wigner_mode
+        )
     if has_radial and radial_on_input:
         x_pair_eff = x_pair_no_radial * radial.unsqueeze(1)
     else:
         x_pair_eff = x_pair_no_radial
 
-    grad_pair = _output_pair_grad_torch(
-        grad_out, wigner, out_base, out_l, offsets, compact_offsets, m, rotate_out, wigner_mode
-    )
+    if use_cuda_epilogue:
+        grad_pair = _output_pair_grad_cuda(
+            grad_out, wigner, out_base, out_l, offsets, compact_offsets,
+            m, rotate_out, wigner_mode, wigner_stride
+        )
+    else:
+        grad_pair = _output_pair_grad_torch(
+            grad_out, wigner, out_base, out_l, offsets, compact_offsets, m, rotate_out, wigner_mode
+        )
     grad_radial = torch.zeros_like(radial) if has_radial else None
     if has_radial and not radial_on_input:
         raw = _segmented_raw_linear_forward(x_pair_eff, graph_index, mixed_weight)
@@ -513,11 +607,11 @@ def _segmented_pair_backward(
     grad_raw[:, 0, cout:] = grad_pair[:, 1, :]
     grad_raw[:, 1, cout:] = -grad_pair[:, 0, :]
 
-    if linear_backend == "cutlass_segmented":
+    if raw_backend == "cutlass_segmented":
         grad_x_pair_eff, grad_weight = _cutlass_segmented_raw_linear_backward(
             x_pair_eff, grad_raw, graph_index, mixed_weight
         )
-    elif linear_backend == "cublas_segmented":
+    elif raw_backend == "cublas_segmented":
         grad_x_pair_eff, grad_weight = _cublas_segmented_raw_linear_backward(
             x_pair_eff, grad_raw, graph_index, mixed_weight
         )
@@ -531,10 +625,16 @@ def _segmented_pair_backward(
     else:
         grad_x_pair = grad_x_pair_eff
 
-    grad_x = _scatter_pair_grad_torch(
-        grad_x_pair, wigner, in_base, in_l, offsets, compact_offsets,
-        x.shape[1], m, rotate_in, wigner_mode
-    )
+    if use_cuda_epilogue:
+        grad_x = _scatter_pair_grad_cuda(
+            grad_x_pair, wigner, in_base, in_l, offsets, compact_offsets,
+            x.shape[1], m, rotate_in, wigner_mode, wigner_stride
+        )
+    else:
+        grad_x = _scatter_pair_grad_torch(
+            grad_x_pair, wigner, in_base, in_l, offsets, compact_offsets,
+            x.shape[1], m, rotate_in, wigner_mode
+        )
     return grad_x, grad_weight, grad_radial
 
 
@@ -629,7 +729,7 @@ class _FusedPairFunction(torch.autograd.Function):
             wigner_mode,
             wigner_stride,
         ) = ctx.meta
-        backward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cublas_segmented")
+        backward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented")
         if backward_mode == "atomic":
             grad_x, grad_mixed_weight, grad_radial = _load_extension().fused_pair_backward_fp32(
                 grad_out.contiguous(),

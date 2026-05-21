@@ -114,11 +114,13 @@ def test_so2_fused_p0_forward_matches_streamed_ref_if_available():
     torch.testing.assert_close(fused_out, ref_out, atol=5e-4, rtol=5e-4)
 
 
-def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available():
+@pytest.mark.parametrize("backward_mode", ["cublas_segmented", "cuda_cublas_segmented"])
+def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeypatch, backward_mode):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 backward smoke requires CUDA")
+    monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", backward_mode)
 
     from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear

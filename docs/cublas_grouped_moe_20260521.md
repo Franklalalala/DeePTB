@@ -170,6 +170,28 @@ Trainable fused P0 follow-up smoke, bs=32, FP32, TF32 off:
 
 Conclusion: CUTLASS grouped GEMM is viable and correct as an opt-in raw-linear backend, but simply swapping cuBLAS grouped for CUTLASS grouped does not solve the production training bottleneck. The remaining performance problem is the still-fragmented SO2 backward dataflow: pair packing, output-rotation gradient, input-rotation scatter, and radial gradient are still separate PyTorch/CUDA work around each per-m GEMM. A production-speed fused SO2 training path needs a single custom CUDA/CuTe kernel family that owns both forward and backward prologue/epilogue, not only the raw GEMM mainloop.
 
+Aggressive follow-up, same day:
+
+- Added `DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE=cuda_cublas_segmented` and made it the default for the opt-in fused P0 route. This keeps cuBLAS grouped GEMM for the raw linear backward, but moves backward input pair packing, output-pair gradient projection, and input-gradient scatter from Python/einsum into CUDA kernels.
+- Liyue correctness smoke: `pytest dptb/tests/test_so2_moe_fused_p0.py::test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available -q` passed for both `cublas_segmented` and `cuda_cublas_segmented` (`2 passed, 1 warning in 36.64s`).
+- Module train smoke, `bench_so2_moe_fused_train.py --n 4096 --top-k 2 --iters 30 --warmup 10`: `streamed_grouped_train` 23.360 ms, fused P0 `cuda_cublas_segmented` 15.002 ms, speedup 1.56x, `x_grad_max_abs=2.27e-12`.
+- Module train smoke, `--n 16384 --top-k 2 --iters 20 --warmup 5`: `streamed_grouped_train` 22.045 ms, fused P0 `cuda_cublas_segmented` 15.893 ms, speedup 1.39x, `x_grad_max_abs=6.82e-13`.
+- Production smoke, bs=32, FP32, TF32 off, compact Wigner, 25 iterations:
+
+| Case | Backend | wall time | Previous fused wall | Stable comparator | Verdict |
+| --- | --- | ---: | ---: | ---: | --- |
+| `global_all_fused_p0_cuda_cublas` | CUDA epilogue + cuBLAS segmented | 90.099 s | 97.969 s | 58.334 s | fused branch +8.0%, still slower than stable |
+| `edge_top2_fused_p0_cuda_cublas` | CUDA epilogue + cuBLAS segmented | 94.898 s | 103.212 s | 57.089 s | fused branch +8.1%, still slower than stable |
+
+This confirms that moving the backward prologue/epilogue into CUDA gives a real fused-P0 improvement, but the current architecture still cannot beat the stable `streamed_m_major_cueq`/`cublas_grouped` production path. The likely remaining blockers are per-`m` custom-op launch count, mixed-weight materialization per route, m0 still on the old path, and the interpolation SO2 layer falling back because it uses `InterpolationBlock` rather than `MOLELinear`.
+
+Hardware/CUTLASS notes:
+
+- Liyue reports `NVIDIA L40S`, compute capability 8.9, driver 535.104.05. This is the primary smoke platform used above.
+- Vanda GPU nodes are A40-class; NVIDIA lists A40 as compute capability 8.6. CUTLASS 3.x/CuTe code can target Ampere, but Hopper-only features such as TMA/WGMMA/threadblock clusters are not available there. Prefer conservative SIMT/CUTLASS 2.x-style grouped GEMM or CuTe code that explicitly instantiates `Sm80`/`Sm86` paths.
+- pro6000 reports `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`, compute capability 12.0, driver 580.126.09, with PyTorch 2.8.0+cu128 available in the checked MoE envs. CUTLASS 3.x/Blackwell paths are a better architectural fit there, but extension builds still need an nvcc/toolkit that supports `sm_120`; nvcc was not on PATH in the probed conda envs.
+- For this DeePTB SO2 workload, CUTLASS grouped + custom epilogue is conceptually closer than a standalone grouped GEMM because the useful work is input Wigner prologue, route/expert mainloop, output Wigner epilogue, and gradient projection. The current negative result for raw CUTLASS segmented GEMM is therefore not a rejection of CUTLASS overall; it rejects the narrower "swap only GEMM mainloop" change.
+
 ## Artifacts
 
 Liyue run root:

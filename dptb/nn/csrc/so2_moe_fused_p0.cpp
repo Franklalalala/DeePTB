@@ -43,6 +43,43 @@ std::vector<torch::Tensor> fused_pair_backward_fp32_cuda(
     int64_t wigner_mode,
     int64_t wigner_stride);
 
+torch::Tensor pack_pair_fp32_cuda(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t m,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor output_pair_grad_fp32_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t m,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor scatter_pair_grad_fp32_cuda(
+    torch::Tensor grad_pair,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t in_dim,
+    int64_t m,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
 #ifdef DPTB_SO2_MOE_FUSED_P0_CUTLASS
 torch::Tensor cutlass_cute_probe_cuda(torch::Tensor a, torch::Tensor b);
 #endif
@@ -189,9 +226,114 @@ std::vector<torch::Tensor> fused_pair_backward_fp32(
       out_dim, m, rotate_in, rotate_out, radial_on_input, wigner_mode, wigner_stride);
 }
 
+torch::Tensor pack_pair_fp32(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t m,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(x, "x");
+  check_cuda_contiguous(in_base, "in_base");
+  check_cuda_contiguous(in_l, "in_l");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be fp32");
+  TORCH_CHECK(in_base.scalar_type() == torch::kInt64, "in_base must be int64");
+  TORCH_CHECK(in_l.scalar_type() == torch::kInt64, "in_l must be int64");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(x.dim() == 2, "x must be [N, in_dim]");
+  TORCH_CHECK(in_base.dim() == 1 && in_l.dim() == 1 && in_base.numel() == in_l.numel(),
+              "input maps must be 1D and aligned");
+  if (rotate_in) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return pack_pair_fp32_cuda(
+      x, wigner, in_base, in_l, offsets, compact_offsets,
+      m, rotate_in, wigner_mode, wigner_stride);
+}
+
+torch::Tensor output_pair_grad_fp32(
+    torch::Tensor grad_out,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t m,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(grad_out, "grad_out");
+  check_cuda_contiguous(out_base, "out_base");
+  check_cuda_contiguous(out_l, "out_l");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  TORCH_CHECK(grad_out.scalar_type() == torch::kFloat32, "grad_out must be fp32");
+  TORCH_CHECK(out_base.scalar_type() == torch::kInt64, "out_base must be int64");
+  TORCH_CHECK(out_l.scalar_type() == torch::kInt64, "out_l must be int64");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(grad_out.dim() == 2, "grad_out must be [N, out_dim]");
+  TORCH_CHECK(out_base.dim() == 1 && out_l.dim() == 1 && out_base.numel() == out_l.numel(),
+              "output maps must be 1D and aligned");
+  if (rotate_out) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return output_pair_grad_fp32_cuda(
+      grad_out, wigner, out_base, out_l, offsets, compact_offsets,
+      m, rotate_out, wigner_mode, wigner_stride);
+}
+
+torch::Tensor scatter_pair_grad_fp32(
+    torch::Tensor grad_pair,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t in_dim,
+    int64_t m,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(grad_pair, "grad_pair");
+  check_cuda_contiguous(in_base, "in_base");
+  check_cuda_contiguous(in_l, "in_l");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  TORCH_CHECK(grad_pair.scalar_type() == torch::kFloat32, "grad_pair must be fp32");
+  TORCH_CHECK(in_base.scalar_type() == torch::kInt64, "in_base must be int64");
+  TORCH_CHECK(in_l.scalar_type() == torch::kInt64, "in_l must be int64");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(grad_pair.dim() == 3 && grad_pair.size(1) == 2,
+              "grad_pair must be [N, 2, Cin]");
+  TORCH_CHECK(in_base.dim() == 1 && in_l.dim() == 1 && in_base.numel() == in_l.numel(),
+              "input maps must be 1D and aligned");
+  TORCH_CHECK(grad_pair.size(2) == in_base.numel(), "grad_pair Cin mismatch");
+  if (rotate_in) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return scatter_pair_grad_fp32_cuda(
+      grad_pair, wigner, in_base, in_l, offsets, compact_offsets,
+      in_dim, m, rotate_in, wigner_mode, wigner_stride);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_pair_forward_fp32", &fused_pair_forward_fp32, "SO2 MoE fused P0 pair forward fp32");
   m.def("fused_pair_backward_fp32", &fused_pair_backward_fp32, "SO2 MoE fused P0 pair backward fp32");
+  m.def("pack_pair_fp32", &pack_pair_fp32, "SO2 MoE fused P0 pack pair fp32");
+  m.def("output_pair_grad_fp32", &output_pair_grad_fp32, "SO2 MoE fused P0 output pair grad fp32");
+  m.def("scatter_pair_grad_fp32", &scatter_pair_grad_fp32, "SO2 MoE fused P0 scatter pair grad fp32");
 #ifdef DPTB_SO2_MOE_FUSED_P0_CUTLASS
   m.def("cutlass_cute_probe", &cutlass_cute_probe_cuda, "Compile-only CuTe dot-mainloop probe");
 #endif
