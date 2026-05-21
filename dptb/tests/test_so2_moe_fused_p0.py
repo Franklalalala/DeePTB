@@ -537,6 +537,7 @@ def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeyp
         ("cublas_grouped", "indexed_sandwich_multi"),
         ("cublas_grouped", "indexed_sandwich_multi_grouped"),
         ("cublas_grouped", "indexed_sandwich_multi_direct_warp"),
+        ("cublas_grouped", "indexed_sandwich_multi_cute_tiled"),
         ("cueq_indexed_linear", "cueq_sandwich"),
     ],
 )
@@ -548,6 +549,10 @@ def test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available(monkeyp
         pytest.importorskip("cuequivariance_torch")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 indexed-sandwich smoke requires CUDA")
+    if forward_mode == "indexed_sandwich_multi_cute_tiled":
+        cutlass_root = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT") or os.environ.get("DPTB_CUTLASS_ROOT")
+        if not cutlass_root:
+            pytest.skip("indexed_sandwich_multi_cute_tiled requires CUTLASS/CuTe include root")
 
     monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", forward_mode)
     monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE", "1")

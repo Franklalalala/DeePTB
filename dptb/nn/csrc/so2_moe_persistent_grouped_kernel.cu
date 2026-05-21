@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <cstdint>
 
+#ifdef DPTB_SO2_MOE_PERSISTENT_P1_CUTE
+#include <cute/tensor.hpp>
+#endif
+
 namespace {
 
 __device__ __forceinline__ int64_t ceil_div_i64(int64_t a, int64_t b) {
@@ -564,6 +568,231 @@ __global__ void persistent_grouped_forward_warp_kernel(
   }
 }
 
+#ifdef DPTB_SO2_MOE_PERSISTENT_P1_CUTE
+
+constexpr int kCuteTileMMax = 16;
+constexpr int kCuteTileNMax = 32;
+constexpr int kCuteTileK = 32;
+constexpr int kCuteThreads = 256;
+
+__global__ void persistent_grouped_forward_cute_tiled_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ edge_order,
+    const int64_t* __restrict__ route_ptr,
+    const int64_t* __restrict__ problem_tile_prefix,
+    const float* __restrict__ weight_flat,
+    const int64_t* __restrict__ weight_offsets,
+    const float* __restrict__ bias_flat,
+    const int64_t* __restrict__ bias_offsets,
+    const int64_t* __restrict__ m_values,
+    const int64_t* __restrict__ in_ptr,
+    const int64_t* __restrict__ in_base,
+    const int64_t* __restrict__ in_l,
+    const int64_t* __restrict__ out_ptr,
+    const int64_t* __restrict__ out_base,
+    const int64_t* __restrict__ out_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    const float* __restrict__ radial_all,
+    const int64_t* __restrict__ m_in_index,
+    float* __restrict__ out,
+    unsigned long long* __restrict__ counter,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t out_dim,
+    int64_t n_routes,
+    int64_t n_m,
+    int64_t n_problems,
+    int64_t total_tiles,
+    int64_t radial_dim,
+    int64_t dense_stride,
+    int64_t compact_stride,
+    int64_t wigner_mode,
+    int64_t block_m,
+    int64_t block_n,
+    bool rotate_in,
+    bool rotate_out,
+    bool radial_on_input,
+    bool has_radial) {
+  extern __shared__ float smem[];
+  auto a_layout = cute::make_layout(
+      cute::make_shape(cute::Int<2>{}, cute::Int<kCuteTileMMax>{}, cute::Int<kCuteTileK>{}));
+  auto b_layout = cute::make_layout(
+      cute::make_shape(cute::Int<2>{}, cute::Int<kCuteTileNMax>{}, cute::Int<kCuteTileK>{}));
+  float* smem_a = smem;
+  float* smem_b = smem_a + 2 * kCuteTileMMax * kCuteTileK;
+
+  __shared__ unsigned long long tile_shared;
+  while (true) {
+    if (threadIdx.x == 0) {
+      tile_shared = atomicAdd(counter, 1ULL);
+    }
+    __syncthreads();
+    const unsigned long long tile_ull = tile_shared;
+    if (tile_ull >= static_cast<unsigned long long>(total_tiles)) {
+      return;
+    }
+
+    const int64_t tile = static_cast<int64_t>(tile_ull);
+    const int64_t problem = find_problem_for_tile(problem_tile_prefix, n_problems, tile);
+    const int64_t route = problem / n_m;
+    const int64_t m_idx = problem - route * n_m;
+    const int64_t m = m_values[m_idx];
+
+    const int64_t route_begin = route_ptr[route];
+    const int64_t route_end = route_ptr[route + 1];
+    const int64_t rows = route_end - route_begin;
+    if (rows <= 0) {
+      continue;
+    }
+
+    const int64_t in_begin = in_ptr[m_idx];
+    const int64_t in_end = in_ptr[m_idx + 1];
+    const int64_t cin = in_end - in_begin;
+    const int64_t out_begin = out_ptr[m_idx];
+    const int64_t out_end = out_ptr[m_idx + 1];
+    const int64_t cout = out_end - out_begin;
+    if (cin <= 0 || cout <= 0) {
+      continue;
+    }
+
+    const int64_t col_tiles = ceil_div_i64(cout, block_n);
+    const int64_t local = tile - problem_tile_prefix[problem];
+    const int64_t row_tile = local / col_tiles;
+    const int64_t col_tile = local - row_tile * col_tiles;
+    const int64_t sorted_row0 = row_tile * block_m;
+    const int64_t col0 = col_tile * block_n;
+    const int64_t row_count = (m == 0) ? cout : 2 * cout;
+    const int64_t w_off = weight_offsets[m_idx] + route * row_count * cin;
+    const int64_t b_off_raw = bias_offsets[m_idx];
+    const int64_t b_off = b_off_raw >= 0 ? b_off_raw + route * row_count : -1;
+    const int64_t radial_begin = has_radial ? m_in_index[m] : 0;
+
+    const int64_t out_linear = threadIdx.x;
+    const int64_t local_row = out_linear / block_n;
+    const int64_t local_col = out_linear - local_row * block_n;
+    const bool owns_output = out_linear < block_m * block_n &&
+                             local_row < block_m &&
+                             local_col < block_n &&
+                             sorted_row0 + local_row < rows &&
+                             col0 + local_col < cout;
+    const int64_t edge = owns_output ? edge_order[route_begin + sorted_row0 + local_row] : -1;
+    const int64_t oc = col0 + local_col;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (int64_t k0 = 0; k0 < cin; k0 += kCuteTileK) {
+      for (int64_t idx = threadIdx.x; idx < block_m * kCuteTileK; idx += blockDim.x) {
+        const int64_t lr = idx / kCuteTileK;
+        const int64_t kk = idx - lr * kCuteTileK;
+        const int64_t ci = k0 + kk;
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        if (lr < block_m && sorted_row0 + lr < rows && ci < cin) {
+          const int64_t e = edge_order[route_begin + sorted_row0 + lr];
+          const int64_t src = in_begin + ci;
+          const int64_t l = in_l[src];
+          if (m == 0) {
+            a0 = load_scalar_component(x, wigner, offsets, compact_offsets,
+                                       e, in_dim, in_base[src], l,
+                                       dense_stride, compact_stride,
+                                       wigner_mode, rotate_in);
+          } else {
+            a0 = load_pair_component(x, wigner, offsets, compact_offsets,
+                                     e, in_dim, in_base[src], l, l - m,
+                                     dense_stride, compact_stride,
+                                     wigner_mode, rotate_in);
+            a1 = load_pair_component(x, wigner, offsets, compact_offsets,
+                                     e, in_dim, in_base[src], l, l + m,
+                                     dense_stride, compact_stride,
+                                     wigner_mode, rotate_in);
+          }
+          if (has_radial && radial_on_input) {
+            const float rv = radial_all[e * radial_dim + radial_begin + ci];
+            a0 *= rv;
+            a1 *= rv;
+          }
+        }
+        smem_a[a_layout(0, lr, kk)] = a0;
+        smem_a[a_layout(1, lr, kk)] = a1;
+      }
+
+      for (int64_t idx = threadIdx.x; idx < block_n * kCuteTileK; idx += blockDim.x) {
+        const int64_t lc = idx / kCuteTileK;
+        const int64_t kk = idx - lc * kCuteTileK;
+        const int64_t ci = k0 + kk;
+        const int64_t oc_i = col0 + lc;
+        float wr = 0.0f;
+        float wi = 0.0f;
+        if (lc < block_n && oc_i < cout && ci < cin) {
+          wr = weight_flat[w_off + oc_i * cin + ci];
+          if (m != 0) {
+            wi = weight_flat[w_off + (cout + oc_i) * cin + ci];
+          }
+        }
+        smem_b[b_layout(0, lc, kk)] = wr;
+        smem_b[b_layout(1, lc, kk)] = wi;
+      }
+      __syncthreads();
+
+      if (owns_output && edge >= 0 && edge < n_edges) {
+        const int64_t remaining_k = cin - k0;
+        const int64_t valid_k = remaining_k < static_cast<int64_t>(kCuteTileK)
+                                     ? remaining_k
+                                     : static_cast<int64_t>(kCuteTileK);
+        for (int64_t kk = 0; kk < valid_k; ++kk) {
+          const float a0 = smem_a[a_layout(0, local_row, kk)];
+          const float a1 = smem_a[a_layout(1, local_row, kk)];
+          const float wr = smem_b[b_layout(0, local_col, kk)];
+          const float wi = smem_b[b_layout(1, local_col, kk)];
+          if (m == 0) {
+            acc0 += a0 * wr;
+          } else {
+            acc0 += a0 * wr - a1 * wi;
+            acc1 += a1 * wr + a0 * wi;
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    if (!owns_output || edge < 0 || edge >= n_edges) {
+      continue;
+    }
+
+    if (m == 0) {
+      if (b_off >= 0) {
+        acc0 += bias_flat[b_off + oc];
+      }
+      if (has_radial && !radial_on_input) {
+        acc0 *= radial_all[edge * radial_dim + radial_begin + oc];
+      }
+      const int64_t dst = out_begin + oc;
+      store_scalar_component(out, wigner, offsets, compact_offsets, edge, out_dim,
+                             out_base[dst], out_l[dst], acc0, dense_stride,
+                             compact_stride, wigner_mode, rotate_out);
+    } else {
+      if (b_off >= 0) {
+        acc0 += bias_flat[b_off + oc];
+        acc1 += bias_flat[b_off + cout + oc];
+      }
+      if (has_radial && !radial_on_input) {
+        const float rv = radial_all[edge * radial_dim + radial_begin + oc];
+        acc0 *= rv;
+        acc1 *= rv;
+      }
+      const int64_t dst = out_begin + oc;
+      const int64_t l = out_l[dst];
+      store_pair_component(out, wigner, offsets, compact_offsets, edge, out_dim,
+                           out_base[dst], l, l - m, l + m, acc0, acc1,
+                           dense_stride, compact_stride, wigner_mode, rotate_out);
+    }
+  }
+}
+
+#endif  // DPTB_SO2_MOE_PERSISTENT_P1_CUTE
+
 }  // namespace
 
 at::Tensor persistent_grouped_forward_fp32_cuda(
@@ -781,4 +1010,121 @@ at::Tensor persistent_grouped_forward_warp_fp32_cuda(
       has_radial);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+at::Tensor persistent_grouped_forward_cute_tiled_fp32_cuda(
+    const at::Tensor& x,
+    const at::Tensor& wigner,
+    const at::Tensor& edge_order,
+    const at::Tensor& route_ptr,
+    const at::Tensor& problem_tile_prefix,
+    const at::Tensor& weight_flat,
+    const at::Tensor& weight_offsets,
+    const at::Tensor& bias_flat,
+    const at::Tensor& bias_offsets,
+    const at::Tensor& m_values,
+    const at::Tensor& in_ptr,
+    const at::Tensor& in_base,
+    const at::Tensor& in_l,
+    const at::Tensor& out_ptr,
+    const at::Tensor& out_base,
+    const at::Tensor& out_l,
+    const at::Tensor& offsets,
+    const at::Tensor& compact_offsets,
+    const at::Tensor& radial_all,
+    const at::Tensor& m_in_index,
+    int64_t out_dim,
+    int64_t n_routes,
+    bool rotate_in,
+    bool rotate_out,
+    bool radial_on_input,
+    int64_t wigner_mode,
+    int64_t wigner_stride,
+    int64_t block_m,
+    int64_t block_n,
+    int64_t active_blocks) {
+#ifndef DPTB_SO2_MOE_PERSISTENT_P1_CUTE
+  TORCH_CHECK(false, "persistent_grouped_forward_cute_tiled_fp32 requires building with DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT or DPTB_CUTLASS_ROOT");
+#else
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  TORCH_CHECK(block_m <= kCuteTileMMax, "cute_tiled block_m must be <= 16");
+  TORCH_CHECK(block_n <= kCuteTileNMax, "cute_tiled block_n must be <= 32");
+  TORCH_CHECK(block_m * block_n <= kCuteThreads, "cute_tiled block_m * block_n must be <= 256");
+  at::Tensor out = at::zeros({x.size(0), out_dim}, x.options());
+  if (x.size(0) == 0 || out_dim == 0 || problem_tile_prefix.numel() == 0) {
+    return out;
+  }
+
+  const int64_t n_m = m_values.numel();
+  const int64_t n_problems = n_routes * n_m;
+  if (n_problems == 0) {
+    return out;
+  }
+
+  const int64_t total_tiles = problem_tile_prefix.narrow(0, problem_tile_prefix.numel() - 1, 1).item<int64_t>();
+  if (total_tiles <= 0) {
+    return out;
+  }
+
+  cudaDeviceProp props{};
+  int dev = -1;
+  cudaGetDevice(&dev);
+  cudaGetDeviceProperties(&props, dev);
+  const int64_t sm_count = std::max(1, props.multiProcessorCount);
+  int64_t blocks_i64 = active_blocks > 0 ? active_blocks : std::min<int64_t>(std::max<int64_t>(1, total_tiles), sm_count * 3);
+  blocks_i64 = std::min<int64_t>(blocks_i64, 65535);
+  const dim3 grid(static_cast<unsigned int>(blocks_i64));
+  const dim3 threads(kCuteThreads);
+
+  at::Tensor counter = at::zeros({1}, at::TensorOptions().device(x.device()).dtype(at::kLong));
+  const bool has_radial = radial_all.numel() > 0;
+  const int64_t radial_dim = has_radial ? radial_all.size(1) : 0;
+  const int64_t compact_stride = (wigner_mode == 2) ? wigner_stride : 0;
+  const int64_t dense_stride = (wigner_mode == 1) ? wigner_stride : 0;
+  const size_t smem_bytes =
+      (2 * kCuteTileMMax * kCuteTileK + 2 * kCuteTileNMax * kCuteTileK) * sizeof(float);
+
+  persistent_grouped_forward_cute_tiled_kernel<<<grid, threads, smem_bytes, at::cuda::getCurrentCUDAStream()>>>(
+      x.data_ptr<float>(),
+      wigner.numel() > 0 ? wigner.data_ptr<float>() : nullptr,
+      edge_order.data_ptr<int64_t>(),
+      route_ptr.data_ptr<int64_t>(),
+      problem_tile_prefix.data_ptr<int64_t>(),
+      weight_flat.data_ptr<float>(),
+      weight_offsets.data_ptr<int64_t>(),
+      bias_flat.numel() > 0 ? bias_flat.data_ptr<float>() : nullptr,
+      bias_offsets.data_ptr<int64_t>(),
+      m_values.data_ptr<int64_t>(),
+      in_ptr.data_ptr<int64_t>(),
+      in_base.data_ptr<int64_t>(),
+      in_l.data_ptr<int64_t>(),
+      out_ptr.data_ptr<int64_t>(),
+      out_base.data_ptr<int64_t>(),
+      out_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() > 0 ? compact_offsets.data_ptr<int64_t>() : nullptr,
+      has_radial ? radial_all.data_ptr<float>() : nullptr,
+      m_in_index.numel() > 0 ? m_in_index.data_ptr<int64_t>() : nullptr,
+      out.data_ptr<float>(),
+      reinterpret_cast<unsigned long long*>(counter.data_ptr<int64_t>()),
+      x.size(0),
+      x.size(1),
+      out_dim,
+      n_routes,
+      n_m,
+      n_problems,
+      total_tiles,
+      radial_dim,
+      dense_stride,
+      compact_stride,
+      wigner_mode,
+      block_m,
+      block_n,
+      rotate_in,
+      rotate_out,
+      radial_on_input,
+      has_radial);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+#endif
 }

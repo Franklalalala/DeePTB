@@ -2728,9 +2728,21 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
         "indexed_sandwich_multi_direct_warp",
         "route_m_direct_warp",
         "custom_a_loader_epilogue",
+        "indexed_sandwich_multi_cute_tiled",
+        "indexed_sandwich_multi_cutlass_native",
+        "custom_a_loader_cutlass_epilogue",
     ):
         from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
 
+        mainloop_override = (
+            "cute_tiled"
+            if forward_mode in (
+                "indexed_sandwich_multi_cute_tiled",
+                "indexed_sandwich_multi_cutlass_native",
+                "custom_a_loader_cutlass_epilogue",
+            )
+            else "warp_collective"
+        )
         return try_forward_so2_moe_persistent_grouped_p1(
             module,
             x,
@@ -2739,6 +2751,7 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
             latents,
             wigner_D_all,
             include_m0_override=False,
+            mainloop_override=mainloop_override,
         )
 
     weights = module.radial_emb(latents) if module.radial_emb else None

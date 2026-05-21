@@ -529,6 +529,50 @@ Negative-result analysis:
 - The huge global wall time includes first-use P1 extension build/runtime warmup. The steady-state number is still the important comparison, and it is also slower than both stable cublas and `indexed_sandwich_multi`.
 - The useful asset to carry forward is the metadata contract and loader/epilogue semantics, not the SIMT dot loop. The next version should keep this A-loader and epilogue contract but attach it to a real CUTLASS/CuTe grouped mainloop.
 
+## CuTe tiled A-loader / epilogue prototype
+
+`DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_cute_tiled` adds the first CUTLASS/CuTe-backed prototype that is wired through the normal fused P0 entry. It keeps the same route/m metadata boundary as the persistent grouped P1 path, forces `m=0` to remain on the existing strong path, and runs `m>0` through a CuTe shared-memory tiled kernel:
+
+- custom A-loader reads original `x`, compact Wigner blocks, `in_base`, and `in_l` directly when loading each K tile;
+- grouped route/m scheduler is still the same `edge_order + route_ptr + problem_tile_prefix` schedule;
+- raw complex finish, optional post-radial scale, Wigner output rotation, and scatter happen in the same kernel epilogue;
+- backward is still the trainable segmented CUDA/cuBLAS fallback used by fused P0/P1;
+- this is opt-in and requires `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT` or `DPTB_CUTLASS_ROOT`.
+
+Build/test flags used on Liyue:
+
+```text
+export DPTB_CUTLASS_ROOT=/home/mingkang_nt/codex/third_party/cutlass
+export DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT=/home/mingkang_nt/codex/third_party/cutlass
+export DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_cute_tiled
+export DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=cute_tiled
+export DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_M=8
+export DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N=16
+export DPTB_CUBLAS_GROUPED_FAST_TF32=0
+
+pytest dptb/tests/test_so2_moe_fused_p0.py -q -k 'indexed_sandwich and cute_tiled'
+
+1 passed, 19 deselected, 1 warning in 44.43s
+```
+
+Same-process module train A/B, Liyue L40S, compact Wigner, FP32 and TF32 off:
+
+| Forward mode | N | fused train ms | loss diff vs `indexed_sandwich_multi` | x-grad max diff |
+| --- | ---: | ---: | ---: | ---: |
+| `indexed_sandwich_multi` | 4096 | 10.986 | 0 | 0 |
+| `indexed_sandwich_multi_cute_tiled`, tile 4x8 | 4096 | 18.848 | 0 | 1.82e-12 |
+| `indexed_sandwich_multi_cute_tiled`, tile 8x16 | 4096 | 18.915 | 0 | 1.82e-12 |
+| `indexed_sandwich_multi` | 16384 | 16.147 | 0 | 0 |
+| `indexed_sandwich_multi_cute_tiled`, tile 4x16 | 16384 | 19.001 | 0 | 6.82e-13 |
+| `indexed_sandwich_multi_cute_tiled`, tile 16x16 | 16384 | 19.018 | 0 | 6.82e-13 |
+
+This is a negative performance result but a useful implementation boundary result:
+
+- It is deeper than the previous `direct_warp` bridge in the specific requested dimension: the pre-GEMM side is now a custom A-loader in the tile mainloop, not a separate pack kernel, and the output rotation/scatter is still in-kernel.
+- It is slower because the first CuTe tile assigns one thread to one output element and therefore serializes the K loop inside that thread. `indexed_sandwich_multi` still uses cuBLAS grouped GEMM for the raw linear mainloop, and the previous P1 warp mainloop at least split K over lanes. The current tile saves intermediate tensors but loses too much raw GEMM throughput.
+- Tile shape `16x32` is now rejected because it has more output elements than the 256-thread prototype can cover; that shape previously produced numerical drift and is not valid for this kernel.
+- The next meaningful CUTLASS step is not more wrapper work. It is either a forked grouped GEMM kernel with a custom problem visitor/A iterator and custom epilogue output path, or a CUTLASS 3.x `GemmUniversal`/collective-style kernel where the loader computes Wigner-rotated A fragments and the epilogue consumes accumulators before D is materialized.
+
 ## Artifacts
 
 Liyue run root:
@@ -576,6 +620,7 @@ prod_smoke_indexed_sandwich_raw_epi_20260521
 prod_smoke_indexed_sandwich_multi_20260521
 prod_smoke_indexed_sandwich_multi_grouped_20260522
 prod_smoke_indexed_sandwich_multi_direct_warp_20260522
+module_bench_indexed_sandwich_multi_cute_tiled_20260522
 prod_smoke_persistent_grouped_p1_20260521
 prod_smoke_persistent_grouped_p1_nom0_20260521
 prod_smoke_persistent_grouped_p1_warp_20260522

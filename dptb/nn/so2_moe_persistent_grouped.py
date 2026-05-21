@@ -18,8 +18,11 @@ P1 deliberately keeps strict safety gates:
 
 The default forward mainloop is warp-collective: a warp owns one row of a
 route/m/output tile, lanes split the K dimension, and lane 0 runs the custom
-SO2 epilogue. ``DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=scalar`` keeps the older
-thread-per-output prototype for debugging.
+SO2 epilogue. ``DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=cute_tiled`` switches to a
+CuTe-backed shared-memory tiled prototype: the tile mainloop reads raw
+``x + compact Wigner + SO2 maps`` through a custom A-loader and keeps the SO2
+output epilogue in-kernel. ``scalar`` keeps the older thread-per-output
+prototype for debugging.
 """
 
 from __future__ import annotations
@@ -54,6 +57,17 @@ def _int_env(name: str, default: int) -> int:
         return int(default)
 
 
+def _mainloop_kind(name: Optional[str] = None) -> int:
+    mode = name or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+    if mode in ("scalar", "thread", "thread_scalar"):
+        return 0
+    if mode in ("warp", "warp_collective", "collective"):
+        return 1
+    if mode in ("cute_tiled", "cutlass_native", "cutlass_cute_tiled", "tiled"):
+        return 2
+    raise RuntimeError(f"unknown DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP={mode!r}")
+
+
 def _warn_once(key: str, message: str) -> None:
     if key in _WARNED:
         return
@@ -73,17 +87,33 @@ def _load_extension():
         )
     )
     build_dir.mkdir(parents=True, exist_ok=True)
+    cflags = ["-O3"]
     cuda_flags = ["-O3", "--expt-relaxed-constexpr"]
+    include_paths = []
     if _flag("DPTB_SO2_MOE_PERSISTENT_P1_LINEINFO"):
         cuda_flags.append("-lineinfo")
+    cutlass_root = (
+        os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT")
+        or os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
+        or os.environ.get("DPTB_CUTLASS_ROOT")
+    )
+    if cutlass_root:
+        cutlass_root_path = Path(cutlass_root)
+        include_paths.extend([
+            str(cutlass_root_path / "include"),
+            str(cutlass_root_path / "tools" / "util" / "include"),
+        ])
+        cflags.append("-DDPTB_SO2_MOE_PERSISTENT_P1_CUTE=1")
+        cuda_flags.append("-DDPTB_SO2_MOE_PERSISTENT_P1_CUTE=1")
     _EXT = load(
         name="dptb_so2_moe_persistent_grouped_p1",
         sources=[
             str(here / "csrc" / "so2_moe_persistent_grouped.cpp"),
             str(here / "csrc" / "so2_moe_persistent_grouped_kernel.cu"),
         ],
-        extra_cflags=["-O3"],
+        extra_cflags=cflags,
         extra_cuda_cflags=cuda_flags,
+        extra_include_paths=include_paths,
         build_directory=str(build_dir),
         with_cuda=True,
         verbose=_flag("DPTB_SO2_MOE_PERSISTENT_P1_VERBOSE"),
@@ -402,18 +432,20 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
         radial_on_input: bool,
         wigner_mode: int,
         wigner_stride: int,
+        mainloop_kind: int,
         block_m: int,
         block_n: int,
         active_blocks: int,
     ):
         ext = _load_extension()
-        mainloop = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
-        if mainloop in ("warp", "warp_collective", "collective"):
+        if int(mainloop_kind) == 2:
+            forward = ext.persistent_grouped_forward_cute_tiled_fp32
+        elif int(mainloop_kind) == 1:
             forward = ext.persistent_grouped_forward_warp_fp32
-        elif mainloop in ("scalar", "thread", "thread_scalar"):
+        elif int(mainloop_kind) == 0:
             forward = ext.persistent_grouped_forward_fp32
         else:
-            raise RuntimeError(f"unknown DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP={mainloop!r}")
+            raise RuntimeError(f"unknown persistent grouped mainloop kind={mainloop_kind!r}")
         out = forward(
             x,
             wigner,
@@ -638,6 +670,7 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
             None,              # radial_on_input
             None,              # wigner_mode
             None,              # wigner_stride
+            None,              # mainloop_kind
             None,              # block_m
             None,              # block_n
             None,              # active_blocks
@@ -653,6 +686,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
     wigner_D_all=None,
     *,
     include_m0_override: Optional[bool] = None,
+    mainloop_override: Optional[str] = None,
 ):
     """Return a fused persistent grouped SO2/MoE forward result or ``None``.
 
@@ -710,6 +744,8 @@ def try_forward_so2_moe_persistent_grouped_p1(
     block_m = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_M", 8))
     block_n = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N", 8))
     active_blocks = _int_env("DPTB_SO2_MOE_PERSISTENT_P1_ACTIVE_BLOCKS", 0)
+    mainloop_name = mainloop_override or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+    mainloop_kind = _mainloop_kind(mainloop_name)
 
     edge_order, route_ptr, problem_tile_prefix = _prepare_route_layout(
         graph_index, n_routes, int(m_values.numel()), block_m, block_n, out_ptr
@@ -753,6 +789,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
         bool(module.front),
         int(wigner_mode),
         int(wigner_stride),
+        int(mainloop_kind),
         int(block_m),
         int(block_n),
         int(active_blocks),
@@ -777,6 +814,6 @@ def try_forward_so2_moe_persistent_grouped_p1(
             f"persistent_grouped_p1 active: routes={n_routes}, m_values={tuple(int(v) for v in m_values.detach().cpu().tolist())}, "
             f"tiles={int(problem_tile_prefix[-1].item())}, block_m={block_m}, block_n={block_n}, "
             f"wigner_mode={wigner_mode}, include_m0={include_m0}, "
-            f"mainloop={os.environ.get('DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP', 'warp_collective')}.",
+            f"mainloop={mainloop_name}.",
         )
     return out.contiguous(), wigner_D_all
