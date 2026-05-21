@@ -78,6 +78,7 @@ def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind
         _pack_pair_cuda,
         _pack_pair_torch,
         _scatter_pair_grad_cuda,
+        _scatter_pair_grad_radial_input_cuda,
         _scatter_pair_grad_torch,
     )
 
@@ -152,6 +153,146 @@ def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind
     )
     torch.testing.assert_close(scatter_cuda, scatter_ref, atol=1e-6, rtol=1e-6)
 
+    radial = torch.randn((n_edges, in_base.numel()), device=device, dtype=torch.float32)
+    grad_pair_eff = torch.randn_like(pack_ref)
+    scatter_radial_ref = _scatter_pair_grad_torch(
+        grad_pair_eff * radial.unsqueeze(1),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        in_dim,
+        m,
+        True,
+        wigner_mode,
+    )
+    grad_radial_ref = (grad_pair_eff * pack_ref).sum(dim=1)
+    scatter_radial_cuda, grad_radial_cuda = _scatter_pair_grad_radial_input_cuda(
+        grad_pair_eff,
+        pack_ref,
+        radial,
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        in_dim,
+        m,
+        True,
+        wigner_mode,
+        wigner_stride,
+    )
+    torch.testing.assert_close(scatter_radial_cuda, scatter_radial_ref, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(grad_radial_cuda, grad_radial_ref, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("tile_out", [2, 3, 4, 8])
+def test_so2_fused_p0_cutlass_tiled_forward_matches_scalar_if_available(tile_out):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 MoE fused P0 tiled forward smoke requires CUDA")
+    if not os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT"):
+        pytest.skip("SO2 MoE fused P0 tiled forward requires CUTLASS root")
+
+    from dptb.nn.so2_moe_fused_p0 import _load_extension, _pair_maps, _wigner_tensor_and_mode
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260525)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    module = SO2_Linear(
+        irreps_in="2x0e + 2x1o + 1x2e",
+        irreps_out="1x0e + 2x1o + 2x2e",
+        radial_emb=True,
+        latent_dim=5,
+        radial_channels=[7],
+        num_experts=5,
+        num_shared_experts=1,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+        mole_linear_mode="cublas_grouped",
+        so2_fusion_mode="streamed_m_major_fused_p0",
+    ).to(device=device, dtype=dtype).eval()
+
+    n_edges = 11
+    routes = 4
+    top_k = 2
+    graph_index = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2], device=device, dtype=torch.long)
+    topk_indices = torch.tensor([[0, 3], [1, 4], [2, 0], [3, 1]], device=device, dtype=torch.long)
+    topk_values = torch.rand((routes, top_k), device=device, dtype=dtype)
+    topk_values = topk_values / topk_values.sum(dim=-1, keepdim=True)
+    coeffs = torch.zeros((routes, 5), device=device, dtype=dtype)
+    coeffs.scatter_(1, topk_indices, topk_values)
+    globals_ = MOLEGlobals(
+        coefficients=coeffs,
+        graph_index=graph_index,
+        topk_indices=topk_indices,
+        topk_values=topk_values,
+    )
+
+    x = torch.randn((n_edges, module.irreps_in.dim), device=device, dtype=dtype)
+    latents = torch.randn((n_edges, 5), device=device, dtype=dtype)
+    R = torch.randn((n_edges, 3), device=device, dtype=dtype)
+    wigner = module._ensure_wigner_rotation(R, None)
+    wigner_info = _wigner_tensor_and_mode(module, wigner, x)
+    assert wigner_info is not None
+    wigner_tensor, compact_offsets, wigner_mode, wigner_stride = wigner_info
+
+    m = 1
+    fc = module.m_linear[m - 1].fc
+    mixed_weight, mixed_bias = fc._mix_expert_parameters(globals_)
+    assert mixed_bias is None
+    weights = module.radial_emb(latents)
+    radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].contiguous()
+    in_base, in_l, out_base, out_l, offsets = _pair_maps(module, m, device)
+    ext = _load_extension()
+
+    scalar = ext.fused_pair_forward_fp32(
+        x.contiguous(),
+        wigner_tensor,
+        graph_index.contiguous(),
+        mixed_weight.contiguous(),
+        radial,
+        in_base,
+        in_l,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(module.irreps_out.dim),
+        int(m),
+        bool(module.rotate_in),
+        bool(module.rotate_out),
+        bool(module.front),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+    tiled_fn = getattr(ext, f"fused_pair_forward_tiled{tile_out}_fp32")
+    tiled = tiled_fn(
+        x.contiguous(),
+        wigner_tensor,
+        graph_index.contiguous(),
+        mixed_weight.contiguous(),
+        radial,
+        in_base,
+        in_l,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(module.irreps_out.dim),
+        int(m),
+        bool(module.rotate_in),
+        bool(module.rotate_out),
+        bool(module.front),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+    torch.testing.assert_close(tiled, scalar, atol=5e-4, rtol=5e-4)
+
 
 def test_so2_fused_p0_forward_matches_streamed_ref_if_available():
     torch = pytest.importorskip("torch")
@@ -202,11 +343,17 @@ def test_so2_fused_p0_forward_matches_streamed_ref_if_available():
 
 
 @pytest.mark.parametrize("backward_mode", ["cublas_segmented", "cuda_cublas_segmented"])
-def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeypatch, backward_mode):
+@pytest.mark.parametrize("forward_mode", ["scalar", "cutlass_tiled4"])
+def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeypatch, backward_mode, forward_mode):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 backward smoke requires CUDA")
+    if forward_mode != "scalar":
+        if not os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT"):
+            pytest.skip("SO2 MoE fused P0 tiled trainable smoke requires CUTLASS root")
+        monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", forward_mode)
+        monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE", "1")
     monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", backward_mode)
 
     from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0

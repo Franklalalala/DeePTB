@@ -416,6 +416,39 @@ def _output_pair_grad_cuda(
     )
 
 
+def _scatter_pair_grad_radial_input_cuda(
+    grad_pair_eff: torch.Tensor,
+    pair_no_radial: torch.Tensor,
+    radial: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    in_dim: int,
+    m: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_x, grad_radial = _load_extension().scatter_pair_grad_radial_input_fp32(
+        grad_pair_eff.contiguous(),
+        pair_no_radial.contiguous(),
+        radial.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        int(in_dim),
+        int(m),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+    return grad_x, grad_radial
+
+
 def _segmented_raw_linear_backward(
     x_pair: torch.Tensor,
     grad_raw: torch.Tensor,
@@ -620,6 +653,23 @@ def _segmented_pair_backward(
             x_pair_eff, grad_raw, graph_index, mixed_weight
         )
     if has_radial and radial_on_input:
+        if use_cuda_epilogue and _flag("DPTB_SO2_MOE_FUSED_P0_FUSE_INPUT_RADIAL_SCATTER", "1"):
+            grad_x, grad_radial = _scatter_pair_grad_radial_input_cuda(
+                grad_x_pair_eff,
+                x_pair_no_radial,
+                radial,
+                wigner,
+                in_base,
+                in_l,
+                offsets,
+                compact_offsets,
+                x.shape[1],
+                m,
+                rotate_in,
+                wigner_mode,
+                wigner_stride,
+            )
+            return grad_x, grad_weight, grad_radial
         grad_radial = (grad_x_pair_eff * x_pair_no_radial).sum(dim=1)
         grad_x_pair = grad_x_pair_eff * radial.unsqueeze(1)
     else:
@@ -661,7 +711,41 @@ class _FusedPairFunction(torch.autograd.Function):
         wigner_mode: int,
         wigner_stride: int,
     ):
-        out = _load_extension().fused_pair_forward_fp32(
+        ext = _load_extension()
+        forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+        forward_fn = ext.fused_pair_forward_fp32
+        tiled_forward_fns = {
+            "cutlass_tiled2": "fused_pair_forward_tiled2_fp32",
+            "cute_tiled2": "fused_pair_forward_tiled2_fp32",
+            "cutlass_tiled3": "fused_pair_forward_tiled3_fp32",
+            "cute_tiled3": "fused_pair_forward_tiled3_fp32",
+            "cutlass_tiled4": "fused_pair_forward_tiled4_fp32",
+            "cute_tiled4": "fused_pair_forward_tiled4_fp32",
+            "cutlass_tiled8": "fused_pair_forward_tiled8_fp32",
+            "cute_tiled8": "fused_pair_forward_tiled8_fp32",
+        }
+        if forward_mode in tiled_forward_fns:
+            forward_fn = getattr(ext, tiled_forward_fns[forward_mode], None)
+        elif forward_mode not in ("", "scalar"):
+            if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
+                raise RuntimeError(f"unknown DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r}")
+            _warn_once(
+                "unknown_forward_mode",
+                f"unknown DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r}; using scalar fused P0 forward.",
+            )
+        if forward_fn is None:
+            if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
+                raise RuntimeError(
+                    f"DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r} requires "
+                    "building the extension with DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT."
+                )
+            _warn_once(
+                "missing_tiled_forward",
+                f"DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE={forward_mode!r} is unavailable; using scalar fused P0 forward.",
+            )
+            forward_fn = ext.fused_pair_forward_fp32
+
+        out = forward_fn(
             x,
             wigner,
             graph_index,

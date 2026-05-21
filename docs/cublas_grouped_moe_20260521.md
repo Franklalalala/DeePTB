@@ -185,6 +185,50 @@ Aggressive follow-up, same day:
 
 This confirms that moving the backward prologue/epilogue into CUDA gives a real fused-P0 improvement, but the current architecture still cannot beat the stable `streamed_m_major_cueq`/`cublas_grouped` production path. The likely remaining blockers are per-`m` custom-op launch count, mixed-weight materialization per route, m0 still on the old path, and the interpolation SO2 layer falling back because it uses `InterpolationBlock` rather than `MOLELinear`.
 
+CuTe-tiled forward and input-radial scatter follow-up:
+
+- Added CUTLASS-root/CuTe-indexed forward variants `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=cutlass_tiled{2,3,4,8}`. These keep the current scalar FP32 dot mainloop, but one CUDA block now computes a small tile of output channels and reuses the Wigner-rotated input pair across that tile. This is not a Tensor Core path; it is a dataflow/prologue-epilogue prototype for SM89 with TF32 off.
+- Added a backward input epilogue kernel for the radial-on-input case. It fuses `grad_radial = sum(grad_x_pair_eff * x_pair_no_radial)`, radial scaling of `grad_x_pair_eff`, and Wigner input-gradient scatter into one CUDA kernel. It is controlled by `DPTB_SO2_MOE_FUSED_P0_FUSE_INPUT_RADIAL_SCATTER` and defaults on inside the opt-in fused P0 route.
+- Liyue correctness smoke with CUTLASS root and compact Wigner: `10 passed, 1 warning in 43.24s`. This covers CUDA pair ops, tile2/3/4/8 forward vs scalar fused P0, and train backward vs streamed reference.
+
+Module train tile search, `bench_so2_moe_fused_train.py --top-k 2`, FP32, TF32 off, `cuda_cublas_segmented` backward:
+
+| N | forward mode | fused P0 train ms | Note |
+| ---: | --- | ---: | --- |
+| 4096 | scalar | 15.708 | baseline fused P0 |
+| 4096 | tile2 | 16.877 | too little channel reuse |
+| 4096 | tile3 | 15.141 | best module result |
+| 4096 | tile4 | 15.880 | neutral |
+| 4096 | tile8 | 15.909 | neutral in module test |
+| 16384 | scalar | 15.871 | baseline fused P0 |
+| 16384 | tile2 | 15.899 | neutral |
+| 16384 | tile3 | 14.894 | best module result |
+| 16384 | tile4 | 15.179 | small win |
+| 16384 | tile8 | 15.238 | small win |
+
+Production timestamp smoke, bs=32, 25 iterations, FP32, TF32 off, compact Wigner, same wrapper for all fused variants:
+
+| Case | forward/backend | wall s | back-half s/iter | Ratio vs scalar fused | Ratio vs stable comparator |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_scalar` | scalar forward + CUDA epilogue + cuBLAS segmented | 101.555 | 3.449 | 1.00 | 0.59 vs `global_all_cublas` |
+| `global_all_fused_p0_tiled3` | tile3 forward + CUDA epilogue + cuBLAS segmented | 81.524 | 2.530 | 1.36 | 0.81 vs `global_all_cublas` |
+| `global_all_fused_p0_tiled4` | tile4 forward + CUDA epilogue + cuBLAS segmented | 78.729 | 2.391 | 1.44 | 0.85 vs `global_all_cublas` |
+| `global_all_fused_p0_tiled8` | tile8 forward + CUDA epilogue + cuBLAS segmented | 75.139 | 2.327 | 1.48 | 0.88 vs `global_all_cublas` |
+| `global_all_fused_p0_tiled8_radial_scatter` | tile8 forward + fused input-radial scatter + cuBLAS segmented | 73.050 | 2.273 | 1.52 | 0.90 vs `global_all_cublas` |
+| `edge_top2_fused_p0_scalar` | scalar forward + CUDA epilogue + cuBLAS segmented | 113.240 | 3.808 | 1.00 | 0.56 vs `edge_top2_cublas` |
+| `edge_top2_fused_p0_tiled3` | tile3 forward + CUDA epilogue + cuBLAS segmented | 89.837 | 2.853 | 1.33 | 0.75 vs `edge_top2_cublas` |
+| `edge_top2_fused_p0_tiled4` | tile4 forward + CUDA epilogue + cuBLAS segmented | 84.765 | 2.716 | 1.40 | 0.79 vs `edge_top2_cublas` |
+| `edge_top2_fused_p0_tiled8` | tile8 forward + CUDA epilogue + cuBLAS segmented | 82.689 | 2.624 | 1.45 | 0.81 vs `edge_top2_cublas` |
+| `edge_top2_fused_p0_tiled8_radial_scatter` | tile8 forward + fused input-radial scatter + cuBLAS segmented | 78.337 | 2.501 | 1.52 | 0.85 vs `edge_top2_cublas` |
+
+This is the first fused P0 result that visibly improves production training, not just module microbench: best global wall time improved from the prior `global_all_fused_p0_cuda_cublas` 90.099 s to 73.050 s, and best edge wall time improved from 94.898 s to 78.337 s. The remaining negative signal is still important: even the best fused P0 remains slower than the stable `cublas_grouped` production comparator because the path still materializes per-route `mixed_weight`, launches per `m`, leaves `m=0` and interpolation SO2 outside the fused backend, and uses segmented cuBLAS for raw backward with intermediate `x_pair_eff`, `grad_raw`, and `grad_x_pair_eff` tensors.
+
+Current recommendation:
+
+- Keep `cutlass_tiled8` and fused input-radial scatter opt-in for the fused P0 branch.
+- Do not make fused P0 the production default yet.
+- The next meaningful step is not another GEMM wrapper. It is either direct expert/route reads to remove route-level `mixed_weight`, or a larger CuTe kernel family that owns the `m` loop plus backward projection/scatter around the raw GEMM tile.
+
 Hardware/CUTLASS notes:
 
 - Liyue reports `NVIDIA L40S`, compute capability 8.9, driver 535.104.05. This is the primary smoke platform used above.
@@ -225,4 +269,20 @@ Fused P0 smoke root:
 
 ```text
 /home/mingkang_nt/codex/0521_fused_so2_moe_p0_clean_20260521/smoke
+```
+
+Aggressive fused P0/CuTe smoke root:
+
+```text
+/home/mingkang_nt/codex/0521_fused_so2_moe_aggressive_20260521
+```
+
+Important subdirectories:
+
+```text
+prod_smoke_scalar_timestamp_20260521
+prod_smoke_tiled3_20260521
+prod_smoke_tiled4_20260521
+prod_smoke_tiled8_20260521
+prod_smoke_tiled8_radial_scatter_20260521
 ```
