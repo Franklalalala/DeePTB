@@ -1108,7 +1108,7 @@ def slem():
     doc_ffn_apply_to_last = "Whether to also attach the node-wise FFN to the final layer. Default: `False`."
     doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
-    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`. The 0425-stable branch defaults to `streamed_m_major_cueq`."
+    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. The 0425-stable branch defaults to `streamed_m_major_cueq`; `streamed_m_major_fused_p0` is an opt-in trainable prototype that treats Wigner/R as constants and falls back on unsupported shapes."
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
     doc_so2_m_linear_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."

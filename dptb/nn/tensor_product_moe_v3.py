@@ -200,6 +200,7 @@ def _normalize_so2_fusion_mode(so2_fusion_mode: str) -> str:
         "staged",
         "streamed_m_major_ref",
         "streamed_m_major_cueq",
+        "streamed_m_major_fused_p0",
     )
     if so2_fusion_mode not in allowed:
         raise ValueError(
@@ -1263,6 +1264,27 @@ class SO2_Linear(torch.nn.Module):
         if self.so2_fusion_mode == "streamed_m_major_ref":
             return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
         if self.so2_fusion_mode == "streamed_m_major_cueq":
+            return self._forward_streamed_m_major_grouped(
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+                route="streamed_m_major_cueq",
+            )
+        if self.so2_fusion_mode == "streamed_m_major_fused_p0":
+            from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
+
+            fused_result = try_forward_so2_moe_fused_p0(
+                self,
+                x,
+                R,
+                mole_globals,
+                latents,
+                wigner_D_all,
+            )
+            if fused_result is not None:
+                return fused_result
             return self._forward_streamed_m_major_grouped(
                 x,
                 R,
