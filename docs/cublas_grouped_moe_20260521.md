@@ -483,6 +483,52 @@ Current decision:
 - Keep stable production default on `mole_linear_mode="cublas_grouped"` / `streamed_m_major_cueq`; this branch's best experimental steady-state path remains `indexed_sandwich_multi`, not grouped pre/post.
 - The next real CUTLASS/CuTe step should be a custom grouped kernel whose accumulator epilogue directly performs raw complex finish and Wigner output scatter before writing to global memory. A post-GEMM epilogue kernel is useful for validating maps and semantics, but is still too late in the dataflow.
 
+## Direct custom A-loader / in-kernel epilogue bridge
+
+`DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_direct_warp` was added as a bridge between the best `indexed_sandwich_multi` semantics and the deeper P1 custom-loader dataflow. It runs through the normal `streamed_m_major_fused_p0` entry, but delegates the `m>0` part to the P1 warp-collective route/m kernel:
+
+- route/m grouped schedule is preserved;
+- `m=0` is forced to stay on the existing strong path, matching the production lesson from the m0 experiment;
+- the kernel reads original `x`, compact Wigner blocks, and SO2 maps directly, so it does not materialize `x_pair`;
+- raw complex finish and Wigner output scatter happen inside the same forward kernel, before any raw-output tensor is materialized;
+- backward remains the trainable segmented CUDA/cuBLAS path, matching the rest of fused P0.
+
+This mode is not a production recommendation. It exists to keep the pre-GEMM custom A-loader asset alive while making the remaining missing piece obvious: the raw-linear mainloop still needs cuBLAS/CUTLASS-level throughput.
+
+Correctness on Liyue, compact Wigner, FP32 and TF32 off:
+
+```text
+export DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_direct_warp
+export DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=warp_collective
+export DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N=16
+pytest dptb/tests/test_so2_moe_fused_p0.py -q -k "indexed_sandwich"
+
+5 passed, 14 deselected, 1 warning in 80.98s
+```
+
+Module train A/B:
+
+| Forward mode | N | fused train ms | max x-grad diff |
+| --- | ---: | ---: | ---: |
+| `indexed_sandwich_multi` | 4096 | 14.983 | 2.73e-12 |
+| `indexed_sandwich_multi_direct_warp` | 4096 | 18.233 | 3.64e-12 |
+| `indexed_sandwich_multi` | 16384 | 15.212 | 6.82e-13 |
+| `indexed_sandwich_multi_direct_warp` | 16384 | 18.337 | 6.82e-13 |
+
+Production smoke, Liyue L40S, bs=32, 25 iterations, FP32 and TF32 off:
+
+| Case | wall s | back-half s/iter | previous `indexed_sandwich_multi` | stable comparator |
+| --- | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_indexed_sandwich_multi_direct_warp` | 144.345 | 2.154 | 62.917 / 1.848 | `global_all_cublas` 54.750 / 2.043 |
+| `edge_top2_fused_p0_indexed_sandwich_multi_direct_warp` | 80.826 | 2.471 | 66.065 / 1.965 | `edge_top2_cublas` 57.089 / 2.134 |
+
+Negative-result analysis:
+
+- This run does not invalidate pre-GEMM fusion. It validates the opposite: the custom A-loader can preserve semantics and trainability, but it must feed a strong tiled GEMM/MMA mainloop.
+- The direct-warp kernel eliminates `x_pair` and raw-output tensors in forward, but it also replaces cuBLAS grouped raw GEMM with a warp-reduced SIMT loop. The mainloop loss is larger than the saved memory traffic.
+- The huge global wall time includes first-use P1 extension build/runtime warmup. The steady-state number is still the important comparison, and it is also slower than both stable cublas and `indexed_sandwich_multi`.
+- The useful asset to carry forward is the metadata contract and loader/epilogue semantics, not the SIMT dot loop. The next version should keep this A-loader and epilogue contract but attach it to a real CUTLASS/CuTe grouped mainloop.
+
 ## Artifacts
 
 Liyue run root:
@@ -529,6 +575,7 @@ prod_smoke_tiled8_m0_fused_20260521
 prod_smoke_indexed_sandwich_raw_epi_20260521
 prod_smoke_indexed_sandwich_multi_20260521
 prod_smoke_indexed_sandwich_multi_grouped_20260522
+prod_smoke_indexed_sandwich_multi_direct_warp_20260522
 prod_smoke_persistent_grouped_p1_20260521
 prod_smoke_persistent_grouped_p1_nom0_20260521
 prod_smoke_persistent_grouped_p1_warp_20260522

@@ -2723,6 +2723,24 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
         return None
     wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
 
+    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    if forward_mode in (
+        "indexed_sandwich_multi_direct_warp",
+        "route_m_direct_warp",
+        "custom_a_loader_epilogue",
+    ):
+        from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
+
+        return try_forward_so2_moe_persistent_grouped_p1(
+            module,
+            x,
+            R,
+            mole_globals,
+            latents,
+            wigner_D_all,
+            include_m0_override=False,
+        )
+
     weights = module.radial_emb(latents) if module.radial_emb else None
     out = torch.zeros((x.shape[0], module.irreps_out.dim), dtype=x.dtype, device=x.device)
 
@@ -2753,7 +2771,6 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
     else:
         out.add_(m0_contribution)
 
-    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
     if forward_mode in (
         "indexed_sandwich_multi",
         "cublas_multi_sandwich",

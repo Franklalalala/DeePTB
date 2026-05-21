@@ -651,6 +651,8 @@ def try_forward_so2_moe_persistent_grouped_p1(
     mole_globals: MOLEGlobals,
     latents=None,
     wigner_D_all=None,
+    *,
+    include_m0_override: Optional[bool] = None,
 ):
     """Return a fused persistent grouped SO2/MoE forward result or ``None``.
 
@@ -674,7 +676,11 @@ def try_forward_so2_moe_persistent_grouped_p1(
         return None
     wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
 
-    include_m0 = _flag("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", "1")
+    include_m0 = (
+        bool(include_m0_override)
+        if include_m0_override is not None
+        else _flag("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", "1")
+    )
 
     (
         m_values,
