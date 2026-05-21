@@ -55,6 +55,19 @@ torch::Tensor pack_pair_fp32_cuda(
     int64_t wigner_mode,
     int64_t wigner_stride);
 
+torch::Tensor pack_pairs_multi_fp32_cuda(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    std::vector<torch::Tensor> in_bases,
+    std::vector<torch::Tensor> in_ls,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cin_prefix,
+    torch::Tensor m_values,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
 torch::Tensor output_pair_grad_fp32_cuda(
     torch::Tensor grad_out,
     torch::Tensor wigner,
@@ -89,6 +102,37 @@ torch::Tensor scatter_raw_pair_forward_fp32_cuda(
     torch::Tensor compact_offsets,
     int64_t out_dim,
     int64_t m,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor scatter_raw_pairs_multi_forward_fp32_cuda(
+    std::vector<torch::Tensor> raws,
+    torch::Tensor wigner,
+    std::vector<torch::Tensor> out_bases,
+    std::vector<torch::Tensor> out_ls,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cout_prefix,
+    torch::Tensor m_values,
+    int64_t out_dim,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride);
+
+torch::Tensor scatter_raw_pairs_multi_output_major_forward_fp32_cuda(
+    std::vector<torch::Tensor> raws,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cout_prefix,
+    torch::Tensor m_values,
+    torch::Tensor entry_offsets,
+    torch::Tensor entry_m,
+    torch::Tensor entry_channel,
+    torch::Tensor entry_d,
+    torch::Tensor entry_l,
+    int64_t out_dim,
     bool rotate_out,
     int64_t wigner_mode,
     int64_t wigner_stride);
@@ -686,6 +730,41 @@ torch::Tensor pack_pair_fp32(
       m, rotate_in, wigner_mode, wigner_stride);
 }
 
+torch::Tensor pack_pairs_multi_fp32(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    std::vector<torch::Tensor> in_bases,
+    std::vector<torch::Tensor> in_ls,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cin_prefix,
+    torch::Tensor m_values,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  check_cuda_contiguous(x, "x");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  check_cuda_contiguous(cin_prefix, "cin_prefix");
+  check_cuda_contiguous(m_values, "m_values");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be fp32");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(cin_prefix.scalar_type() == torch::kInt64, "cin_prefix must be int64");
+  TORCH_CHECK(m_values.scalar_type() == torch::kInt64, "m_values must be int64");
+  TORCH_CHECK(cin_prefix.numel() == static_cast<int64_t>(in_bases.size()) + 1,
+              "cin_prefix must have m_count + 1 entries");
+  TORCH_CHECK(m_values.numel() == static_cast<int64_t>(in_bases.size()),
+              "m_values must have m_count entries");
+  if (rotate_in) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return pack_pairs_multi_fp32_cuda(
+      x, wigner, in_bases, in_ls, offsets, compact_offsets,
+      cin_prefix, m_values, rotate_in, wigner_mode, wigner_stride);
+}
+
 torch::Tensor output_pair_grad_fp32(
     torch::Tensor grad_out,
     torch::Tensor wigner,
@@ -789,6 +868,99 @@ torch::Tensor scatter_raw_pair_forward_fp32(
   return scatter_raw_pair_forward_fp32_cuda(
       raw, wigner, out_base, out_l, offsets, compact_offsets,
       out_dim, m, rotate_out, wigner_mode, wigner_stride);
+}
+
+torch::Tensor scatter_raw_pairs_multi_forward_fp32(
+    std::vector<torch::Tensor> raws,
+    torch::Tensor wigner,
+    std::vector<torch::Tensor> out_bases,
+    std::vector<torch::Tensor> out_ls,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cout_prefix,
+    torch::Tensor m_values,
+    int64_t out_dim,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  TORCH_CHECK(!raws.empty(), "raws must be non-empty");
+  TORCH_CHECK(raws.size() == out_bases.size() && raws.size() == out_ls.size(),
+              "raws/out_bases/out_ls length mismatch");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  check_cuda_contiguous(cout_prefix, "cout_prefix");
+  check_cuda_contiguous(m_values, "m_values");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(cout_prefix.scalar_type() == torch::kInt64, "cout_prefix must be int64");
+  TORCH_CHECK(m_values.scalar_type() == torch::kInt64, "m_values must be int64");
+  TORCH_CHECK(cout_prefix.numel() == static_cast<int64_t>(raws.size()) + 1,
+              "cout_prefix must have raw_count + 1 entries");
+  TORCH_CHECK(m_values.numel() == static_cast<int64_t>(raws.size()),
+              "m_values must have raw_count entries");
+  TORCH_CHECK(out_dim > 0, "out_dim must be positive");
+  if (rotate_out) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return scatter_raw_pairs_multi_forward_fp32_cuda(
+      raws, wigner, out_bases, out_ls, offsets, compact_offsets,
+      cout_prefix, m_values, out_dim, rotate_out, wigner_mode, wigner_stride);
+}
+
+torch::Tensor scatter_raw_pairs_multi_output_major_forward_fp32(
+    std::vector<torch::Tensor> raws,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cout_prefix,
+    torch::Tensor m_values,
+    torch::Tensor entry_offsets,
+    torch::Tensor entry_m,
+    torch::Tensor entry_channel,
+    torch::Tensor entry_d,
+    torch::Tensor entry_l,
+    int64_t out_dim,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  TORCH_CHECK(!raws.empty(), "raws must be non-empty");
+  check_cuda_contiguous(offsets, "offsets");
+  check_cuda_contiguous(compact_offsets, "compact_offsets");
+  check_cuda_contiguous(cout_prefix, "cout_prefix");
+  check_cuda_contiguous(m_values, "m_values");
+  check_cuda_contiguous(entry_offsets, "entry_offsets");
+  check_cuda_contiguous(entry_m, "entry_m");
+  check_cuda_contiguous(entry_channel, "entry_channel");
+  check_cuda_contiguous(entry_d, "entry_d");
+  check_cuda_contiguous(entry_l, "entry_l");
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt64, "offsets must be int64");
+  TORCH_CHECK(compact_offsets.scalar_type() == torch::kInt64, "compact_offsets must be int64");
+  TORCH_CHECK(cout_prefix.scalar_type() == torch::kInt64, "cout_prefix must be int64");
+  TORCH_CHECK(m_values.scalar_type() == torch::kInt64, "m_values must be int64");
+  TORCH_CHECK(entry_offsets.scalar_type() == torch::kInt64, "entry_offsets must be int64");
+  TORCH_CHECK(entry_m.scalar_type() == torch::kInt64, "entry_m must be int64");
+  TORCH_CHECK(entry_channel.scalar_type() == torch::kInt64, "entry_channel must be int64");
+  TORCH_CHECK(entry_d.scalar_type() == torch::kInt64, "entry_d must be int64");
+  TORCH_CHECK(entry_l.scalar_type() == torch::kInt64, "entry_l must be int64");
+  TORCH_CHECK(cout_prefix.numel() == static_cast<int64_t>(raws.size()) + 1,
+              "cout_prefix must have raw_count + 1 entries");
+  TORCH_CHECK(m_values.numel() == static_cast<int64_t>(raws.size()),
+              "m_values must have raw_count entries");
+  TORCH_CHECK(entry_offsets.numel() == out_dim + 1, "entry_offsets must be [out_dim + 1]");
+  TORCH_CHECK(entry_m.numel() == entry_channel.numel() &&
+              entry_m.numel() == entry_d.numel() &&
+              entry_m.numel() == entry_l.numel(),
+              "entry arrays must have the same length");
+  TORCH_CHECK(out_dim > 0, "out_dim must be positive");
+  if (rotate_out) {
+    check_cuda_contiguous(wigner, "wigner");
+    TORCH_CHECK(wigner.scalar_type() == torch::kFloat32, "wigner must be fp32");
+  }
+  return scatter_raw_pairs_multi_output_major_forward_fp32_cuda(
+      raws, wigner, offsets, compact_offsets, cout_prefix, m_values,
+      entry_offsets, entry_m, entry_channel, entry_d, entry_l,
+      out_dim, rotate_out, wigner_mode, wigner_stride);
 }
 
 torch::Tensor raw_pair_output_grad_fp32(
@@ -1058,9 +1230,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scatter_m0_grad_fp32", &scatter_m0_grad_fp32, "SO2 MoE fused P0 scatter m0 grad fp32");
   m.def("scatter_m0_grad_radial_input_fp32", &scatter_m0_grad_radial_input_fp32, "SO2 MoE fused P0 radial-input scatter m0 grad fp32");
   m.def("pack_pair_fp32", &pack_pair_fp32, "SO2 MoE fused P0 pack pair fp32");
+  m.def("pack_pairs_multi_fp32", &pack_pairs_multi_fp32, "SO2 MoE fused P0 grouped pack pair fp32");
   m.def("output_pair_grad_fp32", &output_pair_grad_fp32, "SO2 MoE fused P0 output pair grad fp32");
   m.def("scatter_pair_forward_fp32", &scatter_pair_forward_fp32, "SO2 MoE fused P0 scatter pair forward fp32");
   m.def("scatter_raw_pair_forward_fp32", &scatter_raw_pair_forward_fp32, "SO2 MoE fused P0 scatter raw pair forward fp32");
+  m.def("scatter_raw_pairs_multi_forward_fp32", &scatter_raw_pairs_multi_forward_fp32, "SO2 MoE fused P0 grouped raw pair epilogue forward fp32");
+  m.def("scatter_raw_pairs_multi_output_major_forward_fp32", &scatter_raw_pairs_multi_output_major_forward_fp32, "SO2 MoE fused P0 output-major grouped raw pair epilogue forward fp32");
   m.def("raw_pair_output_grad_fp32", &raw_pair_output_grad_fp32, "SO2 MoE fused P0 raw pair output grad fp32");
   m.def("scatter_pair_grad_fp32", &scatter_pair_grad_fp32, "SO2 MoE fused P0 scatter pair grad fp32");
   m.def("scatter_pair_grad_radial_input_fp32", &scatter_pair_grad_radial_input_fp32, "SO2 MoE fused P0 radial-input scatter pair grad fp32");

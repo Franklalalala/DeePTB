@@ -327,6 +327,33 @@ def _pack_pair_cuda(
         int(wigner_stride),
     )
 
+def _pack_pairs_multi_cuda(
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    in_bases: list[torch.Tensor],
+    in_ls: list[torch.Tensor],
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cin_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().pack_pairs_multi_fp32(
+        x.contiguous(),
+        wigner,
+        in_bases,
+        in_ls,
+        offsets,
+        compact_offsets,
+        cin_prefix,
+        m_values,
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
 
 def _pack_m0_torch(
     x: torch.Tensor,
@@ -603,6 +630,70 @@ def _scatter_raw_pair_forward_cuda(
         compact_offsets,
         int(out_dim),
         int(m),
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+def _scatter_raw_pairs_multi_forward_cuda(
+    raws: list[torch.Tensor],
+    wigner: torch.Tensor,
+    out_bases: list[torch.Tensor],
+    out_ls: list[torch.Tensor],
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cout_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    out_dim: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_raw_pairs_multi_forward_fp32(
+        [raw.contiguous() for raw in raws],
+        wigner,
+        out_bases,
+        out_ls,
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        int(out_dim),
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+def _scatter_raw_pairs_multi_output_major_forward_cuda(
+    raws: list[torch.Tensor],
+    wigner: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cout_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    entry_offsets: torch.Tensor,
+    entry_m: torch.Tensor,
+    entry_channel: torch.Tensor,
+    entry_d: torch.Tensor,
+    entry_l: torch.Tensor,
+    out_dim: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_raw_pairs_multi_output_major_forward_fp32(
+        [raw.contiguous() for raw in raws],
+        wigner,
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        entry_offsets,
+        entry_m,
+        entry_channel,
+        entry_d,
+        entry_l,
+        int(out_dim),
         bool(rotate_out),
         int(wigner_mode),
         int(wigner_stride),
@@ -1450,6 +1541,70 @@ class _PackPairFunction(torch.autograd.Function):
         return grad_x, None, None, None, None, None, None, None, None, None
 
 
+class _PackPairsMultiFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        wigner,
+        in_bases,
+        in_ls,
+        offsets,
+        compact_offsets,
+        cin_prefix,
+        m_values,
+        rotate_in: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        packed = _pack_pairs_multi_cuda(
+            x,
+            wigner,
+            in_bases,
+            in_ls,
+            offsets,
+            compact_offsets,
+            cin_prefix,
+            m_values,
+            bool(rotate_in),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.in_count = len(in_bases)
+        ctx.save_for_backward(wigner, offsets, compact_offsets, cin_prefix, m_values, *in_bases, *in_ls)
+        ctx.meta = (int(x.shape[1]), bool(rotate_in), int(wigner_mode), int(wigner_stride))
+        return packed
+
+    @staticmethod
+    def backward(ctx, grad_packed):
+        tensors = ctx.saved_tensors
+        wigner, offsets, compact_offsets, cin_prefix, m_values = tensors[:5]
+        n = ctx.in_count
+        in_bases = tensors[5:5 + n]
+        in_ls = tensors[5 + n:5 + 2 * n]
+        in_dim, rotate_in, wigner_mode, wigner_stride = ctx.meta
+        grad_x = None
+        for i in range(n):
+            start = int(cin_prefix[i].item())
+            end = int(cin_prefix[i + 1].item())
+            grad_pair = grad_packed[:, :, start:end].contiguous()
+            part = _scatter_pair_grad_cuda(
+                grad_pair,
+                wigner,
+                in_bases[i],
+                in_ls[i],
+                offsets,
+                compact_offsets,
+                int(in_dim),
+                int(m_values[i].item()),
+                bool(rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            )
+            grad_x = part if grad_x is None else grad_x + part
+        return grad_x, None, None, None, None, None, None, None, None, None, None
+
+
 class _ScatterPairOutputFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1564,6 +1719,177 @@ class _ScatterRawPairOutputFunction(torch.autograd.Function):
             int(wigner_stride),
         )
         return grad_raw, None, None, None, None, None, None, None, None, None, None
+
+
+class _ScatterRawPairsMultiOutputFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        wigner,
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        out_dim: int,
+        rotate_out: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+        raw_count: int,
+        *raws_and_maps,
+    ):
+        raw_count = int(raw_count)
+        raws = list(raws_and_maps[:raw_count])
+        out_bases = list(raws_and_maps[raw_count:2 * raw_count])
+        out_ls = list(raws_and_maps[2 * raw_count:3 * raw_count])
+        out = _scatter_raw_pairs_multi_forward_cuda(
+            raws,
+            wigner,
+            out_bases,
+            out_ls,
+            offsets,
+            compact_offsets,
+            cout_prefix,
+            m_values,
+            int(out_dim),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.raw_count = raw_count
+        ctx.save_for_backward(wigner, offsets, compact_offsets, cout_prefix, m_values, *out_bases, *out_ls)
+        ctx.meta = (int(out_dim), bool(rotate_out), int(wigner_mode), int(wigner_stride))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        tensors = ctx.saved_tensors
+        wigner, offsets, compact_offsets, cout_prefix, m_values = tensors[:5]
+        n = ctx.raw_count
+        out_bases = tensors[5:5 + n]
+        out_ls = tensors[5 + n:5 + 2 * n]
+        _out_dim, rotate_out, wigner_mode, wigner_stride = ctx.meta
+        grad_raws = []
+        for i in range(n):
+            grad_raws.append(
+                _raw_pair_output_grad_cuda(
+                    grad_out.contiguous(),
+                    wigner,
+                    out_bases[i],
+                    out_ls[i],
+                    offsets,
+                    compact_offsets,
+                    int(m_values[i].item()),
+                    bool(rotate_out),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
+            )
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            *grad_raws,
+            *([None] * (2 * n)),
+        )
+
+
+class _ScatterRawPairsMultiOutputMajorFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        wigner,
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values,
+        entry_offsets,
+        entry_m,
+        entry_channel,
+        entry_d,
+        entry_l,
+        out_dim: int,
+        rotate_out: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+        raw_count: int,
+        *raws_and_maps,
+    ):
+        raw_count = int(raw_count)
+        raws = list(raws_and_maps[:raw_count])
+        out_bases = list(raws_and_maps[raw_count:2 * raw_count])
+        out_ls = list(raws_and_maps[2 * raw_count:3 * raw_count])
+        out = _scatter_raw_pairs_multi_output_major_forward_cuda(
+            raws,
+            wigner,
+            offsets,
+            compact_offsets,
+            cout_prefix,
+            m_values,
+            entry_offsets,
+            entry_m,
+            entry_channel,
+            entry_d,
+            entry_l,
+            int(out_dim),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.raw_count = raw_count
+        ctx.save_for_backward(wigner, offsets, compact_offsets, cout_prefix, m_values, *out_bases, *out_ls)
+        ctx.meta = (int(out_dim), bool(rotate_out), int(wigner_mode), int(wigner_stride))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        tensors = ctx.saved_tensors
+        wigner, offsets, compact_offsets, _cout_prefix, m_values = tensors[:5]
+        n = ctx.raw_count
+        out_bases = tensors[5:5 + n]
+        out_ls = tensors[5 + n:5 + 2 * n]
+        _out_dim, rotate_out, wigner_mode, wigner_stride = ctx.meta
+        grad_raws = []
+        for i in range(n):
+            grad_raws.append(
+                _raw_pair_output_grad_cuda(
+                    grad_out.contiguous(),
+                    wigner,
+                    out_bases[i],
+                    out_ls[i],
+                    offsets,
+                    compact_offsets,
+                    int(m_values[i].item()),
+                    bool(rotate_out),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
+            )
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            *grad_raws,
+            *([None] * (2 * n)),
+        )
 
 
 class _FusedPairFunction(torch.autograd.Function):
@@ -1863,6 +2189,58 @@ def _fused_pair_indexed_sandwich(
     )
 
 
+def _multi_output_entry_map(
+    module,
+    m_values_host: list[int],
+    out_bases: list[torch.Tensor],
+    out_ls: list[torch.Tensor],
+    out_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache = getattr(module, "_fused_p0_multi_output_entry_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(module, "_fused_p0_multi_output_entry_cache", cache)
+    key = (tuple(int(v) for v in m_values_host), int(out_dim), str(device))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    per_feature: list[list[tuple[int, int, int, int]]] = [[] for _ in range(int(out_dim))]
+    for m_idx, (_m, base_t, l_t) in enumerate(zip(m_values_host, out_bases, out_ls)):
+        base_values = [int(v) for v in base_t.detach().cpu().tolist()]
+        l_values = [int(v) for v in l_t.detach().cpu().tolist()]
+        for channel, (base, l_value) in enumerate(zip(base_values, l_values)):
+            dim = 2 * l_value + 1
+            for d in range(dim):
+                feature = base + d
+                if 0 <= feature < int(out_dim):
+                    per_feature[feature].append((m_idx, channel, d, l_value))
+
+    entry_offsets = [0]
+    entry_m = []
+    entry_channel = []
+    entry_d = []
+    entry_l = []
+    for entries in per_feature:
+        for m_idx, channel, d, l_value in entries:
+            entry_m.append(m_idx)
+            entry_channel.append(channel)
+            entry_d.append(d)
+            entry_l.append(l_value)
+        entry_offsets.append(len(entry_m))
+
+    cached = (
+        torch.tensor(entry_offsets, dtype=torch.long, device=device).contiguous(),
+        torch.tensor(entry_m, dtype=torch.long, device=device).contiguous(),
+        torch.tensor(entry_channel, dtype=torch.long, device=device).contiguous(),
+        torch.tensor(entry_d, dtype=torch.long, device=device).contiguous(),
+        torch.tensor(entry_l, dtype=torch.long, device=device).contiguous(),
+    )
+    cache[key] = cached
+    return cached
+
+
 def _fused_pairs_indexed_sandwich_multi(
     module,
     x: torch.Tensor,
@@ -1882,10 +2260,21 @@ def _fused_pairs_indexed_sandwich_multi(
             f"MOLE graph_index has {graph_index.numel()} rows, but fused multi-m input has {x.shape[0]} rows."
         )
 
+    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    use_native_multi = forward_mode in ("indexed_sandwich_multi_grouped", "cublas_multi_sandwich_grouped")
+    use_grouped_pack = use_native_multi or _flag("DPTB_SO2_MOE_FUSED_P0_MULTI_PACK", "0")
+    use_grouped_epilogue = use_native_multi or _flag("DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE", "0")
     pair_inputs = []
     mixed_weights = []
     post_radials = []
     maps = []
+    in_bases = []
+    in_ls = []
+    cin_values = []
+    m_values_host = []
+    out_bases = []
+    out_ls = []
+    cout_values = []
     route_count = None
 
     for m in range(1, module.m_max + 1):
@@ -1918,19 +2307,6 @@ def _fused_pairs_indexed_sandwich_multi(
             )
             return None
 
-        pair = _PackPairFunction.apply(
-            x.contiguous(),
-            wigner,
-            in_base,
-            in_l,
-            offsets,
-            compact_offsets,
-            int(m),
-            bool(module.rotate_in),
-            int(wigner_mode),
-            int(wigner_stride),
-        )
-
         radial = None
         if weights is not None:
             radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous()
@@ -1943,7 +2319,6 @@ def _fused_pairs_indexed_sandwich_multi(
                 )
                 return None
 
-        pair_for_linear = pair * radial if radial is not None and bool(module.front) else pair
         mixed_weight, mixed_bias = fc._mix_expert_parameters(mole_globals)
         if mixed_bias is not None:
             _warn_once(
@@ -1966,13 +2341,60 @@ def _fused_pairs_indexed_sandwich_multi(
             )
             return None
 
-        pair_inputs.append(pair_for_linear)
+        in_bases.append(in_base)
+        in_ls.append(in_l)
+        cin_values.append(cin)
+        m_values_host.append(int(m))
+        out_bases.append(out_base)
+        out_ls.append(out_l)
+        cout_values.append(cout)
+        pair_inputs.append(None)
         mixed_weights.append(mixed_weight.contiguous())
         post_radials.append(None if radial is None or bool(module.front) else radial)
         maps.append((m, out_base, out_l, offsets))
 
     if not pair_inputs:
         return []
+
+    if use_grouped_pack:
+        cin_prefix = [0]
+        for cin in cin_values:
+            cin_prefix.append(cin_prefix[-1] + int(cin))
+        cin_prefix_t = torch.tensor(cin_prefix, dtype=torch.long, device=x.device).contiguous()
+        m_values_t = torch.tensor(m_values_host, dtype=torch.long, device=x.device).contiguous()
+        packed_all = _PackPairsMultiFunction.apply(
+            x.contiguous(),
+            wigner,
+            in_bases,
+            in_ls,
+            offsets,
+            compact_offsets,
+            cin_prefix_t,
+            m_values_t,
+            bool(module.rotate_in),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        for i, (m, cin) in enumerate(zip(m_values_host, cin_values)):
+            pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
+            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous() if weights is not None else None
+            pair_inputs[i] = pair * radial if radial is not None and bool(module.front) else pair
+    else:
+        for i, m in enumerate(m_values_host):
+            pair = _PackPairFunction.apply(
+                x.contiguous(),
+                wigner,
+                in_bases[i],
+                in_ls[i],
+                offsets,
+                compact_offsets,
+                int(m),
+                bool(module.rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            )
+            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous() if weights is not None else None
+            pair_inputs[i] = pair * radial if radial is not None and bool(module.front) else pair
 
     permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, pair_inputs[0])
     ptr = mole_globals.indexed_segment_ptr(sorted_graph_index, int(route_count), prefer_cpu=True)
@@ -1987,6 +2409,72 @@ def _fused_pairs_indexed_sandwich_multi(
     from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
 
     flat_raw_outputs = grouped_gemm_multi(flat_inputs, [ptr] * len(flat_inputs), mixed_weights)
+
+    if use_grouped_epilogue and all(post_radial is None for post_radial in post_radials):
+        raw_tensors = []
+        for flat_raw in flat_raw_outputs:
+            if unpermute_idx is not None:
+                flat_raw = flat_raw.index_select(0, unpermute_idx)
+            raw_tensors.append(flat_raw.reshape(x.shape[0], 2, -1).contiguous())
+        cout_prefix = [0]
+        for cout in cout_values:
+            cout_prefix.append(cout_prefix[-1] + int(cout))
+        cout_prefix_t = torch.tensor(cout_prefix, dtype=torch.long, device=x.device).contiguous()
+        m_values_t = torch.tensor(m_values_host, dtype=torch.long, device=x.device).contiguous()
+        epilogue_schedule = os.environ.get("DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE_SCHEDULE", "output_major")
+        if epilogue_schedule == "output_major":
+            entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
+                module,
+                m_values_host,
+                out_bases,
+                out_ls,
+                int(module.irreps_out.dim),
+                x.device,
+            )
+            return [
+                _ScatterRawPairsMultiOutputMajorFunction.apply(
+                    wigner,
+                    offsets,
+                    compact_offsets,
+                    cout_prefix_t,
+                    m_values_t,
+                    entry_offsets,
+                    entry_m,
+                    entry_channel,
+                    entry_d,
+                    entry_l,
+                    int(module.irreps_out.dim),
+                    bool(module.rotate_out),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                    len(raw_tensors),
+                    *raw_tensors,
+                    *out_bases,
+                    *out_ls,
+                )
+            ]
+        if epilogue_schedule != "atomic":
+            _warn_once(
+                "indexed_sandwich_multi_epilogue_schedule_fallback",
+                f"Unknown grouped epilogue schedule {epilogue_schedule!r}; using atomic scatter.",
+            )
+        return [
+            _ScatterRawPairsMultiOutputFunction.apply(
+                wigner,
+                offsets,
+                compact_offsets,
+                cout_prefix_t,
+                m_values_t,
+                int(module.irreps_out.dim),
+                bool(module.rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+                len(raw_tensors),
+                *raw_tensors,
+                *out_bases,
+                *out_ls,
+            )
+        ]
 
     contributions = []
     for flat_raw, pair, post_radial, (m, out_base, out_l, offsets) in zip(
@@ -2266,7 +2754,13 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
         out.add_(m0_contribution)
 
     forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
-    if forward_mode in ("indexed_sandwich_multi", "cublas_multi_sandwich", "route_m_sandwich"):
+    if forward_mode in (
+        "indexed_sandwich_multi",
+        "cublas_multi_sandwich",
+        "route_m_sandwich",
+        "indexed_sandwich_multi_grouped",
+        "cublas_multi_sandwich_grouped",
+    ):
         contributions = _fused_pairs_indexed_sandwich_multi(
             module,
             x,

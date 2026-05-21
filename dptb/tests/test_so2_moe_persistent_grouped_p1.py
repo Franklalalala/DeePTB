@@ -50,7 +50,7 @@ def test_direct_persistent_grouped_p1_m0_m1_identity_wigner():
     empty_float = torch.empty(0, device=device, dtype=dtype)
     empty_long = torch.empty(0, device=device, dtype=torch.long)
 
-    out = _load_extension().persistent_grouped_forward_fp32(
+    args = (
         x,
         empty_float,  # wigner_mode=0 identity
         edge_order,
@@ -82,6 +82,8 @@ def test_direct_persistent_grouped_p1_m0_m1_identity_wigner():
         1,
         0,
     )
+    out = _load_extension().persistent_grouped_forward_fp32(*args)
+    out_warp = _load_extension().persistent_grouped_forward_warp_fp32(*args)
 
     ref = torch.zeros_like(out)
     for e in range(n_edges):
@@ -95,6 +97,7 @@ def test_direct_persistent_grouped_p1_m0_m1_identity_wigner():
         ref[e, 1 + 2] += x1 * wr + x0 * wi + b_m1[r, 1]
 
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out_warp, ref, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("include_m0", ["0", "1"])
@@ -103,6 +106,7 @@ def test_persistent_grouped_p1_train_matches_streamed_ref(monkeypatch, include_m
     torch.manual_seed(20260527)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", include_m0)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE", "cuda_cublas_segmented")
+    monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
 
     from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear

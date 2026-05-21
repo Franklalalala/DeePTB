@@ -535,6 +535,7 @@ def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeyp
     [
         ("cublas_grouped", "indexed_sandwich"),
         ("cublas_grouped", "indexed_sandwich_multi"),
+        ("cublas_grouped", "indexed_sandwich_multi_grouped"),
         ("cueq_indexed_linear", "cueq_sandwich"),
     ],
 )

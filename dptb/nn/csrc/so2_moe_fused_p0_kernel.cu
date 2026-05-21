@@ -477,6 +477,50 @@ __global__ void pack_pair_kernel(
       edge, channel, in_dim, dense_stride, wigner_stride, wigner_mode, m, 1, rotate_in);
 }
 
+__global__ void pack_pairs_multi_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wigner,
+    const int64_t* const* __restrict__ in_base_ptrs,
+    const int64_t* const* __restrict__ in_l_ptrs,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    const int64_t* __restrict__ cin_prefix,
+    const int64_t* __restrict__ m_values,
+    float* __restrict__ pair_flat,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t n_m,
+    int64_t total_cin,
+    int wigner_mode,
+    bool rotate_in) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * total_cin;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / total_cin;
+  const int64_t local = idx - edge * total_cin;
+
+  int64_t m_idx = 0;
+  while (m_idx + 1 < n_m && local >= cin_prefix[m_idx + 1]) {
+    ++m_idx;
+  }
+  const int64_t cin = cin_prefix[m_idx + 1] - cin_prefix[m_idx];
+  const int64_t channel = local - cin_prefix[m_idx];
+  const int m = static_cast<int>(m_values[m_idx]);
+  const int64_t* __restrict__ in_base = in_base_ptrs[m_idx];
+  const int64_t* __restrict__ in_l = in_l_ptrs[m_idx];
+
+  pair_flat[(edge * 2) * total_cin + local] = load_pair_value(
+      x, wigner, in_base, in_l, offsets, compact_offsets,
+      edge, channel, in_dim, dense_stride, wigner_stride, wigner_mode, m, 0, rotate_in);
+  pair_flat[(edge * 2 + 1) * total_cin + local] = load_pair_value(
+      x, wigner, in_base, in_l, offsets, compact_offsets,
+      edge, channel, in_dim, dense_stride, wigner_stride, wigner_mode, m, 1, rotate_in);
+}
+
 __global__ void output_pair_grad_kernel(
     const float* __restrict__ grad_out,
     const float* __restrict__ wigner,
@@ -561,8 +605,8 @@ __global__ void scatter_pair_forward_kernel(
   float* __restrict__ out_edge = out + edge * out_dim;
 
   if (!rotate_out) {
-    out_edge[base + row0] += y0;
-    out_edge[base + row1] += y1;
+    atomicAdd(out_edge + base + row0, y0);
+    atomicAdd(out_edge + base + row1, y1);
     return;
   }
 
@@ -574,7 +618,7 @@ __global__ void scatter_pair_forward_kernel(
     const float d1 = load_wigner_value(
         wigner, offsets, compact_offsets,
         edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
-    out_edge[base + d] += y0 * d0 + y1 * d1;
+    atomicAdd(out_edge + base + d, y0 * d0 + y1 * d1);
   }
 }
 
@@ -631,6 +675,145 @@ __global__ void scatter_raw_pair_forward_kernel(
         edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
     out_edge[base + d] += y0 * d0 + y1 * d1;
   }
+}
+
+__global__ void scatter_raw_pairs_multi_forward_kernel(
+    const float* const* __restrict__ raw_ptrs,
+    const int64_t* const* __restrict__ out_base_ptrs,
+    const int64_t* const* __restrict__ out_l_ptrs,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    const int64_t* __restrict__ cout_prefix,
+    const int64_t* __restrict__ m_values,
+    float* __restrict__ out,
+    int64_t n_edges,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t n_m,
+    int64_t total_cout,
+    int wigner_mode,
+    bool rotate_out) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * total_cout;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / total_cout;
+  const int64_t local = idx - edge * total_cout;
+
+  int64_t m_idx = 0;
+  while (m_idx + 1 < n_m && local >= cout_prefix[m_idx + 1]) {
+    ++m_idx;
+  }
+  const int64_t cout = cout_prefix[m_idx + 1] - cout_prefix[m_idx];
+  const int64_t channel = local - cout_prefix[m_idx];
+  const int m = static_cast<int>(m_values[m_idx]);
+  const float* __restrict__ raw = raw_ptrs[m_idx];
+  const int64_t* __restrict__ out_base = out_base_ptrs[m_idx];
+  const int64_t* __restrict__ out_l = out_l_ptrs[m_idx];
+
+  const int64_t out2 = 2 * cout;
+  const float rr0 = raw[(edge * 2) * out2 + channel];
+  const float ii0 = raw[(edge * 2) * out2 + cout + channel];
+  const float rr1 = raw[(edge * 2 + 1) * out2 + channel];
+  const float ii1 = raw[(edge * 2 + 1) * out2 + cout + channel];
+  const float y0 = rr0 - ii1;
+  const float y1 = rr1 + ii0;
+
+  const int l = static_cast<int>(out_l[channel]);
+  const int row0 = l - m;
+  const int row1 = l + m;
+  const int64_t base = out_base[channel];
+  float* __restrict__ out_edge = out + edge * out_dim;
+
+  if (!rotate_out) {
+    out_edge[base + row0] += y0;
+    out_edge[base + row1] += y1;
+    return;
+  }
+
+  const int dim = 2 * l + 1;
+  for (int d = 0; d < dim; ++d) {
+    const float d0 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row0, dense_stride, wigner_stride, wigner_mode);
+    const float d1 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
+    out_edge[base + d] += y0 * d0 + y1 * d1;
+  }
+}
+
+__global__ void scatter_raw_pairs_multi_output_major_forward_kernel(
+    const float* const* __restrict__ raw_ptrs,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    const int64_t* __restrict__ cout_prefix,
+    const int64_t* __restrict__ m_values,
+    const int64_t* __restrict__ entry_offsets,
+    const int64_t* __restrict__ entry_m,
+    const int64_t* __restrict__ entry_channel,
+    const int64_t* __restrict__ entry_d,
+    const int64_t* __restrict__ entry_l,
+    float* __restrict__ out,
+    int64_t n_edges,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int wigner_mode,
+    bool rotate_out) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * out_dim;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / out_dim;
+  const int64_t feature = idx - edge * out_dim;
+
+  float acc = 0.0f;
+  const int64_t begin = entry_offsets[feature];
+  const int64_t end = entry_offsets[feature + 1];
+  for (int64_t ei = begin; ei < end; ++ei) {
+    const int64_t m_idx = entry_m[ei];
+    const int64_t channel = entry_channel[ei];
+    const int d = static_cast<int>(entry_d[ei]);
+    const int l = static_cast<int>(entry_l[ei]);
+    const int m = static_cast<int>(m_values[m_idx]);
+    const int64_t cout = cout_prefix[m_idx + 1] - cout_prefix[m_idx];
+    const int64_t out2 = 2 * cout;
+    const float* __restrict__ raw = raw_ptrs[m_idx];
+
+    const float rr0 = raw[(edge * 2) * out2 + channel];
+    const float ii0 = raw[(edge * 2) * out2 + cout + channel];
+    const float rr1 = raw[(edge * 2 + 1) * out2 + channel];
+    const float ii1 = raw[(edge * 2 + 1) * out2 + cout + channel];
+    const float y0 = rr0 - ii1;
+    const float y1 = rr1 + ii0;
+    const int row0 = l - m;
+    const int row1 = l + m;
+
+    if (!rotate_out) {
+      if (d == row0) {
+        acc += y0;
+      }
+      if (d == row1) {
+        acc += y1;
+      }
+      continue;
+    }
+
+    const float d0 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row0, dense_stride, wigner_stride, wigner_mode);
+    const float d1 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
+    acc += y0 * d0 + y1 * d1;
+  }
+  out[idx] = acc;
 }
 
 __global__ void raw_pair_output_grad_kernel(
@@ -1830,6 +2013,76 @@ torch::Tensor pack_pair_fp32_cuda(
   return pair;
 }
 
+torch::Tensor pack_pairs_multi_fp32_cuda(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    std::vector<torch::Tensor> in_bases,
+    std::vector<torch::Tensor> in_ls,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cin_prefix,
+    torch::Tensor m_values,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_m = static_cast<int64_t>(in_bases.size());
+  TORCH_CHECK(n_m > 0, "in_bases must be non-empty");
+  TORCH_CHECK(static_cast<int64_t>(in_ls.size()) == n_m, "in_ls length mismatch");
+  const int64_t n_edges = x.size(0);
+  const int64_t in_dim = x.size(1);
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  const int64_t total_cin = cin_prefix[cin_prefix.numel() - 1].item<int64_t>();
+  auto pair_flat = torch::empty({n_edges, 2, total_cin}, x.options());
+  if (n_edges == 0 || total_cin == 0) {
+    return pair_flat;
+  }
+
+  std::vector<int64_t> in_base_ptr_host;
+  std::vector<int64_t> in_l_ptr_host;
+  in_base_ptr_host.reserve(n_m);
+  in_l_ptr_host.reserve(n_m);
+  for (int64_t i = 0; i < n_m; ++i) {
+    TORCH_CHECK(in_bases[i].is_cuda() && in_bases[i].is_contiguous(), "in_base tensors must be contiguous CUDA");
+    TORCH_CHECK(in_ls[i].is_cuda() && in_ls[i].is_contiguous(), "in_l tensors must be contiguous CUDA");
+    TORCH_CHECK(in_bases[i].scalar_type() == torch::kInt64, "in_base tensors must be int64");
+    TORCH_CHECK(in_ls[i].scalar_type() == torch::kInt64, "in_l tensors must be int64");
+    TORCH_CHECK(in_bases[i].numel() == in_ls[i].numel(), "in_base/in_l shape mismatch");
+    in_base_ptr_host.push_back(reinterpret_cast<int64_t>(in_bases[i].data_ptr<int64_t>()));
+    in_l_ptr_host.push_back(reinterpret_cast<int64_t>(in_ls[i].data_ptr<int64_t>()));
+  }
+
+  auto ptr_options = x.options().dtype(torch::kInt64);
+  auto in_base_ptrs = torch::empty({n_m}, ptr_options);
+  auto in_l_ptrs = torch::empty({n_m}, ptr_options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaMemcpyAsync(in_base_ptrs.data_ptr<int64_t>(), in_base_ptr_host.data(), n_m * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(in_l_ptrs.data_ptr<int64_t>(), in_l_ptr_host.data(), n_m * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+
+  const int threads = 256;
+  const int64_t total = n_edges * total_cin;
+  const dim3 grid((total + threads - 1) / threads);
+  pack_pairs_multi_kernel<<<grid, threads, 0, stream>>>(
+      x.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      reinterpret_cast<const int64_t* const*>(in_base_ptrs.data_ptr<int64_t>()),
+      reinterpret_cast<const int64_t* const*>(in_l_ptrs.data_ptr<int64_t>()),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      cin_prefix.data_ptr<int64_t>(),
+      m_values.data_ptr<int64_t>(),
+      pair_flat.data_ptr<float>(),
+      n_edges,
+      in_dim,
+      dense_stride,
+      wigner_stride,
+      n_m,
+      total_cin,
+      static_cast<int>(wigner_mode),
+      rotate_in);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return pair_flat;
+}
+
 torch::Tensor output_pair_grad_fp32_cuda(
     torch::Tensor grad_out,
     torch::Tensor wigner,
@@ -1956,6 +2209,154 @@ torch::Tensor scatter_raw_pair_forward_fp32_cuda(
       wigner_stride,
       cout,
       static_cast<int>(m),
+      static_cast<int>(wigner_mode),
+      rotate_out);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor scatter_raw_pairs_multi_forward_fp32_cuda(
+    std::vector<torch::Tensor> raws,
+    torch::Tensor wigner,
+    std::vector<torch::Tensor> out_bases,
+    std::vector<torch::Tensor> out_ls,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cout_prefix,
+    torch::Tensor m_values,
+    int64_t out_dim,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_m = static_cast<int64_t>(raws.size());
+  TORCH_CHECK(n_m > 0, "raws must be non-empty");
+  TORCH_CHECK(static_cast<int64_t>(out_bases.size()) == n_m, "out_bases length mismatch");
+  TORCH_CHECK(static_cast<int64_t>(out_ls.size()) == n_m, "out_ls length mismatch");
+  const int64_t n_edges = raws[0].size(0);
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  const int64_t total_cout = cout_prefix[cout_prefix.numel() - 1].item<int64_t>();
+  auto out = torch::zeros({n_edges, out_dim}, raws[0].options());
+  if (n_edges == 0 || total_cout == 0) {
+    return out;
+  }
+
+  std::vector<int64_t> raw_ptr_host;
+  std::vector<int64_t> out_base_ptr_host;
+  std::vector<int64_t> out_l_ptr_host;
+  raw_ptr_host.reserve(n_m);
+  out_base_ptr_host.reserve(n_m);
+  out_l_ptr_host.reserve(n_m);
+  for (int64_t i = 0; i < n_m; ++i) {
+    const int64_t cout = out_bases[i].numel();
+    TORCH_CHECK(raws[i].is_cuda() && raws[i].is_contiguous(), "raw tensors must be contiguous CUDA");
+    TORCH_CHECK(out_bases[i].is_cuda() && out_bases[i].is_contiguous(), "out_base tensors must be contiguous CUDA");
+    TORCH_CHECK(out_ls[i].is_cuda() && out_ls[i].is_contiguous(), "out_l tensors must be contiguous CUDA");
+    TORCH_CHECK(raws[i].scalar_type() == torch::kFloat32, "raw tensors must be fp32");
+    TORCH_CHECK(out_bases[i].scalar_type() == torch::kInt64, "out_base tensors must be int64");
+    TORCH_CHECK(out_ls[i].scalar_type() == torch::kInt64, "out_l tensors must be int64");
+    TORCH_CHECK(raws[i].dim() == 3 && raws[i].size(0) == n_edges && raws[i].size(1) == 2 && raws[i].size(2) == 2 * cout,
+                "raw tensor shape must be [N, 2, 2*Cout]");
+    TORCH_CHECK(out_ls[i].numel() == cout, "out_l/out_base shape mismatch");
+    raw_ptr_host.push_back(reinterpret_cast<int64_t>(raws[i].data_ptr<float>()));
+    out_base_ptr_host.push_back(reinterpret_cast<int64_t>(out_bases[i].data_ptr<int64_t>()));
+    out_l_ptr_host.push_back(reinterpret_cast<int64_t>(out_ls[i].data_ptr<int64_t>()));
+  }
+
+  auto ptr_options = raws[0].options().dtype(torch::kInt64);
+  auto raw_ptrs = torch::empty({n_m}, ptr_options);
+  auto out_base_ptrs = torch::empty({n_m}, ptr_options);
+  auto out_l_ptrs = torch::empty({n_m}, ptr_options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaMemcpyAsync(raw_ptrs.data_ptr<int64_t>(), raw_ptr_host.data(), n_m * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(out_base_ptrs.data_ptr<int64_t>(), out_base_ptr_host.data(), n_m * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(out_l_ptrs.data_ptr<int64_t>(), out_l_ptr_host.data(), n_m * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+
+  const int threads = 256;
+  const int64_t total = n_edges * total_cout;
+  const dim3 grid((total + threads - 1) / threads);
+  scatter_raw_pairs_multi_forward_kernel<<<grid, threads, 0, stream>>>(
+      reinterpret_cast<const float* const*>(raw_ptrs.data_ptr<int64_t>()),
+      reinterpret_cast<const int64_t* const*>(out_base_ptrs.data_ptr<int64_t>()),
+      reinterpret_cast<const int64_t* const*>(out_l_ptrs.data_ptr<int64_t>()),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      cout_prefix.data_ptr<int64_t>(),
+      m_values.data_ptr<int64_t>(),
+      out.data_ptr<float>(),
+      n_edges,
+      out_dim,
+      dense_stride,
+      wigner_stride,
+      n_m,
+      total_cout,
+      static_cast<int>(wigner_mode),
+      rotate_out);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor scatter_raw_pairs_multi_output_major_forward_fp32_cuda(
+    std::vector<torch::Tensor> raws,
+    torch::Tensor wigner,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cout_prefix,
+    torch::Tensor m_values,
+    torch::Tensor entry_offsets,
+    torch::Tensor entry_m,
+    torch::Tensor entry_channel,
+    torch::Tensor entry_d,
+    torch::Tensor entry_l,
+    int64_t out_dim,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_m = static_cast<int64_t>(raws.size());
+  TORCH_CHECK(n_m > 0, "raws must be non-empty");
+  const int64_t n_edges = raws[0].size(0);
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto out = torch::empty({n_edges, out_dim}, raws[0].options());
+  if (n_edges == 0 || out_dim == 0) {
+    return out;
+  }
+
+  std::vector<int64_t> raw_ptr_host;
+  raw_ptr_host.reserve(n_m);
+  for (int64_t i = 0; i < n_m; ++i) {
+    const int64_t cout = cout_prefix[i + 1].item<int64_t>() - cout_prefix[i].item<int64_t>();
+    TORCH_CHECK(raws[i].is_cuda() && raws[i].is_contiguous(), "raw tensors must be contiguous CUDA");
+    TORCH_CHECK(raws[i].scalar_type() == torch::kFloat32, "raw tensors must be fp32");
+    TORCH_CHECK(raws[i].dim() == 3 && raws[i].size(0) == n_edges && raws[i].size(1) == 2 && raws[i].size(2) == 2 * cout,
+                "raw tensor shape must be [N, 2, 2*Cout]");
+    raw_ptr_host.push_back(reinterpret_cast<int64_t>(raws[i].data_ptr<float>()));
+  }
+
+  auto ptr_options = raws[0].options().dtype(torch::kInt64);
+  auto raw_ptrs = torch::empty({n_m}, ptr_options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaMemcpyAsync(raw_ptrs.data_ptr<int64_t>(), raw_ptr_host.data(), n_m * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+
+  const int threads = 256;
+  const int64_t total = n_edges * out_dim;
+  const dim3 grid((total + threads - 1) / threads);
+  scatter_raw_pairs_multi_output_major_forward_kernel<<<grid, threads, 0, stream>>>(
+      reinterpret_cast<const float* const*>(raw_ptrs.data_ptr<int64_t>()),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      cout_prefix.data_ptr<int64_t>(),
+      m_values.data_ptr<int64_t>(),
+      entry_offsets.data_ptr<int64_t>(),
+      entry_m.data_ptr<int64_t>(),
+      entry_channel.data_ptr<int64_t>(),
+      entry_d.data_ptr<int64_t>(),
+      entry_l.data_ptr<int64_t>(),
+      out.data_ptr<float>(),
+      n_edges,
+      out_dim,
+      dense_stride,
+      wigner_stride,
       static_cast<int>(wigner_mode),
       rotate_out);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

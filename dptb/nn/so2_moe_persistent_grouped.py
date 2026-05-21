@@ -16,10 +16,10 @@ P1 deliberately keeps strict safety gates:
   the existing segmented cuBLAS/CUDA SO2 projection kernels while the persistent
   backward is still experimental.
 
-The kernel itself is a SIMT persistent scheduler, not yet a CUTLASS/CuTe
-MMA mainloop.  It is intended as the next integration step after P0 to validate
-that the scheduling/dataflow boundary is correct before replacing the inner
-serial dot loop with MMA tiles.
+The default forward mainloop is warp-collective: a warp owns one row of a
+route/m/output tile, lanes split the K dimension, and lane 0 runs the custom
+SO2 epilogue. ``DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=scalar`` keeps the older
+thread-per-output prototype for debugging.
 """
 
 from __future__ import annotations
@@ -406,7 +406,15 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
         block_n: int,
         active_blocks: int,
     ):
-        out = _load_extension().persistent_grouped_forward_fp32(
+        ext = _load_extension()
+        mainloop = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+        if mainloop in ("warp", "warp_collective", "collective"):
+            forward = ext.persistent_grouped_forward_warp_fp32
+        elif mainloop in ("scalar", "thread", "thread_scalar"):
+            forward = ext.persistent_grouped_forward_fp32
+        else:
+            raise RuntimeError(f"unknown DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP={mainloop!r}")
+        out = forward(
             x,
             wigner,
             edge_order,
@@ -762,6 +770,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
             "active_route",
             f"persistent_grouped_p1 active: routes={n_routes}, m_values={tuple(int(v) for v in m_values.detach().cpu().tolist())}, "
             f"tiles={int(problem_tile_prefix[-1].item())}, block_m={block_m}, block_n={block_n}, "
-            f"wigner_mode={wigner_mode}, include_m0={include_m0}.",
+            f"wigner_mode={wigner_mode}, include_m0={include_m0}, "
+            f"mainloop={os.environ.get('DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP', 'warp_collective')}.",
         )
     return out.contiguous(), wigner_D_all

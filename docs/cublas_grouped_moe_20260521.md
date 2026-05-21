@@ -379,10 +379,34 @@ Production smoke, same Liyue short-run style, strict disabled only for the known
 | `global_all_persistent_grouped_p1_nom0` | m0 fallback | 87.561 | 2.857 | still worse than `indexed_sandwich_multi` |
 | `edge_top2_persistent_grouped_p1_nom0` | m0 fallback | 98.821 | 3.247 | still worse than `indexed_sandwich_multi` |
 
+Warp-collective P1 follow-up:
+
+- Added `DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=warp_collective`. One warp owns one row of a route/m/output tile, lanes split the input-channel loop, and `__shfl_down_sync` reduces the dot product before the existing custom Wigner epilogue writes the result.
+- Tile search showed that output tile 16 was best among the tested values, so the production smoke used `DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N=16`.
+- Correctness on Liyue: `pytest dptb/tests/test_so2_moe_persistent_grouped_p1.py -q` with `warp_collective` passed (`3 passed, 1 warning in 42.39s`).
+
+Module train smoke:
+
+| P1 mainloop | N | streamed train ms | P1 train ms | Speedup | max x-grad diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `warp_collective`, include m0 | 4096 | 22.714 | 12.899 | 1.76x | 2.73e-12 |
+| `warp_collective`, m0 fallback | 4096 | 24.881 | 18.040 | 1.38x | 2.73e-12 |
+| `warp_collective`, include m0 | 16384 | 24.224 | 15.764 | 1.54x | 9.09e-13 |
+
+Production smoke:
+
+| Case | P1 setting | wall s | back-half s/iter | comparator |
+| --- | --- | ---: | ---: | --- |
+| `global_all_persistent_grouped_p1_warp` | tile 8 | 108.337 | 2.041 | close to stable cublas, slower than `indexed_sandwich_multi` |
+| `edge_top2_persistent_grouped_p1_warp` | tile 8 | 74.848 | 2.328 | slower than stable edge cublas |
+| `global_all_persistent_grouped_p1_warp16` | tile 16 | 65.270 | 1.907 | faster than stable cublas steady-state, slower than `indexed_sandwich_multi` |
+| `edge_top2_persistent_grouped_p1_warp16` | tile 16 | 74.444 | 2.157 | near stable edge cublas, slower than `indexed_sandwich_multi` |
+
 Negative-result analysis:
 
 - The P1 prologue/epilogue fusion is real: compact Wigner input rotation, complex finish, Wigner output rotation, and scatter happen inside the forward CUDA kernel for MoE SO2 blocks.
 - The mainloop is the problem. Replacing the strong indexed/cuBLAS raw-linear path with scalar SIMT dot loops is too expensive at production channel sizes. The saved launches and intermediate tensors do not compensate for weaker math throughput.
+- Warp-collective accumulation improves the scalar mainloop substantially versus the original CTA scalar loop, and tile 16 gives a visible global production gain. It still does not fully solve the problem because the raw-linear math is not a CUTLASS/CuTe MMA or cuBLAS-quality mainloop.
 - Turning off fused `m=0` improved global all-expert from 3.053 to 2.857 s/iter, confirming that `m=0` should not use weak scalar dot by itself. It should be kept on the strong cueq/cuBLAS path or folded into a future true CUTLASS/CuTe grouped mainloop.
 - Edge top2 stayed slow after the m0 adjustment, so the bottleneck is broader than scalar m0. The route/m persistent kernel still consumes route-mixed weights and uses scalar accumulation for all m>0.
 - Production has a final interpolation SO2 layer. Strict mode correctly exposed that this layer is not covered by P1; the measured production runs allow that known fallback and keep the MoE SO2 warning visible in logs.
@@ -393,6 +417,71 @@ Current decision:
 - Keep P1 as an opt-in, trainable, compact-Wigner dataflow prototype for future custom-A-loader work.
 - The best production signal remains `indexed_sandwich_multi`: it keeps the strong raw-linear backend and adds route/m grouped scheduling around the Wigner rotation sandwich.
 - The next production-worthy step is not another SIMT fused dot. It is a real CUTLASS/CuTe grouped kernel where the A iterator computes Wigner-rotated input values, the mainloop uses a strong tiled GEMM path, and the epilogue owns top-k/radial scaling plus Wigner output scatter.
+
+## Multi-m Grouped Pack and Output-major Epilogue Follow-up
+
+The next experiment stays on the `indexed_sandwich_multi` line rather than the weak persistent SIMT-dot P1 line. The goal is to keep the strong grouped raw-linear backend while moving more of the SO2 rotation sandwich into CUDA:
+
+- `DPTB_SO2_MOE_FUSED_P0_MULTI_PACK=1` packs all `m>0` Wigner input pairs in one CUDA launch into a flat `[N, 2, sum(Cin_m)]` tensor. Radial-on-input scaling remains a normal Torch multiply after slicing, so training gradients for radial MLP parameters remain intact.
+- `DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE=1` replaces per-`m` raw CUDA epilogues with a grouped multi-`m` epilogue.
+- `DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE_SCHEDULE=output_major` is the default. One CUDA thread owns one `(edge, output_feature)` and reduces all contributing `(m, channel, Wigner row)` entries before writing the output. This avoids the cross-`m` race that appears when each `(m, channel)` thread scatters into the same SO2 output coordinates.
+- `DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE_SCHEDULE=atomic` exists only as a debug fallback. It is not recommended because it shows visible numeric drift in the module train smoke.
+- `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_grouped` enables grouped pack plus output-major epilogue together.
+
+This is closer to the requested custom epilogue direction than a GEMM wrapper: the raw output is not finished by PyTorch, and Wigner output rotation plus scatter are owned by a single CUDA schedule. It is still not a full CUTLASS 3.x `CollectiveMma + CollectiveEpilogue` kernel, because the raw GEMM itself remains the existing grouped cuBLAS call. A sub-agent review confirmed that the current CUTLASS 2.x wrapper only exposes a conventional `LinearCombination` epilogue and cannot directly express DeePTB's coordinate-aware Wigner scatter without a new custom grouped kernel.
+
+Liyue correctness, compact Wigner, FP32 and TF32 off:
+
+```text
+export DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_grouped
+export DPTB_SO2_MOE_FUSED_P0_MULTI_EPILOGUE_SCHEDULE=output_major
+pytest dptb/tests/test_so2_moe_fused_p0.py -q -k "indexed_sandwich"
+
+4 passed, 14 deselected, 1 warning in 48.60s
+```
+
+Module train smoke, `cublas_grouped`, compact Wigner, `cuda_cublas_segmented` backward:
+
+| Forward mode | Extra schedule | N | fused train ms | max x-grad diff | Verdict |
+| --- | --- | ---: | ---: | ---: | --- |
+| `indexed_sandwich_multi` | existing per-m pack/epilogue | 4096 | 15.094 | 2.73e-12 | internal comparator |
+| `indexed_sandwich_multi_grouped` | grouped pack + output-major epilogue | 4096 | 15.140 | 2.73e-12 | correct, neutral/slower |
+| `indexed_sandwich_multi_grouped` | grouped pack + atomic epilogue | 4096 | 15.351 | 6.07e-6 | numeric drift, reject |
+| `indexed_sandwich_multi` | existing per-m pack/epilogue | 16384 | 15.072 | 6.82e-13 | internal comparator |
+| `indexed_sandwich_multi_grouped` | grouped pack + output-major epilogue | 16384 | 16.400 | 6.82e-13 | correct, slower |
+| `indexed_sandwich_multi_grouped` | grouped pack + atomic epilogue | 16384 | 16.184 | 2.11e-6 | numeric drift, reject |
+
+Split ablation:
+
+| Variant | N | fused train ms | max x-grad diff | Interpretation |
+| --- | ---: | ---: | ---: | --- |
+| grouped pack only | 4096 | 15.994 | 2.73e-12 | one launch saved, flat-pack/slice overhead loses |
+| output-major epilogue only | 4096 | 15.165 | 2.73e-12 | close to baseline, not a clear win |
+| grouped pack only | 16384 | 16.035 | 6.82e-13 | slower than old multi |
+| output-major epilogue only | 16384 | 15.476 | 6.82e-13 | correct but still behind best old multi run |
+
+Production smoke for `indexed_sandwich_multi_grouped`, Liyue L40S, bs=32, 25 iterations, FP32 and TF32 off. Strict forward mode is disabled only for the known interpolation SO2 layer fallback, matching the previous `indexed_sandwich_multi` production smoke:
+
+| Case | wall s | back-half s/iter | previous `indexed_sandwich_multi` | stable comparator |
+| --- | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_indexed_sandwich_multi_grouped` | 65.191 | 1.944 | 62.917 / 1.848 | `global_all_cublas` 54.750 / 2.043 |
+| `edge_top2_fused_p0_indexed_sandwich_multi_grouped` | 69.047 | 2.077 | 66.065 / 1.965 | `edge_top2_cublas` 57.089 / 2.134 |
+
+The grouped output-major path is therefore a correct deeper-fusion prototype and still beats the stable cublas grouped path in steady-state iter time, but it regresses against the simpler `indexed_sandwich_multi` path by about 5.2% for global all-expert and 5.7% for edge top2 in back-half s/iter.
+
+Negative-result analysis:
+
+- The grouped input pack is semantically the right prologue step, but it produces one wide flat tensor and then slices it back per `m` before grouped GEMM. That reduces launch count but adds memory traffic and does not eliminate the per-`m` input tensors that the raw GEMM wrapper consumes.
+- The output-major epilogue fixes the race without atomics and correctly eats Wigner output rotation, but each output feature now loops over a small entry list. At these channel shapes the saved per-`m` launches are not enough to beat the simpler per-`m` epilogue consistently.
+- The atomic epilogue is rejected: it removes the race structurally but introduces unacceptable numeric drift in the training smoke.
+- This experiment narrows the next target: pre/post fusion around an unchanged grouped GEMM is not sufficient. To get a production win, the grouped route/m scheduler must own at least the raw-output epilogue inside the GEMM tile, not after a materialized raw output tensor, and the backward projection/scatter has to be tiled the same way.
+
+Current decision:
+
+- Keep `indexed_sandwich_multi_grouped` as an opt-in development mode for the custom-epilogue dataflow.
+- Do not replace `indexed_sandwich_multi` with it as the recommended fused-P0 steady-state path.
+- Keep stable production default on `mole_linear_mode="cublas_grouped"` / `streamed_m_major_cueq`; this branch's best experimental steady-state path remains `indexed_sandwich_multi`, not grouped pre/post.
+- The next real CUTLASS/CuTe step should be a custom grouped kernel whose accumulator epilogue directly performs raw complex finish and Wigner output scatter before writing to global memory. A post-GEMM epilogue kernel is useful for validating maps and semantics, but is still too late in the dataflow.
 
 ## Artifacts
 
@@ -439,6 +528,9 @@ prod_smoke_tiled8_radial_scatter_20260521
 prod_smoke_tiled8_m0_fused_20260521
 prod_smoke_indexed_sandwich_raw_epi_20260521
 prod_smoke_indexed_sandwich_multi_20260521
+prod_smoke_indexed_sandwich_multi_grouped_20260522
 prod_smoke_persistent_grouped_p1_20260521
 prod_smoke_persistent_grouped_p1_nom0_20260521
+prod_smoke_persistent_grouped_p1_warp_20260522
+prod_smoke_persistent_grouped_p1_warp16_20260522
 ```
