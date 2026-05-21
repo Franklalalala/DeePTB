@@ -89,6 +89,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--mole-linear-mode", default="cublas_grouped",
                         choices=("cublas_grouped", "cueq_indexed_linear"))
+    parser.add_argument("--fusion-mode", default="streamed_m_major_fused_p0")
     parser.add_argument("--irreps-in", default="32x0e + 24x1e + 16x2e + 8x3e")
     parser.add_argument("--irreps-out", default="32x0e + 24x1e + 16x2e + 8x3e")
     args = parser.parse_args()
@@ -103,7 +104,7 @@ def main() -> None:
     torch.manual_seed(20260521)
     device = torch.device("cuda")
     ref = _make_module(args, "streamed_m_major_cueq", device)
-    fused = _make_module(args, "streamed_m_major_fused_p0", device)
+    fused = _make_module(args, args.fusion_mode, device)
     fused.load_state_dict(ref.state_dict(), strict=True)
 
     x_ref = torch.randn((args.n, ref.irreps_in.dim), device=device, dtype=torch.float32, requires_grad=True)
@@ -129,9 +130,9 @@ def main() -> None:
     ref_ms = _cuda_ms(ref_step, args.warmup, args.iters)
     fused_ms = _cuda_ms(fused_step, args.warmup, args.iters)
 
-    print("case,n,routes,experts,top_k,mole_linear_mode,mode,ms,loss_abs_diff,x_grad_max_abs")
-    print(f"streamed_grouped_train,{args.n},{args.routes},{args.experts},{args.top_k},{args.mole_linear_mode},compact,{ref_ms:.6f},0,0")
-    print(f"fused_p0_train,{args.n},{args.routes},{args.experts},{args.top_k},{args.mole_linear_mode},compact,{fused_ms:.6f},{max_abs:.6e},{grad_abs:.6e}")
+    print("case,n,routes,experts,top_k,mole_linear_mode,fusion_mode,ms,loss_abs_diff,x_grad_max_abs")
+    print(f"streamed_grouped_train,{args.n},{args.routes},{args.experts},{args.top_k},{args.mole_linear_mode},streamed_m_major_cueq,{ref_ms:.6f},0,0")
+    print(f"fused_train,{args.n},{args.routes},{args.experts},{args.top_k},{args.mole_linear_mode},{args.fusion_mode},{fused_ms:.6f},{max_abs:.6e},{grad_abs:.6e}")
     print(f"speedup_vs_streamed_grouped_train,{ref_ms / fused_ms:.6f}")
 
 

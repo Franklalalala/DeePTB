@@ -336,6 +336,64 @@ Production smoke for `indexed_sandwich_multi`, with strict forward fallback disa
 
 This is the best steady-state production signal in this branch so far: compared with the stable cublas grouped path, back-half iter time improves by about 9.5% for global all-expert and 7.9% for edge top2. Wall time is still slower because warmup/extension and remaining fallback work are not amortized in the 25-iteration smoke. Compared with the previous `indexed_sandwich` production smoke, multi-m scheduling improves global wall time from 107.079 s to 62.917 s while preserving the same rotation-sandwich semantics.
 
+## Persistent Grouped SO2/MoE P1 Prototype
+
+`streamed_m_major_persistent_grouped_p1` is an opt-in deeper fusion prototype. It was built after reviewing the local P1 manuscript, but the implementation in this branch makes several independent changes:
+
+- the CUDA work queue is block-level, not thread-level, so one CTA cooperates on one route/m/output-tile problem;
+- the forward kernel directly consumes compact Wigner blocks;
+- `m=0` can be included as a special problem in the same route/m schedule via `DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0=1`;
+- the path is trainable: backward reuses the existing segmented CUDA pair ops plus cuBLAS raw-linear reductions, while treating Wigner/R as constant because this branch targets Hamiltonian prediction without force/coordinate gradients;
+- `DPTB_SO2_MOE_PERSISTENT_P1_STRICT=1` can be used during development to catch unexpected fallback.
+
+Forward dataflow covered by P1:
+
+1. persistent grouped schedule over route and `m`;
+2. custom A-loader reads `x`, compact Wigner blocks, and per-`m` channel maps, then forms the Wigner-rotated input value inside the kernel;
+3. scalar raw-linear accumulation uses the mixed route weight for that route/m problem;
+4. epilogue performs m>0 complex finish, optional radial scaling, Wigner output rotation, and scatter/add into the full SO2 output.
+
+Important limitation: this is not yet a production CUTLASS 3.x/CuTe MMA mainloop. It matches the CUTLASS grouped-kernel shape of a persistent scheduler with custom prologue/epilogue, but the dot product is still a custom FP32 SIMT loop. That is why it is useful as a dataflow prototype, not as the production fast path.
+
+Correctness and module-train checks on Liyue, FP32 and TF32 off:
+
+```text
+pytest dptb/tests/test_so2_moe_persistent_grouped_p1.py -q
+3 passed, 1 warning in 3.43s
+```
+
+Module train smoke, `cublas_grouped`, compact Wigner:
+
+| Mode | N | streamed train ms | P1 train ms | Speedup | max x-grad diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| include m0 | 4096 | 23.866 | 13.809 | 1.73x | 2.27e-12 |
+| include m0 | 16384 | 26.480 | 15.358 | 1.72x | 9.09e-13 |
+| P0 comparison | 16384 | 22.074 | 15.627 | 1.41x | 6.82e-13 |
+
+Production smoke, same Liyue short-run style, strict disabled only for the known `use_interpolation_out` SO2 layer whose m>0 path is an `InterpolationBlock` rather than MoE linear:
+
+| Case | P1 setting | wall s | back-half s/iter | comparator |
+| --- | --- | ---: | ---: | --- |
+| `global_all_persistent_grouped_p1` | include m0 | 92.998 | 3.053 | worse than `indexed_sandwich_multi` 1.848 |
+| `edge_top2_persistent_grouped_p1` | include m0 | 98.455 | 3.302 | worse than `indexed_sandwich_multi` 1.965 |
+| `global_all_persistent_grouped_p1_nom0` | m0 fallback | 87.561 | 2.857 | still worse than `indexed_sandwich_multi` |
+| `edge_top2_persistent_grouped_p1_nom0` | m0 fallback | 98.821 | 3.247 | still worse than `indexed_sandwich_multi` |
+
+Negative-result analysis:
+
+- The P1 prologue/epilogue fusion is real: compact Wigner input rotation, complex finish, Wigner output rotation, and scatter happen inside the forward CUDA kernel for MoE SO2 blocks.
+- The mainloop is the problem. Replacing the strong indexed/cuBLAS raw-linear path with scalar SIMT dot loops is too expensive at production channel sizes. The saved launches and intermediate tensors do not compensate for weaker math throughput.
+- Turning off fused `m=0` improved global all-expert from 3.053 to 2.857 s/iter, confirming that `m=0` should not use weak scalar dot by itself. It should be kept on the strong cueq/cuBLAS path or folded into a future true CUTLASS/CuTe grouped mainloop.
+- Edge top2 stayed slow after the m0 adjustment, so the bottleneck is broader than scalar m0. The route/m persistent kernel still consumes route-mixed weights and uses scalar accumulation for all m>0.
+- Production has a final interpolation SO2 layer. Strict mode correctly exposed that this layer is not covered by P1; the measured production runs allow that known fallback and keep the MoE SO2 warning visible in logs.
+
+Current decision:
+
+- Do not make P1 the production default.
+- Keep P1 as an opt-in, trainable, compact-Wigner dataflow prototype for future custom-A-loader work.
+- The best production signal remains `indexed_sandwich_multi`: it keeps the strong raw-linear backend and adds route/m grouped scheduling around the Wigner rotation sandwich.
+- The next production-worthy step is not another SIMT fused dot. It is a real CUTLASS/CuTe grouped kernel where the A iterator computes Wigner-rotated input values, the mainloop uses a strong tiled GEMM path, and the epilogue owns top-k/radial scaling plus Wigner output scatter.
+
 ## Artifacts
 
 Liyue run root:
@@ -381,4 +439,6 @@ prod_smoke_tiled8_radial_scatter_20260521
 prod_smoke_tiled8_m0_fused_20260521
 prod_smoke_indexed_sandwich_raw_epi_20260521
 prod_smoke_indexed_sandwich_multi_20260521
+prod_smoke_persistent_grouped_p1_20260521
+prod_smoke_persistent_grouped_p1_nom0_20260521
 ```
