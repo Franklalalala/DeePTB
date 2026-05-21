@@ -66,6 +66,93 @@ def test_cutlass_grouped_gemm_matches_torch_if_available():
     torch.testing.assert_close(grad_w, ref_w, atol=5e-4, rtol=5e-4)
 
 
+@pytest.mark.parametrize("wigner_kind", ["dense", "compact"])
+def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 MoE fused P0 CUDA pair-op smoke requires CUDA")
+
+    from dptb.nn.so2_moe_fused_p0 import (
+        _output_pair_grad_cuda,
+        _output_pair_grad_torch,
+        _pack_pair_cuda,
+        _pack_pair_torch,
+        _scatter_pair_grad_cuda,
+        _scatter_pair_grad_torch,
+    )
+
+    torch.manual_seed(20260524)
+    device = torch.device("cuda")
+    n_edges = 13
+    lmax = 3
+    dims = [2 * l + 1 for l in range(lmax + 1)]
+    offsets_data = [0]
+    for dim in dims[:-1]:
+        offsets_data.append(offsets_data[-1] + dim)
+    offsets = torch.tensor(offsets_data, device=device, dtype=torch.long)
+    d_total = sum(dims)
+
+    dense = torch.zeros((n_edges, d_total, d_total), device=device, dtype=torch.float32)
+    compact_pieces = []
+    compact_offsets_data = []
+    cursor = 0
+    for l, dim in enumerate(dims):
+        block = torch.randn((n_edges, dim, dim), device=device, dtype=torch.float32)
+        start = offsets_data[l]
+        dense[:, start:start + dim, start:start + dim] = block
+        compact_offsets_data.append(cursor)
+        compact_pieces.append(block.reshape(n_edges, dim * dim))
+        cursor += dim * dim
+
+    if wigner_kind == "dense":
+        wigner = dense.contiguous()
+        compact_offsets = torch.empty((0,), device=device, dtype=torch.long)
+        wigner_mode = 1
+        wigner_stride = d_total
+    else:
+        wigner = torch.cat(compact_pieces, dim=1).contiguous()
+        compact_offsets = torch.tensor(compact_offsets_data, device=device, dtype=torch.long)
+        wigner_mode = 2
+        wigner_stride = cursor
+
+    m = 1
+    in_base = torch.tensor([0, 3, 8, 15], device=device, dtype=torch.long)
+    in_l = torch.tensor([1, 2, 3, 3], device=device, dtype=torch.long)
+    out_base = torch.tensor([0, 3, 8], device=device, dtype=torch.long)
+    out_l = torch.tensor([1, 2, 3], device=device, dtype=torch.long)
+    in_dim = 22
+    out_dim = 15
+
+    x = torch.randn((n_edges, in_dim), device=device, dtype=torch.float32)
+    grad_out = torch.randn((n_edges, out_dim), device=device, dtype=torch.float32)
+    grad_pair = torch.randn((n_edges, 2, in_base.numel()), device=device, dtype=torch.float32)
+
+    pack_ref = _pack_pair_torch(
+        x, wigner, in_base, in_l, offsets, compact_offsets, m, True, wigner_mode
+    )
+    pack_cuda = _pack_pair_cuda(
+        x, wigner, in_base, in_l, offsets, compact_offsets, m, True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(pack_cuda, pack_ref, atol=1e-6, rtol=1e-6)
+
+    out_grad_ref = _output_pair_grad_torch(
+        grad_out, wigner, out_base, out_l, offsets, compact_offsets, m, True, wigner_mode
+    )
+    out_grad_cuda = _output_pair_grad_cuda(
+        grad_out, wigner, out_base, out_l, offsets, compact_offsets, m, True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(out_grad_cuda, out_grad_ref, atol=1e-6, rtol=1e-6)
+
+    scatter_ref = _scatter_pair_grad_torch(
+        grad_pair, wigner, in_base, in_l, offsets, compact_offsets, in_dim, m, True, wigner_mode
+    )
+    scatter_cuda = _scatter_pair_grad_cuda(
+        grad_pair, wigner, in_base, in_l, offsets, compact_offsets,
+        in_dim, m, True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(scatter_cuda, scatter_ref, atol=1e-6, rtol=1e-6)
+
+
 def test_so2_fused_p0_forward_matches_streamed_ref_if_available():
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")

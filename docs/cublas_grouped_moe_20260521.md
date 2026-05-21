@@ -192,6 +192,13 @@ Hardware/CUTLASS notes:
 - pro6000 reports `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`, compute capability 12.0, driver 580.126.09, with PyTorch 2.8.0+cu128 available in the checked MoE envs. CUTLASS 3.x/Blackwell paths are a better architectural fit there, but extension builds still need an nvcc/toolkit that supports `sm_120`; nvcc was not on PATH in the probed conda envs.
 - For this DeePTB SO2 workload, CUTLASS grouped + custom epilogue is conceptually closer than a standalone grouped GEMM because the useful work is input Wigner prologue, route/expert mainloop, output Wigner epilogue, and gradient projection. The current negative result for raw CUTLASS segmented GEMM is therefore not a rejection of CUTLASS overall; it rejects the narrower "swap only GEMM mainloop" change.
 
+P1 review package comparison:
+
+- The external P1 package under `E:\deeptb\codex\0521_graph_pyg\deeptb_so2_moe_fused_p1_20260521` targets the older `ad0cb5b` P0 state. Its main technical suggestion is to move segmented-backward pair pack, output-pair gradient, and input-gradient scatter into CUDA.
+- That suggestion is already absorbed in this branch by the integrated `cuda_cublas_segmented` mode. The integrated implementation reuses the existing fused-P0 extension instead of adding a second pair-op extension, and avoids atomics in input-gradient scatter because the current SO2 pair maps are built from disjoint irrep slices for each `m`.
+- The useful part that was still missing was direct helper-level test coverage. Added `test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available`, covering dense and compact Wigner representations for CUDA pair pack, output-pair gradient projection, and input-gradient scatter against the Torch helper path. Liyue result: `2 passed, 1 warning in 5.09s`.
+- The separate P1 hook script is not applied: it expects the older `_segmented_pair_backward` marker and would duplicate the already-integrated code path. The P1 scatter kernel also uses atomics for overlap tolerance; that is safer for hypothetical overlapping maps but slower than the current disjoint-map implementation used by DeePTB's SO2 layout.
+
 ## Artifacts
 
 Liyue run root:
