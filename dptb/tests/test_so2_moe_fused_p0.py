@@ -530,8 +530,15 @@ def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeyp
         torch.testing.assert_close(fused_param.grad, ref_param.grad, atol=4e-3, rtol=4e-3)
 
 
-@pytest.mark.parametrize("linear_mode", ["cublas_grouped", "cueq_indexed_linear"])
-def test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available(monkeypatch, linear_mode):
+@pytest.mark.parametrize(
+    "linear_mode,forward_mode",
+    [
+        ("cublas_grouped", "indexed_sandwich"),
+        ("cublas_grouped", "indexed_sandwich_multi"),
+        ("cueq_indexed_linear", "cueq_sandwich"),
+    ],
+)
+def test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available(monkeypatch, linear_mode, forward_mode):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     if linear_mode == "cueq_indexed_linear":
@@ -540,10 +547,7 @@ def test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available(monkeyp
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 indexed-sandwich smoke requires CUDA")
 
-    monkeypatch.setenv(
-        "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE",
-        "cueq_sandwich" if linear_mode == "cueq_indexed_linear" else "indexed_sandwich",
-    )
+    monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", forward_mode)
     monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE", "1")
 
     from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0

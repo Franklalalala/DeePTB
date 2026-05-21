@@ -9,7 +9,11 @@ from typing import Optional
 import torch
 from torch.utils.cpp_extension import load
 
-from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2WignerBlocks, _mole_graph_index
+from dptb.nn.tensor_product_moe_v3 import (
+    MOLEGlobals,
+    SO2WignerBlocks,
+    _mole_graph_index,
+)
 
 
 _EXT = None
@@ -1859,6 +1863,172 @@ def _fused_pair_indexed_sandwich(
     )
 
 
+def _fused_pairs_indexed_sandwich_multi(
+    module,
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    wigner_mode: int,
+    wigner_stride: int,
+    mole_globals: MOLEGlobals,
+    weights: Optional[torch.Tensor],
+):
+    if module.m_max < 1:
+        return []
+
+    graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
+    if graph_index.numel() != x.shape[0]:
+        raise ValueError(
+            f"MOLE graph_index has {graph_index.numel()} rows, but fused multi-m input has {x.shape[0]} rows."
+        )
+
+    pair_inputs = []
+    mixed_weights = []
+    post_radials = []
+    maps = []
+    route_count = None
+
+    for m in range(1, module.m_max + 1):
+        fc = module.m_linear[m - 1].fc
+        if not hasattr(fc, "_mix_expert_parameters") or getattr(fc, "mole_linear_mode", None) != "cublas_grouped":
+            if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
+                raise RuntimeError(
+                    "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi "
+                    "currently requires m>0 MOLELinear blocks with mole_linear_mode='cublas_grouped'."
+                )
+            _warn_once(
+                "indexed_sandwich_multi_backend_fallback",
+                "indexed_sandwich_multi currently requires m>0 cublas_grouped MOLELinear blocks; falling back.",
+            )
+            return None
+        if getattr(fc, "bias_experts", None) is not None:
+            _warn_once(
+                "indexed_sandwich_multi_bias_fallback",
+                "indexed_sandwich_multi expects bias-free m>0 MoE linears; falling back.",
+            )
+            return None
+
+        in_base, in_l, out_base, out_l, offsets = _pair_maps(module, m, x.device)
+        cin = int(in_base.numel())
+        cout = int(out_base.numel())
+        if getattr(fc, "in_features", None) != cin or getattr(fc, "out_features", None) != 2 * cout:
+            _warn_once(
+                "indexed_sandwich_multi_shape_fallback",
+                "indexed_sandwich_multi shape does not match SO2 pair maps; falling back.",
+            )
+            return None
+
+        pair = _PackPairFunction.apply(
+            x.contiguous(),
+            wigner,
+            in_base,
+            in_l,
+            offsets,
+            compact_offsets,
+            int(m),
+            bool(module.rotate_in),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+
+        radial = None
+        if weights is not None:
+            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1).contiguous()
+            expected = cin if bool(module.front) else cout
+            if radial.shape != (x.shape[0], 1, expected):
+                _warn_once(
+                    "indexed_sandwich_multi_radial_shape_fallback",
+                    f"indexed_sandwich_multi radial shape {tuple(radial.shape)} "
+                    f"does not match expected {(x.shape[0], 1, expected)}; falling back.",
+                )
+                return None
+
+        pair_for_linear = pair * radial if radial is not None and bool(module.front) else pair
+        mixed_weight, mixed_bias = fc._mix_expert_parameters(mole_globals)
+        if mixed_bias is not None:
+            _warn_once(
+                "indexed_sandwich_multi_mixed_bias_fallback",
+                "indexed_sandwich_multi does not handle m>0 bias; falling back.",
+            )
+            return None
+        if mixed_weight.shape[-2:] != (2 * cout, cin):
+            _warn_once(
+                "indexed_sandwich_multi_weight_shape_fallback",
+                "indexed_sandwich_multi mixed weight shape does not match SO2 pair maps; falling back.",
+            )
+            return None
+        if route_count is None:
+            route_count = int(mixed_weight.shape[0])
+        elif route_count != int(mixed_weight.shape[0]):
+            _warn_once(
+                "indexed_sandwich_multi_route_count_fallback",
+                "indexed_sandwich_multi requires all m blocks to share the same route count; falling back.",
+            )
+            return None
+
+        pair_inputs.append(pair_for_linear)
+        mixed_weights.append(mixed_weight.contiguous())
+        post_radials.append(None if radial is None or bool(module.front) else radial)
+        maps.append((m, out_base, out_l, offsets))
+
+    if not pair_inputs:
+        return []
+
+    permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, pair_inputs[0])
+    ptr = mole_globals.indexed_segment_ptr(sorted_graph_index, int(route_count), prefer_cpu=True)
+
+    flat_inputs = []
+    for pair in pair_inputs:
+        flat = pair.reshape(-1, pair.shape[-1])
+        if permute_idx is not None:
+            flat = flat.index_select(0, permute_idx)
+        flat_inputs.append(flat.contiguous())
+
+    from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
+
+    flat_raw_outputs = grouped_gemm_multi(flat_inputs, [ptr] * len(flat_inputs), mixed_weights)
+
+    contributions = []
+    for flat_raw, pair, post_radial, (m, out_base, out_l, offsets) in zip(
+        flat_raw_outputs, pair_inputs, post_radials, maps
+    ):
+        if unpermute_idx is not None:
+            flat_raw = flat_raw.index_select(0, unpermute_idx)
+        raw = flat_raw.reshape(x.shape[0], 2, -1)
+        if post_radial is None:
+            contribution = _ScatterRawPairOutputFunction.apply(
+                raw.contiguous(),
+                wigner,
+                out_base,
+                out_l,
+                offsets,
+                compact_offsets,
+                int(module.irreps_out.dim),
+                int(m),
+                bool(module.rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            )
+        else:
+            pair_out = module.m_linear[m - 1]._finish_linear_output(raw) * post_radial
+            contribution = _ScatterPairOutputFunction.apply(
+                pair_out.contiguous(),
+                wigner,
+                out_base,
+                out_l,
+                offsets,
+                compact_offsets,
+                int(module.irreps_out.dim),
+                int(m),
+                bool(module.rotate_out),
+                int(wigner_mode),
+                int(wigner_stride),
+            )
+        contributions.append(contribution)
+
+    return contributions
+
+
 def _fused_pair_contribution(
     module,
     m: int,
@@ -2095,22 +2265,39 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
     else:
         out.add_(m0_contribution)
 
-    for m in range(1, module.m_max + 1):
-        radial_m = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1) if module.radial_emb else None
-        contribution = _fused_pair_contribution(
+    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    if forward_mode in ("indexed_sandwich_multi", "cublas_multi_sandwich", "route_m_sandwich"):
+        contributions = _fused_pairs_indexed_sandwich_multi(
             module,
-            m,
             x,
             wigner,
             compact_offsets,
             wigner_mode,
             wigner_stride,
             mole_globals,
-            radial_m,
+            weights,
         )
-        if contribution is None:
+        if contributions is None:
             return None
-        out.add_(contribution)
+        for contribution in contributions:
+            out.add_(contribution)
+    else:
+        for m in range(1, module.m_max + 1):
+            radial_m = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1) if module.radial_emb else None
+            contribution = _fused_pair_contribution(
+                module,
+                m,
+                x,
+                wigner,
+                compact_offsets,
+                wigner_mode,
+                wigner_stride,
+                mole_globals,
+                radial_m,
+            )
+            if contribution is None:
+                return None
+            out.add_(contribution)
 
     if _flag("DPTB_SO2_MOE_FUSED_P0_LOG_ONCE"):
         _warn_once(

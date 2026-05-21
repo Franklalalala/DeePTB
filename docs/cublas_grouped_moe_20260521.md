@@ -298,7 +298,36 @@ Interpretation:
 - This is a cleaner cueq-compatible experiment than replacing GEMM: it does eat DeePTB Wigner input rotation and output rotation around the indexed raw-linear call, while preserving cueq/cublas as the raw mainloop.
 - It still does not beat the best fused P0 tiled SIMT path in production-shaped module tests. The reason is launch and materialization count: `pack_pair`, indexed linear, raw epilogue, and backward pack/scatter are still separate kernels/tensors per `m`.
 - The useful next CUTLASS/CuTe direction is therefore not a cueq wrapper. It is a grouped route/m scheduler with a custom epilogue that owns raw output finish + Wigner output rotation, and a matching backward projection/scatter path. The indexed sandwich is kept as an opt-in correctness/dataflow reference for that kernel.
-- A production smoke for `indexed_sandwich` was launched under `/home/mingkang_nt/codex/0521_fused_so2_moe_aggressive_20260521/prod_smoke_indexed_sandwich_raw_epi_20260521`; it is intentionally not a blocking result because the module data already show this path is a reference design rather than the current production winner.
+
+Production smoke for `indexed_sandwich` completed under `/home/mingkang_nt/codex/0521_fused_so2_moe_aggressive_20260521/prod_smoke_indexed_sandwich_raw_epi_20260521`:
+
+| Case | wall s | back-half s/iter | stable comparator wall | stable comparator back-half |
+| --- | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_indexed_sandwich_raw_epi` | 107.079 | 1.875 | `global_all_cublas` 54.750 | 2.043 |
+| `edge_top2_fused_p0_indexed_sandwich_raw_epi` | 66.450 | 1.985 | `edge_top2_cublas` 57.089 | 2.134 |
+
+The wall time is worse because this smoke includes extension/runtime warmup and still has fragmented launch overhead. The steady-state back-half is nevertheless faster than the stable cublas comparator, which suggests that directly eating Wigner input/output rotation around a strong indexed backend can help once warmup is amortized.
+
+m-loop indexed sandwich follow-up:
+
+- Added `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi` / `cublas_multi_sandwich` / `route_m_sandwich`.
+- This path packs Wigner input rotation per `m`, but then runs all m>0 raw linears through one `grouped_gemm_multi` call and applies the raw CUDA epilogue per `m`. It is a minimal trainable route/m schedule prototype: m is now part of the raw-linear grouped schedule rather than three independent indexed calls.
+- Liyue correctness smoke: indexed sandwich modes passed for cublas single-m, cublas multi-m, and cueq sandwich (`3 passed, 1 warning in 4.76s`).
+
+Module train smoke, `cublas_grouped`, compact Wigner, FP32, TF32 off:
+
+| Forward mode | N | streamed train ms | fused train ms | Speedup | max x-grad diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `indexed_sandwich` | 4096 | 17.569 | 15.972 | 1.10x | 2.73e-12 |
+| `indexed_sandwich` | 16384 | 13.760 | 14.272 | 0.96x | 6.82e-13 |
+| `indexed_sandwich_multi` | 4096 | 19.291 | 15.198 | 1.27x | 2.73e-12 |
+| `indexed_sandwich_multi` | 16384 | 18.263 | 14.693 | 1.24x | 6.82e-13 |
+| `cutlass_tiled8` | 4096 | 17.897 | 15.802 | 1.13x | 2.27e-12 |
+| `cutlass_tiled8` | 16384 | 24.340 | 16.575 | 1.47x | 6.82e-13 |
+
+`indexed_sandwich_multi` confirms that merging route/m raw-linear scheduling helps, but the custom tiled fused forward is still stronger at large N. The remaining gap is now more specific: `indexed_sandwich_multi` still materializes per-m packed inputs and per-m raw outputs, then launches per-m epilogues. A deeper CUTLASS/CuTe kernel should combine the m scheduler with the raw-output epilogue and backward projection/scatter inside the same persistent grouped schedule.
+
+A production smoke for `indexed_sandwich_multi` was launched under `/home/mingkang_nt/codex/0521_fused_so2_moe_aggressive_20260521/prod_smoke_indexed_sandwich_multi_20260521` and is intentionally not blocking this commit.
 
 ## Artifacts
 
@@ -344,4 +373,5 @@ prod_smoke_tiled8_20260521
 prod_smoke_tiled8_radial_scatter_20260521
 prod_smoke_tiled8_m0_fused_20260521
 prod_smoke_indexed_sandwich_raw_epi_20260521
+prod_smoke_indexed_sandwich_multi_20260521
 ```
