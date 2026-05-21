@@ -455,8 +455,45 @@ def _expand_graph_index_cached(
     return cached
 
 
+def _mole_segment_ptr_cached(mole_globals: MOLEGlobals, n_rows: int, inner_size: int):
+    """Return CPU segment ptr for graph-contiguous MoLE rows."""
+    split_sizes = _mole_split_sizes(mole_globals, n_rows)
+    cache = getattr(mole_globals, "_segment_ptr_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(mole_globals, "_segment_ptr_cache", cache)
+
+    key = (split_sizes, int(inner_size))
+    ptr = cache.get(key)
+    if ptr is None:
+        counts = torch.tensor(split_sizes, dtype=torch.long, device="cpu")
+        ptr = torch.empty(len(split_sizes) + 1, dtype=torch.long, device="cpu")
+        ptr[0] = 0
+        torch.cumsum(counts, dim=0, out=ptr[1:])
+        if inner_size != 1:
+            ptr = ptr * int(inner_size)
+        cache[key] = ptr
+    return split_sizes, ptr
+
+
+def _get_pyg_segment_matmul():
+    try:
+        import pyg_lib
+    except ImportError as exc:
+        raise ImportError(
+            "mole_linear_mode='pyg_segment_matmul' requires pyg-lib with "
+            "pyg_lib.ops.segment_matmul."
+        ) from exc
+    segment_matmul = getattr(getattr(pyg_lib, "ops", None), "segment_matmul", None)
+    if segment_matmul is None:
+        raise ImportError(
+            "mole_linear_mode='pyg_segment_matmul' requires pyg_lib.ops.segment_matmul."
+        )
+    return segment_matmul
+
+
 def _normalize_mole_linear_mode(mode: str) -> str:
-    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear"}
+    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear", "pyg_segment_matmul"}
     if mode not in allowed:
         raise ValueError(f"mole_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
@@ -624,6 +661,28 @@ class MOLELinear(nn.Module):
         flat_out = torch.bmm(flat_w, flat_x.unsqueeze(-1)).squeeze(-1)
         if mixed_bias is not None:
             flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
+        return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def _apply_pyg_segment_matmul(self, x, mixed_weights, mixed_bias, mole_globals: MOLEGlobals):
+        if x.dtype != torch.float32 or mixed_weights.dtype != torch.float32:
+            raise RuntimeError(
+                "pyg_segment_matmul is currently validated only for float32. "
+                "Disable AMP/autocast or use split_loop/cueq_indexed_linear."
+            )
+        inner_shape = tuple(int(v) for v in x.shape[1:-1])
+        inner_size = math.prod(inner_shape) if inner_shape else 1
+        split_sizes, ptr = _mole_segment_ptr_cached(mole_globals, x.shape[0], inner_size)
+        if len(split_sizes) != mixed_weights.shape[0]:
+            raise ValueError(
+                f"MOLE split_sizes has {len(split_sizes)} graphs, but coefficients produced "
+                f"{mixed_weights.shape[0]} mixed weights."
+            )
+
+        segment_matmul = _get_pyg_segment_matmul()
+        flat_x = x.reshape(x.shape[0] * inner_size, self.in_features)
+        flat_weight = mixed_weights.transpose(1, 2).contiguous()
+        flat_bias = mixed_bias.contiguous() if mixed_bias is not None else None
+        flat_out = segment_matmul(flat_x, ptr, flat_weight, flat_bias)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
 
     def _cueq_flatten_weight(self, mixed_weights, order: str):
@@ -808,6 +867,8 @@ class MOLELinear(nn.Module):
         # 4. 执行线性变换
         # 根据系统大小拆分 Input，因为每个系统(Graph)对应一个混合后的权重
         mode = self.mole_linear_mode
+        if mode == "pyg_segment_matmul":
+            return self._apply_pyg_segment_matmul(x, mixed_weights, mixed_bias, mole_globals)
         if mode != "split_loop":
             graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
             if graph_index.numel() != x.shape[0]:
