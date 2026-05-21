@@ -206,9 +206,28 @@ def _pair_segment_layout(
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """Return cached pair-row permutation and cuBLAS segment ptr for [N, 2, C]."""
 
+    return _repeated_segment_layout(graph_index, num_routes, repeat=2)
+
+
+def _row_segment_layout(
+    graph_index: torch.Tensor,
+    num_routes: int,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Return cached row permutation and cuBLAS segment ptr for [N, C]."""
+
+    return _repeated_segment_layout(graph_index, num_routes, repeat=1)
+
+
+def _repeated_segment_layout(
+    graph_index: torch.Tensor,
+    num_routes: int,
+    *,
+    repeat: int,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     graph_index = graph_index.reshape(-1).to(dtype=torch.long)
     assume_sorted = _flag("DPTB_SO2_MOE_FUSED_P0_ASSUME_SORTED")
     key = (
+        int(repeat),
         graph_index.device.type,
         graph_index.device.index,
         int(graph_index.data_ptr()),
@@ -222,7 +241,10 @@ def _pair_segment_layout(
         _PAIR_SEGMENT_LAYOUT_CACHE.move_to_end(key)
         return cached
 
-    flat_graph = graph_index.reshape(-1, 1).expand(-1, 2).reshape(-1).contiguous()
+    if repeat == 1:
+        flat_graph = graph_index.contiguous()
+    else:
+        flat_graph = graph_index.reshape(-1, 1).expand(-1, int(repeat)).reshape(-1).contiguous()
     if assume_sorted or flat_graph.numel() <= 1:
         order = None
         unorder = None
@@ -302,6 +324,32 @@ def _pack_pair_cuda(
     )
 
 
+def _pack_m0_torch(
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    rotate_in: bool,
+    wigner_mode: int,
+) -> torch.Tensor:
+    n = x.shape[0]
+    cin = int(in_base.numel())
+    packed = x.new_empty((n, cin))
+    for l, idx in _index_groups_by_l(in_l):
+        bases = in_base.index_select(0, idx).detach().cpu().tolist()
+        dim = 2 * l + 1
+        x_l = torch.stack([x[:, int(base):int(base) + dim] for base in bases], dim=1)
+        if rotate_in:
+            block = _wigner_block_from_flat(wigner, offsets, compact_offsets, l, wigner_mode)
+            packed_l = torch.einsum("ncd,nd->nc", x_l, block[:, :, l])
+        else:
+            packed_l = x_l[:, :, l]
+        packed.index_copy_(1, idx, packed_l)
+    return packed
+
+
 def _scatter_pair_grad_torch(
     grad_pair: torch.Tensor,
     wigner: torch.Tensor,
@@ -328,6 +376,33 @@ def _scatter_pair_grad_torch(
             grad_vals = grad_pair.new_zeros((grad_pair.shape[0], len(bases), dim))
             grad_vals[:, :, row0] = grad_l[:, 0, :]
             grad_vals[:, :, row1] += grad_l[:, 1, :]
+        for local, base in enumerate(bases):
+            grad_x[:, int(base):int(base) + dim] += grad_vals[:, local, :]
+    return grad_x
+
+
+def _scatter_m0_grad_torch(
+    grad_m0: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    in_dim: int,
+    rotate_in: bool,
+    wigner_mode: int,
+) -> torch.Tensor:
+    grad_x = grad_m0.new_zeros((grad_m0.shape[0], int(in_dim)))
+    for l, idx in _index_groups_by_l(in_l):
+        bases = in_base.index_select(0, idx).detach().cpu().tolist()
+        dim = 2 * l + 1
+        grad_l = grad_m0.index_select(1, idx)
+        if rotate_in:
+            block = _wigner_block_from_flat(wigner, offsets, compact_offsets, l, wigner_mode)
+            grad_vals = grad_l.unsqueeze(-1) * block[:, :, l].unsqueeze(1)
+        else:
+            grad_vals = grad_m0.new_zeros((grad_m0.shape[0], len(bases), dim))
+            grad_vals[:, :, l] = grad_l
         for local, base in enumerate(bases):
             grad_x[:, int(base):int(base) + dim] += grad_vals[:, local, :]
     return grad_x
@@ -390,6 +465,64 @@ def _output_pair_grad_torch(
     return grad_pair
 
 
+def _scatter_pair_forward_torch(
+    pair_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    out_dim: int,
+    m: int,
+    rotate_out: bool,
+    wigner_mode: int,
+) -> torch.Tensor:
+    n = pair_out.shape[0]
+    out = pair_out.new_zeros((n, int(out_dim)))
+    for l, idx in _index_groups_by_l(out_l):
+        bases = out_base.index_select(0, idx).detach().cpu().tolist()
+        row0 = l - int(m)
+        row1 = l + int(m)
+        dim = 2 * l + 1
+        pair_l = pair_out.index_select(2, idx)
+        if rotate_out:
+            block = _wigner_block_from_flat(wigner, offsets, compact_offsets, l, wigner_mode)
+            vals = torch.einsum("npc,ndp->ncd", pair_l, block[:, :, [row0, row1]])
+        else:
+            vals = pair_out.new_zeros((n, len(bases), dim))
+            vals[:, :, row0] = pair_l[:, 0, :]
+            vals[:, :, row1] += pair_l[:, 1, :]
+        for local, base in enumerate(bases):
+            out[:, int(base):int(base) + dim] += vals[:, local, :]
+    return out
+
+
+def _output_m0_grad_torch(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    rotate_out: bool,
+    wigner_mode: int,
+) -> torch.Tensor:
+    n = grad_out.shape[0]
+    cout = int(out_base.numel())
+    grad_m0 = grad_out.new_empty((n, cout))
+    for l, idx in _index_groups_by_l(out_l):
+        bases = out_base.index_select(0, idx).detach().cpu().tolist()
+        dim = 2 * l + 1
+        grad_l = torch.stack([grad_out[:, int(base):int(base) + dim] for base in bases], dim=1)
+        if rotate_out:
+            block = _wigner_block_from_flat(wigner, offsets, compact_offsets, l, wigner_mode)
+            grad_l = torch.einsum("ncd,nd->nc", grad_l, block[:, :, l])
+        else:
+            grad_l = grad_l[:, :, l]
+        grad_m0.index_copy_(1, idx, grad_l)
+    return grad_m0
+
+
 def _output_pair_grad_cuda(
     grad_out: torch.Tensor,
     wigner: torch.Tensor,
@@ -403,6 +536,88 @@ def _output_pair_grad_cuda(
     wigner_stride: int,
 ) -> torch.Tensor:
     return _load_extension().output_pair_grad_fp32(
+        grad_out.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(m),
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _scatter_pair_forward_cuda(
+    pair_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    out_dim: int,
+    m: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_pair_forward_fp32(
+        pair_out.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(out_dim),
+        int(m),
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _scatter_raw_pair_forward_cuda(
+    raw: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    out_dim: int,
+    m: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_raw_pair_forward_fp32(
+        raw.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(out_dim),
+        int(m),
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _raw_pair_output_grad_cuda(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    m: int,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().raw_pair_output_grad_fp32(
         grad_out.contiguous(),
         wigner,
         out_base,
@@ -449,6 +664,111 @@ def _scatter_pair_grad_radial_input_cuda(
     return grad_x, grad_radial
 
 
+def _pack_m0_cuda(
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().pack_m0_fp32(
+        x.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _output_m0_grad_cuda(
+    grad_out: torch.Tensor,
+    wigner: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    rotate_out: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().output_m0_grad_fp32(
+        grad_out.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        bool(rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _scatter_m0_grad_cuda(
+    grad_m0: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    in_dim: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_m0_grad_fp32(
+        grad_m0.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        int(in_dim),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
+def _scatter_m0_grad_radial_input_cuda(
+    grad_eff: torch.Tensor,
+    m0_no_radial: torch.Tensor,
+    radial: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    in_dim: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_x, grad_radial = _load_extension().scatter_m0_grad_radial_input_fp32(
+        grad_eff.contiguous(),
+        m0_no_radial.contiguous(),
+        radial.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        int(in_dim),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+    return grad_x, grad_radial
+
+
 def _segmented_raw_linear_backward(
     x_pair: torch.Tensor,
     grad_raw: torch.Tensor,
@@ -471,6 +791,29 @@ def _segmented_raw_linear_backward(
         grad_x_r = grad_r.matmul(mixed_weight[route]).reshape(idx.numel(), 2, cin)
         grad_x_pair.index_copy_(0, idx, grad_x_r)
     return grad_x_pair, grad_weight
+
+
+def _segmented_linear_backward_torch(
+    x_in: torch.Tensor,
+    grad_out: torch.Tensor,
+    graph_index: torch.Tensor,
+    mixed_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n_routes = int(mixed_weight.shape[0])
+    cin = int(mixed_weight.shape[2])
+    cout = int(mixed_weight.shape[1])
+    grad_x = torch.empty_like(x_in)
+    grad_weight = torch.zeros_like(mixed_weight)
+    flat_graph = graph_index.reshape(-1)
+    for route in range(n_routes):
+        idx = torch.nonzero(flat_graph == route, as_tuple=False).reshape(-1)
+        if idx.numel() == 0:
+            continue
+        x_r = x_in.index_select(0, idx).reshape(-1, cin)
+        grad_r = grad_out.index_select(0, idx).reshape(-1, cout)
+        grad_weight[route] = grad_r.transpose(0, 1).matmul(x_r)
+        grad_x.index_copy_(0, idx, grad_r.matmul(mixed_weight[route]).reshape(idx.numel(), cin))
+    return grad_x, grad_weight
 
 
 def _cublas_segmented_raw_linear_backward(
@@ -516,6 +859,49 @@ def _cublas_segmented_raw_linear_backward(
     return grad_x_flat.reshape_as(x_pair), grad_weight
 
 
+def _cublas_segmented_linear_backward(
+    x_in: torch.Tensor,
+    grad_out: torch.Tensor,
+    graph_index: torch.Tensor,
+    mixed_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from dptb.nn.cublas_grouped_gemm import _load_extension as _load_cublas_grouped
+
+    n_routes = int(mixed_weight.shape[0])
+    cin = int(mixed_weight.shape[2])
+    cout = int(mixed_weight.shape[1])
+    x_flat = x_in.reshape(-1, cin).contiguous()
+    grad_flat = grad_out.reshape(-1, cout).contiguous()
+    order, unorder, _sorted_graph, ptr_cpu = _row_segment_layout(graph_index, n_routes)
+
+    if order is not None:
+        x_sorted = x_flat.index_select(0, order).contiguous()
+        grad_sorted = grad_flat.index_select(0, order).contiguous()
+    else:
+        x_sorted = x_flat
+        grad_sorted = grad_flat
+
+    ext = _load_cublas_grouped()
+    grad_x_sorted = ext.grouped_gemm_forward_fp32(
+        grad_sorted,
+        ptr_cpu,
+        mixed_weight.transpose(1, 2).contiguous(),
+        False,
+    )
+    if unorder is not None:
+        grad_x_flat = grad_x_sorted.index_select(0, unorder)
+    else:
+        grad_x_flat = grad_x_sorted
+    grad_weight = ext.grouped_gemm_backward_weight_fp32(
+        grad_sorted,
+        x_sorted,
+        ptr_cpu,
+        n_routes,
+        False,
+    )
+    return grad_x_flat.reshape_as(x_in), grad_weight
+
+
 def _cutlass_segmented_raw_linear_backward(
     x_pair: torch.Tensor,
     grad_raw: torch.Tensor,
@@ -556,6 +942,46 @@ def _cutlass_segmented_raw_linear_backward(
     return grad_x_flat.reshape_as(x_pair), grad_weight
 
 
+def _cutlass_segmented_linear_backward(
+    x_in: torch.Tensor,
+    grad_out: torch.Tensor,
+    graph_index: torch.Tensor,
+    mixed_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from dptb.nn.cutlass_grouped_gemm import grouped_gemm, grouped_gemm_backward_weight
+
+    n_routes = int(mixed_weight.shape[0])
+    cin = int(mixed_weight.shape[2])
+    cout = int(mixed_weight.shape[1])
+    x_flat = x_in.reshape(-1, cin).contiguous()
+    grad_flat = grad_out.reshape(-1, cout).contiguous()
+    order, unorder, _sorted_graph, ptr_cpu = _row_segment_layout(graph_index, n_routes)
+
+    if order is not None:
+        x_sorted = x_flat.index_select(0, order).contiguous()
+        grad_sorted = grad_flat.index_select(0, order).contiguous()
+    else:
+        x_sorted = x_flat
+        grad_sorted = grad_flat
+
+    grad_x_sorted = grouped_gemm(
+        grad_sorted,
+        ptr_cpu,
+        mixed_weight.transpose(1, 2).contiguous(),
+    )
+    if unorder is not None:
+        grad_x_flat = grad_x_sorted.index_select(0, unorder)
+    else:
+        grad_x_flat = grad_x_sorted
+    grad_weight = grouped_gemm_backward_weight(
+        grad_sorted,
+        x_sorted,
+        ptr_cpu,
+        n_routes,
+    )
+    return grad_x_flat.reshape_as(x_in), grad_weight
+
+
 def _segmented_raw_linear_forward(
     x_pair: torch.Tensor,
     graph_index: torch.Tensor,
@@ -573,6 +999,141 @@ def _segmented_raw_linear_forward(
         raw_r = x_r.matmul(mixed_weight[route].transpose(0, 1)).reshape(idx.numel(), 2, out2)
         raw.index_copy_(0, idx, raw_r)
     return raw
+
+
+def _segmented_m0_linear_forward(
+    x_in: torch.Tensor,
+    graph_index: torch.Tensor,
+    mixed_weight: torch.Tensor,
+    mixed_bias: torch.Tensor,
+) -> torch.Tensor:
+    n_routes = int(mixed_weight.shape[0])
+    cout = int(mixed_weight.shape[1])
+    raw = x_in.new_empty((x_in.shape[0], cout))
+    flat_graph = graph_index.reshape(-1)
+    has_bias = mixed_bias.numel() != 0
+    for route in range(n_routes):
+        idx = torch.nonzero(flat_graph == route, as_tuple=False).reshape(-1)
+        if idx.numel() == 0:
+            continue
+        raw_r = x_in.index_select(0, idx).matmul(mixed_weight[route].transpose(0, 1))
+        if has_bias:
+            raw_r = raw_r + mixed_bias[route]
+        raw.index_copy_(0, idx, raw_r)
+    return raw
+
+
+def _route_bias_grad(grad_out: torch.Tensor, graph_index: torch.Tensor, n_routes: int) -> torch.Tensor:
+    grad_bias = grad_out.new_zeros((int(n_routes), grad_out.shape[-1]))
+    expanded = graph_index.reshape(-1, 1).expand(-1, grad_out.shape[-1])
+    grad_bias.scatter_add_(0, expanded, grad_out)
+    return grad_bias
+
+
+def _segmented_m0_backward(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    graph_index: torch.Tensor,
+    mixed_weight: torch.Tensor,
+    mixed_bias: torch.Tensor,
+    radial: torch.Tensor,
+    in_base: torch.Tensor,
+    in_l: torch.Tensor,
+    out_base: torch.Tensor,
+    out_l: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    out_dim: int,
+    rotate_in: bool,
+    rotate_out: bool,
+    radial_on_input: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+    linear_backend: str,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    del out_dim
+    has_radial = radial.numel() != 0
+    has_bias = mixed_bias.numel() != 0
+    use_cuda_epilogue = linear_backend.startswith("cuda_")
+    raw_backend = linear_backend[5:] if use_cuda_epilogue else linear_backend
+    if use_cuda_epilogue:
+        x_m0_no_radial = _pack_m0_cuda(
+            x, wigner, in_base, in_l, offsets, compact_offsets,
+            rotate_in, wigner_mode, wigner_stride
+        )
+    else:
+        x_m0_no_radial = _pack_m0_torch(
+            x, wigner, in_base, in_l, offsets, compact_offsets, rotate_in, wigner_mode
+        )
+    if has_radial and radial_on_input:
+        x_m0_eff = x_m0_no_radial * radial
+    else:
+        x_m0_eff = x_m0_no_radial
+
+    if use_cuda_epilogue:
+        grad_linear = _output_m0_grad_cuda(
+            grad_out, wigner, out_base, out_l, offsets, compact_offsets,
+            rotate_out, wigner_mode, wigner_stride
+        )
+    else:
+        grad_linear = _output_m0_grad_torch(
+            grad_out, wigner, out_base, out_l, offsets, compact_offsets, rotate_out, wigner_mode
+        )
+
+    grad_radial = torch.zeros_like(radial) if has_radial else None
+    if has_radial and not radial_on_input:
+        raw = _segmented_m0_linear_forward(x_m0_eff, graph_index, mixed_weight, mixed_bias)
+        grad_radial = grad_linear * raw
+        grad_linear = grad_linear * radial
+
+    if raw_backend == "cutlass_segmented":
+        grad_m0_eff, grad_weight = _cutlass_segmented_linear_backward(
+            x_m0_eff, grad_linear, graph_index, mixed_weight
+        )
+    elif raw_backend == "cublas_segmented":
+        grad_m0_eff, grad_weight = _cublas_segmented_linear_backward(
+            x_m0_eff, grad_linear, graph_index, mixed_weight
+        )
+    else:
+        grad_m0_eff, grad_weight = _segmented_linear_backward_torch(
+            x_m0_eff, grad_linear, graph_index, mixed_weight
+        )
+    grad_bias = _route_bias_grad(grad_linear, graph_index, int(mixed_weight.shape[0])) if has_bias else None
+
+    if has_radial and radial_on_input:
+        if use_cuda_epilogue and _flag("DPTB_SO2_MOE_FUSED_P0_FUSE_M0_INPUT_RADIAL_SCATTER", "1"):
+            grad_x, grad_radial = _scatter_m0_grad_radial_input_cuda(
+                grad_m0_eff,
+                x_m0_no_radial,
+                radial,
+                wigner,
+                in_base,
+                in_l,
+                offsets,
+                compact_offsets,
+                x.shape[1],
+                rotate_in,
+                wigner_mode,
+                wigner_stride,
+            )
+            return grad_x, grad_weight, grad_bias, grad_radial
+        grad_radial = grad_m0_eff * x_m0_no_radial
+        grad_m0 = grad_m0_eff * radial
+    else:
+        grad_m0 = grad_m0_eff
+
+    if use_cuda_epilogue:
+        grad_x = _scatter_m0_grad_cuda(
+            grad_m0, wigner, in_base, in_l, offsets, compact_offsets,
+            x.shape[1], rotate_in, wigner_mode, wigner_stride
+        )
+    else:
+        grad_x = _scatter_m0_grad_torch(
+            grad_m0, wigner, in_base, in_l, offsets, compact_offsets,
+            x.shape[1], rotate_in, wigner_mode
+        )
+    return grad_x, grad_weight, grad_bias, grad_radial
 
 
 def _segmented_pair_backward(
@@ -686,6 +1247,319 @@ def _segmented_pair_backward(
             x.shape[1], m, rotate_in, wigner_mode
         )
     return grad_x, grad_weight, grad_radial
+
+
+class _FusedM0Function(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        wigner,
+        graph_index,
+        mixed_weight,
+        mixed_bias,
+        radial,
+        in_base,
+        in_l,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        out_dim: int,
+        rotate_in: bool,
+        rotate_out: bool,
+        radial_on_input: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        out = _load_extension().fused_m0_forward_fp32(
+            x,
+            wigner,
+            graph_index,
+            mixed_weight,
+            mixed_bias,
+            radial,
+            in_base,
+            in_l,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(out_dim),
+            bool(rotate_in),
+            bool(rotate_out),
+            bool(radial_on_input),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.save_for_backward(
+            x,
+            wigner,
+            graph_index,
+            mixed_weight,
+            mixed_bias,
+            radial,
+            in_base,
+            in_l,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+        )
+        ctx.meta = (
+            int(out_dim),
+            bool(rotate_in),
+            bool(rotate_out),
+            bool(radial_on_input),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (
+            x,
+            wigner,
+            graph_index,
+            mixed_weight,
+            mixed_bias,
+            radial,
+            in_base,
+            in_l,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+        ) = ctx.saved_tensors
+        (
+            out_dim,
+            rotate_in,
+            rotate_out,
+            radial_on_input,
+            wigner_mode,
+            wigner_stride,
+        ) = ctx.meta
+        backward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", "cuda_cublas_segmented")
+        grad_x, grad_mixed_weight, grad_mixed_bias, grad_radial = _segmented_m0_backward(
+            grad_out.contiguous(),
+            x,
+            wigner,
+            graph_index,
+            mixed_weight,
+            mixed_bias,
+            radial,
+            in_base,
+            in_l,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(out_dim),
+            bool(rotate_in),
+            bool(rotate_out),
+            bool(radial_on_input),
+            int(wigner_mode),
+            int(wigner_stride),
+            backward_mode,
+        )
+        if mixed_bias.numel() == 0:
+            grad_mixed_bias = None
+        if radial.numel() == 0:
+            grad_radial = None
+        return (
+            grad_x,
+            None,
+            None,
+            grad_mixed_weight,
+            grad_mixed_bias,
+            grad_radial,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _PackPairFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        m: int,
+        rotate_in: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        pair = _pack_pair_cuda(
+            x,
+            wigner,
+            in_base,
+            in_l,
+            offsets,
+            compact_offsets,
+            int(m),
+            bool(rotate_in),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.save_for_backward(wigner, in_base, in_l, offsets, compact_offsets)
+        ctx.meta = (
+            int(x.shape[1]),
+            int(m),
+            bool(rotate_in),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return pair
+
+    @staticmethod
+    def backward(ctx, grad_pair):
+        wigner, in_base, in_l, offsets, compact_offsets = ctx.saved_tensors
+        in_dim, m, rotate_in, wigner_mode, wigner_stride = ctx.meta
+        grad_x = _scatter_pair_grad_cuda(
+            grad_pair.contiguous(),
+            wigner,
+            in_base,
+            in_l,
+            offsets,
+            compact_offsets,
+            int(in_dim),
+            int(m),
+            bool(rotate_in),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return grad_x, None, None, None, None, None, None, None, None, None
+
+
+class _ScatterPairOutputFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        pair_out,
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        out_dim: int,
+        m: int,
+        rotate_out: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        out = _scatter_pair_forward_cuda(
+            pair_out,
+            wigner,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(out_dim),
+            int(m),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.save_for_backward(wigner, out_base, out_l, offsets, compact_offsets)
+        ctx.meta = (
+            int(out_dim),
+            int(m),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        wigner, out_base, out_l, offsets, compact_offsets = ctx.saved_tensors
+        _out_dim, m, rotate_out, wigner_mode, wigner_stride = ctx.meta
+        grad_pair = _output_pair_grad_cuda(
+            grad_out.contiguous(),
+            wigner,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(m),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return grad_pair, None, None, None, None, None, None, None, None, None, None
+
+
+class _ScatterRawPairOutputFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        raw,
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        out_dim: int,
+        m: int,
+        rotate_out: bool,
+        wigner_mode: int,
+        wigner_stride: int,
+    ):
+        out = _scatter_raw_pair_forward_cuda(
+            raw,
+            wigner,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(out_dim),
+            int(m),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        ctx.save_for_backward(wigner, out_base, out_l, offsets, compact_offsets)
+        ctx.meta = (
+            int(out_dim),
+            int(m),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        wigner, out_base, out_l, offsets, compact_offsets = ctx.saved_tensors
+        _out_dim, m, rotate_out, wigner_mode, wigner_stride = ctx.meta
+        grad_raw = _raw_pair_output_grad_cuda(
+            grad_out.contiguous(),
+            wigner,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(m),
+            bool(rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+        return grad_raw, None, None, None, None, None, None, None, None, None, None
 
 
 class _FusedPairFunction(torch.autograd.Function):
@@ -883,6 +1757,108 @@ class _FusedPairFunction(torch.autograd.Function):
         )
 
 
+def _fused_pair_indexed_sandwich(
+    module,
+    m: int,
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    wigner_mode: int,
+    wigner_stride: int,
+    mole_globals: MOLEGlobals,
+    radial_weight: Optional[torch.Tensor],
+    *,
+    require_cueq: bool,
+):
+    fc = module.m_linear[m - 1].fc
+    mode = getattr(fc, "mole_linear_mode", None)
+    if require_cueq and mode != "cueq_indexed_linear":
+        if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE"):
+            raise RuntimeError(
+                "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=cueq_sandwich requires "
+                "mole_linear_mode='cueq_indexed_linear'."
+            )
+        _warn_once(
+            "cueq_sandwich_backend_fallback",
+            "cueq_sandwich requested but MOLELinear is not cueq_indexed_linear; "
+            "using the configured indexed linear backend inside the CUDA rotation sandwich.",
+        )
+
+    in_base, in_l, out_base, out_l, offsets = _pair_maps(module, m, x.device)
+    cin = int(in_base.numel())
+    cout = int(out_base.numel())
+    if getattr(fc, "in_features", None) != cin or getattr(fc, "out_features", None) != 2 * cout:
+        _warn_once(
+            "indexed_sandwich_shape_fallback",
+            "streamed_m_major_fused_p0 indexed_sandwich shape does not match SO2 pair maps; falling back.",
+        )
+        return None
+
+    pair = _PackPairFunction.apply(
+        x.contiguous(),
+        wigner,
+        in_base,
+        in_l,
+        offsets,
+        compact_offsets,
+        int(m),
+        bool(module.rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+    radial = None
+    if radial_weight is not None:
+        radial = radial_weight.contiguous()
+        expected = cin if bool(module.front) else cout
+        if radial.shape != (x.shape[0], 1, expected):
+            _warn_once(
+                "indexed_sandwich_radial_shape_fallback",
+                f"streamed_m_major_fused_p0 indexed_sandwich radial shape {tuple(radial.shape)} "
+                f"does not match expected {(x.shape[0], 1, expected)}; falling back.",
+            )
+            return None
+
+    if radial is not None and bool(module.front):
+        pair_for_linear = pair * radial
+    else:
+        pair_for_linear = pair
+
+    raw = fc(pair_for_linear, mole_globals)
+    if radial is None or bool(module.front):
+        return _ScatterRawPairOutputFunction.apply(
+            raw.contiguous(),
+            wigner,
+            out_base,
+            out_l,
+            offsets,
+            compact_offsets,
+            int(module.irreps_out.dim),
+            int(m),
+            bool(module.rotate_out),
+            int(wigner_mode),
+            int(wigner_stride),
+        )
+
+    pair_out = module.m_linear[m - 1]._finish_linear_output(raw)
+    if radial is not None:
+        pair_out = pair_out * radial
+
+    return _ScatterPairOutputFunction.apply(
+        pair_out.contiguous(),
+        wigner,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(module.irreps_out.dim),
+        int(m),
+        bool(module.rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
 def _fused_pair_contribution(
     module,
     m: int,
@@ -904,6 +1880,21 @@ def _fused_pair_contribution(
     if getattr(fc, "bias_experts", None) is not None:
         _warn_once("pair_bias_fallback", "streamed_m_major_fused_p0 expects bias-free m>0 MoE linears; falling back.")
         return None
+
+    forward_mode = os.environ.get("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", "scalar")
+    if forward_mode in ("indexed_sandwich", "cueq_sandwich", "cueq_compatible"):
+        return _fused_pair_indexed_sandwich(
+            module,
+            m,
+            x,
+            wigner,
+            compact_offsets,
+            wigner_mode,
+            wigner_stride,
+            mole_globals,
+            radial_weight,
+            require_cueq=(forward_mode in ("cueq_sandwich", "cueq_compatible")),
+        )
 
     mixed_weight, mixed_bias = fc._mix_expert_parameters(mole_globals)
     if mixed_bias is not None:
@@ -962,6 +1953,84 @@ def _fused_pair_contribution(
     )
 
 
+def _fused_m0_contribution(
+    module,
+    x: torch.Tensor,
+    wigner: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    wigner_mode: int,
+    wigner_stride: int,
+    mole_globals: MOLEGlobals,
+    radial_weight: Optional[torch.Tensor],
+):
+    fc = module.fc_m0
+    if not hasattr(fc, "_mix_expert_parameters"):
+        return None
+
+    mixed_weight, mixed_bias = fc._mix_expert_parameters(mole_globals)
+    graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
+    if graph_index.numel() != x.shape[0]:
+        raise ValueError(
+            f"MOLE graph_index has {graph_index.numel()} rows, but fused m0 input has {x.shape[0]} rows."
+        )
+
+    in_base, in_l, out_base, out_l, offsets = _pair_maps(module, 0, x.device)
+    cin = int(in_base.numel())
+    cout = int(out_base.numel())
+    if mixed_weight.shape[-2:] != (cout, cin):
+        _warn_once(
+            "m0_weight_shape_fallback",
+            "streamed_m_major_fused_p0 m0 mixed weight shape does not match SO2 maps; falling back.",
+        )
+        return None
+
+    if mixed_bias is None:
+        mixed_bias_arg = x.new_empty((0,))
+    else:
+        if mixed_bias.shape != (mixed_weight.shape[0], cout):
+            _warn_once(
+                "m0_bias_shape_fallback",
+                "streamed_m_major_fused_p0 m0 mixed bias shape does not match SO2 maps; falling back.",
+            )
+            return None
+        mixed_bias_arg = mixed_bias.contiguous()
+
+    if radial_weight is None:
+        radial = x.new_empty((0,))
+        radial_on_input = True
+    else:
+        radial = radial_weight.squeeze(1).contiguous()
+        radial_on_input = bool(module.front)
+        expected = cin if radial_on_input else cout
+        if radial.shape != (x.shape[0], expected):
+            _warn_once(
+                "m0_radial_shape_fallback",
+                f"streamed_m_major_fused_p0 m0 radial shape {tuple(radial.shape)} does not match expected {(x.shape[0], expected)}; falling back.",
+            )
+            return None
+
+    return _FusedM0Function.apply(
+        x.contiguous(),
+        wigner,
+        graph_index.to(device=x.device, dtype=torch.long).contiguous(),
+        mixed_weight.contiguous(),
+        mixed_bias_arg,
+        radial,
+        in_base,
+        in_l,
+        out_base,
+        out_l,
+        offsets,
+        compact_offsets,
+        int(module.irreps_out.dim),
+        bool(module.rotate_in),
+        bool(module.rotate_out),
+        bool(radial_on_input),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
 def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
     """Return a trainable fused SO2/MoE P0 result or ``None`` to fall back.
 
@@ -1000,14 +2069,31 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
     out = torch.zeros((x.shape[0], module.irreps_out.dim), dtype=x.dtype, device=x.device)
 
     radial_m0 = weights[:, module.m_in_index[0]:module.m_in_index[1]].unsqueeze(1) if module.radial_emb else None
-    inp0 = module._direct_rotate_pack_m(x, 0, wigner_D_all)
-    if module.front and module.radial_emb:
-        y0 = module.fc_m0(inp0 * radial_m0.squeeze(1), mole_globals)
-    elif module.radial_emb:
-        y0 = module.fc_m0(inp0, mole_globals) * radial_m0.squeeze(1)
+    m0_contribution = None
+    if _flag("DPTB_SO2_MOE_FUSED_P0_FUSE_M0", "0"):
+        m0_contribution = _fused_m0_contribution(
+            module,
+            x,
+            wigner,
+            compact_offsets,
+            wigner_mode,
+            wigner_stride,
+            mole_globals,
+            radial_m0,
+        )
+    if m0_contribution is None:
+        if _flag("DPTB_SO2_MOE_FUSED_P0_STRICT_M0"):
+            raise RuntimeError("streamed_m_major_fused_p0 m0 fusion declined under strict mode.")
+        inp0 = module._direct_rotate_pack_m(x, 0, wigner_D_all)
+        if module.front and module.radial_emb:
+            y0 = module.fc_m0(inp0 * radial_m0.squeeze(1), mole_globals)
+        elif module.radial_emb:
+            y0 = module.fc_m0(inp0, mole_globals) * radial_m0.squeeze(1)
+        else:
+            y0 = module.fc_m0(inp0, mole_globals)
+        module._accumulate_m0_output(out, y0, wigner_D_all)
     else:
-        y0 = module.fc_m0(inp0, mole_globals)
-    module._accumulate_m0_output(out, y0, wigner_D_all)
+        out.add_(m0_contribution)
 
     for m in range(1, module.m_max + 1):
         radial_m = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1) if module.radial_emb else None

@@ -73,10 +73,19 @@ def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind
         pytest.skip("SO2 MoE fused P0 CUDA pair-op smoke requires CUDA")
 
     from dptb.nn.so2_moe_fused_p0 import (
+        _output_m0_grad_cuda,
+        _output_m0_grad_torch,
         _output_pair_grad_cuda,
         _output_pair_grad_torch,
+        _pack_m0_cuda,
+        _pack_m0_torch,
         _pack_pair_cuda,
         _pack_pair_torch,
+        _scatter_m0_grad_cuda,
+        _scatter_m0_grad_radial_input_cuda,
+        _scatter_m0_grad_torch,
+        _scatter_pair_forward_cuda,
+        _scatter_pair_forward_torch,
         _scatter_pair_grad_cuda,
         _scatter_pair_grad_radial_input_cuda,
         _scatter_pair_grad_torch,
@@ -144,6 +153,16 @@ def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind
     )
     torch.testing.assert_close(out_grad_cuda, out_grad_ref, atol=1e-6, rtol=1e-6)
 
+    pair_out = torch.randn((n_edges, 2, out_base.numel()), device=device, dtype=torch.float32)
+    scatter_forward_ref = _scatter_pair_forward_torch(
+        pair_out, wigner, out_base, out_l, offsets, compact_offsets, out_dim, m, True, wigner_mode
+    )
+    scatter_forward_cuda = _scatter_pair_forward_cuda(
+        pair_out, wigner, out_base, out_l, offsets, compact_offsets,
+        out_dim, m, True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(scatter_forward_cuda, scatter_forward_ref, atol=1e-6, rtol=1e-6)
+
     scatter_ref = _scatter_pair_grad_torch(
         grad_pair, wigner, in_base, in_l, offsets, compact_offsets, in_dim, m, True, wigner_mode
     )
@@ -185,6 +204,71 @@ def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind
     )
     torch.testing.assert_close(scatter_radial_cuda, scatter_radial_ref, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(grad_radial_cuda, grad_radial_ref, atol=1e-6, rtol=1e-6)
+
+    m0_in_base = torch.tensor([0, 3, 8, 15], device=device, dtype=torch.long)
+    m0_in_l = torch.tensor([1, 2, 3, 3], device=device, dtype=torch.long)
+    m0_out_base = torch.tensor([0, 3, 8], device=device, dtype=torch.long)
+    m0_out_l = torch.tensor([1, 2, 3], device=device, dtype=torch.long)
+    grad_m0 = torch.randn((n_edges, m0_in_base.numel()), device=device, dtype=torch.float32)
+
+    pack_m0_ref = _pack_m0_torch(
+        x, wigner, m0_in_base, m0_in_l, offsets, compact_offsets, True, wigner_mode
+    )
+    pack_m0_cuda = _pack_m0_cuda(
+        x, wigner, m0_in_base, m0_in_l, offsets, compact_offsets,
+        True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(pack_m0_cuda, pack_m0_ref, atol=1e-6, rtol=1e-6)
+
+    out_m0_grad_ref = _output_m0_grad_torch(
+        grad_out, wigner, m0_out_base, m0_out_l, offsets, compact_offsets, True, wigner_mode
+    )
+    out_m0_grad_cuda = _output_m0_grad_cuda(
+        grad_out, wigner, m0_out_base, m0_out_l, offsets, compact_offsets,
+        True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(out_m0_grad_cuda, out_m0_grad_ref, atol=1e-6, rtol=1e-6)
+
+    scatter_m0_ref = _scatter_m0_grad_torch(
+        grad_m0, wigner, m0_in_base, m0_in_l, offsets, compact_offsets,
+        in_dim, True, wigner_mode
+    )
+    scatter_m0_cuda = _scatter_m0_grad_cuda(
+        grad_m0, wigner, m0_in_base, m0_in_l, offsets, compact_offsets,
+        in_dim, True, wigner_mode, wigner_stride
+    )
+    torch.testing.assert_close(scatter_m0_cuda, scatter_m0_ref, atol=1e-6, rtol=1e-6)
+
+    radial_m0 = torch.randn_like(pack_m0_ref)
+    grad_m0_eff = torch.randn_like(pack_m0_ref)
+    scatter_m0_radial_ref = _scatter_m0_grad_torch(
+        grad_m0_eff * radial_m0,
+        wigner,
+        m0_in_base,
+        m0_in_l,
+        offsets,
+        compact_offsets,
+        in_dim,
+        True,
+        wigner_mode,
+    )
+    grad_m0_radial_ref = grad_m0_eff * pack_m0_ref
+    scatter_m0_radial_cuda, grad_m0_radial_cuda = _scatter_m0_grad_radial_input_cuda(
+        grad_m0_eff,
+        pack_m0_ref,
+        radial_m0,
+        wigner,
+        m0_in_base,
+        m0_in_l,
+        offsets,
+        compact_offsets,
+        in_dim,
+        True,
+        wigner_mode,
+        wigner_stride,
+    )
+    torch.testing.assert_close(scatter_m0_radial_cuda, scatter_m0_radial_ref, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(grad_m0_radial_cuda, grad_m0_radial_ref, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize("tile_out", [2, 3, 4, 8])
@@ -355,6 +439,8 @@ def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeyp
         monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE", forward_mode)
         monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE", "1")
     monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_BACKWARD_MODE", backward_mode)
+    monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_FUSE_M0", "1")
+    monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_STRICT_M0", "1")
 
     from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
@@ -429,6 +515,109 @@ def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeyp
     assert fused_result is not None
     fused_out, returned_wigner = fused_result
     assert returned_wigner is wigner
+    torch.testing.assert_close(fused_out, ref_out, atol=8e-4, rtol=8e-4)
+
+    (ref_out * target).sum().backward()
+    (fused_out * target).sum().backward()
+
+    torch.testing.assert_close(x_fused.grad, x_ref.grad, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(latents_fused.grad, latents_ref.grad, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(topk_values_fused.grad, topk_values_ref.grad, atol=3e-3, rtol=3e-3)
+
+    for name, fused_param in fused.named_parameters():
+        ref_param = dict(ref.named_parameters())[name]
+        assert fused_param.grad is not None, name
+        torch.testing.assert_close(fused_param.grad, ref_param.grad, atol=4e-3, rtol=4e-3)
+
+
+@pytest.mark.parametrize("linear_mode", ["cublas_grouped", "cueq_indexed_linear"])
+def test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available(monkeypatch, linear_mode):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    if linear_mode == "cueq_indexed_linear":
+        pytest.importorskip("cuequivariance")
+        pytest.importorskip("cuequivariance_torch")
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 MoE fused P0 indexed-sandwich smoke requires CUDA")
+
+    monkeypatch.setenv(
+        "DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE",
+        "cueq_sandwich" if linear_mode == "cueq_indexed_linear" else "indexed_sandwich",
+    )
+    monkeypatch.setenv("DPTB_SO2_MOE_FUSED_P0_STRICT_FORWARD_MODE", "1")
+
+    from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260526)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    kwargs = dict(
+        irreps_in="2x0e + 2x1o + 1x2e",
+        irreps_out="1x0e + 2x1o + 2x2e",
+        radial_emb=True,
+        latent_dim=5,
+        radial_channels=[7],
+        num_experts=5,
+        num_shared_experts=1,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+        mole_linear_mode=linear_mode,
+    )
+    ref = SO2_Linear(**kwargs, so2_fusion_mode="streamed_m_major_ref").to(device=device, dtype=dtype)
+    fused = SO2_Linear(**kwargs, so2_fusion_mode="streamed_m_major_fused_p0").to(device=device, dtype=dtype)
+    fused.load_state_dict(ref.state_dict(), strict=True)
+    ref.train()
+    fused.train()
+
+    n_edges = 6
+    routes = 3
+    top_k = 2
+    graph_index = torch.tensor([0, 1, 2, 0, 1, 2], device=device, dtype=torch.long)
+    topk_indices = torch.tensor([[0, 2], [1, 3], [2, 4]], device=device, dtype=torch.long)
+    topk_values_data = torch.rand((routes, top_k), device=device, dtype=dtype)
+    topk_values_data = topk_values_data / topk_values_data.sum(dim=-1, keepdim=True)
+    topk_values_ref = topk_values_data.detach().clone().requires_grad_(True)
+    topk_values_fused = topk_values_data.detach().clone().requires_grad_(True)
+    coeffs_ref = torch.zeros((routes, kwargs["num_experts"]), device=device, dtype=dtype)
+    coeffs_fused = torch.zeros_like(coeffs_ref)
+    coeffs_ref.scatter_(1, topk_indices, topk_values_ref.detach())
+    coeffs_fused.scatter_(1, topk_indices, topk_values_fused.detach())
+    ref_globals = MOLEGlobals(
+        coefficients=coeffs_ref,
+        graph_index=graph_index,
+        topk_indices=topk_indices,
+        topk_values=topk_values_ref,
+    )
+    fused_globals = MOLEGlobals(
+        coefficients=coeffs_fused,
+        graph_index=graph_index,
+        topk_indices=topk_indices,
+        topk_values=topk_values_fused,
+    )
+
+    x_data = torch.randn(n_edges, ref.irreps_in.dim, device=device, dtype=dtype)
+    latents_data = torch.randn(n_edges, kwargs["latent_dim"], device=device, dtype=dtype)
+    R = torch.randn(n_edges, 3, device=device, dtype=dtype)
+    x_ref = x_data.detach().clone().requires_grad_(True)
+    x_fused = x_data.detach().clone().requires_grad_(True)
+    latents_ref = latents_data.detach().clone().requires_grad_(True)
+    latents_fused = latents_data.detach().clone().requires_grad_(True)
+    target = torch.randn(n_edges, ref.irreps_out.dim, device=device, dtype=dtype)
+
+    ref_out, wigner = ref(x_ref, R, ref_globals, latents_ref)
+    fused_result = try_forward_so2_moe_fused_p0(
+        fused,
+        x_fused,
+        R,
+        fused_globals,
+        latents_fused,
+        wigner,
+    )
+
+    assert fused_result is not None
+    fused_out, _ = fused_result
     torch.testing.assert_close(fused_out, ref_out, atol=8e-4, rtol=8e-4)
 
     (ref_out * target).sum().backward()

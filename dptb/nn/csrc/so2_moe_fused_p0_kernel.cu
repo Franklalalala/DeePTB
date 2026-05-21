@@ -73,6 +73,38 @@ __device__ __forceinline__ float load_pair_value(
   return acc;
 }
 
+__device__ __forceinline__ float load_m0_value(
+    const float* __restrict__ x,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ in_base,
+    const int64_t* __restrict__ in_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    int64_t edge,
+    int64_t channel,
+    int64_t in_dim,
+    int64_t dense_stride,
+    int64_t compact_stride,
+    int wigner_mode,
+    bool rotate_in) {
+  const int64_t base = in_base[channel];
+  const int l = static_cast<int>(in_l[channel]);
+  if (!rotate_in || l == 0) {
+    return x[edge * in_dim + base + l];
+  }
+
+  const int dim = 2 * l + 1;
+  float acc = 0.0f;
+  for (int d = 0; d < dim; ++d) {
+    const float x_val = x[edge * in_dim + base + d];
+    const float d_val = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, l, dense_stride, compact_stride, wigner_mode);
+    acc += x_val * d_val;
+  }
+  return acc;
+}
+
 __device__ __forceinline__ void scatter_pair_grad_x(
     float* __restrict__ grad_x,
     const float* __restrict__ wigner,
@@ -497,6 +529,166 @@ __global__ void output_pair_grad_kernel(
   grad_pair[(edge * 2 + 1) * cout + channel] = grad1;
 }
 
+__global__ void scatter_pair_forward_kernel(
+    const float* __restrict__ pair_out,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ out_base,
+    const int64_t* __restrict__ out_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ out,
+    int64_t n_edges,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cout,
+    int m,
+    int wigner_mode,
+    bool rotate_out) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cout;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / cout;
+  const int64_t channel = idx - edge * cout;
+  const int l = static_cast<int>(out_l[channel]);
+  const int row0 = l - m;
+  const int row1 = l + m;
+  const int64_t base = out_base[channel];
+  const float y0 = pair_out[(edge * 2) * cout + channel];
+  const float y1 = pair_out[(edge * 2 + 1) * cout + channel];
+  float* __restrict__ out_edge = out + edge * out_dim;
+
+  if (!rotate_out) {
+    out_edge[base + row0] += y0;
+    out_edge[base + row1] += y1;
+    return;
+  }
+
+  const int dim = 2 * l + 1;
+  for (int d = 0; d < dim; ++d) {
+    const float d0 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row0, dense_stride, wigner_stride, wigner_mode);
+    const float d1 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
+    out_edge[base + d] += y0 * d0 + y1 * d1;
+  }
+}
+
+__global__ void scatter_raw_pair_forward_kernel(
+    const float* __restrict__ raw,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ out_base,
+    const int64_t* __restrict__ out_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ out,
+    int64_t n_edges,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cout,
+    int m,
+    int wigner_mode,
+    bool rotate_out) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cout;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / cout;
+  const int64_t channel = idx - edge * cout;
+  const int64_t out2 = 2 * cout;
+  const float rr0 = raw[(edge * 2) * out2 + channel];
+  const float ii0 = raw[(edge * 2) * out2 + cout + channel];
+  const float rr1 = raw[(edge * 2 + 1) * out2 + channel];
+  const float ii1 = raw[(edge * 2 + 1) * out2 + cout + channel];
+  const float y0 = rr0 - ii1;
+  const float y1 = rr1 + ii0;
+
+  const int l = static_cast<int>(out_l[channel]);
+  const int row0 = l - m;
+  const int row1 = l + m;
+  const int64_t base = out_base[channel];
+  float* __restrict__ out_edge = out + edge * out_dim;
+
+  if (!rotate_out) {
+    out_edge[base + row0] += y0;
+    out_edge[base + row1] += y1;
+    return;
+  }
+
+  const int dim = 2 * l + 1;
+  for (int d = 0; d < dim; ++d) {
+    const float d0 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row0, dense_stride, wigner_stride, wigner_mode);
+    const float d1 = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
+    out_edge[base + d] += y0 * d0 + y1 * d1;
+  }
+}
+
+__global__ void raw_pair_output_grad_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ out_base,
+    const int64_t* __restrict__ out_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ grad_raw,
+    int64_t n_edges,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cout,
+    int m,
+    int wigner_mode,
+    bool rotate_out) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cout;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / cout;
+  const int64_t channel = idx - edge * cout;
+  const int l = static_cast<int>(out_l[channel]);
+  const int row0 = l - m;
+  const int row1 = l + m;
+  const int64_t base = out_base[channel];
+  const float* __restrict__ grad_out_edge = grad_out + edge * out_dim;
+
+  float grad0 = 0.0f;
+  float grad1 = 0.0f;
+  if (!rotate_out) {
+    grad0 = grad_out_edge[base + row0];
+    grad1 = grad_out_edge[base + row1];
+  } else {
+    const int dim = 2 * l + 1;
+    for (int d = 0; d < dim; ++d) {
+      const float go = grad_out_edge[base + d];
+      const float d0 = load_wigner_value(
+          wigner, offsets, compact_offsets,
+          edge, l, d, row0, dense_stride, wigner_stride, wigner_mode);
+      const float d1 = load_wigner_value(
+          wigner, offsets, compact_offsets,
+          edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
+      grad0 += go * d0;
+      grad1 += go * d1;
+    }
+  }
+
+  const int64_t out2 = 2 * cout;
+  grad_raw[(edge * 2) * out2 + channel] = grad0;
+  grad_raw[(edge * 2) * out2 + cout + channel] = grad1;
+  grad_raw[(edge * 2 + 1) * out2 + channel] = grad1;
+  grad_raw[(edge * 2 + 1) * out2 + cout + channel] = -grad0;
+}
+
 __global__ void scatter_pair_grad_kernel(
     const float* __restrict__ grad_pair,
     const float* __restrict__ wigner,
@@ -604,6 +796,248 @@ __global__ void scatter_pair_grad_radial_input_kernel(
         wigner, offsets, compact_offsets,
         edge, l, d, row1, dense_stride, wigner_stride, wigner_mode);
     grad_edge[base + d] = grad0 * d0 + grad1 * d1;
+  }
+}
+
+__global__ void fused_m0_forward_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ graph_index,
+    const float* __restrict__ mixed_weight,
+    const float* __restrict__ mixed_bias,
+    const float* __restrict__ radial,
+    const int64_t* __restrict__ in_base,
+    const int64_t* __restrict__ in_l,
+    const int64_t* __restrict__ out_base,
+    const int64_t* __restrict__ out_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ out,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t n_routes,
+    int64_t cin,
+    int64_t cout,
+    int wigner_mode,
+    bool rotate_in,
+    bool rotate_out,
+    bool has_bias,
+    bool has_radial,
+    bool radial_on_input) {
+  const int64_t edge = static_cast<int64_t>(blockIdx.x);
+  const int64_t out_channel = static_cast<int64_t>(blockIdx.y);
+  const int tid = threadIdx.x;
+  if (edge >= n_edges || out_channel >= cout) {
+    return;
+  }
+
+  const int64_t route = graph_index[edge];
+  if (route < 0 || route >= n_routes) {
+    return;
+  }
+  const float* __restrict__ weight = mixed_weight + route * (cout * cin);
+  float acc = 0.0f;
+  for (int64_t ci = tid; ci < cin; ci += blockDim.x) {
+    float x0 = load_m0_value(
+        x, wigner, in_base, in_l, offsets, compact_offsets,
+        edge, ci, in_dim, dense_stride, wigner_stride, wigner_mode, rotate_in);
+    if (has_radial && radial_on_input) {
+      x0 *= radial[edge * cin + ci];
+    }
+    acc += x0 * weight[out_channel * cin + ci];
+  }
+
+  extern __shared__ float smem[];
+  smem[tid] = acc;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      smem[tid] += smem[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid != 0) {
+    return;
+  }
+
+  float y = smem[0];
+  if (has_bias) {
+    y += mixed_bias[route * cout + out_channel];
+  }
+  if (has_radial && !radial_on_input) {
+    y *= radial[edge * cout + out_channel];
+  }
+
+  const int l = static_cast<int>(out_l[out_channel]);
+  const int dim = 2 * l + 1;
+  const int64_t base = out_base[out_channel];
+  float* __restrict__ out_edge = out + edge * out_dim;
+  if (!rotate_out || l == 0) {
+    out_edge[base + l] += y;
+    return;
+  }
+  for (int d = 0; d < dim; ++d) {
+    const float dv = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, l, dense_stride, wigner_stride, wigner_mode);
+    out_edge[base + d] += y * dv;
+  }
+}
+
+__global__ void pack_m0_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ in_base,
+    const int64_t* __restrict__ in_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ packed,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cin,
+    int wigner_mode,
+    bool rotate_in) {
+  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cin;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t edge = linear / cin;
+  const int64_t channel = linear - edge * cin;
+  packed[edge * cin + channel] = load_m0_value(
+      x, wigner, in_base, in_l, offsets, compact_offsets,
+      edge, channel, in_dim, dense_stride, wigner_stride, wigner_mode, rotate_in);
+}
+
+__global__ void output_m0_grad_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ out_base,
+    const int64_t* __restrict__ out_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ grad_m0,
+    int64_t n_edges,
+    int64_t out_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cout,
+    int wigner_mode,
+    bool rotate_out) {
+  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cout;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t edge = linear / cout;
+  const int64_t channel = linear - edge * cout;
+  const int l = static_cast<int>(out_l[channel]);
+  const int64_t base = out_base[channel];
+  const float* __restrict__ grad_edge = grad_out + edge * out_dim;
+  float grad = 0.0f;
+  if (!rotate_out || l == 0) {
+    grad = grad_edge[base + l];
+  } else {
+    const int dim = 2 * l + 1;
+    for (int d = 0; d < dim; ++d) {
+      const float go = grad_edge[base + d];
+      const float dv = load_wigner_value(
+          wigner, offsets, compact_offsets,
+          edge, l, d, l, dense_stride, wigner_stride, wigner_mode);
+      grad += go * dv;
+    }
+  }
+  grad_m0[edge * cout + channel] = grad;
+}
+
+__global__ void scatter_m0_grad_kernel(
+    const float* __restrict__ grad_m0,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ in_base,
+    const int64_t* __restrict__ in_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ grad_x,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cin,
+    int wigner_mode,
+    bool rotate_in) {
+  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cin;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t edge = linear / cin;
+  const int64_t channel = linear - edge * cin;
+  const float grad = grad_m0[edge * cin + channel];
+  const int64_t base = in_base[channel];
+  const int l = static_cast<int>(in_l[channel]);
+  float* __restrict__ grad_edge = grad_x + edge * in_dim;
+  if (!rotate_in || l == 0) {
+    grad_edge[base + l] = grad;
+    return;
+  }
+  const int dim = 2 * l + 1;
+  for (int d = 0; d < dim; ++d) {
+    const float dv = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, l, dense_stride, wigner_stride, wigner_mode);
+    grad_edge[base + d] = grad * dv;
+  }
+}
+
+__global__ void scatter_m0_grad_radial_input_kernel(
+    const float* __restrict__ grad_eff,
+    const float* __restrict__ m0_no_radial,
+    const float* __restrict__ radial,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ in_base,
+    const int64_t* __restrict__ in_l,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    float* __restrict__ grad_x,
+    float* __restrict__ grad_radial,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t cin,
+    int wigner_mode,
+    bool rotate_in) {
+  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * cin;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t edge = linear / cin;
+  const int64_t channel = linear - edge * cin;
+  const float grad_e = grad_eff[edge * cin + channel];
+  const float x0 = m0_no_radial[edge * cin + channel];
+  const float r = radial[edge * cin + channel];
+  grad_radial[edge * cin + channel] = grad_e * x0;
+  const float grad = grad_e * r;
+  const int64_t base = in_base[channel];
+  const int l = static_cast<int>(in_l[channel]);
+  float* __restrict__ grad_edge = grad_x + edge * in_dim;
+  if (!rotate_in || l == 0) {
+    grad_edge[base + l] = grad;
+    return;
+  }
+  const int dim = 2 * l + 1;
+  for (int d = 0; d < dim; ++d) {
+    const float dv = load_wigner_value(
+        wigner, offsets, compact_offsets,
+        edge, l, d, l, dense_stride, wigner_stride, wigner_mode);
+    grad_edge[base + d] = grad * dv;
   }
 }
 
@@ -1045,6 +1479,72 @@ torch::Tensor fused_pair_forward_fp32_cuda(
   return out;
 }
 
+torch::Tensor fused_m0_forward_fp32_cuda(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    torch::Tensor graph_index,
+    torch::Tensor mixed_weight,
+    torch::Tensor mixed_bias,
+    torch::Tensor radial,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t out_dim,
+    bool rotate_in,
+    bool rotate_out,
+    bool radial_on_input,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = x.size(0);
+  const int64_t in_dim = x.size(1);
+  const int64_t n_routes = mixed_weight.size(0);
+  const int64_t cout = out_base.numel();
+  const int64_t cin = in_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto out = torch::zeros({n_edges, out_dim}, x.options());
+  if (n_edges == 0 || cin == 0 || cout == 0) {
+    return out;
+  }
+
+  const bool has_bias = mixed_bias.numel() != 0;
+  const bool has_radial = radial.numel() != 0;
+  dim3 grid(n_edges, cout);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fused_m0_forward_kernel<<<grid, kThreads, kThreads * sizeof(float), stream>>>(
+      x.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      graph_index.data_ptr<int64_t>(),
+      mixed_weight.data_ptr<float>(),
+      mixed_bias.numel() == 0 ? nullptr : mixed_bias.data_ptr<float>(),
+      radial.numel() == 0 ? nullptr : radial.data_ptr<float>(),
+      in_base.data_ptr<int64_t>(),
+      in_l.data_ptr<int64_t>(),
+      out_base.data_ptr<int64_t>(),
+      out_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      out.data_ptr<float>(),
+      n_edges,
+      in_dim,
+      out_dim,
+      dense_stride,
+      wigner_stride,
+      n_routes,
+      cin,
+      cout,
+      static_cast<int>(wigner_mode),
+      rotate_in,
+      rotate_out,
+      has_bias,
+      has_radial,
+      radial_on_input);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 std::vector<torch::Tensor> fused_pair_backward_fp32_cuda(
     torch::Tensor grad_out,
     torch::Tensor x,
@@ -1114,6 +1614,176 @@ std::vector<torch::Tensor> fused_pair_backward_fp32_cuda(
       radial_on_input);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_x, grad_mixed_weight, grad_radial};
+}
+
+torch::Tensor pack_m0_fp32_cuda(
+    torch::Tensor x,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = x.size(0);
+  const int64_t in_dim = x.size(1);
+  const int64_t cin = in_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto packed = torch::empty({n_edges, cin}, x.options());
+  if (n_edges == 0 || cin == 0) {
+    return packed;
+  }
+  const int threads = 256;
+  const int64_t total = n_edges * cin;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  pack_m0_kernel<<<grid, threads, 0, stream>>>(
+      x.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      in_base.data_ptr<int64_t>(),
+      in_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      packed.data_ptr<float>(),
+      n_edges,
+      in_dim,
+      dense_stride,
+      wigner_stride,
+      cin,
+      static_cast<int>(wigner_mode),
+      rotate_in);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return packed;
+}
+
+torch::Tensor output_m0_grad_fp32_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = grad_out.size(0);
+  const int64_t out_dim = grad_out.size(1);
+  const int64_t cout = out_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto grad_m0 = torch::empty({n_edges, cout}, grad_out.options());
+  if (n_edges == 0 || cout == 0) {
+    return grad_m0;
+  }
+  const int threads = 256;
+  const int64_t total = n_edges * cout;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  output_m0_grad_kernel<<<grid, threads, 0, stream>>>(
+      grad_out.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      out_base.data_ptr<int64_t>(),
+      out_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      grad_m0.data_ptr<float>(),
+      n_edges,
+      out_dim,
+      dense_stride,
+      wigner_stride,
+      cout,
+      static_cast<int>(wigner_mode),
+      rotate_out);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_m0;
+}
+
+torch::Tensor scatter_m0_grad_fp32_cuda(
+    torch::Tensor grad_m0,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t in_dim,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = grad_m0.size(0);
+  const int64_t cin = in_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto grad_x = torch::zeros({n_edges, in_dim}, grad_m0.options());
+  if (n_edges == 0 || cin == 0) {
+    return grad_x;
+  }
+  const int threads = 256;
+  const int64_t total = n_edges * cin;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  scatter_m0_grad_kernel<<<grid, threads, 0, stream>>>(
+      grad_m0.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      in_base.data_ptr<int64_t>(),
+      in_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      grad_x.data_ptr<float>(),
+      n_edges,
+      in_dim,
+      dense_stride,
+      wigner_stride,
+      cin,
+      static_cast<int>(wigner_mode),
+      rotate_in);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_x;
+}
+
+std::vector<torch::Tensor> scatter_m0_grad_radial_input_fp32_cuda(
+    torch::Tensor grad_eff,
+    torch::Tensor m0_no_radial,
+    torch::Tensor radial,
+    torch::Tensor wigner,
+    torch::Tensor in_base,
+    torch::Tensor in_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t in_dim,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = grad_eff.size(0);
+  const int64_t cin = in_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto grad_x = torch::zeros({n_edges, in_dim}, grad_eff.options());
+  auto grad_radial = torch::empty_like(radial);
+  if (n_edges == 0 || cin == 0) {
+    return {grad_x, grad_radial};
+  }
+  const int threads = 256;
+  const int64_t total = n_edges * cin;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  scatter_m0_grad_radial_input_kernel<<<grid, threads, 0, stream>>>(
+      grad_eff.data_ptr<float>(),
+      m0_no_radial.data_ptr<float>(),
+      radial.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      in_base.data_ptr<int64_t>(),
+      in_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      grad_x.data_ptr<float>(),
+      grad_radial.data_ptr<float>(),
+      n_edges,
+      in_dim,
+      dense_stride,
+      wigner_stride,
+      cin,
+      static_cast<int>(wigner_mode),
+      rotate_in);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_x, grad_radial};
 }
 
 torch::Tensor pack_pair_fp32_cuda(
@@ -1202,6 +1872,138 @@ torch::Tensor output_pair_grad_fp32_cuda(
       rotate_out);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return grad_pair;
+}
+
+torch::Tensor scatter_pair_forward_fp32_cuda(
+    torch::Tensor pair_out,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t out_dim,
+    int64_t m,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = pair_out.size(0);
+  const int64_t cout = out_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto out = torch::zeros({n_edges, out_dim}, pair_out.options());
+  if (n_edges == 0 || cout == 0) {
+    return out;
+  }
+
+  const int threads = 256;
+  const int64_t total = n_edges * cout;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  scatter_pair_forward_kernel<<<grid, threads, 0, stream>>>(
+      pair_out.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      out_base.data_ptr<int64_t>(),
+      out_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      out.data_ptr<float>(),
+      n_edges,
+      out_dim,
+      dense_stride,
+      wigner_stride,
+      cout,
+      static_cast<int>(m),
+      static_cast<int>(wigner_mode),
+      rotate_out);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor scatter_raw_pair_forward_fp32_cuda(
+    torch::Tensor raw,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t out_dim,
+    int64_t m,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = raw.size(0);
+  const int64_t cout = out_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto out = torch::zeros({n_edges, out_dim}, raw.options());
+  if (n_edges == 0 || cout == 0) {
+    return out;
+  }
+
+  const int threads = 256;
+  const int64_t total = n_edges * cout;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  scatter_raw_pair_forward_kernel<<<grid, threads, 0, stream>>>(
+      raw.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      out_base.data_ptr<int64_t>(),
+      out_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      out.data_ptr<float>(),
+      n_edges,
+      out_dim,
+      dense_stride,
+      wigner_stride,
+      cout,
+      static_cast<int>(m),
+      static_cast<int>(wigner_mode),
+      rotate_out);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor raw_pair_output_grad_fp32_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor wigner,
+    torch::Tensor out_base,
+    torch::Tensor out_l,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    int64_t m,
+    bool rotate_out,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_edges = grad_out.size(0);
+  const int64_t out_dim = grad_out.size(1);
+  const int64_t cout = out_base.numel();
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto grad_raw = torch::empty({n_edges, 2, 2 * cout}, grad_out.options());
+  if (n_edges == 0 || cout == 0) {
+    return grad_raw;
+  }
+
+  const int threads = 256;
+  const int64_t total = n_edges * cout;
+  const dim3 grid((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  raw_pair_output_grad_kernel<<<grid, threads, 0, stream>>>(
+      grad_out.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      out_base.data_ptr<int64_t>(),
+      out_l.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      grad_raw.data_ptr<float>(),
+      n_edges,
+      out_dim,
+      dense_stride,
+      wigner_stride,
+      cout,
+      static_cast<int>(m),
+      static_cast<int>(wigner_mode),
+      rotate_out);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_raw;
 }
 
 torch::Tensor scatter_pair_grad_fp32_cuda(

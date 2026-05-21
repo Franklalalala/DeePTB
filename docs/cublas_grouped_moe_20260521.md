@@ -243,6 +243,63 @@ P1 review package comparison:
 - The useful part that was still missing was direct helper-level test coverage. Added `test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available`, covering dense and compact Wigner representations for CUDA pair pack, output-pair gradient projection, and input-gradient scatter against the Torch helper path. Liyue result: `2 passed, 1 warning in 5.09s`.
 - The separate P1 hook script is not applied: it expects the older `_segmented_pair_backward` marker and would duplicate the already-integrated code path. The P1 scatter kernel also uses atomics for overlap tolerance; that is safer for hypothetical overlapping maps but slower than the current disjoint-map implementation used by DeePTB's SO2 layout.
 
+m0 Wigner fusion follow-up:
+
+- Implemented an opt-in `DPTB_SO2_MOE_FUSED_P0_FUSE_M0=1` path. This moves the `m=0` Wigner input rotation, output rotation, and train backward projection/scatter into the fused P0 CUDA extension, including compact-Wigner input. It also adds CUDA helper kernels for `pack_m0`, `output_m0_grad`, `scatter_m0_grad`, and fused radial-input scatter.
+- The default remains off because production smoke is negative. This is deliberately not hidden behind fallback: `DPTB_SO2_MOE_FUSED_P0_STRICT_M0=1` makes the test fail if the m0 fusion path declines.
+- Liyue correctness smoke, FP32, TF32 off, compact Wigner where applicable: `pytest dptb/tests/test_so2_moe_fused_p0.py::test_so2_fused_p0_forward_matches_streamed_ref_if_available dptb/tests/test_so2_moe_fused_p0.py::test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available -q` with `DPTB_SO2_MOE_FUSED_P0_FUSE_M0=1` and `DPTB_SO2_MOE_FUSED_P0_STRICT_M0=1` passed: `5 passed, 1 warning in 83.95s`.
+
+Module train smoke, `cutlass_tiled8` forward, `cuda_cublas_segmented` backward:
+
+| m0 fusion | N | streamed grouped train ms | fused P0 train ms | speedup vs streamed | max x-grad diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | 4096 | 10.569 | 6.091 | 1.74x | 2.27e-12 |
+| off | 16384 | 19.279 | 15.557 | 1.24x | 6.82e-13 |
+| on | 4096 | 21.444 | 11.947 | 1.79x | 2.73e-12 |
+| on | 16384 | 17.320 | 11.579 | 1.50x | 7.96e-13 |
+
+Production smoke, bs=32, 25 iterations, FP32, TF32 off, `cutlass_tiled8`, fused input-radial scatter, and m0 fusion enabled:
+
+| Case | wall s | back-half s/iter | Previous best fused P0 | Stable comparator |
+| --- | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_tiled8_m0_fused` | 178.325 | 3.311 | 73.050 s / 2.273 s/iter | `global_all_cublas` 54.750 s / 2.043 s/iter |
+| `edge_top2_fused_p0_tiled8_m0_fused` | 105.025 | 3.558 | 78.337 s / 2.501 s/iter | `edge_top2_cublas` 57.089 s / 2.134 s/iter |
+
+Negative-result analysis:
+
+- The m0 path now does eat DeePTB's Wigner input and output rotations in CUDA, but it also replaces a strong cueq/cuBLAS-indexed scalar linear path with a custom scalar SIMT dot kernel. For m0, the linear work dominates more than the rotation work, so the weaker mainloop loses more than the fused prologue/epilogue saves.
+- The m0 training path still needs intermediate `x_m0_eff`, `grad_linear`, and segmented raw-linear backward tensors. It reduces Python/einsum work, but does not yet remove enough launches or memory traffic.
+- This is different from the m>0 pair path: m>0 benefited from tiled output-channel reuse and fused radial scatter because its old rotation/pack/scatter overhead was larger relative to the pair linear work.
+
+Current decision:
+
+- Keep m0 fusion as an explicit development switch for correctness and future CuTe epilogue work.
+- Do not enable it by default inside fused P0.
+- The production-relevant route remains m>0 `cutlass_tiled8` + fused input-radial scatter as the best fused-P0 prototype, while stable production remains `mole_linear_mode="cublas_grouped"` / `streamed_m_major_cueq`.
+- The next deep CUTLASS/CuTe attempt should not put a weak SIMT dot in front of m0. It should either keep cueq/cublas for m0 and only fuse rotation around it, or build a larger route/m grouped kernel where Wigner input rotation, indexed linear, Wigner output epilogue, and backward projection/scatter are owned by the same schedule.
+
+cueq-compatible indexed sandwich follow-up:
+
+- Added `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich` and `cueq_sandwich`. These modes keep the existing indexed raw-linear backend instead of replacing it with the fused P0 SIMT dot mainloop. The new boundary is CUDA Wigner input pack -> configured `MOLELinear` indexed backend (`cublas_grouped` or `cueq_indexed_linear`) -> CUDA epilogue.
+- Added `scatter_raw_pair_forward_fp32` / `raw_pair_output_grad_fp32`. For the common radial-on-input case this fuses the raw linear output's complex finish and Wigner output rotation into one CUDA epilogue, so the cueq/cublas raw output is no longer finished by PyTorch `narrow/sub/cat` before scatter.
+- Liyue correctness smoke: `test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available` passed for both `cublas_grouped` and `cueq_indexed_linear` (`2 passed, 1 warning in 47.37s`). Helper coverage also checks dense/compact Wigner CUDA `scatter_pair_forward` against the Torch helper.
+
+Module train smoke, compact Wigner, FP32, TF32 off:
+
+| Backend | Forward mode | N | streamed train ms | fused train ms | Speedup | max x-grad diff |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `cublas_grouped` | `indexed_sandwich` + raw CUDA epilogue | 4096 | 19.177 | 15.101 | 1.27x | 2.73e-12 |
+| `cublas_grouped` | `indexed_sandwich` + raw CUDA epilogue | 16384 | 15.621 | 15.559 | 1.00x | 6.82e-13 |
+| `cueq_indexed_linear` | `cueq_sandwich` + raw CUDA epilogue | 4096 | 25.601 | 25.659 | 1.00x | 1.82e-12 |
+| `cueq_indexed_linear` | `cueq_sandwich` + raw CUDA epilogue | 16384 | 26.236 | 27.036 | 0.97x | 6.82e-13 |
+
+Interpretation:
+
+- This is a cleaner cueq-compatible experiment than replacing GEMM: it does eat DeePTB Wigner input rotation and output rotation around the indexed raw-linear call, while preserving cueq/cublas as the raw mainloop.
+- It still does not beat the best fused P0 tiled SIMT path in production-shaped module tests. The reason is launch and materialization count: `pack_pair`, indexed linear, raw epilogue, and backward pack/scatter are still separate kernels/tensors per `m`.
+- The useful next CUTLASS/CuTe direction is therefore not a cueq wrapper. It is a grouped route/m scheduler with a custom epilogue that owns raw output finish + Wigner output rotation, and a matching backward projection/scatter path. The indexed sandwich is kept as an opt-in correctness/dataflow reference for that kernel.
+- A production smoke for `indexed_sandwich` was launched under `/home/mingkang_nt/codex/0521_fused_so2_moe_aggressive_20260521/prod_smoke_indexed_sandwich_raw_epi_20260521`; it is intentionally not a blocking result because the module data already show this path is a reference design rather than the current production winner.
+
 ## Artifacts
 
 Liyue run root:
@@ -285,4 +342,6 @@ prod_smoke_tiled3_20260521
 prod_smoke_tiled4_20260521
 prod_smoke_tiled8_20260521
 prod_smoke_tiled8_radial_scatter_20260521
+prod_smoke_tiled8_m0_fused_20260521
+prod_smoke_indexed_sandwich_raw_epi_20260521
 ```

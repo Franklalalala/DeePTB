@@ -61,7 +61,7 @@ def _make_module(args, mode: str, device: torch.device) -> SO2_Linear:
         rotate_in=True,
         rotate_out=True,
         wigner_apply_mode="compact_blocks",
-        mole_linear_mode="cublas_grouped",
+        mole_linear_mode=args.mole_linear_mode,
         so2_fusion_mode=mode,
     ).to(device=device, dtype=torch.float32).train()
 
@@ -87,6 +87,8 @@ def main() -> None:
     parser.add_argument("--radial-hidden", type=int, default=64)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--mole-linear-mode", default="cublas_grouped",
+                        choices=("cublas_grouped", "cueq_indexed_linear"))
     parser.add_argument("--irreps-in", default="32x0e + 24x1e + 16x2e + 8x3e")
     parser.add_argument("--irreps-out", default="32x0e + 24x1e + 16x2e + 8x3e")
     args = parser.parse_args()
@@ -127,9 +129,9 @@ def main() -> None:
     ref_ms = _cuda_ms(ref_step, args.warmup, args.iters)
     fused_ms = _cuda_ms(fused_step, args.warmup, args.iters)
 
-    print("case,n,routes,experts,top_k,mode,ms,loss_abs_diff,x_grad_max_abs")
-    print(f"streamed_grouped_train,{args.n},{args.routes},{args.experts},{args.top_k},compact,{ref_ms:.6f},0,0")
-    print(f"fused_p0_train,{args.n},{args.routes},{args.experts},{args.top_k},compact,{fused_ms:.6f},{max_abs:.6e},{grad_abs:.6e}")
+    print("case,n,routes,experts,top_k,mole_linear_mode,mode,ms,loss_abs_diff,x_grad_max_abs")
+    print(f"streamed_grouped_train,{args.n},{args.routes},{args.experts},{args.top_k},{args.mole_linear_mode},compact,{ref_ms:.6f},0,0")
+    print(f"fused_p0_train,{args.n},{args.routes},{args.experts},{args.top_k},{args.mole_linear_mode},compact,{fused_ms:.6f},{max_abs:.6e},{grad_abs:.6e}")
     print(f"speedup_vs_streamed_grouped_train,{ref_ms / fused_ms:.6f}")
 
 
