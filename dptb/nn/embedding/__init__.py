@@ -8,6 +8,7 @@ from .e3baseline_local6 import E3BaseLineModel6
 from .slem import Slem
 from .lem import Lem
 from .lem_moe_v3 import LemMoEV3
+from .lem_moe_v3_edge import LemMoEV3Edge, LemMoEV3EdgeH0
 from .lem_moe import LemMoE
 from .lem_global import LemGlobal
 from .lem_local import LemLocal
@@ -60,6 +61,8 @@ __all__ = [
     "LemInFrameOpenequi",
     "LemMoE",
     "LemMoEV3",
+    "LemMoEV3Edge",
+    "LemMoEV3EdgeH0",
     "LemMoEV3H0",
     "LemMoETopK",
     "LemSO2Global",

@@ -309,14 +309,28 @@ def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
 class MOLEGlobals:
     """Stores routing information for the current forward pass."""
 
-    def __init__(self, coefficients=None, sizes=None, split_sizes=None, graph_index=None):
+    def __init__(
+            self,
+            coefficients=None,
+            sizes=None,
+            split_sizes=None,
+            graph_index=None,
+            topk_indices=None,
+            topk_values=None,
+    ):
         self.coefficients = coefficients  # [Batch, Num_Experts]
+        self.topk_indices = topk_indices
+        self.topk_values = topk_values
         self.sizes = sizes  # [Batch] (Edge counts per system)
         # Explicit split sizes preserve the original split-loop contract and
         # must stay authoritative across all MOLELinear backends.
         self.graph_index = None if split_sizes is not None else graph_index
         self._sizes_tensor = self._normalize_sizes_tensor(sizes, split_sizes)
         self.split_sizes = self._normalize_split_sizes(sizes, split_sizes)
+        self._expanded_graph_index_cache = {}
+        self._indexed_flat_permutation_cache = {}
+        self._indexed_segment_ptr_cache = {}
+        self._indexed_inputs_are_sorted = False
 
     @staticmethod
     def _normalize_split_sizes(sizes, split_sizes):
@@ -348,6 +362,69 @@ class MOLEGlobals:
             # Compatibility fallback for direct callers that still pass CUDA sizes.
             values = values.cpu()
         return tuple(int(v) for v in values.tolist())
+
+    def indexed_flat_permutation(self, graph_index: torch.Tensor, x: torch.Tensor):
+        flat_graph_index = _expand_graph_index_cached(graph_index, x, self).reshape(-1).to(dtype=torch.long)
+        key = (
+            str(flat_graph_index.device),
+            str(flat_graph_index.dtype),
+            int(flat_graph_index.numel()),
+            tuple(int(v) for v in x.shape[1:-1]),
+        )
+        cached = self._indexed_flat_permutation_cache.get(key)
+        if cached is None:
+            if flat_graph_index.numel() <= 1 or torch.all(flat_graph_index[1:] >= flat_graph_index[:-1]).item():
+                permute_idx = None
+                unpermute_idx = None
+                sorted_graph_index = flat_graph_index
+            else:
+                permute_idx = torch.argsort(flat_graph_index, stable=True)
+                sorted_graph_index = flat_graph_index.index_select(0, permute_idx)
+                unpermute_idx = torch.empty_like(permute_idx)
+                unpermute_idx.scatter_(
+                    0,
+                    permute_idx,
+                    torch.arange(permute_idx.numel(), device=permute_idx.device, dtype=permute_idx.dtype),
+                )
+            cached = (permute_idx, unpermute_idx, sorted_graph_index)
+            self._indexed_flat_permutation_cache[key] = cached
+        return cached
+
+    def sorted_indexed_view(self, graph_index: torch.Tensor, x: torch.Tensor):
+        permute_idx, unpermute_idx, sorted_graph_index = self.indexed_flat_permutation(graph_index, x)
+        sorted_view = MOLEGlobals(
+            coefficients=self.coefficients,
+            topk_indices=self.topk_indices,
+            topk_values=self.topk_values,
+            sizes=None,
+            split_sizes=None,
+            graph_index=sorted_graph_index,
+        )
+        sorted_view._indexed_inputs_are_sorted = True
+        return permute_idx, unpermute_idx, sorted_view
+
+    def indexed_segment_ptr(
+            self,
+            sorted_graph_index: torch.Tensor,
+            num_groups: int,
+            *,
+            prefer_cpu: bool = True,
+    ) -> torch.Tensor:
+        target_device = torch.device("cpu") if prefer_cpu else sorted_graph_index.device
+        key = (
+            str(sorted_graph_index.device),
+            int(sorted_graph_index.numel()),
+            int(num_groups),
+            str(target_device),
+        )
+        cached = self._indexed_segment_ptr_cache.get(key)
+        if cached is None:
+            counts = torch.bincount(sorted_graph_index, minlength=num_groups)
+            ptr = torch.zeros(num_groups + 1, dtype=torch.long, device=counts.device)
+            ptr[1:] = torch.cumsum(counts, dim=0)
+            cached = ptr.to(device=target_device, dtype=torch.long).contiguous()
+            self._indexed_segment_ptr_cache[key] = cached
+        return cached
 
 
 def _mole_split_sizes(mole_globals, n_rows: int):
@@ -455,8 +532,16 @@ def _expand_graph_index_cached(
     return cached
 
 
+def _index_select_wigner_edges(wigner_D_all, index: torch.Tensor):
+    if wigner_D_all is None:
+        return None
+    if isinstance(wigner_D_all, SO2WignerBlocks):
+        return SO2WignerBlocks(block.index_select(0, index) for block in wigner_D_all.blocks)
+    return wigner_D_all.index_select(0, index)
+
+
 def _normalize_mole_linear_mode(mode: str) -> str:
-    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear"}
+    allowed = {"split_loop", "indexed_ref", "cueq_indexed_linear", "cublas_grouped"}
     if mode not in allowed:
         raise ValueError(f"mole_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
@@ -485,6 +570,8 @@ class MOLERouterV3(nn.Module):
         self.register_buffer('expert_bias', torch.zeros(num_experts))
         effective_top_k = num_experts if top_k is None else min(top_k, num_experts)
         self.register_buffer('ema_load', torch.ones(num_experts) * (effective_top_k / num_experts))
+        self._last_topk_indices = None
+        self._last_topk_values = None
 
         # 修改1: 删除了 step_count 等用于衰减的 Buffer
 
@@ -497,6 +584,8 @@ class MOLERouterV3(nn.Module):
             denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
             probs = scores / denominators
             monitor_val = probs.max(dim=-1)[0].mean().detach()
+            self._last_topk_indices = None
+            self._last_topk_values = None
             return probs, monitor_val, torch.zeros((), dtype=scores.dtype, device=scores.device)
 
         # 加上 Bias 用于选择 Top-K (Aux-loss-free 核心机制)
@@ -538,6 +627,8 @@ class MOLERouterV3(nn.Module):
             topk_scores_original = torch.gather(scores, 1, topk_indices)
             denominators = topk_scores_original.sum(dim=-1, keepdim=True) + 1e-8
             topk_probs = topk_scores_original / denominators
+            self._last_topk_indices = topk_indices
+            self._last_topk_values = topk_probs
 
             # 构建稀疏输出系数
             coeffs = torch.zeros_like(scores)
@@ -553,7 +644,12 @@ class MOLERouterV3(nn.Module):
             denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
             probs = scores / denominators
             monitor_val = probs.max(dim=-1)[0].mean().detach()
+            self._last_topk_indices = None
+            self._last_topk_values = None
             return probs, monitor_val, torch.tensor(0.0, device=scores.device)
+
+    def last_topk(self):
+        return self._last_topk_indices, self._last_topk_values
 
 
 class MOLELinear(nn.Module):
@@ -624,6 +720,80 @@ class MOLELinear(nn.Module):
         flat_out = torch.bmm(flat_w, flat_x.unsqueeze(-1)).squeeze(-1)
         if mixed_bias is not None:
             flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
+        return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def _mix_expert_parameters(self, mole_globals: MOLEGlobals):
+        coefficients = mole_globals.coefficients
+        topk_indices = getattr(mole_globals, "topk_indices", None)
+        topk_values = getattr(mole_globals, "topk_values", None)
+
+        if (
+            topk_indices is not None
+            and topk_values is not None
+            and topk_indices.shape[0] == coefficients.shape[0]
+        ):
+            topk_indices = topk_indices.to(device=self.weight_experts.device, dtype=torch.long)
+            topk_values = topk_values.to(device=self.weight_experts.device, dtype=self.weight_experts.dtype)
+            n_routes, k_routes = topk_indices.shape
+            gathered_weights = self.weight_experts.index_select(0, topk_indices.reshape(-1))
+            gathered_weights = gathered_weights.reshape(
+                n_routes,
+                k_routes,
+                self.out_features,
+                self.in_features,
+            )
+            mixed_weights = (gathered_weights * topk_values.reshape(n_routes, k_routes, 1, 1)).sum(dim=1)
+
+            mixed_bias = None
+            if self.bias_experts is not None:
+                gathered_bias = self.bias_experts.index_select(0, topk_indices.reshape(-1))
+                gathered_bias = gathered_bias.reshape(n_routes, k_routes, self.out_features)
+                mixed_bias = (gathered_bias * topk_values.reshape(n_routes, k_routes, 1)).sum(dim=1)
+        else:
+            mixed_weights = torch.einsum("be, eoi -> boi", coefficients, self.weight_experts)
+            mixed_bias = None
+            if self.bias_experts is not None:
+                mixed_bias = torch.einsum("be, eo -> bo", coefficients, self.bias_experts)
+
+        if self.num_shared_experts > 0:
+            mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
+            if mixed_bias is not None and self.bias_shared is not None:
+                mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
+            elif mixed_bias is None and self.bias_shared is not None:
+                mixed_bias = self.bias_shared.sum(0).unsqueeze(0).expand(mixed_weights.shape[0], -1)
+
+        return mixed_weights, mixed_bias
+
+    def _apply_cublas_grouped(self, x, mixed_weights, mixed_bias, graph_index, mole_globals: MOLEGlobals):
+        if x.device.type != "cuda":
+            raise RuntimeError("mole_linear_mode='cublas_grouped' requires CUDA.")
+        if x.dtype != torch.float32 or mixed_weights.dtype != torch.float32:
+            raise RuntimeError(
+                "mole_linear_mode='cublas_grouped' currently requires float32 tensors; "
+                f"got x={x.dtype}, weight={mixed_weights.dtype}."
+            )
+
+        from dptb.nn.cublas_grouped_gemm import grouped_gemm
+
+        flat_x = x.reshape(-1, self.in_features)
+        if getattr(mole_globals, "_indexed_inputs_are_sorted", False):
+            sorted_graph_index = _expand_graph_index_cached(graph_index, x, mole_globals).reshape(-1).to(dtype=torch.long)
+            unpermute_idx = None
+        else:
+            permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, x)
+            if permute_idx is not None:
+                flat_x = flat_x.index_select(0, permute_idx)
+
+        ptr = mole_globals.indexed_segment_ptr(
+            sorted_graph_index,
+            int(mixed_weights.shape[0]),
+            prefer_cpu=True,
+        )
+        flat_out = grouped_gemm(flat_x.contiguous(), ptr, mixed_weights.contiguous())
+        if mixed_bias is not None:
+            flat_out = flat_out + mixed_bias.index_select(0, sorted_graph_index)
+        if unpermute_idx is not None:
+            flat_out = flat_out.index_select(0, unpermute_idx)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
 
     def _cueq_flatten_weight(self, mixed_weights, order: str):
@@ -763,14 +933,22 @@ class MOLELinear(nn.Module):
             )
 
         flat_x = x.reshape(-1, self.in_features)
-        flat_graph_index = _expand_graph_index_cached(graph_index, x, mole_globals)
+        if getattr(mole_globals, "_indexed_inputs_are_sorted", False):
+            sorted_graph_index = _expand_graph_index_cached(graph_index, x, mole_globals).reshape(-1).to(dtype=torch.long)
+            unpermute_idx = None
+        else:
+            permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, x)
+            if permute_idx is not None:
+                flat_x = flat_x.index_select(0, permute_idx)
         cue_lin = self._get_cueq_indexed_linear(num_graphs, dtype=x.dtype, device=x.device)
 
-        order = self._infer_cueq_weight_order(cue_lin, flat_x, mixed_weights, flat_graph_index)
+        order = self._infer_cueq_weight_order(cue_lin, flat_x, mixed_weights, sorted_graph_index)
         flat_weight = self._cueq_flatten_weight(mixed_weights, order)
-        flat_out = cue_lin(flat_x, weight=flat_weight, weight_indices=flat_graph_index)
+        flat_out = cue_lin(flat_x, weight=flat_weight, weight_indices=sorted_graph_index)
         if mixed_bias is not None:
-            flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
+            flat_out = flat_out + mixed_bias.index_select(0, sorted_graph_index)
+        if unpermute_idx is not None:
+            flat_out = flat_out.index_select(0, unpermute_idx)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
 
     def forward(self, x, mole_globals: MOLEGlobals):
@@ -791,19 +969,12 @@ class MOLELinear(nn.Module):
         # coefficients: [Batch, Num_Experts]
         # weight_experts: [Num_Experts, Out, In]
         # mixed_weights: [Batch, Out, In]
-        mixed_weights = torch.einsum("be, eoi -> boi", mole_globals.coefficients, self.weight_experts)
+        mixed_weights, mixed_bias = self._mix_expert_parameters(mole_globals)
 
         # 2. 【关键】融合共享专家权重
         # 利用分配律: (W_routed + sum(W_shared)) * x
-        if self.num_shared_experts > 0:
-            mixed_weights = mixed_weights + self.weight_shared.sum(0).unsqueeze(0)
 
         # 3. 处理 Bias
-        mixed_bias = None
-        if self.bias_experts is not None:
-            mixed_bias = torch.einsum("be, eo -> bo", mole_globals.coefficients, self.bias_experts)
-            if self.num_shared_experts > 0 and self.bias_shared is not None:
-                mixed_bias = mixed_bias + self.bias_shared.sum(0).unsqueeze(0)
 
         # 4. 执行线性变换
         # 根据系统大小拆分 Input，因为每个系统(Graph)对应一个混合后的权重
@@ -818,6 +989,8 @@ class MOLELinear(nn.Module):
                 return self._apply_indexed_ref(x, mixed_weights, mixed_bias, graph_index)
             if mode == "cueq_indexed_linear":
                 return self._apply_cueq_indexed_linear(x, mixed_weights, mixed_bias, graph_index, mole_globals)
+            if mode == "cublas_grouped":
+                return self._apply_cublas_grouped(x, mixed_weights, mixed_bias, graph_index, mole_globals)
             raise AssertionError(f"unreachable mole_linear_mode={mode!r}")
 
         split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
@@ -1323,6 +1496,17 @@ class SO2_Linear(torch.nn.Module):
                 backends.append(fc.mole_linear_mode)
         return bool(backends) and all(mode == "cueq_indexed_linear" for mode in backends)
 
+    def _cublas_m_fusion_enabled(self) -> bool:
+        if os.environ.get("DPTB_SO2_FUSE_M_CUBLAS", "0") in ("", "0", "false", "False"):
+            return False
+        if self.m_max < 2:
+            return False
+        for module in self.m_linear:
+            fc = getattr(module, "fc", None)
+            if not isinstance(fc, MOLELinear) or fc.mole_linear_mode != "cublas_grouped":
+                return False
+        return True
+
     def _prepare_streamed_route(self, route: str):
         if route == "streamed_m_major_cueq" and not self._cueq_linear_is_enabled():
             self._warn_route_once(
@@ -1463,9 +1647,109 @@ class SO2_Linear(torch.nn.Module):
             out_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
             self._accumulate_group_pair_(out_view, y_entry, entry.l, m, rot_blocks.get(entry.l))
 
+    def _apply_m_linears_cublas_multi(
+            self,
+            x_inputs: list[torch.Tensor],
+            mole_globals: MOLEGlobals,
+    ) -> list[torch.Tensor]:
+        if not x_inputs:
+            return []
+        if x_inputs[0].device.type != "cuda" or x_inputs[0].dtype != torch.float32:
+            raise RuntimeError("SO2 m-fused cuBLAS path requires CUDA float32 inputs.")
+
+        from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
+
+        graph_index = _mole_graph_index(mole_globals, x_inputs[0].shape[0], device=x_inputs[0].device)
+        if graph_index.numel() != x_inputs[0].shape[0]:
+            raise ValueError(
+                f"MOLE graph_index has {graph_index.numel()} rows, but SO2 input has {x_inputs[0].shape[0]} rows."
+            )
+        if getattr(mole_globals, "_indexed_inputs_are_sorted", False):
+            sorted_graph_index = _expand_graph_index_cached(graph_index, x_inputs[0], mole_globals).reshape(-1).to(dtype=torch.long)
+            unpermute_idx = None
+            permute_idx = None
+        else:
+            permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, x_inputs[0])
+
+        flat_inputs = []
+        mixed_weights = []
+        mixed_biases = []
+        for x_m, module in zip(x_inputs, self.m_linear):
+            fc = module.fc
+            flat_x = x_m.reshape(-1, fc.in_features)
+            if permute_idx is not None:
+                flat_x = flat_x.index_select(0, permute_idx)
+            weight, bias = fc._mix_expert_parameters(mole_globals)
+            flat_inputs.append(flat_x.contiguous())
+            mixed_weights.append(weight.contiguous())
+            mixed_biases.append(bias)
+
+        ptr = mole_globals.indexed_segment_ptr(
+            sorted_graph_index,
+            int(mixed_weights[0].shape[0]),
+            prefer_cpu=True,
+        )
+        flat_outputs = grouped_gemm_multi(flat_inputs, [ptr] * len(flat_inputs), mixed_weights)
+
+        outputs = []
+        for flat_out, bias, x_m, module in zip(flat_outputs, mixed_biases, x_inputs, self.m_linear):
+            if bias is not None:
+                flat_out = flat_out + bias.index_select(0, sorted_graph_index)
+            if unpermute_idx is not None:
+                flat_out = flat_out.index_select(0, unpermute_idx)
+            outputs.append(flat_out.reshape(*x_m.shape[:-1], module.fc.out_features))
+        return outputs
+
+    def _forward_cublas_fused_m_pairs_(
+            self,
+            input_groups: Dict[int, torch.Tensor],
+            rot_blocks: Dict[int, torch.Tensor],
+            n: int,
+            x: torch.Tensor,
+            weights: Optional[torch.Tensor],
+            mole_globals: MOLEGlobals,
+            out_groups: Dict[int, torch.Tensor],
+    ) -> None:
+        x_inputs = []
+        post_radial_weights = []
+        for m in range(1, self.m_max + 1):
+            radial_weight = (
+                weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1)
+                if self.radial_emb else None
+            )
+            x_m_in = self._assemble_grouped_pair_input(input_groups, rot_blocks, m, n, x)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                post_radial_weights.append(None)
+            else:
+                post_radial_weights.append(radial_weight)
+            x_inputs.append(x_m_in)
+
+        raw_outputs = self._apply_m_linears_cublas_multi(x_inputs, mole_globals)
+        for m, raw_output, radial_weight in zip(range(1, self.m_max + 1), raw_outputs, post_radial_weights):
+            linear_output = self.m_linear[m - 1]._finish_linear_output(raw_output)
+            if radial_weight is not None:
+                linear_output = linear_output * radial_weight
+            self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+
     def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+        wigner_D_return = wigner_D_all
+        unpermute_idx = None
+        graph_index = getattr(mole_globals, "graph_index", None)
+        if (
+            os.environ.get("DPTB_SO2_SORTED_EDGE_VIEW", "0") != "0"
+            and graph_index is not None
+            and self._cueq_linear_is_enabled()
+            and not getattr(mole_globals, "_indexed_inputs_are_sorted", False)
+        ):
+            permute_idx, unpermute_idx, mole_globals = mole_globals.sorted_indexed_view(graph_index, x)
+            if permute_idx is not None:
+                x = x.index_select(0, permute_idx)
+                if latents is not None:
+                    latents = latents.index_select(0, permute_idx)
+                wigner_D_all = _index_select_wigner_edges(wigner_D_all, permute_idx)
         n, _ = x.shape
         if self.radial_emb and latents is None:
             raise ValueError("SO2_Linear grouped streamed path requires latents when radial_emb=True.")
@@ -1491,6 +1775,18 @@ class SO2_Linear(torch.nn.Module):
                 self._accumulate_grouped_m0_output_(out_groups, y_m, rot_blocks)
                 continue
 
+            if m == 1 and self._cublas_m_fusion_enabled():
+                self._forward_cublas_fused_m_pairs_(
+                    input_groups,
+                    rot_blocks,
+                    n,
+                    x,
+                    weights,
+                    mole_globals,
+                    out_groups,
+                )
+                break
+
             x_m_in = self._assemble_grouped_pair_input(input_groups, rot_blocks, m, n, x)
             if self.front and self.radial_emb:
                 x_m_in = x_m_in * radial_weight
@@ -1504,7 +1800,9 @@ class SO2_Linear(torch.nn.Module):
             self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
 
         out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
-        return out.contiguous(), wigner_D_all
+        if unpermute_idx is not None:
+            out = out.index_select(0, unpermute_idx)
+        return out.contiguous(), wigner_D_return
 
 
 class SO2_m_Linear(torch.nn.Module):
@@ -1551,6 +1849,9 @@ class SO2_m_Linear(torch.nn.Module):
         else:
             x_m = self.fc(x_m)
 
+        return self._finish_linear_output(x_m)
+
+    def _finish_linear_output(self, x_m):
         x_r = x_m.narrow(2, 0, self.num_out_channel)
         x_i = x_m.narrow(2, self.num_out_channel, self.num_out_channel)
         x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)

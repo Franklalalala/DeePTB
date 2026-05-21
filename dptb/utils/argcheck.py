@@ -939,7 +939,9 @@ def embedding():
             Argument("lem_moe_charge", dict, slem()),
             Argument("lem_moe_topk", dict, slem()),
             Argument("lem_moe_v3", dict, slem()),
+            Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
+            Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_moe", dict, slem()),
             Argument("lem_so2", dict, slem()),
             Argument("lem_so2_local", dict, slem()),
@@ -1107,7 +1109,7 @@ def slem():
     doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
     doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`. The 0425-stable branch defaults to `streamed_m_major_cueq`."
-    doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
+    doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
     doc_so2_m_linear_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
@@ -1197,6 +1199,34 @@ def slem_h0():
         Argument("fallback_edge_key", str, optional=True, default="edge_features", doc=doc_fallback_edge_key),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
+    ]
+
+
+def slem_edge():
+    doc_edge_router_in_features = "Input dimension for the edge-wise MoE router. Defaults to `edge_one_hot_dim`."
+    doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
+    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, enable grouped compact dispatch for large-edge batches. Default: `True`."
+    doc_edge_moe_compact_min_edges = "Minimum active-edge count before grouped compact dispatch is used. Default: `16384`."
+
+    return slem() + [
+        Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
+        Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
+        Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
+        Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
+    ]
+
+
+def slem_edge_h0():
+    doc_edge_router_in_features = "Input dimension for the edge-wise MoE router. Defaults to `edge_one_hot_dim`."
+    doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
+    doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, enable grouped compact dispatch for large-edge batches. Default: `True`."
+    doc_edge_moe_compact_min_edges = "Minimum active-edge count before grouped compact dispatch is used. Default: `16384`."
+
+    return slem_h0() + [
+        Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
+        Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
+        Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
+        Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
     ]
 
 
@@ -2270,7 +2300,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")

@@ -613,6 +613,7 @@ class LemMoEV3(torch.nn.Module):
         # 2. Compute Routing Coefficients
         # 返回: coeffs [Batch, Num_Experts], monitor_val (mean max prob)
         coeffs, monitor_val, expert_load_cv = self.router(global_feat)
+        topk_indices, topk_values = self.router.last_topk()
 
         # 不再记录 z_loss，改为记录监控指标 mean_max_prob
         # 这个值越接近 1.0 表示路由越自信，接近 0.5 (TopK=1时) 表示犹豫
@@ -644,12 +645,23 @@ class LemMoEV3(torch.nn.Module):
 
         # Determine sizes for active edges for Weight Merging in MOLELinear
         if precomputed_split_sizes is not None:
-            mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=precomputed_split_sizes)
+            mole_globals = MOLEGlobals(
+                coefficients=coeffs,
+                split_sizes=precomputed_split_sizes,
+                topk_indices=topk_indices,
+                topk_values=topk_values,
+            )
         else:
             edge_batch = batch[edge_index[0][active_edges]]  # Map edge to graph index
             num_systems = coeffs.shape[0]
             edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes, graph_index=edge_batch)
+            mole_globals = MOLEGlobals(
+                coefficients=coeffs,
+                sizes=edge_sizes,
+                graph_index=edge_batch,
+                topk_indices=topk_indices,
+                topk_values=topk_values,
+            )
         # --------------------------
 
         data[_keys.EDGE_OVERLAP_KEY] = latents

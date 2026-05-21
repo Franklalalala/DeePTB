@@ -178,6 +178,80 @@ def test_expand_graph_index_cached_reuses_expanded_tensor():
     assert _expand_graph_index_cached(graph_index, x_2d, globals_) is graph_index
 
 
+def test_mole_globals_caches_indexed_flat_permutation():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
+
+    graph_index = torch.tensor([2, 0, 2, 1, 0], dtype=torch.long)
+    x = torch.randn(graph_index.numel(), 2, 4)
+    globals_ = MOLEGlobals(
+        coefficients=torch.ones(3, 4),
+        graph_index=graph_index,
+    )
+
+    permute_idx, unpermute_idx, sorted_graph_index = globals_.indexed_flat_permutation(graph_index, x)
+    cached = globals_.indexed_flat_permutation(graph_index, x)
+
+    assert sorted_graph_index.tolist() == [0, 0, 0, 0, 1, 1, 2, 2, 2, 2]
+    restored = torch.arange(sorted_graph_index.numel()).index_select(0, permute_idx).index_select(0, unpermute_idx)
+    assert restored.tolist() == list(range(sorted_graph_index.numel()))
+    assert cached[0] is permute_idx
+    assert cached[1] is unpermute_idx
+    assert cached[2] is sorted_graph_index
+
+    sorted_globals = MOLEGlobals(
+        coefficients=torch.ones(3, 4),
+        graph_index=torch.tensor([0, 0, 1, 1, 2], dtype=torch.long),
+    )
+    sorted_x = torch.randn(5, 4)
+    permute_idx, unpermute_idx, sorted_graph_index = sorted_globals.indexed_flat_permutation(
+        sorted_globals.graph_index,
+        sorted_x,
+    )
+    assert permute_idx is None
+    assert unpermute_idx is None
+    assert sorted_graph_index.tolist() == sorted_globals.graph_index.tolist()
+
+
+def test_cueq_indexed_linear_sorts_graph_index_and_restores_order(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    layer = MOLELinear(
+        2,
+        2,
+        num_experts=3,
+        num_shared_experts=0,
+        bias=False,
+        mole_linear_mode="cueq_indexed_linear",
+    )
+    graph_index = torch.tensor([1, 0, 1, 2], dtype=torch.long)
+    globals_ = MOLEGlobals(coefficients=torch.ones(3, 3), graph_index=graph_index)
+    x = torch.tensor(
+        [
+            [1.0, 10.0],
+            [2.0, 20.0],
+            [3.0, 30.0],
+            [4.0, 40.0],
+        ]
+    )
+    mixed_weights = torch.zeros(3, 2, 2)
+
+    class FakeCueIndexedLinear:
+        def __call__(self, flat_x, *, weight, weight_indices):
+            assert torch.all(weight_indices[1:] >= weight_indices[:-1])
+            return flat_x + weight_indices.to(flat_x.dtype).unsqueeze(1) * 100.0
+
+    monkeypatch.setattr(layer, "_get_cueq_indexed_linear", lambda *args, **kwargs: FakeCueIndexedLinear())
+    monkeypatch.setattr(layer, "_infer_cueq_weight_order", lambda *args, **kwargs: "io_scaled")
+    monkeypatch.setattr(layer, "_cueq_flatten_weight", lambda weights, order: weights)
+
+    out = layer._apply_cueq_indexed_linear(x, mixed_weights, None, graph_index, globals_)
+
+    expected = x + graph_index.to(x.dtype).unsqueeze(1) * 100.0
+    torch.testing.assert_close(out, expected)
+
+
 def test_mole_linear_fallback_average_ignores_indexed_mode():
     torch = pytest.importorskip("torch")
     from dptb.nn.tensor_product_moe_v3 import MOLELinear
@@ -319,6 +393,47 @@ def test_mole_linear_env_selects_indexed_ref(monkeypatch):
     assert layer.mole_linear_mode == "indexed_ref"
 
 
+def test_mole_linear_topk_mixing_matches_dense_coefficients():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    torch.manual_seed(20260521)
+    layer = MOLELinear(
+        4,
+        3,
+        num_experts=5,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="indexed_ref",
+    ).to(dtype=torch.float64)
+    topk_indices = torch.tensor([[0, 2], [3, 1], [4, 0]], dtype=torch.long)
+    topk_values = torch.tensor([[0.25, 0.75], [0.6, 0.4], [0.9, 0.1]], dtype=torch.float64)
+    coeffs = torch.zeros(3, 5, dtype=torch.float64)
+    coeffs.scatter_(1, topk_indices, topk_values)
+
+    dense_globals = MOLEGlobals(coefficients=coeffs)
+    topk_globals = MOLEGlobals(
+        coefficients=coeffs,
+        topk_indices=topk_indices,
+        topk_values=topk_values,
+    )
+
+    dense_w, dense_b = layer._mix_expert_parameters(dense_globals)
+    topk_w, topk_b = layer._mix_expert_parameters(topk_globals)
+
+    torch.testing.assert_close(topk_w, dense_w, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(topk_b, dense_b, atol=1e-12, rtol=1e-12)
+
+
+def test_mole_linear_env_selects_cublas_grouped(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import MOLELinear
+
+    monkeypatch.setenv("DPTB_MOLE_LINEAR_MODE", "cublas_grouped")
+    layer = MOLELinear(4, 4)
+    assert layer.mole_linear_mode == "cublas_grouped"
+
+
 def test_mole_linear_invalid_mode_rejected():
     pytest.importorskip("torch")
     from dptb.nn.tensor_product_moe_v3 import MOLELinear
@@ -439,6 +554,109 @@ def test_mole_linear_cueq_indexed_smoke_if_available():
     torch.testing.assert_close(cueq.weight_shared.grad, base.weight_shared.grad, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(cueq.bias_shared.grad, base.bias_shared.grad, atol=2e-4, rtol=2e-4)
     assert cueq._cueq_weight_order == "io_scaled"
+
+
+def test_mole_linear_cublas_grouped_smoke_if_available():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("cuBLAS grouped GEMM smoke requires CUDA")
+
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
+
+    torch.manual_seed(20260521)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    split_sizes = (5, 0, 7, 4)
+    num_graphs = len(split_sizes)
+    num_experts = 6
+    in_features = 5
+    out_features = 8
+    n_edges = sum(split_sizes)
+    coeffs = torch.rand(num_graphs, num_experts, device=device, dtype=dtype)
+    coeffs = (coeffs / coeffs.sum(dim=-1, keepdim=True)).detach()
+    coeffs0 = coeffs.clone().requires_grad_(True)
+    coeffs1 = coeffs.clone().requires_grad_(True)
+    globals0 = MOLEGlobals(coefficients=coeffs0, split_sizes=split_sizes)
+    globals1 = MOLEGlobals(coefficients=coeffs1, split_sizes=split_sizes)
+
+    base = MOLELinear(
+        in_features,
+        out_features,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="split_loop",
+    ).to(device=device, dtype=dtype)
+    cublas = MOLELinear(
+        in_features,
+        out_features,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        bias=True,
+        mole_linear_mode="cublas_grouped",
+    ).to(device=device, dtype=dtype)
+    cublas.load_state_dict(base.state_dict(), strict=True)
+
+    x0 = torch.randn(n_edges, 2, in_features, device=device, dtype=dtype, requires_grad=True)
+    x1 = x0.detach().clone().requires_grad_(True)
+    y0 = base(x0, globals0)
+    y1 = cublas(x1, globals1)
+    torch.testing.assert_close(y1, y0, atol=2e-4, rtol=2e-4)
+
+    probe = torch.randn_like(y0)
+    (y0 * probe).mean().backward()
+    (y1 * probe).mean().backward()
+    torch.testing.assert_close(x1.grad, x0.grad, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(coeffs1.grad, coeffs0.grad, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(cublas.weight_experts.grad, base.weight_experts.grad, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(cublas.bias_experts.grad, base.bias_experts.grad, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(cublas.weight_shared.grad, base.weight_shared.grad, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(cublas.bias_shared.grad, base.bias_shared.grad, atol=2e-4, rtol=2e-4)
+
+
+def test_cublas_grouped_multi_smoke_if_available():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("cuBLAS grouped GEMM smoke requires CUDA")
+
+    import torch.nn.functional as F
+    from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
+
+    torch.manual_seed(20260521)
+    device = torch.device("cuda")
+    ptr = torch.tensor([0, 4, 4, 9], dtype=torch.long)
+    xs0 = [
+        torch.randn(9, 5, device=device, requires_grad=True),
+        torch.randn(9, 3, device=device, requires_grad=True),
+    ]
+    ws0 = [
+        torch.randn(3, 7, 5, device=device, requires_grad=True),
+        torch.randn(3, 4, 3, device=device, requires_grad=True),
+    ]
+    xs1 = [x.detach().clone().requires_grad_(True) for x in xs0]
+    ws1 = [w.detach().clone().requires_grad_(True) for w in ws0]
+
+    def ref_grouped(x, weight):
+        parts = []
+        for group in range(weight.shape[0]):
+            start = int(ptr[group])
+            end = int(ptr[group + 1])
+            if end > start:
+                parts.append(F.linear(x[start:end], weight[group]))
+        return torch.cat(parts, dim=0)
+
+    ref = [ref_grouped(x, w) for x, w in zip(xs0, ws0)]
+    got = grouped_gemm_multi(xs1, [ptr, ptr], ws1)
+    for got_i, ref_i in zip(got, ref):
+        torch.testing.assert_close(got_i, ref_i, atol=2e-4, rtol=2e-4)
+
+    probes = [torch.randn_like(y) for y in ref]
+    sum((y * p).mean() for y, p in zip(ref, probes)).backward()
+    sum((y * p).mean() for y, p in zip(got, probes)).backward()
+    for x1, x0 in zip(xs1, xs0):
+        torch.testing.assert_close(x1.grad, x0.grad, atol=2e-4, rtol=2e-4)
+    for w1, w0 in zip(ws1, ws0):
+        torch.testing.assert_close(w1.grad, w0.grad, atol=2e-4, rtol=2e-4)
 
 
 def test_mole_linear_cueq_env_smoke_if_available(monkeypatch):
