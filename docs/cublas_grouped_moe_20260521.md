@@ -325,9 +325,16 @@ Module train smoke, `cublas_grouped`, compact Wigner, FP32, TF32 off:
 | `cutlass_tiled8` | 4096 | 17.897 | 15.802 | 1.13x | 2.27e-12 |
 | `cutlass_tiled8` | 16384 | 24.340 | 16.575 | 1.47x | 6.82e-13 |
 
-`indexed_sandwich_multi` confirms that merging route/m raw-linear scheduling helps, but the custom tiled fused forward is still stronger at large N. The remaining gap is now more specific: `indexed_sandwich_multi` still materializes per-m packed inputs and per-m raw outputs, then launches per-m epilogues. A deeper CUTLASS/CuTe kernel should combine the m scheduler with the raw-output epilogue and backward projection/scatter inside the same persistent grouped schedule.
+`indexed_sandwich_multi` confirms that merging route/m raw-linear scheduling helps, but the custom tiled fused forward is still stronger at large N in the module benchmark. The remaining gap is now more specific: `indexed_sandwich_multi` still materializes per-m packed inputs and per-m raw outputs, then launches per-m epilogues. A deeper CUTLASS/CuTe kernel should combine the m scheduler with the raw-output epilogue and backward projection/scatter inside the same persistent grouped schedule.
 
-A production smoke for `indexed_sandwich_multi` was launched under `/home/mingkang_nt/codex/0521_fused_so2_moe_aggressive_20260521/prod_smoke_indexed_sandwich_multi_20260521` and is intentionally not blocking this commit.
+Production smoke for `indexed_sandwich_multi`, with strict forward fallback disabled for the known interpolation SO2 layer:
+
+| Case | wall s | back-half s/iter | stable comparator wall | stable comparator back-half |
+| --- | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_indexed_sandwich_multi` | 62.917 | 1.848 | `global_all_cublas` 54.750 | 2.043 |
+| `edge_top2_fused_p0_indexed_sandwich_multi` | 66.065 | 1.965 | `edge_top2_cublas` 57.089 | 2.134 |
+
+This is the best steady-state production signal in this branch so far: compared with the stable cublas grouped path, back-half iter time improves by about 9.5% for global all-expert and 7.9% for edge top2. Wall time is still slower because warmup/extension and remaining fallback work are not amortized in the 25-iteration smoke. Compared with the previous `indexed_sandwich` production smoke, multi-m scheduling improves global wall time from 107.079 s to 62.917 s while preserving the same rotation-sandwich semantics.
 
 ## Artifacts
 
