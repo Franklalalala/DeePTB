@@ -467,6 +467,36 @@ def _scatter_pair_grad_cuda(
     )
 
 
+def _scatter_pairs_multi_grad_cuda(
+    grad_packed: torch.Tensor,
+    wigner: torch.Tensor,
+    in_base_all: torch.Tensor,
+    in_l_all: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cin_prefix: torch.Tensor,
+    m_values: torch.Tensor,
+    in_dim: int,
+    rotate_in: bool,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    return _load_extension().scatter_pairs_multi_grad_fp32(
+        grad_packed.contiguous(),
+        wigner,
+        in_base_all,
+        in_l_all,
+        offsets,
+        compact_offsets,
+        cin_prefix,
+        m_values,
+        int(in_dim),
+        bool(rotate_in),
+        int(wigner_mode),
+        int(wigner_stride),
+    )
+
+
 def _output_pair_grad_torch(
     grad_out: torch.Tensor,
     wigner: torch.Tensor,
@@ -1570,19 +1600,53 @@ class _PackPairsMultiFunction(torch.autograd.Function):
             int(wigner_mode),
             int(wigner_stride),
         )
+        use_multi_backward = _flag("DPTB_SO2_MOE_FUSED_P0_PACK_MULTI_BACKWARD", "1")
+        if use_multi_backward:
+            in_base_all = torch.cat(tuple(t.contiguous() for t in in_bases), dim=0).contiguous()
+            in_l_all = torch.cat(tuple(t.contiguous() for t in in_ls), dim=0).contiguous()
+        else:
+            in_base_all = torch.empty((0,), dtype=torch.long, device=x.device)
+            in_l_all = torch.empty((0,), dtype=torch.long, device=x.device)
         ctx.in_count = len(in_bases)
-        ctx.save_for_backward(wigner, offsets, compact_offsets, cin_prefix, m_values, *in_bases, *in_ls)
+        ctx.use_multi_backward = bool(use_multi_backward)
+        ctx.save_for_backward(
+            wigner,
+            offsets,
+            compact_offsets,
+            cin_prefix,
+            m_values,
+            in_base_all,
+            in_l_all,
+            *in_bases,
+            *in_ls,
+        )
         ctx.meta = (int(x.shape[1]), bool(rotate_in), int(wigner_mode), int(wigner_stride))
         return packed
 
     @staticmethod
     def backward(ctx, grad_packed):
         tensors = ctx.saved_tensors
-        wigner, offsets, compact_offsets, cin_prefix, m_values = tensors[:5]
+        wigner, offsets, compact_offsets, cin_prefix, m_values, in_base_all, in_l_all = tensors[:7]
         n = ctx.in_count
-        in_bases = tensors[5:5 + n]
-        in_ls = tensors[5 + n:5 + 2 * n]
+        in_bases = tensors[7:7 + n]
+        in_ls = tensors[7 + n:7 + 2 * n]
         in_dim, rotate_in, wigner_mode, wigner_stride = ctx.meta
+        if ctx.use_multi_backward:
+            grad_x = _scatter_pairs_multi_grad_cuda(
+                grad_packed,
+                wigner,
+                in_base_all,
+                in_l_all,
+                offsets,
+                compact_offsets,
+                cin_prefix,
+                m_values,
+                int(in_dim),
+                bool(rotate_in),
+                int(wigner_mode),
+                int(wigner_stride),
+            )
+            return grad_x, None, None, None, None, None, None, None, None, None, None
         grad_x = None
         for i in range(n):
             start = int(cin_prefix[i].item())

@@ -921,6 +921,60 @@ __global__ void scatter_pair_grad_kernel(
   }
 }
 
+__global__ void scatter_pairs_multi_grad_kernel(
+    const float* __restrict__ grad_packed,
+    const float* __restrict__ wigner,
+    const int64_t* __restrict__ in_base_all,
+    const int64_t* __restrict__ in_l_all,
+    const int64_t* __restrict__ offsets,
+    const int64_t* __restrict__ compact_offsets,
+    const int64_t* __restrict__ cin_prefix,
+    const int64_t* __restrict__ m_values,
+    float* __restrict__ grad_x,
+    int64_t n_edges,
+    int64_t in_dim,
+    int64_t dense_stride,
+    int64_t wigner_stride,
+    int64_t n_m,
+    int64_t total_cin,
+    int wigner_mode,
+    bool rotate_in) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = n_edges * total_cin;
+  if (idx >= total) {
+    return;
+  }
+  const int64_t edge = idx / total_cin;
+  const int64_t local = idx - edge * total_cin;
+
+  int64_t m_idx = 0;
+  while (m_idx + 1 < n_m && local >= cin_prefix[m_idx + 1]) {
+    ++m_idx;
+  }
+  const int64_t channel = local - cin_prefix[m_idx];
+  const int m = static_cast<int>(m_values[m_idx]);
+  const float grad0 = grad_packed[(edge * 2) * total_cin + local];
+  const float grad1 = grad_packed[(edge * 2 + 1) * total_cin + local];
+
+  scatter_pair_grad_x(
+      grad_x,
+      wigner,
+      in_base_all + cin_prefix[m_idx],
+      in_l_all + cin_prefix[m_idx],
+      offsets,
+      compact_offsets,
+      edge,
+      channel,
+      in_dim,
+      dense_stride,
+      wigner_stride,
+      wigner_mode,
+      m,
+      grad0,
+      grad1,
+      rotate_in);
+}
+
 __global__ void scatter_pair_grad_radial_input_kernel(
     const float* __restrict__ grad_pair_eff,
     const float* __restrict__ pair_no_radial,
@@ -2445,6 +2499,60 @@ torch::Tensor scatter_pair_grad_fp32_cuda(
       wigner_stride,
       cin,
       static_cast<int>(m),
+      static_cast<int>(wigner_mode),
+      rotate_in);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_x;
+}
+
+torch::Tensor scatter_pairs_multi_grad_fp32_cuda(
+    torch::Tensor grad_packed,
+    torch::Tensor wigner,
+    torch::Tensor in_base_all,
+    torch::Tensor in_l_all,
+    torch::Tensor offsets,
+    torch::Tensor compact_offsets,
+    torch::Tensor cin_prefix,
+    torch::Tensor m_values,
+    int64_t in_dim,
+    bool rotate_in,
+    int64_t wigner_mode,
+    int64_t wigner_stride) {
+  const int64_t n_m = m_values.numel();
+  TORCH_CHECK(n_m > 0, "m_values must be non-empty");
+  TORCH_CHECK(cin_prefix.numel() == n_m + 1, "cin_prefix length must be n_m + 1");
+  const int64_t n_edges = grad_packed.size(0);
+  const int64_t total_cin = cin_prefix[cin_prefix.numel() - 1].item<int64_t>();
+  TORCH_CHECK(in_base_all.numel() == total_cin && in_l_all.numel() == total_cin,
+              "flat input maps must have total_cin entries");
+  TORCH_CHECK(grad_packed.dim() == 3 && grad_packed.size(1) == 2 && grad_packed.size(2) == total_cin,
+              "grad_packed must be [N, 2, total_cin]");
+  const int64_t dense_stride = wigner_mode == 1 ? wigner.size(1) : 0;
+  auto grad_x = torch::zeros({n_edges, in_dim}, grad_packed.options());
+  if (n_edges == 0 || total_cin == 0) {
+    return grad_x;
+  }
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = n_edges * total_cin;
+  const dim3 grid((total + threads - 1) / threads);
+  scatter_pairs_multi_grad_kernel<<<grid, threads, 0, stream>>>(
+      grad_packed.data_ptr<float>(),
+      wigner.numel() == 0 ? nullptr : wigner.data_ptr<float>(),
+      in_base_all.data_ptr<int64_t>(),
+      in_l_all.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>(),
+      compact_offsets.numel() == 0 ? nullptr : compact_offsets.data_ptr<int64_t>(),
+      cin_prefix.data_ptr<int64_t>(),
+      m_values.data_ptr<int64_t>(),
+      grad_x.data_ptr<float>(),
+      n_edges,
+      in_dim,
+      dense_stride,
+      wigner_stride,
+      n_m,
+      total_cin,
       static_cast<int>(wigner_mode),
       rotate_in);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

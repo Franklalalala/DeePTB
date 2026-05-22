@@ -483,6 +483,34 @@ Current decision:
 - Keep stable production default on `mole_linear_mode="cublas_grouped"` / `streamed_m_major_cueq`; this branch's best experimental steady-state path remains `indexed_sandwich_multi`, not grouped pre/post.
 - The next real CUTLASS/CuTe step should be a custom grouped kernel whose accumulator epilogue directly performs raw complex finish and Wigner output scatter before writing to global memory. A post-GEMM epilogue kernel is useful for validating maps and semantics, but is still too late in the dataflow.
 
+Flat grouped-pack backward follow-up, 2026-05-22:
+
+- Added `DPTB_SO2_MOE_FUSED_P0_PACK_MULTI_BACKWARD=1` for `_PackPairsMultiFunction.backward`. Instead of launching per-`m` scatter kernels or constructing device pointer arrays on every backward pass, the grouped-pack forward saves flat `in_base_all` / `in_l_all` maps and the backward launches one grouped scatter over all `m` segments.
+- This keeps the strong `indexed_sandwich_multi_grouped` raw GEMM middle intact; it only reduces one backward fragmentation point in the grouped-pack line. It does not affect the plain best `indexed_sandwich_multi` mode unless grouped pack is enabled.
+- Liyue targeted correctness, compact Wigner, FP32 and TF32 off:
+
+```text
+export DPTB_SO2_MOE_FUSED_P0_PACK_MULTI_BACKWARD=1
+pytest dptb/tests/test_so2_moe_fused_p0.py::test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available[cublas_grouped-indexed_sandwich_multi_grouped] --tb=short -q
+1 passed, 1 warning in 3.57s
+```
+
+Module train A/B, `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_grouped`, output-major multi epilogue, `cuda_cublas_segmented` backward:
+
+| N | `PACK_MULTI_BACKWARD=0` fused ms | `PACK_MULTI_BACKWARD=1` fused ms | Interpretation |
+| ---: | ---: | ---: | --- |
+| 4096 | 16.398 avg | 15.510 avg | noisy but positive, about +5.4% |
+| 16384 | 16.411 avg | 16.182 avg | small +1.4% module win |
+
+Production smoke, cached extension, Liyue L40S, bs=32, 25 iterations, FP32 and TF32 off:
+
+| Case | wall s | back-half s/iter | previous grouped-pack | best `indexed_sandwich_multi` | stable comparator |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `global_all_fused_p0_indexed_sandwich_multi_grouped` | 65.930 | 1.947 | 65.191 / 1.944 | 62.917 / 1.848 | `global_all_cublas` 54.750 / 2.043 |
+| `edge_top2_fused_p0_indexed_sandwich_multi_grouped` | 66.950 | 2.007 | 69.047 / 2.077 | 66.065 / 1.965 | `edge_top2_cublas` 57.089 / 2.134 |
+
+Conclusion: flat grouped-pack backward is a correct, low-risk asset for the grouped-pack development path and gives a visible edge-case steady-state improvement. It still does not overturn the main production lesson: `indexed_sandwich_multi` stays the best fused-P0 route because it preserves the strong grouped GEMM and avoids the grouped-pack/output-major overhead. The next step remains a true grouped mainloop with the Wigner output epilogue inside the GEMM tile, plus a similarly tiled backward projection/scatter.
+
 ## Direct custom A-loader / in-kernel epilogue bridge
 
 `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE=indexed_sandwich_multi_direct_warp` was added as a bridge between the best `indexed_sandwich_multi` semantics and the deeper P1 custom-loader dataflow. It runs through the normal `streamed_m_major_fused_p0` entry, but delegates the `m>0` part to the P1 warp-collective route/m kernel:
