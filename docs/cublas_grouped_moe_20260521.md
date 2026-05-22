@@ -654,6 +654,53 @@ Interpretation:
 - 64x32 is the best native tile tested in this round. 32x32 increases scheduling overhead, while 64x16 needs a deeper custom epilogue iterator because CUTLASS's default SIMT epilogue cannot form a valid thread map for that narrow N tile.
 - Do not make `cutlass_native` the default. Keep it as an opt-in asset for the next step: a forked grouped GEMM kernel or CUTLASS 3.x collective where the scheduler exposes route/m/problem metadata directly to both the A loader and epilogue, and where backward projection/scatter is tiled with the same schedule.
 
+## P2 no-sync guard review, 2026-05-22
+
+Reviewed local patch package:
+
+```text
+C:\Users\16608\Documents\Codex\2026-05-21\deeptb_moe_p2_nosync_guard\deeptb_moe_p2_nosync_guard
+```
+
+The whole package was not installed as a new mode. Two reasons:
+
+- It enables via `DPTB_SO2_FUSION_MODE=streamed_m_major_p2_nosync_guard`, but the production smoke JSONs set `embedding.so2_fusion_mode` explicitly. In the current DeePTB dispatch, that environment variable only wins when config passes `None` or `"staged"`, so it would not affect the real three-minute smoke configs unless the JSONs were edited too.
+- Its `production_guard` only blocks `cutlass_native` under grad-enabled execution. Because the package's default mainloop is `warp_collective`, the guard would still route production into P1 instead of stable fallback. That is not a true no-regression guard.
+
+Low-risk pieces absorbed into existing `streamed_m_major_persistent_grouped_p1`:
+
+- `DPTB_SO2_MOE_PERSISTENT_P1_NOSYNC_LAYOUT=1` builds route/m tile prefixes on GPU with `bincount`, `cumsum`, and device-side width arithmetic. The default remains `0` because production smoke did not show a clear gain.
+- `DPTB_SO2_MOE_PERSISTENT_P1_VALIDATE_ROUTE_IDS` now defaults to `0` only when no-sync layout is enabled, avoiding an `.item()` sync in that opt-in hot path. Otherwise validation keeps the old default.
+- `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_M0_POLICY=warp_all` can force all-m `warp_collective` instead of the `cutlass_native m>0 + m0 fallback` split for experiments. The default remains `fallback`.
+- `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_NATIVE_GUARD=1` is an opt-in guard that skips `cutlass_native` under grad-enabled execution unless `DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE=1` is set. The default remains `0` so existing opt-in CUTLASS tests keep exercising the native path.
+
+Liyue CUDA correctness after integrating the default-preserving hooks:
+
+```text
+pytest dptb/tests/test_so2_moe_persistent_grouped_p1.py -q
+4 passed, 1 warning in 55.36s
+```
+
+Module train A/B, Liyue L40S, `streamed_m_major_persistent_grouped_p1`, `warp_collective`, `cuda_cublas_segmented` backward, compact Wigner, FP32 and TF32 off:
+
+| N | `NOSYNC_LAYOUT` | fused train ms |
+| ---: | ---: | ---: |
+| 4096 | 0 | 13.686 avg of 13.632 / 13.740 |
+| 4096 | 1 | 13.414 avg of 13.292 / 13.536 |
+| 16384 | 0 | 15.138 avg of 15.101 / 15.176 |
+| 16384 | 1 | 14.863 avg of 14.835 / 14.892 |
+
+No-sync layout gives about 1.8-2.0% module-level speedup in this isolated benchmark with numerical agreement (`loss_abs_diff=0`, x-gradient max diff around `1e-12`).
+
+Three-minute production smoke, Liyue L40S, bs=32, 25 iterations, `warp_collective`, compact Wigner, FP32 and TF32 off:
+
+| Case | wall s | back-half s/iter | comparison |
+| --- | ---: | ---: | --- |
+| `global_all_persistent_grouped_p1_warp16`, `NOSYNC_LAYOUT=1` | 108.760 | 1.939 | slower than prior P1 warp16 steady-state 1.907; wall includes extension import/build overhead |
+| `edge_top2_persistent_grouped_p1_warp16`, `NOSYNC_LAYOUT=1` | 75.798 | 2.153 | essentially neutral vs prior P1 warp16 2.157 |
+
+Conclusion: the GPU prefix construction is a useful opt-in asset and removes an avoidable host sync from the P1 hot path, but it is not high-yield enough to default on. Production remains dominated by the fused kernel/backward/fallback schedule rather than this prefix construction alone.
+
 ## Artifacts
 
 Liyue run root:

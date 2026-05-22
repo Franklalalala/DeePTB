@@ -360,6 +360,61 @@ def _prepare_route_layout(
     raw_pair_tiles: bool = False,
 ):
     graph_index = graph_index.reshape(-1).to(dtype=torch.long)
+    assume_sorted = _flag("DPTB_SO2_MOE_PERSISTENT_P1_ASSUME_SORTED")
+    nosync_layout = _flag("DPTB_SO2_MOE_PERSISTENT_P1_NOSYNC_LAYOUT", "0")
+    if not nosync_layout:
+        key = (
+            str(graph_index.device),
+            int(graph_index.data_ptr()),
+            int(graph_index.numel()),
+            int(getattr(graph_index, "_version", 0)),
+            int(n_routes),
+            int(n_m),
+            int(block_m),
+            int(block_n),
+            tuple(int(v) for v in out_ptr.detach().cpu().tolist()),
+            bool(raw_pair_tiles),
+            bool(assume_sorted),
+        )
+        cached = _LAYOUT_CACHE.get(key)
+        if cached is not None:
+            _LAYOUT_CACHE.move_to_end(key)
+            return cached
+
+        if graph_index.numel() == 0:
+            edge_order = torch.empty((0,), dtype=torch.long, device=graph_index.device)
+            route_ptr = torch.zeros((n_routes + 1,), dtype=torch.long, device=graph_index.device)
+            prefix = torch.zeros((n_routes * n_m + 1,), dtype=torch.long, device=graph_index.device)
+        else:
+            if assume_sorted or torch.all(graph_index[1:] >= graph_index[:-1]).item():
+                edge_order = torch.arange(graph_index.numel(), dtype=torch.long, device=graph_index.device)
+                sorted_graph = graph_index
+            else:
+                edge_order = torch.argsort(graph_index, stable=True).contiguous()
+                sorted_graph = graph_index.index_select(0, edge_order).contiguous()
+            counts = torch.bincount(sorted_graph, minlength=int(n_routes))
+            route_ptr = torch.zeros((n_routes + 1,), dtype=torch.long, device=graph_index.device)
+            route_ptr[1:] = torch.cumsum(counts, dim=0)
+
+            counts_cpu = counts.detach().cpu().tolist()
+            out_ptr_cpu = [int(v) for v in out_ptr.detach().cpu().tolist()]
+            pref = [0]
+            for r in range(int(n_routes)):
+                rows = int(counts_cpu[r])
+                for m_idx in range(int(n_m)):
+                    cout = out_ptr_cpu[m_idx + 1] - out_ptr_cpu[m_idx]
+                    col_extent = 2 * cout if raw_pair_tiles else cout
+                    row_tiles = (rows + int(block_m) - 1) // int(block_m)
+                    col_tiles = (col_extent + int(block_n) - 1) // int(block_n)
+                    pref.append(pref[-1] + row_tiles * col_tiles)
+            prefix = torch.tensor(pref, dtype=torch.long, device=graph_index.device).contiguous()
+
+        cached = (edge_order.contiguous(), route_ptr.contiguous(), prefix.contiguous())
+        _LAYOUT_CACHE[key] = cached
+        while len(_LAYOUT_CACHE) > _LAYOUT_CACHE_MAX:
+            _LAYOUT_CACHE.popitem(last=False)
+        return cached
+
     key = (
         str(graph_index.device),
         int(graph_index.data_ptr()),
@@ -369,9 +424,11 @@ def _prepare_route_layout(
         int(n_m),
         int(block_m),
         int(block_n),
-        tuple(int(v) for v in out_ptr.detach().cpu().tolist()),
+        int(out_ptr.data_ptr()),
+        int(out_ptr.numel()),
+        int(getattr(out_ptr, "_version", 0)),
         bool(raw_pair_tiles),
-        bool(_flag("DPTB_SO2_MOE_PERSISTENT_P1_ASSUME_SORTED")),
+        bool(assume_sorted),
     )
     cached = _LAYOUT_CACHE.get(key)
     if cached is not None:
@@ -383,33 +440,26 @@ def _prepare_route_layout(
         route_ptr = torch.zeros((n_routes + 1,), dtype=torch.long, device=graph_index.device)
         prefix = torch.zeros((n_routes * n_m + 1,), dtype=torch.long, device=graph_index.device)
     else:
-        if _flag("DPTB_SO2_MOE_PERSISTENT_P1_ASSUME_SORTED") or torch.all(graph_index[1:] >= graph_index[:-1]).item():
+        if assume_sorted:
             edge_order = torch.arange(graph_index.numel(), dtype=torch.long, device=graph_index.device)
             sorted_graph = graph_index
         else:
             edge_order = torch.argsort(graph_index, stable=True).contiguous()
             sorted_graph = graph_index.index_select(0, edge_order).contiguous()
         counts = torch.bincount(sorted_graph, minlength=int(n_routes))
-        route_ptr = torch.zeros((n_routes + 1,), dtype=torch.long, device=graph_index.device)
+        route_ptr = torch.empty((n_routes + 1,), dtype=torch.long, device=graph_index.device)
+        route_ptr[0] = 0
         route_ptr[1:] = torch.cumsum(counts, dim=0)
 
-        counts_cpu = counts.detach().cpu().tolist()
-        out_ptr_cpu = [int(v) for v in out_ptr.detach().cpu().tolist()]
-        pref = [0]
-        for r in range(int(n_routes)):
-            rows = int(counts_cpu[r])
-            for m_idx in range(int(n_m)):
-                cout = out_ptr_cpu[m_idx + 1] - out_ptr_cpu[m_idx]
-                if raw_pair_tiles:
-                    row_extent = rows
-                    col_extent = 2 * cout
-                else:
-                    row_extent = rows
-                    col_extent = cout
-                row_tiles = (row_extent + int(block_m) - 1) // int(block_m)
-                col_tiles = (col_extent + int(block_n) - 1) // int(block_n)
-                pref.append(pref[-1] + row_tiles * col_tiles)
-        prefix = torch.tensor(pref, dtype=torch.long, device=graph_index.device).contiguous()
+        widths = (out_ptr[1:] - out_ptr[:-1]).to(dtype=torch.long)
+        if raw_pair_tiles:
+            widths = widths * 2
+        row_tiles = torch.div(counts + int(block_m) - 1, int(block_m), rounding_mode="floor")
+        col_tiles = torch.div(widths + int(block_n) - 1, int(block_n), rounding_mode="floor")
+        problem_tiles = (row_tiles[:, None] * col_tiles[None, :]).reshape(-1)
+        prefix = torch.empty((problem_tiles.numel() + 1,), dtype=torch.long, device=graph_index.device)
+        prefix[0] = 0
+        prefix[1:] = torch.cumsum(problem_tiles, dim=0)
 
     cached = (edge_order.contiguous(), route_ptr.contiguous(), prefix.contiguous())
     _LAYOUT_CACHE[key] = cached
@@ -737,12 +787,39 @@ def try_forward_so2_moe_persistent_grouped_p1(
     )
     mainloop_name = mainloop_override or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
     mainloop_kind = _mainloop_kind(mainloop_name)
-    if int(mainloop_kind) == 3 and include_m0:
+    if (
+        int(mainloop_kind) == 3
+        and torch.is_grad_enabled()
+        and _flag("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_NATIVE_GUARD", "0")
+        and not _flag("DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE")
+    ):
         _warn_once(
-            "cutlass_native_m0_fallback",
-            "persistent_grouped_p1 cutlass_native currently fuses m>0 and leaves m=0 on the existing fallback.",
+            "cutlass_native_guarded",
+            "persistent_grouped_p1 production guard skipped cutlass_native under grad-enabled execution; "
+            "set DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE=1 to force it.",
         )
-        include_m0 = False
+        return None
+    if int(mainloop_kind) == 3 and include_m0:
+        m0_policy = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_M0_POLICY", "fallback")
+        if m0_policy == "warp_all":
+            _warn_once(
+                "cutlass_native_m0_warp_all",
+                "persistent_grouped_p1 cutlass_native requested with m0; using all-m warp_collective policy.",
+            )
+            mainloop_name = "warp_collective"
+            mainloop_kind = _mainloop_kind(mainloop_name)
+        elif m0_policy in ("fallback", "split"):
+            _warn_once(
+                "cutlass_native_m0_fallback",
+                "persistent_grouped_p1 cutlass_native currently fuses m>0 and leaves m=0 on the existing fallback.",
+            )
+            include_m0 = False
+        else:
+            _warn_once(
+                "cutlass_native_m0_policy_fallback",
+                f"unknown DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_M0_POLICY={m0_policy!r}; falling back.",
+            )
+            return None
 
     (
         m_values,
@@ -765,7 +842,12 @@ def try_forward_so2_moe_persistent_grouped_p1(
     graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
     if graph_index.numel() != x.shape[0]:
         raise ValueError(f"MOLE graph_index has {graph_index.numel()} rows, but fused input has {x.shape[0]} rows.")
-    if graph_index.numel() and (torch.any(graph_index < 0).item() or torch.any(graph_index >= int(n_routes)).item()):
+    validate_route_ids_default = "0" if _flag("DPTB_SO2_MOE_PERSISTENT_P1_NOSYNC_LAYOUT", "0") else "1"
+    if (
+        _flag("DPTB_SO2_MOE_PERSISTENT_P1_VALIDATE_ROUTE_IDS", validate_route_ids_default)
+        and graph_index.numel()
+        and (torch.any(graph_index < 0).item() or torch.any(graph_index >= int(n_routes)).item())
+    ):
         _warn_once("route_id_fallback", "persistent_grouped_p1 graph_index contains a route id outside mixed weight route range; falling back.")
         return None
 
