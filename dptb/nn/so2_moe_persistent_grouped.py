@@ -63,8 +63,10 @@ def _mainloop_kind(name: Optional[str] = None) -> int:
         return 0
     if mode in ("warp", "warp_collective", "collective"):
         return 1
-    if mode in ("cute_tiled", "cutlass_native", "cutlass_cute_tiled", "tiled"):
+    if mode in ("cute_tiled", "cutlass_cute_tiled", "tiled"):
         return 2
+    if mode in ("cutlass_native", "cutlass_native_grouped", "native_cutlass", "cutlass_grouped_native"):
+        return 3
     raise RuntimeError(f"unknown DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP={mode!r}")
 
 
@@ -347,7 +349,16 @@ def _pack_all_m_weights(
     )
 
 
-def _prepare_route_layout(graph_index: torch.Tensor, n_routes: int, n_m: int, block_m: int, block_n: int, out_ptr: torch.Tensor):
+def _prepare_route_layout(
+    graph_index: torch.Tensor,
+    n_routes: int,
+    n_m: int,
+    block_m: int,
+    block_n: int,
+    out_ptr: torch.Tensor,
+    *,
+    raw_pair_tiles: bool = False,
+):
     graph_index = graph_index.reshape(-1).to(dtype=torch.long)
     key = (
         str(graph_index.device),
@@ -359,6 +370,7 @@ def _prepare_route_layout(graph_index: torch.Tensor, n_routes: int, n_m: int, bl
         int(block_m),
         int(block_n),
         tuple(int(v) for v in out_ptr.detach().cpu().tolist()),
+        bool(raw_pair_tiles),
         bool(_flag("DPTB_SO2_MOE_PERSISTENT_P1_ASSUME_SORTED")),
     )
     cached = _LAYOUT_CACHE.get(key)
@@ -386,10 +398,16 @@ def _prepare_route_layout(graph_index: torch.Tensor, n_routes: int, n_m: int, bl
         pref = [0]
         for r in range(int(n_routes)):
             rows = int(counts_cpu[r])
-            row_tiles = (rows + int(block_m) - 1) // int(block_m)
             for m_idx in range(int(n_m)):
                 cout = out_ptr_cpu[m_idx + 1] - out_ptr_cpu[m_idx]
-                col_tiles = (cout + int(block_n) - 1) // int(block_n)
+                if raw_pair_tiles:
+                    row_extent = rows
+                    col_extent = 2 * cout
+                else:
+                    row_extent = rows
+                    col_extent = cout
+                row_tiles = (row_extent + int(block_m) - 1) // int(block_m)
+                col_tiles = (col_extent + int(block_n) - 1) // int(block_n)
                 pref.append(pref[-1] + row_tiles * col_tiles)
         prefix = torch.tensor(pref, dtype=torch.long, device=graph_index.device).contiguous()
 
@@ -438,7 +456,9 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
         active_blocks: int,
     ):
         ext = _load_extension()
-        if int(mainloop_kind) == 2:
+        if int(mainloop_kind) == 3:
+            forward = ext.persistent_grouped_forward_cutlass_native_fp32
+        elif int(mainloop_kind) == 2:
             forward = ext.persistent_grouped_forward_cute_tiled_fp32
         elif int(mainloop_kind) == 1:
             forward = ext.persistent_grouped_forward_warp_fp32
@@ -715,6 +735,14 @@ def try_forward_so2_moe_persistent_grouped_p1(
         if include_m0_override is not None
         else _flag("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", "1")
     )
+    mainloop_name = mainloop_override or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+    mainloop_kind = _mainloop_kind(mainloop_name)
+    if int(mainloop_kind) == 3 and include_m0:
+        _warn_once(
+            "cutlass_native_m0_fallback",
+            "persistent_grouped_p1 cutlass_native currently fuses m>0 and leaves m=0 on the existing fallback.",
+        )
+        include_m0 = False
 
     (
         m_values,
@@ -741,14 +769,22 @@ def try_forward_so2_moe_persistent_grouped_p1(
         _warn_once("route_id_fallback", "persistent_grouped_p1 graph_index contains a route id outside mixed weight route range; falling back.")
         return None
 
-    block_m = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_M", 8))
-    block_n = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N", 8))
+    if int(mainloop_kind) == 3:
+        block_m = 64
+        block_n = 32
+    else:
+        block_m = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_M", 8))
+        block_n = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N", 8))
     active_blocks = _int_env("DPTB_SO2_MOE_PERSISTENT_P1_ACTIVE_BLOCKS", 0)
-    mainloop_name = mainloop_override or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
-    mainloop_kind = _mainloop_kind(mainloop_name)
 
     edge_order, route_ptr, problem_tile_prefix = _prepare_route_layout(
-        graph_index, n_routes, int(m_values.numel()), block_m, block_n, out_ptr
+        graph_index,
+        n_routes,
+        int(m_values.numel()),
+        block_m,
+        block_n,
+        out_ptr,
+        raw_pair_tiles=(int(mainloop_kind) == 3),
     )
 
     radial_all = module.radial_emb(latents).contiguous() if module.radial_emb else x.new_empty((0,))

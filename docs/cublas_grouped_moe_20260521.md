@@ -573,6 +573,59 @@ This is a negative performance result but a useful implementation boundary resul
 - Tile shape `16x32` is now rejected because it has more output elements than the 256-thread prototype can cover; that shape previously produced numerical drift and is not valid for this kernel.
 - The next meaningful CUTLASS step is not more wrapper work. It is either a forked grouped GEMM kernel with a custom problem visitor/A iterator and custom epilogue output path, or a CUTLASS 3.x `GemmUniversal`/collective-style kernel where the loader computes Wigner-rotated A fragments and the epilogue consumes accumulators before D is materialized.
 
+## CUTLASS native A-loader and epilogue prototype, 2026-05-22
+
+`DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP=cutlass_native` adds a deeper P1 backend wired through the existing `streamed_m_major_persistent_grouped_p1` route. It keeps the P1 route/m grouped metadata, but replaces the custom warp/SIMT dot loop for `m>0` with a CUTLASS `MmaPipelined` tiled mainloop:
+
+- custom A iterator: reads original edge features plus compact Wigner blocks and computes the Wigner input pair values while loading A fragments;
+- custom B iterator: reads route-mixed weights and maps them into the real/imag complex multiply layout, so the CUTLASS accumulator directly contains the two SO2 pair outputs;
+- custom visitor epilogue: consumes the accumulator before raw D materialization and applies Wigner output rotation/scatter into the full output buffer;
+- `m=0` remains on the existing strong fallback, and the known interpolation SO2 layer is still allowed to fall back in production smoke.
+
+This path is cueq-semantics compatible at the SO2 boundary, but the fused `m>0` kernel itself is not a cuEq kernel. The stable `cublas_grouped` and `indexed_sandwich_multi` paths remain available and are not changed by default.
+
+Official CUTLASS references used for this iteration:
+
+- CUTLASS 3.x GEMM API: persistent kernels schedule work tiles in the kernel loop, while collectives own the mainloop and epilogue fusion points.
+  https://docs.nvidia.com/cutlass/latest/media/docs/cpp/gemm_api_3x.html
+- CUTLASS grouped scheduler: grouped kernels schedule tiles across problem lists, matching DeePTB's route/m grouped metadata.
+  https://docs.nvidia.com/cutlass/latest/media/docs/cpp/grouped_scheduler.html
+- CUTLASS tile iterator concepts: the custom A/B iterators follow the fragment load and iterator advance contract.
+  https://docs.nvidia.com/cutlass/latest/media/docs/cpp/tile_iterator_concept.html
+
+Liyue correctness, compact Wigner, FP32 and TF32 off:
+
+```text
+pytest dptb/tests/test_cutlass_so2_gemm_universal_smoke.py -q
+3 passed, 1 warning in 47.70s
+
+pytest dptb/tests/test_so2_moe_persistent_grouped_p1.py::test_persistent_grouped_p1_train_matches_streamed_ref --tb=short -q
+3 passed, 1 warning in 49.33s
+```
+
+Module train A/B, `cublas_grouped`, compact Wigner, `cuda_cublas_segmented` backward, `N=4096`, 32 routes, 100 measured iterations, FP32 and TF32 off:
+
+| Mainloop | Tile | fused train ms | `x_grad_max_abs` | Note |
+| --- | --- | ---: | ---: | --- |
+| `warp_collective` | env tile path | 18.662 | 3.64e-12 | new multi-m comparator |
+| `cutlass_native` | 64x32 | 17.993 | 2.27e-12 | 1.037x vs `warp_collective` |
+| `cutlass_native` | 32x32 | 18.048 | 2.27e-12 | correct but slower than 64x32 |
+| `cutlass_native` | 64x16 | compile reject | n/a | CUTLASS SIMT epilogue static assert: `ThreadMap::Iterations::kColumn` becomes zero |
+
+Production smoke, Liyue L40S, bs=32, 25 iterations, FP32 and TF32 off. The extension was precompiled before timing:
+
+| Case | wall s | back-half s/iter | comparator |
+| --- | ---: | ---: | --- |
+| `global_all_persistent_grouped_p1_cutlass_native` | 68.133 | 2.020 | slower than `indexed_sandwich_multi` 62.917 / 1.848; slightly faster steady-state than stable `global_all_cublas` 2.043 |
+| `edge_top2_persistent_grouped_p1_cutlass_native` | 73.692 | 2.207 | slower than `indexed_sandwich_multi` 66.065 / 1.965 and stable `edge_top2_cublas` 2.134 |
+
+Interpretation:
+
+- This is the first wired P1 backend in this branch that uses a CUTLASS mainloop with DeePTB-specific A loading and output epilogue, rather than only wrapping raw GEMM.
+- The module signal is positive versus the P1 warp-collective comparator, but production remains behind the best `indexed_sandwich_multi` path. The production bottleneck is now launch/scheduling granularity plus remaining fallback work, not only the raw m>0 mainloop.
+- 64x32 is the best native tile tested in this round. 32x32 increases scheduling overhead, while 64x16 needs a deeper custom epilogue iterator because CUTLASS's default SIMT epilogue cannot form a valid thread map for that narrow N tile.
+- Do not make `cutlass_native` the default. Keep it as an opt-in asset for the next step: a forked grouped GEMM kernel or CUTLASS 3.x collective where the scheduler exposes route/m/problem metadata directly to both the A loader and epilogue, and where backward projection/scatter is tiled with the same schedule.
+
 ## Artifacts
 
 Liyue run root:
@@ -625,4 +678,5 @@ prod_smoke_persistent_grouped_p1_20260521
 prod_smoke_persistent_grouped_p1_nom0_20260521
 prod_smoke_persistent_grouped_p1_warp_20260522
 prod_smoke_persistent_grouped_p1_warp16_20260522
+prod_smoke_persistent_grouped_p1_cutlass_native_20260522
 ```

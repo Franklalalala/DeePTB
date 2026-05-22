@@ -100,13 +100,16 @@ def test_direct_persistent_grouped_p1_m0_m1_identity_wigner():
     torch.testing.assert_close(out_warp, ref, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("include_m0", ["0", "1"])
+@pytest.mark.parametrize(
+    "include_m0,mainloop",
+    [("0", "warp_collective"), ("1", "warp_collective"), ("0", "cutlass_native")],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for persistent grouped P1")
-def test_persistent_grouped_p1_train_matches_streamed_ref(monkeypatch, include_m0):
+def test_persistent_grouped_p1_train_matches_streamed_ref(monkeypatch, include_m0, mainloop):
     torch.manual_seed(20260527)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", include_m0)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE", "cuda_cublas_segmented")
-    monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
+    monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", mainloop)
 
     from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear

@@ -2738,6 +2738,9 @@ def try_forward_so2_moe_fused_p0(module, x, R, mole_globals: MOLEGlobals, latent
             "cute_tiled"
             if forward_mode in (
                 "indexed_sandwich_multi_cute_tiled",
+            )
+            else "cutlass_native"
+            if forward_mode in (
                 "indexed_sandwich_multi_cutlass_native",
                 "custom_a_loader_cutlass_epilogue",
             )
