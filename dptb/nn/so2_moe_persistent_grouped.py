@@ -57,6 +57,96 @@ def _int_env(name: str, default: int) -> int:
         return int(default)
 
 
+def _parse_tile_spec(value: str) -> Optional[tuple[int, int]]:
+    value = value.lower().replace(" ", "")
+    for sep in ("x", ",", ":"):
+        if sep in value:
+            left, right = value.split(sep, 1)
+            try:
+                return int(left), int(right)
+            except ValueError:
+                return None
+    return None
+
+
+def _cutlass_native_problem_tag(
+    graph_index: torch.Tensor,
+    n_routes: int,
+    m_values: torch.Tensor,
+    in_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    block_m: int,
+    block_n: int,
+) -> str:
+    if graph_index.numel() == 0:
+        row_summary = "0/0/0"
+        counts_cpu: list[int] = []
+    else:
+        counts = torch.bincount(graph_index.reshape(-1).to(dtype=torch.long), minlength=int(n_routes))
+        counts_cpu = [int(v) for v in counts.detach().cpu().tolist()]
+        row_summary = f"{min(counts_cpu)}/{max(counts_cpu)}/{sum(counts_cpu)}"
+    in_cpu = [int(v) for v in in_ptr.detach().cpu().tolist()]
+    out_cpu = [int(v) for v in out_ptr.detach().cpu().tolist()]
+    m_cpu = [int(v) for v in m_values.detach().cpu().tolist()]
+    desc = []
+    tile_desc = []
+    total_native_tiles = 0
+    for idx, m in enumerate(m_cpu):
+        cin = in_cpu[idx + 1] - in_cpu[idx]
+        cout = out_cpu[idx + 1] - out_cpu[idx]
+        if m == 0:
+            desc.append(f"m={m}:native[M=rows,N={cout},K={cin}]")
+            n_cols = cout
+        else:
+            desc.append(
+                f"m={m}:native[M=rows,N={2 * cout},K={2 * cin}],"
+                f"indexed_equiv[M=2*rows,N={2 * cout},K={cin}]"
+            )
+            n_cols = 2 * cout
+        if counts_cpu:
+            m_tiles = sum((rows + block_m - 1) // block_m for rows in counts_cpu)
+            n_tiles = (n_cols + block_n - 1) // block_n
+            total_native_tiles += m_tiles * n_tiles
+            tile_desc.append(f"m={m}:n_tiles={n_tiles},route_m_tiles_sum={m_tiles}")
+    return (
+        f"routes={int(n_routes)}, route_rows_min/max/total={row_summary}, "
+        f"m_count={len(m_cpu)}, problems={int(n_routes) * len(m_cpu)}, "
+        f"descriptors=[{'; '.join(desc)}], "
+        f"tile={int(block_m)}x{int(block_n)}, estimated_tiles={int(total_native_tiles)}, "
+        f"tile_breakdown=[{'; '.join(tile_desc)}]"
+    )
+
+
+def _select_cutlass_native_tile(
+    graph_index: torch.Tensor,
+    n_routes: int,
+    m_values: torch.Tensor,
+    in_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+) -> tuple[int, int]:
+    spec = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_TILE", "auto")
+    if spec == "auto":
+        block_m, block_n = 64, 32
+    else:
+        parsed = _parse_tile_spec(spec)
+        if parsed is None:
+            _warn_once("cutlass_tile_parse_fallback", f"could not parse CUTLASS tile spec {spec!r}; using 64x32.")
+            block_m, block_n = 64, 32
+        else:
+            block_m, block_n = parsed
+    if (block_m, block_n) != (64, 32):
+        _warn_once("cutlass_tile_unavailable_fallback", f"cutlass_native currently only has a 64x32 kernel; requested {block_m}x{block_n}, using 64x32.")
+        block_m, block_n = 64, 32
+    if _flag("DPTB_SO2_MOE_PERSISTENT_P1_LOG_DESCRIPTORS") or _flag("DPTB_SO2_MOE_PERSISTENT_P1_LOG_ONCE"):
+        _warn_once(
+            "cutlass_native_problem_descriptors",
+            "cutlass_native descriptor tag: "
+            f"{_cutlass_native_problem_tag(graph_index, n_routes, m_values, in_ptr, out_ptr, block_m, block_n)}, "
+            "auto_policy=64x32_only_compiled_kernel.",
+        )
+    return block_m, block_n
+
+
 def _mainloop_kind(name: Optional[str] = None) -> int:
     mode = name or os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", "warp_collective")
     if mode in ("scalar", "thread", "thread_scalar"):
@@ -790,7 +880,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
     if (
         int(mainloop_kind) == 3
         and torch.is_grad_enabled()
-        and _flag("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_NATIVE_GUARD", "0")
+        and _flag("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_NATIVE_GUARD", "1")
         and not _flag("DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE")
     ):
         _warn_once(
@@ -852,8 +942,7 @@ def try_forward_so2_moe_persistent_grouped_p1(
         return None
 
     if int(mainloop_kind) == 3:
-        block_m = 64
-        block_n = 32
+        block_m, block_n = _select_cutlass_native_tile(graph_index, n_routes, m_values, in_ptr, out_ptr)
     else:
         block_m = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_M", 8))
         block_n = max(1, _int_env("DPTB_SO2_MOE_PERSISTENT_P1_BLOCK_N", 8))

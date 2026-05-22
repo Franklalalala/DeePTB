@@ -2462,6 +2462,27 @@ def _fused_pairs_indexed_sandwich_multi(
 
     permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, pair_inputs[0])
     ptr = mole_globals.indexed_segment_ptr(sorted_graph_index, int(route_count), prefer_cpu=True)
+    if _flag("DPTB_SO2_MOE_FUSED_P0_LOG_SCHEDULE"):
+        ptr_cpu = ptr.detach().cpu()
+        route_rows = (ptr_cpu[1:] - ptr_cpu[:-1]).to(dtype=torch.long)
+        route_rows_list = [int(v) for v in route_rows.tolist()]
+        if route_rows_list:
+            rows_min = min(route_rows_list)
+            rows_max = max(route_rows_list)
+            rows_total = sum(route_rows_list)
+        else:
+            rows_min = rows_max = rows_total = 0
+        m_desc = []
+        for m, cin, cout in zip(m_values_host, cin_values, cout_values):
+            m_desc.append(f"m={m}:M=2*rows,N={2 * int(cout)},K={int(cin)}")
+        _warn_once(
+            "indexed_sandwich_multi_schedule",
+            "indexed_sandwich_multi schedule tag: "
+            f"routes={int(route_count)}, route_rows_min/max/total={rows_min}/{rows_max}/{rows_total}, "
+            f"m_count={len(m_values_host)}, problems={int(route_count) * len(m_values_host)}, "
+            f"descriptors=[{'; '.join(m_desc)}]. "
+            "Effective per-route GEMM is A=[rows_r*2,K], B=[N,K], C=[rows_r*2,N].",
+        )
 
     flat_inputs = []
     for pair in pair_inputs:

@@ -672,7 +672,7 @@ Low-risk pieces absorbed into existing `streamed_m_major_persistent_grouped_p1`:
 - `DPTB_SO2_MOE_PERSISTENT_P1_NOSYNC_LAYOUT=1` builds route/m tile prefixes on GPU with `bincount`, `cumsum`, and device-side width arithmetic. The default remains `0` because production smoke did not show a clear gain.
 - `DPTB_SO2_MOE_PERSISTENT_P1_VALIDATE_ROUTE_IDS` now defaults to `0` only when no-sync layout is enabled, avoiding an `.item()` sync in that opt-in hot path. Otherwise validation keeps the old default.
 - `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_M0_POLICY=warp_all` can force all-m `warp_collective` instead of the `cutlass_native m>0 + m0 fallback` split for experiments. The default remains `fallback`.
-- `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_NATIVE_GUARD=1` is an opt-in guard that skips `cutlass_native` under grad-enabled execution unless `DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE=1` is set. The default remains `0` so existing opt-in CUTLASS tests keep exercising the native path.
+- `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_NATIVE_GUARD=1` skips `cutlass_native` under grad-enabled execution unless `DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE=1` is set. The default is now guarded for production safety; tests and development benches explicitly set `FORCE_CUTLASS_NATIVE=1` when they need to exercise the native path.
 
 Liyue CUDA correctness after integrating the default-preserving hooks:
 
@@ -700,6 +700,96 @@ Three-minute production smoke, Liyue L40S, bs=32, 25 iterations, `warp_collectiv
 | `edge_top2_persistent_grouped_p1_warp16`, `NOSYNC_LAYOUT=1` | 75.798 | 2.153 | essentially neutral vs prior P1 warp16 2.157 |
 
 Conclusion: the GPU prefix construction is a useful opt-in asset and removes an avoidable host sync from the P1 hot path, but it is not high-yield enough to default on. Production remains dominated by the fused kernel/backward/fallback schedule rather than this prefix construction alone.
+
+## Native-auto schedule diagnostics, 2026-05-22
+
+This pass made the schedule comparison explicit instead of treating `cutlass_native` as a black-box wrapper:
+
+- `indexed_sandwich_multi` now has an opt-in schedule tag via `DPTB_SO2_MOE_FUSED_P0_LOG_SCHEDULE=1`.
+- `cutlass_native` now logs route/m problem descriptors via `DPTB_SO2_MOE_PERSISTENT_P1_LOG_DESCRIPTORS=1`.
+- `DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_TILE=auto` is accepted, but the only compiled native kernel in this branch is still `64x32`. Non-64x32 requests warn and fall back to `64x32`.
+- `cutlass_native` is production-guarded by default under autograd. Use `DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE=1` only for explicit development tests.
+- `tools/bench_so2_moe_native_auto.py` records a reproducible module-train matrix for `indexed_sandwich_multi`, no-sync all-m `warp_collective`, and no-sync `cutlass_native`.
+
+The descriptor mapping was also corrected. `indexed_sandwich_multi` computes per route and per `m`:
+
+```text
+A = [rows_r * 2, Cin_m]
+B = [2 * Cout_m, Cin_m]
+C = [rows_r * 2, 2 * Cout_m]
+```
+
+The current `cutlass_native` kernel uses a real-valued packed internal view for `m>0`:
+
+```text
+native[M=rows_r, N=2*Cout_m, K=2*Cin_m]
+indexed_equiv[M=2*rows_r, N=2*Cout_m, K=Cin_m]
+```
+
+This distinction matters when comparing tile counts. On the production global smoke, `cutlass_native` logged:
+
+```text
+routes=32, route_rows_min/max/total=92/1292/25834,
+m_count=6, problems=192,
+m=1 native[M=rows,N=384,K=360], indexed_equiv[M=2*rows,N=384,K=180],
+...
+tile=64x32, estimated_tiles=17430
+```
+
+On the production edge top2 smoke, it logged:
+
+```text
+routes=158, route_rows_min/max/total=2/8866/25834,
+m_count=6, problems=948,
+tile=64x32, estimated_tiles=20454
+```
+
+Liyue environment used in this pass:
+
+```text
+conda env: /home/mingkang_nt/anaconda3/envs/dptb_triton_gp_0424
+torch: 2.8.0+cu128
+GPU: NVIDIA L40S, SM89
+TF32: off
+build root: /home/mingkang_nt/codex/0522_native_auto_nosync_20260522_175359/build/dptb_triton_gp_0424
+```
+
+Correctness:
+
+```text
+pytest dptb/tests/test_so2_moe_persistent_grouped_p1.py \
+       dptb/tests/test_so2_moe_fused_p0.py::test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available \
+       -q --tb=short
+
+10 passed, 1 warning in 8.04s
+```
+
+Module train A/B, 32 routes, 24 experts, top2, compact Wigner, `cuda_cublas_segmented` backward, FP32 and TF32 off:
+
+| Mode | N | fused train ms | vs `indexed_sandwich_multi` |
+| --- | ---: | ---: | ---: |
+| `indexed_sandwich_multi` | 4096 | 15.167 | 1.000x |
+| `persistent_warp_nosync_all_m` | 4096 | 13.970 | 1.086x |
+| `cutlass_native_nosync_auto` | 4096 | 18.452 | 0.822x |
+| `indexed_sandwich_multi` | 16384 | 15.145 | 1.000x |
+| `persistent_warp_nosync_all_m` | 16384 | 16.094 | 0.941x |
+| `cutlass_native_nosync_auto` | 16384 | 18.533 | 0.817x |
+
+Three-minute production smoke, Liyue L40S, bs=32, 25 iterations, FP32 and TF32 off:
+
+| Case | wall s | back-half s/iter | comparison to `indexed_sandwich_multi` |
+| --- | ---: | ---: | --- |
+| `global_all_cutlass_native_nosync_auto` | 161.383 | 1.987 | slower than 1.848 by about 7.5% |
+| `edge_top2_cutlass_native_nosync_auto` | 74.994 | 2.230 | slower than 1.965 by about 13.5% |
+| `global_all_persistent_warp_nosync_all_m` | 101.076 | 1.917 | slower than 1.848 by about 3.7% |
+| `edge_top2_persistent_warp_nosync_all_m` | 71.502 | 2.166 | slower than 1.965 by about 10.2% |
+
+Interpretation:
+
+- `cutlass_native_nosync_auto` is the most CUTLASS-shaped path in this branch, but the current 64x32 kernel still loses to `indexed_sandwich_multi`. It removes some host sync and exposes the right route/m descriptors, yet it does not beat the already strong cuBLAS grouped raw GEMM schedule.
+- The no-sync all-m `warp_collective` adjustment is useful as a sanity check: it improves the global production smoke over the older non-no-sync warp16 run, but it still does not recover the raw GEMM strength that makes `indexed_sandwich_multi` fast.
+- The remaining gap is consistent with the official CUTLASS direction. A grouped kernel's problem visitor assigns persistent CTAs to problem tiles, and CUTLASS 3.x composes a collective mainloop with a collective epilogue. The current branch logs compatible descriptors, but does not yet have a true 3.x grouped collective where the same scheduler owns the Wigner A-loader, GEMM mainloop, Wigner epilogue/scatter, and backward projection/scatter.
+- Keep `indexed_sandwich_multi` as the recommended experimental production path. Keep `cutlass_native` guarded and opt-in until its backward and route/m scheduling are moved into the same efficient tiled schedule.
 
 ## Artifacts
 
@@ -754,4 +844,18 @@ prod_smoke_persistent_grouped_p1_nom0_20260521
 prod_smoke_persistent_grouped_p1_warp_20260522
 prod_smoke_persistent_grouped_p1_warp16_20260522
 prod_smoke_persistent_grouped_p1_cutlass_native_20260522
+```
+
+Latest native-auto/no-sync run root:
+
+```text
+/home/mingkang_nt/codex/0522_native_auto_nosync_20260522_175359
+```
+
+Important subdirectories:
+
+```text
+module_bench
+prod_smoke_cutlass_native_nosync_auto_20260522
+prod_smoke_persistent_warp_nosync_all_m_20260522
 ```

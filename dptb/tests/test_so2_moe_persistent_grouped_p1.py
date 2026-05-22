@@ -110,6 +110,8 @@ def test_persistent_grouped_p1_train_matches_streamed_ref(monkeypatch, include_m
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", include_m0)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE", "cuda_cublas_segmented")
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_MAINLOOP", mainloop)
+    if mainloop == "cutlass_native":
+        monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_FORCE_CUTLASS_NATIVE", "1")
 
     from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
