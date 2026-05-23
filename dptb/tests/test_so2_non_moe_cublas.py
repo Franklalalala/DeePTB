@@ -90,13 +90,39 @@ def test_non_moe_so2_m_linear_mode_accepts_cuda_pack_scatter_alias(monkeypatch):
     assert layer.so2_m_linear_mode == "indexed_sandwich_cuda"
 
 
-def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward():
+def test_non_moe_so2_m_linear_mode_accepts_cuda_pack_scatter_multi_alias(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv("DPTB_SO2_M_LINEAR_MODE", "cuda_pack_scatter_multi")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+    )
+
+    assert layer.so2_m_linear_mode == "indexed_sandwich_cuda_multi"
+
+
+@pytest.mark.parametrize(
+    ("mode", "epilogue_schedule"),
+    [
+        ("indexed_sandwich_cuda", None),
+        ("indexed_sandwich_cuda_multi", "output_major"),
+        ("indexed_sandwich_cuda_multi", "per_m"),
+    ],
+)
+def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(monkeypatch, mode, epilogue_schedule):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
-        pytest.skip("non-MoE SO2 indexed_sandwich_cuda backend requires CUDA")
+        pytest.skip("non-MoE SO2 indexed_sandwich_cuda backends require CUDA")
 
     from dptb.nn.tensor_product import SO2_Linear
+
+    if epilogue_schedule is not None:
+        monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", epilogue_schedule)
 
     torch.manual_seed(20260523)
     kwargs = dict(
@@ -109,7 +135,7 @@ def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward():
         rotate_out=True,
     )
     ref = SO2_Linear(**kwargs, so2_m_linear_mode="standard").cuda().float().train()
-    cuda_layer = SO2_Linear(**kwargs, so2_m_linear_mode="indexed_sandwich_cuda").cuda().float().train()
+    cuda_layer = SO2_Linear(**kwargs, so2_m_linear_mode=mode).cuda().float().train()
     cuda_layer.load_state_dict(ref.state_dict(), strict=True)
 
     x_ref = torch.randn(29, ref.irreps_in.dim, device="cuda", requires_grad=True)
