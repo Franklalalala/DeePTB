@@ -333,15 +333,19 @@ class SO2_Linear(torch.nn.Module):
             self.so2_m_linear_mode = "indexed_sandwich_cuda"
         if self.so2_m_linear_mode == "cuda_pack_scatter_multi":
             self.so2_m_linear_mode = "indexed_sandwich_cuda_multi"
+        if self.so2_m_linear_mode in ("scheduled_sandwich", "cuda_scheduled_sandwich"):
+            self.so2_m_linear_mode = "indexed_sandwich_scheduled"
         if self.so2_m_linear_mode not in (
             "standard",
             "indexed_sandwich_multi",
             "indexed_sandwich_cuda",
             "indexed_sandwich_cuda_multi",
+            "indexed_sandwich_scheduled",
         ):
             raise ValueError(
                 "so2_m_linear_mode must be 'standard', 'indexed_sandwich_multi', "
-                "'indexed_sandwich_cuda', or 'indexed_sandwich_cuda_multi', "
+                "'indexed_sandwich_cuda', 'indexed_sandwich_cuda_multi', "
+                "or 'indexed_sandwich_scheduled', "
                 f"got {self.so2_m_linear_mode!r}"
             )
 
@@ -415,6 +419,13 @@ class SO2_Linear(torch.nn.Module):
             if (self.rotate_in or self.rotate_out) and self.l_max > 0:
                 angle = xyz_to_angles(R[:, [1, 2, 0]])
                 wigner_D_all = batch_wigner_D(self.l_max, angle[0], angle[1], torch.zeros_like(angle[0]), _Jd)
+
+        if self._use_indexed_sandwich_scheduled_path(x):
+            from dptb.nn.so2_scheduled_sandwich import try_forward_so2_scheduled_sandwich
+
+            result = try_forward_so2_scheduled_sandwich(self, x, weights, wigner_D_all)
+            if result is not None:
+                return result
 
         if self._use_indexed_sandwich_cuda_path(x):
             if self.so2_m_linear_mode == "indexed_sandwich_cuda_multi":
@@ -542,6 +553,21 @@ class SO2_Linear(torch.nn.Module):
             return False
         min_edges = self._int_env("DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES", 0)
         max_edges = self._int_env("DPTB_SO2_INDEXED_SANDWICH_CUDA_MAX_EDGES", 0)
+        if min_edges > 0 and int(x.shape[0]) < min_edges:
+            return False
+        if max_edges > 0 and int(x.shape[0]) > max_edges:
+            return False
+        return all(isinstance(module.fc, nn.Linear) for module in self.m_linear)
+
+    def _use_indexed_sandwich_scheduled_path(self, x):
+        if self.so2_m_linear_mode != "indexed_sandwich_scheduled":
+            return False
+        if x.device.type != "cuda" or x.dtype != torch.float32:
+            return False
+        if self.irreps_out.lmax < 1:
+            return False
+        min_edges = self._int_env("DPTB_SO2_SCHEDULED_SANDWICH_MIN_EDGES", 0)
+        max_edges = self._int_env("DPTB_SO2_SCHEDULED_SANDWICH_MAX_EDGES", 0)
         if min_edges > 0 and int(x.shape[0]) < min_edges:
             return False
         if max_edges > 0 and int(x.shape[0]) > max_edges:
@@ -877,7 +903,7 @@ class SO2_Linear(torch.nn.Module):
             cout_prefix_t = torch.tensor(cout_prefix, dtype=torch.long, device=x.device).contiguous()
             epilogue_schedule = os.environ.get(
                 "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE",
-                "output_major",
+                "per_m",
             ).lower()
             if epilogue_schedule == "output_major":
                 entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(

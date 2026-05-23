@@ -50,6 +50,7 @@ def main() -> None:
     parser.add_argument("--irreps-in", default="16x0e + 16x1o + 12x2e + 8x3o")
     parser.add_argument("--irreps-out", default="16x0e + 16x1o + 12x2e + 8x3o")
     parser.add_argument("--no-radial", action="store_true")
+    parser.add_argument("--scheduled-mainloop", default=None)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -74,37 +75,48 @@ def main() -> None:
     grouped = SO2_Linear(**common, so2_m_linear_mode="indexed_sandwich_multi").to(device=device, dtype=torch.float32).train()
     cuda_pack = SO2_Linear(**common, so2_m_linear_mode="indexed_sandwich_cuda").to(device=device, dtype=torch.float32).train()
     cuda_pack_multi = SO2_Linear(**common, so2_m_linear_mode="indexed_sandwich_cuda_multi").to(device=device, dtype=torch.float32).train()
+    scheduled = SO2_Linear(**common, so2_m_linear_mode="indexed_sandwich_scheduled").to(device=device, dtype=torch.float32).train()
     grouped.load_state_dict(ref.state_dict(), strict=True)
     cuda_pack.load_state_dict(ref.state_dict(), strict=True)
     cuda_pack_multi.load_state_dict(ref.state_dict(), strict=True)
+    scheduled.load_state_dict(ref.state_dict(), strict=True)
 
     x_ref = torch.randn((args.n, ref.irreps_in.dim), device=device, dtype=torch.float32, requires_grad=True)
     x_grouped = x_ref.detach().clone().requires_grad_(True)
     x_cuda_pack = x_ref.detach().clone().requires_grad_(True)
     x_cuda_pack_multi = x_ref.detach().clone().requires_grad_(True)
+    x_scheduled = x_ref.detach().clone().requires_grad_(True)
     r = torch.randn((args.n, 3), device=device, dtype=torch.float32)
     if args.no_radial:
         latents_ref = None
         latents_grouped = None
         latents_cuda_pack = None
         latents_cuda_pack_multi = None
+        latents_scheduled = None
     else:
         latents_ref = torch.randn((args.n, args.latent_dim), device=device, dtype=torch.float32, requires_grad=True)
         latents_grouped = latents_ref.detach().clone().requires_grad_(True)
         latents_cuda_pack = latents_ref.detach().clone().requires_grad_(True)
         latents_cuda_pack_multi = latents_ref.detach().clone().requires_grad_(True)
+        latents_scheduled = latents_ref.detach().clone().requires_grad_(True)
     target = torch.randn((args.n, ref.irreps_out.dim), device=device, dtype=torch.float32)
 
     loss_ref = _train_step(ref, x_ref, r, latents_ref, target)
     loss_grouped = _train_step(grouped, x_grouped, r, latents_grouped, target)
     loss_cuda_pack = _train_step(cuda_pack, x_cuda_pack, r, latents_cuda_pack, target)
     loss_cuda_pack_multi = _train_step(cuda_pack_multi, x_cuda_pack_multi, r, latents_cuda_pack_multi, target)
+    if args.scheduled_mainloop:
+        os.environ["DPTB_SO2_SCHEDULED_SANDWICH_MAINLOOP"] = args.scheduled_mainloop
+    os.environ.setdefault("DPTB_SO2_SCHEDULED_SANDWICH_STRICT", "1")
+    loss_scheduled = _train_step(scheduled, x_scheduled, r, latents_scheduled, target)
     loss_abs = float((loss_grouped.detach() - loss_ref.detach()).abs().cpu())
     cuda_pack_loss_abs = float((loss_cuda_pack.detach() - loss_ref.detach()).abs().cpu())
     cuda_pack_multi_loss_abs = float((loss_cuda_pack_multi.detach() - loss_ref.detach()).abs().cpu())
+    scheduled_loss_abs = float((loss_scheduled.detach() - loss_ref.detach()).abs().cpu())
     x_grad_abs = float((x_grouped.grad - x_ref.grad).abs().max().detach().cpu())
     cuda_pack_x_grad_abs = float((x_cuda_pack.grad - x_ref.grad).abs().max().detach().cpu())
     cuda_pack_multi_x_grad_abs = float((x_cuda_pack_multi.grad - x_ref.grad).abs().max().detach().cpu())
+    scheduled_x_grad_abs = float((x_scheduled.grad - x_ref.grad).abs().max().detach().cpu())
 
     def ref_step() -> None:
         _train_step(ref, x_ref, r, latents_ref, target)
@@ -118,19 +130,25 @@ def main() -> None:
     def cuda_pack_multi_step() -> None:
         _train_step(cuda_pack_multi, x_cuda_pack_multi, r, latents_cuda_pack_multi, target)
 
+    def scheduled_step() -> None:
+        _train_step(scheduled, x_scheduled, r, latents_scheduled, target)
+
     ref_ms = _cuda_ms(ref_step, args.warmup, args.iters)
     grouped_ms = _cuda_ms(grouped_step, args.warmup, args.iters)
     cuda_pack_ms = _cuda_ms(cuda_pack_step, args.warmup, args.iters)
     cuda_pack_multi_ms = _cuda_ms(cuda_pack_multi_step, args.warmup, args.iters)
+    scheduled_ms = _cuda_ms(scheduled_step, args.warmup, args.iters)
 
     print("case,n,radial,mode,ms,loss_abs_diff,x_grad_max_abs")
     print(f"standard,{args.n},{not args.no_radial},standard,{ref_ms:.6f},0,0")
     print(f"indexed_sandwich_multi,{args.n},{not args.no_radial},indexed_sandwich_multi,{grouped_ms:.6f},{loss_abs:.6e},{x_grad_abs:.6e}")
     print(f"indexed_sandwich_cuda,{args.n},{not args.no_radial},indexed_sandwich_cuda,{cuda_pack_ms:.6f},{cuda_pack_loss_abs:.6e},{cuda_pack_x_grad_abs:.6e}")
     print(f"indexed_sandwich_cuda_multi,{args.n},{not args.no_radial},indexed_sandwich_cuda_multi,{cuda_pack_multi_ms:.6f},{cuda_pack_multi_loss_abs:.6e},{cuda_pack_multi_x_grad_abs:.6e}")
+    print(f"indexed_sandwich_scheduled,{args.n},{not args.no_radial},indexed_sandwich_scheduled:{os.environ.get('DPTB_SO2_SCHEDULED_SANDWICH_MAINLOOP', 'warp_collective')},{scheduled_ms:.6f},{scheduled_loss_abs:.6e},{scheduled_x_grad_abs:.6e}")
     print(f"speedup_vs_standard,{ref_ms / grouped_ms:.6f}")
     print(f"speedup_vs_standard_indexed_sandwich_cuda,{ref_ms / cuda_pack_ms:.6f}")
     print(f"speedup_vs_standard_indexed_sandwich_cuda_multi,{ref_ms / cuda_pack_multi_ms:.6f}")
+    print(f"speedup_vs_standard_indexed_sandwich_scheduled,{ref_ms / scheduled_ms:.6f}")
 
 
 if __name__ == "__main__":
