@@ -1,9 +1,9 @@
-import os
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
+
+from dptb.nn.cuda_ops.extension_loader import load_cuda_extension, truthy_env
 
 
 _EXT = None
@@ -15,23 +15,21 @@ def _load_extension():
         return _EXT
 
     src = Path(__file__).resolve().parent / "csrc" / "cublas_grouped_gemm.cpp"
-    build_dir = Path(os.environ.get("DPTB_CUBLAS_GROUPED_BUILD_DIR", Path.home() / ".cache" / "dptb_cublas_grouped"))
-    build_dir.mkdir(parents=True, exist_ok=True)
-    _EXT = load(
+    _EXT = load_cuda_extension(
         name="dptb_cublas_grouped_gemm",
-        sources=[str(src)],
+        source_files=[src],
+        build_dir_env="DPTB_CUBLAS_GROUPED_BUILD_DIR",
+        default_build_dir=Path.home() / ".cache" / "dptb_cublas_grouped",
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
         extra_ldflags=["-lcublas"],
-        build_directory=str(build_dir),
-        with_cuda=True,
-        verbose=os.environ.get("DPTB_CUBLAS_GROUPED_VERBOSE", "0") not in ("", "0", "false", "False"),
+        verbose_env="DPTB_CUBLAS_GROUPED_VERBOSE",
     )
     return _EXT
 
 
 def _fast_tf32_enabled() -> bool:
-    return os.environ.get("DPTB_CUBLAS_GROUPED_FAST_TF32", "0") not in ("", "0", "false", "False")
+    return truthy_env("DPTB_CUBLAS_GROUPED_FAST_TF32")
 
 
 class _GroupedGemmFunction(torch.autograd.Function):

@@ -1124,6 +1124,12 @@ class OEQTensorProduct(nn.Module):
         return out
 
 
+from dptb.nn.embedding.oeq_tp import (  # noqa: E402
+    OEQTensorProduct as OEQTensorProduct,
+    get_feasible_tp as get_feasible_tp,
+)
+
+
 class EAMPOpenequi(EAMP):
     """
     Inherits from EAMP, replaces E3NN TP with OEQ TP.

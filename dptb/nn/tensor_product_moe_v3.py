@@ -775,7 +775,7 @@ class MOLELinear(nn.Module):
                 f"got x={x.dtype}, weight={mixed_weights.dtype}."
             )
 
-        from dptb.nn.cublas_grouped_gemm import grouped_gemm
+        from dptb.nn.cuda_ops.grouped_gemm import grouped_gemm
 
         flat_x = x.reshape(-1, self.in_features)
         if getattr(mole_globals, "_indexed_inputs_are_sorted", False):
@@ -1703,7 +1703,7 @@ class SO2_Linear(torch.nn.Module):
         if x_inputs[0].device.type != "cuda" or x_inputs[0].dtype != torch.float32:
             raise RuntimeError("SO2 m-fused cuBLAS path requires CUDA float32 inputs.")
 
-        from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
+        from dptb.nn.cuda_ops.grouped_gemm import grouped_gemm_multi
 
         graph_index = _mole_graph_index(mole_globals, x_inputs[0].shape[0], device=x_inputs[0].device)
         if graph_index.numel() != x_inputs[0].shape[0]:
