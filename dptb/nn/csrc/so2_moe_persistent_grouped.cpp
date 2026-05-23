@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 
+#include <cstring>
 #include <cstdint>
+#include <vector>
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -11,6 +13,8 @@
     CHECK_CUDA(x);             \
     CHECK_CONTIGUOUS(x);       \
   } while (false)
+
+namespace py = pybind11;
 
 at::Tensor persistent_grouped_forward_fp32_cuda(
     const at::Tensor& x,
@@ -552,7 +556,78 @@ at::Tensor persistent_grouped_forward_cutlass_native_fp32(
       wigner_stride, block_m, block_n, active_blocks);
 }
 
+py::tuple so2_single_route_layout(
+    int64_t num_rows,
+    int64_t n_problems,
+    int64_t block_m,
+    int64_t block_n,
+    const at::Tensor& out_ptr,
+    bool raw_pair_tiles) {
+  TORCH_CHECK(num_rows >= 0, "num_rows must be non-negative");
+  TORCH_CHECK(n_problems >= 0, "n_problems must be non-negative");
+  TORCH_CHECK(block_m > 0 && block_n > 0, "block_m/block_n must be positive");
+  CHECK_CUDA_CONTIGUOUS(out_ptr);
+  CHECK_LONG(out_ptr);
+  TORCH_CHECK(out_ptr.dim() == 1, "out_ptr must be a 1D int64 tensor");
+  TORCH_CHECK(out_ptr.numel() == n_problems + 1, "out_ptr length must be n_problems + 1");
+
+  auto long_cuda_options = out_ptr.options().dtype(at::ScalarType::Long);
+  auto long_cpu_options = at::TensorOptions().dtype(at::ScalarType::Long).device(at::kCPU);
+
+  at::Tensor edge_order = at::arange(num_rows, long_cuda_options);
+
+  at::Tensor route_ptr_cpu = at::empty({2}, long_cpu_options);
+  auto* route_ptr_data = route_ptr_cpu.data_ptr<int64_t>();
+  route_ptr_data[0] = 0;
+  route_ptr_data[1] = num_rows;
+  at::Tensor route_ptr = route_ptr_cpu.to(out_ptr.device(), /*non_blocking=*/false, /*copy=*/true);
+
+  at::Tensor out_ptr_cpu = out_ptr.to(at::kCPU).contiguous();
+  const auto* out_ptr_data = out_ptr_cpu.data_ptr<int64_t>();
+  const int64_t row_tiles = (num_rows + block_m - 1) / block_m;
+
+  std::vector<int64_t> prefix_values;
+  prefix_values.reserve(static_cast<size_t>(n_problems + 1));
+  prefix_values.push_back(0);
+  for (int64_t problem = 0; problem < n_problems; ++problem) {
+    const int64_t width = out_ptr_data[problem + 1] - out_ptr_data[problem];
+    TORCH_CHECK(width >= 0, "out_ptr must be monotonically non-decreasing");
+    const int64_t col_extent = raw_pair_tiles ? 2 * width : width;
+    const int64_t col_tiles = (col_extent + block_n - 1) / block_n;
+    prefix_values.push_back(prefix_values.back() + row_tiles * col_tiles);
+  }
+
+  at::Tensor prefix_cpu = at::empty({static_cast<int64_t>(prefix_values.size())}, long_cpu_options);
+  std::memcpy(
+      prefix_cpu.data_ptr<int64_t>(),
+      prefix_values.data(),
+      sizeof(int64_t) * prefix_values.size());
+  at::Tensor problem_tile_prefix = prefix_cpu.to(out_ptr.device(), /*non_blocking=*/false, /*copy=*/true);
+
+  return py::make_tuple(edge_order.contiguous(), route_ptr.contiguous(), problem_tile_prefix.contiguous());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def(
+      "so2_single_route_layout",
+      &so2_single_route_layout,
+      "Build a single-route SO2 scheduler layout without graph_index (CUDA fp32 path descriptor)");
+  m.def(
+      "so2_scheduler_forward_fp32",
+      &persistent_grouped_forward_fp32,
+      "SO2 CUDA scheduler forward scalar mainloop (CUDA fp32)");
+  m.def(
+      "so2_scheduler_forward_warp_fp32",
+      &persistent_grouped_forward_warp_fp32,
+      "SO2 CUDA scheduler forward warp-collective mainloop (CUDA fp32)");
+  m.def(
+      "so2_scheduler_forward_cute_tiled_fp32",
+      &persistent_grouped_forward_cute_tiled_fp32,
+      "SO2 CUDA scheduler forward CuTe tiled mainloop (CUDA fp32)");
+  m.def(
+      "so2_scheduler_forward_cutlass_native_fp32",
+      &persistent_grouped_forward_cutlass_native_fp32,
+      "SO2 CUDA scheduler forward CUTLASS native mainloop (CUDA fp32)");
   m.def(
       "persistent_grouped_forward_fp32",
       &persistent_grouped_forward_fp32,

@@ -10,7 +10,7 @@ import torch.nn as nn
 from dptb.nn.so2_cuda_scheduler import (
     SO2CudaSchedulerFunction,
     mainloop_kind,
-    prepare_single_route_layout,
+    prepare_so2_single_route_layout,
     wigner_tensor_and_mode,
 )
 from dptb.nn.so2_sandwich_common import so2_m0_output, so2_pair_maps
@@ -217,16 +217,15 @@ def _try_forward_scheduled_sandwich(
         block_m, block_n = _tile_shape(mainloop_kind_id, env_prefix=env_prefix)
         active_blocks = _int_env(f"{env_prefix}_ACTIVE_BLOCKS", 0)
 
-        graph_index = torch.zeros((x.shape[0],), dtype=torch.long, device=x.device)
-        edge_order, route_ptr, problem_tile_prefix = prepare_single_route_layout(
-            graph_index,
-            n_routes=int(n_routes),
+        edge_order, route_ptr, problem_tile_prefix = prepare_so2_single_route_layout(
+            num_rows=int(x.shape[0]),
             n_problems=int(m_values.numel()),
             block_m=int(block_m),
             block_n=int(block_n),
             out_ptr=out_ptr,
             raw_pair_tiles=(int(mainloop_kind_id) == 3),
         )
+        graph_index = _empty_long(x.device)
 
         radial_all = weights.contiguous() if module.radial_emb else x.new_empty((0,))
         m_in_index = (

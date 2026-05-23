@@ -589,15 +589,15 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
     ):
         ext = _load_extension()
         if int(mainloop_kind) == 3:
-            forward = ext.persistent_grouped_forward_cutlass_native_fp32
+            forward = getattr(ext, "so2_scheduler_forward_cutlass_native_fp32", ext.persistent_grouped_forward_cutlass_native_fp32)
         elif int(mainloop_kind) == 2:
-            forward = ext.persistent_grouped_forward_cute_tiled_fp32
+            forward = getattr(ext, "so2_scheduler_forward_cute_tiled_fp32", ext.persistent_grouped_forward_cute_tiled_fp32)
         elif int(mainloop_kind) == 1:
-            forward = ext.persistent_grouped_forward_warp_fp32
+            forward = getattr(ext, "so2_scheduler_forward_warp_fp32", ext.persistent_grouped_forward_warp_fp32)
         elif int(mainloop_kind) == 0:
-            forward = ext.persistent_grouped_forward_fp32
+            forward = getattr(ext, "so2_scheduler_forward_fp32", ext.persistent_grouped_forward_fp32)
         else:
-            raise RuntimeError(f"unknown persistent grouped mainloop kind={mainloop_kind!r}")
+            raise RuntimeError(f"unknown SO2 CUDA scheduler mainloop kind={mainloop_kind!r}")
         out = forward(
             x,
             wigner,
@@ -692,6 +692,11 @@ class _PersistentGroupedP1Function(torch.autograd.Function):
             wigner_mode,
             wigner_stride,
         ) = ctx.meta
+
+        if graph_index.numel() == 0:
+            if int(n_routes) != 1:
+                raise RuntimeError("empty graph_index sentinel is only valid for single-route SO2 scheduler backward")
+            graph_index = torch.zeros((x.shape[0],), dtype=torch.long, device=x.device)
 
         backward_mode = os.environ.get(
             "DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE",

@@ -150,6 +150,61 @@ def test_non_moe_so2_m_linear_mode_accepts_materialized_scheduler_alias(monkeypa
     assert layer.so2_m_linear_mode == "indexed_sandwich_materialized_scheduled"
 
 
+def test_non_moe_so2_scheduler_public_function_is_neutral():
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.so2_cuda_scheduler import SO2CudaSchedulerFunction
+
+    assert SO2CudaSchedulerFunction.__name__ == "SO2CudaSchedulerFunction"
+    assert SO2CudaSchedulerFunction.__module__ == "dptb.nn.so2_cuda_scheduler"
+
+
+def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    if not torch.cuda.is_available():
+        pytest.skip("SO2 CUDA scheduler layout helper requires CUDA")
+
+    from dptb.nn.so2_cuda_scheduler import prepare_so2_single_route_layout
+
+    out_ptr = torch.tensor([0, 3, 8, 10], device="cuda", dtype=torch.long)
+
+    edge_order, route_ptr, prefix = prepare_so2_single_route_layout(
+        num_rows=17,
+        n_problems=3,
+        block_m=8,
+        block_n=4,
+        out_ptr=out_ptr,
+        raw_pair_tiles=False,
+    )
+    torch.testing.assert_close(edge_order.cpu(), torch.arange(17, dtype=torch.long))
+    torch.testing.assert_close(route_ptr.cpu(), torch.tensor([0, 17], dtype=torch.long))
+    torch.testing.assert_close(prefix.cpu(), torch.tensor([0, 3, 9, 12], dtype=torch.long))
+
+    edge_order_again, route_ptr_again, prefix_again = prepare_so2_single_route_layout(
+        num_rows=17,
+        n_problems=3,
+        block_m=8,
+        block_n=4,
+        out_ptr=out_ptr,
+        raw_pair_tiles=False,
+    )
+    assert edge_order_again.data_ptr() == edge_order.data_ptr()
+    assert route_ptr_again.data_ptr() == route_ptr.data_ptr()
+    assert prefix_again.data_ptr() == prefix.data_ptr()
+
+    _, _, pair_prefix = prepare_so2_single_route_layout(
+        num_rows=17,
+        n_problems=3,
+        block_m=8,
+        block_n=4,
+        out_ptr=out_ptr,
+        raw_pair_tiles=True,
+    )
+    torch.testing.assert_close(pair_prefix.cpu(), torch.tensor([0, 6, 15, 18], dtype=torch.long))
+
+
 @pytest.mark.parametrize(
     ("mode", "epilogue_schedule"),
     [
