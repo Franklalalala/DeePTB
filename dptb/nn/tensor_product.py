@@ -329,9 +329,11 @@ class SO2_Linear(torch.nn.Module):
         self.so2_m_linear_mode = so2_m_linear_mode or os.environ.get("DPTB_SO2_M_LINEAR_MODE", "standard")
         if self.so2_m_linear_mode == "cublas_grouped":
             self.so2_m_linear_mode = "indexed_sandwich_multi"
-        if self.so2_m_linear_mode not in ("standard", "indexed_sandwich_multi"):
+        if self.so2_m_linear_mode == "cuda_pack_scatter":
+            self.so2_m_linear_mode = "indexed_sandwich_cuda"
+        if self.so2_m_linear_mode not in ("standard", "indexed_sandwich_multi", "indexed_sandwich_cuda"):
             raise ValueError(
-                "so2_m_linear_mode must be 'standard' or 'indexed_sandwich_multi', "
+                "so2_m_linear_mode must be 'standard', 'indexed_sandwich_multi', or 'indexed_sandwich_cuda', "
                 f"got {self.so2_m_linear_mode!r}"
             )
 
@@ -397,10 +399,7 @@ class SO2_Linear(torch.nn.Module):
         }
 
     def forward(self, x, R, latents=None, wigner_D_all=None):
-        n, _ = x.shape
-        if self.radial_emb:
-            weights = self.radial_emb(latents)
-        x_ = torch.zeros_like(x)
+        weights = self.radial_emb(latents) if self.radial_emb else None
 
         # 旋转逻辑：需要旋转才计算 Wigner D (或者如果外部传进来了就用)
         if wigner_D_all is None:
@@ -409,8 +408,19 @@ class SO2_Linear(torch.nn.Module):
                 angle = xyz_to_angles(R[:, [1, 2, 0]])
                 wigner_D_all = batch_wigner_D(self.l_max, angle[0], angle[1], torch.zeros_like(angle[0]), _Jd)
 
+        if self._use_indexed_sandwich_cuda_path(x):
+            result = self._forward_indexed_sandwich_cuda(x, weights, wigner_D_all)
+            if result is not None:
+                return result
+
         if self._use_indexed_sandwich_multi_path(x):
-            return self._forward_indexed_sandwich_multi(x, weights if self.radial_emb else None, wigner_D_all)
+            return self._forward_indexed_sandwich_multi(x, weights, wigner_D_all)
+
+        return self._forward_standard(x, weights, wigner_D_all)
+
+    def _forward_standard(self, x, weights, wigner_D_all):
+        n, _ = x.shape
+        x_ = torch.zeros_like(x)
 
         groups = defaultdict(list)
         for (mul, (l, p)), slice_info in zip(self.irreps_in, self.irreps_in.slices()):
@@ -505,7 +515,35 @@ class SO2_Linear(torch.nn.Module):
             return False
         return all(isinstance(module.fc, nn.Linear) for module in self.m_linear)
 
+    @staticmethod
+    def _int_env(name, default):
+        try:
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _use_indexed_sandwich_cuda_path(self, x):
+        if self.so2_m_linear_mode != "indexed_sandwich_cuda":
+            return False
+        if x.device.type != "cuda" or x.dtype != torch.float32:
+            return False
+        if self.irreps_out.lmax < 1:
+            return False
+        min_edges = self._int_env("DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES", 0)
+        max_edges = self._int_env("DPTB_SO2_INDEXED_SANDWICH_CUDA_MAX_EDGES", 0)
+        if min_edges > 0 and int(x.shape[0]) < min_edges:
+            return False
+        if max_edges > 0 and int(x.shape[0]) > max_edges:
+            return False
+        return all(isinstance(module.fc, nn.Linear) for module in self.m_linear)
+
     def _select_wigner_block(self, wigner_D_all, l):
+        if hasattr(wigner_D_all, "block") and hasattr(wigner_D_all, "blocks"):
+            block = wigner_D_all.block(l)
+            expected = (self.dims[l], self.dims[l])
+            if block.shape[-2:] != expected:
+                raise ValueError(f"compact Wigner block l={l} has shape {tuple(block.shape[-2:])}, expected {expected}")
+            return block
         start = self.offsets[l]
         dim = self.dims[l]
         return wigner_D_all[:, start:start + dim, start:start + dim]
@@ -622,6 +660,107 @@ class SO2_Linear(torch.nn.Module):
             for x_m in x_inputs
         ]
         return indexed_sandwich_multi_gemm(x_inputs, ptrs, weights)
+
+    def _indexed_sandwich_cuda_pair_maps(self, m, device):
+        from dptb.nn.so2_sandwich_common import so2_pair_maps
+
+        return so2_pair_maps(self, m, device, cache_attr="_indexed_sandwich_cuda_pair_maps_cache")
+
+    def _forward_indexed_sandwich_cuda(self, x, weights, wigner_D_all):
+        strict = os.environ.get("DPTB_SO2_INDEXED_SANDWICH_CUDA_STRICT", "0").lower() in ("1", "true", "yes", "on")
+        try:
+            from dptb.nn.so2_moe_fused_p0 import (
+                _PackPairFunction,
+                _ScatterPairOutputFunction,
+                _ScatterRawPairOutputFunction,
+                _wigner_tensor_and_mode,
+            )
+
+            wigner_info = _wigner_tensor_and_mode(self, wigner_D_all, x)
+            if wigner_info is None:
+                return None
+            wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
+
+            n, _ = x.shape
+            rot_blocks = {
+                l: self._select_wigner_block(wigner_D_all, l)
+                for l in range(self.l_max + 1)
+            }
+            input_groups = {
+                l: self._gather_l_group(x, l)
+                for l in self._in_groups
+            }
+            out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+
+            radial_weight = weights[:, self.m_in_index[0]:self.m_in_index[1]].unsqueeze(1) if self.radial_emb else 1.
+            inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
+            if self.front and self.radial_emb:
+                y_m0 = self.fc_m0(inp * radial_weight.squeeze(1))
+            elif self.radial_emb:
+                y_m0 = self.fc_m0(inp) * radial_weight.squeeze(1)
+            else:
+                y_m0 = self.fc_m0(inp)
+            self._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
+            out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+
+            for m, module in zip(range(1, self.irreps_out.lmax + 1), self.m_linear):
+                in_base, in_l, out_base, out_l, offsets = self._indexed_sandwich_cuda_pair_maps(m, x.device)
+                cin = int(in_base.numel())
+                cout = int(out_base.numel())
+                if cin == 0 or cout == 0 or module.fc.in_features != cin or module.fc.out_features != 2 * cout:
+                    return None
+
+                pair = _PackPairFunction.apply(
+                    x.contiguous(),
+                    wigner,
+                    in_base,
+                    in_l,
+                    offsets,
+                    compact_offsets,
+                    int(m),
+                    bool(self.rotate_in),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
+
+                radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
+                pair_for_linear = pair * radial if radial is not None and bool(self.front) else pair
+                raw = module.fc(pair_for_linear)
+                if radial is None or bool(self.front):
+                    contribution = _ScatterRawPairOutputFunction.apply(
+                        raw.contiguous(),
+                        wigner,
+                        out_base,
+                        out_l,
+                        offsets,
+                        compact_offsets,
+                        int(self.irreps_out.dim),
+                        int(m),
+                        bool(self.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                    )
+                else:
+                    pair_out = module._finish_linear_output(raw) * radial
+                    contribution = _ScatterPairOutputFunction.apply(
+                        pair_out.contiguous(),
+                        wigner,
+                        out_base,
+                        out_l,
+                        offsets,
+                        compact_offsets,
+                        int(self.irreps_out.dim),
+                        int(m),
+                        bool(self.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                    )
+                out = out + contribution
+            return out.contiguous(), wigner_D_all
+        except Exception:
+            if strict:
+                raise
+            return None
 
     def _forward_indexed_sandwich_multi(self, x, weights, wigner_D_all):
         n, _ = x.shape

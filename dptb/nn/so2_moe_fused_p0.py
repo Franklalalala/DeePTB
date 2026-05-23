@@ -9,6 +9,7 @@ import torch
 
 from dptb.nn.cuda_ops.extension_loader import load_cuda_extension, truthy_env
 from dptb.nn.cuda_ops.segments import repeated_segment_layout
+from dptb.nn.so2_sandwich_common import so2_pair_maps
 from dptb.nn.tensor_product_moe_v3 import (
     MOLEGlobals,
     SO2WignerBlocks,
@@ -127,44 +128,7 @@ def _wigner_tensor_and_mode(module, wigner_D_all, x: torch.Tensor):
 
 
 def _pair_maps(module, m: int, device: torch.device):
-    cache = getattr(module, "_so2_moe_fused_p0_pair_maps", None)
-    if cache is None:
-        cache = {}
-        setattr(module, "_so2_moe_fused_p0_pair_maps", cache)
-
-    key = (int(m), str(device))
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    in_base = []
-    in_l = []
-    for entry in module._in_entries_by_m[m]:
-        dim = 2 * int(entry.l) + 1
-        start = int(entry.slice_info.start)
-        for idx in range(int(entry.mul)):
-            in_base.append(start + idx * dim)
-            in_l.append(int(entry.l))
-
-    out_base = []
-    out_l = []
-    for entry in module._out_entries_by_m[m]:
-        dim = 2 * int(entry.l) + 1
-        start = int(entry.slice_info.start)
-        for idx in range(int(entry.mul)):
-            out_base.append(start + idx * dim)
-            out_l.append(int(entry.l))
-
-    offsets = [int(module.offsets[l]) for l in range(module.l_max + 1)]
-    cached = (
-        torch.tensor(in_base, dtype=torch.long, device=device).contiguous(),
-        torch.tensor(in_l, dtype=torch.long, device=device).contiguous(),
-        torch.tensor(out_base, dtype=torch.long, device=device).contiguous(),
-        torch.tensor(out_l, dtype=torch.long, device=device).contiguous(),
-        torch.tensor(offsets, dtype=torch.long, device=device).contiguous(),
-    )
-    cache[key] = cached
-    return cached
+    return so2_pair_maps(module, m, device, cache_attr="_so2_moe_fused_p0_pair_maps")
 
 
 def _wigner_block_from_flat(
