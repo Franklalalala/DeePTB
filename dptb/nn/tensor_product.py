@@ -337,6 +337,12 @@ class SO2_Linear(torch.nn.Module):
             self.so2_m_linear_mode = "indexed_sandwich_scheduled"
         if self.so2_m_linear_mode in ("materialized_sandwich", "cuda_materialized_sandwich"):
             self.so2_m_linear_mode = "indexed_sandwich_materialized"
+        if self.so2_m_linear_mode in (
+            "materialized_cuda_scheduler",
+            "materialized_scheduled_sandwich",
+            "cuda_materialized_scheduled_sandwich",
+        ):
+            self.so2_m_linear_mode = "indexed_sandwich_materialized_scheduled"
         if self.so2_m_linear_mode not in (
             "standard",
             "indexed_sandwich_multi",
@@ -344,11 +350,13 @@ class SO2_Linear(torch.nn.Module):
             "indexed_sandwich_cuda_multi",
             "indexed_sandwich_scheduled",
             "indexed_sandwich_materialized",
+            "indexed_sandwich_materialized_scheduled",
         ):
             raise ValueError(
                 "so2_m_linear_mode must be 'standard', 'indexed_sandwich_multi', "
                 "'indexed_sandwich_cuda', 'indexed_sandwich_cuda_multi', "
-                "'indexed_sandwich_scheduled', or 'indexed_sandwich_materialized', "
+                "'indexed_sandwich_scheduled', 'indexed_sandwich_materialized', "
+                "or 'indexed_sandwich_materialized_scheduled', "
                 f"got {self.so2_m_linear_mode!r}"
             )
 
@@ -427,6 +435,13 @@ class SO2_Linear(torch.nn.Module):
             from dptb.nn.so2_materialized_sandwich import try_forward_so2_materialized_sandwich
 
             result = try_forward_so2_materialized_sandwich(self, x, weights, wigner_D_all)
+            if result is not None:
+                return result
+
+        if self._use_indexed_sandwich_materialized_scheduled_path(x):
+            from dptb.nn.so2_scheduled_sandwich import try_forward_so2_materialized_scheduled_sandwich
+
+            result = try_forward_so2_materialized_scheduled_sandwich(self, x, weights, wigner_D_all)
             if result is not None:
                 return result
 
@@ -595,6 +610,21 @@ class SO2_Linear(torch.nn.Module):
             return False
         min_edges = self._int_env("DPTB_SO2_MATERIALIZED_MIN_EDGES", 0)
         max_edges = self._int_env("DPTB_SO2_MATERIALIZED_MAX_EDGES", 0)
+        if min_edges > 0 and int(x.shape[0]) < min_edges:
+            return False
+        if max_edges > 0 and int(x.shape[0]) > max_edges:
+            return False
+        return all(isinstance(module.fc, nn.Linear) for module in self.m_linear)
+
+    def _use_indexed_sandwich_materialized_scheduled_path(self, x):
+        if self.so2_m_linear_mode != "indexed_sandwich_materialized_scheduled":
+            return False
+        if x.device.type != "cuda" or x.dtype != torch.float32:
+            return False
+        if self.irreps_out.lmax < 1:
+            return False
+        min_edges = self._int_env("DPTB_SO2_MATERIALIZED_SCHEDULED_MIN_EDGES", 0)
+        max_edges = self._int_env("DPTB_SO2_MATERIALIZED_SCHEDULED_MAX_EDGES", 0)
         if min_edges > 0 and int(x.shape[0]) < min_edges:
             return False
         if max_edges > 0 and int(x.shape[0]) > max_edges:
