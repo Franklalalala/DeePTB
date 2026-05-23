@@ -335,17 +335,20 @@ class SO2_Linear(torch.nn.Module):
             self.so2_m_linear_mode = "indexed_sandwich_cuda_multi"
         if self.so2_m_linear_mode in ("scheduled_sandwich", "cuda_scheduled_sandwich"):
             self.so2_m_linear_mode = "indexed_sandwich_scheduled"
+        if self.so2_m_linear_mode in ("materialized_sandwich", "cuda_materialized_sandwich"):
+            self.so2_m_linear_mode = "indexed_sandwich_materialized"
         if self.so2_m_linear_mode not in (
             "standard",
             "indexed_sandwich_multi",
             "indexed_sandwich_cuda",
             "indexed_sandwich_cuda_multi",
             "indexed_sandwich_scheduled",
+            "indexed_sandwich_materialized",
         ):
             raise ValueError(
                 "so2_m_linear_mode must be 'standard', 'indexed_sandwich_multi', "
                 "'indexed_sandwich_cuda', 'indexed_sandwich_cuda_multi', "
-                "or 'indexed_sandwich_scheduled', "
+                "'indexed_sandwich_scheduled', or 'indexed_sandwich_materialized', "
                 f"got {self.so2_m_linear_mode!r}"
             )
 
@@ -419,6 +422,13 @@ class SO2_Linear(torch.nn.Module):
             if (self.rotate_in or self.rotate_out) and self.l_max > 0:
                 angle = xyz_to_angles(R[:, [1, 2, 0]])
                 wigner_D_all = batch_wigner_D(self.l_max, angle[0], angle[1], torch.zeros_like(angle[0]), _Jd)
+
+        if self._use_indexed_sandwich_materialized_path(x):
+            from dptb.nn.so2_materialized_sandwich import try_forward_so2_materialized_sandwich
+
+            result = try_forward_so2_materialized_sandwich(self, x, weights, wigner_D_all)
+            if result is not None:
+                return result
 
         if self._use_indexed_sandwich_scheduled_path(x):
             from dptb.nn.so2_scheduled_sandwich import try_forward_so2_scheduled_sandwich
@@ -568,6 +578,23 @@ class SO2_Linear(torch.nn.Module):
             return False
         min_edges = self._int_env("DPTB_SO2_SCHEDULED_SANDWICH_MIN_EDGES", 0)
         max_edges = self._int_env("DPTB_SO2_SCHEDULED_SANDWICH_MAX_EDGES", 0)
+        if min_edges > 0 and int(x.shape[0]) < min_edges:
+            return False
+        if max_edges > 0 and int(x.shape[0]) > max_edges:
+            return False
+        return all(isinstance(module.fc, nn.Linear) for module in self.m_linear)
+
+    def _use_indexed_sandwich_materialized_path(self, x):
+        if self.so2_m_linear_mode != "indexed_sandwich_materialized":
+            return False
+        if x.device.type != "cuda" or x.dtype != torch.float32:
+            return False
+        if self.irreps_out.lmax < 1:
+            return False
+        if self.radial_emb and not bool(self.front):
+            return False
+        min_edges = self._int_env("DPTB_SO2_MATERIALIZED_MIN_EDGES", 0)
+        max_edges = self._int_env("DPTB_SO2_MATERIALIZED_MAX_EDGES", 0)
         if min_edges > 0 and int(x.shape[0]) < min_edges:
             return False
         if max_edges > 0 and int(x.shape[0]) > max_edges:

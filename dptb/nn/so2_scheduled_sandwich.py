@@ -13,7 +13,7 @@ from dptb.nn.so2_moe_persistent_grouped import (
     _prepare_route_layout,
     _wigner_tensor_and_mode,
 )
-from dptb.nn.so2_sandwich_common import so2_pair_maps
+from dptb.nn.so2_sandwich_common import so2_m0_output, so2_pair_maps
 
 _WARNED: set[str] = set()
 
@@ -46,30 +46,6 @@ def _parse_tile(value: str) -> Optional[tuple[int, int]]:
 
 def _empty_long(device: torch.device) -> torch.Tensor:
     return torch.empty((0,), dtype=torch.long, device=device)
-
-
-def _m0_output(module, x: torch.Tensor, weights, wigner_D_all):
-    n, _ = x.shape
-    rot_blocks = {
-        l: module._select_wigner_block(wigner_D_all, l)
-        for l in range(module.l_max + 1)
-    }
-    input_groups = {
-        l: module._gather_l_group(x, l)
-        for l in module._in_groups
-    }
-    out_groups = module._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
-
-    radial_weight = weights[:, module.m_in_index[0]:module.m_in_index[1]].unsqueeze(1) if module.radial_emb else 1.
-    inp = module._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
-    if module.front and module.radial_emb:
-        y_m0 = module.fc_m0(inp * radial_weight.squeeze(1))
-    elif module.radial_emb:
-        y_m0 = module.fc_m0(inp) * radial_weight.squeeze(1)
-    else:
-        y_m0 = module.fc_m0(inp)
-    module._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
-    return module._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
 
 
 def _scheduled_metadata(module, device: torch.device):
@@ -260,7 +236,7 @@ def try_forward_so2_scheduled_sandwich(module, x: torch.Tensor, weights, wigner_
             int(active_blocks),
         )
 
-        return (out + _m0_output(module, x, weights, wigner_D_all)).contiguous(), wigner_D_all
+        return (out + so2_m0_output(module, x, weights, wigner_D_all)).contiguous(), wigner_D_all
     except Exception:
         if strict:
             raise
