@@ -91,10 +91,17 @@ def _parse_variant(spec: str) -> Variant:
         return Variant(spec, "indexed_sandwich_cuda", wigner=wigner)
     if name == "indexed_sandwich_cuda_multi":
         schedule = option or "output_major"
+        layout = "raw"
+        if len(parts) > 2 and parts[2] in ("raw", "block", "block_complex", "fairchem_block"):
+            layout = parts[2]
+            wigner = parts[3] if len(parts) > 3 else "auto"
         return Variant(
             spec,
             "indexed_sandwich_cuda_multi",
-            (("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", schedule),),
+            (
+                ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", schedule),
+                ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", layout),
+            ),
             wigner=wigner,
         )
     if name in ("materialized", "indexed_sandwich_materialized"):
@@ -153,6 +160,7 @@ def _set_default_env() -> None:
 
 def _reset_variant_env() -> None:
     os.environ["DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE"] = "per_m"
+    os.environ["DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT"] = "raw"
     os.environ["DPTB_SO2_MATERIALIZED_GEMM_STRATEGY"] = "block_dense"
     os.environ["DPTB_SO2_MATERIALIZED_EPILOGUE_SCHEDULE"] = "per_m"
     os.environ["DPTB_SO2_MATERIALIZED_SCHEDULED_GEMM_STRATEGY"] = "scheduler"
