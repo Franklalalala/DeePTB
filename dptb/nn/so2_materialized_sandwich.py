@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
 from dptb.nn.so2_moe_fused_p0 import (
     _PackPairsMultiFunction,
+    _ScatterPairOutputFunction,
     _ScatterRawPairOutputFunction,
     _wigner_tensor_and_mode,
 )
@@ -25,8 +26,7 @@ def _warn_once(key: str, message: str) -> None:
     warnings.warn(message, RuntimeWarning, stacklevel=3)
 
 
-def _strategy() -> str:
-    strategy = os.environ.get("DPTB_SO2_MATERIALIZED_GEMM_STRATEGY", "block_dense").lower()
+def _normalize_strategy(strategy: str) -> str:
     aliases = {
         "cublas_grouped": "grouped",
         "grouped_cublas": "grouped",
@@ -37,6 +37,10 @@ def _strategy() -> str:
         "persistent_block": "block_dense",
     }
     return aliases.get(strategy, strategy)
+
+
+def _strategy() -> str:
+    return _normalize_strategy(os.environ.get("DPTB_SO2_MATERIALIZED_GEMM_STRATEGY", "block_dense").lower())
 
 
 def _empty_long(device: torch.device) -> torch.Tensor:
@@ -108,7 +112,7 @@ def _materialized_metadata(module, device: torch.device):
 
 
 def _apply_radial_front(module, packed_all: torch.Tensor, weights, m_values: list[int], cin_prefix: torch.Tensor) -> torch.Tensor:
-    if not module.radial_emb:
+    if not module.radial_emb or not bool(module.front):
         return packed_all
     pieces = []
     for i, m in enumerate(m_values):
@@ -154,14 +158,24 @@ def _block_dense_raw_outputs(module, packed_eff: torch.Tensor, m_values: list[in
     return raw_tensors
 
 
-def try_forward_so2_materialized_sandwich(module, x: torch.Tensor, weights, wigner_D_all):
-    strict = os.environ.get("DPTB_SO2_MATERIALIZED_STRICT", "0").lower() in ("1", "true", "yes", "on")
+def try_forward_so2_materialized_sandwich(
+    module,
+    x: torch.Tensor,
+    weights,
+    wigner_D_all,
+    *,
+    strategy_override: str | None = None,
+    strict_override: bool | None = None,
+):
+    strict = (
+        bool(strict_override)
+        if strict_override is not None
+        else os.environ.get("DPTB_SO2_MATERIALIZED_STRICT", "0").lower() in ("1", "true", "yes", "on")
+    )
     try:
         if x.device.type != "cuda" or x.dtype != torch.float32:
             return None
         if module.irreps_out.lmax < 1:
-            return None
-        if module.radial_emb and not bool(module.front):
             return None
 
         wigner_info = _wigner_tensor_and_mode(module, wigner_D_all, x)
@@ -189,7 +203,7 @@ def try_forward_so2_materialized_sandwich(module, x: torch.Tensor, weights, wign
         )
         packed_eff = _apply_radial_front(module, packed_all, weights, m_values, cin_prefix)
 
-        strategy = _strategy()
+        strategy = _normalize_strategy(strategy_override.lower()) if strategy_override is not None else _strategy()
         if strategy == "grouped":
             raw_tensors = _grouped_raw_outputs(module, packed_eff, m_values, cin_prefix)
         elif strategy == "block_dense":
@@ -200,19 +214,36 @@ def try_forward_so2_materialized_sandwich(module, x: torch.Tensor, weights, wign
 
         contribution = None
         for raw, m, out_base, out_l in zip(raw_tensors, m_values, out_bases, out_ls):
-            part = _ScatterRawPairOutputFunction.apply(
-                raw.contiguous(),
-                wigner,
-                out_base,
-                out_l,
-                offsets,
-                compact_offsets,
-                int(module.irreps_out.dim),
-                int(m),
-                bool(module.rotate_out),
-                int(wigner_mode),
-                int(wigner_stride),
-            )
+            if module.radial_emb and not bool(module.front):
+                radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1)
+                pair_out = module.m_linear[m - 1]._finish_linear_output(raw) * radial
+                part = _ScatterPairOutputFunction.apply(
+                    pair_out.contiguous(),
+                    wigner,
+                    out_base,
+                    out_l,
+                    offsets,
+                    compact_offsets,
+                    int(module.irreps_out.dim),
+                    int(m),
+                    bool(module.rotate_out),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
+            else:
+                part = _ScatterRawPairOutputFunction.apply(
+                    raw.contiguous(),
+                    wigner,
+                    out_base,
+                    out_l,
+                    offsets,
+                    compact_offsets,
+                    int(module.irreps_out.dim),
+                    int(m),
+                    bool(module.rotate_out),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
             contribution = part if contribution is None else contribution + part
 
         return (so2_m0_output(module, x, weights, wigner_D_all) + contribution).contiguous(), wigner_D_all

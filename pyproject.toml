@@ -30,6 +30,7 @@ seekpath = "*"
 pandas = "*"
 openpyxl = "*"
 seaborn = "*"
+so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main" }
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.2.0"

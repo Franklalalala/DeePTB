@@ -48,6 +48,23 @@ def _empty_long(device: torch.device) -> torch.Tensor:
     return torch.empty((0,), dtype=torch.long, device=device)
 
 
+def _gemm_strategy(env_prefix: str) -> str:
+    strategy = os.environ.get(f"{env_prefix}_GEMM_STRATEGY", "scheduler").lower()
+    aliases = {
+        "cuda": "scheduler",
+        "cuda_scheduler": "scheduler",
+        "scheduled": "scheduler",
+        "warp": "scheduler",
+        "warp_collective": "scheduler",
+        "dense": "block_dense",
+        "single_dense": "block_dense",
+        "block": "block_dense",
+        "persistent": "block_dense",
+        "persistent_block": "block_dense",
+    }
+    return aliases.get(strategy, strategy)
+
+
 def _scheduled_metadata(module, device: torch.device, *, cache_attr: str, include_m0: bool):
     cache = getattr(module, cache_attr, None)
     if cache is None:
@@ -66,6 +83,7 @@ def _scheduled_metadata(module, device: torch.device, *, cache_attr: str, includ
     out_base_parts = []
     out_l_parts = []
     offsets = None
+    weight_specs: list[tuple[int, int, int, int]] = []
 
     max_m = int(module.irreps_out.lmax)
     for m in range(0 if include_m0 else 1, max_m + 1):
@@ -94,6 +112,7 @@ def _scheduled_metadata(module, device: torch.device, *, cache_attr: str, includ
         out_l_parts.append(out_l)
         in_ptr.append(in_ptr[-1] + cin)
         out_ptr.append(out_ptr[-1] + cout)
+        weight_specs.append((int(m), int(cin), int(cout), int(expected_out)))
         offsets = offsets_m
 
     if not m_values:
@@ -109,25 +128,22 @@ def _scheduled_metadata(module, device: torch.device, *, cache_attr: str, includ
         cat(out_base_parts),
         cat(out_l_parts),
         offsets if offsets is not None else _empty_long(device),
+        tuple(weight_specs),
     )
     cache[key] = cached
     return cached
 
 
-def _scheduled_weights(module, m_values: torch.Tensor, out_ptr: torch.Tensor, in_ptr: torch.Tensor):
-    m_list = [int(v) for v in m_values.detach().cpu().tolist()]
+def _scheduled_weights(module, weight_specs: tuple[tuple[int, int, int, int], ...], device: torch.device):
     weight_parts = []
     weight_offsets = []
     bias_offsets = []
     bias_parts = []
     cursor = 0
     bias_cursor = 0
-    for m_idx, m in enumerate(m_list):
+    for m, cin, _cout, expected_rows in weight_specs:
         fc = module.fc_m0 if m == 0 else module.m_linear[m - 1].fc
         weight = fc.weight.unsqueeze(0).contiguous()
-        cin = int((in_ptr[m_idx + 1] - in_ptr[m_idx]).item())
-        cout = int((out_ptr[m_idx + 1] - out_ptr[m_idx]).item())
-        expected_rows = cout if m == 0 else 2 * cout
         if tuple(weight.shape) != (1, expected_rows, cin):
             _warn_once("weight_shape_fallback", "scheduled_sandwich weight shape does not match descriptor; falling back.")
             return None
@@ -147,15 +163,32 @@ def _scheduled_weights(module, m_values: torch.Tensor, out_ptr: torch.Tensor, in
             _warn_once("pair_bias_fallback", "scheduled_sandwich keeps m>0 bias unsupported; falling back.")
             return None
 
-    weight_flat = torch.cat(weight_parts, dim=0).contiguous() if weight_parts else torch.empty((0,), dtype=torch.float32, device=out_ptr.device)
-    bias_flat = torch.cat(bias_parts, dim=0).contiguous() if bias_parts else torch.empty((0,), dtype=torch.float32, device=out_ptr.device)
+    weight_flat = torch.cat(weight_parts, dim=0).contiguous() if weight_parts else torch.empty((0,), dtype=torch.float32, device=device)
+    bias_flat = torch.cat(bias_parts, dim=0).contiguous() if bias_parts else torch.empty((0,), dtype=torch.float32, device=device)
     return (
         weight_flat,
-        torch.tensor(weight_offsets, dtype=torch.long, device=out_ptr.device).contiguous(),
+        torch.tensor(weight_offsets, dtype=torch.long, device=device).contiguous(),
         bias_flat,
-        torch.tensor(bias_offsets, dtype=torch.long, device=out_ptr.device).contiguous(),
+        torch.tensor(bias_offsets, dtype=torch.long, device=device).contiguous(),
         1,
     )
+
+
+def _m_in_index_tensor(module, device: torch.device, cache_attr: str) -> torch.Tensor:
+    if not module.radial_emb:
+        return _empty_long(device)
+    attr = f"{cache_attr}_m_in_index_cache"
+    cache = getattr(module, attr, None)
+    if cache is None:
+        cache = {}
+        setattr(module, attr, cache)
+    key = str(device)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    cached = torch.as_tensor(module.m_in_index, dtype=torch.long, device=device).contiguous()
+    cache[key] = cached
+    return cached
 
 
 def _tile_shape(mainloop_kind: int, *, env_prefix: str) -> tuple[int, int]:
@@ -194,6 +227,27 @@ def _try_forward_scheduled_sandwich(
         if module.irreps_out.lmax < 1:
             return None
 
+        strategy = _gemm_strategy(env_prefix)
+        if strategy == "block_dense":
+            from dptb.nn.so2_materialized_sandwich import try_forward_so2_materialized_sandwich
+
+            result = try_forward_so2_materialized_sandwich(
+                module,
+                x,
+                weights,
+                wigner_D_all,
+                strategy_override="block_dense",
+                strict_override=strict,
+            )
+            if result is not None:
+                return result
+            if strict:
+                raise RuntimeError(f"{env_prefix}_GEMM_STRATEGY=block_dense could not run for this SO2 module.")
+            return None
+        if strategy != "scheduler":
+            _warn_once("unknown_scheduled_gemm_strategy", f"unknown {env_prefix}_GEMM_STRATEGY={strategy!r}; falling back.")
+            return None
+
         wigner_info = wigner_tensor_and_mode(module, wigner_D_all, x)
         if wigner_info is None:
             return None
@@ -207,9 +261,9 @@ def _try_forward_scheduled_sandwich(
         metadata = _scheduled_metadata(module, x.device, cache_attr=cache_attr, include_m0=m0_in_scheduler)
         if metadata is None:
             return None
-        m_values, in_ptr, in_base, in_l, out_ptr, out_base, out_l, offsets = metadata
+        m_values, in_ptr, in_base, in_l, out_ptr, out_base, out_l, offsets, weight_specs = metadata
 
-        packed_weights = _scheduled_weights(module, m_values, out_ptr, in_ptr)
+        packed_weights = _scheduled_weights(module, weight_specs, x.device)
         if packed_weights is None:
             return None
         weight_flat, weight_offsets, bias_flat, bias_offsets, n_routes = packed_weights
@@ -224,15 +278,12 @@ def _try_forward_scheduled_sandwich(
             block_n=int(block_n),
             out_ptr=out_ptr,
             raw_pair_tiles=(int(mainloop_kind_id) == 3),
+            nosync=_flag(f"{env_prefix}_NOSYNC_LAYOUT", "1"),
         )
         graph_index = _empty_long(x.device)
 
         radial_all = weights.contiguous() if module.radial_emb else x.new_empty((0,))
-        m_in_index = (
-            torch.as_tensor(module.m_in_index, dtype=torch.long, device=x.device).contiguous()
-            if module.radial_emb
-            else _empty_long(x.device)
-        )
+        m_in_index = _m_in_index_tensor(module, x.device, cache_attr)
 
         out = SO2CudaSchedulerFunction.apply(
             x.contiguous(),

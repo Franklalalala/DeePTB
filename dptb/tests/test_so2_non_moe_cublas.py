@@ -204,6 +204,17 @@ def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
     )
     torch.testing.assert_close(pair_prefix.cpu(), torch.tensor([0, 6, 15, 18], dtype=torch.long))
 
+    _, _, nosync_prefix = prepare_so2_single_route_layout(
+        num_rows=17,
+        n_problems=3,
+        block_m=8,
+        block_n=4,
+        out_ptr=out_ptr,
+        raw_pair_tiles=False,
+        nosync=True,
+    )
+    torch.testing.assert_close(nosync_prefix.cpu(), torch.tensor([0, 3, 9, 12], dtype=torch.long))
+
 
 @pytest.mark.parametrize(
     ("mode", "epilogue_schedule"),
@@ -403,6 +414,64 @@ def test_non_moe_so2_indexed_sandwich_materialized_scheduled_matches_standard_fo
         assert name_ref == name_scheduled
         if param_ref.grad is not None:
             torch.testing.assert_close(param_scheduled.grad, param_ref.grad, atol=6e-5, rtol=6e-5)
+
+
+@pytest.mark.parametrize(
+    ("irreps_in", "irreps_out", "expected_front"),
+    [
+        ("3x0e + 4x1o + 2x2e", "2x0e + 3x1o + 3x2e", True),
+        ("5x0e + 4x1o + 3x2e", "2x0e + 3x1o + 3x2e", False),
+    ],
+)
+def test_non_moe_so2_materialized_scheduled_block_dense_strategy_matches_standard(
+    monkeypatch,
+    irreps_in,
+    irreps_out,
+    expected_front,
+):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    if not torch.cuda.is_available():
+        pytest.skip("non-MoE materialized scheduled SO2 backend requires CUDA")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.delenv("DPTB_SO2_MATERIALIZED_SCHEDULED_MIN_EDGES", raising=False)
+    monkeypatch.setenv("DPTB_SO2_MATERIALIZED_SCHEDULED_STRICT", "1")
+    monkeypatch.setenv("DPTB_SO2_MATERIALIZED_SCHEDULED_GEMM_STRATEGY", "block_dense")
+    monkeypatch.setenv("DPTB_SO2_MATERIALIZED_SCHEDULED_MAINLOOP", "invalid_mainloop_if_strategy_is_ignored")
+
+    torch.manual_seed(20260527)
+    kwargs = dict(
+        irreps_in=irreps_in,
+        irreps_out=irreps_out,
+        radial_emb=True,
+        latent_dim=7,
+        radial_channels=[11],
+        rotate_in=True,
+        rotate_out=True,
+    )
+    ref = SO2_Linear(**kwargs, so2_m_linear_mode="standard").cuda().float().train()
+    scheduled = SO2_Linear(**kwargs, so2_m_linear_mode="indexed_sandwich_materialized_scheduled").cuda().float().train()
+    scheduled.load_state_dict(ref.state_dict(), strict=True)
+    assert bool(scheduled.front) is expected_front
+
+    x_ref = torch.randn(19, ref.irreps_in.dim, device="cuda", requires_grad=True)
+    x_scheduled = x_ref.detach().clone().requires_grad_(True)
+    r = torch.randn(19, 3, device="cuda")
+    latents_ref = torch.randn(19, 7, device="cuda", requires_grad=True)
+    latents_scheduled = latents_ref.detach().clone().requires_grad_(True)
+
+    out_ref, _ = ref(x_ref, r, latents_ref)
+    out_scheduled, _ = scheduled(x_scheduled, r, latents_scheduled)
+    torch.testing.assert_close(out_scheduled, out_ref, atol=3e-5, rtol=3e-5)
+
+    grad = torch.randn_like(out_ref)
+    out_ref.backward(grad)
+    out_scheduled.backward(grad)
+
+    torch.testing.assert_close(x_scheduled.grad, x_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(latents_scheduled.grad, latents_ref.grad, atol=5e-5, rtol=5e-5)
 
 
 def test_non_moe_so2_indexed_sandwich_cuda_shape_gate_falls_back(monkeypatch):
