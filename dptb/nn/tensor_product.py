@@ -760,6 +760,103 @@ class SO2_Linear(torch.nn.Module):
 
         return so2_pair_maps(self, m, device, cache_attr="_indexed_sandwich_cuda_pair_maps_cache")
 
+    def _indexed_sandwich_cuda_multi_metadata(self, device):
+        cache = getattr(self, "_indexed_sandwich_cuda_multi_metadata_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_indexed_sandwich_cuda_multi_metadata_cache", cache)
+
+        key = str(device)
+        cached = cache.get(key)
+        if cached is not None:
+            m_values_host, _, _, _, _, cin_values, cout_values, _, _, _, _, _, _ = cached
+            for i, m in enumerate(m_values_host):
+                fc = getattr(self.m_linear[m - 1], "fc", None)
+                if (
+                    not isinstance(fc, nn.Linear)
+                    or fc.in_features != cin_values[i]
+                    or fc.out_features != 2 * cout_values[i]
+                ):
+                    return None
+            return cached
+
+        in_bases = []
+        in_ls = []
+        out_bases = []
+        out_ls = []
+        cin_values = []
+        cout_values = []
+        m_values_host = []
+        offsets = None
+        cin_prefix = [0]
+        cout_prefix = [0]
+        for m, module in zip(range(1, self.irreps_out.lmax + 1), self.m_linear):
+            fc = getattr(module, "fc", None)
+            if not isinstance(fc, nn.Linear):
+                return None
+            in_base, in_l, out_base, out_l, offsets_m = self._indexed_sandwich_cuda_pair_maps(m, device)
+            cin = int(in_base.numel())
+            cout = int(out_base.numel())
+            if cin == 0 or cout == 0:
+                continue
+            if fc.in_features != cin or fc.out_features != 2 * cout:
+                return None
+            offsets = offsets_m
+            in_bases.append(in_base)
+            in_ls.append(in_l)
+            out_bases.append(out_base)
+            out_ls.append(out_l)
+            cin_values.append(cin)
+            cout_values.append(cout)
+            m_values_host.append(int(m))
+            cin_prefix.append(cin_prefix[-1] + cin)
+            cout_prefix.append(cout_prefix[-1] + cout)
+
+        cached = (
+            tuple(m_values_host),
+            tuple(in_bases),
+            tuple(in_ls),
+            tuple(out_bases),
+            tuple(out_ls),
+            tuple(cin_values),
+            tuple(cout_values),
+            torch.tensor(cin_prefix, dtype=torch.long, device=device).contiguous(),
+            torch.tensor(cout_prefix, dtype=torch.long, device=device).contiguous(),
+            torch.tensor(m_values_host, dtype=torch.long, device=device).contiguous(),
+            offsets,
+            tuple(int(v) for v in cin_prefix),
+            tuple(int(v) for v in cout_prefix),
+        )
+        cache[key] = cached
+        return cached
+
+    def _indexed_sandwich_cuda_multi_output_entry_map(
+        self,
+        m_values_host,
+        out_bases,
+        out_ls,
+        device,
+        entry_map_fn,
+    ):
+        cache = getattr(self, "_indexed_sandwich_cuda_multi_output_entry_map_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_indexed_sandwich_cuda_multi_output_entry_map_cache", cache)
+
+        key = (str(device), int(self.irreps_out.dim), tuple(int(m) for m in m_values_host))
+        cached = cache.get(key)
+        if cached is None:
+            cached = entry_map_fn(
+                self,
+                list(m_values_host),
+                list(out_bases),
+                list(out_ls),
+                int(self.irreps_out.dim),
+                device,
+            )
+            cache[key] = cached
+        return cached
+
     def _forward_indexed_sandwich_cuda(self, x, weights, wigner_D_all):
         strict = os.environ.get("DPTB_SO2_INDEXED_SANDWICH_CUDA_STRICT", "0").lower() in ("1", "true", "yes", "on")
         try:
@@ -900,41 +997,33 @@ class SO2_Linear(torch.nn.Module):
             self._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
             out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
 
-            in_bases = []
-            in_ls = []
-            out_bases = []
-            out_ls = []
-            cin_values = []
-            cout_values = []
-            m_values_host = []
-            m_modules = []
-            offsets = None
-            for m, module in zip(range(1, self.irreps_out.lmax + 1), self.m_linear):
-                in_base, in_l, out_base, out_l, offsets_m = self._indexed_sandwich_cuda_pair_maps(m, x.device)
-                cin = int(in_base.numel())
-                cout = int(out_base.numel())
-                if cin == 0 or cout == 0:
-                    continue
-                if module.fc.in_features != cin or module.fc.out_features != 2 * cout:
-                    return None
-                offsets = offsets_m
-                in_bases.append(in_base)
-                in_ls.append(in_l)
-                out_bases.append(out_base)
-                out_ls.append(out_l)
-                cin_values.append(cin)
-                cout_values.append(cout)
-                m_values_host.append(int(m))
-                m_modules.append(module)
+            metadata = self._indexed_sandwich_cuda_multi_metadata(x.device)
+            if metadata is None:
+                return None
+            (
+                m_values_host,
+                in_bases,
+                in_ls,
+                out_bases,
+                out_ls,
+                _cin_values,
+                _cout_values,
+                cin_prefix_t,
+                cout_prefix_t,
+                m_values_t,
+                offsets,
+                cin_prefix,
+                _cout_prefix,
+            ) = metadata
 
             if not m_values_host:
                 return out.contiguous(), wigner_D_all
-
-            cin_prefix = [0]
-            for cin in cin_values:
-                cin_prefix.append(cin_prefix[-1] + int(cin))
-            cin_prefix_t = torch.tensor(cin_prefix, dtype=torch.long, device=x.device).contiguous()
-            m_values_t = torch.tensor(m_values_host, dtype=torch.long, device=x.device).contiguous()
+            m_values_host = list(m_values_host)
+            in_bases = list(in_bases)
+            in_ls = list(in_ls)
+            out_bases = list(out_bases)
+            out_ls = list(out_ls)
+            m_modules = [self.m_linear[m - 1] for m in m_values_host]
             packed_all = _PackPairsMultiFunction.apply(
                 x.contiguous(),
                 wigner,
@@ -949,10 +1038,6 @@ class SO2_Linear(torch.nn.Module):
                 int(wigner_stride),
             )
 
-            cout_prefix = [0]
-            for cout in cout_values:
-                cout_prefix.append(cout_prefix[-1] + int(cout))
-            cout_prefix_t = torch.tensor(cout_prefix, dtype=torch.long, device=x.device).contiguous()
             epilogue_schedule = os.environ.get(
                 "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE",
                 "per_m",
@@ -987,13 +1072,14 @@ class SO2_Linear(torch.nn.Module):
                         pair_outputs[i] = pair_outputs[i] * radial
 
                 if epilogue_schedule == "output_major":
-                    entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
-                        self,
-                        m_values_host,
-                        out_bases,
-                        out_ls,
-                        int(self.irreps_out.dim),
-                        x.device,
+                    entry_offsets, entry_m, entry_channel, entry_d, entry_l = (
+                        self._indexed_sandwich_cuda_multi_output_entry_map(
+                            m_values_host,
+                            out_bases,
+                            out_ls,
+                            x.device,
+                            _multi_output_entry_map,
+                        )
                     )
                     contribution = _ScatterPairsMultiOutputMajorFunction.apply(
                         wigner,
@@ -1042,13 +1128,14 @@ class SO2_Linear(torch.nn.Module):
                 raw_tensors.append(module.fc(pair_for_linear).contiguous())
 
             if epilogue_schedule == "output_major":
-                entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
-                    self,
-                    m_values_host,
-                    out_bases,
-                    out_ls,
-                    int(self.irreps_out.dim),
-                    x.device,
+                entry_offsets, entry_m, entry_channel, entry_d, entry_l = (
+                    self._indexed_sandwich_cuda_multi_output_entry_map(
+                        m_values_host,
+                        out_bases,
+                        out_ls,
+                        x.device,
+                        _multi_output_entry_map,
+                    )
                 )
                 contribution = _ScatterRawPairsMultiOutputMajorFunction.apply(
                     wigner,
