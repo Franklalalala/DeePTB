@@ -862,6 +862,8 @@ class SO2_Linear(torch.nn.Module):
             from dptb.nn.so2_moe_fused_p0 import (
                 _PackPairsMultiFunction,
                 _ScatterRawPairOutputFunction,
+                _ScatterPairOutputFunction,
+                _ScatterPairsMultiOutputMajorFunction,
                 _ScatterRawPairsMultiOutputFunction,
                 _ScatterRawPairsMultiOutputMajorFunction,
                 _multi_output_entry_map,
@@ -947,13 +949,6 @@ class SO2_Linear(torch.nn.Module):
                 int(wigner_stride),
             )
 
-            raw_tensors = []
-            for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
-                pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
-                radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
-                pair_for_linear = pair * radial if radial is not None and bool(self.front) else pair
-                raw_tensors.append(module.fc(pair_for_linear).contiguous())
-
             cout_prefix = [0]
             for cout in cout_values:
                 cout_prefix.append(cout_prefix[-1] + int(cout))
@@ -962,6 +957,90 @@ class SO2_Linear(torch.nn.Module):
                 "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE",
                 "per_m",
             ).lower()
+            gemm_layout = os.environ.get(
+                "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT",
+                "raw",
+            ).lower()
+
+            if gemm_layout in ("block", "block_complex", "fairchem_block"):
+                from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_block_gemm
+
+                pair_inputs = []
+                post_radials = []
+                block_weights = []
+                ptrs = []
+                for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
+                    pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
+                    radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
+                    if radial is not None and bool(self.front):
+                        pair = pair * radial
+                        post_radials.append(None)
+                    else:
+                        post_radials.append(radial)
+                    pair_inputs.append(pair)
+                    block_weights.append(module.fc.weight.unsqueeze(0).contiguous())
+                    ptrs.append(torch.tensor([0, int(n)], dtype=torch.long, device="cpu"))
+
+                pair_outputs = indexed_sandwich_multi_block_gemm(pair_inputs, ptrs, block_weights)
+                for i, radial in enumerate(post_radials):
+                    if radial is not None:
+                        pair_outputs[i] = pair_outputs[i] * radial
+
+                if epilogue_schedule == "output_major":
+                    entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
+                        self,
+                        m_values_host,
+                        out_bases,
+                        out_ls,
+                        int(self.irreps_out.dim),
+                        x.device,
+                    )
+                    contribution = _ScatterPairsMultiOutputMajorFunction.apply(
+                        wigner,
+                        offsets,
+                        compact_offsets,
+                        cout_prefix_t,
+                        m_values_t,
+                        entry_offsets,
+                        entry_m,
+                        entry_channel,
+                        entry_d,
+                        entry_l,
+                        int(self.irreps_out.dim),
+                        bool(self.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                        len(pair_outputs),
+                        *pair_outputs,
+                        *out_bases,
+                        *out_ls,
+                    )
+                else:
+                    contribution = None
+                    for pair_out, m, out_base, out_l in zip(pair_outputs, m_values_host, out_bases, out_ls):
+                        part = _ScatterPairOutputFunction.apply(
+                            pair_out.contiguous(),
+                            wigner,
+                            out_base,
+                            out_l,
+                            offsets,
+                            compact_offsets,
+                            int(self.irreps_out.dim),
+                            int(m),
+                            bool(self.rotate_out),
+                            int(wigner_mode),
+                            int(wigner_stride),
+                        )
+                        contribution = part if contribution is None else contribution + part
+                return (out + contribution).contiguous(), wigner_D_all
+
+            raw_tensors = []
+            for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
+                pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
+                radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
+                pair_for_linear = pair * radial if radial is not None and bool(self.front) else pair
+                raw_tensors.append(module.fc(pair_for_linear).contiguous())
+
             if epilogue_schedule == "output_major":
                 entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
                     self,
