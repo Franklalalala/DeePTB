@@ -227,6 +227,7 @@ def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
     ("mode", "epilogue_schedule"),
     [
         ("indexed_sandwich_cuda", None),
+        ("indexed_sandwich_cuda_multi", None),
         ("indexed_sandwich_cuda_multi", "output_major"),
         ("indexed_sandwich_cuda_multi", "per_m"),
     ],
@@ -580,6 +581,57 @@ def test_non_moe_so2_indexed_sandwich_cuda_shape_gate_prefers_dptb_env(monkeypat
     )
 
     assert layer._use_indexed_sandwich_cuda_path(_FakeCudaInput(torch, 4, layer.irreps_in.dim))
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_defaults_to_output_major(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.delenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", raising=False)
+    monkeypatch.delenv("SO2_CUDA_EPILOGUE_SCHEDULE", raising=False)
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_epilogue_schedule() == "output_major"
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_accepts_so2_epilogue_alias(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.delenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", raising=False)
+    monkeypatch.setenv("SO2_CUDA_EPILOGUE_SCHEDULE", "per_m")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_epilogue_schedule() == "per_m"
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_epilogue_prefers_dptb_env(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv("SO2_CUDA_EPILOGUE_SCHEDULE", "output_major")
+    monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", "per_m")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_epilogue_schedule() == "per_m"
 
 
 def test_non_moe_so2_materialized_shape_gate_accepts_so2_env_alias(monkeypatch):

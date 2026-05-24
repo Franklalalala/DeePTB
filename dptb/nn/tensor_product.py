@@ -581,6 +581,23 @@ class SO2_Linear(torch.nn.Module):
                 return int(default)
         return int(default)
 
+    @staticmethod
+    def _str_env_any(names, default):
+        for name in names:
+            value = os.environ.get(name)
+            if value is not None:
+                return str(value)
+        return str(default)
+
+    def _indexed_sandwich_cuda_multi_epilogue_schedule(self):
+        return self._str_env_any(
+            (
+                "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE",
+                "SO2_CUDA_EPILOGUE_SCHEDULE",
+            ),
+            "output_major",
+        ).lower()
+
     def _use_indexed_sandwich_cuda_path(self, x):
         if self.so2_m_linear_mode not in ("indexed_sandwich_cuda", "indexed_sandwich_cuda_multi"):
             return False
@@ -1070,10 +1087,7 @@ class SO2_Linear(torch.nn.Module):
                 int(wigner_stride),
             )
 
-            epilogue_schedule = os.environ.get(
-                "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE",
-                "per_m",
-            ).lower()
+            epilogue_schedule = self._indexed_sandwich_cuda_multi_epilogue_schedule()
             gemm_layout = os.environ.get(
                 "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT",
                 "raw",
