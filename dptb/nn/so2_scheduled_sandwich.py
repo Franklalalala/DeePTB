@@ -134,31 +134,66 @@ def _scheduled_metadata(module, device: torch.device, *, cache_attr: str, includ
     return cached
 
 
-def _scheduled_weights(module, weight_specs: tuple[tuple[int, int, int, int], ...], device: torch.device):
-    weight_parts = []
+def _scheduled_weight_offset_tensors(module, weight_specs: tuple[tuple[int, int, int, int], ...], device: torch.device):
+    cache = getattr(module, "_so2_scheduled_weight_offset_tensor_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(module, "_so2_scheduled_weight_offset_tensor_cache", cache)
+    bias_presence = []
+    for m, _cin, _cout, _expected_rows in weight_specs:
+        fc = module.fc_m0 if m == 0 else module.m_linear[m - 1].fc
+        bias_presence.append(fc.bias is not None)
+    key = (str(device), weight_specs, tuple(bias_presence))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
     weight_offsets = []
     bias_offsets = []
-    bias_parts = []
     cursor = 0
     bias_cursor = 0
+    for (m, cin, _cout, expected_rows), has_bias in zip(weight_specs, bias_presence):
+        weight_offsets.append(cursor)
+        cursor += int(expected_rows) * int(cin)
+        if not has_bias:
+            bias_offsets.append(-1)
+        elif m == 0:
+            bias_offsets.append(bias_cursor)
+            bias_cursor += int(expected_rows)
+        else:
+            _warn_once("pair_bias_fallback", "scheduled_sandwich keeps m>0 bias unsupported; falling back.")
+            return None
+
+    cached = (
+        torch.tensor(weight_offsets, dtype=torch.long, device=device).contiguous(),
+        torch.tensor(bias_offsets, dtype=torch.long, device=device).contiguous(),
+    )
+    cache[key] = cached
+    return cached
+
+
+def _scheduled_weights(module, weight_specs: tuple[tuple[int, int, int, int], ...], device: torch.device):
+    weight_parts = []
+    bias_parts = []
+    offsets = _scheduled_weight_offset_tensors(module, weight_specs, device)
+    if offsets is None:
+        return None
+    weight_offsets, bias_offsets = offsets
+
     for m, cin, _cout, expected_rows in weight_specs:
         fc = module.fc_m0 if m == 0 else module.m_linear[m - 1].fc
         weight = fc.weight.unsqueeze(0).contiguous()
         if tuple(weight.shape) != (1, expected_rows, cin):
             _warn_once("weight_shape_fallback", "scheduled_sandwich weight shape does not match descriptor; falling back.")
             return None
-        weight_offsets.append(cursor)
         flat = weight.reshape(-1).contiguous()
         weight_parts.append(flat)
-        cursor += int(flat.numel())
         bias = fc.bias
         if bias is None:
-            bias_offsets.append(-1)
+            continue
         elif m == 0:
             flat_bias = bias.unsqueeze(0).contiguous().reshape(-1)
-            bias_offsets.append(bias_cursor)
             bias_parts.append(flat_bias)
-            bias_cursor += int(flat_bias.numel())
         else:
             _warn_once("pair_bias_fallback", "scheduled_sandwich keeps m>0 bias unsupported; falling back.")
             return None
@@ -167,9 +202,9 @@ def _scheduled_weights(module, weight_specs: tuple[tuple[int, int, int, int], ..
     bias_flat = torch.cat(bias_parts, dim=0).contiguous() if bias_parts else torch.empty((0,), dtype=torch.float32, device=device)
     return (
         weight_flat,
-        torch.tensor(weight_offsets, dtype=torch.long, device=device).contiguous(),
+        weight_offsets,
         bias_flat,
-        torch.tensor(bias_offsets, dtype=torch.long, device=device).contiguous(),
+        bias_offsets,
         1,
     )
 

@@ -320,7 +320,8 @@ def test_non_moe_so2_indexed_sandwich_scheduled_matches_standard_forward_backwar
 
 
 @pytest.mark.parametrize("strategy", ["grouped", "block_dense"])
-def test_non_moe_so2_indexed_sandwich_materialized_matches_standard_forward_backward(monkeypatch, strategy):
+@pytest.mark.parametrize("epilogue_schedule", ["per_m", "output_major"])
+def test_non_moe_so2_indexed_sandwich_materialized_matches_standard_forward_backward(monkeypatch, strategy, epilogue_schedule):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
@@ -329,6 +330,7 @@ def test_non_moe_so2_indexed_sandwich_materialized_matches_standard_forward_back
     from dptb.nn.tensor_product import SO2_Linear
 
     monkeypatch.setenv("DPTB_SO2_MATERIALIZED_GEMM_STRATEGY", strategy)
+    monkeypatch.setenv("DPTB_SO2_MATERIALIZED_EPILOGUE_SCHEDULE", epilogue_schedule)
     monkeypatch.setenv("DPTB_SO2_MATERIALIZED_STRICT", "1")
 
     torch.manual_seed(20260525)

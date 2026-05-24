@@ -12,6 +12,8 @@ from dptb.nn.so2_moe_fused_p0 import (
     _PackPairsMultiFunction,
     _ScatterPairOutputFunction,
     _ScatterRawPairOutputFunction,
+    _ScatterRawPairsMultiOutputMajorFunction,
+    _multi_output_entry_map,
     _wigner_tensor_and_mode,
 )
 from dptb.nn.so2_sandwich_common import so2_m0_output, so2_pair_maps
@@ -106,43 +108,64 @@ def _materialized_metadata(module, device: torch.device):
         torch.tensor(cout_prefix, dtype=torch.long, device=device).contiguous(),
         torch.tensor(m_values, dtype=torch.long, device=device).contiguous(),
         offsets if offsets is not None else _empty_long(device),
+        tuple(int(v) for v in cin_prefix),
+        tuple(int(v) for v in cout_prefix),
     )
     cache[key] = cached
     return cached
 
 
-def _apply_radial_front(module, packed_all: torch.Tensor, weights, m_values: list[int], cin_prefix: torch.Tensor) -> torch.Tensor:
+def _apply_radial_front(module, packed_all: torch.Tensor, weights, m_values: list[int], cin_prefix_host: tuple[int, ...]) -> torch.Tensor:
     if not module.radial_emb or not bool(module.front):
         return packed_all
     pieces = []
     for i, m in enumerate(m_values):
-        start = int(cin_prefix[i].item())
-        end = int(cin_prefix[i + 1].item())
+        start = cin_prefix_host[i]
+        end = cin_prefix_host[i + 1]
         radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1)
         pieces.append(packed_all[:, :, start:end] * radial)
     return torch.cat(pieces, dim=2).contiguous() if pieces else packed_all
 
 
-def _grouped_raw_outputs(module, packed_eff: torch.Tensor, m_values: list[int], cin_prefix: torch.Tensor):
+def _single_route_pair_ptr(module, n_rows: int) -> torch.Tensor:
+    cache = getattr(module, "_so2_materialized_single_route_pair_ptr_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(module, "_so2_materialized_single_route_pair_ptr_cache", cache)
+    cached = cache.get(int(n_rows))
+    if cached is None:
+        cached = torch.tensor([0, int(n_rows) * 2], dtype=torch.long, device="cpu")
+        cache[int(n_rows)] = cached
+    return cached
+
+
+def _grouped_raw_outputs(module, packed_eff: torch.Tensor, m_values: list[int], cin_prefix_host: tuple[int, ...]):
     pair_inputs = []
+    ptr = _single_route_pair_ptr(module, int(packed_eff.shape[0]))
     ptrs = []
     weights = []
     for i, m in enumerate(m_values):
-        start = int(cin_prefix[i].item())
-        end = int(cin_prefix[i + 1].item())
+        start = cin_prefix_host[i]
+        end = cin_prefix_host[i + 1]
         pair = packed_eff[:, :, start:end]
         pair_inputs.append(pair.contiguous())
-        ptrs.append(torch.tensor([0, pair.reshape(-1, pair.shape[-1]).shape[0]], dtype=torch.long, device="cpu"))
+        ptrs.append(ptr)
         weights.append(module.m_linear[m - 1].fc.weight.unsqueeze(0).contiguous())
     return indexed_sandwich_multi_gemm(pair_inputs, ptrs, weights)
 
 
-def _block_dense_raw_outputs(module, packed_eff: torch.Tensor, m_values: list[int], cin_prefix: torch.Tensor, cout_prefix: torch.Tensor):
-    total_cin = int(cin_prefix[-1].item())
+def _block_dense_raw_outputs(
+    module,
+    packed_eff: torch.Tensor,
+    m_values: list[int],
+    cin_prefix_host: tuple[int, ...],
+    cout_prefix_host: tuple[int, ...],
+):
+    total_cin = cin_prefix_host[-1]
     weight_rows = []
     for i, m in enumerate(m_values):
-        left = int(cin_prefix[i].item())
-        right = int(cin_prefix[i + 1].item())
+        left = cin_prefix_host[i]
+        right = cin_prefix_host[i + 1]
         weight = module.m_linear[m - 1].fc.weight
         weight_rows.append(F.pad(weight, (left, total_cin - right)))
 
@@ -152,10 +175,54 @@ def _block_dense_raw_outputs(module, packed_eff: torch.Tensor, m_values: list[in
 
     raw_tensors = []
     for i in range(len(m_values)):
-        start = 2 * int(cout_prefix[i].item())
-        end = 2 * int(cout_prefix[i + 1].item())
+        start = 2 * cout_prefix_host[i]
+        end = 2 * cout_prefix_host[i + 1]
         raw_tensors.append(raw_all[:, :, start:end].contiguous())
     return raw_tensors
+
+
+def _raw_output_major_contribution(
+    module,
+    raw_tensors,
+    m_values: list[int],
+    out_bases: list[torch.Tensor],
+    out_ls: list[torch.Tensor],
+    wigner: torch.Tensor,
+    offsets: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    cout_prefix: torch.Tensor,
+    m_values_t: torch.Tensor,
+    wigner_mode: int,
+    wigner_stride: int,
+) -> torch.Tensor:
+    entry_offsets, entry_m, entry_channel, entry_d, entry_l = _multi_output_entry_map(
+        module,
+        m_values,
+        out_bases,
+        out_ls,
+        int(module.irreps_out.dim),
+        wigner.device,
+    )
+    return _ScatterRawPairsMultiOutputMajorFunction.apply(
+        wigner,
+        offsets,
+        compact_offsets,
+        cout_prefix,
+        m_values_t,
+        entry_offsets,
+        entry_m,
+        entry_channel,
+        entry_d,
+        entry_l,
+        int(module.irreps_out.dim),
+        bool(module.rotate_out),
+        int(wigner_mode),
+        int(wigner_stride),
+        len(raw_tensors),
+        *raw_tensors,
+        *out_bases,
+        *out_ls,
+    )
 
 
 def try_forward_so2_materialized_sandwich(
@@ -186,7 +253,19 @@ def try_forward_so2_materialized_sandwich(
         metadata = _materialized_metadata(module, x.device)
         if metadata is None:
             return None
-        m_values, in_bases, in_ls, out_bases, out_ls, cin_prefix, cout_prefix, m_values_t, offsets = metadata
+        (
+            m_values,
+            in_bases,
+            in_ls,
+            out_bases,
+            out_ls,
+            cin_prefix,
+            cout_prefix,
+            m_values_t,
+            offsets,
+            cin_prefix_host,
+            cout_prefix_host,
+        ) = metadata
 
         packed_all = _PackPairsMultiFunction.apply(
             x.contiguous(),
@@ -201,50 +280,70 @@ def try_forward_so2_materialized_sandwich(
             int(wigner_mode),
             int(wigner_stride),
         )
-        packed_eff = _apply_radial_front(module, packed_all, weights, m_values, cin_prefix)
+        packed_eff = _apply_radial_front(module, packed_all, weights, m_values, cin_prefix_host)
 
         strategy = _normalize_strategy(strategy_override.lower()) if strategy_override is not None else _strategy()
         if strategy == "grouped":
-            raw_tensors = _grouped_raw_outputs(module, packed_eff, m_values, cin_prefix)
+            raw_tensors = _grouped_raw_outputs(module, packed_eff, m_values, cin_prefix_host)
         elif strategy == "block_dense":
-            raw_tensors = _block_dense_raw_outputs(module, packed_eff, m_values, cin_prefix, cout_prefix)
+            raw_tensors = _block_dense_raw_outputs(module, packed_eff, m_values, cin_prefix_host, cout_prefix_host)
         else:
             _warn_once("unknown_strategy_fallback", f"unknown DPTB_SO2_MATERIALIZED_GEMM_STRATEGY={strategy!r}; falling back.")
             return None
 
-        contribution = None
-        for raw, m, out_base, out_l in zip(raw_tensors, m_values, out_bases, out_ls):
-            if module.radial_emb and not bool(module.front):
-                radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1)
-                pair_out = module.m_linear[m - 1]._finish_linear_output(raw) * radial
-                part = _ScatterPairOutputFunction.apply(
-                    pair_out.contiguous(),
-                    wigner,
-                    out_base,
-                    out_l,
-                    offsets,
-                    compact_offsets,
-                    int(module.irreps_out.dim),
-                    int(m),
-                    bool(module.rotate_out),
-                    int(wigner_mode),
-                    int(wigner_stride),
-                )
-            else:
-                part = _ScatterRawPairOutputFunction.apply(
-                    raw.contiguous(),
-                    wigner,
-                    out_base,
-                    out_l,
-                    offsets,
-                    compact_offsets,
-                    int(module.irreps_out.dim),
-                    int(m),
-                    bool(module.rotate_out),
-                    int(wigner_mode),
-                    int(wigner_stride),
-                )
-            contribution = part if contribution is None else contribution + part
+        epilogue_schedule = os.environ.get("DPTB_SO2_MATERIALIZED_EPILOGUE_SCHEDULE", "per_m").lower()
+        raw_output_epilogue = not (module.radial_emb and not bool(module.front))
+        if epilogue_schedule == "output_major" and raw_output_epilogue:
+            contribution = _raw_output_major_contribution(
+                module,
+                raw_tensors,
+                m_values,
+                out_bases,
+                out_ls,
+                wigner,
+                offsets,
+                compact_offsets,
+                cout_prefix,
+                m_values_t,
+                int(wigner_mode),
+                int(wigner_stride),
+            )
+        else:
+            contribution = None
+            for raw, m, out_base, out_l in zip(raw_tensors, m_values, out_bases, out_ls):
+                if module.radial_emb and not bool(module.front):
+                    radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]].unsqueeze(1)
+                    pair_out = module.m_linear[m - 1]._finish_linear_output(raw) * radial
+                    part = _ScatterPairOutputFunction.apply(
+                        pair_out.contiguous(),
+                        wigner,
+                        out_base,
+                        out_l,
+                        offsets,
+                        compact_offsets,
+                        int(module.irreps_out.dim),
+                        int(m),
+                        bool(module.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                    )
+                else:
+                    part = _ScatterRawPairOutputFunction.apply(
+                        raw.contiguous(),
+                        wigner,
+                        out_base,
+                        out_l,
+                        offsets,
+                        compact_offsets,
+                        int(module.irreps_out.dim),
+                        int(m),
+                        bool(module.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                    )
+                contribution = part if contribution is None else contribution + part
+        if contribution is None:
+            return None
 
         return (so2_m0_output(module, x, weights, wigner_D_all) + contribution).contiguous(), wigner_D_all
     except Exception:
