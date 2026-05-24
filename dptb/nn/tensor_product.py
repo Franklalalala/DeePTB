@@ -598,6 +598,16 @@ class SO2_Linear(torch.nn.Module):
             "output_major",
         ).lower()
 
+    def _indexed_sandwich_cuda_multi_gemm_layout(self):
+        return self._str_env_any(
+            (
+                "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT",
+                "SO2_CUDA_GEMM_LAYOUT",
+                "SO2_CUDA_GEMM_STRATEGY",
+            ),
+            "raw",
+        ).lower()
+
     def _use_indexed_sandwich_cuda_path(self, x):
         if self.so2_m_linear_mode not in ("indexed_sandwich_cuda", "indexed_sandwich_cuda_multi"):
             return False
@@ -1088,10 +1098,7 @@ class SO2_Linear(torch.nn.Module):
             )
 
             epilogue_schedule = self._indexed_sandwich_cuda_multi_epilogue_schedule()
-            gemm_layout = os.environ.get(
-                "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT",
-                "raw",
-            ).lower()
+            gemm_layout = self._indexed_sandwich_cuda_multi_gemm_layout()
 
             if gemm_layout in ("block", "block_complex", "fairchem_block"):
                 from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_block_gemm
@@ -1167,11 +1174,24 @@ class SO2_Linear(torch.nn.Module):
                 return (out + contribution).contiguous(), wigner_D_all
 
             raw_tensors = []
-            for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
-                pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
-                radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
-                pair_for_linear = pair * radial if radial is not None and bool(self.front) else pair
-                raw_tensors.append(module.fc(pair_for_linear).contiguous())
+            if gemm_layout in ("grouped_raw", "cublas_grouped", "grouped_gemm"):
+                from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
+
+                pair_inputs = []
+                raw_weights = []
+                ptr = torch.tensor([0, int(2 * n)], dtype=torch.long, device="cpu")
+                for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
+                    pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
+                    radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
+                    pair_inputs.append(pair * radial if radial is not None and bool(self.front) else pair)
+                    raw_weights.append(module.fc.weight.unsqueeze(0).contiguous())
+                raw_tensors = indexed_sandwich_multi_gemm(pair_inputs, ptr, raw_weights)
+            else:
+                for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
+                    pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
+                    radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
+                    pair_for_linear = pair * radial if radial is not None and bool(self.front) else pair
+                    raw_tensors.append(module.fc(pair_for_linear).contiguous())
 
             if epilogue_schedule == "output_major":
                 entry_offsets, entry_m, entry_channel, entry_d, entry_l = (

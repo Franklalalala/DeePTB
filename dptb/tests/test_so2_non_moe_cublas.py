@@ -224,15 +224,21 @@ def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
 
 
 @pytest.mark.parametrize(
-    ("mode", "epilogue_schedule"),
+    ("mode", "epilogue_schedule", "gemm_layout"),
     [
-        ("indexed_sandwich_cuda", None),
-        ("indexed_sandwich_cuda_multi", None),
-        ("indexed_sandwich_cuda_multi", "output_major"),
-        ("indexed_sandwich_cuda_multi", "per_m"),
+        ("indexed_sandwich_cuda", None, None),
+        ("indexed_sandwich_cuda_multi", None, None),
+        ("indexed_sandwich_cuda_multi", "output_major", None),
+        ("indexed_sandwich_cuda_multi", "per_m", None),
+        ("indexed_sandwich_cuda_multi", "output_major", "grouped_raw"),
     ],
 )
-def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(monkeypatch, mode, epilogue_schedule):
+def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(
+    monkeypatch,
+    mode,
+    epilogue_schedule,
+    gemm_layout,
+):
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
@@ -242,6 +248,8 @@ def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(mon
 
     if epilogue_schedule is not None:
         monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", epilogue_schedule)
+    if gemm_layout is not None:
+        monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", gemm_layout)
 
     torch.manual_seed(20260523)
     kwargs = dict(
@@ -632,6 +640,41 @@ def test_non_moe_so2_indexed_sandwich_cuda_multi_epilogue_prefers_dptb_env(monke
     )
 
     assert layer._indexed_sandwich_cuda_multi_epilogue_schedule() == "per_m"
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_accepts_so2_gemm_strategy_alias(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.delenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", raising=False)
+    monkeypatch.delenv("SO2_CUDA_GEMM_LAYOUT", raising=False)
+    monkeypatch.setenv("SO2_CUDA_GEMM_STRATEGY", "grouped_raw")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_gemm_layout() == "grouped_raw"
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_gemm_prefers_dptb_env(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv("SO2_CUDA_GEMM_STRATEGY", "grouped_raw")
+    monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", "raw")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_gemm_layout() == "raw"
 
 
 def test_non_moe_so2_materialized_shape_gate_accepts_so2_env_alias(monkeypatch):

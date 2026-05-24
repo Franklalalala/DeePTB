@@ -92,7 +92,15 @@ def _parse_variant(spec: str) -> Variant:
     if name == "indexed_sandwich_cuda_multi":
         schedule = option or "output_major"
         layout = "raw"
-        if len(parts) > 2 and parts[2] in ("raw", "block", "block_complex", "fairchem_block"):
+        if len(parts) > 2 and parts[2] in (
+            "raw",
+            "grouped_raw",
+            "cublas_grouped",
+            "grouped_gemm",
+            "block",
+            "block_complex",
+            "fairchem_block",
+        ):
             layout = parts[2]
             wigner = parts[3] if len(parts) > 3 else "auto"
         return Variant(
