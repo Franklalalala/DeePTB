@@ -569,6 +569,18 @@ class SO2_Linear(torch.nn.Module):
         except (TypeError, ValueError):
             return int(default)
 
+    @staticmethod
+    def _int_env_any(names, default):
+        for name in names:
+            value = os.environ.get(name)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return int(default)
+        return int(default)
+
     def _use_indexed_sandwich_cuda_path(self, x):
         if self.so2_m_linear_mode not in ("indexed_sandwich_cuda", "indexed_sandwich_cuda_multi"):
             return False
@@ -576,8 +588,12 @@ class SO2_Linear(torch.nn.Module):
             return False
         if self.irreps_out.lmax < 1:
             return False
-        min_edges = self._int_env("DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES", 0)
-        max_edges = self._int_env("DPTB_SO2_INDEXED_SANDWICH_CUDA_MAX_EDGES", 0)
+        min_edges = self._int_env_any(
+            ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES", "SO2_CUDA_MIN_EDGES"), 0
+        )
+        max_edges = self._int_env_any(
+            ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MAX_EDGES", "SO2_CUDA_MAX_EDGES"), 0
+        )
         if min_edges > 0 and int(x.shape[0]) < min_edges:
             return False
         if max_edges > 0 and int(x.shape[0]) > max_edges:
@@ -608,8 +624,12 @@ class SO2_Linear(torch.nn.Module):
             return False
         if self.radial_emb and not bool(self.front):
             return False
-        min_edges = self._int_env("DPTB_SO2_MATERIALIZED_MIN_EDGES", 0)
-        max_edges = self._int_env("DPTB_SO2_MATERIALIZED_MAX_EDGES", 0)
+        min_edges = self._int_env_any(
+            ("DPTB_SO2_MATERIALIZED_MIN_EDGES", "SO2_CUDA_MATERIALIZED_MIN_EDGES"), 0
+        )
+        max_edges = self._int_env_any(
+            ("DPTB_SO2_MATERIALIZED_MAX_EDGES", "SO2_CUDA_MATERIALIZED_MAX_EDGES"), 0
+        )
         if min_edges > 0 and int(x.shape[0]) < min_edges:
             return False
         if max_edges > 0 and int(x.shape[0]) > max_edges:
@@ -623,8 +643,20 @@ class SO2_Linear(torch.nn.Module):
             return False
         if self.irreps_out.lmax < 1:
             return False
-        min_edges = self._int_env("DPTB_SO2_MATERIALIZED_SCHEDULED_MIN_EDGES", 0)
-        max_edges = self._int_env("DPTB_SO2_MATERIALIZED_SCHEDULED_MAX_EDGES", 0)
+        min_edges = self._int_env_any(
+            (
+                "DPTB_SO2_MATERIALIZED_SCHEDULED_MIN_EDGES",
+                "SO2_CUDA_MATERIALIZED_MIN_EDGES",
+            ),
+            0,
+        )
+        max_edges = self._int_env_any(
+            (
+                "DPTB_SO2_MATERIALIZED_SCHEDULED_MAX_EDGES",
+                "SO2_CUDA_MATERIALIZED_MAX_EDGES",
+            ),
+            0,
+        )
         if min_edges > 0 and int(x.shape[0]) < min_edges:
             return False
         if max_edges > 0 and int(x.shape[0]) > max_edges:

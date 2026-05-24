@@ -1,6 +1,13 @@
 import pytest
 
 
+class _FakeCudaInput:
+    def __init__(self, torch, rows, dim):
+        self.device = type("Device", (), {"type": "cuda"})()
+        self.dtype = torch.float32
+        self.shape = (rows, dim)
+
+
 def test_non_moe_so2_indexed_sandwich_multi_matches_standard_forward_backward():
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
@@ -525,7 +532,7 @@ def test_non_moe_so2_materialized_scheduled_block_dense_strategy_matches_standar
 
 
 def test_non_moe_so2_indexed_sandwich_cuda_shape_gate_falls_back(monkeypatch):
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
 
     from dptb.nn.tensor_product import SO2_Linear
@@ -538,4 +545,55 @@ def test_non_moe_so2_indexed_sandwich_cuda_shape_gate_falls_back(monkeypatch):
     )
 
     assert layer.so2_m_linear_mode == "indexed_sandwich_cuda"
-    assert not layer._use_indexed_sandwich_cuda_path(__import__("torch").zeros(4, layer.irreps_in.dim))
+    assert not layer._use_indexed_sandwich_cuda_path(_FakeCudaInput(torch, 4, layer.irreps_in.dim))
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_shape_gate_accepts_so2_env_alias(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.delenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES", raising=False)
+    monkeypatch.setenv("SO2_CUDA_MIN_EDGES", "999999")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda",
+    )
+
+    assert not layer._use_indexed_sandwich_cuda_path(_FakeCudaInput(torch, 4, layer.irreps_in.dim))
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_shape_gate_prefers_dptb_env(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv("SO2_CUDA_MIN_EDGES", "999999")
+    monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES", "0")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda",
+    )
+
+    assert layer._use_indexed_sandwich_cuda_path(_FakeCudaInput(torch, 4, layer.irreps_in.dim))
+
+
+def test_non_moe_so2_materialized_shape_gate_accepts_so2_env_alias(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.delenv("DPTB_SO2_MATERIALIZED_MIN_EDGES", raising=False)
+    monkeypatch.setenv("SO2_CUDA_MATERIALIZED_MIN_EDGES", "999999")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_materialized",
+    )
+
+    assert not layer._use_indexed_sandwich_materialized_path(_FakeCudaInput(torch, 4, layer.irreps_in.dim))
