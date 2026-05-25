@@ -589,6 +589,15 @@ class SO2_Linear(torch.nn.Module):
                 return str(value)
         return str(default)
 
+    @staticmethod
+    def _bool_env_any(names, default):
+        false_values = {"", "0", "false", "False", "FALSE", "off", "OFF", "no", "No"}
+        for name in names:
+            value = os.environ.get(name)
+            if value is not None:
+                return value not in false_values
+        return bool(default)
+
     def _indexed_sandwich_cuda_multi_epilogue_schedule(self):
         return self._str_env_any(
             (
@@ -1560,7 +1569,14 @@ class SO2_Linear(torch.nn.Module):
                     )
                 if m0_fused_payload is not None:
                     y_m0, m0_out_base, m0_out_l, m0_offsets = m0_fused_payload
-                    if out_base_all is not None and out_l_all is not None and cout_values is not None:
+                    use_flat_backward = self._bool_env_any(
+                        (
+                            "DPTB_SO2_INDEXED_SANDWICH_CUDA_FLAT_BACKWARD",
+                            "SO2_CUDA_FLAT_BACKWARD",
+                        ),
+                        True,
+                    )
+                    if use_flat_backward and out_base_all is not None and out_l_all is not None and cout_values is not None:
                         contribution = _ScatterM0RawPairsMultiOutputMajorFlatFunction.apply(
                             y_m0,
                             wigner,
