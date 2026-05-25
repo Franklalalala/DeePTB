@@ -624,6 +624,13 @@ class SO2_Linear(torch.nn.Module):
             "raw_output_major_v3_pack_v2_m0_cuda": "raw_pack_v2_m0_cuda",
             "pack_v2_m0_cuda": "raw_pack_v2_m0_cuda",
             "m0_cuda_pack_v2": "raw_pack_v2_m0_cuda",
+            "raw_pack_v2_m0_cuda_grouped_v2": "raw_pack_v2_m0_cuda_grouped_v2",
+            "pack_v2_m0_cuda_grouped_v2": "raw_pack_v2_m0_cuda_grouped_v2",
+            "m0_cuda_grouped_v2": "raw_pack_v2_m0_cuda_grouped_v2",
+            "raw_pack_v2_m0_cuda_fused": "raw_pack_v2_m0_cuda_fused",
+            "pack_v2_m0_cuda_fused": "raw_pack_v2_m0_cuda_fused",
+            "m0_cuda_fused": "raw_pack_v2_m0_cuda_fused",
+            "raw_pack_v2_m0_cuda_v3": "raw_pack_v2_m0_cuda_fused",
         }
         return aliases.get(value, value)
 
@@ -637,6 +644,10 @@ class SO2_Linear(torch.nn.Module):
             return "raw_output_major_v3_pack_v2"
         if layout == "raw_pack_v2_m0_cuda":
             return "raw_output_major_v3_pack_v2_m0_cuda"
+        if layout == "raw_pack_v2_m0_cuda_grouped_v2":
+            return "raw_output_major_v4_pack_v2_m0_cuda_grouped"
+        if layout == "raw_pack_v2_m0_cuda_fused":
+            return "raw_output_major_v5_pack_v2_m0_fused_epilogue"
         if layout == "raw":
             return "raw_output_major_v1"
         return layout
@@ -1177,6 +1188,7 @@ class SO2_Linear(torch.nn.Module):
                 _PackPairsMultiFunction,
                 _PackPairsMultiDescFunction,
                 _ScatterRawPairOutputFunction,
+                _ScatterM0RawPairsMultiOutputMajorFunction,
                 _ScatterM0OutputFunction,
                 _ScatterPairOutputFunction,
                 _ScatterPairsMultiOutputMajorFunction,
@@ -1196,10 +1208,33 @@ class SO2_Linear(torch.nn.Module):
 
             n, _ = x.shape
             gemm_layout = self._indexed_sandwich_cuda_multi_gemm_layout()
+            epilogue_schedule = self._indexed_sandwich_cuda_multi_epilogue_schedule()
+            use_pack_v2 = gemm_layout in (
+                "raw_pack_v2",
+                "raw_pack_v2_m0_cuda",
+                "raw_pack_v2_m0_cuda_grouped_v2",
+                "raw_pack_v2_m0_cuda_fused",
+            )
+            use_m0_cuda = gemm_layout in (
+                "raw_pack_v2_m0_cuda",
+                "raw_pack_v2_m0_cuda_grouped_v2",
+                "raw_pack_v2_m0_cuda_fused",
+            )
+            use_m0_accumulate_inplace = gemm_layout in (
+                "raw_pack_v2_m0_cuda_grouped_v2",
+            )
+            use_m0_epilogue_fused = gemm_layout == "raw_pack_v2_m0_cuda_fused" and epilogue_schedule == "output_major"
+            use_grouped_raw_linear = gemm_layout in (
+                "grouped_raw",
+                "grouped_raw_v2",
+                "cublas_grouped",
+                "grouped_gemm",
+                "raw_pack_v2_m0_cuda_grouped_v2",
+            )
 
             def _run_m0_path():
                 radial_weight = weights[:, self.m_in_index[0]:self.m_in_index[1]].unsqueeze(1) if self.radial_emb else None
-                if gemm_layout == "raw_pack_v2_m0_cuda":
+                if use_m0_cuda:
                     in_base, in_l, out_base, out_l, m0_offsets = self._indexed_sandwich_cuda_pair_maps(0, x.device)
                     if (
                         isinstance(self.fc_m0, nn.Linear)
@@ -1224,6 +1259,13 @@ class SO2_Linear(torch.nn.Module):
                             y_m0 = self.fc_m0(inp) * radial_flat
                         else:
                             y_m0 = self.fc_m0(inp)
+                        if use_m0_epilogue_fused:
+                            return (
+                                y_m0.contiguous(),
+                                out_base,
+                                out_l,
+                                m0_offsets,
+                            )
                         return _ScatterM0OutputFunction.apply(
                             y_m0.contiguous(),
                             wigner,
@@ -1257,7 +1299,9 @@ class SO2_Linear(torch.nn.Module):
                 self._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
                 return self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
 
-            out = record_cuda_span("so2.forward.m0_path", x, _run_m0_path)
+            m0_result = record_cuda_span("so2.forward.m0_path", x, _run_m0_path)
+            m0_fused_payload = m0_result if isinstance(m0_result, tuple) else None
+            out = None if m0_fused_payload is not None else m0_result
 
             metadata = record_host_span(
                 "so2.host.metadata",
@@ -1282,9 +1326,29 @@ class SO2_Linear(torch.nn.Module):
             ) = metadata
 
             if not m_values_host:
+                if m0_fused_payload is not None:
+                    y_m0, out_base, out_l, m0_offsets = m0_fused_payload
+                    out = _ScatterM0OutputFunction.apply(
+                        y_m0,
+                        wigner,
+                        out_base,
+                        out_l,
+                        m0_offsets,
+                        compact_offsets,
+                        int(self.irreps_out.dim),
+                        bool(self.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                    )
                 return _finish_profile((out.contiguous(), wigner_D_all))
-            epilogue_schedule = self._indexed_sandwich_cuda_multi_epilogue_schedule()
-            use_call_plan = gemm_layout in ("raw_cached", "grouped_raw_v2", "raw_pack_v2", "raw_pack_v2_m0_cuda")
+            use_call_plan = gemm_layout in (
+                "raw_cached",
+                "grouped_raw_v2",
+                "raw_pack_v2",
+                "raw_pack_v2_m0_cuda",
+                "raw_pack_v2_m0_cuda_grouped_v2",
+                "raw_pack_v2_m0_cuda_fused",
+            )
             call_plan = None
             if use_call_plan:
                 call_plan = record_host_span(
@@ -1321,7 +1385,7 @@ class SO2_Linear(torch.nn.Module):
                 pack_desc = None
                 in_base_all = None
                 in_l_all = None
-            if gemm_layout in ("raw_pack_v2", "raw_pack_v2_m0_cuda") and pack_desc is not None:
+            if use_pack_v2 and pack_desc is not None:
                 packed_all = _PackPairsMultiDescFunction.apply(
                     x.contiguous(),
                     wigner,
@@ -1438,12 +1502,12 @@ class SO2_Linear(torch.nn.Module):
                 return _finish_profile(((out + contribution).contiguous(), wigner_D_all))
 
             raw_tensors = []
-            if gemm_layout in ("grouped_raw", "grouped_raw_v2", "cublas_grouped", "grouped_gemm"):
+            if use_grouped_raw_linear:
                 from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
 
                 pair_inputs = []
                 raw_weights = []
-                if gemm_layout == "grouped_raw_v2" and call_plan is not None:
+                if gemm_layout in ("grouped_raw_v2", "raw_pack_v2_m0_cuda_grouped_v2") and call_plan is not None:
                     ptr = self._indexed_sandwich_cuda_multi_raw_row_ptr(call_plan, n, rows_per_edge=2)
                 else:
                     ptr = torch.tensor([0, int(2 * n)], dtype=torch.long, device="cpu")
@@ -1484,26 +1548,52 @@ class SO2_Linear(torch.nn.Module):
                             _multi_output_entry_map,
                         )
                     )
-                contribution = _ScatterRawPairsMultiOutputMajorFunction.apply(
-                    wigner,
-                    offsets,
-                    compact_offsets,
-                    cout_prefix_t,
-                    m_values_t,
-                    entry_offsets,
-                    entry_m,
-                    entry_channel,
-                    entry_d,
-                    entry_l,
-                    int(self.irreps_out.dim),
-                    bool(self.rotate_out),
-                    int(wigner_mode),
-                    int(wigner_stride),
-                    len(raw_tensors),
-                    *raw_tensors,
-                    *out_bases,
-                    *out_ls,
-                )
+                if m0_fused_payload is not None:
+                    y_m0, m0_out_base, m0_out_l, m0_offsets = m0_fused_payload
+                    contribution = _ScatterM0RawPairsMultiOutputMajorFunction.apply(
+                        y_m0,
+                        wigner,
+                        m0_out_base,
+                        m0_out_l,
+                        m0_offsets,
+                        compact_offsets,
+                        cout_prefix_t,
+                        m_values_t,
+                        entry_offsets,
+                        entry_m,
+                        entry_channel,
+                        entry_d,
+                        entry_l,
+                        int(self.irreps_out.dim),
+                        bool(self.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                        len(raw_tensors),
+                        *raw_tensors,
+                        *out_bases,
+                        *out_ls,
+                    )
+                else:
+                    contribution = _ScatterRawPairsMultiOutputMajorFunction.apply(
+                        wigner,
+                        offsets,
+                        compact_offsets,
+                        cout_prefix_t,
+                        m_values_t,
+                        entry_offsets,
+                        entry_m,
+                        entry_channel,
+                        entry_d,
+                        entry_l,
+                        int(self.irreps_out.dim),
+                        bool(self.rotate_out),
+                        int(wigner_mode),
+                        int(wigner_stride),
+                        len(raw_tensors),
+                        *raw_tensors,
+                        *out_bases,
+                        *out_ls,
+                    )
             elif epilogue_schedule == "per_m":
                 contribution = None
                 for raw, m, out_base, out_l in zip(raw_tensors, m_values_host, out_bases, out_ls):
@@ -1537,6 +1627,11 @@ class SO2_Linear(torch.nn.Module):
                     *out_bases,
                     *out_ls,
                 )
+            if m0_fused_payload is not None and epilogue_schedule == "output_major":
+                return _finish_profile((contribution.contiguous(), wigner_D_all))
+            if use_m0_accumulate_inplace and epilogue_schedule == "output_major":
+                contribution.add_(out)
+                return _finish_profile((contribution.contiguous(), wigner_D_all))
             return _finish_profile(((out + contribution).contiguous(), wigner_D_all))
         except Exception:
             _finish_profile(None)

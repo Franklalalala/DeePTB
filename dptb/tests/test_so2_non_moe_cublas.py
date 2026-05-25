@@ -235,6 +235,8 @@ def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
         ("indexed_sandwich_cuda_multi", "output_major", "grouped_raw_v2"),
         ("indexed_sandwich_cuda_multi", "output_major", "raw_pack_v2"),
         ("indexed_sandwich_cuda_multi", "output_major", "raw_pack_v2_m0_cuda"),
+        ("indexed_sandwich_cuda_multi", "output_major", "raw_pack_v2_m0_cuda_grouped_v2"),
+        ("indexed_sandwich_cuda_multi", "output_major", "raw_pack_v2_m0_cuda_fused"),
         ("indexed_sandwich_cuda_multi", "output_major", "block_direct"),
     ],
 )
@@ -300,6 +302,10 @@ def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(
         ("raw_output_major_v3_pack", "raw_pack_v2", "raw_output_major_v3_pack_v2"),
         ("raw_pack_v2_m0_cuda", "raw_pack_v2_m0_cuda", "raw_output_major_v3_pack_v2_m0_cuda"),
         ("pack_v2_m0_cuda", "raw_pack_v2_m0_cuda", "raw_output_major_v3_pack_v2_m0_cuda"),
+        ("raw_pack_v2_m0_cuda_grouped_v2", "raw_pack_v2_m0_cuda_grouped_v2", "raw_output_major_v4_pack_v2_m0_cuda_grouped"),
+        ("m0_cuda_grouped_v2", "raw_pack_v2_m0_cuda_grouped_v2", "raw_output_major_v4_pack_v2_m0_cuda_grouped"),
+        ("raw_pack_v2_m0_cuda_fused", "raw_pack_v2_m0_cuda_fused", "raw_output_major_v5_pack_v2_m0_fused_epilogue"),
+        ("m0_cuda_fused", "raw_pack_v2_m0_cuda_fused", "raw_output_major_v5_pack_v2_m0_fused_epilogue"),
     ],
 )
 def test_non_moe_so2_cuda_multi_accepts_pack_v2_layout_aliases(monkeypatch, env_value, layout, tag):
@@ -325,6 +331,8 @@ def test_non_moe_so2_cuda_multi_accepts_pack_v2_layout_aliases(monkeypatch, env_
         ("indexed_sandwich_cuda_multi:output_major:raw_pack_v2", "raw_pack_v2"),
         ("indexed_sandwich_cuda_multi:output_major:pack_v2", "raw_pack_v2"),
         ("indexed_sandwich_cuda_multi:output_major:raw_pack_v2_m0_cuda", "raw_pack_v2_m0_cuda"),
+        ("indexed_sandwich_cuda_multi:output_major:raw_pack_v2_m0_cuda_grouped_v2", "raw_pack_v2_m0_cuda_grouped_v2"),
+        ("indexed_sandwich_cuda_multi:output_major:raw_pack_v2_m0_cuda_fused", "raw_pack_v2_m0_cuda_fused"),
     ],
 )
 def test_bench_so2_variant_parser_accepts_pack_v2_layouts(spec, layout):
