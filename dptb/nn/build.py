@@ -7,7 +7,6 @@ import torch.nn as nn
 from dptb.utils.tools import j_must_have, j_loader
 from dptb.data import AtomicDataDict
 from dptb.data.AtomicDataDict import with_edge_vectors
-from dptb.nnops.ddp_utils import checkpoint_load_barrier, maybe_stagger_checkpoint_load
 import copy
 import random
 import numpy as np
@@ -375,9 +374,7 @@ def build_model(
         if checkpoint.split(".")[-1] == "json":
             ckptconfig = j_loader(checkpoint)
         else:
-            maybe_stagger_checkpoint_load("build_model", checkpoint)
             f = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            checkpoint_load_barrier("build_model")
             ckptconfig = f['config']
             ckpt_state_dict = f.get("model_state_dict", None)
             del f

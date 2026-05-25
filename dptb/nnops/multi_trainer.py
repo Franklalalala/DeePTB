@@ -21,11 +21,7 @@ from dptb.data import AtomicDataset, AtomicData, DataLoader
 from dptb.data import _keys
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nnops.trainer import Trainer
-from dptb.nnops.ddp_utils import (
-    checkpoint_load_barrier,
-    maybe_stagger_checkpoint_load,
-    merge_restart_train_options,
-)
+from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.nnops.expert_parallel_layout import (
     rank_to_expert_parallel,
     resolve_expert_parallel_layout,
@@ -3202,9 +3198,7 @@ class MultiTrainer(Trainer):
         map_loc = "cpu" if distributed_expert else (
             common_options["device"] if len(common_options) > 0 and "device" in common_options else "cpu"
         )
-        maybe_stagger_checkpoint_load("trainer_restart", checkpoint)
         ckpt = torch.load(checkpoint, map_location=map_loc, weights_only=False)
-        checkpoint_load_barrier("trainer_restart")
 
         ckpt_train_options = copy.deepcopy(ckpt["config"].get("train_options", {}))
         merged_train_options = merge_restart_train_options(

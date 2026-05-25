@@ -269,38 +269,6 @@ class Saver(Plugin):
         )
         self._barrier_on_current_device()
 
-    def _post_save_cooldown(self, name):
-        sleep_sec = max(0.0, _env_float("DPTB_SAVER_POST_SAVE_SLEEP_SEC", 0.0))
-        if sleep_sec <= 0.0:
-            return
-
-        device = self._trainer_cuda_device()
-        if device is not None:
-            try:
-                torch.cuda.synchronize(device)
-            except Exception:
-                pass
-
-        with self._profile_stage("post_save_cooldown_pre_barrier"):
-            self._barrier_on_current_device()
-
-        log.info(
-            "[SaverCooldown][rank=%s] checkpoint %s sleep %.1fs before training resumes",
-            self._rank(),
-            name,
-            sleep_sec,
-        )
-        self._profile_record("post_save_sleep_start", sleep_sec=sleep_sec)
-        time.sleep(sleep_sec)
-        self._profile_record("post_save_sleep_end", sleep_sec=sleep_sec)
-
-        if device is not None:
-            try:
-                torch.cuda.synchronize(device)
-            except Exception:
-                pass
-        self._barrier_on_current_device()
-
     def _to_cpu_obj(self, obj):
         if torch.is_tensor(obj):
             return obj.detach().cpu()
@@ -681,7 +649,6 @@ class Saver(Plugin):
             with self._profile_stage("post_save_barrier"):
                 dist.barrier()
             self._profile_record("save_end")
-            self._post_save_cooldown(name)
             self._profile_save_name = previous_profile_save_name
             return
 
@@ -724,5 +691,4 @@ class Saver(Plugin):
         )
         log.info(msg="checkpoint saved as {}".format(name))
         self._profile_record("save_end")
-        self._post_save_cooldown(name)
         self._profile_save_name = previous_profile_save_name
