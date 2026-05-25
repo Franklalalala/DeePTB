@@ -8,6 +8,16 @@ import torch.distributed as dist
 
 log = logging.getLogger(__name__)
 
+# codex checkpoint pressure controls, 2026-05-25.
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+def _env_flag(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_ENV_VALUES
+
+
 
 class Saver(Plugin):
     def __init__(self, interval=None):
@@ -17,6 +27,8 @@ class Saver(Plugin):
         self.best_loss = 1e7
         self.best_quene = []
         self.latest_quene = []
+        self._last_iteration_checkpoint_name = None
+        self._last_iteration_checkpoint_iter = None
 
     def register(self, trainer, checkpoint_path):
         self.checkpoint_path = checkpoint_path
@@ -92,6 +104,8 @@ class Saver(Plugin):
             return None, None
 
     def _clear_cuda_cache_after_iteration_save(self, name):
+        if not _env_flag("DPTB_SAVER_CLEAR_CUDA_CACHE_AFTER_ITER_SAVE", False):
+            return
         device = self._trainer_cuda_device()
         if device is None:
             return
@@ -157,13 +171,24 @@ class Saver(Plugin):
         local_opt_state = self._to_cpu_obj(local_opt.state_dict()) if local_opt is not None else None
         local_sch_state = self._to_cpu_obj(local_sch.state_dict()) if local_sch is not None else None
 
-        expert_states = [None for _ in range(self.trainer.world_size)]
-        opt_states = [None for _ in range(self.trainer.world_size)]
-        sch_states = [None for _ in range(self.trainer.world_size)]
+        if _env_flag("DPTB_SAVER_GATHER_TO_MAIN_ONLY", True):
+            expert_states = [None for _ in range(self.trainer.world_size)] if self._is_main() else None
+            opt_states = [None for _ in range(self.trainer.world_size)] if self._is_main() else None
+            sch_states = [None for _ in range(self.trainer.world_size)] if self._is_main() else None
 
-        dist.all_gather_object(expert_states, local_expert_state)
-        dist.all_gather_object(opt_states, local_opt_state)
-        dist.all_gather_object(sch_states, local_sch_state)
+            dist.gather_object(local_expert_state, object_gather_list=expert_states, dst=0)
+            dist.gather_object(local_opt_state, object_gather_list=opt_states, dst=0)
+            dist.gather_object(local_sch_state, object_gather_list=sch_states, dst=0)
+            if not self._is_main():
+                return None, None, None
+        else:
+            expert_states = [None for _ in range(self.trainer.world_size)]
+            opt_states = [None for _ in range(self.trainer.world_size)]
+            sch_states = [None for _ in range(self.trainer.world_size)]
+
+            dist.all_gather_object(expert_states, local_expert_state)
+            dist.all_gather_object(opt_states, local_opt_state)
+            dist.all_gather_object(sch_states, local_sch_state)
 
         dp_size = int(getattr(self.trainer, "expert_data_parallel_size", 1))
         num_experts = int(getattr(self.trainer, "num_experts", len(expert_states)))
@@ -240,6 +265,9 @@ class Saver(Plugin):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
                 self._safe_link_or_copy(latest_ckpt_abs_path, latest_symlink)
 
+        self._last_iteration_checkpoint_name = name
+        self._last_iteration_checkpoint_iter = self.trainer.iter
+
         self._clear_cuda_cache_after_iteration_save(name)
 
     def epoch(self, **kwargs):
@@ -260,13 +288,38 @@ class Saver(Plugin):
             if len(self.best_quene) > max_ckpt:
                 delete_name = self.best_quene.pop(0)
 
-            self._save(
-                name=name,
-                model=self.trainer.model,
-                model_options=self.trainer.model.model_options,
-                common_options=self.trainer.common_options,
-                train_options=self.trainer.train_options,
-            )
+            reused_iter_checkpoint = False
+            if (
+                _env_flag("DPTB_SAVER_REUSE_ITER_CKPT_FOR_EPOCH_BEST", True)
+                and self._last_iteration_checkpoint_name is not None
+                and self._last_iteration_checkpoint_iter == self.trainer.iter
+            ):
+                iter_ckpt = os.path.join(self.checkpoint_path, self._last_iteration_checkpoint_name + ".pth")
+                epoch_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
+                reuse_decision = [False]
+                if self._is_main() and os.path.exists(iter_ckpt):
+                    if os.path.lexists(epoch_ckpt):
+                        os.unlink(epoch_ckpt)
+                    self._safe_link_or_copy(os.path.abspath(iter_ckpt), epoch_ckpt)
+                    log.info(
+                        "checkpoint %s reused from same-iteration checkpoint %s",
+                        name,
+                        self._last_iteration_checkpoint_name,
+                    )
+                    reuse_decision[0] = True
+                if dist.is_available() and dist.is_initialized():
+                    dist.broadcast_object_list(reuse_decision, src=0)
+                reused_iter_checkpoint = bool(reuse_decision[0])
+                self._barrier_on_current_device()
+
+            if not reused_iter_checkpoint:
+                self._save(
+                    name=name,
+                    model=self.trainer.model,
+                    model_options=self.trainer.model.model_options,
+                    common_options=self.trainer.common_options,
+                    train_options=self.trainer.train_options,
+                )
 
             self.best_loss = updated_loss
 
@@ -285,6 +338,12 @@ class Saver(Plugin):
                     raise FileNotFoundError(f"Source file {best_ckpt_abs_path} does not exist.")
                 self._safe_link_or_copy(best_ckpt_abs_path, best_symlink)
 
+                if _env_flag("DPTB_SAVER_EPOCH_UPDATES_LATEST", True):
+                    latest_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".latest.pth")
+                    if os.path.lexists(latest_symlink):
+                        os.unlink(latest_symlink)
+                    self._safe_link_or_copy(best_ckpt_abs_path, latest_symlink)
+
     def _save(self, name, model, model_options, common_options, train_options):
         obj = {}
         obj.update({"config": {"model_options": model_options, "common_options": common_options,
@@ -292,19 +351,20 @@ class Saver(Plugin):
 
         if self._is_dist_expert():
             expert_states, opt_states, sch_states = self._gather_dist_states()
-            full_model_state = self._assemble_full_model_state(expert_states)
-
-            obj.update({
-                "model_state_dict": full_model_state,
-                "task": self.trainer.task,
-                "epoch": self.trainer.ep,
-                "iteration": self.trainer.iter,
-                "stats": self.trainer.stats,
-                "optimizers_state_dict": opt_states,
-                "lr_schedulers_state_dict": sch_states,
-            })
 
             if self._is_main():
+                full_model_state = self._assemble_full_model_state(expert_states)
+
+                obj.update({
+                    "model_state_dict": full_model_state,
+                    "task": self.trainer.task,
+                    "epoch": self.trainer.ep,
+                    "iteration": self.trainer.iter,
+                    "stats": self.trainer.stats,
+                    "optimizers_state_dict": opt_states,
+                    "lr_schedulers_state_dict": sch_states,
+                })
+
                 f_path = os.path.join(self.checkpoint_path, name + ".pth")
                 torch.save(obj, f=f_path)
                 log.info(msg="checkpoint saved as {}".format(name))
