@@ -1016,6 +1016,7 @@ class SO2_Linear(torch.nn.Module):
             "offsets": offsets,
             "cin_prefix": tuple(int(v) for v in cin_prefix),
             "cout_prefix": tuple(int(v) for v in cout_prefix),
+            "cout_values": tuple(int(v) for v in _cout_values),
             "raw_row_ptr_by_n": {},
             "output_entry_map": None,
         }
@@ -1031,6 +1032,8 @@ class SO2_Linear(torch.nn.Module):
         plan["pack_desc"] = pack_desc.contiguous()
         plan["in_base_all"] = torch.cat(tuple(t.contiguous() for t in plan["in_bases"]), dim=0).contiguous()
         plan["in_l_all"] = torch.cat(tuple(t.contiguous() for t in plan["in_ls"]), dim=0).contiguous()
+        plan["out_base_all"] = torch.cat(tuple(t.contiguous() for t in plan["out_bases"]), dim=0).contiguous()
+        plan["out_l_all"] = torch.cat(tuple(t.contiguous() for t in plan["out_ls"]), dim=0).contiguous()
         plan["m0_maps"] = self._indexed_sandwich_cuda_pair_maps(0, device)
         if epilogue_schedule == "output_major":
             plan["output_entry_map"] = self._indexed_sandwich_cuda_multi_output_entry_map(
@@ -1189,6 +1192,7 @@ class SO2_Linear(torch.nn.Module):
                 _PackPairsMultiDescFunction,
                 _ScatterRawPairOutputFunction,
                 _ScatterM0RawPairsMultiOutputMajorFunction,
+                _ScatterM0RawPairsMultiOutputMajorFlatFunction,
                 _ScatterM0OutputFunction,
                 _ScatterPairOutputFunction,
                 _ScatterPairsMultiOutputMajorFunction,
@@ -1375,6 +1379,9 @@ class SO2_Linear(torch.nn.Module):
                 pack_desc = call_plan.get("pack_desc")
                 in_base_all = call_plan.get("in_base_all")
                 in_l_all = call_plan.get("in_l_all")
+                out_base_all = call_plan.get("out_base_all")
+                out_l_all = call_plan.get("out_l_all")
+                cout_values = call_plan.get("cout_values")
             else:
                 m_values_host = list(m_values_host)
                 in_bases = list(in_bases)
@@ -1385,6 +1392,9 @@ class SO2_Linear(torch.nn.Module):
                 pack_desc = None
                 in_base_all = None
                 in_l_all = None
+                out_base_all = None
+                out_l_all = None
+                cout_values = None
             if use_pack_v2 and pack_desc is not None:
                 packed_all = _PackPairsMultiDescFunction.apply(
                     x.contiguous(),
@@ -1550,29 +1560,55 @@ class SO2_Linear(torch.nn.Module):
                     )
                 if m0_fused_payload is not None:
                     y_m0, m0_out_base, m0_out_l, m0_offsets = m0_fused_payload
-                    contribution = _ScatterM0RawPairsMultiOutputMajorFunction.apply(
-                        y_m0,
-                        wigner,
-                        m0_out_base,
-                        m0_out_l,
-                        m0_offsets,
-                        compact_offsets,
-                        cout_prefix_t,
-                        m_values_t,
-                        entry_offsets,
-                        entry_m,
-                        entry_channel,
-                        entry_d,
-                        entry_l,
-                        int(self.irreps_out.dim),
-                        bool(self.rotate_out),
-                        int(wigner_mode),
-                        int(wigner_stride),
-                        len(raw_tensors),
-                        *raw_tensors,
-                        *out_bases,
-                        *out_ls,
-                    )
+                    if out_base_all is not None and out_l_all is not None and cout_values is not None:
+                        contribution = _ScatterM0RawPairsMultiOutputMajorFlatFunction.apply(
+                            y_m0,
+                            wigner,
+                            m0_out_base,
+                            m0_out_l,
+                            m0_offsets,
+                            compact_offsets,
+                            cout_prefix_t,
+                            m_values_t,
+                            out_base_all,
+                            out_l_all,
+                            entry_offsets,
+                            entry_m,
+                            entry_channel,
+                            entry_d,
+                            entry_l,
+                            int(self.irreps_out.dim),
+                            bool(self.rotate_out),
+                            int(wigner_mode),
+                            int(wigner_stride),
+                            len(raw_tensors),
+                            tuple(int(v) for v in cout_values),
+                            *raw_tensors,
+                        )
+                    else:
+                        contribution = _ScatterM0RawPairsMultiOutputMajorFunction.apply(
+                            y_m0,
+                            wigner,
+                            m0_out_base,
+                            m0_out_l,
+                            m0_offsets,
+                            compact_offsets,
+                            cout_prefix_t,
+                            m_values_t,
+                            entry_offsets,
+                            entry_m,
+                            entry_channel,
+                            entry_d,
+                            entry_l,
+                            int(self.irreps_out.dim),
+                            bool(self.rotate_out),
+                            int(wigner_mode),
+                            int(wigner_stride),
+                            len(raw_tensors),
+                            *raw_tensors,
+                            *out_bases,
+                            *out_ls,
+                        )
                 else:
                     contribution = _ScatterRawPairsMultiOutputMajorFunction.apply(
                         wigner,
