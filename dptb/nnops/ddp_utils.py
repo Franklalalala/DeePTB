@@ -1,6 +1,7 @@
 import copy
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -98,6 +99,81 @@ def dist_barrier_on_current_device() -> None:
         except TypeError:
             pass
     dist.barrier()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _checkpoint_load_stagger_interval_sec() -> float:
+    interval = _env_float("DPTB_RESTART_LOAD_STAGGER_SEC", -1.0)
+    if interval < 0.0:
+        interval = _env_float("DPTB_CHECKPOINT_LOAD_STAGGER_SEC", 0.0)
+    return max(0.0, interval)
+
+
+def _current_dist_or_env_rank() -> int:
+    if is_dist_ready():
+        try:
+            return int(dist.get_rank())
+        except Exception:
+            pass
+    for key in ("RANK", "LOCAL_RANK"):
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return 0
+
+
+def maybe_stagger_checkpoint_load(label: str, checkpoint: Optional[str] = None) -> None:
+    """Optionally spread restart checkpoint loads across ranks.
+
+    This is an opt-in pressure isolation knob for large DDP restarts. It does
+    not change checkpoint contents or training semantics; it only delays each
+    rank by rank * interval before torch.load.
+    """
+    interval = _checkpoint_load_stagger_interval_sec()
+    if interval <= 0.0:
+        return
+    rank = _current_dist_or_env_rank()
+    delay = max(0.0, rank * interval)
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    log.info(
+        "[CheckpointLoadStagger][rank=%s] %s%s: sleep %.1fs before torch.load",
+        rank,
+        label,
+        f" checkpoint={checkpoint}" if checkpoint else "",
+        delay,
+    )
+    if delay > 0.0:
+        time.sleep(delay)
+
+
+def checkpoint_load_barrier(label: str) -> None:
+    interval = _checkpoint_load_stagger_interval_sec()
+    if interval <= 0.0:
+        return
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    log.info("[CheckpointLoadStagger] %s: barrier after torch.load", label)
+    dist_barrier_on_current_device()
 
 
 def strip_deprecated_train_options(raw_config: Dict[str, Any]) -> Dict[str, Any]:

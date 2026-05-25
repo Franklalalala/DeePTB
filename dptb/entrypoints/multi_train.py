@@ -29,9 +29,11 @@ from dptb.nnops.ddp_utils import (
     derive_rank_log_path,
     dist_barrier_on_current_device,
     destroy_process_group_safely,
+    checkpoint_load_barrier,
     init_process_group_with_device,
     is_dist_ready,
     load_multi_train_config,
+    maybe_stagger_checkpoint_load,
     merge_restart_train_options,
 )
 from dptb.nnops.expert_parallel_layout import (
@@ -344,7 +346,9 @@ def _multi_train_impl(
             if f.split(".")[-1] == "json":
                 assert not restart, "json model can not be used as restart! should be a checkpoint file"
             else:
+                maybe_stagger_checkpoint_load("entry_config_merge", f)
                 f = torch.load(f, map_location="cpu", weights_only=False)
+                checkpoint_load_barrier("entry_config_merge")
                 if jdata.get("model_options", None) is None:
                     jdata["model_options"] = f["config"]["model_options"]
 
