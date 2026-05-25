@@ -34,6 +34,10 @@ DEFAULT_VARIANTS = (
     "indexed_sandwich_multi",
     "indexed_sandwich_cuda_multi:output_major",
     "indexed_sandwich_cuda_multi:per_m",
+    "indexed_sandwich_cuda_multi:output_major:raw_cached",
+    "indexed_sandwich_cuda_multi:output_major:raw_pack_v2",
+    "indexed_sandwich_cuda_multi:output_major:raw_pack_v2_m0_cuda",
+    "indexed_sandwich_cuda_multi:output_major:grouped_raw_v2",
     "materialized:grouped",
     "materialized:block_dense",
     "materialized_scheduled:scheduler",
@@ -92,16 +96,42 @@ def _parse_variant(spec: str) -> Variant:
     if name == "indexed_sandwich_cuda_multi":
         schedule = option or "output_major"
         layout = "raw"
-        if len(parts) > 2 and parts[2] in (
+        layout_aliases = {
+            "raw_output_major_v2_cached": "raw_cached",
+            "output_major_v2_cached": "raw_cached",
+            "v2_cached": "raw_cached",
+            "cached_raw": "raw_cached",
+            "raw_output_major_v2_grouped": "grouped_raw_v2",
+            "output_major_v2_grouped": "grouped_raw_v2",
+            "v2_grouped": "grouped_raw_v2",
+            "grouped_v2": "grouped_raw_v2",
+            "raw_output_major_v3_pack": "raw_pack_v2",
+            "raw_output_major_v3_pack_v2": "raw_pack_v2",
+            "pack_v2": "raw_pack_v2",
+            "desc_pack": "raw_pack_v2",
+            "raw_output_major_v3_pack_m0_cuda": "raw_pack_v2_m0_cuda",
+            "raw_output_major_v3_pack_v2_m0_cuda": "raw_pack_v2_m0_cuda",
+            "pack_v2_m0_cuda": "raw_pack_v2_m0_cuda",
+            "m0_cuda_pack_v2": "raw_pack_v2_m0_cuda",
+        }
+        allowed_layouts = (
             "raw",
+            "raw_cached",
+            "raw_pack_v2",
+            "raw_pack_v2_m0_cuda",
             "grouped_raw",
+            "grouped_raw_v2",
             "cublas_grouped",
             "grouped_gemm",
             "block",
             "block_complex",
+            "block_direct",
+            "direct_block_complex",
+            "compact_block",
             "fairchem_block",
-        ):
-            layout = parts[2]
+        )
+        if len(parts) > 2 and (parts[2] in allowed_layouts or parts[2] in layout_aliases):
+            layout = layout_aliases.get(parts[2], parts[2])
             wigner = parts[3] if len(parts) > 3 else "auto"
         return Variant(
             spec,
@@ -164,6 +194,61 @@ def _set_default_env() -> None:
     os.environ.setdefault("DPTB_SO2_SCHEDULED_SANDWICH_NOSYNC_LAYOUT", "1")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+
+
+def _set_profile_env(enabled: bool, print_every: int) -> None:
+    if not enabled:
+        return
+    os.environ["SO2_CUDA_PROFILE"] = "1"
+    os.environ["DPTB_SO2_PROFILE"] = "1"
+    os.environ["SO2_CUDA_PROFILE_PRINT_EVERY"] = str(int(print_every))
+    os.environ["DPTB_SO2_PROFILE_PRINT_EVERY"] = str(int(print_every))
+
+
+def _reset_so2_profile(enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        from so2_cuda_ops import reset_profile_summary
+    except Exception:
+        return
+    reset_profile_summary()
+
+
+def _take_so2_profile(enabled: bool) -> dict | None:
+    if not enabled:
+        return None
+    try:
+        from so2_cuda_ops import get_profile_summary
+    except Exception as exc:
+        return {"error": repr(exc)}
+    return get_profile_summary(reset=True)
+
+
+def _profiled_so2_cuda_ms(summary: dict | None) -> float | None:
+    if not summary or "error" in summary:
+        return None
+    cuda = summary.get("cuda_ms", {})
+    total = float(cuda.get("so2.forward_total", {}).get("mean", 0.0))
+    for label, row in cuda.items():
+        if label.startswith("so2.backward."):
+            total += float(row.get("mean", 0.0))
+    return total
+
+
+def _non_so2_surrounding_ms(step_ms: float | None, summary: dict | None) -> float | None:
+    if step_ms is None:
+        return None
+    profiled = _profiled_so2_cuda_ms(summary)
+    if profiled is None:
+        return None
+    return max(0.0, float(step_ms) - float(profiled))
+
+
+def _profile_json(summary: dict | None) -> str | None:
+    if summary is None:
+        return None
+    return json.dumps(summary, sort_keys=True)
 
 
 def _reset_variant_env() -> None:
@@ -238,6 +323,8 @@ def main() -> None:
     parser.add_argument("--phase", choices=("train", "forward"), default="train")
     parser.add_argument("--csv", default=None)
     parser.add_argument("--jsonl", default=None)
+    parser.add_argument("--so2-profile", action="store_true")
+    parser.add_argument("--so2-profile-print-every", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260525)
     parser.add_argument("--atol", type=float, default=3e-4)
     parser.add_argument("--rtol", type=float, default=3e-4)
@@ -247,6 +334,7 @@ def main() -> None:
         raise RuntimeError("CUDA is required for the non-MoE SO2 benchmark.")
 
     _set_default_env()
+    _set_profile_env(args.so2_profile, args.so2_profile_print_every)
     variants = _variant_list(args.variants)
     n_values = [int(v) for v in args.n_list.split(",")] if args.n_list else [int(args.n)]
 
@@ -288,7 +376,9 @@ def main() -> None:
                 with torch.no_grad():
                     return _forward_step(ref, x_ref, r, latents_ref, wigner_D_all=wigner_ref)
 
+        _reset_so2_profile(args.so2_profile)
         ref_ms, ref_peak = _cuda_ms(ref_step, args.warmup, args.iters)
+        ref_profile = _take_so2_profile(args.so2_profile)
         ref_row = {
             "n": n,
             "phase": args.phase,
@@ -302,6 +392,9 @@ def main() -> None:
             "correct": True,
             "max_abs": 0.0,
             "env": {},
+            "so2_profile": _profile_json(ref_profile),
+            "so2_profiled_cuda_ms": _profiled_so2_cuda_ms(ref_profile),
+            "non_so2_surrounding_cuda_ms": _non_so2_surrounding_ms(ref_ms, ref_profile),
         }
         rows.append(ref_row)
         print(json.dumps(ref_row, sort_keys=True), flush=True)
@@ -334,7 +427,9 @@ def main() -> None:
                         with torch.no_grad():
                             return _forward_step(module, x, r, latents, wigner_D_all=wigner)
 
+                _reset_so2_profile(args.so2_profile)
                 ms, peak = _cuda_ms(step, args.warmup, args.iters)
+                so2_profile = _take_so2_profile(args.so2_profile)
                 row = {
                     "n": n,
                     "phase": args.phase,
@@ -348,8 +443,12 @@ def main() -> None:
                     "correct": correct,
                     "max_abs": max_abs,
                     "env": dict(variant.env),
+                    "so2_profile": _profile_json(so2_profile),
+                    "so2_profiled_cuda_ms": _profiled_so2_cuda_ms(so2_profile),
+                    "non_so2_surrounding_cuda_ms": _non_so2_surrounding_ms(ms, so2_profile),
                 }
             except Exception as exc:
+                so2_profile = _take_so2_profile(args.so2_profile)
                 row = {
                     "n": n,
                     "phase": args.phase,
@@ -363,6 +462,9 @@ def main() -> None:
                     "correct": False,
                     "max_abs": None,
                     "env": dict(variant.env),
+                    "so2_profile": _profile_json(so2_profile),
+                    "so2_profiled_cuda_ms": _profiled_so2_cuda_ms(so2_profile),
+                    "non_so2_surrounding_cuda_ms": _non_so2_surrounding_ms(None, so2_profile),
                     "error": repr(exc),
                 }
             rows.append(row)

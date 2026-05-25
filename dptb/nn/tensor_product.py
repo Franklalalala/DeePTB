@@ -599,7 +599,7 @@ class SO2_Linear(torch.nn.Module):
         ).lower()
 
     def _indexed_sandwich_cuda_multi_gemm_layout(self):
-        return self._str_env_any(
+        value = self._str_env_any(
             (
                 "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT",
                 "SO2_CUDA_GEMM_LAYOUT",
@@ -607,6 +607,39 @@ class SO2_Linear(torch.nn.Module):
             ),
             "raw",
         ).lower()
+        aliases = {
+            "raw_output_major_v2_cached": "raw_cached",
+            "output_major_v2_cached": "raw_cached",
+            "v2_cached": "raw_cached",
+            "cached_raw": "raw_cached",
+            "raw_output_major_v2_grouped": "grouped_raw_v2",
+            "output_major_v2_grouped": "grouped_raw_v2",
+            "v2_grouped": "grouped_raw_v2",
+            "grouped_v2": "grouped_raw_v2",
+            "raw_output_major_v3_pack": "raw_pack_v2",
+            "raw_output_major_v3_pack_v2": "raw_pack_v2",
+            "pack_v2": "raw_pack_v2",
+            "desc_pack": "raw_pack_v2",
+            "raw_output_major_v3_pack_m0_cuda": "raw_pack_v2_m0_cuda",
+            "raw_output_major_v3_pack_v2_m0_cuda": "raw_pack_v2_m0_cuda",
+            "pack_v2_m0_cuda": "raw_pack_v2_m0_cuda",
+            "m0_cuda_pack_v2": "raw_pack_v2_m0_cuda",
+        }
+        return aliases.get(value, value)
+
+    def _indexed_sandwich_cuda_multi_execution_tag(self):
+        layout = self._indexed_sandwich_cuda_multi_gemm_layout()
+        if layout == "raw_cached":
+            return "raw_output_major_v2_cached"
+        if layout == "grouped_raw_v2":
+            return "raw_output_major_v2_grouped"
+        if layout == "raw_pack_v2":
+            return "raw_output_major_v3_pack_v2"
+        if layout == "raw_pack_v2_m0_cuda":
+            return "raw_output_major_v3_pack_v2_m0_cuda"
+        if layout == "raw":
+            return "raw_output_major_v1"
+        return layout
 
     def _use_indexed_sandwich_cuda_path(self, x):
         if self.so2_m_linear_mode not in ("indexed_sandwich_cuda", "indexed_sandwich_cuda_multi"):
@@ -916,6 +949,104 @@ class SO2_Linear(torch.nn.Module):
             cache[key] = cached
         return cached
 
+    def _indexed_sandwich_cuda_multi_call_plan(
+        self,
+        metadata,
+        device,
+        entry_map_fn,
+        epilogue_schedule,
+    ):
+        cache = getattr(self, "_indexed_sandwich_cuda_multi_call_plan_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_indexed_sandwich_cuda_multi_call_plan_cache", cache)
+
+        (
+            m_values_host,
+            in_bases,
+            in_ls,
+            out_bases,
+            out_ls,
+            _cin_values,
+            _cout_values,
+            cin_prefix_t,
+            cout_prefix_t,
+            m_values_t,
+            offsets,
+            cin_prefix,
+            cout_prefix,
+        ) = metadata
+        key = (
+            str(device),
+            int(self.irreps_out.dim),
+            tuple(int(v) for v in m_values_host),
+            tuple(int(v) for v in cin_prefix),
+            tuple(int(v) for v in cout_prefix),
+            tuple(
+                id(getattr(self.m_linear[int(m) - 1], "fc", None))
+                for m in m_values_host
+            ),
+            str(epilogue_schedule),
+        )
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        plan = {
+            "m_values_host": tuple(int(v) for v in m_values_host),
+            "in_bases": tuple(in_bases),
+            "in_ls": tuple(in_ls),
+            "out_bases": tuple(out_bases),
+            "out_ls": tuple(out_ls),
+            "m_modules": tuple(self.m_linear[int(m) - 1] for m in m_values_host),
+            "cin_prefix_t": cin_prefix_t,
+            "cout_prefix_t": cout_prefix_t,
+            "m_values_t": m_values_t,
+            "offsets": offsets,
+            "cin_prefix": tuple(int(v) for v in cin_prefix),
+            "cout_prefix": tuple(int(v) for v in cout_prefix),
+            "raw_row_ptr_by_n": {},
+            "output_entry_map": None,
+        }
+        total_cin = int(plan["cin_prefix"][-1])
+        pack_desc = torch.empty((total_cin, 3), dtype=torch.long, device=device)
+        cursor = 0
+        for m, in_base, in_l in zip(plan["m_values_host"], plan["in_bases"], plan["in_ls"]):
+            end = cursor + int(in_base.numel())
+            pack_desc[cursor:end, 0].copy_(in_base)
+            pack_desc[cursor:end, 1].copy_(in_l)
+            pack_desc[cursor:end, 2].fill_(int(m))
+            cursor = end
+        plan["pack_desc"] = pack_desc.contiguous()
+        plan["in_base_all"] = torch.cat(tuple(t.contiguous() for t in plan["in_bases"]), dim=0).contiguous()
+        plan["in_l_all"] = torch.cat(tuple(t.contiguous() for t in plan["in_ls"]), dim=0).contiguous()
+        plan["m0_maps"] = self._indexed_sandwich_cuda_pair_maps(0, device)
+        if epilogue_schedule == "output_major":
+            plan["output_entry_map"] = self._indexed_sandwich_cuda_multi_output_entry_map(
+                plan["m_values_host"],
+                plan["out_bases"],
+                plan["out_ls"],
+                device,
+                entry_map_fn,
+            )
+        cache[key] = plan
+        return plan
+
+    @staticmethod
+    def _indexed_sandwich_cuda_multi_raw_row_ptr(plan, n, rows_per_edge):
+        row_count = int(n) * int(rows_per_edge)
+        cache = plan.get("raw_row_ptr_by_n")
+        if cache is None:
+            cache = {}
+            plan["raw_row_ptr_by_n"] = cache
+        cached = cache.get(row_count)
+        if cached is None:
+            cached = torch.tensor([0, row_count], dtype=torch.long, device="cpu")
+            if len(cache) >= 16:
+                cache.pop(next(iter(cache)))
+            cache[row_count] = cached
+        return cached
+
     def _forward_indexed_sandwich_cuda(self, x, weights, wigner_D_all):
         strict = os.environ.get("DPTB_SO2_INDEXED_SANDWICH_CUDA_STRICT", "0").lower() in ("1", "true", "yes", "on")
         try:
@@ -1015,9 +1146,38 @@ class SO2_Linear(torch.nn.Module):
     def _forward_indexed_sandwich_cuda_multi(self, x, weights, wigner_D_all):
         strict = os.environ.get("DPTB_SO2_INDEXED_SANDWICH_CUDA_STRICT", "0").lower() in ("1", "true", "yes", "on")
         try:
+            from so2_cuda_ops.profiler import (
+                cuda_span_end,
+                cuda_span_start,
+                maybe_print_profile,
+                record_cuda_span,
+                record_host_span,
+            )
+        except Exception:
+            cuda_span_start = lambda *_args, **_kwargs: None
+            cuda_span_end = lambda *_args, **_kwargs: None
+            maybe_print_profile = lambda *_args, **_kwargs: None
+            record_cuda_span = lambda _label, _device, fn: fn()
+            record_host_span = lambda _label, fn: fn()
+
+        profile_token = cuda_span_start("so2.forward_total", x)
+        profile_done = False
+
+        def _finish_profile(value):
+            nonlocal profile_done
+            if not profile_done:
+                cuda_span_end(profile_token)
+                maybe_print_profile(self._indexed_sandwich_cuda_multi_execution_tag())
+                profile_done = True
+            return value
+
+        try:
             from dptb.nn.so2_moe_fused_p0 import (
+                _PackM0Function,
                 _PackPairsMultiFunction,
+                _PackPairsMultiDescFunction,
                 _ScatterRawPairOutputFunction,
+                _ScatterM0OutputFunction,
                 _ScatterPairOutputFunction,
                 _ScatterPairsMultiOutputMajorFunction,
                 _ScatterRawPairsMultiOutputFunction,
@@ -1027,38 +1187,84 @@ class SO2_Linear(torch.nn.Module):
             )
 
             if self.radial_emb and not bool(self.front):
-                return self._forward_indexed_sandwich_cuda(x, weights, wigner_D_all)
+                return _finish_profile(self._forward_indexed_sandwich_cuda(x, weights, wigner_D_all))
 
             wigner_info = _wigner_tensor_and_mode(self, wigner_D_all, x)
             if wigner_info is None:
-                return None
+                return _finish_profile(None)
             wigner, compact_offsets, wigner_mode, wigner_stride = wigner_info
 
             n, _ = x.shape
-            rot_blocks = {
-                l: self._select_wigner_block(wigner_D_all, l)
-                for l in range(self.l_max + 1)
-            }
-            input_groups = {
-                l: self._gather_l_group(x, l)
-                for l in self._in_groups
-            }
-            out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+            gemm_layout = self._indexed_sandwich_cuda_multi_gemm_layout()
 
-            radial_weight = weights[:, self.m_in_index[0]:self.m_in_index[1]].unsqueeze(1) if self.radial_emb else 1.
-            inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
-            if self.front and self.radial_emb:
-                y_m0 = self.fc_m0(inp * radial_weight.squeeze(1))
-            elif self.radial_emb:
-                y_m0 = self.fc_m0(inp) * radial_weight.squeeze(1)
-            else:
-                y_m0 = self.fc_m0(inp)
-            self._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
-            out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+            def _run_m0_path():
+                radial_weight = weights[:, self.m_in_index[0]:self.m_in_index[1]].unsqueeze(1) if self.radial_emb else None
+                if gemm_layout == "raw_pack_v2_m0_cuda":
+                    in_base, in_l, out_base, out_l, m0_offsets = self._indexed_sandwich_cuda_pair_maps(0, x.device)
+                    if (
+                        isinstance(self.fc_m0, nn.Linear)
+                        and int(in_base.numel()) == int(self.fc_m0.in_features)
+                        and int(out_base.numel()) == int(self.fc_m0.out_features)
+                    ):
+                        inp = _PackM0Function.apply(
+                            x.contiguous(),
+                            wigner,
+                            in_base,
+                            in_l,
+                            m0_offsets,
+                            compact_offsets,
+                            bool(self.rotate_in),
+                            int(wigner_mode),
+                            int(wigner_stride),
+                        )
+                        radial_flat = radial_weight.squeeze(1) if radial_weight is not None else None
+                        if self.front and self.radial_emb:
+                            y_m0 = self.fc_m0(inp * radial_flat)
+                        elif self.radial_emb:
+                            y_m0 = self.fc_m0(inp) * radial_flat
+                        else:
+                            y_m0 = self.fc_m0(inp)
+                        return _ScatterM0OutputFunction.apply(
+                            y_m0.contiguous(),
+                            wigner,
+                            out_base,
+                            out_l,
+                            m0_offsets,
+                            compact_offsets,
+                            int(self.irreps_out.dim),
+                            bool(self.rotate_out),
+                            int(wigner_mode),
+                            int(wigner_stride),
+                        )
 
-            metadata = self._indexed_sandwich_cuda_multi_metadata(x.device)
+                rot_blocks = {
+                    l: self._select_wigner_block(wigner_D_all, l)
+                    for l in range(self.l_max + 1)
+                }
+                input_groups = {
+                    l: self._gather_l_group(x, l)
+                    for l in self._in_groups
+                }
+                out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+                radial_weight = radial_weight if radial_weight is not None else 1.
+                inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
+                if self.front and self.radial_emb:
+                    y_m0 = self.fc_m0(inp * radial_weight.squeeze(1))
+                elif self.radial_emb:
+                    y_m0 = self.fc_m0(inp) * radial_weight.squeeze(1)
+                else:
+                    y_m0 = self.fc_m0(inp)
+                self._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
+                return self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+
+            out = record_cuda_span("so2.forward.m0_path", x, _run_m0_path)
+
+            metadata = record_host_span(
+                "so2.host.metadata",
+                lambda: self._indexed_sandwich_cuda_multi_metadata(x.device),
+            )
             if metadata is None:
-                return None
+                return _finish_profile(None)
             (
                 m_values_host,
                 in_bases,
@@ -1076,32 +1282,87 @@ class SO2_Linear(torch.nn.Module):
             ) = metadata
 
             if not m_values_host:
-                return out.contiguous(), wigner_D_all
-            m_values_host = list(m_values_host)
-            in_bases = list(in_bases)
-            in_ls = list(in_ls)
-            out_bases = list(out_bases)
-            out_ls = list(out_ls)
-            m_modules = [self.m_linear[m - 1] for m in m_values_host]
-            packed_all = _PackPairsMultiFunction.apply(
-                x.contiguous(),
-                wigner,
-                in_bases,
-                in_ls,
-                offsets,
-                compact_offsets,
-                cin_prefix_t,
-                m_values_t,
-                bool(self.rotate_in),
-                int(wigner_mode),
-                int(wigner_stride),
-            )
-
+                return _finish_profile((out.contiguous(), wigner_D_all))
             epilogue_schedule = self._indexed_sandwich_cuda_multi_epilogue_schedule()
-            gemm_layout = self._indexed_sandwich_cuda_multi_gemm_layout()
+            use_call_plan = gemm_layout in ("raw_cached", "grouped_raw_v2", "raw_pack_v2", "raw_pack_v2_m0_cuda")
+            call_plan = None
+            if use_call_plan:
+                call_plan = record_host_span(
+                    "so2.host.call_plan",
+                    lambda: self._indexed_sandwich_cuda_multi_call_plan(
+                        metadata,
+                        x.device,
+                        _multi_output_entry_map,
+                        epilogue_schedule,
+                    ),
+                )
+                m_values_host = call_plan["m_values_host"]
+                in_bases = call_plan["in_bases"]
+                in_ls = call_plan["in_ls"]
+                out_bases = call_plan["out_bases"]
+                out_ls = call_plan["out_ls"]
+                m_modules = call_plan["m_modules"]
+                cin_prefix_t = call_plan["cin_prefix_t"]
+                cout_prefix_t = call_plan["cout_prefix_t"]
+                m_values_t = call_plan["m_values_t"]
+                offsets = call_plan["offsets"]
+                cin_prefix = call_plan["cin_prefix"]
+                cout_prefix = call_plan["cout_prefix"]
+                pack_desc = call_plan.get("pack_desc")
+                in_base_all = call_plan.get("in_base_all")
+                in_l_all = call_plan.get("in_l_all")
+            else:
+                m_values_host = list(m_values_host)
+                in_bases = list(in_bases)
+                in_ls = list(in_ls)
+                out_bases = list(out_bases)
+                out_ls = list(out_ls)
+                m_modules = [self.m_linear[m - 1] for m in m_values_host]
+                pack_desc = None
+                in_base_all = None
+                in_l_all = None
+            if gemm_layout in ("raw_pack_v2", "raw_pack_v2_m0_cuda") and pack_desc is not None:
+                packed_all = _PackPairsMultiDescFunction.apply(
+                    x.contiguous(),
+                    wigner,
+                    pack_desc,
+                    in_base_all,
+                    in_l_all,
+                    offsets,
+                    compact_offsets,
+                    cin_prefix_t,
+                    m_values_t,
+                    bool(self.rotate_in),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
+            else:
+                packed_all = _PackPairsMultiFunction.apply(
+                    x.contiguous(),
+                    wigner,
+                    in_bases,
+                    in_ls,
+                    offsets,
+                    compact_offsets,
+                    cin_prefix_t,
+                    m_values_t,
+                    bool(self.rotate_in),
+                    int(wigner_mode),
+                    int(wigner_stride),
+                )
 
-            if gemm_layout in ("block", "block_complex", "fairchem_block"):
-                from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_block_gemm
+            if gemm_layout in (
+                "block",
+                "block_complex",
+                "fairchem_block",
+                "block_direct",
+                "direct_block_complex",
+                "compact_block",
+            ):
+                from dptb.nn.cuda_ops.grouped_gemm import (
+                    indexed_sandwich_multi_block_direct_gemm,
+                    indexed_sandwich_multi_block_gemm,
+                )
 
                 pair_inputs = []
                 post_radials = []
@@ -1119,7 +1380,10 @@ class SO2_Linear(torch.nn.Module):
                     block_weights.append(module.fc.weight.unsqueeze(0).contiguous())
                     ptrs.append(torch.tensor([0, int(n)], dtype=torch.long, device="cpu"))
 
-                pair_outputs = indexed_sandwich_multi_block_gemm(pair_inputs, ptrs, block_weights)
+                if gemm_layout in ("block_direct", "direct_block_complex", "compact_block"):
+                    pair_outputs = indexed_sandwich_multi_block_direct_gemm(pair_inputs, block_weights)
+                else:
+                    pair_outputs = indexed_sandwich_multi_block_gemm(pair_inputs, ptrs, block_weights)
                 for i, radial in enumerate(post_radials):
                     if radial is not None:
                         pair_outputs[i] = pair_outputs[i] * radial
@@ -1171,38 +1435,55 @@ class SO2_Linear(torch.nn.Module):
                             int(wigner_stride),
                         )
                         contribution = part if contribution is None else contribution + part
-                return (out + contribution).contiguous(), wigner_D_all
+                return _finish_profile(((out + contribution).contiguous(), wigner_D_all))
 
             raw_tensors = []
-            if gemm_layout in ("grouped_raw", "cublas_grouped", "grouped_gemm"):
+            if gemm_layout in ("grouped_raw", "grouped_raw_v2", "cublas_grouped", "grouped_gemm"):
                 from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
 
                 pair_inputs = []
                 raw_weights = []
-                ptr = torch.tensor([0, int(2 * n)], dtype=torch.long, device="cpu")
+                if gemm_layout == "grouped_raw_v2" and call_plan is not None:
+                    ptr = self._indexed_sandwich_cuda_multi_raw_row_ptr(call_plan, n, rows_per_edge=2)
+                else:
+                    ptr = torch.tensor([0, int(2 * n)], dtype=torch.long, device="cpu")
                 for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
                     pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
                     radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
                     pair_inputs.append(pair * radial if radial is not None and bool(self.front) else pair)
                     raw_weights.append(module.fc.weight.unsqueeze(0).contiguous())
-                raw_tensors = indexed_sandwich_multi_gemm(pair_inputs, ptr, raw_weights)
+                raw_tensors = record_cuda_span(
+                    "so2.forward.grouped_raw_linear",
+                    packed_all,
+                    lambda: indexed_sandwich_multi_gemm(pair_inputs, ptr, raw_weights),
+                )
             else:
                 for i, (m, module) in enumerate(zip(m_values_host, m_modules)):
                     pair = packed_all[:, :, cin_prefix[i]:cin_prefix[i + 1]]
                     radial = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
                     pair_for_linear = pair * radial if radial is not None and bool(self.front) else pair
-                    raw_tensors.append(module.fc(pair_for_linear).contiguous())
+                    raw_tensors.append(
+                        record_cuda_span(
+                            "so2.forward.raw_linear_per_m",
+                            pair_for_linear,
+                            lambda: module.fc(pair_for_linear).contiguous(),
+                        )
+                    )
 
             if epilogue_schedule == "output_major":
-                entry_offsets, entry_m, entry_channel, entry_d, entry_l = (
-                    self._indexed_sandwich_cuda_multi_output_entry_map(
-                        m_values_host,
-                        out_bases,
-                        out_ls,
-                        x.device,
-                        _multi_output_entry_map,
+                if call_plan is not None and call_plan.get("output_entry_map") is not None:
+                    entry_offsets, entry_m, entry_channel, entry_d, entry_l = call_plan["output_entry_map"]
+                else:
+                    entry_offsets, entry_m, entry_channel, entry_d, entry_l = record_host_span(
+                        "so2.host.output_entry_map",
+                        lambda: self._indexed_sandwich_cuda_multi_output_entry_map(
+                            m_values_host,
+                            out_bases,
+                            out_ls,
+                            x.device,
+                            _multi_output_entry_map,
+                        )
                     )
-                )
                 contribution = _ScatterRawPairsMultiOutputMajorFunction.apply(
                     wigner,
                     offsets,
@@ -1256,8 +1537,9 @@ class SO2_Linear(torch.nn.Module):
                     *out_bases,
                     *out_ls,
                 )
-            return (out + contribution).contiguous(), wigner_D_all
+            return _finish_profile(((out + contribution).contiguous(), wigner_D_all))
         except Exception:
+            _finish_profile(None)
             if strict:
                 raise
             return None

@@ -231,6 +231,11 @@ def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
         ("indexed_sandwich_cuda_multi", "output_major", None),
         ("indexed_sandwich_cuda_multi", "per_m", None),
         ("indexed_sandwich_cuda_multi", "output_major", "grouped_raw"),
+        ("indexed_sandwich_cuda_multi", "output_major", "raw_cached"),
+        ("indexed_sandwich_cuda_multi", "output_major", "grouped_raw_v2"),
+        ("indexed_sandwich_cuda_multi", "output_major", "raw_pack_v2"),
+        ("indexed_sandwich_cuda_multi", "output_major", "raw_pack_v2_m0_cuda"),
+        ("indexed_sandwich_cuda_multi", "output_major", "block_direct"),
     ],
 )
 def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(
@@ -285,6 +290,55 @@ def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(
         assert name_ref == name_cuda
         if param_ref.grad is not None:
             torch.testing.assert_close(param_cuda.grad, param_ref.grad, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.parametrize(
+    ("env_value", "layout", "tag"),
+    [
+        ("raw_pack_v2", "raw_pack_v2", "raw_output_major_v3_pack_v2"),
+        ("pack_v2", "raw_pack_v2", "raw_output_major_v3_pack_v2"),
+        ("raw_output_major_v3_pack", "raw_pack_v2", "raw_output_major_v3_pack_v2"),
+        ("raw_pack_v2_m0_cuda", "raw_pack_v2_m0_cuda", "raw_output_major_v3_pack_v2_m0_cuda"),
+        ("pack_v2_m0_cuda", "raw_pack_v2_m0_cuda", "raw_output_major_v3_pack_v2_m0_cuda"),
+    ],
+)
+def test_non_moe_so2_cuda_multi_accepts_pack_v2_layout_aliases(monkeypatch, env_value, layout, tag):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", env_value)
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_gemm_layout() == layout
+    assert layer._indexed_sandwich_cuda_multi_execution_tag() == tag
+
+
+@pytest.mark.parametrize(
+    ("spec", "layout"),
+    [
+        ("indexed_sandwich_cuda_multi:output_major:raw_pack_v2", "raw_pack_v2"),
+        ("indexed_sandwich_cuda_multi:output_major:pack_v2", "raw_pack_v2"),
+        ("indexed_sandwich_cuda_multi:output_major:raw_pack_v2_m0_cuda", "raw_pack_v2_m0_cuda"),
+    ],
+)
+def test_bench_so2_variant_parser_accepts_pack_v2_layouts(spec, layout):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    if not hasattr(torch, "cuda"):
+        pytest.skip("bench parser imports torch CUDA helpers")
+
+    from tools.bench_so2_non_moe_cublas import _parse_variant
+
+    variant = _parse_variant(spec)
+
+    assert variant.mode == "indexed_sandwich_cuda_multi"
+    assert ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", layout) in variant.env
 
 
 def test_non_moe_so2_indexed_sandwich_cuda_multi_block_complex_matches_standard(monkeypatch):
@@ -675,6 +729,62 @@ def test_non_moe_so2_indexed_sandwich_cuda_multi_gemm_prefers_dptb_env(monkeypat
     )
 
     assert layer._indexed_sandwich_cuda_multi_gemm_layout() == "raw"
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_accepts_v2_cached_tag(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv(
+        "DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT",
+        "raw_output_major_v2_cached",
+    )
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_gemm_layout() == "raw_cached"
+    assert layer._indexed_sandwich_cuda_multi_execution_tag() == "raw_output_major_v2_cached"
+
+
+def test_non_moe_so2_indexed_sandwich_cuda_multi_accepts_grouped_v2_tag(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from dptb.nn.tensor_product import SO2_Linear
+
+    monkeypatch.setenv("SO2_CUDA_GEMM_STRATEGY", "raw_output_major_v2_grouped")
+    layer = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        so2_m_linear_mode="indexed_sandwich_cuda_multi",
+    )
+
+    assert layer._indexed_sandwich_cuda_multi_gemm_layout() == "grouped_raw_v2"
+    assert layer._indexed_sandwich_cuda_multi_execution_tag() == "raw_output_major_v2_grouped"
+
+
+def test_bench_so2_non_moe_cublas_parses_v2_tags():
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+
+    from tools.bench_so2_non_moe_cublas import _parse_variant
+
+    cached = _parse_variant("indexed_sandwich_cuda_multi:output_major:raw_cached")
+    grouped = _parse_variant("indexed_sandwich_cuda_multi:output_major:grouped_raw_v2")
+
+    assert cached.env == (
+        ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", "output_major"),
+        ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", "raw_cached"),
+    )
+    assert grouped.env == (
+        ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_EPILOGUE_SCHEDULE", "output_major"),
+        ("DPTB_SO2_INDEXED_SANDWICH_CUDA_MULTI_GEMM_LAYOUT", "grouped_raw_v2"),
+    )
 
 
 def test_non_moe_so2_materialized_shape_gate_accepts_so2_env_alias(monkeypatch):
