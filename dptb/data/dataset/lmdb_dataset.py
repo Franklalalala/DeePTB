@@ -79,6 +79,112 @@ def _lmdb_tensor(value: Any, dtype: Optional[torch.dtype] = None) -> torch.Tenso
     return tensor
 
 
+def _lmdb_scalar_bool(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(value.item())
+    array = np.asarray(value)
+    if array.shape == ():
+        return bool(array.item())
+    return bool(value)
+
+
+def _lmdb_scalar_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.item())
+    array = np.asarray(value)
+    if array.shape == ():
+        return int(array.item())
+    return int(value)
+
+
+def _soc_uureal_keep_mask(
+    data_dict: Dict[str, Any],
+    full_rme: int,
+    keep_mask: Optional[Any] = None,
+) -> torch.Tensor:
+    if keep_mask is not None:
+        mask = torch.as_tensor(keep_mask, dtype=torch.bool).flatten()
+    else:
+        keep = data_dict.get("soc_uureal_keep", None)
+        if keep is None:
+            raise ValueError(
+                "Compact SOC uu_real LMDB entry is missing soc_uureal_keep metadata."
+            )
+        keep_tensor = torch.as_tensor(keep)
+        if keep_tensor.ndim == 0:
+            keep_count = int(keep_tensor.item())
+            if keep_count == full_rme:
+                mask = torch.ones(full_rme, dtype=torch.bool)
+            else:
+                raise ValueError(
+                    "Compact SOC uu_real LMDB entry stores only a keep count. "
+                    "Enable nextham_uureal_mask so the dataset can use the "
+                    "type_mapper.mask_uureal layout mask for expansion."
+                )
+        elif keep_tensor.dtype == torch.bool:
+            mask = keep_tensor.flatten()
+        else:
+            keep_flat = keep_tensor.flatten().to(dtype=torch.long)
+            if keep_flat.numel() == full_rme and (
+                keep_flat.numel() == 0 or int(keep_flat.max().item()) <= 1
+            ):
+                mask = keep_flat.to(dtype=torch.bool)
+            else:
+                mask = torch.zeros(full_rme, dtype=torch.bool)
+                mask[keep_flat] = True
+
+    if mask.numel() != full_rme:
+        raise ValueError(
+            "Compact SOC uu_real mask width does not match full RME: "
+            f"mask={mask.numel()}, full_rme={full_rme}."
+        )
+    return mask
+
+
+def _expand_soc_uureal_compact(
+    value: Any,
+    data_dict: Dict[str, Any],
+    field_name: str,
+    keep_mask: Optional[Any] = None,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(value)
+    if not _lmdb_scalar_bool(data_dict.get("soc_uureal_compact", False)):
+        return tensor
+
+    full_rme_value = data_dict.get("soc_uureal_full_rme", None)
+    if full_rme_value is None:
+        raise ValueError(
+            f"Compact SOC uu_real LMDB field {field_name} is missing "
+            "soc_uureal_full_rme metadata."
+        )
+    full_rme = _lmdb_scalar_int(full_rme_value)
+    if full_rme <= 0:
+        raise ValueError(
+            f"Compact SOC uu_real LMDB field {field_name} has invalid "
+            f"soc_uureal_full_rme={full_rme}."
+        )
+
+    if tensor.shape[-1] == full_rme:
+        return tensor
+
+    mask = _soc_uureal_keep_mask(data_dict, full_rme, keep_mask=keep_mask)
+    compact_rme = int(mask.sum().item())
+    if tensor.shape[-1] != compact_rme:
+        raise ValueError(
+            f"Compact SOC uu_real LMDB field {field_name} has incompatible "
+            f"width {tensor.shape[-1]}; expected compact width {compact_rme} "
+            f"or full width {full_rme}."
+        )
+
+    expanded = torch.zeros(
+        (*tensor.shape[:-1], full_rme),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    expanded[..., mask.to(device=tensor.device)] = tensor
+    return expanded
+
+
 _ATOMICDATA_CONSTRUCTOR_OPTIONS = {"r_max", "er_max", "oer_max", "self_interaction"}
 
 
@@ -328,6 +434,7 @@ class LMDBDataset(AtomicDataset):
         h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
+        soc_uureal_keep_mask = getattr(self.type_mapper, "mask_uureal", None)
 
         if self.info_files[self.file_map[idx]]['train_dip'] == True:
             self.info_files[self.file_map[idx]].update({'dip': data_dict['dipole_moment']})
@@ -439,8 +546,18 @@ class LMDBDataset(AtomicDataset):
         num_nodes = atomicdata.num_nodes
 
         if has_pre_main and has_pre_overlap:
-            pre_node_features = torch.as_tensor(pre_node_features)
-            pre_edge_features = torch.as_tensor(pre_edge_features)
+            pre_node_features = _expand_soc_uureal_compact(
+                pre_node_features,
+                data_dict,
+                field_name=AtomicDataDict.NODE_FEATURES_KEY,
+                keep_mask=soc_uureal_keep_mask,
+            )
+            pre_edge_features = _expand_soc_uureal_compact(
+                pre_edge_features,
+                data_dict,
+                field_name=AtomicDataDict.EDGE_FEATURES_KEY,
+                keep_mask=soc_uureal_keep_mask,
+            )
             if pre_node_features.shape[0] != num_nodes or pre_edge_features.shape[0] != num_edges:
                 raise ValueError(
                     "Precomputed LMDB feature rows do not match the active graph: "
@@ -471,8 +588,18 @@ class LMDBDataset(AtomicDataset):
 
         if self.get_H0:
             if self.prefer_precomputed_h0 and node_h0 is not None and edge_h0 is not None:
-                node_h0 = torch.as_tensor(node_h0)
-                edge_h0 = torch.as_tensor(edge_h0)
+                node_h0 = _expand_soc_uureal_compact(
+                    node_h0,
+                    data_dict,
+                    field_name=AtomicDataDict.NODE_H0_KEY,
+                    keep_mask=soc_uureal_keep_mask,
+                )
+                edge_h0 = _expand_soc_uureal_compact(
+                    edge_h0,
+                    data_dict,
+                    field_name=AtomicDataDict.EDGE_H0_KEY,
+                    keep_mask=soc_uureal_keep_mask,
+                )
                 if node_h0.shape[0] != num_nodes or edge_h0.shape[0] != num_edges:
                     raise ValueError(
                         "Precomputed LMDB H0 rows do not match the active graph: "
@@ -492,8 +619,18 @@ class LMDBDataset(AtomicDataset):
                     edge_field=AtomicDataDict.EDGE_H0_KEY,
                 )
             elif node_h0 is not None and edge_h0 is not None:
-                atomicdata[AtomicDataDict.NODE_H0_KEY] = torch.as_tensor(node_h0)
-                atomicdata[AtomicDataDict.EDGE_H0_KEY] = torch.as_tensor(edge_h0)
+                atomicdata[AtomicDataDict.NODE_H0_KEY] = _expand_soc_uureal_compact(
+                    node_h0,
+                    data_dict,
+                    field_name=AtomicDataDict.NODE_H0_KEY,
+                    keep_mask=soc_uureal_keep_mask,
+                )
+                atomicdata[AtomicDataDict.EDGE_H0_KEY] = _expand_soc_uureal_compact(
+                    edge_h0,
+                    data_dict,
+                    field_name=AtomicDataDict.EDGE_H0_KEY,
+                    keep_mask=soc_uureal_keep_mask,
+                )
 
         return atomicdata
 
