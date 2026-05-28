@@ -89,6 +89,10 @@ def common_options():
     doc_overlap = "Whether to calculate the overlap matrix. Default: False"
     doc_train_w_charge = "Whether to train with charge info. Default: False"
     doc_has_soc = "Whether to train with SOC. Default: False"
+    doc_nextham_uureal_mask = (
+        "Whether to expose the NextHAM SOC uu.real mask to dataset and loss "
+        "helpers. Default: False"
+    )
     doc_train_dip = "Whether to train the dipole moment tensor. Default: False"
     doc_train_polar = "Whether to train the polarizaty tensor. Default: False"
     doc_wave_align = "Whether to align the wavefunctions. Default: False"
@@ -101,6 +105,7 @@ def common_options():
         Argument("train_dip", bool, optional=True, default=False, doc=doc_train_dip),
         Argument("train_w_charge", bool, optional=True, default=False, doc=doc_train_w_charge),
         Argument("has_soc", bool, optional=True, default=False, doc=doc_has_soc),
+        Argument("nextham_uureal_mask", bool, optional=True, default=False, doc=doc_nextham_uureal_mask),
         Argument("device", str, optional = True, default="cpu", doc = doc_device),
         Argument("dtype", str, optional = True, default="float32", doc = doc_dtype),
         Argument("seed", int, optional=True, default=3982377700, doc=doc_seed),

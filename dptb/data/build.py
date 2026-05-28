@@ -169,7 +169,12 @@ class DatasetBuilder:
         # See if we can get a OrbitalMapper.
         if basis is not None:
             has_soc_flag = kwargs.get('has_soc', False)
-            idp = OrbitalMapper(basis=basis, has_soc=has_soc_flag)
+            idp = OrbitalMapper(
+                basis=basis,
+                has_soc=has_soc_flag,
+                soc_complex_doubling=kwargs.get('soc_complex_doubling', True),
+                nextham_uureal_mask=kwargs.get('nextham_uureal_mask', False),
+            )
         else:
             idp = None
 

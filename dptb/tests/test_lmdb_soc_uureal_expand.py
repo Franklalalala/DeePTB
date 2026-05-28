@@ -12,6 +12,8 @@ _MISSING_DEPS = [
 if not _MISSING_DEPS:
     import torch
 
+    import dptb.data.build as data_build
+    from dptb.data.build import DatasetBuilder
     from dptb.data.dataset.lmdb_dataset import _expand_soc_uureal_compact
 
 
@@ -98,3 +100,42 @@ def test_expand_soc_uureal_compact_rejects_inconsistent_width():
             },
             field_name="node_h0",
         )
+
+
+@pytest.mark.skipif(
+    bool(_MISSING_DEPS),
+    reason=f"missing runtime dependencies: {', '.join(_MISSING_DEPS)}",
+)
+def test_lmdb_dataset_builder_passes_uureal_mask_to_orbital_mapper(
+    monkeypatch,
+    tmp_path,
+):
+    calls = {}
+
+    class FakeOrbitalMapper:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    class FakeLMDBDataset:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(data_build, "OrbitalMapper", FakeOrbitalMapper)
+    monkeypatch.setattr(data_build, "LMDBDataset", FakeLMDBDataset)
+    data_dir = tmp_path / "data.0000"
+    data_dir.mkdir()
+    (data_dir / "data.mdb").write_bytes(b"")
+
+    dataset = DatasetBuilder()(
+        root=str(tmp_path),
+        prefix="data",
+        type="LMDBDataset",
+        r_max=5.0,
+        basis={"H": "1s"},
+        has_soc=True,
+        nextham_uureal_mask=True,
+    )
+
+    assert calls["has_soc"] is True
+    assert calls["nextham_uureal_mask"] is True
+    assert isinstance(dataset, FakeLMDBDataset)
