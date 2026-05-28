@@ -67,3 +67,39 @@ def test_hamil_abs_element_avg_uses_element_average():
     expected = 0.5 * (expected_l1 + expected_rmse)
 
     assert torch.allclose(actual, expected)
+
+
+@pytest.mark.skipif(
+    bool(_MISSING_DEPS),
+    reason=f"missing runtime dependencies: {', '.join(_MISSING_DEPS)}",
+)
+def test_hamil_abs_respects_uureal_only_masks():
+    class FakeUuRealIdp:
+        # Mimic NextHAM SOC uu.real-only masking: one supervised channel out of
+        # an eight-channel spin/complex slice.
+        mask_to_nrme = torch.tensor(
+            [[True, False, False, False, False, False, False, False]]
+        )
+        mask_to_erme = mask_to_nrme
+
+    data = {
+        AtomicDataDict.ATOM_TYPE_KEY: torch.tensor([[0]]),
+        AtomicDataDict.EDGE_TYPE_KEY: torch.tensor([[0]]),
+        AtomicDataDict.NODE_FEATURES_KEY: torch.zeros((1, 8)),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.zeros((1, 8)),
+    }
+    ref_data = {
+        AtomicDataDict.ATOM_TYPE_KEY: torch.tensor([[0]]),
+        AtomicDataDict.EDGE_TYPE_KEY: torch.tensor([[0]]),
+        AtomicDataDict.NODE_FEATURES_KEY: torch.tensor(
+            [[2.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0]]
+        ),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.tensor(
+            [[4.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0]]
+        ),
+    }
+
+    loss = HamilLossAbs(idp=FakeUuRealIdp())
+    actual = loss(data, ref_data)
+
+    assert torch.allclose(actual, torch.tensor(3.0))
