@@ -61,6 +61,9 @@ class E3Hamiltonian(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.soc = soc
+        self.nextham_uureal_mask = bool(
+            kwargs.get("nextham_uureal_mask", getattr(idp, "nextham_uureal_mask", False))
+        )
 
         # 定义复数类型
         self.cdtype = float2comlex(self.dtype)
@@ -117,6 +120,7 @@ class E3Hamiltonian(torch.nn.Module):
                 device=self.device,
                 has_soc=self.soc,
                 soc_complex_doubling=soc_complex_doubling,
+                nextham_uureal_mask=self.nextham_uureal_mask,
             )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."
@@ -126,6 +130,7 @@ class E3Hamiltonian(torch.nn.Module):
 
         self.basis = self.idp.basis
         self.soc_complex_doubling = getattr(self.idp, "soc_complex_doubling", True)
+        self.nextham_uureal_mask = bool(getattr(self.idp, "nextham_uureal_mask", self.nextham_uureal_mask))
 
         # ---- CG basis ----
         self.cgbasis = {}
@@ -403,7 +408,7 @@ class E3Hamiltonian(torch.nn.Module):
                 if verbose:
                     self._tensor_stats(f"[EDGE]{opairtype}.HR(before_spinproj)", HR)
 
-                if self.soc:
+                if self.soc and not self.nextham_uureal_mask:
                     HR = self._spin_projection(HR)
                     if verbose:
                         self._tensor_stats(f"[EDGE]{opairtype}.HR(after_spinproj)", HR)
@@ -450,7 +455,7 @@ class E3Hamiltonian(torch.nn.Module):
                     if verbose:
                         self._tensor_stats(f"[NODE]{opairtype}.HR(before_spinproj)", HR)
 
-                    if self.soc:
+                    if self.soc and not self.nextham_uureal_mask:
                         HR = self._spin_projection(HR)
                         if verbose:
                             self._tensor_stats(f"[NODE]{opairtype}.HR(after_spinproj)", HR)

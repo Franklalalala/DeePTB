@@ -453,7 +453,7 @@ class OrbitalMapper(BondMapper):
             # SOC Flags (Primarily for e3tb)
             has_soc: bool = False,
             soc_complex_doubling: bool = True,
-            nextham_uureal_mask: bool = False,  # <--- 新增
+            nextham_uureal_mask: bool = False,
     ):
         """
         Maps orbital pairs to feature indices (Reduced Matrix Elements).
@@ -487,7 +487,16 @@ class OrbitalMapper(BondMapper):
         self.device = device
         self.has_soc = has_soc
         self.soc_complex_doubling = soc_complex_doubling if has_soc else False
-        self.nextham_uureal_mask = nextham_uureal_mask
+        self.nextham_uureal_mask = bool(nextham_uureal_mask)
+        self.soc_uureal_target = bool(
+            self.method == "e3tb" and self.has_soc and self.nextham_uureal_mask
+        )
+        if self.soc_uureal_target:
+            log.info(
+                "[OrbitalMapper] nextham_uureal_mask=True: build a reduced "
+                "SOC target space containing only uu_real. The full SOC "
+                "spin/complex factor is kept out of RME maps and irreps."
+            )
         if self.method not in ["e3tb", "sktb"]:
             raise ValueError(f"Unknown method {self.method}, only 'e3tb' and 'sktb' are supported.")
 
@@ -548,8 +557,8 @@ class OrbitalMapper(BondMapper):
                 self.reduced_matrix_element = int((self.full_basis_norb ** 2 + total_onsite_block_elements) / 2)
             else:
                 # [SOC]: Full matrix storage
-                # Count = N^2 * 4 (Spin) * 2 (if Complex Doubling)
-                factor = 4 * (2 if self.soc_complex_doubling else 1)
+                # Full SOC uses N^2 * 4 spin blocks * 2 real/imag parts.
+                factor = self._e3tb_soc_feature_factor()
                 self.reduced_matrix_element = self.full_basis_norb ** 2 * factor
 
         else:
@@ -688,6 +697,13 @@ class OrbitalMapper(BondMapper):
             f"Init OrbitalMapper: Method={self.method}, SOC={self.has_soc}, RME={self.reduced_matrix_element}, Basis={orbtype_count}")
 
     # ================== Map Generation Methods ==================
+
+    def _e3tb_soc_feature_factor(self) -> int:
+        """Number of SOC storage channels per spatial matrix element."""
+        if self.method == "e3tb" and self.has_soc:
+            return 1 if self.nextham_uureal_mask else 4 * (2 if self.soc_complex_doubling else 1)
+        return 1
+
     def _apply_nextham_uureal_mask(self):
         """
         NextHAM-like mask:
@@ -706,14 +722,17 @@ class OrbitalMapper(BondMapper):
             self.reduced_matrix_element, dtype=torch.bool, device=self.device
         )
 
-        for k, sli in self.orbpair_maps.items():
-            io, jo = k.split("-")
-            il = anglrMId[re.findall(r"[a-z]", io)[0]]
-            jl = anglrMId[re.findall(r"[a-z]", jo)[0]]
+        if self._e3tb_soc_feature_factor() == 1:
+            uu_real_mask_1d[:] = True
+        else:
+            for k, sli in self.orbpair_maps.items():
+                io, jo = k.split("-")
+                il = anglrMId[re.findall(r"[a-z]", io)[0]]
+                jl = anglrMId[re.findall(r"[a-z]", jo)[0]]
 
-            base_dim = (2 * il + 1) * (2 * jl + 1)
-            # Keep only uu_real => first base_dim entries of this slice
-            uu_real_mask_1d[sli.start: sli.start + base_dim] = True
+                base_dim = (2 * il + 1) * (2 * jl + 1)
+                # Keep only uu_real => first base_dim entries of this slice.
+                uu_real_mask_1d[sli.start: sli.start + base_dim] = True
 
         # cache for debug
         self.mask_uureal = uu_real_mask_1d
@@ -759,7 +778,7 @@ class OrbitalMapper(BondMapper):
                 # Determine feature size per hop
                 if self.method == "e3tb":
                     if self.has_soc:
-                        factor = 4 * (2 if self.soc_complex_doubling else 1)
+                        factor = self._e3tb_soc_feature_factor()
                         n_rme = (2 * il + 1) * (2 * jl + 1) * factor
                     else:
                         n_rme = (2 * il + 1) * (2 * jl + 1)
@@ -815,7 +834,7 @@ class OrbitalMapper(BondMapper):
                 # Determine feature size
                 if self.method == "e3tb":
                     if self.has_soc:
-                        factor = 4 * (2 if self.soc_complex_doubling else 1)
+                        factor = self._e3tb_soc_feature_factor()
                         n_feature = (2 * il + 1) * (2 * jl + 1) * factor
                     else:
                         n_feature = (2 * il + 1) * (2 * jl + 1)
@@ -943,7 +962,7 @@ class OrbitalMapper(BondMapper):
     def get_irreps(self, no_parity=False):
         """E3TB: Generates E3NN Irreps for edge features."""
         assert self.method == "e3tb", "Only support e3tb method for now."
-        cache_key = (no_parity, self.has_soc, self.soc_complex_doubling)
+        cache_key = (no_parity, self.has_soc, self.soc_complex_doubling, self.nextham_uureal_mask)
         if hasattr(self, "_cached_irreps_key") and self._cached_irreps_key == cache_key:
             return self.orbpair_irreps
         self.no_parity = no_parity
@@ -958,7 +977,7 @@ class OrbitalMapper(BondMapper):
 
             # Calculate dimension of a single interaction block
             if self.has_soc:
-                factor_dim = 4 * (2 if self.soc_complex_doubling else 1)
+                factor_dim = self._e3tb_soc_feature_factor()
                 block_dim = (2 * l1 + 1) * (2 * l2 + 1) * factor_dim
             else:
                 block_dim = (2 * l1 + 1) * (2 * l2 + 1)
@@ -967,9 +986,14 @@ class OrbitalMapper(BondMapper):
             num_blocks = int((sli.stop - sli.start) / block_dim)
 
             # Generate irreps for a single block
-            block_ir = irreps_from_l1l2(l1, l2, spinful=self.has_soc, no_parity=no_parity)
+            block_ir = irreps_from_l1l2(
+                l1,
+                l2,
+                spinful=self.has_soc and not self.nextham_uureal_mask,
+                no_parity=no_parity,
+            )
 
-            if self.has_soc and self.soc_complex_doubling:
+            if self.has_soc and self.soc_complex_doubling and not self.nextham_uureal_mask:
                 block_ir = block_ir + block_ir
 
             # Sum irreps for all blocks
@@ -997,4 +1021,5 @@ class OrbitalMapper(BondMapper):
     def __eq__(self, other):
         return (self.basis == other.basis and
                 self.method == other.method and
-                getattr(self, 'has_soc', False) == getattr(other, 'has_soc', False))
+                getattr(self, 'has_soc', False) == getattr(other, 'has_soc', False) and
+                getattr(self, 'nextham_uureal_mask', False) == getattr(other, 'nextham_uureal_mask', False))

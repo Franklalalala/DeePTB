@@ -421,6 +421,8 @@ class LemMoEV3(torch.nn.Module):
         if isinstance(device, str):
             device = torch.device(device)
         self.device = device
+        self.has_soc = bool(kwargs.get("has_soc", False))
+        self.nextham_uureal_mask = bool(kwargs.get("nextham_uureal_mask", False))
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
@@ -431,12 +433,20 @@ class LemMoEV3(torch.nn.Module):
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
 
         if basis is not None:
-            self.idp = OrbitalMapper(basis, method="e3tb")
+            self.idp = OrbitalMapper(
+                basis,
+                method="e3tb",
+                device=self.device,
+                has_soc=self.has_soc,
+                nextham_uureal_mask=self.nextham_uureal_mask,
+            )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."
         else:
             assert idp is not None, "Either basis or idp should be provided."
             self.idp = idp
+        self.has_soc = bool(getattr(self.idp, "has_soc", self.has_soc))
+        self.nextham_uureal_mask = bool(getattr(self.idp, "nextham_uureal_mask", self.nextham_uureal_mask))
 
         latent_kwargs = {
             "mlp_latent_dimensions": latent_channels + [latent_dim],

@@ -164,6 +164,18 @@ def _expand_soc_uureal_compact(
             f"soc_uureal_full_rme={full_rme}."
         )
 
+    if keep_mask is not None:
+        target_mask = torch.as_tensor(keep_mask, dtype=torch.bool).flatten()
+        target_rme = int(target_mask.numel())
+        if target_rme != full_rme and bool(target_mask.all().item()):
+            if tensor.shape[-1] == target_rme:
+                return tensor
+            raise ValueError(
+                f"Compact SOC uu_real LMDB field {field_name} has width "
+                f"{tensor.shape[-1]}; reduced uu_real target expects compact "
+                f"width {target_rme}."
+            )
+
     if tensor.shape[-1] == full_rme:
         return tensor
 
