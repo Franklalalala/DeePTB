@@ -9,6 +9,7 @@ from e3nn import o3
 from torch_runstats.scatter import scatter
 
 from dptb.nn.embedding.emb import Embedding
+from dptb.nn.activation_recompute import checkpoint_function_call
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
 from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
@@ -164,6 +165,16 @@ def _activate_expert_outputs(activation: torch.nn.Module, expert_outputs: torch.
     return torch.stack(activated, dim=1)
 
 
+def _checkpoint_non_linear_block(module: torch.nn.Module, fn, *args):
+    return checkpoint_function_call(
+        fn,
+        *args,
+        enabled=bool(getattr(module, "_activation_recompute_enabled", False)) and module.training,
+        use_reentrant=bool(getattr(module, "_activation_recompute_use_reentrant", False)),
+        preserve_rng_state=bool(getattr(module, "_activation_recompute_preserve_rng_state", False)),
+    )
+
+
 class NonLinearExpertUpdateNode(torch.nn.Module):
     def __init__(self, base_update: torch.nn.Module, num_experts: int = 2):
         super().__init__()
@@ -177,6 +188,56 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
         self.irreps_in = self.base.irreps_in
         self.irreps_out = self.base.irreps_out
 
+    def _run_expert_block(self, x, edge_vector, mole_globals, latents, wigner_D_all):
+        base = self.base
+        expert_messages, wigner_D_all = self.expert_tp(
+            x,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+        )
+        expert_messages = _activate_expert_outputs(base.activation, expert_messages)
+        message, _ = self.expert_mixer(expert_messages)
+        return message, wigner_D_all
+
+    def _run_expert_block_from_parts(
+            self,
+            node_in,
+            edge_in,
+            edge_center,
+            active_edges,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+    ):
+        def _block(node_in_arg, edge_in_arg, edge_center_arg, active_edges_arg, edge_vector_arg,
+                   latents_arg, wigner_D_all_arg):
+            x = torch.cat(
+                [node_in_arg[edge_center_arg[active_edges_arg]], edge_in_arg],
+                dim=-1,
+            )
+            return self._run_expert_block(
+                x,
+                edge_vector_arg[active_edges_arg],
+                mole_globals,
+                latents_arg[active_edges_arg],
+                wigner_D_all_arg,
+            )
+
+        return _checkpoint_non_linear_block(
+            self,
+            _block,
+            node_in,
+            edge_in,
+            edge_center,
+            active_edges,
+            edge_vector,
+            latents,
+            wigner_D_all,
+        )
+
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
                 cutoff_coeffs, active_edges, wigner_D_all, mole_globals):
         base = self.base
@@ -185,18 +246,16 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
         new_node_features = node_features
         node_in = base.node_norm(new_node_features) if base.node_norm is not None else new_node_features
         edge_in = base.edge_norm(edge_features) if base.edge_norm is not None else edge_features
-        expert_messages, wigner_D_all = self.expert_tp(
-            torch.cat(
-                [node_in[edge_center[active_edges]], edge_in],
-                dim=-1,
-            ),
-            edge_vector[active_edges],
+        message, wigner_D_all = self._run_expert_block_from_parts(
+            node_in,
+            edge_in,
+            edge_center,
+            active_edges,
+            edge_vector,
             mole_globals,
-            latents[active_edges],
+            latents,
             wigner_D_all,
         )
-        expert_messages = _activate_expert_outputs(base.activation, expert_messages)
-        message, _ = self.expert_mixer(expert_messages)
         message = base.lin_post(message)
         if hasattr(base, "focus_gate"):
             message = base.focus_gate(message)
@@ -265,6 +324,62 @@ class NonLinearExpertUpdateEdge(torch.nn.Module):
         self.irreps_in = self.base.irreps_in
         self.irreps_out = self.base.irreps_out
 
+    def _run_expert_block(self, x, edge_vector, mole_globals, latents, wigner_D_all):
+        base = self.base
+        expert_edge_features, wigner_D_all = self.expert_tp(
+            x,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+        )
+        expert_edge_features = _activate_expert_outputs(base.activation, expert_edge_features)
+        new_edge_features, _ = self.expert_mixer(expert_edge_features)
+        return new_edge_features, wigner_D_all
+
+    def _run_expert_block_from_parts(
+            self,
+            node_in,
+            edge_in,
+            edge_center,
+            edge_neighbor,
+            active_edges,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+    ):
+        def _block(node_in_arg, edge_in_arg, edge_center_arg, edge_neighbor_arg, active_edges_arg,
+                   edge_vector_arg, latents_arg, wigner_D_all_arg):
+            x = torch.cat(
+                [
+                    node_in_arg[edge_center_arg[active_edges_arg]],
+                    edge_in_arg,
+                    node_in_arg[edge_neighbor_arg[active_edges_arg]],
+                ],
+                dim=-1,
+            )
+            return self._run_expert_block(
+                x,
+                edge_vector_arg[active_edges_arg],
+                mole_globals,
+                latents_arg[active_edges_arg],
+                wigner_D_all_arg,
+            )
+
+        return _checkpoint_non_linear_block(
+            self,
+            _block,
+            node_in,
+            edge_in,
+            edge_center,
+            edge_neighbor,
+            active_edges,
+            edge_vector,
+            latents,
+            wigner_D_all,
+        )
+
     def forward(self, latents, node_features, node_onehot, edge_features, edge_index, edge_vector, cutoff_coeffs,
                 active_edges, edge_one_hot, wigner_D_all, mole_globals):
         base = self.base
@@ -275,23 +390,18 @@ class NonLinearExpertUpdateEdge(torch.nn.Module):
         node_in = base.node_norm(new_node_features) if base.node_norm is not None else new_node_features
         edge_in = base.edge_norm(edge_features) if base.edge_norm is not None else edge_features
 
-        expert_edge_features, wigner_D_all = self.expert_tp(
-            torch.cat(
-                [
-                    node_in[edge_center[active_edges]],
-                    edge_in,
-                    node_in[edge_neighbor[active_edges]],
-                ],
-                dim=-1,
-            ),
-            edge_vector[active_edges],
+        new_edge_features, wigner_D_all = self._run_expert_block_from_parts(
+            node_in,
+            edge_in,
+            edge_center,
+            edge_neighbor,
+            active_edges,
+            edge_vector,
             mole_globals,
-            latents[active_edges],
+            latents,
             wigner_D_all,
         )
 
-        expert_edge_features = _activate_expert_outputs(base.activation, expert_edge_features)
-        new_edge_features, _ = self.expert_mixer(expert_edge_features)
         new_edge_features = base.lin_post(new_edge_features)
 
         scalars = new_edge_features[:, :base.irreps_out[0].dim]

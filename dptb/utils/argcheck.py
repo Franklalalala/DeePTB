@@ -163,6 +163,37 @@ def dynamic_batch_options():
     )
 
 
+def activation_recompute_options():
+    doc = (
+        "Train-time activation recomputation/checkpointing for memory hot paths. "
+        "Supported targets are lem_moe_v3_tp and lem_non_linear_expert_block. "
+        "The nonlinear target checkpoints gather/cat, full expert TP, expert activation, "
+        "and 0e post-activation mixing without changing state_dict keys."
+    )
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument(
+            "targets",
+            list,
+            optional=True,
+            default=["lem_moe_v3_tp", "lem_non_linear_expert_block"],
+        ),
+        Argument("checkpoint_node_tp", bool, optional=True, default=True),
+        Argument("checkpoint_edge_tp", bool, optional=True, default=True),
+        Argument("use_reentrant", bool, optional=True, default=False),
+        Argument("preserve_rng_state", bool, optional=True, default=False),
+    ]
+    return Argument(
+        "activation_recompute",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def train_options():
     doc_num_epoch = "Total number of training epochs. It is worth noted, if the model is reloaded with `-r` or `--restart` option, epoch which have been trained will counted from the time that the checkpoint is saved."
     doc_save_freq = "Frequency, or every how many iteration to saved the current model into checkpoints, The name of checkpoint is formulated as `latest|best_dptb|nnsk_b<bond_cutoff>_c<sk_cutoff>_w<sk_decay_w>`. Default: `10`"
@@ -456,6 +487,7 @@ def train_options():
         # data / batch
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
         dynamic_batch_options(),
+        activation_recompute_options(),
         Argument("ref_batch_size", int, optional=True, default=1, doc=doc_ref_batch_size),
         Argument("val_batch_size", int, optional=True, default=1, doc=doc_val_batch_size),
 

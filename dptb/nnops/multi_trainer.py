@@ -27,6 +27,7 @@ from dptb.nnops.expert_parallel_layout import (
     resolve_expert_parallel_layout,
 )
 from dptb.nn.build import build_model
+from dptb.nn.activation_recompute import configure_activation_recompute
 
 log = logging.getLogger(__name__)
 
@@ -505,6 +506,11 @@ class MultiTrainer(Trainer):
 
         if not hasattr(self.model, 'experts') or len(self.model.experts) != self.num_experts:
             raise ValueError(f"Model must have a nn.ModuleList named 'experts' with {self.num_experts} sub-models!")
+
+        self.activation_recompute_state = configure_activation_recompute(
+            self.model,
+            self.train_options.get("activation_recompute", None),
+        )
 
         if self.distributed_expert:
             self._materialize_local_expert_only()
