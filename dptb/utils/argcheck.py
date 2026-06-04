@@ -93,6 +93,11 @@ def common_options():
         "Whether to expose the NextHAM SOC uu.real mask to dataset and loss "
         "helpers. Default: False"
     )
+    doc_full_soc_prediction = (
+        "Whether to predict the full SOC target space. When True, this "
+        "overrides nextham_uureal_mask and restores all spin and real/imag "
+        "SOC channels. Default: False"
+    )
     doc_train_dip = "Whether to train the dipole moment tensor. Default: False"
     doc_train_polar = "Whether to train the polarizaty tensor. Default: False"
     doc_wave_align = "Whether to align the wavefunctions. Default: False"
@@ -106,6 +111,7 @@ def common_options():
         Argument("train_w_charge", bool, optional=True, default=False, doc=doc_train_w_charge),
         Argument("has_soc", bool, optional=True, default=False, doc=doc_has_soc),
         Argument("nextham_uureal_mask", bool, optional=True, default=False, doc=doc_nextham_uureal_mask),
+        Argument("full_soc_prediction", bool, optional=True, default=False, doc=doc_full_soc_prediction),
         Argument("device", str, optional = True, default="cpu", doc = doc_device),
         Argument("dtype", str, optional = True, default="float32", doc = doc_dtype),
         Argument("seed", int, optional=True, default=3982377700, doc=doc_seed),

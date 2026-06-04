@@ -11,6 +11,7 @@ from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
 from e3nn.o3 import Linear
 from dptb.nn.rescale import E3PerSpeciesScaleShift, E3PerEdgeSpeciesScaleShift
+from dptb.utils.soc_target import resolve_nextham_uureal_mask
 import logging
 
 log = logging.getLogger(__name__)
@@ -116,11 +117,18 @@ class NNENV(nn.Module):
         self.scale_type = scale_type
 
         self.has_soc = has_soc
-        self.nextham_uureal_mask = bool(
+        self.full_soc_prediction = bool(
             kwargs.get(
+                "full_soc_prediction",
+                embedding.get("full_soc_prediction", prediction.get("full_soc_prediction", False)),
+            )
+        )
+        self.nextham_uureal_mask = resolve_nextham_uureal_mask(
+            nextham_uureal_mask=kwargs.get(
                 "nextham_uureal_mask",
                 embedding.get("nextham_uureal_mask", prediction.get("nextham_uureal_mask", False)),
-            )
+            ),
+            full_soc_prediction=self.full_soc_prediction,
         )
         print(f'NNENV soc flag: {self.has_soc}')
 
@@ -131,6 +139,7 @@ class NNENV(nn.Module):
                 device=self.device,
                 has_soc=has_soc,
                 nextham_uureal_mask=self.nextham_uureal_mask,
+                full_soc_prediction=self.full_soc_prediction,
             )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."
@@ -142,7 +151,11 @@ class NNENV(nn.Module):
         self.nextham_uureal_mask = bool(getattr(self.idp, "nextham_uureal_mask", self.nextham_uureal_mask))
         self.idp.get_orbpair_maps()
 
-        embedding.update({'has_soc': has_soc, 'nextham_uureal_mask': self.nextham_uureal_mask})
+        embedding.update({
+            'has_soc': has_soc,
+            'nextham_uureal_mask': self.nextham_uureal_mask,
+            'full_soc_prediction': self.full_soc_prediction,
+        })
 
         n_species = len(self.basis.keys())
         # initialize the embedding layer

@@ -27,6 +27,7 @@ from .lem_moe_v3_plugins import (
 from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3
 import math
 from dptb.data.transforms import OrbitalMapper
+from dptb.utils.soc_target import resolve_nextham_uureal_mask
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
@@ -422,7 +423,11 @@ class LemMoEV3(torch.nn.Module):
             device = torch.device(device)
         self.device = device
         self.has_soc = bool(kwargs.get("has_soc", False))
-        self.nextham_uureal_mask = bool(kwargs.get("nextham_uureal_mask", False))
+        self.full_soc_prediction = bool(kwargs.get("full_soc_prediction", False))
+        self.nextham_uureal_mask = resolve_nextham_uureal_mask(
+            nextham_uureal_mask=kwargs.get("nextham_uureal_mask", False),
+            full_soc_prediction=self.full_soc_prediction,
+        )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
@@ -439,6 +444,7 @@ class LemMoEV3(torch.nn.Module):
                 device=self.device,
                 has_soc=self.has_soc,
                 nextham_uureal_mask=self.nextham_uureal_mask,
+                full_soc_prediction=self.full_soc_prediction,
             )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."

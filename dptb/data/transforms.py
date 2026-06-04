@@ -2,6 +2,7 @@ from typing import Dict, Optional, Union, List
 from dptb.data.AtomicDataDict import Type
 from dptb.utils.tools import get_uniq_symbol
 from dptb.utils.constants import anglrMId
+from dptb.utils.soc_target import resolve_nextham_uureal_mask
 import re
 import warnings
 
@@ -454,6 +455,7 @@ class OrbitalMapper(BondMapper):
             has_soc: bool = False,
             soc_complex_doubling: bool = True,
             nextham_uureal_mask: bool = False,
+            full_soc_prediction: bool = False,
     ):
         """
         Maps orbital pairs to feature indices (Reduced Matrix Elements).
@@ -487,7 +489,11 @@ class OrbitalMapper(BondMapper):
         self.device = device
         self.has_soc = has_soc
         self.soc_complex_doubling = soc_complex_doubling if has_soc else False
-        self.nextham_uureal_mask = bool(nextham_uureal_mask)
+        self.full_soc_prediction = bool(full_soc_prediction)
+        self.nextham_uureal_mask = resolve_nextham_uureal_mask(
+            nextham_uureal_mask=nextham_uureal_mask,
+            full_soc_prediction=self.full_soc_prediction,
+        )
         self.soc_uureal_target = bool(
             self.method == "e3tb" and self.has_soc and self.nextham_uureal_mask
         )
@@ -496,6 +502,11 @@ class OrbitalMapper(BondMapper):
                 "[OrbitalMapper] nextham_uureal_mask=True: build a reduced "
                 "SOC target space containing only uu_real. The full SOC "
                 "spin/complex factor is kept out of RME maps and irreps."
+            )
+        elif self.method == "e3tb" and self.has_soc and self.full_soc_prediction:
+            log.info(
+                "[OrbitalMapper] full_soc_prediction=True: use the full SOC "
+                "target space, including all spin and real/imag blocks."
             )
         if self.method not in ["e3tb", "sktb"]:
             raise ValueError(f"Unknown method {self.method}, only 'e3tb' and 'sktb' are supported.")

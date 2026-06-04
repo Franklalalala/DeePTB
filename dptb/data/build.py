@@ -174,6 +174,7 @@ class DatasetBuilder:
                 has_soc=has_soc_flag,
                 soc_complex_doubling=kwargs.get('soc_complex_doubling', True),
                 nextham_uureal_mask=kwargs.get('nextham_uureal_mask', False),
+                full_soc_prediction=kwargs.get('full_soc_prediction', False),
             )
         else:
             idp = None

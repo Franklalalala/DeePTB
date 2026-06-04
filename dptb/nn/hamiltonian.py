@@ -6,6 +6,7 @@ from dptb.utils.constants import anglrMId
 from e3nn.o3 import wigner_3j, xyz_to_angles
 from dptb.nn.tensor_product import wigner_D
 from dptb.utils.tools import float2comlex
+from dptb.utils.soc_target import resolve_nextham_uureal_mask
 # 保持原有的 import，确保 get_soc_matrix_cubic_basis 可用
 from dptb.nn.sktb.socbasic import get_soc_matrix_cubic_basis
 import re
@@ -61,8 +62,12 @@ class E3Hamiltonian(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.soc = soc
-        self.nextham_uureal_mask = bool(
-            kwargs.get("nextham_uureal_mask", getattr(idp, "nextham_uureal_mask", False))
+        self.full_soc_prediction = bool(
+            kwargs.get("full_soc_prediction", getattr(idp, "full_soc_prediction", False))
+        )
+        self.nextham_uureal_mask = resolve_nextham_uureal_mask(
+            nextham_uureal_mask=kwargs.get("nextham_uureal_mask", getattr(idp, "nextham_uureal_mask", False)),
+            full_soc_prediction=self.full_soc_prediction,
         )
 
         # 定义复数类型
@@ -121,6 +126,7 @@ class E3Hamiltonian(torch.nn.Module):
                 has_soc=self.soc,
                 soc_complex_doubling=soc_complex_doubling,
                 nextham_uureal_mask=self.nextham_uureal_mask,
+                full_soc_prediction=self.full_soc_prediction,
             )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."

@@ -15,6 +15,7 @@ from dptb.utils.constants import anglrMId
 from dptb.nn.dftbsk import DFTBSK
 import re
 from dptb.nn.hr2hk import HR2HK, HR2HK_Gamma_Only
+from dptb.utils.soc_target import resolve_nextham_uureal_mask
 # from pyscf import gto, dft
 
 """this is the register class for descriptors
@@ -656,6 +657,12 @@ class HamilLossAbs(nn.Module):
         if self.debug:
             self._log_caller_info(kwargs)
 
+        full_soc_prediction = bool(kwargs.get("full_soc_prediction", False))
+        nextham_uureal_mask = resolve_nextham_uureal_mask(
+            nextham_uureal_mask=nextham_uureal_mask,
+            full_soc_prediction=full_soc_prediction,
+        )
+
         if basis is not None:
             has_soc = kwargs.get('has_soc', False)
             self.idp = OrbitalMapper(
@@ -664,6 +671,7 @@ class HamilLossAbs(nn.Module):
                 device=self.device,
                 has_soc=has_soc,
                 nextham_uureal_mask=nextham_uureal_mask,
+                full_soc_prediction=full_soc_prediction,
             )
             log.warning(f'initialize loss rme with nextham_uureal_mask: {nextham_uureal_mask}')
             if idp is not None:
