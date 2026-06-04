@@ -6,7 +6,7 @@ import torch
 from torch_runstats.scatter import scatter
 from torch import fx
 from e3nn import o3
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_add, scatter_max, scatter_mean
 from e3nn.o3 import Linear, SphericalHarmonics, FullyConnectedTensorProduct, TensorProduct
 from dptb.data import AtomicDataDict
 from dptb.nn.embedding.emb import Embedding
@@ -38,6 +38,17 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def _normalize_node_message_aggregation(mode: Optional[str]) -> str:
+    mode = mode or "scatter"
+    allowed = {"scatter", "single_head_0e"}
+    if mode not in allowed:
+        raise ValueError(
+            "node_message_aggregation must be one of "
+            f"{sorted(allowed)}, got {mode!r}."
+        )
+    return mode
+
+
 def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
     mode = mode or os.environ.get("DPTB_ONEHOT_TP_MODE", "scalar_fast")
     allowed = {"scalar_fast"}
@@ -66,6 +77,141 @@ def _irreps_slices(irreps: o3.Irreps) -> List[slice]:
         slices.append(slice(offset, offset + width))
         offset += width
     return slices
+
+
+def _focus_feature_index(irreps: o3.Irreps, num_focus: int) -> torch.Tensor:
+    focus_indices = []
+    for mul, ir in irreps:
+        per_channel_focus = torch.arange(mul, dtype=torch.long).remainder(num_focus)
+        focus_indices.append(per_channel_focus.repeat_interleave(ir.dim))
+    if not focus_indices:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(focus_indices, dim=0)
+
+
+class PostActivation0eFocusGate(torch.nn.Module):
+    """Post-activation scalar router that gates equivariant message channels."""
+
+    def __init__(
+            self,
+            irreps: o3.Irreps,
+            num_focus: int = 1,
+            hidden_dim: Optional[int] = None,
+            dtype: Union[str, torch.dtype] = torch.float32,
+            device: Union[str, torch.device] = torch.device("cpu"),
+    ):
+        super().__init__()
+        self.irreps = o3.Irreps(irreps)
+        self.num_focus = int(num_focus)
+        if self.num_focus < 1:
+            raise ValueError(f"num_focus must be >= 1, got {num_focus!r}")
+        if self.irreps[0].ir.l != 0:
+            raise ValueError("PostActivation0eFocusGate expects irreps to start with 0e scalars.")
+        self.scalar_dim = self.irreps[0].dim
+        self.enabled = self.num_focus > 1
+        self.register_buffer(
+            "focus_index",
+            _focus_feature_index(self.irreps, self.num_focus).to(device=device),
+        )
+        if self.enabled:
+            hidden = hidden_dim or max(16, self.scalar_dim)
+            self.router = torch.nn.Sequential(
+                torch.nn.Linear(self.scalar_dim, hidden, dtype=dtype, device=device),
+                torch.nn.SiLU(),
+                torch.nn.Linear(hidden, self.num_focus, dtype=dtype, device=device),
+            )
+            torch.nn.init.zeros_(self.router[-1].weight)
+            torch.nn.init.zeros_(self.router[-1].bias)
+        else:
+            self.router = None
+
+    def forward(self, message: torch.Tensor) -> torch.Tensor:
+        if not self.enabled or message.numel() == 0:
+            return message
+        scalars = message[:, :self.scalar_dim]
+        focus_scale = 2.0 * torch.sigmoid(self.router(scalars))
+        feature_scale = focus_scale.index_select(1, self.focus_index.to(device=message.device))
+        return message * feature_scale
+
+
+class SingleHead0eEnvelopeAttention(torch.nn.Module):
+    """Single-head destination attention from 0e scalars with cutoff envelope gating."""
+
+    def __init__(
+            self,
+            node_scalar_dim: int,
+            message_scalar_dim: int,
+            latent_dim: int,
+            attn_dim: int = 32,
+            dtype: Union[str, torch.dtype] = torch.float32,
+            device: Union[str, torch.device] = torch.device("cpu"),
+    ):
+        super().__init__()
+        if attn_dim < 1:
+            raise ValueError(f"attn_dim must be >= 1, got {attn_dim!r}")
+        self.query = torch.nn.Linear(node_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
+        self.key = torch.nn.Linear(message_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
+        self.latent_bias = torch.nn.Sequential(
+            torch.nn.LayerNorm(latent_dim, dtype=dtype, device=device),
+            torch.nn.Linear(latent_dim, attn_dim, dtype=dtype, device=device),
+            torch.nn.SiLU(),
+            torch.nn.Linear(attn_dim, 1, dtype=dtype, device=device),
+        )
+        self.logit_scale = attn_dim ** -0.5
+        self.null_logit = torch.nn.Parameter(torch.tensor(-8.0, dtype=dtype, device=device))
+
+    def attention_weights(
+            self,
+            dst_index: torch.Tensor,
+            node_scalars: torch.Tensor,
+            message_scalars: torch.Tensor,
+            latents: torch.Tensor,
+            cutoff_coeffs: torch.Tensor,
+            dim_size: int,
+    ) -> torch.Tensor:
+        if dst_index.numel() == 0:
+            return message_scalars.new_zeros((0,))
+
+        q = self.query(node_scalars.index_select(0, dst_index))
+        k = self.key(message_scalars)
+        logits = (q * k).sum(dim=-1) * self.logit_scale
+        logits = logits + self.latent_bias(latents).squeeze(-1)
+
+        max_per_node = scatter_max(logits, dst_index, dim=0, dim_size=dim_size)[0]
+        max_per_node = torch.where(
+            torch.isfinite(max_per_node),
+            max_per_node,
+            torch.zeros_like(max_per_node),
+        )
+        shifted = logits - max_per_node.index_select(0, dst_index)
+        numer = torch.exp(shifted)
+        numer = numer * cutoff_coeffs.clamp_min(0.0)
+
+        denom = scatter_add(numer, dst_index, dim=0, dim_size=dim_size)
+        null_numer = torch.exp(self.null_logit - max_per_node)
+        denom = denom + null_numer
+        denom = denom.clamp_min(torch.finfo(numer.dtype).tiny)
+        return numer / denom.index_select(0, dst_index)
+
+    def forward(
+            self,
+            message: torch.Tensor,
+            dst_index: torch.Tensor,
+            node_scalars: torch.Tensor,
+            message_scalars: torch.Tensor,
+            latents: torch.Tensor,
+            cutoff_coeffs: torch.Tensor,
+            dim_size: int,
+    ) -> torch.Tensor:
+        weights = self.attention_weights(
+            dst_index=dst_index,
+            node_scalars=node_scalars,
+            message_scalars=message_scalars,
+            latents=latents,
+            cutoff_coeffs=cutoff_coeffs,
+            dim_size=dim_size,
+        )
+        return scatter_add(message * weights.unsqueeze(-1), dst_index, dim=0, dim_size=dim_size)
 
 
 def _instruction_get(instruction, name: str, index: int):
@@ -371,6 +517,9 @@ class LemMoEV3(torch.nn.Module):
             so2_m_linear_mode: Optional[str] = None,
             mole_linear_m0_mode: Optional[str] = None,
             onehot_tp_mode: Optional[str] = None,
+            node_message_aggregation: str = "scatter",
+            num_focus: int = 1,
+            focus_attention_dim: int = 32,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             universal: Optional[bool] = False,
@@ -429,6 +578,8 @@ class LemMoEV3(torch.nn.Module):
             full_soc_prediction=self.full_soc_prediction,
         )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
+        self.num_focus = int(num_focus)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
         )
@@ -436,6 +587,11 @@ class LemMoEV3(torch.nn.Module):
             "mole_linear_m0_mode", mole_linear_m0_mode
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
+        log.info(
+            "  - DPA4-style Focus/Aggregation: "
+            f"num_focus={self.num_focus}, node_message_aggregation={self.node_message_aggregation}, "
+            f"focus_attention_dim={focus_attention_dim}"
+        )
 
         if basis is not None:
             self.idp = OrbitalMapper(
@@ -565,6 +721,9 @@ class LemMoEV3(torch.nn.Module):
                 so2_fusion_mode=so2_fusion_mode,
                 mole_linear_mode=mole_linear_mode,
                 onehot_tp_mode=self.onehot_tp_mode,
+                node_message_aggregation=self.node_message_aggregation,
+                num_focus=self.num_focus,
+                focus_attention_dim=focus_attention_dim,
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
@@ -1050,6 +1209,9 @@ class UpdateNode(torch.nn.Module):
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
             onehot_tp_mode: Optional[str] = None,
+            node_message_aggregation: str = "scatter",
+            num_focus: int = 1,
+            focus_attention_dim: int = 32,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1063,6 +1225,7 @@ class UpdateNode(torch.nn.Module):
         self.device = device
         self.res_update = res_update
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -1138,6 +1301,23 @@ class UpdateNode(torch.nn.Module):
             internal_weights=True,
             biases=True,
         )
+        self.focus_gate = PostActivation0eFocusGate(
+            self.irreps_out,
+            num_focus=num_focus,
+            dtype=dtype,
+            device=device,
+        )
+        if self.node_message_aggregation == "single_head_0e":
+            self.node_attention = SingleHead0eEnvelopeAttention(
+                node_scalar_dim=self.irreps_in[0].dim,
+                message_scalar_dim=self.irreps_out[0].dim,
+                latent_dim=latent_dim,
+                attn_dim=focus_attention_dim,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            self.node_attention = None
 
         if res_update:
             self.linear_res = Linear(
@@ -1192,7 +1372,7 @@ class UpdateNode(torch.nn.Module):
                 )
 
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
-                active_edges, wigner_D_all, mole_globals):  # Accept globals
+                cutoff_coeffs, active_edges, wigner_D_all, mole_globals):  # Accept globals
         edge_center = edge_index[0]
         edge_neighbor = edge_index[1]
 
@@ -1212,14 +1392,29 @@ class UpdateNode(torch.nn.Module):
 
         message = self.activation(message)
         message = self.lin_post(message)
+        message = self.focus_gate(message)
         scalars = message[:, :self.irreps_out[0].dim]
 
         weights = self.env_embed_mlps(latents[active_edges])
-        new_node_features = scatter(
-            self._env_weighter(message, weights),
-            edge_center[active_edges],
-            dim=0,
-        )
+        weighted_message = self._env_weighter(message, weights)
+        active_edge_center = edge_center[active_edges]
+        if self.node_attention is None:
+            new_node_features = scatter(
+                weighted_message,
+                active_edge_center,
+                dim=0,
+            )
+        else:
+            node_scalars = node_in[:, :self.irreps_in[0].dim]
+            new_node_features = self.node_attention(
+                weighted_message,
+                active_edge_center,
+                node_scalars,
+                scalars,
+                latents[active_edges],
+                cutoff_coeffs[active_edges],
+                dim_size=node_features.shape[0],
+            )
 
         if self.env_sum_normalizations.ndim < 1:
             norm_const = self.env_sum_normalizations
@@ -1542,6 +1737,9 @@ class Layer(torch.nn.Module):
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
             onehot_tp_mode: Optional[str] = None,
+            node_message_aggregation: str = "scatter",
+            num_focus: int = 1,
+            focus_attention_dim: int = 32,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1613,6 +1811,9 @@ class Layer(torch.nn.Module):
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
             onehot_tp_mode=onehot_tp_mode,
+            node_message_aggregation=node_message_aggregation,
+            num_focus=num_focus,
+            focus_attention_dim=focus_attention_dim,
         )
 
         self.node_ffn = None
@@ -1633,7 +1834,7 @@ class Layer(torch.nn.Module):
                                                                 edge_index, edge_vector, cutoff_coeffs, active_edges,
                                                                 edge_one_hot, wigner_D_all, mole_globals)
         node_features = self.node_update(latents, node_features, edge_features, atom_type, node_onehot, edge_index,
-                                         edge_vector, active_edges, wigner_D_all, mole_globals)
+                                         edge_vector, cutoff_coeffs, active_edges, wigner_D_all, mole_globals)
         if self.node_ffn is not None:
             node_features = self.node_ffn(node_features)
 

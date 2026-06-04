@@ -1124,6 +1124,9 @@ def slem():
     doc_so2_m_linear_mode = "SO2 m-linear backend for non-MoE SO2 TP. Supported values are `standard`, `indexed_sandwich_multi`, or null; `cublas_grouped` is accepted only as a legacy alias. Triton experiment modes remain unsupported."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
+    doc_node_message_aggregation = "Node message aggregation mode. Supported: `scatter` for the legacy sum, `single_head_0e` for DPA4-style envelope-gated scalar attention."
+    doc_num_focus = "Number of post-activation 0e focus gates. Values larger than 1 enable DPA4-style channel focus routing."
+    doc_focus_attention_dim = "Hidden dimension of the single-head 0e attention query/key projections."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
@@ -1179,6 +1182,9 @@ def slem():
         Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
         Argument("mole_linear_m0_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_m0_mode),
         Argument("onehot_tp_mode", [str, None], optional=True, default=None, doc=doc_onehot_tp_mode),
+        Argument("node_message_aggregation", str, optional=True, default="scatter", doc=doc_node_message_aggregation),
+        Argument("num_focus", int, optional=True, default=1, doc=doc_num_focus),
+        Argument("focus_attention_dim", int, optional=True, default=32, doc=doc_focus_attention_dim),
 
         # ---- New norm conditioning flags ----
         Argument("norm_build_node_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_node_condition_branch),

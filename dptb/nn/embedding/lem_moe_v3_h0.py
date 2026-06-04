@@ -77,6 +77,7 @@ class LemMoEV3H0(LemMoEV3):
 
         global_feat = scatter_mean(node_one_hot, batch, dim=0)
         coeffs, monitor_val, expert_load_cv = self.router(global_feat)
+        topk_indices, topk_values = self.router.last_topk()
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
 
@@ -108,12 +109,23 @@ class LemMoEV3H0(LemMoEV3):
 
         edge_one_hot = edge_one_hot[active_edges]
         if precomputed_split_sizes is not None:
-            mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=precomputed_split_sizes)
+            mole_globals = MOLEGlobals(
+                coefficients=coeffs,
+                split_sizes=precomputed_split_sizes,
+                topk_indices=topk_indices,
+                topk_values=topk_values,
+            )
         else:
             edge_batch = batch[edge_index[0][active_edges]]
             num_systems = coeffs.shape[0]
             edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes)
+            mole_globals = MOLEGlobals(
+                coefficients=coeffs,
+                sizes=edge_sizes,
+                graph_index=edge_batch,
+                topk_indices=topk_indices,
+                topk_values=topk_values,
+            )
 
         data[_keys.EDGE_OVERLAP_KEY] = latents
         wigner_D_all = None
