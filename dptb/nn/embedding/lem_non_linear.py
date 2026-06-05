@@ -281,6 +281,23 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
                 cutoff_coeffs[active_edges],
                 dim_size=node_features.shape[0],
             )
+        edge_aggregation_gate = getattr(base, "edge_aggregation_gate", None)
+        if edge_aggregation_gate is not None:
+            if new_node_features.shape[0] != node_features.shape[0]:
+                padded_node_features = node_features.new_zeros(
+                    node_features.shape[0],
+                    new_node_features.shape[1],
+                )
+                padded_node_features[:new_node_features.shape[0]] = new_node_features
+                new_node_features = padded_node_features
+            node_scalars = node_in[:, :base.irreps_in[0].dim]
+            new_node_features = edge_aggregation_gate(
+                new_node_features,
+                node_scalars,
+                dst_index=active_edge_center,
+                edge_message=weighted_message,
+                dim_size=node_features.shape[0],
+            )
 
         if base.env_sum_normalizations.ndim < 1:
             norm_const = base.env_sum_normalizations

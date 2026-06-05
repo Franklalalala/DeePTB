@@ -1,7 +1,7 @@
 from dptb.nnops.trainer import Trainer
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
-from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor
+from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
 from dptb.plugins.train_logger import Logger
 from dptb.utils.argcheck import normalize, collect_cutoffs, chk_avg_per_iter
 from dptb.plugins.saver import Saver
@@ -580,6 +580,24 @@ def train(
                 grad_norm_dead_threshold=train_options.get(
                     "monitor_param_dynamics_grad_norm_dead_threshold", 1.0e-12
                 ),
+            )
+        )
+
+    if bool(train_options.get("monitor_gated_edge_attention", False)):
+        gated_edge_freq = int(
+            train_options.get("monitor_gated_edge_attention_freq") or train_options["display_freq"]
+        )
+        gated_edge_freq = max(1, gated_edge_freq)
+        gated_edge_tb_opt = train_options.get("monitor_gated_edge_attention_tensorboard", None)
+        if gated_edge_tb_opt is None:
+            gated_edge_tb = bool(train_options.get("use_tensorboard", False))
+        else:
+            gated_edge_tb = bool(gated_edge_tb_opt)
+        trainer.register_plugin(
+            GatedEdgeAggregationMonitor(
+                output,
+                interval=[(gated_edge_freq, 'iteration')],
+                tensorboard=gated_edge_tb,
             )
         )
 

@@ -217,6 +217,13 @@ def train_options():
     doc_monitor_param_dynamics_freq = (
         "Parameter dynamics sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
     )
+    doc_monitor_gated_edge_attention = (
+        "Set true to record Fig.2-style diagnostics for gated edge aggregation: gate statistics, "
+        "pre/post-gate sparsity, activation maxima, and top inbound-edge contribution share."
+    )
+    doc_monitor_gated_edge_attention_freq = (
+        "Gated edge aggregation monitor sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
+    )
     doc_expert_lrs = (
         "Optional per-expert initial learning rates. "
         "If provided, it must be a list of floats with length == num_experts (len(distance_ranges)). "
@@ -501,6 +508,9 @@ def train_options():
         Argument("monitor_param_dynamics_grad_eps", float, optional=True, default=0.0, doc="Absolute gradient threshold used for grad_nonzero_fraction."),
         Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Deprecated compatibility option. DEAD detection is gradient-norm based; delta metrics are diagnostic only."),
         Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Gradient norm threshold used by parameter dynamics DEAD detection; groups below this value count as no-gradient."),
+        Argument("monitor_gated_edge_attention", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention),
+        Argument("monitor_gated_edge_attention_freq", int, optional=True, default=0, doc=doc_monitor_gated_edge_attention_freq),
+        Argument("monitor_gated_edge_attention_tensorboard", bool, optional=True, default=None, doc="Write gated edge aggregation diagnostics to TensorBoard when the monitor is enabled. Default follows use_tensorboard."),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 
@@ -1165,6 +1175,7 @@ def slem():
     doc_node_message_aggregation = "Node message aggregation mode. Supported: `scatter` for the legacy sum, `single_head_0e` for DPA4-style envelope-gated scalar attention."
     doc_num_focus = "Number of post-activation 0e focus gates. Values larger than 1 enable DPA4-style channel focus routing."
     doc_focus_attention_dim = "Hidden dimension of the single-head 0e attention query/key projections."
+    doc_edge_aggregation_gated_attention = "Apply query-dependent sigmoid gating after edge-to-node aggregation, following the SDPA-output gated-attention pattern while preserving equivariant irrep groups. Default: `False`."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
@@ -1227,6 +1238,7 @@ def slem():
         Argument("node_message_aggregation", str, optional=True, default="scatter", doc=doc_node_message_aggregation),
         Argument("num_focus", int, optional=True, default=1, doc=doc_num_focus),
         Argument("focus_attention_dim", int, optional=True, default=32, doc=doc_focus_attention_dim),
+        Argument("edge_aggregation_gated_attention", bool, optional=True, default=False, doc=doc_edge_aggregation_gated_attention),
 
         # ---- New norm conditioning flags ----
         Argument("norm_build_node_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_node_condition_branch),

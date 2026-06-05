@@ -1050,6 +1050,128 @@ class CUDAMemoryMonitor(Plugin):
             self._epoch_max[name] = None
 
 
+class GatedEdgeAggregationMonitor(Plugin):
+    """Record Fig.2-style sparsity and sink diagnostics for gated edge aggregation."""
+
+    _HEADER = [
+        "iter",
+        "rank",
+        "module",
+        "gate_mean",
+        "gate_std",
+        "gate_min",
+        "gate_max",
+        "gate_sparsity_lt_0_1",
+        "gate_sparsity_lt_1e_2",
+        "pre_sparsity_lt_1e_2",
+        "post_sparsity_lt_1e_2",
+        "pre_activation_max",
+        "post_activation_max",
+        "top_edge_share_mean",
+        "top_edge_share_max",
+        "active_edges",
+        "nodes_with_edges",
+    ]
+
+    def __init__(
+        self,
+        output_dir,
+        interval=None,
+        tensorboard=False,
+        tensorboard_log_dir=None,
+    ):
+        if interval is None:
+            interval = [(1, "iteration")]
+        super(GatedEdgeAggregationMonitor, self).__init__(interval)
+        self.output_dir = output_dir or "monitor_logs"
+        self.csv_path = os.path.join(self.output_dir, "gated_edge_aggregation.csv")
+        self.tensorboard = bool(tensorboard)
+        self.tensorboard_log_dir = tensorboard_log_dir
+        self.writer = None
+        self.rank = 0
+        self.is_main_process = True
+        self._modules = []
+
+    def register(self, trainer):
+        self.trainer = trainer
+        self.rank = int(getattr(trainer, "rank", 0))
+        self.is_main_process = bool(getattr(trainer, "is_main_process", True))
+        self._modules = [
+            (name, module)
+            for name, module in trainer.model.named_modules()
+            if module.__class__.__name__ == "GatedEdgeAggregation"
+        ]
+        if self.is_main_process:
+            os.makedirs(self.output_dir, exist_ok=True)
+            self._ensure_csv_header()
+            if self.tensorboard:
+                tb_dir = self.tensorboard_log_dir or os.path.join(self.output_dir, "tensorboard_logs")
+                self.writer = SummaryWriter(log_dir=tb_dir)
+        log.info(
+            "[GatedEdgeAggregationMonitor][rank=%s] monitoring %s modules; csv=%s",
+            self.rank,
+            len(self._modules),
+            self.csv_path,
+        )
+
+    def _ensure_csv_header(self):
+        needs_header = (not os.path.exists(self.csv_path)) or os.path.getsize(self.csv_path) == 0
+        if not needs_header:
+            return
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._HEADER)
+            writer.writeheader()
+
+    @staticmethod
+    def _format_float(value):
+        return f"{float(value):.12g}"
+
+    def _rows(self, iteration):
+        rows = []
+        for name, module in self._modules:
+            stats = getattr(module, "last_stats", None)
+            if not stats:
+                continue
+            row = {
+                "iter": int(iteration),
+                "rank": self.rank,
+                "module": name,
+            }
+            for key in self._HEADER[3:]:
+                value = stats.get(key, 0.0)
+                if key in {"active_edges", "nodes_with_edges"}:
+                    row[key] = int(value)
+                else:
+                    row[key] = self._format_float(value)
+            rows.append(row)
+        return rows
+
+    def _write_tensorboard(self, rows, iteration):
+        if self.writer is None:
+            return
+        for row in rows:
+            module_name = row["module"].replace(".", "/")
+            for key in self._HEADER[3:]:
+                self.writer.add_scalar(
+                    f"GatedEdgeAggregation/{module_name}/{key}",
+                    float(row[key]),
+                    iteration,
+                )
+        self.writer.flush()
+
+    def iteration(self, **kwargs):
+        if not self.is_main_process:
+            return
+        iteration = kwargs.get("time", getattr(self.trainer, "iter", 0))
+        rows = self._rows(iteration)
+        if not rows:
+            return
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._HEADER)
+            writer.writerows(rows)
+        self._write_tensorboard(rows, iteration)
+
+
 class ParamDynamicsMonitor(Plugin):
     """
     Lightweight production monitor for parameter updates and gradient flow.
