@@ -5,6 +5,7 @@ from dptb.nn.embedding.lem_moe_v3 import (
     GatedEdgeAggregation,
     PostActivation0eFocusGate,
     SingleHead0eEnvelopeAttention,
+    UpdateNode,
 )
 from dptb.nn.embedding.lem_non_linear import NonLinearExpertUpdateNode
 from dptb.plugins.monitor import GatedEdgeAggregationMonitor
@@ -67,6 +68,119 @@ def test_single_head_0e_attention_normalizes_per_destination_with_envelope():
     assert out.shape == (3, 7)
     assert torch.isfinite(out).all()
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+def test_single_head_0e_attention_can_square_envelope_without_latent_bias():
+    attention = SingleHead0eEnvelopeAttention(
+        node_scalar_dim=1,
+        message_scalar_dim=1,
+        latent_dim=2,
+        attn_dim=1,
+        envelope_power=2.0,
+        use_latent_bias=False,
+    )
+    with torch.no_grad():
+        attention.query.weight.zero_()
+        attention.key.weight.zero_()
+
+    dst_index = torch.tensor([0, 0], dtype=torch.long)
+    node_scalars = torch.zeros(1, 1)
+    message_scalars = torch.zeros(2, 1)
+    cutoff = torch.tensor([1.0, 0.5])
+
+    weights_a = attention.attention_weights(
+        dst_index=dst_index,
+        node_scalars=node_scalars,
+        message_scalars=message_scalars,
+        latents=torch.zeros(2, 2),
+        cutoff_coeffs=cutoff,
+        dim_size=1,
+    )
+    weights_b = attention.attention_weights(
+        dst_index=dst_index,
+        node_scalars=node_scalars,
+        message_scalars=message_scalars,
+        latents=torch.full((2, 2), 1000.0),
+        cutoff_coeffs=cutoff,
+        dim_size=1,
+    )
+
+    assert torch.allclose(weights_a, torch.tensor([0.8, 0.2]), atol=1e-5)
+    assert torch.allclose(weights_a, weights_b)
+
+
+def test_single_head_0e_attention_key_layer_norm_is_key_only():
+    attention = SingleHead0eEnvelopeAttention(
+        node_scalar_dim=2,
+        message_scalar_dim=2,
+        latent_dim=2,
+        attn_dim=2,
+        use_latent_bias=False,
+        key_layer_norm=True,
+    )
+    with torch.no_grad():
+        attention.query.weight.copy_(torch.eye(2))
+        attention.key.weight.copy_(torch.eye(2))
+
+    weights = attention.attention_weights(
+        dst_index=torch.tensor([0, 0], dtype=torch.long),
+        node_scalars=torch.tensor([[1.0, 0.0]]),
+        message_scalars=torch.tensor([[1.0, 3.0], [10.0, 12.0]]),
+        latents=torch.zeros(2, 2),
+        cutoff_coeffs=torch.ones(2),
+        dim_size=1,
+    )
+
+    assert isinstance(attention.key_norm, torch.nn.LayerNorm)
+    assert torch.allclose(weights, torch.tensor([0.5, 0.5]), atol=1e-5)
+
+
+def test_update_node_can_bypass_env_message_weighting():
+    class DummyTP(torch.nn.Module):
+        def forward(self, x, r, mole_globals, latents=None, wigner_D_all=None):
+            return torch.ones(x.shape[0], 1, dtype=x.dtype, device=x.device), wigner_D_all
+
+    class DummyUpdate:
+        def __init__(self):
+            self.irreps_in = o3.Irreps("1x0e")
+            self.irreps_out = o3.Irreps("1x0e")
+            self.edge_irreps_in = o3.Irreps("1x0e")
+            self.tp = DummyTP()
+            self.activation = torch.nn.Identity()
+            self.lin_post = torch.nn.Identity()
+            self.focus_gate = torch.nn.Identity()
+            self.post_activation_expert_mixer = None
+            self.node_norm = None
+            self.edge_norm = None
+            self.node_attention = None
+            self.edge_aggregation_gate = None
+            self.env_sum_normalizations = torch.tensor(1.0)
+            self.res_update = False
+            self.use_layer_onehot_tp = False
+            self.edge_message_env_weight = False
+            self.env_embed_mlps = self._unexpected_env_weight
+            self._env_weighter = self._unexpected_env_weight
+
+        def _unexpected_env_weight(self, *args, **kwargs):
+            raise AssertionError("env message weighting should be bypassed")
+
+    dummy = DummyUpdate()
+    out = UpdateNode.forward(
+        dummy,
+        latents=torch.zeros(2, 1),
+        node_features=torch.zeros(2, 1),
+        edge_features=torch.zeros(2, 1),
+        atom_type=torch.zeros(2, 1, dtype=torch.long),
+        node_onehot=torch.zeros(2, 1),
+        edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        edge_vector=torch.zeros(2, 3),
+        cutoff_coeffs=torch.ones(2),
+        active_edges=torch.tensor([0, 1], dtype=torch.long),
+        wigner_D_all=None,
+        mole_globals=None,
+    )
+
+    assert torch.allclose(out, torch.ones(2, 1))
 
 
 def test_gated_edge_aggregation_applies_equivariant_sigmoid_gate_and_records_stats():
@@ -207,6 +321,7 @@ def test_non_linear_node_wrapper_applies_base_gated_edge_aggregation():
             self.env_sum_normalizations = torch.tensor(1.0)
             self.res_update = False
             self.use_layer_onehot_tp = False
+            self.edge_message_env_weight = True
             self.env_embed_mlps = lambda latents: latents
             self._env_weighter = lambda message, weights: message
 

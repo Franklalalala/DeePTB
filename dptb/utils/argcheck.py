@@ -1185,6 +1185,11 @@ def slem():
     doc_num_focus = "Number of post-activation 0e focus gates. Values larger than 1 enable DPA4-style channel focus routing."
     doc_focus_attention_dim = "Hidden dimension of the single-head 0e attention query/key projections."
     doc_edge_aggregation_gated_attention = "Apply query-dependent sigmoid gating after edge-to-node aggregation, following the SDPA-output gated-attention pattern while preserving equivariant irrep groups. Default: `False`."
+    doc_edge_attention_key_source = "Key source for single-head edge attention. Currently supported: `message`, using post-activation edge message 0e scalars as keys. Default: `message`."
+    doc_edge_attention_envelope_power = "Power applied to cutoff coefficients in single-head edge attention numerator. `1.0` preserves the legacy implementation; `2.0` uses cutoff^2. Default: `1.0`."
+    doc_edge_attention_use_latent_bias = "Whether to add latent-conditioned bias to single-head edge attention logits. Default: `True`, preserving the legacy implementation."
+    doc_edge_attention_key_layer_norm = "Apply LayerNorm only to message 0e scalars before the single-head edge-attention key projection. Default: `False`."
+    doc_edge_message_env_weight = "Whether to apply the legacy latent-conditioned env value weighting to node-update edge messages before aggregation. Default: `True`, preserving the legacy implementation."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
@@ -1248,6 +1253,11 @@ def slem():
         Argument("num_focus", int, optional=True, default=1, doc=doc_num_focus),
         Argument("focus_attention_dim", int, optional=True, default=32, doc=doc_focus_attention_dim),
         Argument("edge_aggregation_gated_attention", bool, optional=True, default=False, doc=doc_edge_aggregation_gated_attention),
+        Argument("edge_attention_key_source", str, optional=True, default="message", doc=doc_edge_attention_key_source),
+        Argument("edge_attention_envelope_power", float, optional=True, default=1.0, doc=doc_edge_attention_envelope_power),
+        Argument("edge_attention_use_latent_bias", bool, optional=True, default=True, doc=doc_edge_attention_use_latent_bias),
+        Argument("edge_attention_key_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_key_layer_norm),
+        Argument("edge_message_env_weight", bool, optional=True, default=True, doc=doc_edge_message_env_weight),
 
         # ---- New norm conditioning flags ----
         Argument("norm_build_node_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_node_condition_branch),

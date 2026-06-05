@@ -49,6 +49,17 @@ def _normalize_node_message_aggregation(mode: Optional[str]) -> str:
     return mode
 
 
+def _normalize_edge_attention_key_source(source: Optional[str]) -> str:
+    source = source or "message"
+    allowed = {"message"}
+    if source not in allowed:
+        raise ValueError(
+            "edge_attention_key_source must be one of "
+            f"{sorted(allowed)}, got {source!r}."
+        )
+    return source
+
+
 def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
     mode = mode or os.environ.get("DPTB_ONEHOT_TP_MODE", "scalar_fast")
     allowed = {"scalar_fast"}
@@ -513,22 +524,39 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
             message_scalar_dim: int,
             latent_dim: int,
             attn_dim: int = 32,
+            envelope_power: float = 1.0,
+            use_latent_bias: bool = True,
+            key_source: str = "message",
+            key_layer_norm: bool = False,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
     ):
         super().__init__()
         if attn_dim < 1:
             raise ValueError(f"attn_dim must be >= 1, got {attn_dim!r}")
+        if envelope_power <= 0.0:
+            raise ValueError(f"envelope_power must be > 0, got {envelope_power!r}")
+        self.envelope_power = float(envelope_power)
+        self.use_latent_bias = bool(use_latent_bias)
+        self.key_source = _normalize_edge_attention_key_source(key_source)
+        self.key_layer_norm = bool(key_layer_norm)
         self.query = torch.nn.Linear(node_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
-        self.key = torch.nn.Linear(message_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
-        self.latent_bias = torch.nn.Sequential(
-            torch.nn.LayerNorm(latent_dim, dtype=dtype, device=device),
-            torch.nn.Linear(latent_dim, attn_dim, dtype=dtype, device=device),
-            torch.nn.SiLU(),
-            torch.nn.Linear(attn_dim, 1, dtype=dtype, device=device),
+        self.key_norm = (
+            torch.nn.LayerNorm(message_scalar_dim, dtype=dtype, device=device)
+            if self.key_layer_norm
+            else torch.nn.Identity()
         )
+        self.key = torch.nn.Linear(message_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
+        if self.use_latent_bias:
+            self.latent_bias = torch.nn.Sequential(
+                torch.nn.LayerNorm(latent_dim, dtype=dtype, device=device),
+                torch.nn.Linear(latent_dim, attn_dim, dtype=dtype, device=device),
+                torch.nn.SiLU(),
+                torch.nn.Linear(attn_dim, 1, dtype=dtype, device=device),
+            )
+        else:
+            self.latent_bias = None
         self.logit_scale = attn_dim ** -0.5
-        self.null_logit = torch.nn.Parameter(torch.tensor(-8.0, dtype=dtype, device=device))
 
     def attention_weights(
             self,
@@ -543,9 +571,10 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
             return message_scalars.new_zeros((0,))
 
         q = self.query(node_scalars.index_select(0, dst_index))
-        k = self.key(message_scalars)
+        k = self.key(self.key_norm(message_scalars))
         logits = (q * k).sum(dim=-1) * self.logit_scale
-        logits = logits + self.latent_bias(latents).squeeze(-1)
+        if self.latent_bias is not None:
+            logits = logits + self.latent_bias(latents).squeeze(-1)
 
         max_per_node = scatter_max(logits, dst_index, dim=0, dim_size=dim_size)[0]
         max_per_node = torch.where(
@@ -555,11 +584,9 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
         )
         shifted = logits - max_per_node.index_select(0, dst_index)
         numer = torch.exp(shifted)
-        numer = numer * cutoff_coeffs.clamp_min(0.0)
+        numer = numer * cutoff_coeffs.clamp_min(0.0).pow(self.envelope_power)
 
         denom = scatter_add(numer, dst_index, dim=0, dim_size=dim_size)
-        null_numer = torch.exp(self.null_logit - max_per_node)
-        denom = denom + null_numer
         denom = denom.clamp_min(torch.finfo(numer.dtype).tiny)
         return numer / denom.index_select(0, dst_index)
 
@@ -895,6 +922,11 @@ class LemMoEV3(torch.nn.Module):
             num_focus: int = 1,
             focus_attention_dim: int = 32,
             edge_aggregation_gated_attention: bool = False,
+            edge_attention_key_source: str = "message",
+            edge_attention_envelope_power: float = 1.0,
+            edge_attention_use_latent_bias: bool = True,
+            edge_attention_key_layer_norm: bool = False,
+            edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             universal: Optional[bool] = False,
@@ -957,6 +989,11 @@ class LemMoEV3(torch.nn.Module):
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
         self.edge_aggregation_gated_attention = bool(edge_aggregation_gated_attention)
+        self.edge_attention_key_source = _normalize_edge_attention_key_source(edge_attention_key_source)
+        self.edge_attention_envelope_power = float(edge_attention_envelope_power)
+        self.edge_attention_use_latent_bias = bool(edge_attention_use_latent_bias)
+        self.edge_attention_key_layer_norm = bool(edge_attention_key_layer_norm)
+        self.edge_message_env_weight = bool(edge_message_env_weight)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
         )
@@ -969,7 +1006,12 @@ class LemMoEV3(torch.nn.Module):
             "  - DPA4-style Focus/Aggregation: "
             f"num_focus={self.num_focus}, node_message_aggregation={self.node_message_aggregation}, "
             f"focus_attention_dim={focus_attention_dim}, "
-            f"edge_aggregation_gated_attention={self.edge_aggregation_gated_attention}"
+            f"edge_aggregation_gated_attention={self.edge_aggregation_gated_attention}, "
+            f"edge_attention_key_source={self.edge_attention_key_source}, "
+            f"edge_attention_envelope_power={self.edge_attention_envelope_power}, "
+            f"edge_attention_use_latent_bias={self.edge_attention_use_latent_bias}, "
+            f"edge_attention_key_layer_norm={self.edge_attention_key_layer_norm}, "
+            f"edge_message_env_weight={self.edge_message_env_weight}"
         )
 
         if basis is not None:
@@ -1108,6 +1150,11 @@ class LemMoEV3(torch.nn.Module):
                 num_focus=self.num_focus,
                 focus_attention_dim=focus_attention_dim,
                 edge_aggregation_gated_attention=self.edge_aggregation_gated_attention,
+                edge_attention_key_source=self.edge_attention_key_source,
+                edge_attention_envelope_power=self.edge_attention_envelope_power,
+                edge_attention_use_latent_bias=self.edge_attention_use_latent_bias,
+                edge_attention_key_layer_norm=self.edge_attention_key_layer_norm,
+                edge_message_env_weight=self.edge_message_env_weight,
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
@@ -1603,6 +1650,11 @@ class UpdateNode(torch.nn.Module):
             num_focus: int = 1,
             focus_attention_dim: int = 32,
             edge_aggregation_gated_attention: bool = False,
+            edge_attention_key_source: str = "message",
+            edge_attention_envelope_power: float = 1.0,
+            edge_attention_use_latent_bias: bool = True,
+            edge_attention_key_layer_norm: bool = False,
+            edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1619,6 +1671,11 @@ class UpdateNode(torch.nn.Module):
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.edge_aggregation_gated_attention = bool(edge_aggregation_gated_attention)
+        self.edge_attention_key_source = _normalize_edge_attention_key_source(edge_attention_key_source)
+        self.edge_attention_envelope_power = float(edge_attention_envelope_power)
+        self.edge_attention_use_latent_bias = bool(edge_attention_use_latent_bias)
+        self.edge_attention_key_layer_norm = bool(edge_attention_key_layer_norm)
+        self.edge_message_env_weight = bool(edge_message_env_weight)
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -1718,6 +1775,10 @@ class UpdateNode(torch.nn.Module):
                 message_scalar_dim=self.irreps_out[0].dim,
                 latent_dim=latent_dim,
                 attn_dim=focus_attention_dim,
+                envelope_power=self.edge_attention_envelope_power,
+                use_latent_bias=self.edge_attention_use_latent_bias,
+                key_source=self.edge_attention_key_source,
+                key_layer_norm=self.edge_attention_key_layer_norm,
                 dtype=dtype,
                 device=device,
             )
@@ -1809,8 +1870,11 @@ class UpdateNode(torch.nn.Module):
         message = self.focus_gate(message)
         scalars = message[:, :self.irreps_out[0].dim]
 
-        weights = self.env_embed_mlps(latents[active_edges])
-        weighted_message = self._env_weighter(message, weights)
+        if self.edge_message_env_weight:
+            weights = self.env_embed_mlps(latents[active_edges])
+            weighted_message = self._env_weighter(message, weights)
+        else:
+            weighted_message = message
         active_edge_center = edge_center[active_edges]
         active_edge_neighbor = edge_neighbor[active_edges]
         if self.node_attention is None:
@@ -2194,6 +2258,11 @@ class Layer(torch.nn.Module):
             num_focus: int = 1,
             focus_attention_dim: int = 32,
             edge_aggregation_gated_attention: bool = False,
+            edge_attention_key_source: str = "message",
+            edge_attention_envelope_power: float = 1.0,
+            edge_attention_use_latent_bias: bool = True,
+            edge_attention_key_layer_norm: bool = False,
+            edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -2277,6 +2346,11 @@ class Layer(torch.nn.Module):
             num_focus=num_focus,
             focus_attention_dim=focus_attention_dim,
             edge_aggregation_gated_attention=edge_aggregation_gated_attention,
+            edge_attention_key_source=edge_attention_key_source,
+            edge_attention_envelope_power=edge_attention_envelope_power,
+            edge_attention_use_latent_bias=edge_attention_use_latent_bias,
+            edge_attention_key_layer_norm=edge_attention_key_layer_norm,
+            edge_message_env_weight=edge_message_env_weight,
         )
 
         self.node_ffn = None
