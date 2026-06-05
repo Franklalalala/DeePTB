@@ -242,6 +242,7 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
                 cutoff_coeffs, active_edges, wigner_D_all, mole_globals):
         base = self.base
         edge_center = edge_index[0]
+        edge_neighbor = edge_index[1]
 
         new_node_features = node_features
         node_in = base.node_norm(new_node_features) if base.node_norm is not None else new_node_features
@@ -264,6 +265,7 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
         weights = base.env_embed_mlps(latents[active_edges])
         weighted_message = base._env_weighter(message, weights)
         active_edge_center = edge_center[active_edges]
+        active_edge_neighbor = edge_neighbor[active_edges]
         if getattr(base, "node_attention", None) is None:
             new_node_features = scatter(
                 weighted_message,
@@ -295,6 +297,7 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
                 new_node_features,
                 node_scalars,
                 dst_index=active_edge_center,
+                src_index=active_edge_neighbor,
                 edge_message=weighted_message,
                 dim_size=node_features.shape[0],
             )

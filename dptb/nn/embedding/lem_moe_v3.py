@@ -234,6 +234,8 @@ class GatedEdgeAggregation(torch.nn.Module):
         torch.nn.init.zeros_(self.gate.weight)
         torch.nn.init.zeros_(self.gate.bias)
         self.last_stats: Optional[Dict[str, float]] = None
+        self.last_heatmap: Optional[Dict[str, object]] = None
+        self.heatmap_max_nodes = 64
 
     @staticmethod
     def _tensor_stat(tensor: torch.Tensor, op: str) -> float:
@@ -293,12 +295,104 @@ class GatedEdgeAggregation(torch.nn.Module):
             nodes_with_edges,
         )
 
+    def _build_heatmap(
+            self,
+            dst_index: Optional[torch.Tensor],
+            src_index: Optional[torch.Tensor],
+            edge_message: Optional[torch.Tensor],
+            dim_size: int,
+    ) -> Optional[Dict[str, object]]:
+        if (
+                dst_index is None
+                or src_index is None
+                or edge_message is None
+                or dst_index.numel() == 0
+                or src_index.numel() != dst_index.numel()
+        ):
+            return None
+
+        max_nodes = max(1, int(getattr(self, "heatmap_max_nodes", 64)))
+        dst = dst_index.detach().long()
+        src = src_index.detach().long()
+        contribution = edge_message.detach().float().abs().sum(dim=-1)
+        valid_edges = (
+            (dst >= 0)
+            & (src >= 0)
+            & (dst < dim_size)
+            & (src < dim_size)
+            & torch.isfinite(contribution)
+            & (contribution > 0)
+        )
+        if not bool(valid_edges.any().item()):
+            return None
+
+        dst = dst[valid_edges]
+        src = src[valid_edges]
+        contribution = contribution[valid_edges]
+        device = contribution.device
+
+        query_nodes = torch.unique(dst, sorted=True)[:max_nodes]
+        visible = torch.zeros(dim_size, dtype=torch.bool, device=device)
+        visible[query_nodes] = True
+        visible_edges = visible[dst]
+        if not bool(visible_edges.any().item()):
+            return None
+
+        key_totals = scatter_add(
+            contribution[visible_edges],
+            src[visible_edges],
+            dim=0,
+            dim_size=dim_size,
+        )
+        key_nodes = torch.nonzero(key_totals > 0, as_tuple=False).flatten()
+        if key_nodes.numel() == 0:
+            return None
+        key_nodes = key_nodes[torch.argsort(key_totals[key_nodes], descending=True)[:max_nodes]]
+        key_nodes = torch.sort(key_nodes).values
+
+        query_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
+        key_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
+        query_pos[query_nodes] = torch.arange(query_nodes.numel(), device=device)
+        key_pos[key_nodes] = torch.arange(key_nodes.numel(), device=device)
+        qi = query_pos[dst]
+        ki = key_pos[src]
+        selected = (qi >= 0) & (ki >= 0)
+        if not bool(selected.any().item()):
+            return None
+
+        flat_size = int(query_nodes.numel() * key_nodes.numel())
+        flat_index = qi[selected] * int(key_nodes.numel()) + ki[selected]
+        heatmap = scatter_add(
+            contribution[selected],
+            flat_index,
+            dim=0,
+            dim_size=flat_size,
+        ).reshape(int(query_nodes.numel()), int(key_nodes.numel()))
+
+        row_total_all_keys = scatter_add(contribution, dst, dim=0, dim_size=dim_size)[query_nodes]
+        heatmap = heatmap / row_total_all_keys.unsqueeze(-1).clamp_min(
+            torch.finfo(heatmap.dtype).tiny
+        )
+        column_score = heatmap.mean(dim=0)
+        top_key_score = float(column_score.max().item()) if column_score.numel() else 0.0
+        first_key_score = float(column_score[0].item()) if column_score.numel() else 0.0
+        visible_mass = float(heatmap.sum(dim=-1).mean().item()) if heatmap.numel() else 0.0
+        return {
+            "matrix": heatmap.detach().cpu(),
+            "query_nodes": query_nodes.detach().cpu(),
+            "key_nodes": key_nodes.detach().cpu(),
+            "top_key_score": top_key_score,
+            "first_key_score": first_key_score,
+            "visible_mass": visible_mass,
+        }
+
     def _record_stats(
             self,
             gate_values: torch.Tensor,
             pre_gate: torch.Tensor,
             post_gate: torch.Tensor,
             dst_index: Optional[torch.Tensor],
+            src_index: Optional[torch.Tensor],
             edge_message: Optional[torch.Tensor],
             dim_size: int,
     ) -> None:
@@ -327,12 +421,19 @@ class GatedEdgeAggregation(torch.nn.Module):
                 "active_edges": active_edges,
                 "nodes_with_edges": nodes_with_edges,
             }
+            self.last_heatmap = self._build_heatmap(
+                dst_index,
+                src_index,
+                edge_message,
+                dim_size,
+            )
 
     def forward(
             self,
             aggregated: torch.Tensor,
             query_scalars: torch.Tensor,
             dst_index: Optional[torch.Tensor] = None,
+            src_index: Optional[torch.Tensor] = None,
             edge_message: Optional[torch.Tensor] = None,
             dim_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -352,6 +453,7 @@ class GatedEdgeAggregation(torch.nn.Module):
             aggregated,
             gated,
             dst_index,
+            src_index,
             edge_message,
             int(dim_size or aggregated.shape[0]),
         )
@@ -1664,6 +1766,7 @@ class UpdateNode(torch.nn.Module):
         weights = self.env_embed_mlps(latents[active_edges])
         weighted_message = self._env_weighter(message, weights)
         active_edge_center = edge_center[active_edges]
+        active_edge_neighbor = edge_neighbor[active_edges]
         if self.node_attention is None:
             new_node_features = scatter(
                 weighted_message,
@@ -1694,6 +1797,7 @@ class UpdateNode(torch.nn.Module):
                 new_node_features,
                 node_scalars,
                 dst_index=active_edge_center,
+                src_index=active_edge_neighbor,
                 edge_message=weighted_message,
                 dim_size=node_features.shape[0],
             )

@@ -224,6 +224,13 @@ def train_options():
     doc_monitor_gated_edge_attention_freq = (
         "Gated edge aggregation monitor sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
     )
+    doc_monitor_gated_edge_attention_heatmap = (
+        "Set true to save Fig.2-like query-key heatmap PNG/NPZ snapshots for gated edge aggregation. "
+        "Rows are target/query nodes, columns are source/key nodes, and colors are normalized edge-message contribution mass."
+    )
+    doc_monitor_gated_edge_attention_heatmap_size = (
+        "Maximum number of query and key nodes shown in gated edge aggregation heatmaps. Default: `64`."
+    )
     doc_expert_lrs = (
         "Optional per-expert initial learning rates. "
         "If provided, it must be a list of floats with length == num_experts (len(distance_ranges)). "
@@ -511,6 +518,8 @@ def train_options():
         Argument("monitor_gated_edge_attention", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention),
         Argument("monitor_gated_edge_attention_freq", int, optional=True, default=0, doc=doc_monitor_gated_edge_attention_freq),
         Argument("monitor_gated_edge_attention_tensorboard", bool, optional=True, default=None, doc="Write gated edge aggregation diagnostics to TensorBoard when the monitor is enabled. Default follows use_tensorboard."),
+        Argument("monitor_gated_edge_attention_heatmap", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention_heatmap),
+        Argument("monitor_gated_edge_attention_heatmap_size", int, optional=True, default=64, doc=doc_monitor_gated_edge_attention_heatmap_size),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 

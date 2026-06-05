@@ -89,6 +89,7 @@ def test_gated_edge_aggregation_applies_equivariant_sigmoid_gate_and_records_sta
         aggregated,
         query_scalars,
         dst_index=dst_index,
+        src_index=torch.tensor([0, 1, 0, 1], dtype=torch.long),
         edge_message=edge_message,
         dim_size=aggregated.shape[0],
     )
@@ -108,6 +109,14 @@ def test_gated_edge_aggregation_applies_equivariant_sigmoid_gate_and_records_sta
     assert stats["post_activation_max"] == 0.5
     assert torch.isclose(torch.tensor(stats["top_edge_share_mean"]), torch.tensor(0.75))
     assert torch.isclose(torch.tensor(stats["top_edge_share_max"]), torch.tensor(0.75))
+    assert gate.last_heatmap is not None
+    assert gate.last_heatmap["query_nodes"].tolist() == [0, 1]
+    assert gate.last_heatmap["key_nodes"].tolist() == [0, 1]
+    assert torch.allclose(
+        gate.last_heatmap["matrix"],
+        torch.tensor([[0.25, 0.75], [0.25, 0.75]]),
+    )
+    assert torch.isclose(torch.tensor(gate.last_heatmap["top_key_score"]), torch.tensor(0.75))
 
 
 def test_gated_edge_aggregation_monitor_writes_latest_layer_stats(tmp_path):
@@ -127,6 +136,7 @@ def test_gated_edge_aggregation_monitor_writes_latest_layer_stats(tmp_path):
         torch.ones(1, 1),
         torch.zeros(1, 1),
         dst_index=torch.tensor([0], dtype=torch.long),
+        src_index=torch.tensor([0], dtype=torch.long),
         edge_message=torch.ones(1, 1),
         dim_size=1,
     )
@@ -135,6 +145,7 @@ def test_gated_edge_aggregation_monitor_writes_latest_layer_stats(tmp_path):
         str(tmp_path),
         interval=[(1, "iteration")],
         tensorboard=False,
+        heatmap=True,
     )
     monitor.register(trainer)
     monitor.iteration(time=7)
@@ -142,6 +153,9 @@ def test_gated_edge_aggregation_monitor_writes_latest_layer_stats(tmp_path):
     csv_text = (tmp_path / "gated_edge_aggregation.csv").read_text()
     assert "iter,rank,module,gate_mean" in csv_text
     assert "7,0,edge_gate,0.5" in csv_text
+    heatmap_dir = tmp_path / "gated_edge_aggregation_heatmaps"
+    assert (heatmap_dir / "gated_edge_aggregation_heatmap_iter0000007_rank0.npz").exists()
+    assert (heatmap_dir / "gated_edge_aggregation_heatmap_iter0000007_rank0.png").exists()
 
 
 def test_non_linear_node_wrapper_applies_base_gated_edge_aggregation():

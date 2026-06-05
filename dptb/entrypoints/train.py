@@ -598,6 +598,8 @@ def train(
                 output,
                 interval=[(gated_edge_freq, 'iteration')],
                 tensorboard=gated_edge_tb,
+                heatmap=bool(train_options.get("monitor_gated_edge_attention_heatmap", False)),
+                heatmap_max_nodes=int(train_options.get("monitor_gated_edge_attention_heatmap_size", 64)),
             )
         )
 

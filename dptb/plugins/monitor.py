@@ -1079,14 +1079,19 @@ class GatedEdgeAggregationMonitor(Plugin):
         interval=None,
         tensorboard=False,
         tensorboard_log_dir=None,
+        heatmap=False,
+        heatmap_max_nodes=64,
     ):
         if interval is None:
             interval = [(1, "iteration")]
         super(GatedEdgeAggregationMonitor, self).__init__(interval)
         self.output_dir = output_dir or "monitor_logs"
         self.csv_path = os.path.join(self.output_dir, "gated_edge_aggregation.csv")
+        self.heatmap_dir = os.path.join(self.output_dir, "gated_edge_aggregation_heatmaps")
         self.tensorboard = bool(tensorboard)
         self.tensorboard_log_dir = tensorboard_log_dir
+        self.heatmap = bool(heatmap)
+        self.heatmap_max_nodes = max(1, int(heatmap_max_nodes))
         self.writer = None
         self.rank = 0
         self.is_main_process = True
@@ -1101,17 +1106,23 @@ class GatedEdgeAggregationMonitor(Plugin):
             for name, module in trainer.model.named_modules()
             if module.__class__.__name__ == "GatedEdgeAggregation"
         ]
+        for _, module in self._modules:
+            if hasattr(module, "heatmap_max_nodes"):
+                module.heatmap_max_nodes = self.heatmap_max_nodes
         if self.is_main_process:
             os.makedirs(self.output_dir, exist_ok=True)
+            if self.heatmap:
+                os.makedirs(self.heatmap_dir, exist_ok=True)
             self._ensure_csv_header()
             if self.tensorboard:
                 tb_dir = self.tensorboard_log_dir or os.path.join(self.output_dir, "tensorboard_logs")
                 self.writer = SummaryWriter(log_dir=tb_dir)
         log.info(
-            "[GatedEdgeAggregationMonitor][rank=%s] monitoring %s modules; csv=%s",
+            "[GatedEdgeAggregationMonitor][rank=%s] monitoring %s modules; csv=%s; heatmap=%s",
             self.rank,
             len(self._modules),
             self.csv_path,
+            self.heatmap,
         )
 
     def _ensure_csv_header(self):
@@ -1159,6 +1170,92 @@ class GatedEdgeAggregationMonitor(Plugin):
                 )
         self.writer.flush()
 
+    @staticmethod
+    def _short_module_name(name):
+        match = re.search(r"layers\.(\d+)", name)
+        if match:
+            return f"layer {match.group(1)}"
+        return name
+
+    def _heatmap_entries(self):
+        entries = []
+        for name, module in self._modules:
+            heatmap = getattr(module, "last_heatmap", None)
+            if not heatmap:
+                continue
+            matrix = heatmap.get("matrix")
+            if matrix is None or not hasattr(matrix, "numel") or matrix.numel() == 0:
+                continue
+            entries.append((name, heatmap))
+        return entries
+
+    def _write_heatmaps(self, iteration):
+        if not self.heatmap:
+            return
+        entries = self._heatmap_entries()
+        if not entries:
+            return
+        try:
+            import numpy as np
+        except Exception as exc:
+            log.warning("[GatedEdgeAggregationMonitor] numpy unavailable for heatmap dump: %s", exc)
+            return
+
+        os.makedirs(self.heatmap_dir, exist_ok=True)
+        prefix = os.path.join(
+            self.heatmap_dir,
+            f"gated_edge_aggregation_heatmap_iter{int(iteration):07d}_rank{self.rank}",
+        )
+        npz_payload = {}
+        for idx, (name, heatmap) in enumerate(entries):
+            matrix = heatmap["matrix"].detach().cpu().numpy()
+            npz_payload[f"matrix_{idx}"] = matrix
+            npz_payload[f"query_nodes_{idx}"] = heatmap["query_nodes"].detach().cpu().numpy()
+            npz_payload[f"key_nodes_{idx}"] = heatmap["key_nodes"].detach().cpu().numpy()
+            npz_payload[f"module_{idx}"] = np.array(name)
+            npz_payload[f"top_key_score_{idx}"] = np.array(float(heatmap.get("top_key_score", 0.0)))
+            npz_payload[f"first_key_score_{idx}"] = np.array(float(heatmap.get("first_key_score", 0.0)))
+            npz_payload[f"visible_mass_{idx}"] = np.array(float(heatmap.get("visible_mass", 0.0)))
+        np.savez_compressed(prefix + ".npz", **npz_payload)
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("[GatedEdgeAggregationMonitor] matplotlib unavailable for heatmap png: %s", exc)
+            return
+
+        n = len(entries)
+        cols = min(2, n)
+        rows = int(math.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(5.0 * cols, 4.5 * rows), squeeze=False)
+        for ax in axes.flat:
+            ax.axis("off")
+        for idx, (name, heatmap) in enumerate(entries):
+            ax = axes.flat[idx]
+            ax.axis("on")
+            matrix = heatmap["matrix"].detach().cpu().numpy()
+            image = ax.imshow(matrix, vmin=0.0, vmax=1.0, cmap="viridis", interpolation="nearest")
+            ax.set_title(self._short_module_name(name))
+            ax.set_xlabel("Key source node")
+            ax.set_ylabel("Query target node")
+            ax.text(
+                0.5,
+                0.94,
+                f"top key score: {float(heatmap.get('top_key_score', 0.0)):.2f}",
+                transform=ax.transAxes,
+                ha="center",
+                va="top",
+                color="white",
+                fontsize=10,
+            )
+            fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
+        fig.suptitle(f"gated edge aggregation heatmap, iter {int(iteration)}", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.savefig(prefix + ".png", dpi=160)
+        plt.close(fig)
+
     def iteration(self, **kwargs):
         if not self.is_main_process:
             return
@@ -1170,6 +1267,7 @@ class GatedEdgeAggregationMonitor(Plugin):
             writer = csv.DictWriter(f, fieldnames=self._HEADER)
             writer.writerows(rows)
         self._write_tensorboard(rows, iteration)
+        self._write_heatmaps(iteration)
 
 
 class ParamDynamicsMonitor(Plugin):
