@@ -102,6 +102,7 @@ class LemMoEV3H0(LemMoEV3):
             precomputed_cutoff_coeffs,
         )
 
+        node_batch = batch[: node_features.shape[0]]
         if node_features.shape[0] < num_nodes_total:
             safe_node_one_hot = node_one_hot[: node_features.shape[0]]
         else:
@@ -143,6 +144,7 @@ class LemMoEV3H0(LemMoEV3):
                 edge_one_hot,
                 wigner_D_all,
                 mole_globals,
+                node_batch,
             )
 
         if node_features.shape[0] < num_nodes_total:
