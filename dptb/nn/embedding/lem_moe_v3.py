@@ -24,7 +24,7 @@ from .lem_moe_v3_plugins import (
     can_use_flat_s2_patch,
 )
 # Note: Modified SO2_Linear and MOLE classes imported here
-from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3
+from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3, SO2PostActivationExpertMixer
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
@@ -66,6 +66,63 @@ def _normalize_stable_standard_compat_mode(name: str, mode: Optional[str]) -> st
     raise ValueError(
         f"0425-stable accepts only {name}=None or 'standard'. "
         f"Use the Triton experiment branch for {name}={mode!r}."
+    )
+
+
+def _normalize_so2_expert_mixing_mode(mode: Optional[str]) -> str:
+    mode = mode or "pre_activation"
+    allowed = {"pre_activation", "post_activation"}
+    if mode not in allowed:
+        raise ValueError(f"so2_expert_mixing_mode must be one of {sorted(allowed)}, got {mode!r}.")
+    return mode
+
+
+def _build_so2_post_activation_expert_mixer(
+        tp: SO2_Linear,
+        activation: torch.nn.Module,
+        scalar_dim: int,
+        router_hidden_dim: int,
+        route_chunk_size: Optional[int],
+        route_checkpoint: bool,
+) -> SO2PostActivationExpertMixer:
+    return SO2PostActivationExpertMixer(
+        tp=tp,
+        activation=activation,
+        router_from_0e=torch.nn.Sequential(
+            torch.nn.Linear(scalar_dim, router_hidden_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(router_hidden_dim, 1),
+        ),
+        scalar_dim=scalar_dim,
+        route_chunk_size=route_chunk_size,
+        checkpoint_routes=route_checkpoint,
+    )
+
+
+def _apply_so2_tp_or_post_activation_mixer(
+        module: torch.nn.Module,
+        tp_input: torch.Tensor,
+        edge_vector: torch.Tensor,
+        mole_globals: MOLEGlobals,
+        latents: torch.Tensor,
+        wigner_D_all,
+):
+    if module.post_activation_expert_mixer is None:
+        features, wigner_D_all = module.tp(
+            tp_input,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+        )
+        features = module.activation(features)
+        return features, wigner_D_all
+    return module.post_activation_expert_mixer(
+        tp_input,
+        edge_vector,
+        mole_globals,
+        latents,
+        wigner_D_all,
     )
 
 
@@ -514,6 +571,10 @@ class LemMoEV3(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             so2_m_linear_mode: Optional[str] = None,
             mole_linear_m0_mode: Optional[str] = None,
             onehot_tp_mode: Optional[str] = None,
@@ -578,6 +639,7 @@ class LemMoEV3(torch.nn.Module):
             full_soc_prediction=self.full_soc_prediction,
         )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
@@ -587,6 +649,7 @@ class LemMoEV3(torch.nn.Module):
             "mole_linear_m0_mode", mole_linear_m0_mode
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
+        log.info(f"  - SO2 Expert Mixing Mode: {self.so2_expert_mixing_mode}")
         log.info(
             "  - DPA4-style Focus/Aggregation: "
             f"num_focus={self.num_focus}, node_message_aggregation={self.node_message_aggregation}, "
@@ -720,6 +783,10 @@ class LemMoEV3(torch.nn.Module):
                 so2_wigner_apply_mode=so2_wigner_apply_mode,
                 so2_fusion_mode=so2_fusion_mode,
                 mole_linear_mode=mole_linear_mode,
+                so2_expert_mixing_mode=self.so2_expert_mixing_mode,
+                so2_expert_route_chunk_size=so2_expert_route_chunk_size,
+                so2_expert_route_checkpoint=so2_expert_route_checkpoint,
+                so2_output_router_hidden_dim=so2_output_router_hidden_dim,
                 onehot_tp_mode=self.onehot_tp_mode,
                 node_message_aggregation=self.node_message_aggregation,
                 num_focus=self.num_focus,
@@ -1208,6 +1275,10 @@ class UpdateNode(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             onehot_tp_mode: Optional[str] = None,
             node_message_aggregation: str = "scatter",
             num_focus: int = 1,
@@ -1225,6 +1296,7 @@ class UpdateNode(torch.nn.Module):
         self.device = device
         self.res_update = res_update
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
 
         self.register_buffer(
@@ -1301,6 +1373,18 @@ class UpdateNode(torch.nn.Module):
             internal_weights=True,
             biases=True,
         )
+        self.post_activation_expert_mixer = None
+        if self.so2_expert_mixing_mode == "post_activation":
+            scalar_dim = self.activation.irreps_out[0].dim
+            self.post_activation_expert_mixer = _build_so2_post_activation_expert_mixer(
+                self.tp,
+                self.activation,
+                scalar_dim,
+                so2_output_router_hidden_dim,
+                so2_expert_route_chunk_size,
+                so2_expert_route_checkpoint,
+            )
+
         self.focus_gate = PostActivation0eFocusGate(
             self.irreps_out,
             num_focus=num_focus,
@@ -1379,18 +1463,18 @@ class UpdateNode(torch.nn.Module):
         new_node_features = node_features
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
-        message, _ = self.tp(
-            torch.cat(
-                [node_in[edge_center[active_edges]], edge_in],
-                dim=-1,
-            ),
+        tp_input = torch.cat(
+            [node_in[edge_center[active_edges]], edge_in],
+            dim=-1,
+        )
+        message, _ = _apply_so2_tp_or_post_activation_mixer(
+            self,
+            tp_input,
             edge_vector[active_edges],
             mole_globals,
             latents[active_edges],
             wigner_D_all,
-        )  # Pass globals
-
-        message = self.activation(message)
+        )
         message = self.lin_post(message)
         message = self.focus_gate(message)
         scalars = message[:, :self.irreps_out[0].dim]
@@ -1472,6 +1556,10 @@ class UpdateEdge(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
@@ -1486,6 +1574,7 @@ class UpdateEdge(torch.nn.Module):
         self.device = device
         self.res_update = res_update
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
 
         self._edge_weighter = E3ElementLinear(
             irreps_in=irreps_out,
@@ -1572,6 +1661,17 @@ class UpdateEdge(torch.nn.Module):
             internal_weights=True,
             biases=True,
         )
+        self.post_activation_expert_mixer = None
+        if self.so2_expert_mixing_mode == "post_activation":
+            scalar_dim = self.activation.irreps_out[0].dim
+            self.post_activation_expert_mixer = _build_so2_post_activation_expert_mixer(
+                self.tp,
+                self.activation,
+                scalar_dim,
+                so2_output_router_hidden_dim,
+                so2_expert_route_chunk_size,
+                so2_expert_route_checkpoint,
+            )
 
         if res_update:
             self.linear_res = Linear(
@@ -1636,22 +1736,22 @@ class UpdateEdge(torch.nn.Module):
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
 
-        new_edge_features, wigner_D_all = self.tp(
-            torch.cat(
-                [
-                    node_in[edge_center[active_edges]],
-                    edge_in,
-                    node_in[edge_neighbor[active_edges]],
-                ],
-                dim=-1,
-            ),
+        tp_input = torch.cat(
+            [
+                node_in[edge_center[active_edges]],
+                edge_in,
+                node_in[edge_neighbor[active_edges]],
+            ],
+            dim=-1,
+        )
+        new_edge_features, wigner_D_all = _apply_so2_tp_or_post_activation_mixer(
+            self,
+            tp_input,
             edge_vector[active_edges],
             mole_globals,
             latents[active_edges],
             wigner_D_all,
-        )  # Pass globals
-
-        new_edge_features = self.activation(new_edge_features)
+        )
         new_edge_features = self.lin_post(new_edge_features)
 
         scalars = new_edge_features[:, :self.irreps_out[0].dim]
@@ -1736,6 +1836,10 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             onehot_tp_mode: Optional[str] = None,
             node_message_aggregation: str = "scatter",
             num_focus: int = 1,
@@ -1782,6 +1886,10 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            so2_expert_mixing_mode=so2_expert_mixing_mode,
+            so2_expert_route_chunk_size=so2_expert_route_chunk_size,
+            so2_expert_route_checkpoint=so2_expert_route_checkpoint,
+            so2_output_router_hidden_dim=so2_output_router_hidden_dim,
             onehot_tp_mode=onehot_tp_mode,
         )
 
@@ -1810,6 +1918,10 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            so2_expert_mixing_mode=so2_expert_mixing_mode,
+            so2_expert_route_chunk_size=so2_expert_route_chunk_size,
+            so2_expert_route_checkpoint=so2_expert_route_checkpoint,
+            so2_output_router_hidden_dim=so2_output_router_hidden_dim,
             onehot_tp_mode=onehot_tp_mode,
             node_message_aggregation=node_message_aggregation,
             num_focus=num_focus,

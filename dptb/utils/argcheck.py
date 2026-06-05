@@ -1156,6 +1156,10 @@ def slem():
     doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. The 0425-stable branch defaults to `streamed_m_major_cueq`; `streamed_m_major_fused_p0` is an opt-in trainable prototype that treats Wigner/R as constants and falls back on unsupported shapes."
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
     doc_so2_m_linear_mode = "SO2 m-linear backend for non-MoE SO2 TP. Supported values are `standard`, `indexed_sandwich_multi`, or null; `cublas_grouped` is accepted only as a legacy alias. Triton experiment modes remain unsupported."
+    doc_so2_expert_mixing_mode = "Expert mixing placement for SO2 MoE TP. `pre_activation` keeps the existing fused-weight path; `post_activation` evaluates raw expert TP outputs, applies equivariant activation, routes from 0e output scalars, and mixes activated outputs."
+    doc_so2_expert_route_chunk_size = "Maximum original SO2 rows processed per post-activation expert-mixing chunk. Null or non-positive means process all rows in one chunk."
+    doc_so2_expert_route_checkpoint = "Whether to activation-checkpoint each post-activation expert-route chunk. This recomputes TP/activation/router during backward to reduce saved route activations."
+    doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
     doc_node_message_aggregation = "Node message aggregation mode. Supported: `scatter` for the legacy sum, `single_head_0e` for DPA4-style envelope-gated scalar attention."
@@ -1214,6 +1218,10 @@ def slem():
         Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
         Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
+        Argument("so2_expert_mixing_mode", str, optional=True, default="pre_activation", doc=doc_so2_expert_mixing_mode),
+        Argument("so2_expert_route_chunk_size", [int, None], optional=True, default=None, doc=doc_so2_expert_route_chunk_size),
+        Argument("so2_expert_route_checkpoint", bool, optional=True, default=False, doc=doc_so2_expert_route_checkpoint),
+        Argument("so2_output_router_hidden_dim", int, optional=True, default=32, doc=doc_so2_output_router_hidden_dim),
         Argument("mole_linear_m0_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_m0_mode),
         Argument("onehot_tp_mode", [str, None], optional=True, default=None, doc=doc_onehot_tp_mode),
         Argument("node_message_aggregation", str, optional=True, default="scatter", doc=doc_node_message_aggregation),

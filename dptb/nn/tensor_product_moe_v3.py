@@ -7,6 +7,7 @@ import warnings
 import math
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from e3nn.o3 import Linear as e3nn_Linear
 from torch.nn import Linear
 import os
@@ -534,6 +535,16 @@ def _expand_graph_index_cached(
     return cached
 
 
+
+def _expand_route_index_for_leading_dims(route_index: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Expand one route/expert id per row to match x.reshape(-1, x.shape[-1])."""
+    route_index = route_index.reshape(-1).to(device=x.device, dtype=torch.long)
+    if x.ndim == 2:
+        return route_index
+    expand_shape = [route_index.shape[0]] + list(x.shape[1:-1])
+    return route_index.reshape(-1, *([1] * (x.ndim - 2))).expand(expand_shape).reshape(-1)
+
+
 def _index_select_wigner_edges(wigner_D_all, index: torch.Tensor):
     if wigner_D_all is None:
         return None
@@ -547,6 +558,27 @@ def _normalize_mole_linear_mode(mode: str) -> str:
     if mode not in allowed:
         raise ValueError(f"mole_linear_mode must be one of {sorted(allowed)}, got {mode!r}")
     return mode
+
+
+
+def _expert_route_indices_from_globals(
+        mole_globals: MOLEGlobals,
+        num_experts: int,
+        n_rows: int,
+        *,
+        device: torch.device,
+) -> torch.Tensor:
+    """Return candidate expert ids per row, shape [n_rows, k]."""
+    graph_index = _mole_graph_index(mole_globals, n_rows, device=device)
+    topk_indices = getattr(mole_globals, "topk_indices", None)
+    if topk_indices is not None:
+        topk_indices = topk_indices.to(device=device, dtype=torch.long)
+        if topk_indices.ndim != 2:
+            raise ValueError(f"MOLE topk_indices must be [num_graphs, k], got {tuple(topk_indices.shape)}.")
+        return topk_indices.index_select(0, graph_index)
+
+    all_experts = torch.arange(num_experts, device=device, dtype=torch.long)
+    return all_experts.reshape(1, num_experts).expand(n_rows, num_experts)
 
 
 class MOLERouterV3(nn.Module):
@@ -723,6 +755,84 @@ class MOLELinear(nn.Module):
         if mixed_bias is not None:
             flat_out = flat_out + mixed_bias.index_select(0, flat_graph_index)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+
+    def _apply_expert_indexed_ref(self, x, expert_index):
+        flat_x = x.reshape(-1, self.in_features)
+        flat_expert_index = _expand_route_index_for_leading_dims(expert_index, x)
+        flat_w = self.weight_experts.index_select(0, flat_expert_index)
+        flat_out = torch.bmm(flat_w, flat_x.unsqueeze(-1)).squeeze(-1)
+        if self.bias_experts is not None:
+            flat_out = flat_out + self.bias_experts.index_select(0, flat_expert_index)
+        return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def _apply_expert_cublas_grouped(self, x, expert_index):
+        if x.device.type != "cuda":
+            raise RuntimeError("expert cublas_grouped dispatch requires CUDA.")
+        if x.dtype != torch.float32 or self.weight_experts.dtype != torch.float32:
+            raise RuntimeError(
+                "expert cublas_grouped dispatch currently requires float32 tensors; "
+                f"got x={x.dtype}, weight={self.weight_experts.dtype}."
+            )
+
+        from dptb.nn.cublas_grouped_gemm import grouped_gemm
+
+        flat_x = x.reshape(-1, self.in_features)
+        flat_expert_index = _expand_route_index_for_leading_dims(expert_index, x)
+        if flat_expert_index.numel() > 1 and not torch.all(flat_expert_index[1:] >= flat_expert_index[:-1]).item():
+            permute_idx = torch.argsort(flat_expert_index, stable=True)
+            sorted_expert_index = flat_expert_index.index_select(0, permute_idx)
+            flat_x = flat_x.index_select(0, permute_idx)
+            unpermute_idx = torch.empty_like(permute_idx)
+            unpermute_idx.scatter_(
+                0,
+                permute_idx,
+                torch.arange(permute_idx.numel(), device=permute_idx.device, dtype=permute_idx.dtype),
+            )
+        else:
+            sorted_expert_index = flat_expert_index
+            unpermute_idx = None
+
+        counts = torch.bincount(sorted_expert_index, minlength=self.num_experts)
+        ptr = torch.zeros(self.num_experts + 1, dtype=torch.long, device=counts.device)
+        ptr[1:] = torch.cumsum(counts, dim=0)
+        flat_out = grouped_gemm(
+            flat_x.contiguous(),
+            ptr.to(device="cpu", dtype=torch.long).contiguous(),
+            self.weight_experts.contiguous(),
+        )
+        if self.bias_experts is not None:
+            flat_out = flat_out + self.bias_experts.index_select(0, sorted_expert_index)
+        if unpermute_idx is not None:
+            flat_out = flat_out.index_select(0, unpermute_idx)
+        return flat_out.reshape(*x.shape[:-1], self.out_features)
+
+    def apply_experts(self, x, expert_index, *, include_shared_experts: bool = False):
+        """Apply raw expert weights selected by expert_index, without coefficient mixing.
+
+        This is the nonlinear MoE building block: expert_index is an expert id,
+        not a graph id for a pre-mixed weight class.
+        """
+        expert_index = expert_index.to(device=x.device, dtype=torch.long).reshape(-1)
+        if expert_index.numel() != x.shape[0]:
+            raise ValueError(
+                f"expert_index has {expert_index.numel()} rows, but input has {x.shape[0]} rows."
+            )
+        if expert_index.numel() and (
+                int(expert_index.min().item()) < 0 or int(expert_index.max().item()) >= self.num_experts
+        ):
+            raise ValueError(f"expert_index values must be in [0, {self.num_experts}).")
+
+        if self.mole_linear_mode == "cublas_grouped":
+            out = self._apply_expert_cublas_grouped(x, expert_index)
+        else:
+            out = self._apply_expert_indexed_ref(x, expert_index)
+
+        if include_shared_experts and self.num_shared_experts > 0:
+            shared_weight = self.weight_shared.sum(0)
+            shared_bias = self.bias_shared.sum(0) if self.bias_shared is not None else None
+            out = out + F.linear(x, shared_weight, shared_bias)
+        return out
 
     def _mix_expert_parameters(self, mole_globals: MOLEGlobals):
         coefficients = mole_globals.coefficients
@@ -1123,6 +1233,126 @@ class SO2_Attention(torch.nn.Module):
         latent = self.final_mlp(fused)  # (e, latent_dim)
 
         return latent
+
+
+
+class SO2PostActivationExpertMixer(torch.nn.Module):
+    """Hybrid nonlinear expert mixer for SO2 TP outputs."""
+
+    def __init__(
+            self,
+            tp: "SO2_Linear",
+            activation: torch.nn.Module,
+            router_from_0e: torch.nn.Module,
+            scalar_dim: int,
+            route_chunk_size: Optional[int] = None,
+        checkpoint_routes: bool = False,
+    ):
+        super().__init__()
+        object.__setattr__(self, "tp", tp)
+        object.__setattr__(self, "activation", activation)
+        self.router_from_0e = router_from_0e
+        self.scalar_dim = int(scalar_dim)
+        self.route_chunk_size = None if route_chunk_size is None else int(route_chunk_size)
+        self.checkpoint_routes = bool(checkpoint_routes)
+
+    def _mix_route_chunk(self, x_routes, R_routes, flat_expert_index, latents_routes, wigner_routes, n_rows, k_routes):
+        y_routes, _ = self.tp.forward_expert_routes(
+            x_routes,
+            R_routes,
+            flat_expert_index,
+            latents=latents_routes,
+            wigner_D_all=wigner_routes,
+        )
+        y_routes = self.activation(y_routes)
+        if self.scalar_dim <= 0 or y_routes.shape[-1] < self.scalar_dim:
+            raise ValueError(
+                f"scalar_dim={self.scalar_dim} is incompatible with activated output "
+                f"dim={y_routes.shape[-1]}."
+            )
+        scores = self.router_from_0e(y_routes[:, :self.scalar_dim]).reshape(n_rows, k_routes)
+        alpha = torch.softmax(scores, dim=1).reshape(n_rows, k_routes, 1)
+        return (y_routes.reshape(n_rows, k_routes, -1) * alpha).sum(dim=1)
+
+    def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
+        if mole_globals is None:
+            raise ValueError("SO2PostActivationExpertMixer requires MOLEGlobals.")
+        n_rows = int(x.shape[0])
+        if n_rows == 0:
+            empty, _ = self.tp.forward_expert_routes(
+                x,
+                R,
+                x.new_empty((0,), dtype=torch.long),
+                latents=latents,
+                wigner_D_all=wigner_D_all,
+            )
+            return empty, wigner_D_all
+
+        expert_indices = _expert_route_indices_from_globals(
+            mole_globals,
+            self.tp.num_experts,
+            n_rows,
+            device=x.device,
+        )
+        if expert_indices.ndim != 2:
+            raise ValueError(f"expert route indices must be [n_rows, k], got {tuple(expert_indices.shape)}.")
+        k_routes = int(expert_indices.shape[1])
+        if k_routes <= 0:
+            raise ValueError("SO2PostActivationExpertMixer requires at least one expert route per row.")
+
+        chunk_size = self.route_chunk_size or n_rows
+        if chunk_size <= 0:
+            chunk_size = n_rows
+
+        out_parts = []
+        for start in range(0, n_rows, chunk_size):
+            end = min(start + chunk_size, n_rows)
+            row_index = torch.arange(start, end, device=x.device, dtype=torch.long)
+            local_row_index = torch.arange(end - start, device=x.device, dtype=torch.long)
+            flat_local_row_index = local_row_index.repeat_interleave(k_routes)
+            flat_expert_index = expert_indices[start:end].reshape(-1)
+
+            x_chunk = x.index_select(0, row_index)
+            R_chunk = R.index_select(0, row_index) if R is not None else None
+            latents_chunk = latents.index_select(0, row_index) if latents is not None else x_chunk.new_empty((0,))
+            chunk_wigner = _index_select_wigner_edges(wigner_D_all, row_index)
+            if chunk_wigner is None and R is not None:
+                chunk_wigner = self.tp._ensure_wigner_rotation(R_chunk, None)
+
+            def chunk_fn(
+                x_chunk_arg,
+                latents_chunk_arg,
+                R_arg=R_chunk,
+                expert_arg=flat_expert_index,
+                wigner_arg=chunk_wigner,
+                local_index_arg=flat_local_row_index,
+                has_latents=latents is not None,
+                chunk_rows=end - start,
+            ):
+                x_routes_arg = x_chunk_arg.index_select(0, local_index_arg)
+                R_routes_arg = R_arg.index_select(0, local_index_arg) if R_arg is not None else None
+                latents_routes_arg = (
+                    latents_chunk_arg.index_select(0, local_index_arg)
+                    if has_latents else None
+                )
+                wigner_routes_arg = _index_select_wigner_edges(wigner_arg, local_index_arg)
+                return self._mix_route_chunk(
+                    x_routes_arg,
+                    R_routes_arg,
+                    expert_arg,
+                    latents_routes_arg,
+                    wigner_routes_arg,
+                    chunk_rows,
+                    k_routes,
+                )
+
+            if self.checkpoint_routes and torch.is_grad_enabled():
+                mixed = torch_checkpoint(chunk_fn, x_chunk, latents_chunk, use_reentrant=False)
+            else:
+                mixed = chunk_fn(x_chunk, latents_chunk)
+            out_parts.append(mixed)
+
+        return torch.cat(out_parts, dim=0), wigner_D_all
 
 
 class SO2_Linear(torch.nn.Module):
@@ -1526,6 +1756,59 @@ class SO2_Linear(torch.nn.Module):
 
         return out.contiguous(), wigner_D_all
 
+
+    def forward_expert_routes(self, x, R, expert_index: torch.Tensor, latents=None, wigner_D_all=None):
+        """Evaluate SO2 TP rows with raw expert weights selected by expert_index.
+
+        expert_index is the dispatch class for each row. It indexes routed
+        experts directly and deliberately bypasses graph-level coefficient
+        weight fusion.
+        """
+        expert_index = expert_index.to(device=x.device, dtype=torch.long).reshape(-1)
+        n, _ = x.shape
+        if expert_index.numel() != n:
+            raise ValueError(f"expert_index has {expert_index.numel()} rows, but input has {n} rows.")
+        if self.radial_emb and latents is None:
+            raise ValueError("SO2_Linear expert-route path requires latents when radial_emb=True.")
+
+        wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+        weights = self.radial_emb(latents) if self.radial_emb else None
+        rot_blocks = self._make_wigner_block_cache(wigner_D_all)
+        input_groups = self._gather_input_l_groups(x)
+        out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+
+        for m in range(self.m_max + 1):
+            radial_weight = (
+                weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1)
+                if self.radial_emb else 1.
+            )
+
+            if m == 0:
+                inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
+                if self.front and self.radial_emb:
+                    y_m = self.fc_m0.apply_experts(inp * radial_weight.squeeze(1), expert_index)
+                elif self.radial_emb:
+                    y_m = self.fc_m0.apply_experts(inp, expert_index) * radial_weight.squeeze(1)
+                else:
+                    y_m = self.fc_m0.apply_experts(inp, expert_index)
+                self._accumulate_grouped_m0_output_(out_groups, y_m, rot_blocks)
+                continue
+
+            x_m_in = self._assemble_grouped_pair_input(input_groups, rot_blocks, m, n, x)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                linear_output = self.m_linear[m - 1].forward_experts(x_m_in, expert_index)
+            elif self.radial_emb:
+                linear_output = self.m_linear[m - 1].forward_experts(x_m_in, expert_index)
+                linear_output = linear_output * radial_weight
+            else:
+                linear_output = self.m_linear[m - 1].forward_experts(x_m_in, expert_index)
+
+            self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+
+        out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+        return out.contiguous(), wigner_D_all
+
     def _warn_route_once(self, key: str, message: str):
         if key in self._route_warned:
             return
@@ -1895,6 +2178,13 @@ class SO2_m_Linear(torch.nn.Module):
         else:
             x_m = self.fc(x_m)
 
+        return self._finish_linear_output(x_m)
+
+
+    def forward_experts(self, x_m, expert_index: torch.Tensor):
+        if not self.is_mole:
+            raise RuntimeError("SO2_m_Linear.forward_experts requires a MOLELinear block, not interpolation.")
+        x_m = self.fc.apply_experts(x_m, expert_index)
         return self._finish_linear_output(x_m)
 
     def _finish_linear_output(self, x_m):
