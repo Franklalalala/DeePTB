@@ -1251,8 +1251,8 @@ class GatedEdgeAggregationMonitor(Plugin):
                 0.5,
                 0.94,
                 (
-                    f"top key score: {float(heatmap.get('top_key_score', 0.0)):.2f}; "
-                    f"visible mass: {float(heatmap.get('visible_mass', 0.0)):.2f}"
+                    f"sink: {float(heatmap.get('top_key_score', 0.0)):.2f}; "
+                    f"mass: {float(heatmap.get('visible_mass', 0.0)):.2f}"
                 ),
                 transform=ax.transAxes,
                 ha="center",
