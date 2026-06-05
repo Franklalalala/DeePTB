@@ -299,6 +299,7 @@ class GatedEdgeAggregation(torch.nn.Module):
             self,
             dst_index: Optional[torch.Tensor],
             src_index: Optional[torch.Tensor],
+            node_batch: Optional[torch.Tensor],
             edge_message: Optional[torch.Tensor],
             dim_size: int,
     ) -> Optional[Dict[str, object]]:
@@ -329,47 +330,63 @@ class GatedEdgeAggregation(torch.nn.Module):
         dst = dst[valid_edges]
         src = src[valid_edges]
         contribution = contribution[valid_edges]
+        edge_message = edge_message.detach().float()[valid_edges]
         device = contribution.device
 
-        query_nodes = torch.unique(dst, sorted=True)[:max_nodes]
-        visible = torch.zeros(dim_size, dtype=torch.bool, device=device)
-        visible[query_nodes] = True
-        visible_edges = visible[dst]
-        if not bool(visible_edges.any().item()):
+        if node_batch is not None and node_batch.numel() >= dim_size:
+            batch = node_batch.detach().long().to(device=device)[:dim_size]
+            same_graph = batch[dst] == batch[src]
+            if not bool(same_graph.any().item()):
+                return None
+            dst = dst[same_graph]
+            src = src[same_graph]
+            contribution = contribution[same_graph]
+            edge_message = edge_message[same_graph]
+            edge_graph = batch[dst]
+            num_graphs = int(batch.max().item()) + 1 if batch.numel() else 1
+            graph_mass = scatter_add(contribution, edge_graph, dim=0, dim_size=num_graphs)
+            selected_graph = int(torch.argmax(graph_mass).item())
+            graph_nodes = torch.nonzero(batch == selected_graph, as_tuple=False).flatten()
+            graph_edges = edge_graph == selected_graph
+            dst = dst[graph_edges]
+            src = src[graph_edges]
+            contribution = contribution[graph_edges]
+            edge_message = edge_message[graph_edges]
+        else:
+            selected_graph = -1
+            graph_nodes = torch.unique(torch.cat([dst, src]), sorted=True)
+
+        if graph_nodes.numel() == 0:
             return None
 
-        key_totals = scatter_add(
-            contribution[visible_edges],
-            src[visible_edges],
-            dim=0,
-            dim_size=dim_size,
-        )
-        key_nodes = torch.nonzero(key_totals > 0, as_tuple=False).flatten()
-        if key_nodes.numel() == 0:
+        visible_nodes = graph_nodes[:max_nodes]
+        visible = torch.zeros(dim_size, dtype=torch.bool, device=device)
+        visible[visible_nodes] = True
+        visible_edges = visible[dst]
+        selected_edges = visible_edges & visible[src]
+        if not bool(visible_edges.any().item()) or not bool(selected_edges.any().item()):
             return None
-        key_nodes = key_nodes[torch.argsort(key_totals[key_nodes], descending=True)[:max_nodes]]
-        key_nodes = torch.sort(key_nodes).values
 
         query_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
         key_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
-        query_pos[query_nodes] = torch.arange(query_nodes.numel(), device=device)
-        key_pos[key_nodes] = torch.arange(key_nodes.numel(), device=device)
+        query_pos[visible_nodes] = torch.arange(visible_nodes.numel(), device=device)
+        key_pos[visible_nodes] = torch.arange(visible_nodes.numel(), device=device)
         qi = query_pos[dst]
         ki = key_pos[src]
         selected = (qi >= 0) & (ki >= 0)
         if not bool(selected.any().item()):
             return None
 
-        flat_size = int(query_nodes.numel() * key_nodes.numel())
-        flat_index = qi[selected] * int(key_nodes.numel()) + ki[selected]
+        flat_size = int(visible_nodes.numel() * visible_nodes.numel())
+        flat_index = qi[selected] * int(visible_nodes.numel()) + ki[selected]
         heatmap = scatter_add(
             contribution[selected],
             flat_index,
             dim=0,
             dim_size=flat_size,
-        ).reshape(int(query_nodes.numel()), int(key_nodes.numel()))
+        ).reshape(int(visible_nodes.numel()), int(visible_nodes.numel()))
 
-        row_total_all_keys = scatter_add(contribution, dst, dim=0, dim_size=dim_size)[query_nodes]
+        row_total_all_keys = scatter_add(contribution, dst, dim=0, dim_size=dim_size)[visible_nodes]
         heatmap = heatmap / row_total_all_keys.unsqueeze(-1).clamp_min(
             torch.finfo(heatmap.dtype).tiny
         )
@@ -377,13 +394,36 @@ class GatedEdgeAggregation(torch.nn.Module):
         top_key_score = float(column_score.max().item()) if column_score.numel() else 0.0
         first_key_score = float(column_score[0].item()) if column_score.numel() else 0.0
         visible_mass = float(heatmap.sum(dim=-1).mean().item()) if heatmap.numel() else 0.0
+        local_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
+        local_pos[graph_nodes] = torch.arange(graph_nodes.numel(), device=device)
+
+        irrep_labels = []
+        irrep_mass = []
+        query_edge_message = edge_message[visible_edges]
+        for idx, ((mul, ir), sl) in enumerate(zip(self.irreps, _irreps_slices(self.irreps))):
+            irrep_labels.append(f"{idx}:{mul}x{ir}")
+            if query_edge_message.numel() == 0:
+                irrep_mass.append(0.0)
+            else:
+                irrep_mass.append(float(query_edge_message[:, sl].abs().sum().item()))
+        irrep_mass_tensor = torch.tensor(irrep_mass, dtype=torch.float32)
+        irrep_total = float(irrep_mass_tensor.sum().item())
+        if irrep_total > 0.0:
+            irrep_share = (irrep_mass_tensor / irrep_total).tolist()
+        else:
+            irrep_share = [0.0 for _ in irrep_mass]
         return {
             "matrix": heatmap.detach().cpu(),
-            "query_nodes": query_nodes.detach().cpu(),
-            "key_nodes": key_nodes.detach().cpu(),
+            "query_nodes": visible_nodes.detach().cpu(),
+            "key_nodes": visible_nodes.detach().cpu(),
+            "query_node_local": local_pos[visible_nodes].detach().cpu(),
+            "key_node_local": local_pos[visible_nodes].detach().cpu(),
+            "sample_index": selected_graph,
             "top_key_score": top_key_score,
             "first_key_score": first_key_score,
             "visible_mass": visible_mass,
+            "irrep_labels": irrep_labels,
+            "irrep_share": irrep_share,
         }
 
     def _record_stats(
@@ -393,6 +433,7 @@ class GatedEdgeAggregation(torch.nn.Module):
             post_gate: torch.Tensor,
             dst_index: Optional[torch.Tensor],
             src_index: Optional[torch.Tensor],
+            node_batch: Optional[torch.Tensor],
             edge_message: Optional[torch.Tensor],
             dim_size: int,
     ) -> None:
@@ -424,6 +465,7 @@ class GatedEdgeAggregation(torch.nn.Module):
             self.last_heatmap = self._build_heatmap(
                 dst_index,
                 src_index,
+                node_batch,
                 edge_message,
                 dim_size,
             )
@@ -434,6 +476,7 @@ class GatedEdgeAggregation(torch.nn.Module):
             query_scalars: torch.Tensor,
             dst_index: Optional[torch.Tensor] = None,
             src_index: Optional[torch.Tensor] = None,
+            node_batch: Optional[torch.Tensor] = None,
             edge_message: Optional[torch.Tensor] = None,
             dim_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -454,6 +497,7 @@ class GatedEdgeAggregation(torch.nn.Module):
             gated,
             dst_index,
             src_index,
+            node_batch,
             edge_message,
             int(dim_size or aggregated.shape[0]),
         )
@@ -1151,6 +1195,7 @@ class LemMoEV3(torch.nn.Module):
                                                                                              precomputed_cutoff_coeffs)
 
         n_active_nodes = node_features.shape[0]
+        node_batch = batch[:n_active_nodes]
         if n_active_nodes < num_nodes_total:
             safe_node_one_hot = node_one_hot[:n_active_nodes]
         else:
@@ -1195,7 +1240,8 @@ class LemMoEV3(torch.nn.Module):
                     active_edges,
                     edge_one_hot,
                     wigner_D_all,
-                    mole_globals  # Pass globals to layers
+                    mole_globals,  # Pass globals to layers
+                    node_batch,
                 )
 
         if node_features.shape[0] < num_nodes_total:
@@ -1740,7 +1786,7 @@ class UpdateNode(torch.nn.Module):
                 )
 
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
-                cutoff_coeffs, active_edges, wigner_D_all, mole_globals):  # Accept globals
+                cutoff_coeffs, active_edges, wigner_D_all, mole_globals, node_batch=None):  # Accept globals
         edge_center = edge_index[0]
         edge_neighbor = edge_index[1]
 
@@ -1798,6 +1844,7 @@ class UpdateNode(torch.nn.Module):
                 node_scalars,
                 dst_index=active_edge_center,
                 src_index=active_edge_neighbor,
+                node_batch=node_batch,
                 edge_message=weighted_message,
                 dim_size=node_features.shape[0],
             )
@@ -2245,12 +2292,13 @@ class Layer(torch.nn.Module):
             )
 
     def forward(self, latents, node_features, edge_features, node_onehot, edge_index, edge_vector, atom_type,
-                cutoff_coeffs, active_edges, edge_one_hot, wigner_D_all, mole_globals):
+                cutoff_coeffs, active_edges, edge_one_hot, wigner_D_all, mole_globals, node_batch=None):
         edge_features, latents, wigner_D_all = self.edge_update(latents, node_features, node_onehot, edge_features,
                                                                 edge_index, edge_vector, cutoff_coeffs, active_edges,
                                                                 edge_one_hot, wigner_D_all, mole_globals)
         node_features = self.node_update(latents, node_features, edge_features, atom_type, node_onehot, edge_index,
-                                         edge_vector, cutoff_coeffs, active_edges, wigner_D_all, mole_globals)
+                                         edge_vector, cutoff_coeffs, active_edges, wigner_D_all, mole_globals,
+                                         node_batch=node_batch)
         if self.node_ffn is not None:
             node_features = self.node_ffn(node_features)
 

@@ -239,7 +239,7 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
         )
 
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
-                cutoff_coeffs, active_edges, wigner_D_all, mole_globals):
+                cutoff_coeffs, active_edges, wigner_D_all, mole_globals, node_batch=None):
         base = self.base
         edge_center = edge_index[0]
         edge_neighbor = edge_index[1]
@@ -298,6 +298,7 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
                 node_scalars,
                 dst_index=active_edge_center,
                 src_index=active_edge_neighbor,
+                node_batch=node_batch,
                 edge_message=weighted_message,
                 dim_size=node_features.shape[0],
             )

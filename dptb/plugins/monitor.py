@@ -1212,10 +1212,15 @@ class GatedEdgeAggregationMonitor(Plugin):
             npz_payload[f"matrix_{idx}"] = matrix
             npz_payload[f"query_nodes_{idx}"] = heatmap["query_nodes"].detach().cpu().numpy()
             npz_payload[f"key_nodes_{idx}"] = heatmap["key_nodes"].detach().cpu().numpy()
+            npz_payload[f"query_node_local_{idx}"] = heatmap["query_node_local"].detach().cpu().numpy()
+            npz_payload[f"key_node_local_{idx}"] = heatmap["key_node_local"].detach().cpu().numpy()
             npz_payload[f"module_{idx}"] = np.array(name)
+            npz_payload[f"sample_index_{idx}"] = np.array(int(heatmap.get("sample_index", -1)))
             npz_payload[f"top_key_score_{idx}"] = np.array(float(heatmap.get("top_key_score", 0.0)))
             npz_payload[f"first_key_score_{idx}"] = np.array(float(heatmap.get("first_key_score", 0.0)))
             npz_payload[f"visible_mass_{idx}"] = np.array(float(heatmap.get("visible_mass", 0.0)))
+            npz_payload[f"irrep_labels_{idx}"] = np.array(heatmap.get("irrep_labels", []))
+            npz_payload[f"irrep_share_{idx}"] = np.array(heatmap.get("irrep_share", []), dtype=float)
         np.savez_compressed(prefix + ".npz", **npz_payload)
 
         try:
@@ -1227,23 +1232,28 @@ class GatedEdgeAggregationMonitor(Plugin):
             return
 
         n = len(entries)
-        cols = min(2, n)
-        rows = int(math.ceil(n / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(5.0 * cols, 4.5 * rows), squeeze=False)
-        for ax in axes.flat:
-            ax.axis("off")
+        fig, axes = plt.subplots(
+            n,
+            2,
+            figsize=(9.2, 3.8 * n),
+            squeeze=False,
+            gridspec_kw={"width_ratios": [1.0, 0.42]},
+        )
         for idx, (name, heatmap) in enumerate(entries):
-            ax = axes.flat[idx]
-            ax.axis("on")
+            ax = axes[idx, 0]
             matrix = heatmap["matrix"].detach().cpu().numpy()
             image = ax.imshow(matrix, vmin=0.0, vmax=1.0, cmap="viridis", interpolation="nearest")
-            ax.set_title(self._short_module_name(name))
-            ax.set_xlabel("Key source node")
-            ax.set_ylabel("Query target node")
+            sample = int(heatmap.get("sample_index", -1))
+            ax.set_title(f"{self._short_module_name(name)}, sample {sample}")
+            ax.set_xlabel("Key source node (local)")
+            ax.set_ylabel("Query target node (local)")
             ax.text(
                 0.5,
                 0.94,
-                f"top key score: {float(heatmap.get('top_key_score', 0.0)):.2f}",
+                (
+                    f"top key score: {float(heatmap.get('top_key_score', 0.0)):.2f}; "
+                    f"visible mass: {float(heatmap.get('visible_mass', 0.0)):.2f}"
+                ),
                 transform=ax.transAxes,
                 ha="center",
                 va="top",
@@ -1251,6 +1261,20 @@ class GatedEdgeAggregationMonitor(Plugin):
                 fontsize=10,
             )
             fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
+            ax_irrep = axes[idx, 1]
+            labels = list(heatmap.get("irrep_labels", []))
+            shares = list(heatmap.get("irrep_share", []))
+            if labels and shares:
+                y = list(range(len(labels)))
+                ax_irrep.barh(y, shares, color="#2f7d59")
+                ax_irrep.set_yticks(y, labels)
+                ax_irrep.invert_yaxis()
+                ax_irrep.set_xlim(0.0, max(0.01, max(shares) * 1.15))
+                ax_irrep.set_xlabel("message mass share")
+                ax_irrep.set_title("irrep profile")
+                ax_irrep.grid(axis="x", alpha=0.22)
+            else:
+                ax_irrep.axis("off")
         fig.suptitle(f"gated edge aggregation heatmap, iter {int(iteration)}", fontsize=12)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         fig.savefig(prefix + ".png", dpi=160)

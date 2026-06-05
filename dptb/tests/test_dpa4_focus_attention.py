@@ -117,6 +117,28 @@ def test_gated_edge_aggregation_applies_equivariant_sigmoid_gate_and_records_sta
         torch.tensor([[0.25, 0.75], [0.25, 0.75]]),
     )
     assert torch.isclose(torch.tensor(gate.last_heatmap["top_key_score"]), torch.tensor(0.75))
+    assert gate.last_heatmap["irrep_labels"] == ["0:2x0e", "1:1x1o"]
+
+
+def test_gated_edge_aggregation_heatmap_selects_one_sample_from_batch():
+    gate = GatedEdgeAggregation(o3.Irreps("1x0e"), query_scalar_dim=1)
+
+    _ = gate(
+        torch.ones(4, 1),
+        torch.zeros(4, 1),
+        dst_index=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        src_index=torch.tensor([1, 0, 3, 2], dtype=torch.long),
+        node_batch=torch.tensor([0, 0, 1, 1], dtype=torch.long),
+        edge_message=torch.tensor([[1.0], [1.0], [10.0], [20.0]]),
+        dim_size=4,
+    )
+
+    heatmap = gate.last_heatmap
+    assert heatmap["sample_index"] == 1
+    assert heatmap["query_nodes"].tolist() == [2, 3]
+    assert heatmap["key_nodes"].tolist() == [2, 3]
+    assert heatmap["query_node_local"].tolist() == [0, 1]
+    assert torch.allclose(heatmap["matrix"], torch.tensor([[0.0, 1.0], [1.0, 0.0]]))
 
 
 def test_gated_edge_aggregation_monitor_writes_latest_layer_stats(tmp_path):
