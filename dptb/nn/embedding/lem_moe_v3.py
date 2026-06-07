@@ -6,7 +6,7 @@ import torch
 from torch_runstats.scatter import scatter
 from torch import fx
 from e3nn import o3
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_add, scatter_max, scatter_mean
 from e3nn.o3 import Linear, SphericalHarmonics, FullyConnectedTensorProduct, TensorProduct
 from dptb.data import AtomicDataDict
 from dptb.nn.embedding.emb import Embedding
@@ -24,9 +24,10 @@ from .lem_moe_v3_plugins import (
     can_use_flat_s2_patch,
 )
 # Note: Modified SO2_Linear and MOLE classes imported here
-from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3
+from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3, SO2PostActivationExpertMixer
 import math
 from dptb.data.transforms import OrbitalMapper
+from dptb.utils.soc_target import resolve_nextham_uureal_mask
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
@@ -35,6 +36,28 @@ from math import ceil
 import logging
 
 log = logging.getLogger(__name__)
+
+
+def _normalize_node_message_aggregation(mode: Optional[str]) -> str:
+    mode = mode or "scatter"
+    allowed = {"scatter", "single_head_0e"}
+    if mode not in allowed:
+        raise ValueError(
+            "node_message_aggregation must be one of "
+            f"{sorted(allowed)}, got {mode!r}."
+        )
+    return mode
+
+
+def _normalize_edge_attention_key_source(source: Optional[str]) -> str:
+    source = source or "message"
+    allowed = {"message"}
+    if source not in allowed:
+        raise ValueError(
+            "edge_attention_key_source must be one of "
+            f"{sorted(allowed)}, got {source!r}."
+        )
+    return source
 
 
 def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
@@ -57,6 +80,63 @@ def _normalize_stable_standard_compat_mode(name: str, mode: Optional[str]) -> st
     )
 
 
+def _normalize_so2_expert_mixing_mode(mode: Optional[str]) -> str:
+    mode = mode or "pre_activation"
+    allowed = {"pre_activation", "post_activation"}
+    if mode not in allowed:
+        raise ValueError(f"so2_expert_mixing_mode must be one of {sorted(allowed)}, got {mode!r}.")
+    return mode
+
+
+def _build_so2_post_activation_expert_mixer(
+        tp: SO2_Linear,
+        activation: torch.nn.Module,
+        scalar_dim: int,
+        router_hidden_dim: int,
+        route_chunk_size: Optional[int],
+        route_checkpoint: bool,
+) -> SO2PostActivationExpertMixer:
+    return SO2PostActivationExpertMixer(
+        tp=tp,
+        activation=activation,
+        router_from_0e=torch.nn.Sequential(
+            torch.nn.Linear(scalar_dim, router_hidden_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(router_hidden_dim, 1),
+        ),
+        scalar_dim=scalar_dim,
+        route_chunk_size=route_chunk_size,
+        checkpoint_routes=route_checkpoint,
+    )
+
+
+def _apply_so2_tp_or_post_activation_mixer(
+        module: torch.nn.Module,
+        tp_input: torch.Tensor,
+        edge_vector: torch.Tensor,
+        mole_globals: MOLEGlobals,
+        latents: torch.Tensor,
+        wigner_D_all,
+):
+    if module.post_activation_expert_mixer is None:
+        features, wigner_D_all = module.tp(
+            tp_input,
+            edge_vector,
+            mole_globals,
+            latents,
+            wigner_D_all,
+        )
+        features = module.activation(features)
+        return features, wigner_D_all
+    return module.post_activation_expert_mixer(
+        tp_input,
+        edge_vector,
+        mole_globals,
+        latents,
+        wigner_D_all,
+    )
+
+
 def _irreps_slices(irreps: o3.Irreps) -> List[slice]:
     slices = []
     offset = 0
@@ -65,6 +145,470 @@ def _irreps_slices(irreps: o3.Irreps) -> List[slice]:
         slices.append(slice(offset, offset + width))
         offset += width
     return slices
+
+
+def _focus_feature_index(irreps: o3.Irreps, num_focus: int) -> torch.Tensor:
+    focus_indices = []
+    for mul, ir in irreps:
+        per_channel_focus = torch.arange(mul, dtype=torch.long).remainder(num_focus)
+        focus_indices.append(per_channel_focus.repeat_interleave(ir.dim))
+    if not focus_indices:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(focus_indices, dim=0)
+
+
+def _equivariant_gate_feature_index(irreps: o3.Irreps) -> Tuple[torch.Tensor, int]:
+    gate_indices = []
+    offset = 0
+    for mul, ir in irreps:
+        per_mul_gate = torch.arange(offset, offset + mul, dtype=torch.long)
+        gate_indices.append(per_mul_gate.repeat_interleave(ir.dim))
+        offset += mul
+    if not gate_indices:
+        return torch.empty(0, dtype=torch.long), 0
+    return torch.cat(gate_indices, dim=0), offset
+
+
+class PostActivation0eFocusGate(torch.nn.Module):
+    """Post-activation scalar router that gates equivariant message channels."""
+
+    def __init__(
+            self,
+            irreps: o3.Irreps,
+            num_focus: int = 1,
+            hidden_dim: Optional[int] = None,
+            dtype: Union[str, torch.dtype] = torch.float32,
+            device: Union[str, torch.device] = torch.device("cpu"),
+    ):
+        super().__init__()
+        self.irreps = o3.Irreps(irreps)
+        self.num_focus = int(num_focus)
+        if self.num_focus < 1:
+            raise ValueError(f"num_focus must be >= 1, got {num_focus!r}")
+        if self.irreps[0].ir.l != 0:
+            raise ValueError("PostActivation0eFocusGate expects irreps to start with 0e scalars.")
+        self.scalar_dim = self.irreps[0].dim
+        self.enabled = self.num_focus > 1
+        self.register_buffer(
+            "focus_index",
+            _focus_feature_index(self.irreps, self.num_focus).to(device=device),
+        )
+        if self.enabled:
+            hidden = hidden_dim or max(16, self.scalar_dim)
+            self.router = torch.nn.Sequential(
+                torch.nn.Linear(self.scalar_dim, hidden, dtype=dtype, device=device),
+                torch.nn.SiLU(),
+                torch.nn.Linear(hidden, self.num_focus, dtype=dtype, device=device),
+            )
+            torch.nn.init.zeros_(self.router[-1].weight)
+            torch.nn.init.zeros_(self.router[-1].bias)
+        else:
+            self.router = None
+
+    def forward(self, message: torch.Tensor) -> torch.Tensor:
+        if not self.enabled or message.numel() == 0:
+            return message
+        scalars = message[:, :self.scalar_dim]
+        focus_scale = 2.0 * torch.sigmoid(self.router(scalars))
+        feature_scale = focus_scale.index_select(1, self.focus_index.to(device=message.device))
+        return message * feature_scale
+
+
+class GatedEdgeAggregation(torch.nn.Module):
+    """Query-dependent sigmoid gate applied after edge-to-node aggregation."""
+
+    def __init__(
+            self,
+            irreps: o3.Irreps,
+            query_scalar_dim: int,
+            sparsity_threshold: float = 1.0e-2,
+            dtype: Union[str, torch.dtype] = torch.float32,
+            device: Union[str, torch.device] = torch.device("cpu"),
+    ):
+        super().__init__()
+        self.irreps = o3.Irreps(irreps)
+        if query_scalar_dim < 1:
+            raise ValueError(f"query_scalar_dim must be >= 1, got {query_scalar_dim!r}")
+        feature_gate_index, gate_dim = _equivariant_gate_feature_index(self.irreps)
+        if gate_dim < 1:
+            raise ValueError("GatedEdgeAggregation requires a non-empty output irreps.")
+        self.query_scalar_dim = int(query_scalar_dim)
+        self.gate_dim = int(gate_dim)
+        self.sparsity_threshold = float(sparsity_threshold)
+        self.register_buffer("feature_gate_index", feature_gate_index.to(device=device))
+        self.gate = torch.nn.Linear(
+            self.query_scalar_dim,
+            self.gate_dim,
+            dtype=dtype,
+            device=device,
+        )
+        torch.nn.init.zeros_(self.gate.weight)
+        torch.nn.init.zeros_(self.gate.bias)
+        self.last_stats: Optional[Dict[str, float]] = None
+        self.last_heatmap: Optional[Dict[str, object]] = None
+        self.heatmap_max_nodes = 64
+
+    @staticmethod
+    def _tensor_stat(tensor: torch.Tensor, op: str) -> float:
+        if tensor.numel() == 0:
+            return 0.0
+        finite = tensor[torch.isfinite(tensor)]
+        if finite.numel() == 0:
+            return 0.0
+        if op == "mean":
+            return float(finite.mean().item())
+        if op == "std":
+            return float(finite.std(unbiased=False).item()) if finite.numel() > 1 else 0.0
+        if op == "min":
+            return float(finite.min().item())
+        if op == "max":
+            return float(finite.max().item())
+        raise ValueError(f"unsupported tensor stat {op!r}")
+
+    @staticmethod
+    def _sparsity(tensor: torch.Tensor, threshold: float) -> float:
+        if tensor.numel() == 0:
+            return 0.0
+        finite = tensor[torch.isfinite(tensor)]
+        if finite.numel() == 0:
+            return 0.0
+        return float((finite.abs() < threshold).float().mean().item())
+
+    def _top_edge_share_stats(
+            self,
+            dst_index: Optional[torch.Tensor],
+            edge_message: Optional[torch.Tensor],
+            dim_size: int,
+    ) -> Tuple[float, float, int, int]:
+        if dst_index is None or edge_message is None or dst_index.numel() == 0:
+            return 0.0, 0.0, 0, 0
+        dst = dst_index.detach()
+        contribution = edge_message.detach().float().abs().sum(dim=-1)
+        active_edges = int(contribution.numel())
+        if active_edges == 0:
+            return 0.0, 0.0, 0, 0
+        per_node_sum = scatter_add(contribution, dst, dim=0, dim_size=dim_size)
+        per_node_max = scatter_max(contribution, dst, dim=0, dim_size=dim_size)[0]
+        per_node_max = torch.where(
+            torch.isfinite(per_node_max),
+            per_node_max,
+            torch.zeros_like(per_node_max),
+        )
+        valid = per_node_sum > torch.finfo(per_node_sum.dtype).tiny
+        nodes_with_edges = int(valid.sum().item())
+        if nodes_with_edges == 0:
+            return 0.0, 0.0, active_edges, 0
+        share = per_node_max[valid] / per_node_sum[valid].clamp_min(torch.finfo(per_node_sum.dtype).tiny)
+        return (
+            float(share.mean().item()),
+            float(share.max().item()),
+            active_edges,
+            nodes_with_edges,
+        )
+
+    def _build_heatmap(
+            self,
+            dst_index: Optional[torch.Tensor],
+            src_index: Optional[torch.Tensor],
+            node_batch: Optional[torch.Tensor],
+            edge_message: Optional[torch.Tensor],
+            dim_size: int,
+    ) -> Optional[Dict[str, object]]:
+        if (
+                dst_index is None
+                or src_index is None
+                or edge_message is None
+                or dst_index.numel() == 0
+                or src_index.numel() != dst_index.numel()
+        ):
+            return None
+
+        max_nodes = max(1, int(getattr(self, "heatmap_max_nodes", 64)))
+        dst = dst_index.detach().long()
+        src = src_index.detach().long()
+        contribution = edge_message.detach().float().abs().sum(dim=-1)
+        valid_edges = (
+            (dst >= 0)
+            & (src >= 0)
+            & (dst < dim_size)
+            & (src < dim_size)
+            & torch.isfinite(contribution)
+            & (contribution > 0)
+        )
+        if not bool(valid_edges.any().item()):
+            return None
+
+        dst = dst[valid_edges]
+        src = src[valid_edges]
+        contribution = contribution[valid_edges]
+        edge_message = edge_message.detach().float()[valid_edges]
+        device = contribution.device
+
+        if node_batch is not None and node_batch.numel() >= dim_size:
+            batch = node_batch.detach().long().to(device=device)[:dim_size]
+            same_graph = batch[dst] == batch[src]
+            if not bool(same_graph.any().item()):
+                return None
+            dst = dst[same_graph]
+            src = src[same_graph]
+            contribution = contribution[same_graph]
+            edge_message = edge_message[same_graph]
+            edge_graph = batch[dst]
+            num_graphs = int(batch.max().item()) + 1 if batch.numel() else 1
+            graph_mass = scatter_add(contribution, edge_graph, dim=0, dim_size=num_graphs)
+            selected_graph = int(torch.argmax(graph_mass).item())
+            graph_nodes = torch.nonzero(batch == selected_graph, as_tuple=False).flatten()
+            graph_edges = edge_graph == selected_graph
+            dst = dst[graph_edges]
+            src = src[graph_edges]
+            contribution = contribution[graph_edges]
+            edge_message = edge_message[graph_edges]
+        else:
+            selected_graph = -1
+            graph_nodes = torch.unique(torch.cat([dst, src]), sorted=True)
+
+        if graph_nodes.numel() == 0:
+            return None
+
+        visible_nodes = graph_nodes[:max_nodes]
+        visible = torch.zeros(dim_size, dtype=torch.bool, device=device)
+        visible[visible_nodes] = True
+        visible_edges = visible[dst]
+        selected_edges = visible_edges & visible[src]
+        if not bool(visible_edges.any().item()) or not bool(selected_edges.any().item()):
+            return None
+
+        query_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
+        key_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
+        query_pos[visible_nodes] = torch.arange(visible_nodes.numel(), device=device)
+        key_pos[visible_nodes] = torch.arange(visible_nodes.numel(), device=device)
+        qi = query_pos[dst]
+        ki = key_pos[src]
+        selected = (qi >= 0) & (ki >= 0)
+        if not bool(selected.any().item()):
+            return None
+
+        flat_size = int(visible_nodes.numel() * visible_nodes.numel())
+        flat_index = qi[selected] * int(visible_nodes.numel()) + ki[selected]
+        heatmap = scatter_add(
+            contribution[selected],
+            flat_index,
+            dim=0,
+            dim_size=flat_size,
+        ).reshape(int(visible_nodes.numel()), int(visible_nodes.numel()))
+
+        row_total_all_keys = scatter_add(contribution, dst, dim=0, dim_size=dim_size)[visible_nodes]
+        heatmap = heatmap / row_total_all_keys.unsqueeze(-1).clamp_min(
+            torch.finfo(heatmap.dtype).tiny
+        )
+        column_score = heatmap.mean(dim=0)
+        top_key_score = float(column_score.max().item()) if column_score.numel() else 0.0
+        first_key_score = float(column_score[0].item()) if column_score.numel() else 0.0
+        visible_mass = float(heatmap.sum(dim=-1).mean().item()) if heatmap.numel() else 0.0
+        local_pos = torch.full((dim_size,), -1, dtype=torch.long, device=device)
+        local_pos[graph_nodes] = torch.arange(graph_nodes.numel(), device=device)
+
+        irrep_labels = []
+        irrep_mass = []
+        query_edge_message = edge_message[visible_edges]
+        for idx, ((mul, ir), sl) in enumerate(zip(self.irreps, _irreps_slices(self.irreps))):
+            irrep_labels.append(f"{idx}:{mul}x{ir}")
+            if query_edge_message.numel() == 0:
+                irrep_mass.append(0.0)
+            else:
+                irrep_mass.append(float(query_edge_message[:, sl].abs().sum().item()))
+        irrep_mass_tensor = torch.tensor(irrep_mass, dtype=torch.float32)
+        irrep_total = float(irrep_mass_tensor.sum().item())
+        if irrep_total > 0.0:
+            irrep_share = (irrep_mass_tensor / irrep_total).tolist()
+        else:
+            irrep_share = [0.0 for _ in irrep_mass]
+        return {
+            "matrix": heatmap.detach().cpu(),
+            "query_nodes": visible_nodes.detach().cpu(),
+            "key_nodes": visible_nodes.detach().cpu(),
+            "query_node_local": local_pos[visible_nodes].detach().cpu(),
+            "key_node_local": local_pos[visible_nodes].detach().cpu(),
+            "sample_index": selected_graph,
+            "top_key_score": top_key_score,
+            "first_key_score": first_key_score,
+            "visible_mass": visible_mass,
+            "irrep_labels": irrep_labels,
+            "irrep_share": irrep_share,
+        }
+
+    def _record_stats(
+            self,
+            gate_values: torch.Tensor,
+            pre_gate: torch.Tensor,
+            post_gate: torch.Tensor,
+            dst_index: Optional[torch.Tensor],
+            src_index: Optional[torch.Tensor],
+            node_batch: Optional[torch.Tensor],
+            edge_message: Optional[torch.Tensor],
+            dim_size: int,
+    ) -> None:
+        with torch.no_grad():
+            gate_det = gate_values.detach().float()
+            pre_det = pre_gate.detach().float()
+            post_det = post_gate.detach().float()
+            top_mean, top_max, active_edges, nodes_with_edges = self._top_edge_share_stats(
+                dst_index,
+                edge_message,
+                dim_size,
+            )
+            self.last_stats = {
+                "gate_mean": self._tensor_stat(gate_det, "mean"),
+                "gate_std": self._tensor_stat(gate_det, "std"),
+                "gate_min": self._tensor_stat(gate_det, "min"),
+                "gate_max": self._tensor_stat(gate_det, "max"),
+                "gate_sparsity_lt_0_1": self._sparsity(gate_det, 0.1),
+                "gate_sparsity_lt_1e_2": self._sparsity(gate_det, 1.0e-2),
+                "pre_sparsity_lt_1e_2": self._sparsity(pre_det, self.sparsity_threshold),
+                "post_sparsity_lt_1e_2": self._sparsity(post_det, self.sparsity_threshold),
+                "pre_activation_max": self._tensor_stat(pre_det.abs(), "max"),
+                "post_activation_max": self._tensor_stat(post_det.abs(), "max"),
+                "top_edge_share_mean": top_mean,
+                "top_edge_share_max": top_max,
+                "active_edges": active_edges,
+                "nodes_with_edges": nodes_with_edges,
+            }
+            self.last_heatmap = self._build_heatmap(
+                dst_index,
+                src_index,
+                node_batch,
+                edge_message,
+                dim_size,
+            )
+
+    def forward(
+            self,
+            aggregated: torch.Tensor,
+            query_scalars: torch.Tensor,
+            dst_index: Optional[torch.Tensor] = None,
+            src_index: Optional[torch.Tensor] = None,
+            node_batch: Optional[torch.Tensor] = None,
+            edge_message: Optional[torch.Tensor] = None,
+            dim_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        if query_scalars.shape[0] != aggregated.shape[0]:
+            raise ValueError(
+                "query_scalars and aggregated node messages must have the same leading dimension, "
+                f"got {query_scalars.shape[0]} and {aggregated.shape[0]}."
+            )
+        gate_values = torch.sigmoid(self.gate(query_scalars))
+        feature_gate = gate_values.index_select(
+            1,
+            self.feature_gate_index.to(device=aggregated.device),
+        )
+        gated = aggregated * feature_gate
+        self._record_stats(
+            gate_values,
+            aggregated,
+            gated,
+            dst_index,
+            src_index,
+            node_batch,
+            edge_message,
+            int(dim_size or aggregated.shape[0]),
+        )
+        return gated
+
+
+class SingleHead0eEnvelopeAttention(torch.nn.Module):
+    """Single-head destination attention from 0e scalars with cutoff envelope gating."""
+
+    def __init__(
+            self,
+            node_scalar_dim: int,
+            message_scalar_dim: int,
+            latent_dim: int,
+            attn_dim: int = 32,
+            envelope_power: float = 1.0,
+            use_latent_bias: bool = True,
+            key_source: str = "message",
+            key_layer_norm: bool = False,
+            dtype: Union[str, torch.dtype] = torch.float32,
+            device: Union[str, torch.device] = torch.device("cpu"),
+    ):
+        super().__init__()
+        if attn_dim < 1:
+            raise ValueError(f"attn_dim must be >= 1, got {attn_dim!r}")
+        if envelope_power <= 0.0:
+            raise ValueError(f"envelope_power must be > 0, got {envelope_power!r}")
+        self.envelope_power = float(envelope_power)
+        self.use_latent_bias = bool(use_latent_bias)
+        self.key_source = _normalize_edge_attention_key_source(key_source)
+        self.key_layer_norm = bool(key_layer_norm)
+        self.query = torch.nn.Linear(node_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
+        self.key_norm = (
+            torch.nn.LayerNorm(message_scalar_dim, dtype=dtype, device=device)
+            if self.key_layer_norm
+            else torch.nn.Identity()
+        )
+        self.key = torch.nn.Linear(message_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
+        if self.use_latent_bias:
+            self.latent_bias = torch.nn.Sequential(
+                torch.nn.LayerNorm(latent_dim, dtype=dtype, device=device),
+                torch.nn.Linear(latent_dim, attn_dim, dtype=dtype, device=device),
+                torch.nn.SiLU(),
+                torch.nn.Linear(attn_dim, 1, dtype=dtype, device=device),
+            )
+        else:
+            self.latent_bias = None
+        self.logit_scale = attn_dim ** -0.5
+
+    def attention_weights(
+            self,
+            dst_index: torch.Tensor,
+            node_scalars: torch.Tensor,
+            message_scalars: torch.Tensor,
+            latents: torch.Tensor,
+            cutoff_coeffs: torch.Tensor,
+            dim_size: int,
+    ) -> torch.Tensor:
+        if dst_index.numel() == 0:
+            return message_scalars.new_zeros((0,))
+
+        q = self.query(node_scalars.index_select(0, dst_index))
+        k = self.key(self.key_norm(message_scalars))
+        logits = (q * k).sum(dim=-1) * self.logit_scale
+        if self.latent_bias is not None:
+            logits = logits + self.latent_bias(latents).squeeze(-1)
+
+        max_per_node = scatter_max(logits, dst_index, dim=0, dim_size=dim_size)[0]
+        max_per_node = torch.where(
+            torch.isfinite(max_per_node),
+            max_per_node,
+            torch.zeros_like(max_per_node),
+        )
+        shifted = logits - max_per_node.index_select(0, dst_index)
+        numer = torch.exp(shifted)
+        numer = numer * cutoff_coeffs.clamp_min(0.0).pow(self.envelope_power)
+
+        denom = scatter_add(numer, dst_index, dim=0, dim_size=dim_size)
+        denom = denom.clamp_min(torch.finfo(numer.dtype).tiny)
+        return numer / denom.index_select(0, dst_index)
+
+    def forward(
+            self,
+            message: torch.Tensor,
+            dst_index: torch.Tensor,
+            node_scalars: torch.Tensor,
+            message_scalars: torch.Tensor,
+            latents: torch.Tensor,
+            cutoff_coeffs: torch.Tensor,
+            dim_size: int,
+    ) -> torch.Tensor:
+        weights = self.attention_weights(
+            dst_index=dst_index,
+            node_scalars=node_scalars,
+            message_scalars=message_scalars,
+            latents=latents,
+            cutoff_coeffs=cutoff_coeffs,
+            dim_size=dim_size,
+        )
+        return scatter_add(message * weights.unsqueeze(-1), dst_index, dim=0, dim_size=dim_size)
 
 
 def _instruction_get(instruction, name: str, index: int):
@@ -367,9 +911,22 @@ class LemMoEV3(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             so2_m_linear_mode: Optional[str] = None,
             mole_linear_m0_mode: Optional[str] = None,
             onehot_tp_mode: Optional[str] = None,
+            node_message_aggregation: str = "scatter",
+            num_focus: int = 1,
+            focus_attention_dim: int = 32,
+            edge_aggregation_gated_attention: bool = False,
+            edge_attention_key_source: str = "message",
+            edge_attention_envelope_power: float = 1.0,
+            edge_attention_use_latent_bias: bool = True,
+            edge_attention_key_layer_norm: bool = False,
+            edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             universal: Optional[bool] = False,
@@ -421,7 +978,22 @@ class LemMoEV3(torch.nn.Module):
         if isinstance(device, str):
             device = torch.device(device)
         self.device = device
+        self.has_soc = bool(kwargs.get("has_soc", False))
+        self.full_soc_prediction = bool(kwargs.get("full_soc_prediction", False))
+        self.nextham_uureal_mask = resolve_nextham_uureal_mask(
+            nextham_uureal_mask=kwargs.get("nextham_uureal_mask", False),
+            full_soc_prediction=self.full_soc_prediction,
+        )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
+        self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
+        self.num_focus = int(num_focus)
+        self.edge_aggregation_gated_attention = bool(edge_aggregation_gated_attention)
+        self.edge_attention_key_source = _normalize_edge_attention_key_source(edge_attention_key_source)
+        self.edge_attention_envelope_power = float(edge_attention_envelope_power)
+        self.edge_attention_use_latent_bias = bool(edge_attention_use_latent_bias)
+        self.edge_attention_key_layer_norm = bool(edge_attention_key_layer_norm)
+        self.edge_message_env_weight = bool(edge_message_env_weight)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
         )
@@ -429,14 +1001,35 @@ class LemMoEV3(torch.nn.Module):
             "mole_linear_m0_mode", mole_linear_m0_mode
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
+        log.info(f"  - SO2 Expert Mixing Mode: {self.so2_expert_mixing_mode}")
+        log.info(
+            "  - DPA4-style Focus/Aggregation: "
+            f"num_focus={self.num_focus}, node_message_aggregation={self.node_message_aggregation}, "
+            f"focus_attention_dim={focus_attention_dim}, "
+            f"edge_aggregation_gated_attention={self.edge_aggregation_gated_attention}, "
+            f"edge_attention_key_source={self.edge_attention_key_source}, "
+            f"edge_attention_envelope_power={self.edge_attention_envelope_power}, "
+            f"edge_attention_use_latent_bias={self.edge_attention_use_latent_bias}, "
+            f"edge_attention_key_layer_norm={self.edge_attention_key_layer_norm}, "
+            f"edge_message_env_weight={self.edge_message_env_weight}"
+        )
 
         if basis is not None:
-            self.idp = OrbitalMapper(basis, method="e3tb")
+            self.idp = OrbitalMapper(
+                basis,
+                method="e3tb",
+                device=self.device,
+                has_soc=self.has_soc,
+                nextham_uureal_mask=self.nextham_uureal_mask,
+                full_soc_prediction=self.full_soc_prediction,
+            )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."
         else:
             assert idp is not None, "Either basis or idp should be provided."
             self.idp = idp
+        self.has_soc = bool(getattr(self.idp, "has_soc", self.has_soc))
+        self.nextham_uureal_mask = bool(getattr(self.idp, "nextham_uureal_mask", self.nextham_uureal_mask))
 
         latent_kwargs = {
             "mlp_latent_dimensions": latent_channels + [latent_dim],
@@ -548,7 +1141,20 @@ class LemMoEV3(torch.nn.Module):
                 so2_wigner_apply_mode=so2_wigner_apply_mode,
                 so2_fusion_mode=so2_fusion_mode,
                 mole_linear_mode=mole_linear_mode,
+                so2_expert_mixing_mode=self.so2_expert_mixing_mode,
+                so2_expert_route_chunk_size=so2_expert_route_chunk_size,
+                so2_expert_route_checkpoint=so2_expert_route_checkpoint,
+                so2_output_router_hidden_dim=so2_output_router_hidden_dim,
                 onehot_tp_mode=self.onehot_tp_mode,
+                node_message_aggregation=self.node_message_aggregation,
+                num_focus=self.num_focus,
+                focus_attention_dim=focus_attention_dim,
+                edge_aggregation_gated_attention=self.edge_aggregation_gated_attention,
+                edge_attention_key_source=self.edge_attention_key_source,
+                edge_attention_envelope_power=self.edge_attention_envelope_power,
+                edge_attention_use_latent_bias=self.edge_attention_use_latent_bias,
+                edge_attention_key_layer_norm=self.edge_attention_key_layer_norm,
+                edge_message_env_weight=self.edge_message_env_weight,
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
@@ -636,6 +1242,7 @@ class LemMoEV3(torch.nn.Module):
                                                                                              precomputed_cutoff_coeffs)
 
         n_active_nodes = node_features.shape[0]
+        node_batch = batch[:n_active_nodes]
         if n_active_nodes < num_nodes_total:
             safe_node_one_hot = node_one_hot[:n_active_nodes]
         else:
@@ -680,7 +1287,8 @@ class LemMoEV3(torch.nn.Module):
                     active_edges,
                     edge_one_hot,
                     wigner_D_all,
-                    mole_globals  # Pass globals to layers
+                    mole_globals,  # Pass globals to layers
+                    node_batch,
                 )
 
         if node_features.shape[0] < num_nodes_total:
@@ -1033,7 +1641,20 @@ class UpdateNode(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             onehot_tp_mode: Optional[str] = None,
+            node_message_aggregation: str = "scatter",
+            num_focus: int = 1,
+            focus_attention_dim: int = 32,
+            edge_aggregation_gated_attention: bool = False,
+            edge_attention_key_source: str = "message",
+            edge_attention_envelope_power: float = 1.0,
+            edge_attention_use_latent_bias: bool = True,
+            edge_attention_key_layer_norm: bool = False,
+            edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1047,6 +1668,14 @@ class UpdateNode(torch.nn.Module):
         self.device = device
         self.res_update = res_update
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
+        self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
+        self.edge_aggregation_gated_attention = bool(edge_aggregation_gated_attention)
+        self.edge_attention_key_source = _normalize_edge_attention_key_source(edge_attention_key_source)
+        self.edge_attention_envelope_power = float(edge_attention_envelope_power)
+        self.edge_attention_use_latent_bias = bool(edge_attention_use_latent_bias)
+        self.edge_attention_key_layer_norm = bool(edge_attention_key_layer_norm)
+        self.edge_message_env_weight = bool(edge_message_env_weight)
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -1122,6 +1751,48 @@ class UpdateNode(torch.nn.Module):
             internal_weights=True,
             biases=True,
         )
+        self.post_activation_expert_mixer = None
+        if self.so2_expert_mixing_mode == "post_activation":
+            scalar_dim = self.activation.irreps_out[0].dim
+            self.post_activation_expert_mixer = _build_so2_post_activation_expert_mixer(
+                self.tp,
+                self.activation,
+                scalar_dim,
+                so2_output_router_hidden_dim,
+                so2_expert_route_chunk_size,
+                so2_expert_route_checkpoint,
+            )
+
+        self.focus_gate = PostActivation0eFocusGate(
+            self.irreps_out,
+            num_focus=num_focus,
+            dtype=dtype,
+            device=device,
+        )
+        if self.node_message_aggregation == "single_head_0e":
+            self.node_attention = SingleHead0eEnvelopeAttention(
+                node_scalar_dim=self.irreps_in[0].dim,
+                message_scalar_dim=self.irreps_out[0].dim,
+                latent_dim=latent_dim,
+                attn_dim=focus_attention_dim,
+                envelope_power=self.edge_attention_envelope_power,
+                use_latent_bias=self.edge_attention_use_latent_bias,
+                key_source=self.edge_attention_key_source,
+                key_layer_norm=self.edge_attention_key_layer_norm,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            self.node_attention = None
+        if self.edge_aggregation_gated_attention:
+            self.edge_aggregation_gate = GatedEdgeAggregation(
+                self.irreps_out,
+                query_scalar_dim=self.irreps_in[0].dim,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            self.edge_aggregation_gate = None
 
         if res_update:
             self.linear_res = Linear(
@@ -1176,34 +1847,71 @@ class UpdateNode(torch.nn.Module):
                 )
 
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
-                active_edges, wigner_D_all, mole_globals):  # Accept globals
+                cutoff_coeffs, active_edges, wigner_D_all, mole_globals, node_batch=None):  # Accept globals
         edge_center = edge_index[0]
         edge_neighbor = edge_index[1]
 
         new_node_features = node_features
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
-        message, _ = self.tp(
-            torch.cat(
-                [node_in[edge_center[active_edges]], edge_in],
-                dim=-1,
-            ),
+        tp_input = torch.cat(
+            [node_in[edge_center[active_edges]], edge_in],
+            dim=-1,
+        )
+        message, _ = _apply_so2_tp_or_post_activation_mixer(
+            self,
+            tp_input,
             edge_vector[active_edges],
             mole_globals,
             latents[active_edges],
             wigner_D_all,
-        )  # Pass globals
-
-        message = self.activation(message)
+        )
         message = self.lin_post(message)
+        message = self.focus_gate(message)
         scalars = message[:, :self.irreps_out[0].dim]
 
-        weights = self.env_embed_mlps(latents[active_edges])
-        new_node_features = scatter(
-            self._env_weighter(message, weights),
-            edge_center[active_edges],
-            dim=0,
-        )
+        if self.edge_message_env_weight:
+            weights = self.env_embed_mlps(latents[active_edges])
+            weighted_message = self._env_weighter(message, weights)
+        else:
+            weighted_message = message
+        active_edge_center = edge_center[active_edges]
+        active_edge_neighbor = edge_neighbor[active_edges]
+        if self.node_attention is None:
+            new_node_features = scatter(
+                weighted_message,
+                active_edge_center,
+                dim=0,
+            )
+        else:
+            node_scalars = node_in[:, :self.irreps_in[0].dim]
+            new_node_features = self.node_attention(
+                weighted_message,
+                active_edge_center,
+                node_scalars,
+                scalars,
+                latents[active_edges],
+                cutoff_coeffs[active_edges],
+                dim_size=node_features.shape[0],
+            )
+        if self.edge_aggregation_gate is not None:
+            if new_node_features.shape[0] != node_features.shape[0]:
+                padded_node_features = node_features.new_zeros(
+                    node_features.shape[0],
+                    new_node_features.shape[1],
+                )
+                padded_node_features[:new_node_features.shape[0]] = new_node_features
+                new_node_features = padded_node_features
+            node_scalars = node_in[:, :self.irreps_in[0].dim]
+            new_node_features = self.edge_aggregation_gate(
+                new_node_features,
+                node_scalars,
+                dst_index=active_edge_center,
+                src_index=active_edge_neighbor,
+                node_batch=node_batch,
+                edge_message=weighted_message,
+                dim_size=node_features.shape[0],
+            )
 
         if self.env_sum_normalizations.ndim < 1:
             norm_const = self.env_sum_normalizations
@@ -1261,6 +1969,10 @@ class UpdateEdge(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             onehot_tp_mode: Optional[str] = None,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
@@ -1275,6 +1987,7 @@ class UpdateEdge(torch.nn.Module):
         self.device = device
         self.res_update = res_update
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
 
         self._edge_weighter = E3ElementLinear(
             irreps_in=irreps_out,
@@ -1361,6 +2074,17 @@ class UpdateEdge(torch.nn.Module):
             internal_weights=True,
             biases=True,
         )
+        self.post_activation_expert_mixer = None
+        if self.so2_expert_mixing_mode == "post_activation":
+            scalar_dim = self.activation.irreps_out[0].dim
+            self.post_activation_expert_mixer = _build_so2_post_activation_expert_mixer(
+                self.tp,
+                self.activation,
+                scalar_dim,
+                so2_output_router_hidden_dim,
+                so2_expert_route_chunk_size,
+                so2_expert_route_checkpoint,
+            )
 
         if res_update:
             self.linear_res = Linear(
@@ -1425,22 +2149,22 @@ class UpdateEdge(torch.nn.Module):
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
         edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
 
-        new_edge_features, wigner_D_all = self.tp(
-            torch.cat(
-                [
-                    node_in[edge_center[active_edges]],
-                    edge_in,
-                    node_in[edge_neighbor[active_edges]],
-                ],
-                dim=-1,
-            ),
+        tp_input = torch.cat(
+            [
+                node_in[edge_center[active_edges]],
+                edge_in,
+                node_in[edge_neighbor[active_edges]],
+            ],
+            dim=-1,
+        )
+        new_edge_features, wigner_D_all = _apply_so2_tp_or_post_activation_mixer(
+            self,
+            tp_input,
             edge_vector[active_edges],
             mole_globals,
             latents[active_edges],
             wigner_D_all,
-        )  # Pass globals
-
-        new_edge_features = self.activation(new_edge_features)
+        )
         new_edge_features = self.lin_post(new_edge_features)
 
         scalars = new_edge_features[:, :self.irreps_out[0].dim]
@@ -1525,7 +2249,20 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            so2_expert_mixing_mode: str = "pre_activation",
+            so2_expert_route_chunk_size: Optional[int] = None,
+            so2_expert_route_checkpoint: bool = False,
+            so2_output_router_hidden_dim: int = 32,
             onehot_tp_mode: Optional[str] = None,
+            node_message_aggregation: str = "scatter",
+            num_focus: int = 1,
+            focus_attention_dim: int = 32,
+            edge_aggregation_gated_attention: bool = False,
+            edge_attention_key_source: str = "message",
+            edge_attention_envelope_power: float = 1.0,
+            edge_attention_use_latent_bias: bool = True,
+            edge_attention_key_layer_norm: bool = False,
+            edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1568,6 +2305,10 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            so2_expert_mixing_mode=so2_expert_mixing_mode,
+            so2_expert_route_chunk_size=so2_expert_route_chunk_size,
+            so2_expert_route_checkpoint=so2_expert_route_checkpoint,
+            so2_output_router_hidden_dim=so2_output_router_hidden_dim,
             onehot_tp_mode=onehot_tp_mode,
         )
 
@@ -1596,7 +2337,20 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            so2_expert_mixing_mode=so2_expert_mixing_mode,
+            so2_expert_route_chunk_size=so2_expert_route_chunk_size,
+            so2_expert_route_checkpoint=so2_expert_route_checkpoint,
+            so2_output_router_hidden_dim=so2_output_router_hidden_dim,
             onehot_tp_mode=onehot_tp_mode,
+            node_message_aggregation=node_message_aggregation,
+            num_focus=num_focus,
+            focus_attention_dim=focus_attention_dim,
+            edge_aggregation_gated_attention=edge_aggregation_gated_attention,
+            edge_attention_key_source=edge_attention_key_source,
+            edge_attention_envelope_power=edge_attention_envelope_power,
+            edge_attention_use_latent_bias=edge_attention_use_latent_bias,
+            edge_attention_key_layer_norm=edge_attention_key_layer_norm,
+            edge_message_env_weight=edge_message_env_weight,
         )
 
         self.node_ffn = None
@@ -1612,12 +2366,13 @@ class Layer(torch.nn.Module):
             )
 
     def forward(self, latents, node_features, edge_features, node_onehot, edge_index, edge_vector, atom_type,
-                cutoff_coeffs, active_edges, edge_one_hot, wigner_D_all, mole_globals):
+                cutoff_coeffs, active_edges, edge_one_hot, wigner_D_all, mole_globals, node_batch=None):
         edge_features, latents, wigner_D_all = self.edge_update(latents, node_features, node_onehot, edge_features,
                                                                 edge_index, edge_vector, cutoff_coeffs, active_edges,
                                                                 edge_one_hot, wigner_D_all, mole_globals)
         node_features = self.node_update(latents, node_features, edge_features, atom_type, node_onehot, edge_index,
-                                         edge_vector, active_edges, wigner_D_all, mole_globals)
+                                         edge_vector, cutoff_coeffs, active_edges, wigner_D_all, mole_globals,
+                                         node_batch=node_batch)
         if self.node_ffn is not None:
             node_features = self.node_ffn(node_features)
 

@@ -288,6 +288,7 @@ class EAMP(torch.nn.Module):
             self_mix_mode: str = "scalar_channelwise",
             self_mix_iter: int = 1,
             self_mix_type: str = "node",  # "node", "edge", or "all"
+            so2_m_linear_mode: Optional[str] = None,
     ):
         super(EAMP, self).__init__()
 
@@ -311,6 +312,7 @@ class EAMP(torch.nn.Module):
         self.self_mix_mode = self_mix_mode.lower()
         self.self_mix_iter = self_mix_iter
         self.self_mix_type = self_mix_type.lower()
+        self.so2_m_linear_mode = so2_m_linear_mode
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -360,6 +362,7 @@ class EAMP(torch.nn.Module):
             use_interpolation=use_interpolation_tp,
             rotate_in=tp_rotate_in,
             rotate_out=real_tp_rotate_out,
+            so2_m_linear_mode=so2_m_linear_mode,
         )
 
         self.lin_post = Linear(
@@ -735,6 +738,7 @@ class EMolES(torch.nn.Module):
             self_mix_mode: str = "scalar_channelwise",
             self_mix_iter: int = 2,
             self_mix_type: str = "node",
+            so2_m_linear_mode: Optional[str] = None,
             **kwargs,
     ):
         super(EMolES, self).__init__()
@@ -764,6 +768,7 @@ class EMolES(torch.nn.Module):
         self.self_mix_mode = self_mix_mode
         self.self_mix_iter = self_mix_iter
         self.self_mix_type = self_mix_type
+        self.so2_m_linear_mode = so2_m_linear_mode
 
         if basis is not None:
             self.idp = OrbitalMapper(basis, method="e3tb")
@@ -876,6 +881,7 @@ class EMolES(torch.nn.Module):
                     self_mix_mode=self_mix_mode,
                     self_mix_iter=self_mix_iter,
                     self_mix_type=self_mix_type,
+                    so2_m_linear_mode=so2_m_linear_mode,
                 )
             )
 
@@ -1118,6 +1124,12 @@ class OEQTensorProduct(nn.Module):
         return out
 
 
+from dptb.nn.embedding.oeq_tp import (  # noqa: E402
+    OEQTensorProduct as OEQTensorProduct,
+    get_feasible_tp as get_feasible_tp,
+)
+
+
 class EAMPOpenequi(EAMP):
     """
     Inherits from EAMP, replaces E3NN TP with OEQ TP.
@@ -1292,6 +1304,7 @@ class EMolESOpenequi(EMolES):
             "self_mix_mode": kwargs.get('self_mix_mode', "scalar_channelwise"),
             "self_mix_iter": kwargs.get('self_mix_iter', 1),
             "self_mix_type": kwargs.get('self_mix_type', "node"),
+            "so2_m_linear_mode": kwargs.get('so2_m_linear_mode', None),
         }
 
         tasks = []

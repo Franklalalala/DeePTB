@@ -78,7 +78,7 @@ def gen_doc_setinfo(*, make_anchor=True, make_link=True, **kwargs):
 
 def common_options():
     doc_device = "The device to run the calculation, choose among `cpu` and `cuda[:int]`, Default: `cpu`"
-    doc_dtype = """The digital number's precison, choose among: 
+    doc_dtype = """The digital number's precison, choose among:
                     Default: `float32`
                         - `float32`: indicating torch.float32
                         - `float64`: indicating torch.float64
@@ -89,6 +89,15 @@ def common_options():
     doc_overlap = "Whether to calculate the overlap matrix. Default: False"
     doc_train_w_charge = "Whether to train with charge info. Default: False"
     doc_has_soc = "Whether to train with SOC. Default: False"
+    doc_nextham_uureal_mask = (
+        "Whether to expose the NextHAM SOC uu.real mask to dataset and loss "
+        "helpers. Default: False"
+    )
+    doc_full_soc_prediction = (
+        "Whether to predict the full SOC target space. When True, this "
+        "overrides nextham_uureal_mask and restores all spin and real/imag "
+        "SOC channels. Default: False"
+    )
     doc_train_dip = "Whether to train the dipole moment tensor. Default: False"
     doc_train_polar = "Whether to train the polarizaty tensor. Default: False"
     doc_wave_align = "Whether to align the wavefunctions. Default: False"
@@ -101,6 +110,8 @@ def common_options():
         Argument("train_dip", bool, optional=True, default=False, doc=doc_train_dip),
         Argument("train_w_charge", bool, optional=True, default=False, doc=doc_train_w_charge),
         Argument("has_soc", bool, optional=True, default=False, doc=doc_has_soc),
+        Argument("nextham_uureal_mask", bool, optional=True, default=False, doc=doc_nextham_uureal_mask),
+        Argument("full_soc_prediction", bool, optional=True, default=False, doc=doc_full_soc_prediction),
         Argument("device", str, optional = True, default="cpu", doc = doc_device),
         Argument("dtype", str, optional = True, default="float32", doc = doc_dtype),
         Argument("seed", int, optional=True, default=3982377700, doc=doc_seed),
@@ -152,6 +163,37 @@ def dynamic_batch_options():
     )
 
 
+def activation_recompute_options():
+    doc = (
+        "Train-time activation recomputation/checkpointing for memory hot paths. "
+        "Supported targets are lem_moe_v3_tp and lem_non_linear_expert_block. "
+        "The nonlinear target checkpoints gather/cat, full expert TP, expert activation, "
+        "and 0e post-activation mixing without changing state_dict keys."
+    )
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument(
+            "targets",
+            list,
+            optional=True,
+            default=["lem_moe_v3_tp", "lem_non_linear_expert_block"],
+        ),
+        Argument("checkpoint_node_tp", bool, optional=True, default=True),
+        Argument("checkpoint_edge_tp", bool, optional=True, default=True),
+        Argument("use_reentrant", bool, optional=True, default=False),
+        Argument("preserve_rng_state", bool, optional=True, default=False),
+    ]
+    return Argument(
+        "activation_recompute",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def train_options():
     doc_num_epoch = "Total number of training epochs. It is worth noted, if the model is reloaded with `-r` or `--restart` option, epoch which have been trained will counted from the time that the checkpoint is saved."
     doc_save_freq = "Frequency, or every how many iteration to saved the current model into checkpoints, The name of checkpoint is formulated as `latest|best_dptb|nnsk_b<bond_cutoff>_c<sk_cutoff>_w<sk_decay_w>`. Default: `10`"
@@ -174,6 +216,20 @@ def train_options():
     )
     doc_monitor_param_dynamics_freq = (
         "Parameter dynamics sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
+    )
+    doc_monitor_gated_edge_attention = (
+        "Set true to record Fig.2-style diagnostics for gated edge aggregation: gate statistics, "
+        "pre/post-gate sparsity, activation maxima, and top inbound-edge contribution share."
+    )
+    doc_monitor_gated_edge_attention_freq = (
+        "Gated edge aggregation monitor sampling interval in iterations. Use 0 to follow display_freq. Default: `0`."
+    )
+    doc_monitor_gated_edge_attention_heatmap = (
+        "Set true to save Fig.2-like query-key heatmap PNG/NPZ snapshots for gated edge aggregation. "
+        "Rows are target/query nodes, columns are source/key nodes, and colors are normalized edge-message contribution mass."
+    )
+    doc_monitor_gated_edge_attention_heatmap_size = (
+        "Maximum number of query and key nodes shown in gated edge aggregation heatmaps. Default: `64`."
     )
     doc_expert_lrs = (
         "Optional per-expert initial learning rates. "
@@ -445,6 +501,7 @@ def train_options():
         # data / batch
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
         dynamic_batch_options(),
+        activation_recompute_options(),
         Argument("ref_batch_size", int, optional=True, default=1, doc=doc_ref_batch_size),
         Argument("val_batch_size", int, optional=True, default=1, doc=doc_val_batch_size),
 
@@ -458,6 +515,11 @@ def train_options():
         Argument("monitor_param_dynamics_grad_eps", float, optional=True, default=0.0, doc="Absolute gradient threshold used for grad_nonzero_fraction."),
         Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Deprecated compatibility option. DEAD detection is gradient-norm based; delta metrics are diagnostic only."),
         Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Gradient norm threshold used by parameter dynamics DEAD detection; groups below this value count as no-gradient."),
+        Argument("monitor_gated_edge_attention", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention),
+        Argument("monitor_gated_edge_attention_freq", int, optional=True, default=0, doc=doc_monitor_gated_edge_attention_freq),
+        Argument("monitor_gated_edge_attention_tensorboard", bool, optional=True, default=None, doc="Write gated edge aggregation diagnostics to TensorBoard when the monitor is enabled. Default follows use_tensorboard."),
+        Argument("monitor_gated_edge_attention_heatmap", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention_heatmap),
+        Argument("monitor_gated_edge_attention_heatmap_size", int, optional=True, default=64, doc=doc_monitor_gated_edge_attention_heatmap_size),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 
@@ -942,6 +1004,8 @@ def embedding():
             Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
+            Argument("lem_non_linear", dict, slem()),
+            Argument("lem_non_linear_h0", dict, slem_h0()),
             Argument("lem_moe", dict, slem()),
             Argument("lem_so2", dict, slem()),
             Argument("lem_so2_local", dict, slem()),
@@ -1110,9 +1174,22 @@ def slem():
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
     doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. The 0425-stable branch defaults to `streamed_m_major_cueq`; `streamed_m_major_fused_p0` is an opt-in trainable prototype that treats Wigner/R as constants and falls back on unsupported shapes."
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
-    doc_so2_m_linear_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
+    doc_so2_m_linear_mode = "SO2 m-linear backend for non-MoE SO2 TP. Supported values are `standard`, `indexed_sandwich_multi`, or null; `cublas_grouped` is accepted only as a legacy alias. Triton experiment modes remain unsupported."
+    doc_so2_expert_mixing_mode = "Expert mixing placement for SO2 MoE TP. `pre_activation` keeps the existing fused-weight path; `post_activation` evaluates raw expert TP outputs, applies equivariant activation, routes from 0e output scalars, and mixes activated outputs."
+    doc_so2_expert_route_chunk_size = "Maximum original SO2 rows processed per post-activation expert-mixing chunk. Null or non-positive means process all rows in one chunk."
+    doc_so2_expert_route_checkpoint = "Whether to activation-checkpoint each post-activation expert-route chunk. This recomputes TP/activation/router during backward to reduce saved route activations."
+    doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
+    doc_node_message_aggregation = "Node message aggregation mode. Supported: `scatter` for the legacy sum, `single_head_0e` for DPA4-style envelope-gated scalar attention."
+    doc_num_focus = "Number of post-activation 0e focus gates. Values larger than 1 enable DPA4-style channel focus routing."
+    doc_focus_attention_dim = "Hidden dimension of the single-head 0e attention query/key projections."
+    doc_edge_aggregation_gated_attention = "Apply query-dependent sigmoid gating after edge-to-node aggregation, following the SDPA-output gated-attention pattern while preserving equivariant irrep groups. Default: `False`."
+    doc_edge_attention_key_source = "Key source for single-head edge attention. Currently supported: `message`, using post-activation edge message 0e scalars as keys. Default: `message`."
+    doc_edge_attention_envelope_power = "Power applied to cutoff coefficients in single-head edge attention numerator. `1.0` preserves the legacy implementation; `2.0` uses cutoff^2. Default: `1.0`."
+    doc_edge_attention_use_latent_bias = "Whether to add latent-conditioned bias to single-head edge attention logits. Default: `True`, preserving the legacy implementation."
+    doc_edge_attention_key_layer_norm = "Apply LayerNorm only to message 0e scalars before the single-head edge-attention key projection. Default: `False`."
+    doc_edge_message_env_weight = "Whether to apply the legacy latent-conditioned env value weighting to node-update edge messages before aggregation. Default: `True`, preserving the legacy implementation."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
@@ -1166,8 +1243,21 @@ def slem():
         Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
         Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
+        Argument("so2_expert_mixing_mode", str, optional=True, default="pre_activation", doc=doc_so2_expert_mixing_mode),
+        Argument("so2_expert_route_chunk_size", [int, None], optional=True, default=None, doc=doc_so2_expert_route_chunk_size),
+        Argument("so2_expert_route_checkpoint", bool, optional=True, default=False, doc=doc_so2_expert_route_checkpoint),
+        Argument("so2_output_router_hidden_dim", int, optional=True, default=32, doc=doc_so2_output_router_hidden_dim),
         Argument("mole_linear_m0_mode", [str, None], optional=True, default=None, doc=doc_mole_linear_m0_mode),
         Argument("onehot_tp_mode", [str, None], optional=True, default=None, doc=doc_onehot_tp_mode),
+        Argument("node_message_aggregation", str, optional=True, default="scatter", doc=doc_node_message_aggregation),
+        Argument("num_focus", int, optional=True, default=1, doc=doc_num_focus),
+        Argument("focus_attention_dim", int, optional=True, default=32, doc=doc_focus_attention_dim),
+        Argument("edge_aggregation_gated_attention", bool, optional=True, default=False, doc=doc_edge_aggregation_gated_attention),
+        Argument("edge_attention_key_source", str, optional=True, default="message", doc=doc_edge_attention_key_source),
+        Argument("edge_attention_envelope_power", float, optional=True, default=1.0, doc=doc_edge_attention_envelope_power),
+        Argument("edge_attention_use_latent_bias", bool, optional=True, default=True, doc=doc_edge_attention_use_latent_bias),
+        Argument("edge_attention_key_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_key_layer_norm),
+        Argument("edge_message_env_weight", bool, optional=True, default=True, doc=doc_edge_message_env_weight),
 
         # ---- New norm conditioning flags ----
         Argument("norm_build_node_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_node_condition_branch),
@@ -1303,12 +1393,12 @@ def nnsk():
     doc_hopping = "The hopping options to define the hopping of nnsk model."
     doc_soc = """The soc options to define the soc of nnsk model,
                 Default: {} # empty dict\n
-                - {'method':'none'} : use database soc value. 
+                - {'method':'none'} : use database soc value.
                 - {'method':uniform} : set lambda_il; assign a soc lambda value for each orbital -l on each atomtype i; l=0,1,2 for s p d."""
     doc_freeze = """The parameters to define the freeze of nnsk model can be bool and string and list.\n
                     Default: False\n
                      - True: freeze all the nnsk parameters\n
-                     - False: train all the nnsk parameters\n 
+                     - False: train all the nnsk parameters\n
                      - 'hopping','onsite','overlap' and 'soc' to freeze the corresponding parameters.
                      - list of the strings e.g. ['overlap','soc'] to freeze both overlap and soc parameters."""
     doc_std = "The std value to initialize the nnsk parameters. Default: 0.01"
@@ -1345,7 +1435,7 @@ def onsite():
     doc_method = r"""The onsite correction mode, the onsite energy is expressed as the energy of isolated atoms plus the model correction, the correction mode are:
                     Default: `none`: use the database onsite energy value.
                     - `strain`: The strain mode correct the onsite matrix densly by $$H_{i,i}^{lm,l^\prime m^\prime} = \epsilon_l^0 \delta_{ll^\prime}\delta_{mm^\prime} + \sum_p \sum_{\zeta} \Big[ \mathcal{U}_{\zeta}(\hat{\br}_{ip}) \ \epsilon_{ll^\prime \zeta} \Big]_{mm^\prime}$$ which is also parameterized as a set of Slater-Koster like integrals.\n\n\
-                    - `uniform`: The correction is a energy shift respect of orbital of each atom. Which is formally written as: 
+                    - `uniform`: The correction is a energy shift respect of orbital of each atom. Which is formally written as:
                                 $$H_{i,i}^{lm,l^\prime m^\prime} = (\epsilon_l^0+\epsilon_l^\prime) \delta_{ll^\prime}\delta_{mm^\prime}$$ Where $\epsilon_l^0$ is the isolated energy level from the DeePTB onsite database, and $\epsilon_l^\prime$ is the parameters to fit.
                     - `NRL`: use the NRL-TB formula.
                 """
@@ -1375,11 +1465,11 @@ def onsite():
                 ],optional=False, doc=doc_method)
 
 def hopping():
-    doc_method = """The hopping formula. 
+    doc_method = """The hopping formula.
                     -  `powerlaw`: the powerlaw formula for bond length dependence for sk integrals.
                     -  `varTang96`: a variational formula based on Tang96 formula.
                     -  `NRL0`: the old version of NRL formula for overlap, we set overlap and hopping share same options.
-                    -  `NRL1`: the new version of NRL formula for overlap. 
+                    -  `NRL1`: the new version of NRL formula for overlap.
                     """
     doc_rs_soft = "The cut-off for smooth function fc for powerlaw and varTang96, fc(rs)=0.5"
     doc_w = " The decay w in fc"
@@ -1424,7 +1514,7 @@ def hopping():
 def loss_options():
     doc_method = """The loss function type, defined by a string like `<fitting target>_<loss type>`, Default: `eigs_l2dsf`. supported loss functions includes:\n\n\
                     - `eigvals`: The mse loss predicted and labeled eigenvalues and Delta eigenvalues between different k.
-                    - `hamil`: 
+                    - `hamil`:
                     - `hamil_abs`:
                     - `hamil_abs_element_avg`:
                     - `hamil_blas`:
@@ -1859,13 +1949,13 @@ def run_options():
     doc_structure = "the structure to run the task"
     doc_gui = "To use the GUI or not"
     doc_device = "The device to run the calculation, choose among `cpu` and `cuda[:int]`, Default: None. default None means to use the device seeting in the model ckpt file."
-    doc_dtype = """The digital number's precison, choose among: 
+    doc_dtype = """The digital number's precison, choose among:
                     Default: None,
                         - `float32`: indicating torch.float32
                         - `float64`: indicating torch.float64
                     default None means to use the device seeting in the model ckpt file.
                 """
-    doc_pbc = """The periodic boundary condition, choose among: 
+    doc_pbc = """The periodic boundary condition, choose among:
                     Default: True,
                         - True: indicating the structure is periodic
                         - False: indicating the structure is not periodic
@@ -1893,8 +1983,8 @@ def normalize_run(data):
     return data
 
 def task_options():
-    doc_task = '''The string define the task DeePTB conduct, includes: 
-                    - `band`: for band structure plotting. 
+    doc_task = '''The string define the task DeePTB conduct, includes:
+                    - `band`: for band structure plotting.
                     - `dos`: for density of states plotting.
                     - `pdos`: for projected density of states plotting.
                     - `FS2D`: for 2D fermi-surface plotting.
@@ -1921,7 +2011,7 @@ def task_options():
 
 def band():
     doc_kline_type ="""The different type to build kpath line mode.
-                    - "abacus" : the abacus format 
+                    - "abacus" : the abacus format
                     - "vasp" : the vasp format
                     - "ase" : the ase format
                     """
@@ -2189,7 +2279,7 @@ def normalize_bandinfo(data):
 def bandinfo_sub():
     doc_band_min = """the minum band index for the training band window with respected to the correctly selected DFT bands.
                    `important`: before setting this tag you should make sure you have already  exclude all the irrelevant in your training data.
-                                This logic for band_min and max is based on the simple fact the total number TB bands > the bands you care.   
+                                This logic for band_min and max is based on the simple fact the total number TB bands > the bands you care.
                    """
     doc_band_max = "The maxmum band index for training band window"
     doc_emin = "the minmum energy window, 0 meand the min value of the band at index band_min"
@@ -2276,12 +2366,12 @@ def get_cutoffs_from_model_options(model_options):
     """
     Extract cutoff values from the provided model options.
 
-    This function retrieves the cutoff values `r_max`, `er_max`, and `oer_max` from the `model_options` 
-    dictionary. It handles different model types such as `embedding`, `nnsk`, and `dftbsk`, ensuring 
+    This function retrieves the cutoff values `r_max`, `er_max`, and `oer_max` from the `model_options`
+    dictionary. It handles different model types such as `embedding`, `nnsk`, and `dftbsk`, ensuring
     that the appropriate cutoff values are provided and valid.
 
     Parameters:
-    model_options (dict): A dictionary containing model configuration options. It may include keys 
+    model_options (dict): A dictionary containing model configuration options. It may include keys
                           like `embedding`, `nnsk`, and `dftbsk` with their respective cutoff values.
 
     Returns:
@@ -2300,7 +2390,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")
@@ -2309,7 +2399,7 @@ def get_cutoffs_from_model_options(model_options):
     if model_options.get("nnsk", None) is not None:
         assert r_max is None, "r_max should not be provided in outside the nnsk for training nnsk model."
         if model_options["nnsk"]["hopping"].get("rs",None) is not None:
-            # 其他方法在模型公式中，已经包含了 +5w 的范围，所以这里为了保险额外加上3w 的范围; 
+            # 其他方法在模型公式中，已经包含了 +5w 的范围，所以这里为了保险额外加上3w 的范围;
             # 对于两个特例，powerlaw 和 varTang96 的情况，为了和旧版存档的兼容, 模型公式的本身并没有 +5w 的范围，所以这里额外加上8w 的范围。
             if model_options["nnsk"]["hopping"]['method'] in ["powerlaw","varTang96"]:
                 # r_max = model_options["nnsk"]["hopping"]["rs"] + 8 * model_options["nnsk"]["hopping"]["w"]
@@ -2339,20 +2429,20 @@ def collect_cutoffs(jdata):
     """
     Collect cutoff values from the provided JSON data.
 
-    This function extracts the cutoff values `r_max`, `er_max`, and `oer_max` from the `model_options` 
-    in the provided JSON data. If the `nnsk` push model is used, it ensures that the necessary 
-    cutoff values are provided in `data_options` and overrides the values from `model_options` 
+    This function extracts the cutoff values `r_max`, `er_max`, and `oer_max` from the `model_options`
+    in the provided JSON data. If the `nnsk` push model is used, it ensures that the necessary
+    cutoff values are provided in `data_options` and overrides the values from `model_options`
     accordingly.
 
     Parameters:
-    jdata (dict): A dictionary containing model and data options. It must include `model_options` 
+    jdata (dict): A dictionary containing model and data options. It must include `model_options`
                   and optionally `data_options` if `nnsk` push model is used.
 
     Returns:
     dict: A dictionary containing the cutoff options with keys `r_max`, `er_max`, and `oer_max`.
 
     Raises:
-    AssertionError: If required keys are missing in `jdata` or if `r_max` is not provided when 
+    AssertionError: If required keys are missing in `jdata` or if `r_max` is not provided when
                     using the `nnsk` push model.
 
     Logs:
@@ -2467,4 +2557,3 @@ def normalize_skf2nnsk(data):
     base.check_value(data, strict=True)
 
     return data
-

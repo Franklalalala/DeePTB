@@ -34,20 +34,19 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
 
+from dptb.nn.cuda_ops.extension_loader import load_cuda_extension, truthy_env
 from dptb.nn.so2_moe_fused_p0 import _segmented_m0_backward, _segmented_pair_backward
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2WignerBlocks, _mole_graph_index
 
 _EXT = None
 _WARNED: set[str] = set()
-_FALSE = {"", "0", "false", "False", "FALSE", "off", "OFF", "no", "No"}
 _LAYOUT_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
 _LAYOUT_CACHE_MAX = 32
 
 
 def _flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default) not in _FALSE
+    return truthy_env(name, default)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -172,13 +171,6 @@ def _load_extension():
     if _EXT is not None:
         return _EXT
     here = Path(__file__).resolve().parent
-    build_dir = Path(
-        os.environ.get(
-            "DPTB_SO2_MOE_PERSISTENT_P1_BUILD_DIR",
-            Path.home() / ".cache" / "dptb_so2_moe_persistent_grouped_p1",
-        )
-    )
-    build_dir.mkdir(parents=True, exist_ok=True)
     cflags = ["-O3"]
     cuda_flags = ["-O3", "--expt-relaxed-constexpr"]
     include_paths = []
@@ -197,18 +189,18 @@ def _load_extension():
         ])
         cflags.append("-DDPTB_SO2_MOE_PERSISTENT_P1_CUTE=1")
         cuda_flags.append("-DDPTB_SO2_MOE_PERSISTENT_P1_CUTE=1")
-    _EXT = load(
+    _EXT = load_cuda_extension(
         name="dptb_so2_moe_persistent_grouped_p1",
-        sources=[
-            str(here / "csrc" / "so2_moe_persistent_grouped.cpp"),
-            str(here / "csrc" / "so2_moe_persistent_grouped_kernel.cu"),
+        source_files=[
+            here / "csrc" / "so2_moe_persistent_grouped.cpp",
+            here / "csrc" / "so2_moe_persistent_grouped_kernel.cu",
         ],
+        build_dir_env="DPTB_SO2_MOE_PERSISTENT_P1_BUILD_DIR",
+        default_build_dir=Path.home() / ".cache" / "dptb_so2_moe_persistent_grouped_p1",
         extra_cflags=cflags,
         extra_cuda_cflags=cuda_flags,
         extra_include_paths=include_paths,
-        build_directory=str(build_dir),
-        with_cuda=True,
-        verbose=_flag("DPTB_SO2_MOE_PERSISTENT_P1_VERBOSE"),
+        verbose_env="DPTB_SO2_MOE_PERSISTENT_P1_VERBOSE",
     )
     return _EXT
 

@@ -3,6 +3,7 @@ import logging
 import os
 import csv
 import math
+import copy
 import torch.nn as nn
 from dptb.utils.tools import get_lr_scheduler, get_optimizer
 from dptb.nnops.base_trainer import BaseTrainer
@@ -10,6 +11,7 @@ from dptb.plugins.monitor import Plugin
 from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
+from dptb.nn.activation_recompute import configure_activation_recompute
 from dptb.nnops.loss import Loss
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,10 @@ class Trainer(BaseTrainer):
 
         # init the object
         self.model = model.to(self.device)
+        self.activation_recompute_state = configure_activation_recompute(
+            self.model,
+            train_options.get("activation_recompute", None),
+        )
         self.optimizer = get_optimizer(model_param=self.model.parameters(), **train_options["optimizer"])
         self.lr_scheduler = get_lr_scheduler(optimizer=self.optimizer, **train_options["lr_scheduler"])
         self.update_lr_per_iter = train_options["update_lr_per_iter"]
@@ -85,14 +91,20 @@ class Trainer(BaseTrainer):
                                                 batch_size=train_options["val_batch_size"], shuffle=True)
 
         # loss function
-        self.train_lossfunc = Loss(**train_options["loss_options"]["train"], **common_options,
-                                   idp=self.model.hamiltonian.idp)
+        self.train_lossfunc = Loss(
+            **self._loss_kwargs(train_options["loss_options"]["train"], common_options),
+            idp=self.model.hamiltonian.idp,
+        )
         if self.use_validation:
-            self.validation_lossfunc = Loss(**train_options["loss_options"]["validation"], **common_options,
-                                            idp=self.model.hamiltonian.idp)
+            self.validation_lossfunc = Loss(
+                **self._loss_kwargs(train_options["loss_options"]["validation"], common_options),
+                idp=self.model.hamiltonian.idp,
+            )
         if self.use_reference:
-            self.reference_lossfunc = Loss(**train_options["loss_options"]["reference"], **common_options,
-                                           idp=self.model.hamiltonian.idp)
+            self.reference_lossfunc = Loss(
+                **self._loss_kwargs(train_options["loss_options"]["reference"], common_options),
+                idp=self.model.hamiltonian.idp,
+            )
 
         if train_options["loss_options"]["train"]["method"] == "skints":
             assert self.model.name == 'nnsk', "The model should be nnsk for the skints loss function."
@@ -100,6 +112,12 @@ class Trainer(BaseTrainer):
                                                      'uniform'], "The onsite function should be none or uniform for the skints loss function."
             log.info("The skints loss function is used for training, the model.transform is then set to False.")
             self.model.transform = False
+
+    @staticmethod
+    def _loss_kwargs(loss_options, common_options):
+        kwargs = dict(loss_options)
+        kwargs.update(common_options)
+        return kwargs
 
     @staticmethod
     def _dynamic_batch_state_from_batch(batch):
@@ -215,7 +233,28 @@ class Trainer(BaseTrainer):
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
                 validation_datasets=None):
         ckpt = torch.load(checkpoint, map_location=common_options["device"], weights_only=False)
-        model = build_model(checkpoint, ckpt["config"]["model_options"], ckpt["config"]["common_options"])
+        ckpt_train_options = ckpt["config"]["train_options"]
+        model_build_train_options = train_options if len(train_options) != 0 else ckpt_train_options
+        model_state = ckpt.get("model_state_dict", {})
+        has_flat_distance_state = (
+            bool(ckpt_train_options.get("distance_ranges"))
+            and isinstance(model_state, dict)
+            and not any(k.startswith("experts.") for k in model_state.keys())
+        )
+        if has_flat_distance_state:
+            model_build_train_options = copy.deepcopy(model_build_train_options)
+            model_build_train_options.pop("distance_ranges", None)
+            log.warning(
+                "Detected flat single-model checkpoint with distance_ranges; "
+                "building the restart model without DistanceEnsembleWrapper so "
+                "optimizer parameter groups match the saved checkpoint."
+            )
+        model = build_model(
+            checkpoint,
+            ckpt["config"]["model_options"],
+            ckpt["config"]["common_options"],
+            train_options=model_build_train_options,
+        )
         if len(train_options) == 0: train_options = ckpt["config"]["train_options"]
         if len(common_options) == 0: common_options = ckpt["config"]["common_options"]
         trainer = cls(model=model, train_datasets=train_datasets, reference_datasets=reference_datasets,
@@ -274,4 +313,3 @@ class Trainer(BaseTrainer):
                 if fast: break
         if not fast: loss = loss / len(self.validation_loader)
         return loss
-
