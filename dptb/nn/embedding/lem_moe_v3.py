@@ -528,6 +528,8 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
             use_latent_bias: bool = True,
             key_source: str = "message",
             key_layer_norm: bool = False,
+            query_layer_norm: bool = False,
+            qk_layer_norm: bool = False,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
     ):
@@ -539,7 +541,14 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
         self.envelope_power = float(envelope_power)
         self.use_latent_bias = bool(use_latent_bias)
         self.key_source = _normalize_edge_attention_key_source(key_source)
-        self.key_layer_norm = bool(key_layer_norm)
+        self.query_layer_norm = bool(query_layer_norm) or bool(qk_layer_norm)
+        self.key_layer_norm = bool(key_layer_norm) or bool(qk_layer_norm)
+        self.qk_layer_norm = bool(qk_layer_norm)
+        self.query_norm = (
+            torch.nn.LayerNorm(node_scalar_dim, dtype=dtype, device=device)
+            if self.query_layer_norm
+            else torch.nn.Identity()
+        )
         self.query = torch.nn.Linear(node_scalar_dim, attn_dim, bias=False, dtype=dtype, device=device)
         self.key_norm = (
             torch.nn.LayerNorm(message_scalar_dim, dtype=dtype, device=device)
@@ -570,7 +579,7 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
         if dst_index.numel() == 0:
             return message_scalars.new_zeros((0,))
 
-        q = self.query(node_scalars.index_select(0, dst_index))
+        q = self.query(self.query_norm(node_scalars.index_select(0, dst_index)))
         k = self.key(self.key_norm(message_scalars))
         logits = (q * k).sum(dim=-1) * self.logit_scale
         if self.latent_bias is not None:
@@ -926,6 +935,8 @@ class LemMoEV3(torch.nn.Module):
             edge_attention_envelope_power: float = 1.0,
             edge_attention_use_latent_bias: bool = True,
             edge_attention_key_layer_norm: bool = False,
+            edge_attention_query_layer_norm: bool = False,
+            edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
@@ -993,6 +1004,8 @@ class LemMoEV3(torch.nn.Module):
         self.edge_attention_envelope_power = float(edge_attention_envelope_power)
         self.edge_attention_use_latent_bias = bool(edge_attention_use_latent_bias)
         self.edge_attention_key_layer_norm = bool(edge_attention_key_layer_norm)
+        self.edge_attention_query_layer_norm = bool(edge_attention_query_layer_norm)
+        self.edge_attention_qk_layer_norm = bool(edge_attention_qk_layer_norm)
         self.edge_message_env_weight = bool(edge_message_env_weight)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
@@ -1011,6 +1024,8 @@ class LemMoEV3(torch.nn.Module):
             f"edge_attention_envelope_power={self.edge_attention_envelope_power}, "
             f"edge_attention_use_latent_bias={self.edge_attention_use_latent_bias}, "
             f"edge_attention_key_layer_norm={self.edge_attention_key_layer_norm}, "
+            f"edge_attention_query_layer_norm={self.edge_attention_query_layer_norm}, "
+            f"edge_attention_qk_layer_norm={self.edge_attention_qk_layer_norm}, "
             f"edge_message_env_weight={self.edge_message_env_weight}"
         )
 
@@ -1154,6 +1169,8 @@ class LemMoEV3(torch.nn.Module):
                 edge_attention_envelope_power=self.edge_attention_envelope_power,
                 edge_attention_use_latent_bias=self.edge_attention_use_latent_bias,
                 edge_attention_key_layer_norm=self.edge_attention_key_layer_norm,
+                edge_attention_query_layer_norm=self.edge_attention_query_layer_norm,
+                edge_attention_qk_layer_norm=self.edge_attention_qk_layer_norm,
                 edge_message_env_weight=self.edge_message_env_weight,
                 dtype=dtype,
                 device=device,
@@ -1654,6 +1671,8 @@ class UpdateNode(torch.nn.Module):
             edge_attention_envelope_power: float = 1.0,
             edge_attention_use_latent_bias: bool = True,
             edge_attention_key_layer_norm: bool = False,
+            edge_attention_query_layer_norm: bool = False,
+            edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
@@ -1675,6 +1694,8 @@ class UpdateNode(torch.nn.Module):
         self.edge_attention_envelope_power = float(edge_attention_envelope_power)
         self.edge_attention_use_latent_bias = bool(edge_attention_use_latent_bias)
         self.edge_attention_key_layer_norm = bool(edge_attention_key_layer_norm)
+        self.edge_attention_query_layer_norm = bool(edge_attention_query_layer_norm)
+        self.edge_attention_qk_layer_norm = bool(edge_attention_qk_layer_norm)
         self.edge_message_env_weight = bool(edge_message_env_weight)
 
         self.register_buffer(
@@ -1779,6 +1800,8 @@ class UpdateNode(torch.nn.Module):
                 use_latent_bias=self.edge_attention_use_latent_bias,
                 key_source=self.edge_attention_key_source,
                 key_layer_norm=self.edge_attention_key_layer_norm,
+                query_layer_norm=self.edge_attention_query_layer_norm,
+                qk_layer_norm=self.edge_attention_qk_layer_norm,
                 dtype=dtype,
                 device=device,
             )
@@ -2262,6 +2285,8 @@ class Layer(torch.nn.Module):
             edge_attention_envelope_power: float = 1.0,
             edge_attention_use_latent_bias: bool = True,
             edge_attention_key_layer_norm: bool = False,
+            edge_attention_query_layer_norm: bool = False,
+            edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
@@ -2350,6 +2375,8 @@ class Layer(torch.nn.Module):
             edge_attention_envelope_power=edge_attention_envelope_power,
             edge_attention_use_latent_bias=edge_attention_use_latent_bias,
             edge_attention_key_layer_norm=edge_attention_key_layer_norm,
+            edge_attention_query_layer_norm=edge_attention_query_layer_norm,
+            edge_attention_qk_layer_norm=edge_attention_qk_layer_norm,
             edge_message_env_weight=edge_message_env_weight,
         )
 

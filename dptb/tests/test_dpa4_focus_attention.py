@@ -132,7 +132,25 @@ def test_single_head_0e_attention_key_layer_norm_is_key_only():
     )
 
     assert isinstance(attention.key_norm, torch.nn.LayerNorm)
+    assert isinstance(attention.query_norm, torch.nn.Identity)
     assert torch.allclose(weights, torch.tensor([0.5, 0.5]), atol=1e-5)
+
+
+def test_single_head_0e_attention_qk_layer_norm_enables_both_inputs():
+    attention = SingleHead0eEnvelopeAttention(
+        node_scalar_dim=2,
+        message_scalar_dim=2,
+        latent_dim=2,
+        attn_dim=2,
+        use_latent_bias=False,
+        qk_layer_norm=True,
+    )
+
+    assert attention.qk_layer_norm
+    assert attention.query_layer_norm
+    assert attention.key_layer_norm
+    assert isinstance(attention.query_norm, torch.nn.LayerNorm)
+    assert isinstance(attention.key_norm, torch.nn.LayerNorm)
 
 
 def test_update_node_can_bypass_env_message_weighting():
