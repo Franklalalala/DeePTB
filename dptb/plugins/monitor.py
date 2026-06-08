@@ -1104,7 +1104,7 @@ class GatedEdgeAggregationMonitor(Plugin):
         self._modules = [
             (name, module)
             for name, module in trainer.model.named_modules()
-            if module.__class__.__name__ == "GatedEdgeAggregation"
+            if module.__class__.__name__ in {"GatedEdgeAggregation", "EdgeMessageValueGate"}
         ]
         for _, module in self._modules:
             if hasattr(module, "heatmap_max_nodes"):

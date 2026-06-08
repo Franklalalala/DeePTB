@@ -262,10 +262,23 @@ class NonLinearExpertUpdateNode(torch.nn.Module):
             message = base.focus_gate(message)
         scalars = message[:, :base.irreps_out[0].dim]
 
-        weights = base.env_embed_mlps(latents[active_edges])
-        weighted_message = base._env_weighter(message, weights)
         active_edge_center = edge_center[active_edges]
         active_edge_neighbor = edge_neighbor[active_edges]
+        if getattr(base, "edge_message_env_weight", True):
+            weights = base.env_embed_mlps(latents[active_edges])
+            weighted_message = base._env_weighter(message, weights)
+        else:
+            weighted_message = message
+        edge_message_gate = getattr(base, "edge_message_gate", None)
+        if edge_message_gate is not None:
+            node_scalars = node_in[:, :base.irreps_in[0].dim]
+            weighted_message = edge_message_gate(
+                weighted_message,
+                node_scalars,
+                scalars,
+                active_edge_center,
+                dim_size=node_features.shape[0],
+            )
         if getattr(base, "node_attention", None) is None:
             new_node_features = scatter(
                 weighted_message,

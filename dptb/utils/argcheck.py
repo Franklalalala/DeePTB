@@ -1255,6 +1255,8 @@ def slem():
     doc_edge_attention_query_layer_norm = "Apply LayerNorm only to destination node 0e scalars before the single-head edge-attention query projection. Default: `False`."
     doc_edge_attention_qk_layer_norm = "Shortcut that applies LayerNorm to both query and key 0e scalar inputs before the single-head edge-attention projections. Default: `False`."
     doc_edge_message_env_weight = "Whether to apply the legacy latent-conditioned env value weighting to node-update edge messages before aggregation. Default: `True`, preserving the legacy implementation."
+    doc_edge_message_value_gate = "Apply a query-dependent sigmoid value gate to edge messages before node aggregation. The gate is generated from destination node 0e scalars and message 0e scalars, then applied per equivariant irrep group. Default: `False`."
+    doc_edge_message_value_gate_hidden_dim = "Optional hidden dimension for edge_message_value_gate. Use 0 for a single linear sigmoid gate. Default: `0`."
 
     return [
         Argument("irreps_hidden", str, optional=False, doc=doc_irreps_hidden),
@@ -1325,6 +1327,8 @@ def slem():
         Argument("edge_attention_query_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_query_layer_norm),
         Argument("edge_attention_qk_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_qk_layer_norm),
         Argument("edge_message_env_weight", bool, optional=True, default=True, doc=doc_edge_message_env_weight),
+        Argument("edge_message_value_gate", bool, optional=True, default=False, doc=doc_edge_message_value_gate),
+        Argument("edge_message_value_gate_hidden_dim", int, optional=True, default=0, doc=doc_edge_message_value_gate_hidden_dim),
 
         # ---- New norm conditioning flags ----
         Argument("norm_build_node_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_node_condition_branch),

@@ -515,6 +515,151 @@ class GatedEdgeAggregation(torch.nn.Module):
         return gated
 
 
+class EdgeMessageValueGate(torch.nn.Module):
+    """Query-dependent sigmoid gate applied to edge values before aggregation."""
+
+    def __init__(
+            self,
+            irreps: o3.Irreps,
+            query_scalar_dim: int,
+            message_scalar_dim: int,
+            hidden_dim: int = 0,
+            sparsity_threshold: float = 1.0e-2,
+            dtype: Union[str, torch.dtype] = torch.float32,
+            device: Union[str, torch.device] = torch.device("cpu"),
+    ):
+        super().__init__()
+        self.irreps = o3.Irreps(irreps)
+        if query_scalar_dim < 1:
+            raise ValueError(f"query_scalar_dim must be >= 1, got {query_scalar_dim!r}")
+        if message_scalar_dim < 1:
+            raise ValueError(f"message_scalar_dim must be >= 1, got {message_scalar_dim!r}")
+        feature_gate_index, gate_dim = _equivariant_gate_feature_index(self.irreps)
+        if gate_dim < 1:
+            raise ValueError("EdgeMessageValueGate requires a non-empty output irreps.")
+        self.query_scalar_dim = int(query_scalar_dim)
+        self.message_scalar_dim = int(message_scalar_dim)
+        self.gate_dim = int(gate_dim)
+        self.sparsity_threshold = float(sparsity_threshold)
+        self.register_buffer("feature_gate_index", feature_gate_index.to(device=device))
+        input_dim = self.query_scalar_dim + self.message_scalar_dim
+        hidden_dim = int(hidden_dim or 0)
+        if hidden_dim > 0:
+            self.gate = torch.nn.Sequential(
+                torch.nn.Linear(input_dim, hidden_dim, dtype=dtype, device=device),
+                torch.nn.SiLU(),
+                torch.nn.Linear(hidden_dim, self.gate_dim, dtype=dtype, device=device),
+            )
+            torch.nn.init.zeros_(self.gate[-1].weight)
+            torch.nn.init.zeros_(self.gate[-1].bias)
+        else:
+            self.gate = torch.nn.Linear(input_dim, self.gate_dim, dtype=dtype, device=device)
+            torch.nn.init.zeros_(self.gate.weight)
+            torch.nn.init.zeros_(self.gate.bias)
+        self.last_stats: Optional[Dict[str, float]] = None
+        self.last_heatmap = None
+
+    _tensor_stat = staticmethod(GatedEdgeAggregation._tensor_stat)
+    _sparsity = staticmethod(GatedEdgeAggregation._sparsity)
+    _top_edge_share_stats = GatedEdgeAggregation._top_edge_share_stats
+
+    def _record_stats(
+            self,
+            gate_values: torch.Tensor,
+            pre_gate: torch.Tensor,
+            post_gate: torch.Tensor,
+            dst_index: torch.Tensor,
+            dim_size: int,
+    ) -> None:
+        with torch.no_grad():
+            gate_det = gate_values.detach().float()
+            pre_det = pre_gate.detach().float()
+            post_det = post_gate.detach().float()
+            top_mean, top_max, active_edges, nodes_with_edges = self._top_edge_share_stats(
+                dst_index,
+                post_gate,
+                dim_size,
+            )
+            self.last_stats = {
+                "gate_mean": self._tensor_stat(gate_det, "mean"),
+                "gate_std": self._tensor_stat(gate_det, "std"),
+                "gate_min": self._tensor_stat(gate_det, "min"),
+                "gate_max": self._tensor_stat(gate_det, "max"),
+                "gate_sparsity_lt_0_1": self._sparsity(gate_det, 0.1),
+                "gate_sparsity_lt_1e_2": self._sparsity(gate_det, 1.0e-2),
+                "pre_sparsity_lt_1e_2": self._sparsity(pre_det, self.sparsity_threshold),
+                "post_sparsity_lt_1e_2": self._sparsity(post_det, self.sparsity_threshold),
+                "pre_activation_max": self._tensor_stat(pre_det.abs(), "max"),
+                "post_activation_max": self._tensor_stat(post_det.abs(), "max"),
+                "top_edge_share_mean": top_mean,
+                "top_edge_share_max": top_max,
+                "active_edges": active_edges,
+                "nodes_with_edges": nodes_with_edges,
+            }
+
+    def forward(
+            self,
+            message: torch.Tensor,
+            query_scalars: torch.Tensor,
+            message_scalars: torch.Tensor,
+            dst_index: torch.Tensor,
+            dim_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        if message.shape[0] != dst_index.numel():
+            raise ValueError(
+                "message and dst_index must describe the same number of edges, "
+                f"got {message.shape[0]} and {dst_index.numel()}."
+            )
+        if message_scalars.shape[0] != message.shape[0]:
+            raise ValueError(
+                "message_scalars and message must have the same leading dimension, "
+                f"got {message_scalars.shape[0]} and {message.shape[0]}."
+            )
+        if query_scalars.shape[-1] != self.query_scalar_dim:
+            raise ValueError(
+                f"query scalar dim mismatch: got {query_scalars.shape[-1]}, "
+                f"expected {self.query_scalar_dim}."
+            )
+        if message_scalars.shape[-1] != self.message_scalar_dim:
+            raise ValueError(
+                f"message scalar dim mismatch: got {message_scalars.shape[-1]}, "
+                f"expected {self.message_scalar_dim}."
+            )
+        if dst_index.numel() == 0:
+            self.last_stats = {
+                key: 0.0
+                for key in (
+                    "gate_mean",
+                    "gate_std",
+                    "gate_min",
+                    "gate_max",
+                    "gate_sparsity_lt_0_1",
+                    "gate_sparsity_lt_1e_2",
+                    "pre_sparsity_lt_1e_2",
+                    "post_sparsity_lt_1e_2",
+                    "pre_activation_max",
+                    "post_activation_max",
+                    "top_edge_share_mean",
+                    "top_edge_share_max",
+                    "active_edges",
+                    "nodes_with_edges",
+                )
+            }
+            return message
+        query_per_edge = query_scalars.index_select(0, dst_index)
+        gate_input = torch.cat([query_per_edge, message_scalars], dim=-1)
+        gate_values = torch.sigmoid(self.gate(gate_input))
+        feature_gate = gate_values.index_select(
+            1,
+            self.feature_gate_index.to(device=message.device),
+        )
+        gated = message * feature_gate
+        if dim_size is None:
+            dim_size = int(dst_index.max().item()) + 1
+        self._record_stats(gate_values, message, gated, dst_index, int(dim_size))
+        return gated
+
+
 class SingleHead0eEnvelopeAttention(torch.nn.Module):
     """Single-head destination attention from 0e scalars with cutoff envelope gating."""
 
@@ -938,6 +1083,8 @@ class LemMoEV3(torch.nn.Module):
             edge_attention_query_layer_norm: bool = False,
             edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
+            edge_message_value_gate: bool = False,
+            edge_message_value_gate_hidden_dim: int = 0,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             universal: Optional[bool] = False,
@@ -1007,6 +1154,8 @@ class LemMoEV3(torch.nn.Module):
         self.edge_attention_query_layer_norm = bool(edge_attention_query_layer_norm)
         self.edge_attention_qk_layer_norm = bool(edge_attention_qk_layer_norm)
         self.edge_message_env_weight = bool(edge_message_env_weight)
+        self.edge_message_value_gate = bool(edge_message_value_gate)
+        self.edge_message_value_gate_hidden_dim = int(edge_message_value_gate_hidden_dim or 0)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
         )
@@ -1026,7 +1175,9 @@ class LemMoEV3(torch.nn.Module):
             f"edge_attention_key_layer_norm={self.edge_attention_key_layer_norm}, "
             f"edge_attention_query_layer_norm={self.edge_attention_query_layer_norm}, "
             f"edge_attention_qk_layer_norm={self.edge_attention_qk_layer_norm}, "
-            f"edge_message_env_weight={self.edge_message_env_weight}"
+            f"edge_message_env_weight={self.edge_message_env_weight}, "
+            f"edge_message_value_gate={self.edge_message_value_gate}, "
+            f"edge_message_value_gate_hidden_dim={self.edge_message_value_gate_hidden_dim}"
         )
 
         if basis is not None:
@@ -1172,6 +1323,8 @@ class LemMoEV3(torch.nn.Module):
                 edge_attention_query_layer_norm=self.edge_attention_query_layer_norm,
                 edge_attention_qk_layer_norm=self.edge_attention_qk_layer_norm,
                 edge_message_env_weight=self.edge_message_env_weight,
+                edge_message_value_gate=self.edge_message_value_gate,
+                edge_message_value_gate_hidden_dim=self.edge_message_value_gate_hidden_dim,
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
@@ -1674,6 +1827,8 @@ class UpdateNode(torch.nn.Module):
             edge_attention_query_layer_norm: bool = False,
             edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
+            edge_message_value_gate: bool = False,
+            edge_message_value_gate_hidden_dim: int = 0,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -1697,6 +1852,8 @@ class UpdateNode(torch.nn.Module):
         self.edge_attention_query_layer_norm = bool(edge_attention_query_layer_norm)
         self.edge_attention_qk_layer_norm = bool(edge_attention_qk_layer_norm)
         self.edge_message_env_weight = bool(edge_message_env_weight)
+        self.edge_message_value_gate_enabled = bool(edge_message_value_gate)
+        self.edge_message_value_gate_hidden_dim = int(edge_message_value_gate_hidden_dim or 0)
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -1807,6 +1964,17 @@ class UpdateNode(torch.nn.Module):
             )
         else:
             self.node_attention = None
+        if self.edge_message_value_gate_enabled:
+            self.edge_message_gate = EdgeMessageValueGate(
+                self.irreps_out,
+                query_scalar_dim=self.irreps_in[0].dim,
+                message_scalar_dim=self.irreps_out[0].dim,
+                hidden_dim=self.edge_message_value_gate_hidden_dim,
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            self.edge_message_gate = None
         if self.edge_aggregation_gated_attention:
             self.edge_aggregation_gate = GatedEdgeAggregation(
                 self.irreps_out,
@@ -1900,6 +2068,16 @@ class UpdateNode(torch.nn.Module):
             weighted_message = message
         active_edge_center = edge_center[active_edges]
         active_edge_neighbor = edge_neighbor[active_edges]
+        edge_message_gate = getattr(self, "edge_message_gate", None)
+        if edge_message_gate is not None:
+            node_scalars = node_in[:, :self.irreps_in[0].dim]
+            weighted_message = edge_message_gate(
+                weighted_message,
+                node_scalars,
+                scalars,
+                active_edge_center,
+                dim_size=node_features.shape[0],
+            )
         if self.node_attention is None:
             new_node_features = scatter(
                 weighted_message,
@@ -2288,6 +2466,8 @@ class Layer(torch.nn.Module):
             edge_attention_query_layer_norm: bool = False,
             edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
+            edge_message_value_gate: bool = False,
+            edge_message_value_gate_hidden_dim: int = 0,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -2378,6 +2558,8 @@ class Layer(torch.nn.Module):
             edge_attention_query_layer_norm=edge_attention_query_layer_norm,
             edge_attention_qk_layer_norm=edge_attention_qk_layer_norm,
             edge_message_env_weight=edge_message_env_weight,
+            edge_message_value_gate=edge_message_value_gate,
+            edge_message_value_gate_hidden_dim=edge_message_value_gate_hidden_dim,
         )
 
         self.node_ffn = None
