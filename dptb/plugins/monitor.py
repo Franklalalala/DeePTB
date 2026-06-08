@@ -1109,14 +1109,13 @@ class GatedEdgeAggregationMonitor(Plugin):
         for _, module in self._modules:
             if hasattr(module, "heatmap_max_nodes"):
                 module.heatmap_max_nodes = self.heatmap_max_nodes
-        if self.is_main_process:
-            os.makedirs(self.output_dir, exist_ok=True)
-            if self.heatmap:
-                os.makedirs(self.heatmap_dir, exist_ok=True)
-            self._ensure_csv_header()
-            if self.tensorboard:
-                tb_dir = self.tensorboard_log_dir or os.path.join(self.output_dir, "tensorboard_logs")
-                self.writer = SummaryWriter(log_dir=tb_dir)
+        os.makedirs(self.output_dir, exist_ok=True)
+        if self.heatmap:
+            os.makedirs(self.heatmap_dir, exist_ok=True)
+        self._ensure_csv_header()
+        if self.tensorboard:
+            tb_dir = self.tensorboard_log_dir or os.path.join(self.output_dir, "tensorboard_logs")
+            self.writer = SummaryWriter(log_dir=tb_dir)
         log.info(
             "[GatedEdgeAggregationMonitor][rank=%s] monitoring %s modules; csv=%s; heatmap=%s",
             self.rank,
@@ -1281,8 +1280,6 @@ class GatedEdgeAggregationMonitor(Plugin):
         plt.close(fig)
 
     def iteration(self, **kwargs):
-        if not self.is_main_process:
-            return
         iteration = kwargs.get("time", getattr(self.trainer, "iter", 0))
         rows = self._rows(iteration)
         if not rows:

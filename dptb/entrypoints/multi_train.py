@@ -603,8 +603,8 @@ def _multi_train_impl(
                 )
             )
 
-        gated_edge_monitor_enabled = bool(train_options.get("monitor_gated_edge_attention", False))
-        if gated_edge_monitor_enabled:
+        gated_edge_enabled = bool(train_options.get("monitor_gated_edge_attention", False))
+        if gated_edge_enabled:
             gated_edge_freq = int(
                 train_options.get("monitor_gated_edge_attention_freq") or train_options["display_freq"]
             )
@@ -623,7 +623,7 @@ def _multi_train_impl(
                     interval=[(gated_edge_freq, 'iteration')],
                     tensorboard=gated_edge_tb,
                     heatmap=bool(train_options.get("monitor_gated_edge_attention_heatmap", False)),
-                    heatmap_max_nodes=int(train_options.get("monitor_gated_edge_attention_heatmap_size", 64)),
+                    heatmap_max_nodes=train_options.get("monitor_gated_edge_attention_heatmap_size", 64),
                 )
             )
 

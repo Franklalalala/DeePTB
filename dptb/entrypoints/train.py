@@ -598,8 +598,9 @@ def train(
                 output,
                 interval=[(gated_edge_freq, 'iteration')],
                 tensorboard=gated_edge_tb,
+                tensorboard_log_dir=os.path.join(output, "tensorboard_logs") if output else None,
                 heatmap=bool(train_options.get("monitor_gated_edge_attention_heatmap", False)),
-                heatmap_max_nodes=int(train_options.get("monitor_gated_edge_attention_heatmap_size", 64)),
+                heatmap_max_nodes=train_options.get("monitor_gated_edge_attention_heatmap_size", 64),
             )
         )
 

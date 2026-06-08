@@ -3,6 +3,7 @@ import logging
 import os
 import csv
 import math
+import copy
 import torch.nn as nn
 from dptb.utils.tools import get_lr_scheduler, get_optimizer
 from dptb.nnops.base_trainer import BaseTrainer
@@ -232,7 +233,28 @@ class Trainer(BaseTrainer):
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
                 validation_datasets=None):
         ckpt = torch.load(checkpoint, map_location=common_options["device"], weights_only=False)
-        model = build_model(checkpoint, ckpt["config"]["model_options"], ckpt["config"]["common_options"])
+        ckpt_train_options = ckpt["config"]["train_options"]
+        model_build_train_options = train_options if len(train_options) != 0 else ckpt_train_options
+        model_state = ckpt.get("model_state_dict", {})
+        has_flat_distance_state = (
+            bool(ckpt_train_options.get("distance_ranges"))
+            and isinstance(model_state, dict)
+            and not any(k.startswith("experts.") for k in model_state.keys())
+        )
+        if has_flat_distance_state:
+            model_build_train_options = copy.deepcopy(model_build_train_options)
+            model_build_train_options.pop("distance_ranges", None)
+            log.warning(
+                "Detected flat single-model checkpoint with distance_ranges; "
+                "building the restart model without DistanceEnsembleWrapper so "
+                "optimizer parameter groups match the saved checkpoint."
+            )
+        model = build_model(
+            checkpoint,
+            ckpt["config"]["model_options"],
+            ckpt["config"]["common_options"],
+            train_options=model_build_train_options,
+        )
         if len(train_options) == 0: train_options = ckpt["config"]["train_options"]
         if len(common_options) == 0: common_options = ckpt["config"]["common_options"]
         trainer = cls(model=model, train_datasets=train_datasets, reference_datasets=reference_datasets,
