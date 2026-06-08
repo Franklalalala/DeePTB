@@ -661,6 +661,33 @@ def Adam():
         Argument("amsgrad", bool, optional=True, default=False, doc=doc_amsgrad)
     ]
 
+def HybridMuon():
+    doc_lr = "learning rate. Default: 1e-3"
+    doc_weight_decay = "decoupled weight decay for Muon-routed matrix parameters. Default: 1e-3"
+    doc_muon_beta = "momentum coefficient for Muon-routed matrix parameters. Default: 0.95"
+    doc_muon_scale = "DPA4 update-RMS matching scale gamma. Default: 0.18"
+    doc_adam_betas = "Adam-family beta coefficients for vector/scalar parameters. Default: (0.9, 0.999)"
+    doc_adam_eps = "Adam-family epsilon for vector/scalar parameters. Default: 1e-20"
+    doc_matrix_min_dim = "Minimum trailing matrix dimension for Muon routing. Default: 2"
+    doc_magma_lite = "Set true to enable DPA4 Magma-lite momentum-alignment damping for Muon blocks. Default: True"
+    doc_magma_temperature = "Temperature for Magma-lite alignment sigmoid. DPA4 uses 2.0."
+    doc_magma_ema_beta = "EMA coefficient for Magma-lite damping scores. DPA4 uses 0.9."
+    doc_magma_min_scale = "Lower bound for Magma-lite damping scale. DPA4 uses 0.1."
+
+    return [
+        Argument("lr", float, optional=True, default=1e-3, doc=doc_lr),
+        Argument("weight_decay", float, optional=True, default=1e-3, doc=doc_weight_decay),
+        Argument("muon_beta", float, optional=True, default=0.95, doc=doc_muon_beta),
+        Argument("muon_scale", float, optional=True, default=0.18, doc=doc_muon_scale),
+        Argument("adam_betas", list, optional=True, default=[0.9, 0.999], doc=doc_adam_betas),
+        Argument("adam_eps", float, optional=True, default=1e-20, doc=doc_adam_eps),
+        Argument("matrix_min_dim", int, optional=True, default=2, doc=doc_matrix_min_dim),
+        Argument("magma_lite", bool, optional=True, default=True, doc=doc_magma_lite),
+        Argument("magma_temperature", float, optional=True, default=2.0, doc=doc_magma_temperature),
+        Argument("magma_ema_beta", float, optional=True, default=0.9, doc=doc_magma_ema_beta),
+        Argument("magma_min_scale", float, optional=True, default=0.1, doc=doc_magma_min_scale),
+    ]
+
 def SGD():
     doc_lr = "learning rate. Default: 1e-3"
     doc_weight_decay = "weight decay (L2 penalty), Default: 0"
@@ -711,11 +738,12 @@ def LBFGS():
     ]
 
 def optimizer():
-    doc_type = "select type of optimizer, support type includes: `Adam`, `AdamW`, `SGD` and `LBFGS`. Default: `Adam`"
+    doc_type = "select type of optimizer, support type includes: `Adam`, `AdamW`, `HybridMuon`, `SGD` and `LBFGS`. Default: `Adam`"
 
     return Variant("type", [
             Argument("Adam", dict, Adam()),
             Argument("AdamW", dict, Adam()),
+            Argument("HybridMuon", dict, HybridMuon()),
             Argument("SGD", dict, SGD()),
             Argument("RMSprop", dict, RMSprop()),
             Argument("LBFGS", dict, LBFGS()),
@@ -809,14 +837,36 @@ def CosineAnnealingLR():
         Argument("eta_min", float, optional=True, default=0, doc=doc_eta_min),
     ]
 
+def WarmupStableDecayLR():
+    doc_total_steps = "Total number of optimizer steps for DPA4 warmup-stable-decay scheduling."
+    doc_warmup_steps = "Number of linear warmup steps. DPA4 tables use 5000."
+    doc_decay_ratio = "Training-progress fraction at which final decay starts. DPA4 tables use 0.65."
+    doc_min_lr = "Final minimum learning rate. DPA4 tables use 1e-6."
+    doc_warmup_lr = "Initial warmup learning rate. Default: 0."
+    doc_decay_steps = "Optional explicit decay length. If set, overrides decay_ratio-derived decay length."
+    doc_decay_type = "Decay type. DPA4 uses cosine."
+    doc_last_epoch = "Last scheduler step index for resume. Default: -1."
+
+    return [
+        Argument("total_steps", int, optional=False, doc=doc_total_steps),
+        Argument("warmup_steps", int, optional=True, default=5000, doc=doc_warmup_steps),
+        Argument("decay_ratio", float, optional=True, default=0.65, doc=doc_decay_ratio),
+        Argument("min_lr", [float, list], optional=True, default=1e-6, doc=doc_min_lr),
+        Argument("warmup_lr", [float, list], optional=True, default=0.0, doc=doc_warmup_lr),
+        Argument("decay_steps", int, optional=True, default=None, doc=doc_decay_steps),
+        Argument("decay_type", str, optional=True, default="cosine", doc=doc_decay_type),
+        Argument("last_epoch", int, optional=True, default=-1, doc=doc_last_epoch),
+    ]
+
 def lr_scheduler():
-    doc_type = "select type of lr_scheduler, support type includes `exp`, `linear`"
+    doc_type = "select type of lr_scheduler, support type includes `exp`, `linear`, `rop`, `cos`, `wsd`, and `cyclic`"
 
     return Variant("type", [
             Argument("exp", dict, ExponentialLR()),
             Argument("linear", dict, LinearLR()),
             Argument("rop", dict, ReduceOnPlateau(), doc="rop: reduce on plateau"),
             Argument("cos", dict, CosineAnnealingLR(), doc="cos: cosine annealing"),
+            Argument("wsd", dict, WarmupStableDecayLR(), doc="wsd: DPA4 warmup-stable-decay"),
             Argument("cyclic", dict, CyclicLR(), doc="Cyclic learning rate")
         ],optional=True, default_tag="exp", doc=doc_type)
 

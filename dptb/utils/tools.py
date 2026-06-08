@@ -21,6 +21,7 @@ import yaml
 import torch.optim as optim
 import logging
 import random
+from dptb.utils.dpa4_optim import HybridMuon, WarmupStableDecayLR
 from ase.neighborlist import neighbor_list
 from ase.io.trajectory import Trajectory
 import ase
@@ -138,6 +139,8 @@ def get_optimizer(type: str, model_param, lr: float, **options: dict):
         optimizer = optim.Adam(params=model_param, lr=lr, **options)
     elif type == 'AdamW':
         optimizer = optim.AdamW(params=model_param, lr=lr, **options)
+    elif type == 'HybridMuon':
+        optimizer = HybridMuon(params=model_param, lr=lr, **options)
     elif type == 'SGD':
         optimizer = optim.SGD(params=model_param, lr=lr, **options)
     elif type == 'RMSprop':
@@ -145,7 +148,7 @@ def get_optimizer(type: str, model_param, lr: float, **options: dict):
     elif type == 'LBFGS':
         optimizer = optim.LBFGS(params=model_param, lr=lr, **options)
     else:
-        raise RuntimeError("Optimizer should be Adam/AdamW/SGD/RMSprop, not {}".format(type))
+        raise RuntimeError("Optimizer should be Adam/AdamW/HybridMuon/SGD/RMSprop, not {}".format(type))
     return optimizer
 
 def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
@@ -157,10 +160,12 @@ def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, **sch_options)
     elif type == 'cos':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, **sch_options)
+    elif type == 'wsd':
+        scheduler = WarmupStableDecayLR(optimizer=optimizer, **sch_options)
     elif type == "cyclic":
         scheduler = optim.lr_scheduler.CyclicLR(optimizer=optimizer, **sch_options)
     else:
-        raise RuntimeError("Scheduler should be exp/linear/rop/cyclic..., not {}".format(type))
+        raise RuntimeError("Scheduler should be exp/linear/rop/cos/wsd/cyclic..., not {}".format(type))
 
     return scheduler
 
