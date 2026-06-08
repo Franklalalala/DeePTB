@@ -42,7 +42,7 @@ from dptb.plugins.monitor import (
     TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor,
     DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, CUDAModuleMemoryMonitor,
     TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor,
-    ScalarFieldMonitor, CUDAMemoryMonitor, ParamDynamicsMonitor
+    ScalarFieldMonitor, CUDAMemoryMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
 )
 from dptb.plugins.train_logger import Logger
 from dptb.plugins.saver import Saver
@@ -600,6 +600,30 @@ def _multi_train_impl(
                     grad_norm_dead_threshold=train_options.get(
                         "monitor_param_dynamics_grad_norm_dead_threshold", 1.0e-12
                     ),
+                )
+            )
+
+        gated_edge_enabled = bool(train_options.get("monitor_gated_edge_attention", False))
+        if gated_edge_enabled:
+            gated_edge_freq = int(
+                train_options.get("monitor_gated_edge_attention_freq") or train_options["display_freq"]
+            )
+            gated_edge_freq = max(1, gated_edge_freq)
+            gated_edge_tb_opt = train_options.get("monitor_gated_edge_attention_tensorboard", None)
+            if gated_edge_tb_opt is None:
+                gated_edge_tb = bool(train_options.get("use_tensorboard", False))
+            else:
+                gated_edge_tb = bool(gated_edge_tb_opt)
+            gated_edge_output = output or "monitor_logs"
+            if distributed_expert:
+                gated_edge_output = os.path.join(gated_edge_output, f"rank{rank}")
+            trainer.register_plugin(
+                GatedEdgeAggregationMonitor(
+                    gated_edge_output,
+                    interval=[(gated_edge_freq, 'iteration')],
+                    tensorboard=gated_edge_tb,
+                    heatmap=bool(train_options.get("monitor_gated_edge_attention_heatmap", False)),
+                    heatmap_max_nodes=train_options.get("monitor_gated_edge_attention_heatmap_size", 64),
                 )
             )
 
