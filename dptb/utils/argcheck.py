@@ -12,9 +12,9 @@ dptb_model_config_checklist = ['dptb-if_batch_normalized', 'dptb-hopping_net_typ
                         'dptb-hopping_net_neuron', 'dptb-env_net_neuron', 'dptb-soc_net_neuron', 'dptb-onsite_net_neuron', 'dptb-axis_neuron', 'skfunction-skformula', 'sknetwork-sk_onsite_nhidden',
                         'sknetwork-sk_hop_nhidden']
 
-# set default values in case of rop & update lr per step
+# set default values in case of plateau schedulers & update lr per step
 def chk_avg_per_iter(jdata):
-    if jdata["train_options"]["lr_scheduler"]["type"] == 'rop' and jdata["train_options"]["update_lr_per_iter"]:
+    if jdata["train_options"]["lr_scheduler"]["type"] in {"rop", "warmup_rop"} and jdata["train_options"]["update_lr_per_iter"]:
         avg_per_iter = True
     else:
         avg_per_iter = False
@@ -858,13 +858,26 @@ def WarmupStableDecayLR():
         Argument("last_epoch", int, optional=True, default=-1, doc=doc_last_epoch),
     ]
 
+def WarmupReduceOnPlateau():
+    doc_warmup_steps = "Number of linear warmup scheduler steps before ReduceLROnPlateau starts. Default: 5000."
+    doc_warmup_lr = "Initial warmup learning rate. Can be a scalar or one value per optimizer parameter group. Default: 0."
+    doc_last_epoch = "Last scheduler step index for resume. Default: -1."
+
+    return [
+        Argument("warmup_steps", int, optional=True, default=5000, doc=doc_warmup_steps),
+        Argument("warmup_lr", [float, list], optional=True, default=0.0, doc=doc_warmup_lr),
+        *ReduceOnPlateau(),
+        Argument("last_epoch", int, optional=True, default=-1, doc=doc_last_epoch),
+    ]
+
 def lr_scheduler():
-    doc_type = "select type of lr_scheduler, support type includes `exp`, `linear`, `rop`, `cos`, `wsd`, and `cyclic`"
+    doc_type = "select type of lr_scheduler, support type includes `exp`, `linear`, `rop`, `warmup_rop`, `cos`, `wsd`, and `cyclic`"
 
     return Variant("type", [
             Argument("exp", dict, ExponentialLR()),
             Argument("linear", dict, LinearLR()),
             Argument("rop", dict, ReduceOnPlateau(), doc="rop: reduce on plateau"),
+            Argument("warmup_rop", dict, WarmupReduceOnPlateau(), doc="warmup_rop: linear warmup followed by reduce on plateau"),
             Argument("cos", dict, CosineAnnealingLR(), doc="cos: cosine annealing"),
             Argument("wsd", dict, WarmupStableDecayLR(), doc="wsd: DPA4 warmup-stable-decay"),
             Argument("cyclic", dict, CyclicLR(), doc="Cyclic learning rate")

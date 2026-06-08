@@ -21,7 +21,7 @@ import yaml
 import torch.optim as optim
 import logging
 import random
-from dptb.utils.dpa4_optim import HybridMuon, WarmupStableDecayLR
+from dptb.utils.dpa4_optim import HybridMuon, WarmupStableDecayLR, WarmupThenReduceLROnPlateau
 from ase.neighborlist import neighbor_list
 from ase.io.trajectory import Trajectory
 import ase
@@ -162,12 +162,26 @@ def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, **sch_options)
     elif type == 'wsd':
         scheduler = WarmupStableDecayLR(optimizer=optimizer, **sch_options)
+    elif type == "warmup_rop":
+        scheduler = WarmupThenReduceLROnPlateau(optimizer=optimizer, **sch_options)
     elif type == "cyclic":
         scheduler = optim.lr_scheduler.CyclicLR(optimizer=optimizer, **sch_options)
     else:
-        raise RuntimeError("Scheduler should be exp/linear/rop/cos/wsd/cyclic..., not {}".format(type))
+        raise RuntimeError("Scheduler should be exp/linear/rop/cos/wsd/warmup_rop/cyclic..., not {}".format(type))
 
     return scheduler
+
+
+def lr_scheduler_requires_metric(scheduler) -> bool:
+    return (
+        isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau)
+        or bool(getattr(scheduler, "requires_metric", False))
+    )
+
+
+def lr_scheduler_can_step_without_metric(scheduler) -> bool:
+    can_step = getattr(scheduler, "can_step_without_metric", None)
+    return bool(callable(can_step) and can_step())
 
 def j_must_have(
     jdata: Dict[str, "_DICT_VAL"], key: str, deprecated_key: List[str] = []

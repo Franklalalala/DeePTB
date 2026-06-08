@@ -98,6 +98,111 @@ class WarmupStableDecayLR(torch.optim.lr_scheduler.LRScheduler):
         return self.get_lr_at_step(self.last_epoch)
 
 
+class WarmupThenReduceLROnPlateau:
+    """Linear warmup followed by metric-driven ReduceLROnPlateau.
+
+    ``warmup_steps`` counts scheduler ``step`` calls. This makes the schedule
+    work for both epoch-level stepping and ``update_lr_per_iter=True`` runs.
+    """
+
+    requires_metric = True
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup_steps: int = 5000,
+        warmup_lr: NumberOrList = 0.0,
+        mode: str = "min",
+        factor: float = 0.1,
+        patience: int = 10,
+        threshold: float = 1.0e-4,
+        threshold_mode: str = "rel",
+        cooldown: int = 0,
+        min_lr: NumberOrList = 0.0,
+        eps: float = 1.0e-8,
+        last_epoch: int = -1,
+    ) -> None:
+        if warmup_steps < 0:
+            raise ValueError("warmup_steps must be >= 0 for warmup_rop scheduler")
+        self.optimizer = optimizer
+        self.warmup_steps = int(warmup_steps)
+        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.warmup_lrs = _as_float_list(warmup_lr, len(optimizer.param_groups), "warmup_lr")
+        self.last_epoch = int(last_epoch)
+        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=optimizer,
+            mode=mode,
+            factor=factor,
+            patience=patience,
+            threshold=threshold,
+            threshold_mode=threshold_mode,
+            cooldown=cooldown,
+            min_lr=min_lr,
+            eps=eps,
+        )
+        self._last_lr = [float(group["lr"]) for group in optimizer.param_groups]
+
+        if self.last_epoch < 0:
+            self.last_epoch = 0
+        if self.last_epoch <= self.warmup_steps:
+            self._set_lrs(self.get_warmup_lrs_at_step(self.last_epoch))
+
+    def _set_lrs(self, lrs: Sequence[float]) -> None:
+        for group, lr in zip(self.optimizer.param_groups, lrs):
+            group["lr"] = float(lr)
+        self._last_lr = [float(lr) for lr in lrs]
+
+    def _warmup_lr_for_step(self, step: int, base_lr: float, warmup_lr: float) -> float:
+        if self.warmup_steps == 0:
+            return float(base_lr)
+        t = min(max(0, int(step)), self.warmup_steps)
+        return float(warmup_lr + (base_lr - warmup_lr) * (t / self.warmup_steps))
+
+    def get_warmup_lrs_at_step(self, step: int) -> List[float]:
+        return [
+            self._warmup_lr_for_step(step, base_lr, warmup_lr)
+            for base_lr, warmup_lr in zip(self.base_lrs, self.warmup_lrs)
+        ]
+
+    def get_last_lr(self) -> List[float]:
+        return list(self._last_lr)
+
+    def can_step_without_metric(self) -> bool:
+        return self.last_epoch < self.warmup_steps
+
+    def step(self, metrics=None):
+        if self.last_epoch < self.warmup_steps:
+            self.last_epoch += 1
+            self._set_lrs(self.get_warmup_lrs_at_step(self.last_epoch))
+            return self.get_last_lr()
+
+        if metrics is None:
+            raise ValueError("warmup_rop requires a metric after warmup finishes")
+
+        self.last_epoch += 1
+        self.plateau.step(metrics)
+        self._last_lr = [float(group["lr"]) for group in self.optimizer.param_groups]
+        return self.get_last_lr()
+
+    def state_dict(self):
+        return {
+            "warmup_steps": self.warmup_steps,
+            "warmup_lrs": list(self.warmup_lrs),
+            "base_lrs": list(self.base_lrs),
+            "last_epoch": self.last_epoch,
+            "_last_lr": list(self._last_lr),
+            "plateau_state_dict": self.plateau.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.warmup_steps = int(state_dict["warmup_steps"])
+        self.warmup_lrs = [float(v) for v in state_dict["warmup_lrs"]]
+        self.base_lrs = [float(v) for v in state_dict["base_lrs"]]
+        self.last_epoch = int(state_dict["last_epoch"])
+        self._last_lr = [float(v) for v in state_dict.get("_last_lr", self._last_lr)]
+        self.plateau.load_state_dict(state_dict["plateau_state_dict"])
+
+
 class HybridMuon(Optimizer):
     """DPA4-style hybrid Muon/AdamW optimizer.
 

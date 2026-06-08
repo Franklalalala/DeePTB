@@ -5,7 +5,12 @@ import csv
 import math
 import copy
 import torch.nn as nn
-from dptb.utils.tools import get_lr_scheduler, get_optimizer
+from dptb.utils.tools import (
+    get_lr_scheduler,
+    get_optimizer,
+    lr_scheduler_can_step_without_metric,
+    lr_scheduler_requires_metric,
+)
 from dptb.nnops.base_trainer import BaseTrainer
 from dptb.plugins.monitor import Plugin
 from typing import Union, Optional
@@ -208,9 +213,11 @@ class Trainer(BaseTrainer):
         self.optimizer.step()
 
         if self.update_lr_per_iter:
-            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            if lr_scheduler_requires_metric(self.lr_scheduler):
                 if self.iter > 1:
                     self.lr_scheduler.step(self.stats["train_loss"]['latest_avg_iter_loss'])
+                elif lr_scheduler_can_step_without_metric(self.lr_scheduler):
+                    self.lr_scheduler.step()
             else:
                 self.lr_scheduler.step()
 

@@ -15,7 +15,12 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torch.profiler import profile as torch_profile, ProfilerActivity
 
-from dptb.utils.tools import get_lr_scheduler, get_optimizer
+from dptb.utils.tools import (
+    get_lr_scheduler,
+    get_optimizer,
+    lr_scheduler_can_step_without_metric,
+    lr_scheduler_requires_metric,
+)
 from dptb.utils.cuda_cache_memory import cuda_cache_memory_context
 from dptb.data import AtomicDataset, AtomicData, DataLoader
 from dptb.data import _keys
@@ -2428,17 +2433,19 @@ class MultiTrainer(Trainer):
             if sch is None:
                 return
 
-            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            if lr_scheduler_requires_metric(sch):
                 metric_float = _metric_float()
                 with self._tagger.tag("scheduler/local_step", it=self.iter, expert=self.local_expert_idx, extra=f"metric={metric_float:.6g}"):
                     if self.iter > 1:
                         sch.step(metric_float)
+                    elif lr_scheduler_can_step_without_metric(sch):
+                        sch.step()
             else:
                 with self._tagger.tag("scheduler/local_step", it=self.iter, expert=self.local_expert_idx, extra="metric=not_required"):
                     sch.step()
         else:
             needs_metric = any(
-                isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau)
+                lr_scheduler_requires_metric(sch)
                 for sch in self.lr_schedulers
                 if sch is not None
             )
@@ -2446,9 +2453,11 @@ class MultiTrainer(Trainer):
             extra = f"metric={metric_float:.6g}" if metric_float is not None else "metric=not_required"
             with self._tagger.tag("scheduler/local_step(all)", it=self.iter, extra=extra):
                 for sch in self.lr_schedulers:
-                    if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    if lr_scheduler_requires_metric(sch):
                         if self.iter > 1:
                             sch.step(metric_float)
+                        elif lr_scheduler_can_step_without_metric(sch):
+                            sch.step()
                     else:
                         sch.step()
 
@@ -2463,7 +2472,7 @@ class MultiTrainer(Trainer):
                 return
 
             extra = f"metric={metric_float:.6g}" if metric_float is not None else "metric=None"
-            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            if lr_scheduler_requires_metric(sch):
                 if metric_float is None:
                     log.warning("Skip epoch LR scheduler step: no epoch metric is available.")
                     return

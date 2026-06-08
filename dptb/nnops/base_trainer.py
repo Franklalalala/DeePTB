@@ -1,7 +1,7 @@
 import torch
 import heapq
 import logging
-from dptb.utils.tools import get_lr_scheduler, j_must_have, get_optimizer
+from dptb.utils.tools import get_lr_scheduler, j_must_have, get_optimizer, lr_scheduler_requires_metric
 from abc import ABCMeta, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 from future.utils import with_metaclass
@@ -54,7 +54,7 @@ class BaseTrainer(with_metaclass(ABCMeta, PluginUser)):
             self.call_plugins(queue_name='epoch', time=i)
 
             if not self.update_lr_per_iter:
-                if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                if lr_scheduler_requires_metric(self.lr_scheduler):
                     if 'validation_loss' in self.stats and 'epoch_mean' in self.stats['validation_loss']:
                         self.lr_scheduler.step(self.stats['validation_loss']['epoch_mean'])  # 使用验证损失
                     else:
