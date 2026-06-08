@@ -1239,6 +1239,8 @@ def slem():
     doc_edge_attention_envelope_power = "Power applied to cutoff coefficients in single-head edge attention numerator. `1.0` preserves the legacy implementation; `2.0` uses cutoff^2. Default: `1.0`."
     doc_edge_attention_use_latent_bias = "Whether to add latent-conditioned bias to single-head edge attention logits. Default: `True`, preserving the legacy implementation."
     doc_edge_attention_key_layer_norm = "Apply LayerNorm only to message 0e scalars before the single-head edge-attention key projection. Default: `False`."
+    doc_edge_attention_query_layer_norm = "Apply LayerNorm only to destination node 0e scalars before the single-head edge-attention query projection. Default: `False`."
+    doc_edge_attention_qk_layer_norm = "Shortcut that applies LayerNorm to both query and key 0e scalar inputs before the single-head edge-attention projections. Default: `False`."
     doc_edge_message_env_weight = "Whether to apply the legacy latent-conditioned env value weighting to node-update edge messages before aggregation. Default: `True`, preserving the legacy implementation."
 
     return [
@@ -1307,6 +1309,8 @@ def slem():
         Argument("edge_attention_envelope_power", float, optional=True, default=1.0, doc=doc_edge_attention_envelope_power),
         Argument("edge_attention_use_latent_bias", bool, optional=True, default=True, doc=doc_edge_attention_use_latent_bias),
         Argument("edge_attention_key_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_key_layer_norm),
+        Argument("edge_attention_query_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_query_layer_norm),
+        Argument("edge_attention_qk_layer_norm", bool, optional=True, default=False, doc=doc_edge_attention_qk_layer_norm),
         Argument("edge_message_env_weight", bool, optional=True, default=True, doc=doc_edge_message_env_weight),
 
         # ---- New norm conditioning flags ----
