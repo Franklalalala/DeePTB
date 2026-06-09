@@ -524,7 +524,7 @@ class MultiTrainer(Trainer):
 
         def _make_opt_for_expert(i: int):
             opt_cfg = self._build_optimizer_cfg_for_expert(i)
-            return get_optimizer(model_param=self._expert_parameters(i), **opt_cfg)
+            return get_optimizer(model_param=self._expert_optimizer_parameters(i), **opt_cfg)
 
         def _make_scheduler_for_expert(i: int, opt):
             sch_cfg = self._build_lr_scheduler_cfg_for_expert(i)
@@ -981,6 +981,9 @@ class MultiTrainer(Trainer):
 
     def _expert_parameters(self, expert_idx: int):
         return self._expert_module(expert_idx).parameters()
+
+    def _expert_optimizer_parameters(self, expert_idx: int):
+        return self._expert_module(expert_idx).named_parameters()
 
     def _maybe_wrap_local_expert_ddp(self):
         if (
@@ -2390,6 +2393,7 @@ class MultiTrainer(Trainer):
         if dynamic_batch_oom_skips > 0:
             state["dynamic_batch_oom_skipped_iters"] = dynamic_batch_oom_skips
 
+        self._add_optimizer_diagnostics_to_state(state)
         self._add_cuda_memory_state(state, cuda_memory_metrics)
 
         self._reset_display_window_buffers()
@@ -2398,6 +2402,27 @@ class MultiTrainer(Trainer):
     # ---------------------------------------------------------------------
     # scheduler
     # ---------------------------------------------------------------------
+
+    def _add_optimizer_diagnostics_to_state(self, state):
+        total_clip_events = 0.0
+        total_muon_blocks = 0.0
+        any_diagnostics = False
+        for expert_idx, optimizer in enumerate(getattr(self, "optimizers", [])):
+            if optimizer is None or not hasattr(optimizer, "get_diagnostics"):
+                continue
+            try:
+                diagnostics = optimizer.get_diagnostics()
+            except Exception as exc:
+                log.debug("optimizer diagnostics collection failed for expert %s: %s", expert_idx, exc)
+                continue
+            any_diagnostics = True
+            state.update({f"expert_{expert_idx}_{key}": value for key, value in diagnostics.items()})
+            total_clip_events += float(diagnostics.get("muon_clip_events", 0.0))
+            total_muon_blocks += float(diagnostics.get("muon_blocks", 0.0))
+        if any_diagnostics:
+            state["muon_clip_events"] = total_clip_events
+            if total_muon_blocks:
+                state["muon_clip_event_ratio"] = total_clip_events / total_muon_blocks
 
     def _get_epoch_scheduler_metric(self):
         validation_stat = self.stats.get("validation_loss", {})
@@ -3022,6 +3047,7 @@ class MultiTrainer(Trainer):
                     state["mean_max_prob"] = sum(z_metric_values) / len(z_metric_values)
                 state.update(dynamic_batch_state)
 
+                self._add_optimizer_diagnostics_to_state(state)
                 self._add_cuda_memory_state(state, self._gather_cuda_memory_metrics())
 
                 with self._tagger.tag("iteration/call_plugins", it=self.iter):

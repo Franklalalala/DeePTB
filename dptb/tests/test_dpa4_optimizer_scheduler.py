@@ -204,6 +204,89 @@ def test_hybrid_muon_uses_effective_shape_for_singleton_matrix_tensors():
     assert "magma_ema" in optimizer.state[param]
 
 
+def test_hybrid_muon_auto_routes_factorable_flat_weight():
+    param = torch.nn.Parameter(torch.zeros(32 * 33))
+    param.grad = torch.ones_like(param)
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[("layers.0.node_onehot_tp.weight", param)],
+        lr=0.1,
+        weight_decay=0.0,
+        muon_beta=0.0,
+        magma_lite=False,
+    )
+
+    optimizer.step()
+
+    assert optimizer.route_counts == {"muon": 1, "adam": 0}
+    assert optimizer.route_summary()["params_1d_muon"] == 1
+    assert optimizer._effective_shape_for_param(param, optimizer.param_groups[0]) == [32, 33]
+    assert torch.isfinite(param).all()
+
+
+def test_hybrid_muon_keeps_norm_and_unfactorable_vectors_on_adamw():
+    norm_weight = torch.nn.Parameter(torch.ones(128))
+    prime_weight = torch.nn.Parameter(torch.ones(17))
+    norm_weight.grad = torch.ones_like(norm_weight)
+    prime_weight.grad = torch.ones_like(prime_weight)
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[
+            ("layers.0.node_norm.weight", norm_weight),
+            ("layers.0.flat_tp.weight", prime_weight),
+        ],
+        lr=0.1,
+        weight_decay=0.1,
+        muon_beta=0.0,
+        adam_betas=[0.0, 0.0],
+        adam_eps=1.0e-20,
+    )
+
+    optimizer.step()
+
+    assert optimizer.route_counts == {"muon": 0, "adam": 2}
+    assert torch.allclose(norm_weight, torch.full_like(norm_weight, 0.89))
+    assert "exp_avg" in optimizer.state[norm_weight]
+    assert "exp_avg" in optimizer.state[prime_weight]
+
+
+def test_hybrid_muon_fixed_clip_caps_update_and_reports_diagnostics():
+    param = torch.nn.Parameter(torch.zeros(4, 4))
+    param.grad = torch.ones_like(param)
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[param],
+        lr=1.0,
+        weight_decay=0.0,
+        muon_beta=0.0,
+        muon_scale=10.0,
+        magma_lite=False,
+        muon_clip_mode="fixed",
+        muon_clip_rms=0.25,
+    )
+
+    optimizer.step()
+
+    assert (-param).pow(2).mean().sqrt().item() <= 0.250001
+    diagnostics = optimizer.get_diagnostics()
+    assert diagnostics["muon_clip_events"] >= 1
+    assert diagnostics["hybrid_muon_route_numel_muon"] == pytest.approx(16)
+
+
+def test_hybrid_muon_fills_new_group_defaults_for_old_checkpoint_state():
+    param = torch.nn.Parameter(torch.zeros(3, 4))
+    param.grad = torch.ones_like(param)
+    optimizer = get_optimizer(type="HybridMuon", model_param=[param], lr=0.1)
+    for key in list(optimizer.defaults):
+        if key.startswith("muon_1d_") or key.startswith("muon_clip"):
+            optimizer.param_groups[0].pop(key, None)
+
+    optimizer.step()
+
+    assert optimizer.route_counts == {"muon": 1, "adam": 0}
+    assert "muon_clip_mode" in optimizer.param_groups[0]
+
+
 def test_train_options_accepts_hybrid_muon_optimizer_and_wsd_scheduler():
     normalized = train_options().normalize_value(
         {
@@ -226,6 +309,10 @@ def test_train_options_accepts_hybrid_muon_optimizer_and_wsd_scheduler():
     )
     assert normalized["optimizer"]["type"] == "HybridMuon"
     assert normalized["optimizer"]["magma_lite"] is True
+    assert normalized["optimizer"]["muon_1d_route_mode"] == "auto"
+    assert normalized["optimizer"]["muon_1d_allow_degenerate_matrix"] is False
+    assert normalized["optimizer"]["muon_clip_mode"] == "auto"
+    assert normalized["optimizer"]["muon_clip_max_ratio"] == pytest.approx(0.25)
     assert normalized["lr_scheduler"]["type"] == "wsd"
     assert normalized["lr_scheduler"]["decay_type"] == "cosine"
 

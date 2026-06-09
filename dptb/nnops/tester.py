@@ -38,8 +38,18 @@ class Tester(BaseTester):
         return self
 
     @staticmethod
+    def _loss_component_source(lossfunc):
+        """Return the wrapped loss module that owns component metrics."""
+        loss_obj = lossfunc
+        for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
+            inner = getattr(loss_obj, attr, None)
+            if isinstance(inner, torch.nn.Module):
+                return inner
+        return loss_obj
+
+    @staticmethod
     def _loss_component_state(lossfunc, *, prefix="test"):
-        loss_obj = getattr(lossfunc, "loss", lossfunc)
+        loss_obj = Tester._loss_component_source(lossfunc)
         state = {}
         onsite_comp = getattr(loss_obj, "last_onsite_loss", None)
         hopping_comp = getattr(loss_obj, "last_hopping_loss", None)

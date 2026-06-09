@@ -43,7 +43,7 @@ class Trainer(BaseTrainer):
             self.model,
             train_options.get("activation_recompute", None),
         )
-        self.optimizer = get_optimizer(model_param=self.model.parameters(), **train_options["optimizer"])
+        self.optimizer = get_optimizer(model_param=self.model.named_parameters(), **train_options["optimizer"])
         self.lr_scheduler = get_lr_scheduler(optimizer=self.optimizer, **train_options["lr_scheduler"])
         self.update_lr_per_iter = train_options["update_lr_per_iter"]
         self.common_options = common_options
@@ -175,6 +175,16 @@ class Trainer(BaseTrainer):
             "__num_nodes_list__": batch.__num_nodes_list__,
             "__data_class__": batch.__data_class__,
         }
+
+    @staticmethod
+    def _optimizer_diagnostics(optimizer):
+        if not hasattr(optimizer, "get_diagnostics"):
+            return {}
+        try:
+            return optimizer.get_diagnostics()
+        except Exception as exc:
+            log.debug("optimizer diagnostics collection failed: %s", exc)
+            return {}
 
     def _loss_on_batch(self, batch, lossfunc):
         batch = batch.to(self.device)
@@ -321,6 +331,7 @@ class Trainer(BaseTrainer):
             state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
         state.update(getattr(self, "_last_flow_state", {}))
+        state.update(self._optimizer_diagnostics(self.optimizer))
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1

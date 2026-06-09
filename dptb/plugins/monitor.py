@@ -1849,6 +1849,13 @@ class TensorBoardMonitor(Plugin):
             )
         return sorted(names)
 
+    def _write_epoch_stat(self, stat_name, tag, epoch, *, require_updated=False):
+        if stat_name not in self.trainer.stats:
+            return
+        if require_updated and not self._epoch_stat_updated(stat_name, epoch):
+            return
+        self.writer.add_scalar(tag, self._get_stat(stat_name, 'epoch_mean', 0.0), epoch)
+
     def epoch(self, **kwargs):
         epoch = kwargs.get("time", self.trainer.ep)
 
@@ -1889,54 +1896,20 @@ class TensorBoardMonitor(Plugin):
             if value is not None:
                 self.writer.add_scalar(f'{name}_mean/epoch', value, epoch)
 
-        if 'train_onsite_loss' in self.trainer.stats:
-            self.writer.add_scalar(
-                'train_onsite_loss_mean/epoch',
-                self._get_stat('train_onsite_loss', 'epoch_mean', 0.0),
-                epoch
-            )
-        if 'train_hopping_loss' in self.trainer.stats:
-            self.writer.add_scalar(
-                'train_hopping_loss_mean/epoch',
-                self._get_stat('train_hopping_loss', 'epoch_mean', 0.0),
-                epoch
-            )
-        if (
-            'validation_onsite_loss' in self.trainer.stats
-            and self._epoch_stat_updated('validation_onsite_loss', epoch)
-        ):
-            self.writer.add_scalar(
-                'validation_onsite_loss_mean/epoch',
-                self._get_stat('validation_onsite_loss', 'epoch_mean', 0.0),
-                epoch
-            )
-        if (
-            'validation_hopping_loss' in self.trainer.stats
-            and self._epoch_stat_updated('validation_hopping_loss', epoch)
-        ):
-            self.writer.add_scalar(
-                'validation_hopping_loss_mean/epoch',
-                self._get_stat('validation_hopping_loss', 'epoch_mean', 0.0),
-                epoch
-            )
-        if (
-            'test_onsite_loss' in self.trainer.stats
-            and self._epoch_stat_updated('test_onsite_loss', epoch)
-        ):
-            self.writer.add_scalar(
-                'test_onsite_loss_mean/epoch',
-                self._get_stat('test_onsite_loss', 'epoch_mean', 0.0),
-                epoch
-            )
-        if (
-            'test_hopping_loss' in self.trainer.stats
-            and self._epoch_stat_updated('test_hopping_loss', epoch)
-        ):
-            self.writer.add_scalar(
-                'test_hopping_loss_mean/epoch',
-                self._get_stat('test_hopping_loss', 'epoch_mean', 0.0),
-                epoch
-            )
+        self._write_epoch_stat('train_onsite_loss', 'train_onsite_loss_mean/epoch', epoch)
+        self._write_epoch_stat('train_hopping_loss', 'train_hopping_loss_mean/epoch', epoch)
+        self._write_epoch_stat(
+            'validation_onsite_loss', 'validation_onsite_loss_mean/epoch', epoch, require_updated=True
+        )
+        self._write_epoch_stat(
+            'validation_hopping_loss', 'validation_hopping_loss_mean/epoch', epoch, require_updated=True
+        )
+        self._write_epoch_stat(
+            'test_onsite_loss', 'test_onsite_loss_mean/epoch', epoch, require_updated=True
+        )
+        self._write_epoch_stat(
+            'test_hopping_loss', 'test_hopping_loss_mean/epoch', epoch, require_updated=True
+        )
         if 'mean_max_prob' in self.trainer.stats:
             self.writer.add_scalar(
                 'mean_max_prob_mean/epoch',

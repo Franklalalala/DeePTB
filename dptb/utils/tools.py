@@ -45,6 +45,40 @@ if TYPE_CHECKING:
     _PRECISION = Literal["default", "float16", "float32", "float64"]
 
 
+def _strip_named_optimizer_params(model_param):
+    def strip_one(item):
+        if (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and torch.is_tensor(item[1])
+        ):
+            return item[1]
+        return item
+
+    def strip_sequence(seq):
+        if torch.is_tensor(seq):
+            return seq
+        return [strip_one(item) for item in list(seq)]
+
+    if torch.is_tensor(model_param):
+        return model_param
+    if isinstance(model_param, dict):
+        group = dict(model_param)
+        group["params"] = strip_sequence(group["params"])
+        return [group]
+
+    items = list(model_param)
+    if all(isinstance(item, dict) for item in items):
+        groups = []
+        for item in items:
+            group = dict(item)
+            group["params"] = strip_sequence(group["params"])
+            groups.append(group)
+        return groups
+    return [strip_one(item) for item in items]
+
+
 def float2comlex(dtype):
     if isinstance(dtype, str):
         dtype =  getattr(torch, dtype)
@@ -136,16 +170,34 @@ def setup_seed(seed):
 
 def get_optimizer(type: str, model_param, lr: float, **options: dict):
     if type == 'Adam':
+        model_param = _strip_named_optimizer_params(model_param)
         optimizer = optim.Adam(params=model_param, lr=lr, **options)
     elif type == 'AdamW':
+        model_param = _strip_named_optimizer_params(model_param)
         optimizer = optim.AdamW(params=model_param, lr=lr, **options)
     elif type == 'HybridMuon':
         optimizer = HybridMuon(params=model_param, lr=lr, **options)
+        summary = optimizer.route_summary()
+        log.info(
+            "HybridMuon routes: params_muon=%s/%s, flat_1d_muon=%s, "
+            "numel_muon=%s/%s (%.2f%%), flat_numel=%s (%.2f%%)",
+            summary["params_muon"],
+            summary["params_total"],
+            summary["params_1d_muon"],
+            summary["numel_muon"],
+            summary["numel_total"],
+            100.0 * summary["numel_muon_ratio"],
+            summary["numel_flat_muon"],
+            100.0 * summary["numel_flat_muon_ratio"],
+        )
     elif type == 'SGD':
+        model_param = _strip_named_optimizer_params(model_param)
         optimizer = optim.SGD(params=model_param, lr=lr, **options)
     elif type == 'RMSprop':
+        model_param = _strip_named_optimizer_params(model_param)
         optimizer = optim.RMSprop(params=model_param, lr=lr, **options)
     elif type == 'LBFGS':
+        model_param = _strip_named_optimizer_params(model_param)
         optimizer = optim.LBFGS(params=model_param, lr=lr, **options)
     else:
         raise RuntimeError("Optimizer should be Adam/AdamW/HybridMuon/SGD/RMSprop, not {}".format(type))
