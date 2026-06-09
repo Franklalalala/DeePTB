@@ -692,10 +692,12 @@ def train_options():
 def test_options():
     doc_display_freq = "Frequency, or every how many iteration to display the training log to screem. Default: `1`"
     doc_batch_size = "The batch size used in testing, Default: 1"
+    doc_use_tensorboard = "Set true to write test loss and component loss scalars to TensorBoard. Default: `False`"
 
     args = [
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
         Argument("display_freq", int, optional=True, default=1, doc=doc_display_freq),
+        Argument("use_tensorboard", bool, optional=True, default=False, doc=doc_use_tensorboard),
         loss_options()
     ]
 
@@ -1080,6 +1082,9 @@ def data_options():
 def test_data_options():
 
     args = [
+        Argument("r_max", [float,int,None], optional=True, default=None, doc="r_max"),
+        Argument("oer_max", [float,int,None], optional=True, default=None, doc="oer_max"),
+        Argument("er_max", [float,int,None], optional=True, default=None, doc="er_max"),
         test_data_sub()
     ]
 
@@ -1659,6 +1664,7 @@ def loss_options():
     doc_train = "Loss options for training."
     doc_validation = "Loss options for validation."
     doc_reference = "Loss options for reference data in training."
+    doc_test = "Loss options for testing."
     doc_model_basis_name = "The basis used by the model for the calculation of fock matrix. Default: def2svp"
     doc_on_the_fly_ovp_flag = "Calculate overlap matrices on the fly. Default: True"
     doc_on_the_fly_solve_eigen = "Get eigen values on the fly. Default: True"
@@ -1789,6 +1795,7 @@ def loss_options():
         Argument("train", dict, optional=False, sub_fields=[], sub_variants=[loss_args], doc=doc_train),
         Argument("validation", dict, optional=True, sub_fields=[], sub_variants=[loss_args], doc=doc_validation),
         Argument("reference", dict, optional=True, sub_fields=[], sub_variants=[loss_args], doc=doc_reference),
+        Argument("test", dict, optional=True, sub_fields=[], sub_variants=[loss_args], doc=doc_test),
     ]
 
     doc_loss_options = ""
@@ -1873,7 +1880,11 @@ def normalize_test(data):
     da = test_data_options()
     to = test_options()
 
-    base = Argument("base", dict, [co, da, to, lo])
+    loss_opts = data.get("test_options", {}).get("loss_options", {})
+    if isinstance(loss_opts, dict) and "test" in loss_opts and "train" not in loss_opts:
+        loss_opts["train"] = loss_opts["test"]
+
+    base = Argument("base", dict, [co, da, to])
     data = base.normalize_value(data)
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
