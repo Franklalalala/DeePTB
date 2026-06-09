@@ -48,6 +48,7 @@ class Trainer(BaseTrainer):
         self.update_lr_per_iter = train_options["update_lr_per_iter"]
         self.common_options = common_options
         self.train_options = train_options
+        self.optimizer_diagnostics_freq = max(int(train_options.get("display_freq", 1)), 1)
 
         # ============================================================
         # [修改 1] 初始化 Clip 阈值
@@ -185,6 +186,10 @@ class Trainer(BaseTrainer):
         except Exception as exc:
             log.debug("optimizer diagnostics collection failed: %s", exc)
             return {}
+
+    def _optimizer_diagnostics_due(self):
+        frequency = max(int(getattr(self, "optimizer_diagnostics_freq", 1)), 1)
+        return self.iter == 1 or self.iter % frequency == 0
 
     def _loss_on_batch(self, batch, lossfunc):
         batch = batch.to(self.device)
@@ -331,7 +336,8 @@ class Trainer(BaseTrainer):
             state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
         state.update(getattr(self, "_last_flow_state", {}))
-        state.update(self._optimizer_diagnostics(self.optimizer))
+        if self._optimizer_diagnostics_due():
+            state.update(self._optimizer_diagnostics(self.optimizer))
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1

@@ -250,6 +250,23 @@ def test_hybrid_muon_keeps_norm_and_unfactorable_vectors_on_adamw():
     assert "exp_avg" in optimizer.state[prime_weight]
 
 
+def test_hybrid_muon_route_summary_refreshes_after_adding_param_group():
+    matrix = torch.nn.Parameter(torch.zeros(4, 4))
+    vector = torch.nn.Parameter(torch.zeros(4))
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[matrix],
+        lr=0.1,
+        weight_decay=0.0,
+    )
+
+    assert optimizer.route_counts == {"muon": 1, "adam": 0}
+
+    optimizer.add_param_group({"params": [vector]})
+
+    assert optimizer.route_counts == {"muon": 1, "adam": 1}
+
+
 def test_hybrid_muon_fixed_clip_caps_update_and_reports_diagnostics():
     param = torch.nn.Parameter(torch.zeros(4, 4))
     param.grad = torch.ones_like(param)
@@ -271,6 +288,55 @@ def test_hybrid_muon_fixed_clip_caps_update_and_reports_diagnostics():
     diagnostics = optimizer.get_diagnostics()
     assert diagnostics["muon_clip_events"] >= 1
     assert diagnostics["hybrid_muon_route_numel_muon"] == pytest.approx(16)
+
+
+def test_hybrid_muon_step_does_not_materialize_diagnostics(monkeypatch):
+    param = torch.nn.Parameter(torch.zeros(4, 4))
+    param.grad = torch.ones_like(param)
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[param],
+        lr=0.1,
+        weight_decay=0.0,
+        muon_beta=0.0,
+        magma_lite=False,
+    )
+
+    def fail_on_item(_tensor):
+        raise AssertionError("optimizer.step() must not synchronize diagnostics with Tensor.item()")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_on_item)
+
+    optimizer.step()
+
+
+def test_hybrid_muon_diagnostics_accumulate_until_materialized():
+    param = torch.nn.Parameter(torch.zeros(4, 4))
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[param],
+        lr=1.0,
+        weight_decay=0.0,
+        muon_beta=0.0,
+        muon_scale=10.0,
+        magma_lite=False,
+        muon_clip_mode="fixed",
+        muon_clip_rms=0.25,
+    )
+
+    for _ in range(3):
+        param.grad = torch.ones_like(param)
+        optimizer.step()
+
+    diagnostics = optimizer.get_diagnostics()
+    assert diagnostics["muon_blocks"] == pytest.approx(3)
+    assert diagnostics["muon_clip_events"] == pytest.approx(3)
+    assert optimizer.get_diagnostics() == diagnostics
+
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+
+    assert optimizer.get_diagnostics()["muon_blocks"] == pytest.approx(1)
 
 
 def test_hybrid_muon_fills_new_group_defaults_for_old_checkpoint_state():
@@ -312,6 +378,7 @@ def test_train_options_accepts_hybrid_muon_optimizer_and_wsd_scheduler():
     assert normalized["optimizer"]["muon_1d_route_mode"] == "auto"
     assert normalized["optimizer"]["muon_1d_allow_degenerate_matrix"] is False
     assert normalized["optimizer"]["muon_clip_mode"] == "auto"
+    assert normalized["optimizer"]["muon_clip_rms"] == pytest.approx(0.6)
     assert normalized["optimizer"]["muon_clip_max_ratio"] == pytest.approx(0.25)
     assert normalized["lr_scheduler"]["type"] == "wsd"
     assert normalized["lr_scheduler"]["decay_type"] == "cosine"

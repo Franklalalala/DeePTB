@@ -742,7 +742,7 @@ def HybridMuon():
     doc_muon_force_patterns = "Optional name patterns that force eligible 1D tensors through Muon."
     doc_muon_clip = "Enable Muon update clipping. Default: True"
     doc_muon_clip_mode = "Muon clip mode: auto/fixed/rms/off. Default: auto"
-    doc_muon_clip_rms = "Hard cap for scaled Muon update RMS. Default: 0.4"
+    doc_muon_clip_rms = "Hard cap for scaled Muon update RMS. Default: 0.6"
     doc_muon_clip_auto_beta = "EMA beta for automatic relative-step clipping. Default: 0.98"
     doc_muon_clip_auto_mult = "EMA multiplier for automatic relative-step clipping. Default: 3.0"
     doc_muon_clip_auto_std_mult = "Standard-deviation multiplier for automatic clipping. Default: 2.0"
@@ -772,7 +772,7 @@ def HybridMuon():
         Argument("muon_force_name_patterns", list, optional=True, default=[], doc=doc_muon_force_patterns),
         Argument("muon_clip", bool, optional=True, default=True, doc=doc_muon_clip),
         Argument("muon_clip_mode", str, optional=True, default="auto", doc=doc_muon_clip_mode),
-        Argument("muon_clip_rms", float, optional=True, default=0.4, doc=doc_muon_clip_rms),
+        Argument("muon_clip_rms", float, optional=True, default=0.6, doc=doc_muon_clip_rms),
         Argument("muon_clip_auto_beta", float, optional=True, default=0.98, doc=doc_muon_clip_auto_beta),
         Argument("muon_clip_auto_mult", float, optional=True, default=3.0, doc=doc_muon_clip_auto_mult),
         Argument("muon_clip_auto_std_mult", float, optional=True, default=2.0, doc=doc_muon_clip_auto_std_mult),

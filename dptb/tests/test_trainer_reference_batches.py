@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -100,6 +102,7 @@ def _fake_trainer(monkeypatch):
     trainer.update_lr_per_iter = False
     trainer.iter = 5
     trainer.stats = {"train_loss": {"latest_avg_iter_loss": torch.tensor(0.0)}}
+    trainer.flow_cfm = SimpleNamespace(enabled=False)
     trainer.train_lossfunc = RecordingLoss("train", events, model)
     trainer.reference_lossfunc = RecordingLoss("reference", events, model)
     trainer.call_plugins = (
@@ -108,6 +111,18 @@ def _fake_trainer(monkeypatch):
         )
     )
     return trainer, events, observed_states
+
+
+def test_optimizer_diagnostics_follow_display_frequency():
+    trainer = Trainer.__new__(Trainer)
+    trainer.optimizer_diagnostics_freq = 100
+
+    trainer.iter = 1
+    assert trainer._optimizer_diagnostics_due()
+    trainer.iter = 99
+    assert not trainer._optimizer_diagnostics_due()
+    trainer.iter = 100
+    assert trainer._optimizer_diagnostics_due()
 
 
 def test_iteration_uses_reference_loss_and_backwards_train_before_reference(monkeypatch):

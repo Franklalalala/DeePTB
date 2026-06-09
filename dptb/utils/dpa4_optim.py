@@ -8,6 +8,7 @@ from torch.optim import Optimizer
 
 NumberOrList = Union[float, Sequence[float]]
 NamedParamMap = Dict[int, str]
+ClipStatTensors = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 def _is_named_parameter(item) -> bool:
@@ -261,6 +262,13 @@ class HybridMuon(Optimizer):
 
     _FAST_COEFF = (3.4445, -4.7750, 2.0315)
     _POLISH_COEFF = (2.0, -1.5, 0.5)
+    _STAT_BLOCKS = 0
+    _STAT_CLIP_EVENTS = 1
+    _STAT_CLIP_MIN_SCALE = 2
+    _STAT_UPDATE_RMS_MAX = 3
+    _STAT_UPDATE_RMS_SUM = 4
+    _STAT_UPDATE_RMS_COUNT = 5
+    _STAT_STEP_RATIO_MAX = 6
     _DEFAULT_1D_INCLUDE_PATTERNS = ("*weight*", "*tensor_product*")
     _DEFAULT_1D_EXCLUDE_PATTERNS = (
         "*bias*",
@@ -299,7 +307,7 @@ class HybridMuon(Optimizer):
         muon_force_name_patterns: Optional[Sequence[str]] = None,
         muon_clip: bool = True,
         muon_clip_mode: str = "auto",
-        muon_clip_rms: float = 0.4,
+        muon_clip_rms: float = 0.6,
         muon_clip_auto_beta: float = 0.98,
         muon_clip_auto_mult: float = 3.0,
         muon_clip_auto_std_mult: float = 2.0,
@@ -401,7 +409,19 @@ class HybridMuon(Optimizer):
         )
         params, self._param_names = _normalize_named_parameters(params)
         super().__init__(params, defaults)
-        self._last_step_stats: Dict[str, float] = {}
+        self._last_step_stat_tensors: List[ClipStatTensors] = []
+        self._pending_diagnostics_tensor: Optional[torch.Tensor] = None
+        self._last_step_diagnostics_cache: Optional[Dict[str, float]] = None
+        self._route_summary_cache: Optional[Dict[str, Union[int, float]]] = None
+
+    def add_param_group(self, param_group) -> None:
+        super().add_param_group(param_group)
+        self._route_summary_cache = None
+
+    def load_state_dict(self, state_dict):
+        result = super().load_state_dict(state_dict)
+        self._route_summary_cache = None
+        return result
 
     def _ensure_group_defaults(self, group) -> None:
         """Fill new options when loading checkpoints written by older versions."""
@@ -476,7 +496,7 @@ class HybridMuon(Optimizer):
     def _effective_shape_for_param(self, param: torch.Tensor, group) -> List[int]:
         return self._flat_1d_matrix_shape(param, group) or self._effective_shape(param)
 
-    def route_summary(self) -> Dict[str, Union[int, float]]:
+    def _compute_route_summary(self) -> Dict[str, Union[int, float]]:
         counts = {"muon": 0, "adam": 0}
         numels = {"muon": 0, "adam": 0, "flat_muon": 0, "total": 0}
         one_d_muon = 0
@@ -505,6 +525,11 @@ class HybridMuon(Optimizer):
             "numel_muon_ratio": numels["muon"] / total_numel,
             "numel_flat_muon_ratio": numels["flat_muon"] / total_numel,
         }
+
+    def route_summary(self) -> Dict[str, Union[int, float]]:
+        if self._route_summary_cache is None:
+            self._route_summary_cache = self._compute_route_summary()
+        return dict(self._route_summary_cache)
 
     @property
     def route_counts(self) -> Dict[str, int]:
@@ -540,35 +565,81 @@ class HybridMuon(Optimizer):
         return x.reshape(original_shape).to(dtype=update.dtype)
 
     def _reset_step_stats(self) -> None:
-        self._last_step_stats = {
-            "muon_blocks": 0.0,
-            "muon_clip_events": 0.0,
-            "muon_clip_min_scale": 1.0,
-            "muon_update_rms_max": 0.0,
-            "muon_update_rms_sum": 0.0,
-            "muon_update_rms_count": 0.0,
-            "muon_step_ratio_max": 0.0,
-        }
+        if self._last_step_diagnostics_cache is not None:
+            self._pending_diagnostics_tensor = None
+        self._last_step_stat_tensors = []
+        self._last_step_diagnostics_cache = None
 
     def get_diagnostics(self) -> Dict[str, float]:
-        count = self._last_step_stats.get("muon_update_rms_count", 0.0)
-        diagnostics = {
-            key: float(value)
-            for key, value in self._last_step_stats.items()
-            if key not in {"muon_update_rms_sum", "muon_update_rms_count"}
-        }
-        diagnostics["muon_update_rms_mean"] = (
-            float(self._last_step_stats.get("muon_update_rms_sum", 0.0)) / count
-            if count
-            else 0.0
-        )
-        diagnostics.update(
-            {
-                f"hybrid_muon_route_{key}": float(value)
-                for key, value in self.route_summary().items()
+        if self._last_step_diagnostics_cache is None:
+            diagnostics = self._materialize_step_diagnostics()
+            diagnostics.update(
+                {
+                    f"hybrid_muon_route_{key}": float(value)
+                    for key, value in self.route_summary().items()
+                }
+            )
+            self._last_step_diagnostics_cache = diagnostics
+        return dict(self._last_step_diagnostics_cache)
+
+    def _materialize_step_diagnostics(self) -> Dict[str, float]:
+        if self._pending_diagnostics_tensor is None:
+            return {
+                "muon_blocks": 0.0,
+                "muon_clip_events": 0.0,
+                "muon_clip_min_scale": 1.0,
+                "muon_update_rms_max": 0.0,
+                "muon_update_rms_mean": 0.0,
+                "muon_step_ratio_max": 0.0,
             }
+
+        materialized = self._pending_diagnostics_tensor.tolist()
+        count = materialized[self._STAT_UPDATE_RMS_COUNT]
+        mean_rms = materialized[self._STAT_UPDATE_RMS_SUM] / count if count else 0.0
+        return {
+            "muon_blocks": float(materialized[self._STAT_BLOCKS]),
+            "muon_clip_events": float(materialized[self._STAT_CLIP_EVENTS]),
+            "muon_clip_min_scale": float(materialized[self._STAT_CLIP_MIN_SCALE]),
+            "muon_update_rms_max": float(materialized[self._STAT_UPDATE_RMS_MAX]),
+            "muon_update_rms_mean": float(mean_rms),
+            "muon_step_ratio_max": float(materialized[self._STAT_STEP_RATIO_MAX]),
+        }
+
+    def _finalize_step_stats(self) -> None:
+        if not self._last_step_stat_tensors:
+            return
+
+        rms = torch.cat([values[0] for values in self._last_step_stat_tensors])
+        clip_scale = torch.cat([values[1] for values in self._last_step_stat_tensors])
+        step_ratio = torch.cat([values[2] for values in self._last_step_stat_tensors])
+        count = rms.new_tensor(float(rms.numel()))
+        current = torch.stack(
+            [
+                count,
+                (clip_scale < 0.999999).sum().to(rms.dtype),
+                clip_scale.min(),
+                rms.max(),
+                rms.sum(),
+                count,
+                step_ratio.max(),
+            ]
         )
-        return diagnostics
+        if self._pending_diagnostics_tensor is None:
+            self._pending_diagnostics_tensor = current
+        else:
+            pending = self._pending_diagnostics_tensor
+            self._pending_diagnostics_tensor = torch.stack(
+                [
+                    pending[self._STAT_BLOCKS] + current[self._STAT_BLOCKS],
+                    pending[self._STAT_CLIP_EVENTS] + current[self._STAT_CLIP_EVENTS],
+                    torch.minimum(pending[self._STAT_CLIP_MIN_SCALE], current[self._STAT_CLIP_MIN_SCALE]),
+                    torch.maximum(pending[self._STAT_UPDATE_RMS_MAX], current[self._STAT_UPDATE_RMS_MAX]),
+                    pending[self._STAT_UPDATE_RMS_SUM] + current[self._STAT_UPDATE_RMS_SUM],
+                    pending[self._STAT_UPDATE_RMS_COUNT] + current[self._STAT_UPDATE_RMS_COUNT],
+                    torch.maximum(pending[self._STAT_STEP_RATIO_MAX], current[self._STAT_STEP_RATIO_MAX]),
+                ]
+            )
+        self._last_step_stat_tensors = []
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -593,6 +664,7 @@ class HybridMuon(Optimizer):
                 else:
                     self._adamw_step(param, grad, group, lr, weight_decay)
 
+        self._finalize_step_stats()
         return loss
 
     def _muon_step(self, param, grad, group, lr, weight_decay):
@@ -693,21 +765,12 @@ class HybridMuon(Optimizer):
         return (update.reshape(effective_shape) * scale_view).reshape(param.shape)
 
     def _accumulate_clip_stats(self, rms, clip_scale, step_ratio) -> None:
-        self._last_step_stats["muon_blocks"] += float(rms.numel())
-        self._last_step_stats["muon_clip_events"] += float((clip_scale < 0.999999).sum().item())
-        self._last_step_stats["muon_clip_min_scale"] = min(
-            self._last_step_stats["muon_clip_min_scale"],
-            float(clip_scale.min().item()),
-        )
-        self._last_step_stats["muon_update_rms_max"] = max(
-            self._last_step_stats["muon_update_rms_max"],
-            float(rms.max().item()),
-        )
-        self._last_step_stats["muon_update_rms_sum"] += float(rms.sum().item())
-        self._last_step_stats["muon_update_rms_count"] += float(rms.numel())
-        self._last_step_stats["muon_step_ratio_max"] = max(
-            self._last_step_stats["muon_step_ratio_max"],
-            float(step_ratio.max().item()),
+        self._last_step_stat_tensors.append(
+            (
+                rms.detach().reshape(-1),
+                clip_scale.detach().reshape(-1),
+                step_ratio.detach().reshape(-1),
+            )
         )
 
     def _adamw_step(self, param, grad, group, lr, weight_decay):

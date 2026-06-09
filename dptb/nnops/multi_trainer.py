@@ -3047,7 +3047,8 @@ class MultiTrainer(Trainer):
                     state["mean_max_prob"] = sum(z_metric_values) / len(z_metric_values)
                 state.update(dynamic_batch_state)
 
-                self._add_optimizer_diagnostics_to_state(state)
+                if self._optimizer_diagnostics_due():
+                    self._add_optimizer_diagnostics_to_state(state)
                 self._add_cuda_memory_state(state, self._gather_cuda_memory_metrics())
 
                 with self._tagger.tag("iteration/call_plugins", it=self.iter):
