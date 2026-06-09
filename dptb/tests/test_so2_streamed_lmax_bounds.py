@@ -1,4 +1,34 @@
 import pytest
+from pathlib import Path
+
+
+def test_so2_streamed_grouped_source_has_flash_aggregate_and_direct_fallback():
+    source = Path(__file__).parents[1] / "nn" / "tensor_product_moe_v3.py"
+    text = source.read_text(encoding="utf-8")
+    start = text.index("    def _forward_streamed_m_major_grouped(")
+    end = text.index("\n\nclass SO2_m_Linear", start)
+    body = text[start:end]
+
+    assert "DPTB_SO2_FLASH_AGGREGATE" in text
+    assert "so2_flash_aggregate_mode" in text
+    assert "hybrid_output_l" in body
+    assert "rotate_input_once" in body
+    assert "aggregate_output_once" in body
+    assert "_rotate_input_l_groups_once" in body
+    assert "_accumulate_direct_m0_output_" in body
+
+
+def test_so2_single_entry_l_group_stays_view():
+    torch = pytest.importorskip("torch")
+    from dptb.nn.tensor_product_moe_v3 import _build_so2_layout_plans, _gather_so2_l_group
+    from e3nn import o3
+
+    _, plans = _build_so2_layout_plans(o3.Irreps("2x1e"))
+    x = torch.randn(5, 6)
+    group = _gather_so2_l_group(x, plans[1])
+
+    assert group.shape == (5, 2, 3)
+    assert group.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
 
 
 @pytest.mark.parametrize("wigner_apply_mode", ["compact_blocks", "full_dense"])
@@ -104,6 +134,152 @@ def test_so2_radial_requires_latents(so2_fusion_mode):
 
     with pytest.raises(ValueError, match="latents"):
         layer(x, R, None, latents=None)
+
+
+def test_so2_streamed_grouped_direct_fallback_avoids_output_group_buffer(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    monkeypatch.setenv("DPTB_SO2_FLASH_AGGREGATE", "0")
+    torch.manual_seed(20260425)
+    dtype = torch.float64
+    kwargs = dict(
+        irreps_in="1x0e + 1x1o + 1x2e",
+        irreps_out="1x0e + 1x1o + 1x2e",
+        radial_emb=False,
+        num_experts=3,
+        num_shared_experts=1,
+        rotate_in=False,
+        rotate_out=False,
+        wigner_apply_mode="compact_blocks",
+    )
+    staged = SO2_Linear(**kwargs, so2_fusion_mode="staged").to(dtype=dtype)
+    streamed = SO2_Linear(**kwargs, so2_fusion_mode="streamed_m_major_cueq").to(dtype=dtype)
+    streamed.load_state_dict(staged.state_dict(), strict=True)
+
+    def fail_output_group_alloc(*_args, **_kwargs):
+        raise AssertionError("grouped streamed route should write directly to final output")
+
+    monkeypatch.setattr(streamed, "_alloc_output_l_groups", fail_output_group_alloc)
+
+    x = torch.randn(6, staged.irreps_in.dim, dtype=dtype, requires_grad=True)
+    r = torch.randn(6, 3, dtype=dtype)
+    coeffs = torch.tensor([[0.1, 0.2, 0.7], [0.3, 0.3, 0.4]], dtype=dtype)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=(2, 4))
+
+    out0, _ = staged(x, r, globals_)
+    out1, _ = streamed(x, r, globals_)
+
+    torch.testing.assert_close(out1, out0, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.parametrize("flash_mode", ["input", "output", "1", "hybrid"])
+@pytest.mark.parametrize(
+    "rotate_in, rotate_out",
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_so2_streamed_grouped_flash_aggregate_matches_direct_forward_and_grad(
+        monkeypatch,
+        flash_mode,
+        rotate_in,
+        rotate_out,
+):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260425)
+    dtype = torch.float64
+    kwargs = dict(
+        irreps_in="2x0e + 2x1o + 1x2e",
+        irreps_out="2x0e + 2x1o + 1x2e",
+        radial_emb=False,
+        num_experts=3,
+        num_shared_experts=1,
+        rotate_in=rotate_in,
+        rotate_out=rotate_out,
+        wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="streamed_m_major_cueq",
+        mole_linear_mode="indexed_ref",
+    )
+    monkeypatch.setenv("DPTB_SO2_FLASH_AGGREGATE", "0")
+    direct = SO2_Linear(**kwargs).to(dtype=dtype)
+    monkeypatch.setenv("DPTB_SO2_FLASH_AGGREGATE", flash_mode)
+    flash = SO2_Linear(**kwargs).to(dtype=dtype)
+    flash.load_state_dict(direct.state_dict(), strict=True)
+
+    n_rows = 9
+    split_sizes = (4, 5)
+    x0 = torch.randn(n_rows, direct.irreps_in.dim, dtype=dtype)
+    r = torch.randn(n_rows, 3, dtype=dtype)
+    coeff0 = torch.softmax(torch.randn(len(split_sizes), 3, dtype=dtype), dim=-1)
+
+    x_direct = x0.detach().clone().requires_grad_(True)
+    x_flash = x0.detach().clone().requires_grad_(True)
+    coeff_direct = coeff0.detach().clone().requires_grad_(True)
+    coeff_flash = coeff0.detach().clone().requires_grad_(True)
+
+    out_direct, _ = direct(x_direct, r, MOLEGlobals(coefficients=coeff_direct, split_sizes=split_sizes))
+    out_flash, _ = flash(x_flash, r, MOLEGlobals(coefficients=coeff_flash, split_sizes=split_sizes))
+    torch.testing.assert_close(out_flash, out_direct, atol=1e-10, rtol=1e-10)
+
+    grad = torch.randn_like(out_direct)
+    out_direct.backward(grad)
+    out_flash.backward(grad)
+
+    torch.testing.assert_close(x_flash.grad, x_direct.grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(coeff_flash.grad, coeff_direct.grad, atol=1e-10, rtol=1e-10)
+    for (_, direct_param), (_, flash_param) in zip(direct.named_parameters(), flash.named_parameters()):
+        if direct_param.grad is None and flash_param.grad is None:
+            continue
+        assert direct_param.grad is not None
+        assert flash_param.grad is not None
+        torch.testing.assert_close(flash_param.grad, direct_param.grad, atol=1e-10, rtol=1e-10)
+
+
+def test_so2_streamed_grouped_no_rotation_external_wigner_keeps_direct_output(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    monkeypatch.setenv("DPTB_SO2_FLASH_AGGREGATE", "1")
+    torch.manual_seed(20260425)
+    dtype = torch.float64
+    kwargs = dict(
+        irreps_in="1x0e + 1x1o + 1x2e",
+        irreps_out="1x0e + 1x1o + 1x2e",
+        radial_emb=False,
+        num_experts=3,
+        num_shared_experts=1,
+        rotate_in=False,
+        rotate_out=False,
+        wigner_apply_mode="compact_blocks",
+    )
+    staged = SO2_Linear(**kwargs, so2_fusion_mode="staged").to(dtype=dtype)
+    streamed = SO2_Linear(**kwargs, so2_fusion_mode="streamed_m_major_cueq").to(dtype=dtype)
+    streamed.load_state_dict(staged.state_dict(), strict=True)
+
+    fake_blocks = {
+        l: torch.eye(2 * l + 1, dtype=dtype).expand(4, -1, -1).clone()
+        for l in range(1, streamed.l_max + 1)
+    }
+    monkeypatch.setattr(streamed, "_make_wigner_block_cache", lambda _wigner: fake_blocks)
+
+    def fail_output_group_alloc(*_args, **_kwargs):
+        raise AssertionError("no-rotation route should stay on direct-output even with external Wigner blocks")
+
+    monkeypatch.setattr(streamed, "_alloc_output_l_groups", fail_output_group_alloc)
+
+    x = torch.randn(4, staged.irreps_in.dim, dtype=dtype)
+    r = torch.randn(4, 3, dtype=dtype)
+    coeffs = torch.tensor([[0.1, 0.2, 0.7], [0.3, 0.3, 0.4]], dtype=dtype)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=(2, 2))
+
+    out0, _ = staged(x, r, globals_, wigner_D_all=torch.empty(0))
+    out1, _ = streamed(x, r, globals_, wigner_D_all=torch.empty(0))
+
+    torch.testing.assert_close(out1, out0, atol=1e-10, rtol=1e-10)
 
 
 def test_so2_rejects_too_small_external_wigner_dense():
