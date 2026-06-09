@@ -20,6 +20,7 @@ def test_tensor_product_source_exposes_compact_wigner_dual_path():
     assert "def batch_wigner_D_blocks" in source
     assert "wigner_apply_mode" in source
     assert "so2_fusion_mode" in source
+    assert '"flash_tp"' in source
     assert '"streamed_m_major_ref"' in source
     assert '"full_dense"' in source
     assert '"compact_blocks"' in source
@@ -39,12 +40,13 @@ def test_compact_wigner_config_is_threaded_to_lem():
     argcheck_source = ARGCHECK_SOURCE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     assert 'so2_wigner_apply_mode: str = "compact_blocks"' in lem_source
-    assert 'so2_fusion_mode: str = "staged"' in lem_source
+    assert 'so2_fusion_mode: str = "flash_tp"' in lem_source
     assert "wigner_apply_mode=so2_wigner_apply_mode" in lem_source
     assert "so2_fusion_mode=so2_fusion_mode" in lem_source
     assert 'Argument("so2_wigner_apply_mode", str' in argcheck_source
     assert 'Argument("so2_fusion_mode", str' in argcheck_source
     assert 'default="compact_blocks"' in argcheck_source
+    assert 'default="flash_tp"' in argcheck_source
 
 
 def test_compact_wigner_blocks_match_full_dense_slices():
@@ -79,6 +81,49 @@ def test_so2_linear_default_mode_is_compact_blocks():
     layer = SO2_Linear("1x0e + 1x1e", "1x0e + 1x1e")
 
     assert layer.wigner_apply_mode == "compact_blocks"
+    assert layer.so2_fusion_mode == "flash_tp"
+
+
+def test_flash_tp_mode_builds_direct_tensorproduct_replacement():
+    pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import SO2_Linear
+
+    layer = SO2_Linear("32x0e + 32x1o", "32x0e + 32x1o", latent_dim=8, radial_channels=[16])
+
+    assert layer.so2_fusion_mode == "flash_tp"
+    assert hasattr(layer, "flash_tp_ref")
+    assert hasattr(layer, "flash_tp_weight_net")
+    assert hasattr(layer, "flash_tp_out_project")
+    assert not hasattr(layer, "fc_m0")
+    assert layer.flash_tp_ref.weight_numel > 0
+
+
+def test_flash_tp_cpu_fallback_forward_and_grad():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import SO2_Linear
+
+    torch.manual_seed(20260425)
+    layer = SO2_Linear(
+        "32x0e + 32x1o",
+        "32x0e + 32x1o",
+        latent_dim=8,
+        radial_channels=[16],
+        so2_fusion_mode="flash_tp",
+    )
+    x = torch.randn(4, layer.irreps_in.dim, requires_grad=True)
+    R = torch.randn(4, 3)
+    latents = torch.randn(4, 8, requires_grad=True)
+
+    out, wigner = layer(x, R, None, latents)
+
+    assert wigner is None
+    assert out.shape == (4, layer.irreps_out.dim)
+    assert torch.isfinite(out).all()
+    out.square().mean().backward()
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(latents.grad).all()
 
 
 def test_so2_linear_compact_mode_matches_full_dense_forward_and_grad():
@@ -94,6 +139,7 @@ def test_so2_linear_compact_mode_matches_full_dense_forward_and_grad():
         num_experts=3,
         num_shared_experts=1,
         wigner_apply_mode="full_dense",
+        so2_fusion_mode="staged",
     )
     compact_layer = SO2_Linear(
         irreps,
@@ -101,6 +147,7 @@ def test_so2_linear_compact_mode_matches_full_dense_forward_and_grad():
         num_experts=3,
         num_shared_experts=1,
         wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="staged",
     )
     compact_layer.load_state_dict(dense_layer.state_dict())
 
