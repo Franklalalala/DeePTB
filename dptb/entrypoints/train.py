@@ -567,9 +567,7 @@ def train(
                     f"validation_compatible_euler_{int(num_steps)}_hopping_loss",
                 ])
         log_field.extend(flow_log_fields)
-        flow_scalar_fields = [
-            name for name in flow_log_fields if not name.startswith("validation_")
-        ]
+        flow_scalar_fields = list(flow_log_fields)
     if validation_datasets:
         validation_intervals = []
         validation_freq = int(jdata["train_options"].get("validation_freq", 10) or 0)
@@ -599,6 +597,15 @@ def train(
                     interval=[(1, 'iteration'), (1, 'epoch')],
                 )
             )
+    if validation_datasets:
+        for validation_stat_name in ("validation_onsite_loss", "validation_hopping_loss"):
+            if validation_stat_name not in flow_scalar_fields:
+                trainer.register_plugin(
+                    ScalarFieldMonitor(
+                        stat_name=validation_stat_name,
+                        interval=[(1, 'iteration'), (1, 'epoch')],
+                    )
+                )
 ##############################
     trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))

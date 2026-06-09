@@ -570,6 +570,9 @@ def _multi_train_impl(
         trainer.register_plugin(ExpertLoadCVMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ScalarFieldMonitor(stat_name="train_loss_opt", interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
+        if validation_datasets:
+            trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_onsite_loss", interval=[(1, 'iteration'), (1, 'epoch')]))
+            trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_hopping_loss", interval=[(1, 'iteration'), (1, 'epoch')]))
 
         for i in range(trainer.num_experts):
             trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_onsite", interval=[(1, 'iteration'), (1, 'epoch')]))
