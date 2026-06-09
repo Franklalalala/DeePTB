@@ -198,6 +198,8 @@ def flow_options():
         Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
         Argument("component_reduction", str, optional=True, default="global_elements"),
         Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
+        Argument("log_compatible_loss", bool, optional=True, default=True),
+        Argument("compatible_loss_to_legacy_keys", bool, optional=True, default=True),
         Argument("overwrite_feature_keys", bool, optional=True, default=True),
         Argument("detach_interpolated_h0", bool, optional=True, default=True),
         Argument("warn_missing_h0", bool, optional=True, default=True),

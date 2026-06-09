@@ -536,6 +536,7 @@ def train(
     flow_enabled = bool(train_options.get("flow_options", {}).get("enabled", False))
     flow_log_fields = []
     if flow_enabled:
+        flow_options = train_options.get("flow_options", {})
         flow_log_fields.extend([
             "train_flow_loss",
             "train_flow_onsite_loss",
@@ -545,8 +546,20 @@ def train(
             "validation_flow_random_t_loss",
             "validation_flow_t0_loss",
         ])
-        for num_steps in train_options.get("flow_options", {}).get("validation_ode_steps", [1, 3]):
+        for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
             flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
+        if flow_options.get("log_compatible_loss", True):
+            flow_log_fields.extend([
+                "validation_compatible_t0_loss",
+                "validation_compatible_t0_onsite_loss",
+                "validation_compatible_t0_hopping_loss",
+            ])
+            for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
+                flow_log_fields.extend([
+                    f"validation_compatible_euler_{int(num_steps)}_loss",
+                    f"validation_compatible_euler_{int(num_steps)}_onsite_loss",
+                    f"validation_compatible_euler_{int(num_steps)}_hopping_loss",
+                ])
         log_field.extend(flow_log_fields)
     if validation_datasets:
         trainer.register_plugin(Validationer(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')], fast_mode=jdata["train_options"]["valid_fast"]))

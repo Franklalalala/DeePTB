@@ -169,6 +169,18 @@ class Trainer(BaseTrainer):
             batch.update(batch_info)
             batch_for_loss.update(batch_info)
             loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
+            if self.flow_cfm.log_compatible_loss:
+                flow_state.update(
+                    self._compatible_loss_state(
+                        lossfunc,
+                        batch,
+                        batch_for_loss,
+                        prefix="train_compatible",
+                        legacy_prefix=(
+                            "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
+                        ),
+                    )
+                )
             self._last_flow_state = flow_state
             return loss
         self._last_flow_state = {}
@@ -177,7 +189,8 @@ class Trainer(BaseTrainer):
         batch_for_loss.update(batch_info)
         return lossfunc(batch, batch_for_loss)
 
-    def _loss_component_state(self, lossfunc, *, prefix="train"):
+    @staticmethod
+    def _loss_component_state(lossfunc, *, prefix="train"):
         loss_obj = lossfunc
         for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
             inner = getattr(loss_obj, attr, None)
@@ -200,6 +213,34 @@ class Trainer(BaseTrainer):
         if z_loss_comp is not None:
             state["mean_max_prob" if prefix == "train" else f"{prefix}_mean_max_prob"] = z_loss_comp
         return state
+
+    @staticmethod
+    def _compatible_loss_state(lossfunc, pred_data, ref_data, *, prefix, legacy_prefix=None):
+        with torch.no_grad():
+            compatible_loss = lossfunc(pred_data, ref_data)
+
+        state = {
+            f"{prefix}_loss": compatible_loss.detach()
+            if torch.is_tensor(compatible_loss)
+            else torch.as_tensor(compatible_loss)
+        }
+        state.update(Trainer._loss_component_state(lossfunc, prefix=prefix))
+
+        if legacy_prefix is not None:
+            onsite_key = f"{prefix}_onsite_loss"
+            hopping_key = f"{prefix}_hopping_loss"
+            if onsite_key in state:
+                state[f"{legacy_prefix}_onsite_loss"] = state[onsite_key]
+            if hopping_key in state:
+                state[f"{legacy_prefix}_hopping_loss"] = state[hopping_key]
+        return state
+
+    @staticmethod
+    def _accumulate_metric_state(metric_sums, state):
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                value = value.detach()
+            metric_sums[key] = metric_sums.get(key, 0.0) + value
 
     def iteration(self, batch, ref_batch=None):
         '''
@@ -358,6 +399,16 @@ class Trainer(BaseTrainer):
                     flow_metric_sums["validation_flow_t0_loss"] = (
                         flow_metric_sums.get("validation_flow_t0_loss", 0.0) + t0_loss.detach()
                     )
+                    if self.flow_cfm.log_compatible_loss:
+                        self._accumulate_metric_state(
+                            flow_metric_sums,
+                            self._compatible_loss_state(
+                                self.validation_lossfunc,
+                                t0_pred,
+                                t0_ref,
+                                prefix="validation_compatible_t0",
+                            ),
+                        )
                     for num_steps in self.flow_cfm.validation_ode_steps:
                         sampled = self.flow_cfm.sample(
                             self.model, original_batch, num_steps=num_steps
@@ -367,6 +418,16 @@ class Trainer(BaseTrainer):
                         flow_metric_sums[key] = (
                             flow_metric_sums.get(key, 0.0) + sample_loss.detach()
                         )
+                        if self.flow_cfm.log_compatible_loss:
+                            self._accumulate_metric_state(
+                                flow_metric_sums,
+                                self._compatible_loss_state(
+                                    self.validation_lossfunc,
+                                    sampled,
+                                    t0_ref,
+                                    prefix=f"validation_compatible_euler_{num_steps}",
+                                ),
+                            )
                 else:
                     batch = self.model(batch)
                     batch.update(batch_info)

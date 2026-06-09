@@ -114,6 +114,10 @@ class HamiltonianCFM:
         self.validation_ode_steps = tuple(
             sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
         )
+        self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
+        self.compatible_loss_to_legacy_keys = bool(
+            options.get("compatible_loss_to_legacy_keys", True)
+        )
 
         # Loss and regularization.
         self.loss_type = str(options.get("loss_type", "mse")).lower()
@@ -442,7 +446,6 @@ class HamiltonianCFM:
             total_numerator = self.node_weight * node_numerator
             total_count = self.node_weight * node_count
             state["train_flow_onsite_loss"] = node_loss.detach()
-            state["train_onsite_loss"] = node_loss.detach()
 
         edge_loss = None
         if ctx.edge_target is not None and self.edge_target_key in pred_data:
@@ -461,7 +464,6 @@ class HamiltonianCFM:
                 total_numerator = total_numerator + self.edge_weight * edge_numerator
                 total_count = total_count + self.edge_weight * edge_count
             state["train_flow_hopping_loss"] = edge_loss.detach()
-            state["train_hopping_loss"] = edge_loss.detach()
 
         if total is None:
             raise KeyError(
