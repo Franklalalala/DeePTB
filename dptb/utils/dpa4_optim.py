@@ -420,6 +420,10 @@ class HybridMuon(Optimizer):
 
     def load_state_dict(self, state_dict):
         result = super().load_state_dict(state_dict)
+        for state in self.state.values():
+            step = state.get("step")
+            if torch.is_tensor(step):
+                state["step"] = int(step.item())
         self._route_summary_cache = None
         return result
 
@@ -776,7 +780,7 @@ class HybridMuon(Optimizer):
     def _adamw_step(self, param, grad, group, lr, weight_decay):
         state = self.state[param]
         if len(state) == 0:
-            state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
+            state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
             state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
@@ -786,8 +790,8 @@ class HybridMuon(Optimizer):
         beta1, beta2 = group["adam_betas"]
         exp_avg = state["exp_avg"]
         exp_avg_sq = state["exp_avg_sq"]
-        state["step"].add_(1.0)
-        step = int(state["step"].item())
+        state["step"] += 1
+        step = state["step"]
 
         exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)

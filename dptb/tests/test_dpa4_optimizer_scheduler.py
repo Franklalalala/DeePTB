@@ -291,11 +291,13 @@ def test_hybrid_muon_fixed_clip_caps_update_and_reports_diagnostics():
 
 
 def test_hybrid_muon_step_does_not_materialize_diagnostics(monkeypatch):
-    param = torch.nn.Parameter(torch.zeros(4, 4))
-    param.grad = torch.ones_like(param)
+    matrix = torch.nn.Parameter(torch.zeros(4, 4))
+    vector = torch.nn.Parameter(torch.zeros(4))
+    matrix.grad = torch.ones_like(matrix)
+    vector.grad = torch.ones_like(vector)
     optimizer = get_optimizer(
         type="HybridMuon",
-        model_param=[param],
+        model_param=[matrix, vector],
         lr=0.1,
         weight_decay=0.0,
         muon_beta=0.0,
@@ -351,6 +353,24 @@ def test_hybrid_muon_fills_new_group_defaults_for_old_checkpoint_state():
 
     assert optimizer.route_counts == {"muon": 1, "adam": 0}
     assert "muon_clip_mode" in optimizer.param_groups[0]
+
+
+def test_hybrid_muon_loads_legacy_tensor_adam_step():
+    param = torch.nn.Parameter(torch.zeros(4))
+    optimizer = get_optimizer(type="HybridMuon", model_param=[param], lr=0.1)
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    state_dict = optimizer.state_dict()
+    state_dict["state"][0]["step"] = torch.tensor(3.0)
+
+    restored_param = torch.nn.Parameter(torch.zeros(4))
+    restored = get_optimizer(type="HybridMuon", model_param=[restored_param], lr=0.1)
+    restored.load_state_dict(state_dict)
+
+    assert restored.state[restored_param]["step"] == 3
+    restored_param.grad = torch.ones_like(restored_param)
+    restored.step()
+    assert restored.state[restored_param]["step"] == 4
 
 
 def test_train_options_accepts_hybrid_muon_optimizer_and_wsd_scheduler():
