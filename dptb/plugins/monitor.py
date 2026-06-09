@@ -1744,7 +1744,7 @@ class Validationer(Monitor):
         self.trigger_interval = interval
         self.fast_mode = fast_mode
 
-    def _record_flow_metric(self, name, value, *, epoch=False):
+    def _record_flow_metric(self, name, value, *, epoch=False, time=None):
         val = self._normalize_scalar(value)
         if val is None:
             return
@@ -1759,24 +1759,27 @@ class Validationer(Monitor):
         if epoch:
             stats['epoch_mean'] = val
             stats['epoch_stats'] = (0, 0)
+            if time is not None:
+                stats['epoch_last_updated'] = time
         else:
             curr_s, curr_c = stats.get('epoch_stats', (0, 0))
             stats['epoch_stats'] = (curr_s + val, curr_c + 1)
 
-    def _sync_flow_metrics(self, *, epoch=False):
+    def _sync_flow_metrics(self, *, epoch=False, time=None):
         for name, value in getattr(self.trainer, "_last_flow_validation_state", {}).items():
-            self._record_flow_metric(name, value, epoch=epoch)
+            self._record_flow_metric(name, value, epoch=epoch, time=time)
 
     def _get_value(self, **kwargs):
         if kwargs.get('field') == "iteration":
             val = self.trainer.validation(fast=True)
-            self._sync_flow_metrics(epoch=False)
+            self._sync_flow_metrics(epoch=False, time=kwargs.get("time"))
             return val
 
     def epoch(self, **kwargs):
+        epoch = kwargs.get("time", self.trainer.ep)
         stats = self.trainer.stats.setdefault(self.stat_name, {})
         val = self.trainer.validation(fast=self.fast_mode)
-        self._sync_flow_metrics(epoch=True)
+        self._sync_flow_metrics(epoch=True, time=epoch)
         if torch.is_tensor(val):
             val = val.detach()
             if val.ndim > 0:
@@ -1785,6 +1788,7 @@ class Validationer(Monitor):
         else:
             val = float(val)
         stats['epoch_mean'] = val
+        stats['epoch_last_updated'] = epoch
 
 
 class TensorBoardMonitor(Plugin):
@@ -1826,6 +1830,10 @@ class TensorBoardMonitor(Plugin):
             return self._to_float(kwargs.get(name), default=default)
         return self._get_stat(name, key, default=default)
 
+    def _epoch_stat_updated(self, name, epoch):
+        stat = self.trainer.stats.get(name, {})
+        return stat.get('epoch_last_updated') == epoch
+
     def _memory_names(self, kwargs=None):
         names = {
             name for name in self.trainer.stats
@@ -1844,7 +1852,11 @@ class TensorBoardMonitor(Plugin):
         lr = self._get_stat('lr', 'last', None)
         train_loss_mean = self._get_stat('train_loss', 'epoch_mean', None)
         train_loss_opt_mean = self._get_stat('train_loss_opt', 'epoch_mean', None)
-        validation_loss_mean = self._get_stat('validation_loss', 'epoch_mean', None)
+        validation_loss_mean = (
+            self._get_stat('validation_loss', 'epoch_mean', None)
+            if self._epoch_stat_updated('validation_loss', epoch)
+            else None
+        )
         total_grad_norm_mean = self._get_stat('total_grad_norm', 'epoch_mean', None)
 
         if lr is not None:
@@ -1861,6 +1873,8 @@ class TensorBoardMonitor(Plugin):
         for name in sorted(self.trainer.stats):
             if not name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_")):
                 continue
+            if name.startswith("validation_") and not self._epoch_stat_updated(name, epoch):
+                continue
             value = self._get_stat(name, 'epoch_mean', None)
             if value is not None:
                 self.writer.add_scalar(f'{name}_mean/epoch', value, epoch)
@@ -1875,6 +1889,24 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar(
                 'train_hopping_loss_mean/epoch',
                 self._get_stat('train_hopping_loss', 'epoch_mean', 0.0),
+                epoch
+            )
+        if (
+            'validation_onsite_loss' in self.trainer.stats
+            and self._epoch_stat_updated('validation_onsite_loss', epoch)
+        ):
+            self.writer.add_scalar(
+                'validation_onsite_loss_mean/epoch',
+                self._get_stat('validation_onsite_loss', 'epoch_mean', 0.0),
+                epoch
+            )
+        if (
+            'validation_hopping_loss' in self.trainer.stats
+            and self._epoch_stat_updated('validation_hopping_loss', epoch)
+        ):
+            self.writer.add_scalar(
+                'validation_hopping_loss_mean/epoch',
+                self._get_stat('validation_hopping_loss', 'epoch_mean', 0.0),
                 epoch
             )
         if 'mean_max_prob' in self.trainer.stats:

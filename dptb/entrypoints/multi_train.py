@@ -535,13 +535,24 @@ def _multi_train_impl(
         log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]
 
         if validation_datasets:
+            validation_intervals = []
+            validation_freq = int(jdata["train_options"].get("validation_freq", 10) or 0)
+            validation_epoch_freq = int(jdata["train_options"].get("validation_epoch_freq", 1) or 0)
+            if validation_freq > 0:
+                validation_intervals.append((validation_freq, 'iteration'))
+            if validation_epoch_freq > 0:
+                validation_intervals.append((validation_epoch_freq, 'epoch'))
             trainer.register_plugin(
                 Validationer(
-                    interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')],
+                    interval=validation_intervals,
                     fast_mode=jdata["train_options"]["valid_fast"]
                 )
             )
-            log_field.append("validation_loss")
+            log_field.extend([
+                "validation_loss",
+                "validation_onsite_loss",
+                "validation_hopping_loss",
+            ])
 
         avg_per_iter = chk_avg_per_iter(jdata)
 

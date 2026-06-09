@@ -535,6 +535,7 @@ def train(
     log_field = ["train_loss", "lr", "total_grad_norm"]
     flow_enabled = bool(train_options.get("flow_options", {}).get("enabled", False))
     flow_log_fields = []
+    flow_scalar_fields = []
     if flow_enabled:
         flow_options = train_options.get("flow_options", {})
         flow_log_fields.extend([
@@ -548,16 +549,16 @@ def train(
         ])
         for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
             flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
-        if flow_options.get("log_compatible_loss", True):
+        if flow_options.get("log_train_compatible_loss", flow_options.get("log_compatible_loss", True)):
             flow_log_fields.extend([
                 "train_compatible_loss",
                 "train_compatible_onsite_loss",
                 "train_compatible_hopping_loss",
             ])
+        if flow_options.get("log_validation_compatible_loss", flow_options.get("log_compatible_loss", True)):
             flow_log_fields.extend([
-                "validation_compatible_t0_loss",
-                "validation_compatible_t0_onsite_loss",
-                "validation_compatible_t0_hopping_loss",
+                "validation_onsite_loss",
+                "validation_hopping_loss",
             ])
             for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
                 flow_log_fields.extend([
@@ -566,16 +567,32 @@ def train(
                     f"validation_compatible_euler_{int(num_steps)}_hopping_loss",
                 ])
         log_field.extend(flow_log_fields)
+        flow_scalar_fields = [
+            name for name in flow_log_fields if not name.startswith("validation_")
+        ]
     if validation_datasets:
-        trainer.register_plugin(Validationer(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')], fast_mode=jdata["train_options"]["valid_fast"]))
+        validation_intervals = []
+        validation_freq = int(jdata["train_options"].get("validation_freq", 10) or 0)
+        validation_epoch_freq = int(jdata["train_options"].get("validation_epoch_freq", 1) or 0)
+        if validation_freq > 0:
+            validation_intervals.append((validation_freq, 'iteration'))
+        if validation_epoch_freq > 0:
+            validation_intervals.append((validation_epoch_freq, 'epoch'))
+        trainer.register_plugin(Validationer(interval=validation_intervals, fast_mode=jdata["train_options"]["valid_fast"]))
 
-        log_field.append("validation_loss")
+        for validation_field in (
+            "validation_loss",
+            "validation_onsite_loss",
+            "validation_hopping_loss",
+        ):
+            if validation_field not in log_field:
+                log_field.append(validation_field)
     avg_per_iter = chk_avg_per_iter(jdata)
     trainer.register_plugin(TrainLossMonitor(sliding_win_size=jdata["train_options"]["sliding_win_size"], avg_per_iter=avg_per_iter)) # by default, avg_per_iter is false, will not be activated.
     trainer.register_plugin(LearningRateMonitor())
     trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
     if flow_enabled:
-        for flow_stat_name in flow_log_fields:
+        for flow_stat_name in flow_scalar_fields:
             trainer.register_plugin(
                 ScalarFieldMonitor(
                     stat_name=flow_stat_name,
@@ -655,7 +672,8 @@ def train(
         trainer.register_plugin(pre_so2_monitor)
 
     if jdata["train_options"]["use_tensorboard"]:
-        assert jdata["train_options"]["display_freq"] >= jdata["train_options"]["validation_freq"], 'The display frequency must be greater than the validation frequency.'
+        validation_freq = int(jdata["train_options"].get("validation_freq", 10) or 0)
+        assert validation_freq <= 0 or jdata["train_options"]["display_freq"] >= validation_freq, 'The display frequency must be greater than the validation frequency.'
         trainer.register_plugin(TensorBoardMonitor(interval=[(jdata["train_options"]["display_freq"], 'iteration'), (1, 'epoch')]))
     trainer.register_plugin(Logger(log_field,
         interval=[(jdata["train_options"]["display_freq"], 'iteration'), (1, 'epoch')]))

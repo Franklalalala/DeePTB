@@ -164,6 +164,23 @@ def test_flow_compatible_loss_state_explicit_legacy_mapping():
     assert lossfunc.last_hopping_loss.item() == pytest.approx(456.0)
 
 
+def test_flow_compatible_loss_state_maps_validation_components_only():
+    lossfunc = _ComponentLoss()
+    pred, ref = _pred_ref()
+
+    state = Trainer._compatible_loss_state(
+        lossfunc,
+        pred,
+        ref,
+        prefix="validation_compatible_euler_1",
+        legacy_prefix="validation",
+    )
+
+    assert state["validation_onsite_loss"].item() == pytest.approx(2.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(2.0)
+    assert "validation_loss" not in state
+
+
 class _ConstantEndpoint(torch.nn.Module):
     def forward(self, data):
         data = data.copy()

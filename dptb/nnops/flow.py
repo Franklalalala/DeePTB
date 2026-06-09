@@ -115,6 +115,12 @@ class HamiltonianCFM:
             sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
         )
         self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
+        self.log_train_compatible_loss = bool(
+            options.get("log_train_compatible_loss", self.log_compatible_loss)
+        )
+        self.log_validation_compatible_loss = bool(
+            options.get("log_validation_compatible_loss", self.log_compatible_loss)
+        )
         self.compatible_loss_to_legacy_keys = bool(
             options.get("compatible_loss_to_legacy_keys", True)
         )

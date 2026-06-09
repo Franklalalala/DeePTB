@@ -187,7 +187,7 @@ class Trainer(BaseTrainer):
             batch.update(batch_info)
             batch_for_loss.update(batch_info)
             loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
-            if self.flow_cfm.log_compatible_loss:
+            if self.flow_cfm.log_train_compatible_loss:
                 flow_state.update(
                     self._compatible_loss_state(
                         lossfunc,
@@ -431,16 +431,6 @@ class Trainer(BaseTrainer):
                     flow_metric_sums["validation_flow_t0_loss"] = (
                         flow_metric_sums.get("validation_flow_t0_loss", 0.0) + t0_loss.detach()
                     )
-                    if self.flow_cfm.log_compatible_loss:
-                        self._accumulate_metric_state(
-                            flow_metric_sums,
-                            self._compatible_loss_state(
-                                self.validation_lossfunc,
-                                t0_pred,
-                                t0_ref,
-                                prefix="validation_compatible_t0",
-                            ),
-                        )
                     for num_steps in self.flow_cfm.validation_ode_steps:
                         sampled = self.flow_cfm.sample(
                             self.model, original_batch, num_steps=num_steps
@@ -451,7 +441,7 @@ class Trainer(BaseTrainer):
                         flow_metric_sums[key] = (
                             flow_metric_sums.get(key, 0.0) + sample_loss.detach()
                         )
-                        if self.flow_cfm.log_compatible_loss:
+                        if self.flow_cfm.log_validation_compatible_loss:
                             self._accumulate_metric_state(
                                 flow_metric_sums,
                                 self._compatible_loss_state(
@@ -459,13 +449,22 @@ class Trainer(BaseTrainer):
                                     sampled,
                                     t0_ref,
                                     prefix=f"validation_compatible_euler_{num_steps}",
+                                    legacy_prefix="validation" if int(num_steps) == 1 else None,
                                 ),
                             )
                 else:
                     batch = self.model(batch)
                     batch.update(batch_info)
                     batch_for_loss.update(batch_info)
-                    loss += self.validation_lossfunc(batch, batch_for_loss)
+                    batch_loss = self.validation_lossfunc(batch, batch_for_loss)
+                    loss += batch_loss
+                    self._accumulate_metric_state(
+                        flow_metric_sums,
+                        self._loss_component_state(
+                            self.validation_lossfunc,
+                            prefix="validation",
+                        ),
+                    )
                 num_batches += 1
                 if fast: break
         divisor = max(num_batches, 1)

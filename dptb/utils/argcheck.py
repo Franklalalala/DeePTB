@@ -199,6 +199,8 @@ def flow_options():
         Argument("component_reduction", str, optional=True, default="global_elements"),
         Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
         Argument("log_compatible_loss", bool, optional=True, default=True),
+        Argument("log_train_compatible_loss", bool, optional=True, default=True),
+        Argument("log_validation_compatible_loss", bool, optional=True, default=True),
         Argument("compatible_loss_to_legacy_keys", bool, optional=True, default=True),
         Argument("overwrite_feature_keys", bool, optional=True, default=True),
         Argument("detach_interpolated_h0", bool, optional=True, default=True),
@@ -250,7 +252,8 @@ def activation_recompute_options():
 def train_options():
     doc_num_epoch = "Total number of training epochs. It is worth noted, if the model is reloaded with `-r` or `--restart` option, epoch which have been trained will counted from the time that the checkpoint is saved."
     doc_save_freq = "Frequency, or every how many iteration to saved the current model into checkpoints, The name of checkpoint is formulated as `latest|best_dptb|nnsk_b<bond_cutoff>_c<sk_cutoff>_w<sk_decay_w>`. Default: `10`"
-    doc_validation_freq = "Frequency or every how many iteration to do model validation on validation datasets. Default: `10`"
+    doc_validation_freq = "Frequency or every how many iteration to do model validation on validation datasets. Set 0 to disable iteration validation. Default: `10`"
+    doc_validation_epoch_freq = "Frequency or every how many epochs to do model validation on validation datasets. Set 0 to disable epoch validation. Default: `1`"
     doc_display_freq = "Frequency, or every how many iteration to display the training log to screem. Default: `1`"
     doc_use_tensorboard = (
         "Set true to use tensorboard. It will record iteration error once every `25` iterations, "
@@ -587,6 +590,7 @@ def train_options():
         # save / log
         Argument("save_freq", int, optional=True, default=10, doc=doc_save_freq),
         Argument("validation_freq", int, optional=True, default=10, doc=doc_validation_freq),
+        Argument("validation_epoch_freq", int, optional=True, default=1, doc=doc_validation_epoch_freq),
         Argument("display_freq", int, optional=True, default=1, doc=doc_display_freq),
         Argument("use_tensorboard", bool, optional=True, default=False, doc=doc_use_tensorboard),
         Argument("max_ckpt", int, optional=True, default=4, doc=doc_max_ckpt),
