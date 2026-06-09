@@ -550,6 +550,11 @@ def train(
             flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
         if flow_options.get("log_compatible_loss", True):
             flow_log_fields.extend([
+                "train_compatible_loss",
+                "train_compatible_onsite_loss",
+                "train_compatible_hopping_loss",
+            ])
+            flow_log_fields.extend([
                 "validation_compatible_t0_loss",
                 "validation_compatible_t0_onsite_loss",
                 "validation_compatible_t0_hopping_loss",

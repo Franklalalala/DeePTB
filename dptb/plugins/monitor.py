@@ -1859,7 +1859,7 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('total_grad_norm_mean/epoch', total_grad_norm_mean, epoch)
 
         for name in sorted(self.trainer.stats):
-            if not name.startswith(("train_flow_", "validation_flow_", "validation_compatible_")):
+            if not name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_")):
                 continue
             value = self._get_stat(name, 'epoch_mean', None)
             if value is not None:
@@ -1956,11 +1956,11 @@ class TensorBoardMonitor(Plugin):
 
         flow_names = {
             name for name in self.trainer.stats
-            if name.startswith(("train_flow_", "validation_flow_", "validation_compatible_"))
+            if name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_"))
         }
         flow_names.update(
             name for name in kwargs
-            if name.startswith(("train_flow_", "validation_flow_", "validation_compatible_"))
+            if name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_"))
         )
         for name in sorted(flow_names):
             value = self._get_value(name, 'last', kwargs, default=None)

@@ -129,6 +129,24 @@ class Trainer(BaseTrainer):
             self.model.transform = False
 
     @staticmethod
+    def _loss_component_source(lossfunc):
+        """Return the inner loss object that owns component side-effect fields."""
+        loss_obj = lossfunc
+        for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
+            inner = getattr(loss_obj, attr, None)
+            if isinstance(inner, nn.Module):
+                loss_obj = inner
+                break
+        return loss_obj
+
+    _COMPATIBLE_LOSS_SIDE_EFFECT_ATTRS = (
+        "last_onsite_loss",
+        "last_hopping_loss",
+        "last_z_loss",
+        "expert_load_cv",
+    )
+
+    @staticmethod
     def _loss_kwargs(loss_options, common_options):
         kwargs = dict(loss_options)
         kwargs.update(common_options)
@@ -191,13 +209,7 @@ class Trainer(BaseTrainer):
 
     @staticmethod
     def _loss_component_state(lossfunc, *, prefix="train"):
-        loss_obj = lossfunc
-        for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
-            inner = getattr(loss_obj, attr, None)
-            if isinstance(inner, nn.Module):
-                loss_obj = inner
-                break
-
+        loss_obj = Trainer._loss_component_source(lossfunc)
         state = {}
         onsite_comp = getattr(loss_obj, "last_onsite_loss", None)
         hopping_comp = getattr(loss_obj, "last_hopping_loss", None)
@@ -216,15 +228,32 @@ class Trainer(BaseTrainer):
 
     @staticmethod
     def _compatible_loss_state(lossfunc, pred_data, ref_data, *, prefix, legacy_prefix=None):
-        with torch.no_grad():
-            compatible_loss = lossfunc(pred_data, ref_data)
-
-        state = {
-            f"{prefix}_loss": compatible_loss.detach()
-            if torch.is_tensor(compatible_loss)
-            else torch.as_tensor(compatible_loss)
+        loss_obj = Trainer._loss_component_source(lossfunc)
+        sentinel = object()
+        saved_side_effects = {
+            attr: getattr(loss_obj, attr, sentinel)
+            for attr in Trainer._COMPATIBLE_LOSS_SIDE_EFFECT_ATTRS
         }
-        state.update(Trainer._loss_component_state(lossfunc, prefix=prefix))
+
+        try:
+            with torch.no_grad():
+                compatible_loss = lossfunc(pred_data, ref_data)
+
+            state = {
+                f"{prefix}_loss": compatible_loss.detach()
+                if torch.is_tensor(compatible_loss)
+                else torch.as_tensor(compatible_loss)
+            }
+            state.update(Trainer._loss_component_state(lossfunc, prefix=prefix))
+        finally:
+            for attr, value in saved_side_effects.items():
+                if value is sentinel:
+                    try:
+                        delattr(loss_obj, attr)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(loss_obj, attr, value)
 
         if legacy_prefix is not None:
             onsite_key = f"{prefix}_onsite_loss"
@@ -288,7 +317,8 @@ class Trainer(BaseTrainer):
             "total_grad_norm": total_norm.item()
         }
         state.update(dynamic_batch_state)
-        state.update(self._loss_component_state(self.train_lossfunc))
+        if not self.flow_cfm.enabled:
+            state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
         state.update(getattr(self, "_last_flow_state", {}))
 
@@ -395,6 +425,8 @@ class Trainer(BaseTrainer):
                         original_batch, batch_for_loss, t=zero_t
                     )
                     t0_pred = self.model(t0_batch)
+                    t0_pred.update(batch_info)
+                    t0_ref.update(batch_info)
                     t0_loss, _ = self.flow_cfm.loss(t0_pred, t0_ref, t0_ctx)
                     flow_metric_sums["validation_flow_t0_loss"] = (
                         flow_metric_sums.get("validation_flow_t0_loss", 0.0) + t0_loss.detach()
@@ -413,6 +445,7 @@ class Trainer(BaseTrainer):
                         sampled = self.flow_cfm.sample(
                             self.model, original_batch, num_steps=num_steps
                         )
+                        sampled.update(batch_info)
                         sample_loss, _ = self.flow_cfm.loss(sampled, t0_ref, t0_ctx)
                         key = f"validation_flow_euler_{num_steps}_loss"
                         flow_metric_sums[key] = (

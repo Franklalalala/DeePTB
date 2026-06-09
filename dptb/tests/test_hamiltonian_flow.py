@@ -99,8 +99,8 @@ class _ComponentLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.called_with_grad_enabled = None
-        self.last_onsite_loss = None
-        self.last_hopping_loss = None
+        self.last_onsite_loss = torch.tensor(123.0)
+        self.last_hopping_loss = torch.tensor(456.0)
 
     def forward(self, pred, ref):
         self.called_with_grad_enabled = torch.is_grad_enabled()
@@ -111,8 +111,7 @@ class _ComponentLoss(torch.nn.Module):
         return 0.5 * (onsite + hopping)
 
 
-def test_flow_compatible_loss_state_uses_no_grad_and_legacy_keys():
-    lossfunc = _ComponentLoss()
+def _pred_ref():
     pred = {
         "node_features": torch.tensor([[1.0], [3.0]], requires_grad=True),
         "edge_features": torch.tensor([[2.0]], requires_grad=True),
@@ -121,6 +120,35 @@ def test_flow_compatible_loss_state_uses_no_grad_and_legacy_keys():
         "node_features": torch.zeros(2, 1),
         "edge_features": torch.zeros(1, 1),
     }
+    return pred, ref
+
+
+def test_flow_compatible_loss_state_uses_no_grad_and_restores_side_effects():
+    lossfunc = _ComponentLoss()
+    pred, ref = _pred_ref()
+
+    state = Trainer._compatible_loss_state(
+        lossfunc,
+        pred,
+        ref,
+        prefix="train_compatible",
+        legacy_prefix=None,
+    )
+
+    assert lossfunc.called_with_grad_enabled is False
+    assert state["train_compatible_loss"].requires_grad is False
+    assert state["train_compatible_onsite_loss"].item() == pytest.approx(2.0)
+    assert state["train_compatible_hopping_loss"].item() == pytest.approx(2.0)
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
+
+    assert lossfunc.last_onsite_loss.item() == pytest.approx(123.0)
+    assert lossfunc.last_hopping_loss.item() == pytest.approx(456.0)
+
+
+def test_flow_compatible_loss_state_explicit_legacy_mapping():
+    lossfunc = _ComponentLoss()
+    pred, ref = _pred_ref()
 
     state = Trainer._compatible_loss_state(
         lossfunc,
@@ -130,12 +158,10 @@ def test_flow_compatible_loss_state_uses_no_grad_and_legacy_keys():
         legacy_prefix="train",
     )
 
-    assert lossfunc.called_with_grad_enabled is False
-    assert state["train_compatible_loss"].requires_grad is False
-    assert state["train_compatible_onsite_loss"].item() == pytest.approx(2.0)
-    assert state["train_compatible_hopping_loss"].item() == pytest.approx(2.0)
     assert state["train_onsite_loss"].item() == pytest.approx(2.0)
     assert state["train_hopping_loss"].item() == pytest.approx(2.0)
+    assert lossfunc.last_onsite_loss.item() == pytest.approx(123.0)
+    assert lossfunc.last_hopping_loss.item() == pytest.approx(456.0)
 
 
 class _ConstantEndpoint(torch.nn.Module):
