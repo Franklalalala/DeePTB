@@ -17,6 +17,7 @@ from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
 from dptb.nn.activation_recompute import configure_activation_recompute
+from dptb.nnops.flow import HamiltonianCFM
 from dptb.nnops.loss import Loss
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,15 @@ class Trainer(BaseTrainer):
                 idp=self.model.hamiltonian.idp,
             )
 
+        self.flow_cfm = HamiltonianCFM(
+            train_options.get("flow_options", None),
+            idp=self.model.hamiltonian.idp,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._last_flow_state = {}
+        self._last_flow_validation_state = {}
+
         if train_options["loss_options"]["train"]["method"] == "skints":
             assert self.model.name == 'nnsk', "The model should be nnsk for the skints loss function."
             assert self.model.onsite_fn.functype in ['none',
@@ -153,6 +163,15 @@ class Trainer(BaseTrainer):
         batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
+        if self.flow_cfm.enabled:
+            batch, batch_for_loss, flow_ctx = self.flow_cfm.prepare_batch(batch, batch_for_loss)
+            batch = self.model(batch)
+            batch.update(batch_info)
+            batch_for_loss.update(batch_info)
+            loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
+            self._last_flow_state = flow_state
+            return loss
+        self._last_flow_state = {}
         batch = self.model(batch)
         batch.update(batch_info)
         batch_for_loss.update(batch_info)
@@ -230,6 +249,7 @@ class Trainer(BaseTrainer):
         state.update(dynamic_batch_state)
         state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
+        state.update(getattr(self, "_last_flow_state", {}))
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1
@@ -305,6 +325,8 @@ class Trainer(BaseTrainer):
     def validation(self, fast=True):
         with torch.no_grad():
             loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
+            flow_metric_sums = {}
+            num_batches = 0
             self.model.eval()
             for batch in self.validation_loader:
                 batch = batch.to(self.device)
@@ -313,11 +335,50 @@ class Trainer(BaseTrainer):
                               "__data_class__": batch.__data_class__}
                 batch = AtomicData.to_AtomicDataDict(batch)
                 batch_for_loss = batch.copy()
-                batch = self.model(batch)
-                batch.update(batch_info)
-                batch_for_loss.update(batch_info)
-                loss += self.validation_lossfunc(batch, batch_for_loss)
+                if self.flow_cfm.enabled:
+                    original_batch = batch.copy()
+                    flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                        original_batch, batch_for_loss
+                    )
+                    flow_pred = self.model(flow_batch)
+                    random_t_loss, _ = self.flow_cfm.loss(flow_pred, flow_ref, flow_ctx)
+                    loss += random_t_loss
+                    flow_metric_sums["validation_flow_random_t_loss"] = (
+                        flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
+                        + random_t_loss.detach()
+                    )
+
+                    num_graphs = self.flow_cfm._num_graphs(original_batch)
+                    zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
+                    t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
+                        original_batch, batch_for_loss, t=zero_t
+                    )
+                    t0_pred = self.model(t0_batch)
+                    t0_loss, _ = self.flow_cfm.loss(t0_pred, t0_ref, t0_ctx)
+                    flow_metric_sums["validation_flow_t0_loss"] = (
+                        flow_metric_sums.get("validation_flow_t0_loss", 0.0) + t0_loss.detach()
+                    )
+                    for num_steps in self.flow_cfm.validation_ode_steps:
+                        sampled = self.flow_cfm.sample(
+                            self.model, original_batch, num_steps=num_steps
+                        )
+                        sample_loss, _ = self.flow_cfm.loss(sampled, t0_ref, t0_ctx)
+                        key = f"validation_flow_euler_{num_steps}_loss"
+                        flow_metric_sums[key] = (
+                            flow_metric_sums.get(key, 0.0) + sample_loss.detach()
+                        )
+                else:
+                    batch = self.model(batch)
+                    batch.update(batch_info)
+                    batch_for_loss.update(batch_info)
+                    loss += self.validation_lossfunc(batch, batch_for_loss)
+                num_batches += 1
                 if fast: break
-        if not fast: loss = loss / len(self.validation_loader)
+        divisor = max(num_batches, 1)
+        if not fast:
+            loss = loss / divisor
+        self._last_flow_validation_state = {
+            key: value / divisor for key, value in flow_metric_sums.items()
+        }
         return loss
 

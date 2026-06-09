@@ -1744,13 +1744,39 @@ class Validationer(Monitor):
         self.trigger_interval = interval
         self.fast_mode = fast_mode
 
+    def _record_flow_metric(self, name, value, *, epoch=False):
+        val = self._normalize_scalar(value)
+        if val is None:
+            return
+        stats = self.trainer.stats.setdefault(name, {})
+        stats.setdefault('log_format', self.log_format)
+        stats.setdefault('log_unit', self.log_unit)
+        stats.setdefault('log_iter_fields', self.log_iter_fields)
+        stats.setdefault('log_epoch_fields', self.log_epoch_fields)
+        stats['last'] = val
+        previous_avg = stats.get('running_avg', 0.0)
+        stats['running_avg'] = previous_avg * self.smoothing + val * (1 - self.smoothing)
+        if epoch:
+            stats['epoch_mean'] = val
+            stats['epoch_stats'] = (0, 0)
+        else:
+            curr_s, curr_c = stats.get('epoch_stats', (0, 0))
+            stats['epoch_stats'] = (curr_s + val, curr_c + 1)
+
+    def _sync_flow_metrics(self, *, epoch=False):
+        for name, value in getattr(self.trainer, "_last_flow_validation_state", {}).items():
+            self._record_flow_metric(name, value, epoch=epoch)
+
     def _get_value(self, **kwargs):
         if kwargs.get('field') == "iteration":
-            return self.trainer.validation(fast=True)
+            val = self.trainer.validation(fast=True)
+            self._sync_flow_metrics(epoch=False)
+            return val
 
     def epoch(self, **kwargs):
         stats = self.trainer.stats.setdefault(self.stat_name, {})
         val = self.trainer.validation(fast=self.fast_mode)
+        self._sync_flow_metrics(epoch=True)
         if torch.is_tensor(val):
             val = val.detach()
             if val.ndim > 0:
@@ -1831,6 +1857,13 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('validation_loss_mean/epoch', validation_loss_mean, epoch)
         if total_grad_norm_mean is not None:
             self.writer.add_scalar('total_grad_norm_mean/epoch', total_grad_norm_mean, epoch)
+
+        for name in sorted(self.trainer.stats):
+            if not name.startswith(("train_flow_", "validation_flow_")):
+                continue
+            value = self._get_stat(name, 'epoch_mean', None)
+            if value is not None:
+                self.writer.add_scalar(f'{name}_mean/epoch', value, epoch)
 
         if 'train_onsite_loss' in self.trainer.stats:
             self.writer.add_scalar(
@@ -1920,6 +1953,19 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('expert_load_cv_iter/iteration', expert_load_cv, iteration)
         if total_grad_norm is not None:
             self.writer.add_scalar('total_grad_norm_iter/iteration', total_grad_norm, iteration)
+
+        flow_names = {
+            name for name in self.trainer.stats
+            if name.startswith(("train_flow_", "validation_flow_"))
+        }
+        flow_names.update(
+            name for name in kwargs
+            if name.startswith(("train_flow_", "validation_flow_"))
+        )
+        for name in sorted(flow_names):
+            value = self._get_value(name, 'last', kwargs, default=None)
+            if value is not None:
+                self.writer.add_scalar(f'{name}_iter/iteration', value, iteration)
 
         latest_avg_iter_loss = self._get_stat('train_loss', 'latest_avg_iter_loss', None)
         if latest_avg_iter_loss is not None:

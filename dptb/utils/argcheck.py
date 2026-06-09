@@ -163,6 +163,57 @@ def dynamic_batch_options():
     )
 
 
+def flow_options():
+    doc = (
+        "Trainer-side conditional flow matching for Hamiltonian prediction. "
+        "When enabled, DeePTB replaces node_h0/edge_h0 by an interpolated "
+        "Hamiltonian state H_t and trains the existing model to predict the "
+        "clean target Hamiltonian, following a QHFlow2-style residual CFM path."
+    )
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument("mode", str, optional=True, default="residual"),
+        Argument("prior", str, optional=True, default="zero"),
+        Argument("node_h0_key", str, optional=True, default="node_h0"),
+        Argument("edge_h0_key", str, optional=True, default="edge_h0"),
+        Argument("node_target_key", str, optional=True, default="node_features"),
+        Argument("edge_target_key", str, optional=True, default="edge_features"),
+        Argument("flow_time_key", str, optional=True, default="flow_time"),
+        Argument("time_sampling", str, optional=True, default="uniform"),
+        Argument("t_min", (int, float), optional=True, default=0.0),
+        Argument("t_max", (int, float), optional=True, default=0.999),
+        Argument("t0_probability", (int, float), optional=True, default=0.0),
+        Argument("t_eps", (int, float), optional=True, default=1.0e-3),
+        Argument("time_logit_mean", (int, float), optional=True, default=-0.4),
+        Argument("time_logit_std", (int, float), optional=True, default=1.0),
+        Argument("node_sigma", (int, float), optional=True, default=1.0),
+        Argument("edge_sigma", (int, float), optional=True, default=1.0),
+        Argument("residual_sigma_floor", (int, float), optional=True, default=1.0e-6),
+        Argument("loss_type", str, optional=True, default="mse"),
+        Argument("node_weight", (int, float), optional=True, default=1.0),
+        Argument("edge_weight", (int, float), optional=True, default=1.0),
+        Argument("z_loss_coef", (int, float), optional=True, default=0.0),
+        Argument("omit_time_scaling", bool, optional=True, default=True),
+        Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
+        Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
+        Argument("component_reduction", str, optional=True, default="global_elements"),
+        Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
+        Argument("overwrite_feature_keys", bool, optional=True, default=True),
+        Argument("detach_interpolated_h0", bool, optional=True, default=True),
+        Argument("warn_missing_h0", bool, optional=True, default=True),
+        Argument("strict_h0", bool, optional=True, default=True),
+    ]
+    return Argument(
+        "flow_options",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def activation_recompute_options():
     doc = (
         "Train-time activation recomputation/checkpointing for memory hot paths. "
@@ -623,6 +674,7 @@ def train_options():
         Argument("allow_tf32", bool, optional=True, default=True, doc=doc_allow_tf32),
         Argument("float32_matmul_precision", str, optional=True, default="", doc=doc_float32_matmul_precision),
 
+        flow_options(),
         loss_options()
     ]
 
@@ -1348,6 +1400,10 @@ def slem_h0():
     doc_fallback_edge_key = "Fallback edge key used when explicit H0 is absent. Default: `edge_features`."
     doc_h0_merge_mode = "How to combine H0-projected features with the base init output. Supported: `replace`, `add`. Default: `replace`."
     doc_h0_self_edge_tol = "Tolerance used to detect self-edges in `self_edge` node mode. Default: `1e-8`."
+    doc_use_flow_time_embedding = "Whether to inject graph-level flow time into scalar channels before message passing. Default: `False`."
+    doc_flow_time_key = "Graph-level flow time key written by train_options.flow_options. Default: `flow_time`."
+    doc_flow_time_max_positions = "Scale used by the sinusoidal flow-time embedding. Default: `2000`."
+    doc_flow_time_missing_value = "Fallback normalized time when flow_time is absent. Default: `0.0`."
 
     return slem() + [
         Argument("use_h0_init", bool, optional=True, default=True, doc=doc_use_h0_init),
@@ -1360,6 +1416,10 @@ def slem_h0():
         Argument("fallback_edge_key", str, optional=True, default="edge_features", doc=doc_fallback_edge_key),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
+        Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),
+        Argument("flow_time_key", str, optional=True, default="flow_time", doc=doc_flow_time_key),
+        Argument("flow_time_max_positions", int, optional=True, default=2000, doc=doc_flow_time_max_positions),
+        Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
     ]
 
 

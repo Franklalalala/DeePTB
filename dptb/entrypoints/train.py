@@ -533,6 +533,21 @@ def train(
     # register the plugin in trainer, to tract training info
     train_options = jdata["train_options"]
     log_field = ["train_loss", "lr", "total_grad_norm"]
+    flow_enabled = bool(train_options.get("flow_options", {}).get("enabled", False))
+    flow_log_fields = []
+    if flow_enabled:
+        flow_log_fields.extend([
+            "train_flow_loss",
+            "train_flow_onsite_loss",
+            "train_flow_hopping_loss",
+            "train_flow_t",
+            "train_flow_weight",
+            "validation_flow_random_t_loss",
+            "validation_flow_t0_loss",
+        ])
+        for num_steps in train_options.get("flow_options", {}).get("validation_ode_steps", [1, 3]):
+            flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
+        log_field.extend(flow_log_fields)
     if validation_datasets:
         trainer.register_plugin(Validationer(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')], fast_mode=jdata["train_options"]["valid_fast"]))
 
@@ -541,6 +556,14 @@ def train(
     trainer.register_plugin(TrainLossMonitor(sliding_win_size=jdata["train_options"]["sliding_win_size"], avg_per_iter=avg_per_iter)) # by default, avg_per_iter is false, will not be activated.
     trainer.register_plugin(LearningRateMonitor())
     trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
+    if flow_enabled:
+        for flow_stat_name in flow_log_fields:
+            trainer.register_plugin(
+                ScalarFieldMonitor(
+                    stat_name=flow_stat_name,
+                    interval=[(1, 'iteration'), (1, 'epoch')],
+                )
+            )
 ##############################
     trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
