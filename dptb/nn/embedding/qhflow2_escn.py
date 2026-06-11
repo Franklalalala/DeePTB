@@ -82,6 +82,7 @@ class QHFlow2ESCNEmbedding(nn.Module):
         matrix_l: int = 6,
         context_hidden: int = 256,
         head_hidden: int = 256,
+        ham_context_mode: str = "features",
         use_flow_time_embedding: bool = True,
         flow_time_key: str = "flow_time",
         qhflow2_src: str | None = None,
@@ -97,6 +98,12 @@ class QHFlow2ESCNEmbedding(nn.Module):
         self.hidden_size = int(hidden_size)
         self.sh_lmax = int(sh_lmax)
         self.matrix_l = int(matrix_l)
+        self.ham_context_mode = str(ham_context_mode)
+        if self.ham_context_mode not in {"features", "zero"}:
+            raise ValueError(
+                "QHFlow2ESCNEmbedding ham_context_mode must be 'features' or 'zero', "
+                f"got {self.ham_context_mode!r}"
+            )
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
         self.flow_time_key = flow_time_key
 
@@ -188,6 +195,15 @@ class QHFlow2ESCNEmbedding(nn.Module):
         edge_index: torch.Tensor,
         num_graphs: int,
     ) -> torch.Tensor:
+        if self.ham_context_mode == "zero":
+            return torch.zeros(
+                num_graphs,
+                self.matrix_l,
+                self.hidden_size,
+                device=batch.device,
+                dtype=self.dtype,
+            )
+
         node = data.get(_keys.NODE_FEATURES_KEY, None)
         if node is None:
             node = torch.zeros(batch.numel(), self.rme_dim, device=batch.device, dtype=self.dtype)
