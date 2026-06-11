@@ -1270,6 +1270,7 @@ def slem_h0():
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False),
+        Argument("ham_context_mode", str, optional=True, default="features"),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
         Argument("flow_time_max_positions", int, optional=True, default=2000),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0),
