@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import os
 import warnings
-from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
 
+from dptb.nn.cuda_ops.extension_loader import load_cuda_extension, truthy_env
+from dptb.nn.cuda_ops.segments import repeated_segment_layout
 from dptb.nn.tensor_product_moe_v3 import (
     MOLEGlobals,
     SO2WignerBlocks,
@@ -18,13 +18,10 @@ from dptb.nn.tensor_product_moe_v3 import (
 
 _EXT = None
 _WARNED: set[str] = set()
-_FALSE = {"", "0", "false", "False", "FALSE", "off", "OFF", "no", "No"}
-_PAIR_SEGMENT_LAYOUT_CACHE: "OrderedDict[tuple, tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor]]" = OrderedDict()
-_PAIR_SEGMENT_LAYOUT_CACHE_MAX = 64
 
 
 def _flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default) not in _FALSE
+    return truthy_env(name, default)
 
 
 def _warn_once(key: str, message: str) -> None:
@@ -40,13 +37,6 @@ def _load_extension():
         return _EXT
 
     here = Path(__file__).resolve().parent
-    build_dir = Path(
-        os.environ.get(
-            "DPTB_SO2_MOE_FUSED_P0_BUILD_DIR",
-            Path.home() / ".cache" / "dptb_so2_moe_fused_p0",
-        )
-    )
-    build_dir.mkdir(parents=True, exist_ok=True)
     cflags = ["-O3"]
     cuda_flags = ["-O3", "--expt-relaxed-constexpr"]
     include_paths = []
@@ -62,18 +52,18 @@ def _load_extension():
         cflags.append("-DDPTB_SO2_MOE_FUSED_P0_CUTLASS=1")
         cuda_flags.append("-DDPTB_SO2_MOE_FUSED_P0_CUTLASS=1")
 
-    _EXT = load(
+    _EXT = load_cuda_extension(
         name="dptb_so2_moe_fused_p0",
-        sources=[
-            str(here / "csrc" / "so2_moe_fused_p0.cpp"),
-            str(here / "csrc" / "so2_moe_fused_p0_kernel.cu"),
+        source_files=[
+            here / "csrc" / "so2_moe_fused_p0.cpp",
+            here / "csrc" / "so2_moe_fused_p0_kernel.cu",
         ],
+        build_dir_env="DPTB_SO2_MOE_FUSED_P0_BUILD_DIR",
+        default_build_dir=Path.home() / ".cache" / "dptb_so2_moe_fused_p0",
         extra_cflags=cflags,
         extra_cuda_cflags=cuda_flags,
         extra_include_paths=include_paths,
-        build_directory=str(build_dir),
-        with_cuda=True,
-        verbose=_flag("DPTB_SO2_MOE_FUSED_P0_VERBOSE"),
+        verbose_env="DPTB_SO2_MOE_FUSED_P0_VERBOSE",
     )
     return _EXT
 
@@ -228,49 +218,13 @@ def _repeated_segment_layout(
     *,
     repeat: int,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    graph_index = graph_index.reshape(-1).to(dtype=torch.long)
-    assume_sorted = _flag("DPTB_SO2_MOE_FUSED_P0_ASSUME_SORTED")
-    key = (
-        int(repeat),
-        graph_index.device.type,
-        graph_index.device.index,
-        int(graph_index.data_ptr()),
-        int(graph_index.numel()),
-        int(getattr(graph_index, "_version", 0)),
-        int(num_routes),
-        bool(assume_sorted),
-    )
-    cached = _PAIR_SEGMENT_LAYOUT_CACHE.get(key)
-    if cached is not None:
-        _PAIR_SEGMENT_LAYOUT_CACHE.move_to_end(key)
-        return cached
-
-    if repeat == 1:
-        flat_graph = graph_index.contiguous()
-    else:
-        flat_graph = graph_index.reshape(-1, 1).expand(-1, int(repeat)).reshape(-1).contiguous()
-    if assume_sorted or flat_graph.numel() <= 1:
-        order = None
-        unorder = None
-        sorted_graph = flat_graph
-    elif torch.all(flat_graph[1:] >= flat_graph[:-1]).item():
-        order = None
-        unorder = None
-        sorted_graph = flat_graph
-    else:
-        order = torch.argsort(flat_graph, stable=True)
-        sorted_graph = flat_graph.index_select(0, order)
-        unorder = torch.empty_like(order)
-        unorder.scatter_(0, order, torch.arange(order.numel(), device=order.device, dtype=order.dtype))
-
-    counts = torch.bincount(sorted_graph, minlength=int(num_routes))
-    ptr = torch.zeros(int(num_routes) + 1, dtype=torch.long, device=counts.device)
-    ptr[1:] = torch.cumsum(counts, dim=0)
-    cached = (order, unorder, sorted_graph, ptr.to(device="cpu", dtype=torch.long).contiguous())
-    _PAIR_SEGMENT_LAYOUT_CACHE[key] = cached
-    while len(_PAIR_SEGMENT_LAYOUT_CACHE) > _PAIR_SEGMENT_LAYOUT_CACHE_MAX:
-        _PAIR_SEGMENT_LAYOUT_CACHE.popitem(last=False)
-    return cached
+    return repeated_segment_layout(
+        graph_index,
+        num_routes,
+        repeat=repeat,
+        assume_sorted=_flag("DPTB_SO2_MOE_FUSED_P0_ASSUME_SORTED"),
+        cache_name="so2_moe_fused_p0",
+    ).as_legacy_tuple()
 
 
 def _pack_pair_torch(
@@ -2462,24 +2416,40 @@ def _fused_pairs_indexed_sandwich_multi(
 
     permute_idx, unpermute_idx, sorted_graph_index = mole_globals.indexed_flat_permutation(graph_index, pair_inputs[0])
     ptr = mole_globals.indexed_segment_ptr(sorted_graph_index, int(route_count), prefer_cpu=True)
+    if _flag("DPTB_SO2_MOE_FUSED_P0_LOG_SCHEDULE"):
+        ptr_cpu = ptr.detach().cpu()
+        route_rows = (ptr_cpu[1:] - ptr_cpu[:-1]).to(dtype=torch.long)
+        route_rows_list = [int(v) for v in route_rows.tolist()]
+        if route_rows_list:
+            rows_min = min(route_rows_list)
+            rows_max = max(route_rows_list)
+            rows_total = sum(route_rows_list)
+        else:
+            rows_min = rows_max = rows_total = 0
+        m_desc = []
+        for m, cin, cout in zip(m_values_host, cin_values, cout_values):
+            m_desc.append(f"m={m}:M=2*rows,N={2 * int(cout)},K={int(cin)}")
+        _warn_once(
+            "indexed_sandwich_multi_schedule",
+            "indexed_sandwich_multi schedule tag: "
+            f"routes={int(route_count)}, route_rows_min/max/total={rows_min}/{rows_max}/{rows_total}, "
+            f"m_count={len(m_values_host)}, problems={int(route_count) * len(m_values_host)}, "
+            f"descriptors=[{'; '.join(m_desc)}]. "
+            "Effective per-route GEMM is A=[rows_r*2,K], B=[N,K], C=[rows_r*2,N].",
+        )
 
-    flat_inputs = []
-    for pair in pair_inputs:
-        flat = pair.reshape(-1, pair.shape[-1])
-        if permute_idx is not None:
-            flat = flat.index_select(0, permute_idx)
-        flat_inputs.append(flat.contiguous())
+    from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
 
-    from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
-
-    flat_raw_outputs = grouped_gemm_multi(flat_inputs, [ptr] * len(flat_inputs), mixed_weights)
+    raw_outputs = indexed_sandwich_multi_gemm(
+        pair_inputs,
+        ptr,
+        mixed_weights,
+        permute_idx=permute_idx,
+        unpermute_idx=unpermute_idx,
+    )
 
     if use_grouped_epilogue and all(post_radial is None for post_radial in post_radials):
-        raw_tensors = []
-        for flat_raw in flat_raw_outputs:
-            if unpermute_idx is not None:
-                flat_raw = flat_raw.index_select(0, unpermute_idx)
-            raw_tensors.append(flat_raw.reshape(x.shape[0], 2, -1).contiguous())
+        raw_tensors = raw_outputs
         cout_prefix = [0]
         for cout in cout_values:
             cout_prefix.append(cout_prefix[-1] + int(cout))
@@ -2541,12 +2511,9 @@ def _fused_pairs_indexed_sandwich_multi(
         ]
 
     contributions = []
-    for flat_raw, pair, post_radial, (m, out_base, out_l, offsets) in zip(
-        flat_raw_outputs, pair_inputs, post_radials, maps
+    for raw, pair, post_radial, (m, out_base, out_l, offsets) in zip(
+        raw_outputs, pair_inputs, post_radials, maps
     ):
-        if unpermute_idx is not None:
-            flat_raw = flat_raw.index_select(0, unpermute_idx)
-        raw = flat_raw.reshape(x.shape[0], 2, -1)
         if post_radial is None:
             contribution = _ScatterRawPairOutputFunction.apply(
                 raw.contiguous(),

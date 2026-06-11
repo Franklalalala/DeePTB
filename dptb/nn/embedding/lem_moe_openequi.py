@@ -196,6 +196,47 @@ class OEQTensorProduct(nn.Module):
         return self.post_linear(out)
 
 
+from dptb.nn.embedding.oeq_tp import (  # noqa: E402
+    OEQTensorProduct as _SharedOEQTensorProduct,
+    get_feasible_tp as _shared_get_feasible_tp,
+)
+
+
+def get_feasible_tp(
+        irreps_in1: o3.Irreps,
+        irreps_in2: o3.Irreps,
+        filter_irreps_out: o3.Irreps,
+        tp_mode: str = "uvw",
+        trainable: bool = True
+):
+    return _shared_get_feasible_tp(
+        irreps_in1,
+        irreps_in2,
+        filter_irreps_out,
+        tp_mode=tp_mode,
+        trainable=trainable,
+        path_normalization="e3nn",
+        sort_irreps=True,
+    )
+
+
+class OEQTensorProduct(_SharedOEQTensorProduct):
+    def __init__(self, irreps_in1: o3.Irreps, irreps_in2: o3.Irreps, irreps_out: o3.Irreps, mode: str = 'uvw',
+                 device="cpu"):
+        super().__init__(
+            irreps_in1=irreps_in1,
+            irreps_in2=irreps_in2,
+            irreps_out=irreps_out,
+            mode=mode,
+            internal_weights=True,
+            shared_weights=True,
+            path_normalization="e3nn",
+            sort_irreps=True,
+            simplify_post_linear=True,
+            device=device,
+        )
+
+
 @Embedding.register("lem_moe_openequi")
 class LemMoEOpenEqui(torch.nn.Module):
     def __init__(

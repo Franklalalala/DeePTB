@@ -152,10 +152,67 @@ def dynamic_batch_options():
     )
 
 
+
+def flow_options():
+    doc = (
+        "Trainer-side conditional flow matching for Hamiltonian prediction. "
+        "When enabled, DeePTB replaces node_h0/edge_h0 by an interpolated "
+        "Hamiltonian state H_t and trains the existing model to predict the "
+        "clean target Hamiltonian, following a QHFlow2-style residual CFM path."
+    )
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument("mode", str, optional=True, default="residual"),
+        Argument("prior", str, optional=True, default="zero"),
+        Argument("node_h0_key", str, optional=True, default="node_h0"),
+        Argument("edge_h0_key", str, optional=True, default="edge_h0"),
+        Argument("node_target_key", str, optional=True, default="node_features"),
+        Argument("edge_target_key", str, optional=True, default="edge_features"),
+        Argument("flow_time_key", str, optional=True, default="flow_time"),
+        Argument("time_sampling", str, optional=True, default="uniform"),
+        Argument("t_min", (int, float), optional=True, default=0.0),
+        Argument("t_max", (int, float), optional=True, default=0.999),
+        Argument("t0_probability", (int, float), optional=True, default=0.0),
+        Argument("t_eps", (int, float), optional=True, default=1.0e-3),
+        Argument("time_logit_mean", (int, float), optional=True, default=-0.4),
+        Argument("time_logit_std", (int, float), optional=True, default=1.0),
+        Argument("node_sigma", (int, float), optional=True, default=1.0),
+        Argument("edge_sigma", (int, float), optional=True, default=1.0),
+        Argument("residual_sigma_floor", (int, float), optional=True, default=1.0e-6),
+        Argument("loss_type", str, optional=True, default="mse"),
+        Argument("node_weight", (int, float), optional=True, default=1.0),
+        Argument("edge_weight", (int, float), optional=True, default=1.0),
+        Argument("z_loss_coef", (int, float), optional=True, default=0.0),
+        Argument("omit_time_scaling", bool, optional=True, default=True),
+        Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
+        Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
+        Argument("component_reduction", str, optional=True, default="global_elements"),
+        Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
+        Argument("log_compatible_loss", bool, optional=True, default=True),
+        Argument("log_train_compatible_loss", bool, optional=True, default=True),
+        Argument("log_validation_compatible_loss", bool, optional=True, default=True),
+        Argument("compatible_loss_to_legacy_keys", bool, optional=True, default=False),
+        Argument("overwrite_feature_keys", bool, optional=True, default=True),
+        Argument("detach_interpolated_h0", bool, optional=True, default=True),
+        Argument("warn_missing_h0", bool, optional=True, default=True),
+        Argument("strict_h0", bool, optional=True, default=True),
+    ]
+    return Argument(
+        "flow_options",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def train_options():
     doc_num_epoch = "Total number of training epochs. It is worth noted, if the model is reloaded with `-r` or `--restart` option, epoch which have been trained will counted from the time that the checkpoint is saved."
     doc_save_freq = "Frequency, or every how many iteration to saved the current model into checkpoints, The name of checkpoint is formulated as `latest|best_dptb|nnsk_b<bond_cutoff>_c<sk_cutoff>_w<sk_decay_w>`. Default: `10`"
-    doc_validation_freq = "Frequency or every how many iteration to do model validation on validation datasets. Default: `10`"
+    doc_validation_freq = "Frequency or every how many iteration to do model validation on validation datasets. Set 0 to disable iteration validation. Default: `10`"
+    doc_validation_epoch_freq = "Frequency or every how many epochs to do model validation on validation datasets. Set 0 to disable epoch validation. Default: `1`"
     doc_display_freq = "Frequency, or every how many iteration to display the training log to screem. Default: `1`"
     doc_use_tensorboard = (
         "Set true to use tensorboard. It will record iteration error once every `25` iterations, "
@@ -252,6 +309,10 @@ def train_options():
     doc_log_single_model_compatible_loss_mode = (
         "Reduction mode for reconstructing the compatible stitched loss. "
         "Currently the recommended mode is `reduce`. Default: `reduce`"
+    )
+    doc_clean_compatible_tensorboard = (
+        "Set true to write only six flat TensorBoard tags: valid onsite/hopping loss and "
+        "learning rate, each at iteration and epoch granularity. Default: `False`"
     )
 
     # ================= 轻量 debug tag =================
@@ -472,8 +533,10 @@ def train_options():
         # save / log
         Argument("save_freq", int, optional=True, default=10, doc=doc_save_freq),
         Argument("validation_freq", int, optional=True, default=10, doc=doc_validation_freq),
+        Argument("validation_epoch_freq", int, optional=True, default=1, doc=doc_validation_epoch_freq),
         Argument("display_freq", int, optional=True, default=1, doc=doc_display_freq),
         Argument("use_tensorboard", bool, optional=True, default=False, doc=doc_use_tensorboard),
+        Argument("clean_compatible_tensorboard", bool, optional=True, default=False, doc=doc_clean_compatible_tensorboard),
         Argument("max_ckpt", int, optional=True, default=4, doc=doc_max_ckpt),
 
         # distributed / DDP
@@ -561,6 +624,7 @@ def train_options():
         Argument("allow_tf32", bool, optional=True, default=True, doc=doc_allow_tf32),
         Argument("float32_matmul_precision", str, optional=True, default="", doc=doc_float32_matmul_precision),
 
+        flow_options(),
         loss_options()
     ]
 
@@ -572,10 +636,12 @@ def train_options():
 def test_options():
     doc_display_freq = "Frequency, or every how many iteration to display the training log to screem. Default: `1`"
     doc_batch_size = "The batch size used in testing, Default: 1"
+    doc_use_tensorboard = "Set true to write test loss and component loss scalars to TensorBoard. Default: `False`"
 
     args = [
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
         Argument("display_freq", int, optional=True, default=1, doc=doc_display_freq),
+        Argument("use_tensorboard", bool, optional=True, default=False, doc=doc_use_tensorboard),
         loss_options()
     ]
 
@@ -897,6 +963,9 @@ def data_options():
 def test_data_options():
 
     args = [
+        Argument("r_max", [float,int,None], optional=True, default=None, doc="r_max"),
+        Argument("oer_max", [float,int,None], optional=True, default=None, doc="oer_max"),
+        Argument("er_max", [float,int,None], optional=True, default=None, doc="er_max"),
         test_data_sub()
     ]
 
@@ -941,6 +1010,7 @@ def embedding():
             Argument("lem_moe_v3", dict, slem()),
             Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
+            Argument("qhflow2_escn", dict, slem_h0()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_moe", dict, slem()),
             Argument("lem_so2", dict, slem()),
@@ -1110,7 +1180,7 @@ def slem():
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
     doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. The 0425-stable branch defaults to `streamed_m_major_cueq`; `streamed_m_major_fused_p0` is an opt-in trainable prototype that treats Wigner/R as constants and falls back on unsupported shapes."
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
-    doc_so2_m_linear_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
+    doc_so2_m_linear_mode = "SO2 m-linear backend for non-MoE SO2 TP. Supported values are `standard`, `indexed_sandwich_multi`, or null; `cublas_grouped` is accepted only as a legacy alias. Triton experiment modes remain unsupported."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
 
@@ -1199,6 +1269,10 @@ def slem_h0():
         Argument("fallback_edge_key", str, optional=True, default="edge_features", doc=doc_fallback_edge_key),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
+        Argument("use_flow_time_embedding", bool, optional=True, default=False),
+        Argument("flow_time_key", str, optional=True, default="flow_time"),
+        Argument("flow_time_max_positions", int, optional=True, default=2000),
+        Argument("flow_time_missing_value", (int, float), optional=True, default=0.0),
     ]
 
 
@@ -1432,6 +1506,7 @@ def loss_options():
     doc_train = "Loss options for training."
     doc_validation = "Loss options for validation."
     doc_reference = "Loss options for reference data in training."
+    doc_test = "Loss options for testing."
     doc_model_basis_name = "The basis used by the model for the calculation of fock matrix. Default: def2svp"
     doc_on_the_fly_ovp_flag = "Calculate overlap matrices on the fly. Default: True"
     doc_on_the_fly_solve_eigen = "Get eigen values on the fly. Default: True"
@@ -1562,6 +1637,7 @@ def loss_options():
         Argument("train", dict, optional=False, sub_fields=[], sub_variants=[loss_args], doc=doc_train),
         Argument("validation", dict, optional=True, sub_fields=[], sub_variants=[loss_args], doc=doc_validation),
         Argument("reference", dict, optional=True, sub_fields=[], sub_variants=[loss_args], doc=doc_reference),
+        Argument("test", dict, optional=True, sub_fields=[], sub_variants=[loss_args], doc=doc_test),
     ]
 
     doc_loss_options = ""
@@ -1646,7 +1722,11 @@ def normalize_test(data):
     da = test_data_options()
     to = test_options()
 
-    base = Argument("base", dict, [co, da, to, lo])
+    loss_opts = data.get("test_options", {}).get("loss_options", {})
+    if isinstance(loss_opts, dict) and "test" in loss_opts and "train" not in loss_opts:
+        loss_opts["train"] = loss_opts["test"]
+
+    base = Argument("base", dict, [co, da, to])
     data = base.normalize_value(data)
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
@@ -2300,7 +2380,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "qhflow2_escn", "lem_moe_v3_edge_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")
@@ -2467,4 +2547,3 @@ def normalize_skf2nnsk(data):
     base.check_value(data, strict=True)
 
     return data
-

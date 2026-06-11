@@ -317,6 +317,7 @@ class SO2_Linear(torch.nn.Module):
             # === 新增参数 ===
             rotate_in: bool = True,
             rotate_out: bool = True,
+            so2_m_linear_mode: str = None,
     ):
         super(SO2_Linear, self).__init__()
 
@@ -325,6 +326,14 @@ class SO2_Linear(torch.nn.Module):
         self.radial_emb = radial_emb
         self.latent_dim = latent_dim
         self.m_linear = nn.ModuleList()
+        self.so2_m_linear_mode = so2_m_linear_mode or os.environ.get("DPTB_SO2_M_LINEAR_MODE", "standard")
+        if self.so2_m_linear_mode == "cublas_grouped":
+            self.so2_m_linear_mode = "indexed_sandwich_multi"
+        if self.so2_m_linear_mode not in ("standard", "indexed_sandwich_multi"):
+            raise ValueError(
+                "so2_m_linear_mode must be 'standard' or 'indexed_sandwich_multi', "
+                f"got {self.so2_m_linear_mode!r}"
+            )
 
         # 保存 flag
         self.rotate_in = rotate_in
@@ -376,6 +385,16 @@ class SO2_Linear(torch.nn.Module):
         for l in range(self.l_max + 1):
             self.offsets[l] = offset
             offset += self.dims[l]
+        self._in_entries, self._in_groups = self._build_layout_plans(self.irreps_in)
+        self._out_entries, self._out_groups = self._build_layout_plans(self.irreps_out)
+        self._in_entries_by_m = {
+            m: tuple(entry for entry in self._in_entries if entry[0] >= m)
+            for m in range(self.irreps_out.lmax + 1)
+        }
+        self._out_entries_by_m = {
+            m: tuple(entry for entry in self._out_entries if entry[0] >= m)
+            for m in range(self.irreps_out.lmax + 1)
+        }
 
     def forward(self, x, R, latents=None, wigner_D_all=None):
         n, _ = x.shape
@@ -389,6 +408,9 @@ class SO2_Linear(torch.nn.Module):
             if (self.rotate_in or self.rotate_out) and self.l_max > 0:
                 angle = xyz_to_angles(R[:, [1, 2, 0]])
                 wigner_D_all = batch_wigner_D(self.l_max, angle[0], angle[1], torch.zeros_like(angle[0]), _Jd)
+
+        if self._use_indexed_sandwich_multi_path(x):
+            return self._forward_indexed_sandwich_multi(x, weights if self.radial_emb else None, wigner_D_all)
 
         groups = defaultdict(list)
         for (mul, (l, p)), slice_info in zip(self.irreps_in, self.irreps_in.slices()):
@@ -454,6 +476,197 @@ class SO2_Linear(torch.nn.Module):
                 out[:, slice_in] = rotated.reshape(n, -1)
         return out.contiguous(), wigner_D_all
 
+    @staticmethod
+    def _build_layout_plans(irreps):
+        running_by_l = defaultdict(int)
+        groups = defaultdict(list)
+        entries = []
+        for (mul, (l, _p)), slice_info in zip(irreps, irreps.slices()):
+            group_start = running_by_l[l]
+            entries.append((l, mul, slice_info, group_start))
+            running_by_l[l] += mul
+            groups[l].append((mul, slice_info))
+        return tuple(entries), {
+            l: (
+                tuple(mul for mul, _ in specs),
+                tuple(slice_info for _, slice_info in specs),
+                sum(mul for mul, _ in specs),
+                2 * l + 1,
+            )
+            for l, specs in groups.items()
+        }
+
+    def _use_indexed_sandwich_multi_path(self, x):
+        if self.so2_m_linear_mode != "indexed_sandwich_multi":
+            return False
+        if x.device.type != "cuda" or x.dtype != torch.float32:
+            return False
+        if self.irreps_out.lmax < 1:
+            return False
+        return all(isinstance(module.fc, nn.Linear) for module in self.m_linear)
+
+    def _select_wigner_block(self, wigner_D_all, l):
+        start = self.offsets[l]
+        dim = self.dims[l]
+        return wigner_D_all[:, start:start + dim, start:start + dim]
+
+    def _gather_l_group(self, x, l):
+        muls, slices, _total_mul, dims = self._in_groups[l]
+        n = x.shape[0]
+        parts = [
+            x[:, slice_info].reshape(n, mul, dims)
+            for mul, slice_info in zip(muls, slices)
+        ]
+        if len(parts) == 1:
+            return parts[0].contiguous()
+        return torch.cat(parts, dim=1).contiguous()
+
+    def _pack_group_m0(self, x_group, l, rot_block):
+        if x_group.numel() == 0:
+            return x_group.new_empty((x_group.shape[0], x_group.shape[1]))
+        if l == 0 or not self.rotate_in or rot_block is None:
+            return x_group[:, :, l]
+        return torch.einsum("ncd,nd->nc", x_group, rot_block[:, :, l])
+
+    def _pack_group_pair(self, x_group, l, m, rot_block):
+        if x_group.numel() == 0:
+            return x_group.new_empty((x_group.shape[0], 2, x_group.shape[1]))
+        rows = [l - m, l + m]
+        if not self.rotate_in or rot_block is None:
+            return x_group[:, :, rows].transpose(1, 2).contiguous()
+        return torch.einsum("ncd,ndp->npc", x_group, rot_block[:, :, rows])
+
+    def _alloc_output_l_groups(self, n, *, dtype, device):
+        return {
+            l: torch.zeros((n, total_mul, dims), dtype=dtype, device=device)
+            for l, (_muls, _slices, total_mul, dims) in self._out_groups.items()
+        }
+
+    def _assemble_grouped_m0_input(self, input_groups, rot_blocks, n, x_template):
+        packed_by_l = {
+            l: self._pack_group_m0(x_group, l, rot_blocks.get(l))
+            for l, x_group in input_groups.items()
+        }
+        parts = [
+            packed_by_l[l][:, group_start:group_start + mul]
+            for l, mul, _slice_info, group_start in self._in_entries_by_m[0]
+        ]
+        if not parts:
+            return x_template.new_empty((n, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)
+
+    def _assemble_grouped_pair_input(self, input_groups, rot_blocks, m, n, x_template):
+        packed_by_l = {}
+        for l, x_group in input_groups.items():
+            if l >= m:
+                packed_by_l[l] = self._pack_group_pair(x_group, l, m, rot_blocks.get(l))
+        parts = [
+            packed_by_l[l][:, :, group_start:group_start + mul]
+            for l, mul, _slice_info, group_start in self._in_entries_by_m[m]
+            if l in packed_by_l
+        ]
+        if not parts:
+            return x_template.new_empty((n, 2, 0))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=2)
+
+    def _accumulate_group_m0_(self, out_group, y_group, l, rot_block):
+        if y_group.numel() == 0:
+            return
+        if l == 0 or not self.rotate_out or rot_block is None:
+            out_group[:, :, l] += y_group
+            return
+        out_group += y_group.unsqueeze(-1) * rot_block[:, :, l].unsqueeze(1)
+
+    def _accumulate_group_pair_(self, out_group, y_group, l, m, rot_block):
+        if y_group.numel() == 0:
+            return
+        rows = [l - m, l + m]
+        if not self.rotate_out or rot_block is None:
+            out_group[:, :, rows] += y_group.transpose(1, 2)
+            return
+        out_group += torch.einsum("npc,ndp->ncd", y_group, rot_block[:, :, rows])
+
+    def _accumulate_grouped_m0_output_(self, out_groups, y_m0, rot_blocks):
+        cursor = 0
+        for l, mul, _slice_info, group_start in self._out_entries_by_m[0]:
+            y_entry = y_m0[:, cursor:cursor + mul]
+            cursor += mul
+            out_view = out_groups[l][:, group_start:group_start + mul, :]
+            self._accumulate_group_m0_(out_view, y_entry, l, rot_blocks.get(l))
+
+    def _accumulate_grouped_pair_output_(self, out_groups, y_m, rot_blocks, m):
+        cursor = 0
+        for l, mul, _slice_info, group_start in self._out_entries_by_m[m]:
+            y_entry = y_m[:, :, cursor:cursor + mul]
+            cursor += mul
+            out_view = out_groups[l][:, group_start:group_start + mul, :]
+            self._accumulate_group_pair_(out_view, y_entry, l, m, rot_blocks.get(l))
+
+    def _materialize_output_l_groups(self, out_groups, *, n, dtype, device):
+        out = torch.zeros((n, self.irreps_out.dim), dtype=dtype, device=device)
+        for l, mul, slice_info, group_start in self._out_entries:
+            group_view = out_groups[l][:, group_start:group_start + mul, :]
+            out[:, slice_info] = group_view.reshape(n, -1)
+        return out
+
+    def _apply_indexed_sandwich_multi_gemm(self, x_inputs):
+        from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
+
+        weights = [module.fc.weight.unsqueeze(0).contiguous() for module in self.m_linear[:len(x_inputs)]]
+        ptrs = [
+            torch.tensor([0, x_m.reshape(-1, x_m.shape[-1]).shape[0]], dtype=torch.long, device="cpu")
+            for x_m in x_inputs
+        ]
+        return indexed_sandwich_multi_gemm(x_inputs, ptrs, weights)
+
+    def _forward_indexed_sandwich_multi(self, x, weights, wigner_D_all):
+        n, _ = x.shape
+        rot_blocks = {
+            l: self._select_wigner_block(wigner_D_all, l)
+            for l in range(self.l_max + 1)
+        }
+        input_groups = {
+            l: self._gather_l_group(x, l)
+            for l in self._in_groups
+        }
+        out_groups = self._alloc_output_l_groups(n, dtype=x.dtype, device=x.device)
+
+        radial_weight = weights[:, self.m_in_index[0]:self.m_in_index[1]].unsqueeze(1) if self.radial_emb else 1.
+        inp = self._assemble_grouped_m0_input(input_groups, rot_blocks, n, x)
+        if self.front and self.radial_emb:
+            y_m0 = self.fc_m0(inp * radial_weight.squeeze(1))
+        elif self.radial_emb:
+            y_m0 = self.fc_m0(inp) * radial_weight.squeeze(1)
+        else:
+            y_m0 = self.fc_m0(inp)
+        self._accumulate_grouped_m0_output_(out_groups, y_m0, rot_blocks)
+
+        x_inputs = []
+        post_radial_weights = []
+        for m in range(1, self.irreps_out.lmax + 1):
+            radial_weight = weights[:, self.m_in_index[m]:self.m_in_index[m + 1]].unsqueeze(1) if self.radial_emb else None
+            x_m_in = self._assemble_grouped_pair_input(input_groups, rot_blocks, m, n, x)
+            if self.front and self.radial_emb:
+                x_m_in = x_m_in * radial_weight
+                post_radial_weights.append(None)
+            else:
+                post_radial_weights.append(radial_weight)
+            x_inputs.append(x_m_in)
+
+        raw_outputs = self._apply_indexed_sandwich_multi_gemm(x_inputs)
+        for m, raw_output, radial_weight, module in zip(range(1, self.irreps_out.lmax + 1), raw_outputs, post_radial_weights, self.m_linear):
+            linear_output = module._finish_linear_output(raw_output)
+            if radial_weight is not None:
+                linear_output = linear_output * radial_weight
+            self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
+
+        out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
+        return out.contiguous(), wigner_D_all
+
 
 class SO2_m_Linear(torch.nn.Module):
     def __init__(
@@ -477,6 +690,9 @@ class SO2_m_Linear(torch.nn.Module):
     def forward(self, x_m):
         # x_m ~ [N, 2, n_channels]
         x_m = self.fc(x_m)
+        return self._finish_linear_output(x_m)
+
+    def _finish_linear_output(self, x_m):
         x_r = x_m.narrow(2, 0, self.num_out_channel)
         x_i = x_m.narrow(2, self.num_out_channel, self.num_out_channel)
         x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)

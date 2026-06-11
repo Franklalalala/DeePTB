@@ -11,8 +11,8 @@ from typing import Optional
 from dptb.utils.loggers import set_log_handles
 from dptb.utils.tools import j_loader, setup_seed
 from dptb.nnops.tester import Tester
-from dptb.utils.argcheck import normalize_test
-from dptb.plugins.monitor import TestLossMonitor
+from dptb.utils.argcheck import normalize_test, collect_cutoffs
+from dptb.plugins.monitor import TestLossMonitor, TensorBoardMonitor, ScalarFieldMonitor
 from dptb.plugins.train_logger import Logger
 
 __all__ = ["test"]
@@ -25,7 +25,7 @@ def _test(
         output: str,
         log_level: int,
         log_path: Optional[str],
-        use_correction: Optional[str],
+        use_correction: Optional[str] = None,
         **kwargs
 ):
     # TODO: permit commandline init_model and config file init.
@@ -74,7 +74,12 @@ def _test(
     jdata["model_options"] = f["config"]["model_options"]
     del f
     
-    test_datasets = build_dataset(**jdata["data_options"]["test"], **jdata["common_options"])
+    cutoff_options = collect_cutoffs(jdata)
+    cutoff_options = {
+        key: cutoff_options.get(key, jdata["data_options"].get(key))
+        for key in ("r_max", "oer_max", "er_max")
+    }
+    test_datasets = build_dataset(**cutoff_options, **jdata["data_options"]["test"], **jdata["common_options"])
     model = build_model(run_opt["init_model"], model_options=jdata["model_options"], common_options=jdata["common_options"])
     model.eval()
     tester = Tester(
@@ -86,7 +91,19 @@ def _test(
 
     # register the plugin in tester, to tract training info
     tester.register_plugin(TestLossMonitor())
-    tester.register_plugin(Logger(["test_loss"], 
+    for test_field in ("test_onsite_loss", "test_hopping_loss"):
+        tester.register_plugin(
+            ScalarFieldMonitor(
+                stat_name=test_field,
+                interval=[(1, 'iteration'), (1, 'epoch')],
+            )
+        )
+
+    if bool(jdata.get("test_options", {}).get("use_tensorboard", False)):
+        tb_dir = os.path.join(str(output), "tensorboard_logs") if output else "./tensorboard_logs"
+        tester.register_plugin(TensorBoardMonitor(interval=[(1, 'epoch')], log_dir=tb_dir))
+
+    tester.register_plugin(Logger(["test_loss", "test_onsite_loss", "test_hopping_loss"],
         interval=[(1, 'iteration'), (1, 'epoch')]))
     
     for q in tester.plugin_queues.values():

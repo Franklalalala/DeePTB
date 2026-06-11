@@ -29,10 +29,25 @@ class Tester(BaseTester):
         
         self.test_datasets = test_datasets
 
-        self.test_loader = DataLoader(dataset=self.train_datasets, batch_size=test_options["batch_size"], shuffle=False)
+        self.test_loader = DataLoader(dataset=self.test_datasets, batch_size=test_options["batch_size"], shuffle=False)
 
         # loss function
         self.test_lossfunc = Loss(**test_options["loss_options"]["test"], **common_options, idp=self.model.hamiltonian.idp)
+
+    def build(self):
+        return self
+
+    @staticmethod
+    def _loss_component_state(lossfunc, *, prefix="test"):
+        loss_obj = getattr(lossfunc, "loss", lossfunc)
+        state = {}
+        onsite_comp = getattr(loss_obj, "last_onsite_loss", None)
+        hopping_comp = getattr(loss_obj, "last_hopping_loss", None)
+        if onsite_comp is not None:
+            state[f"{prefix}_onsite_loss"] = onsite_comp
+        if hopping_comp is not None:
+            state[f"{prefix}_hopping_loss"] = hopping_comp
+        return state
     
     def iteration(self, batch):
         '''
@@ -62,9 +77,10 @@ class Tester(BaseTester):
         batch.update(batch_info)
         batch_for_loss.update(batch_info)
 
-        loss = self.train_lossfunc(batch, batch_for_loss)
+        loss = self.test_lossfunc(batch, batch_for_loss)
 
         state = {'field':'iteration', "test_loss": loss.detach()}
+        state.update(self._loss_component_state(self.test_lossfunc, prefix="test"))
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1
 

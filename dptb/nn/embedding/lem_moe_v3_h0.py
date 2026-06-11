@@ -12,6 +12,7 @@ from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
 from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
 from .lem_moe_v3_h0_helpers import H0InitLayer
+from .flow_time import FlowTimeConditioner
 
 
 @Embedding.register("lem_moe_v3_h0")
@@ -28,10 +29,26 @@ class LemMoEV3H0(LemMoEV3):
         fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
         h0_merge_mode: str = "replace",
         h0_self_edge_tol: float = 1e-8,
+        use_flow_time_embedding: bool = False,
+        flow_time_key: str = "flow_time",
+        flow_time_max_positions: int = 2000,
+        flow_time_missing_value: float = 0.0,
+        env_embed_multiplicity: int = 32,
         **kwargs: Any,
     ):
-        super().__init__(**kwargs)
+        super().__init__(env_embed_multiplicity=env_embed_multiplicity, **kwargs)
         self.use_h0_init = use_h0_init
+        self.use_flow_time_embedding = bool(use_flow_time_embedding)
+        self.flow_time_conditioner = (
+            FlowTimeConditioner(
+                scalar_channels=env_embed_multiplicity,
+                flow_time_key=flow_time_key,
+                max_positions=flow_time_max_positions,
+                missing_time_value=flow_time_missing_value,
+            )
+            if self.use_flow_time_embedding
+            else None
+        )
         if h0_fallback_to_hamiltonian is not None:
             fallback_to_hamiltonian = bool(h0_fallback_to_hamiltonian)
 
@@ -100,6 +117,8 @@ class LemMoEV3H0(LemMoEV3):
             precomputed_active_edges,
             precomputed_cutoff_coeffs,
         )
+        if self.flow_time_conditioner is not None:
+            node_features = self.flow_time_conditioner(node_features, data)
 
         if node_features.shape[0] < num_nodes_total:
             safe_node_one_hot = node_one_hot[: node_features.shape[0]]

@@ -11,6 +11,7 @@ from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
 from dptb.nnops.loss import Loss
+from dptb.nnops.flow import HamiltonianCFM
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +95,17 @@ class Trainer(BaseTrainer):
             self.reference_lossfunc = Loss(**train_options["loss_options"]["reference"], **common_options,
                                            idp=self.model.hamiltonian.idp)
 
+        self.flow_cfm = HamiltonianCFM(
+            train_options.get("flow_options", None),
+            idp=self.model.hamiltonian.idp,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.log_single_model_compatible_loss = bool(
+            train_options.get("log_single_model_compatible_loss", True)
+        )
+        self._last_flow_state = {}
+
         if train_options["loss_options"]["train"]["method"] == "skints":
             assert self.model.name == 'nnsk', "The model should be nnsk for the skints loss function."
             assert self.model.onsite_fn.functype in ['none',
@@ -130,19 +142,51 @@ class Trainer(BaseTrainer):
         batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
+        if self.flow_cfm.enabled:
+            batch, batch_for_loss, flow_ctx = self.flow_cfm.prepare_batch(batch, batch_for_loss)
+            batch = self.model(batch)
+            batch.update(batch_info)
+            batch_for_loss.update(batch_info)
+            loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
+            if self.flow_cfm.log_train_compatible_loss:
+                flow_state.update(
+                    self._compatible_loss_state(
+                        lossfunc,
+                        batch,
+                        batch_for_loss,
+                        prefix="train_compatible",
+                        legacy_prefix=(
+                            "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
+                        ),
+                    )
+                )
+            self._last_flow_state = flow_state
+            return loss
+        self._last_flow_state = {}
         batch = self.model(batch)
         batch.update(batch_info)
         batch_for_loss.update(batch_info)
         return lossfunc(batch, batch_for_loss)
 
-    def _loss_component_state(self, lossfunc, *, prefix="train"):
+    @staticmethod
+    def _loss_component_source(lossfunc):
         loss_obj = lossfunc
         for attr in ("lossfunc", "loss_fn", "criterion", "method", "loss"):
             inner = getattr(loss_obj, attr, None)
             if isinstance(inner, nn.Module):
                 loss_obj = inner
                 break
+        return loss_obj
 
+    _COMPATIBLE_LOSS_SIDE_EFFECT_ATTRS = (
+        "last_onsite_loss",
+        "last_hopping_loss",
+        "last_z_loss",
+        "expert_load_cv",
+    )
+
+    def _loss_component_state(self, lossfunc, *, prefix="train"):
+        loss_obj = self._loss_component_source(lossfunc)
         state = {}
         onsite_comp = getattr(loss_obj, "last_onsite_loss", None)
         hopping_comp = getattr(loss_obj, "last_hopping_loss", None)
@@ -158,6 +202,35 @@ class Trainer(BaseTrainer):
         if z_loss_comp is not None:
             state["mean_max_prob" if prefix == "train" else f"{prefix}_mean_max_prob"] = z_loss_comp
         return state
+
+    def _compatible_loss_state(self, lossfunc, pred, ref, *, prefix, legacy_prefix=None):
+        loss_obj = self._loss_component_source(lossfunc)
+        saved = {
+            attr: getattr(loss_obj, attr, None)
+            for attr in self._COMPATIBLE_LOSS_SIDE_EFFECT_ATTRS
+            if hasattr(loss_obj, attr)
+        }
+        with torch.no_grad():
+            compatible_loss = lossfunc(pred, ref)
+            state = {f"{prefix}_loss": compatible_loss.detach()}
+            state.update(self._loss_component_state(lossfunc, prefix=prefix))
+            if legacy_prefix is not None:
+                onsite_key = f"{prefix}_onsite_loss"
+                hopping_key = f"{prefix}_hopping_loss"
+                if onsite_key in state:
+                    state[f"{legacy_prefix}_onsite_loss"] = state[onsite_key]
+                if hopping_key in state:
+                    state[f"{legacy_prefix}_hopping_loss"] = state[hopping_key]
+        for attr, value in saved.items():
+            setattr(loss_obj, attr, value)
+        return state
+
+    @staticmethod
+    def _accumulate_metric_state(metric_sums, state):
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                value = value.detach()
+            metric_sums[key] = metric_sums.get(key, 0.0) + value
 
     def iteration(self, batch, ref_batch=None):
         '''
@@ -203,8 +276,10 @@ class Trainer(BaseTrainer):
             "total_grad_norm": total_norm.item()
         }
         state.update(dynamic_batch_state)
-        state.update(self._loss_component_state(self.train_lossfunc))
+        if not self.flow_cfm.enabled:
+            state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
+        state.update(getattr(self, "_last_flow_state", {}))
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1
@@ -259,6 +334,8 @@ class Trainer(BaseTrainer):
     def validation(self, fast=True):
         with torch.no_grad():
             loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
+            flow_metric_sums = {}
+            num_batches = 0
             self.model.eval()
             for batch in self.validation_loader:
                 batch = batch.to(self.device)
@@ -267,11 +344,80 @@ class Trainer(BaseTrainer):
                               "__data_class__": batch.__data_class__}
                 batch = AtomicData.to_AtomicDataDict(batch)
                 batch_for_loss = batch.copy()
-                batch = self.model(batch)
-                batch.update(batch_info)
-                batch_for_loss.update(batch_info)
-                loss += self.validation_lossfunc(batch, batch_for_loss)
-                if fast: break
-        if not fast: loss = loss / len(self.validation_loader)
-        return loss
+                if self.flow_cfm.enabled:
+                    original_batch = batch.copy()
+                    flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                        original_batch, batch_for_loss
+                    )
+                    flow_pred = self.model(flow_batch)
+                    random_t_loss, _ = self.flow_cfm.loss(flow_pred, flow_ref, flow_ctx)
+                    loss += random_t_loss
+                    flow_metric_sums["validation_flow_random_t_loss"] = (
+                        flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
+                        + random_t_loss.detach()
+                    )
 
+                    num_graphs = self.flow_cfm._num_graphs(original_batch)
+                    zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
+                    t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
+                        original_batch, batch_for_loss, t=zero_t
+                    )
+                    t0_pred = self.model(t0_batch)
+                    t0_pred.update(batch_info)
+                    t0_ref.update(batch_info)
+                    t0_loss, _ = self.flow_cfm.loss(t0_pred, t0_ref, t0_ctx)
+                    flow_metric_sums["validation_flow_t0_loss"] = (
+                        flow_metric_sums.get("validation_flow_t0_loss", 0.0) + t0_loss.detach()
+                    )
+                    for num_steps in self.flow_cfm.validation_ode_steps:
+                        sampled = self.flow_cfm.sample(
+                            self.model, original_batch, num_steps=num_steps
+                        )
+                        sampled.update(batch_info)
+                        sample_loss, _ = self.flow_cfm.loss(sampled, t0_ref, t0_ctx)
+                        key = f"validation_flow_euler_{num_steps}_loss"
+                        flow_metric_sums[key] = (
+                            flow_metric_sums.get(key, 0.0) + sample_loss.detach()
+                        )
+                        if self.flow_cfm.log_validation_compatible_loss:
+                            self._accumulate_metric_state(
+                                flow_metric_sums,
+                                self._compatible_loss_state(
+                                    self.validation_lossfunc,
+                                    sampled,
+                                    t0_ref,
+                                    prefix=f"validation_compatible_euler_{num_steps}",
+                                    legacy_prefix="validation" if int(num_steps) == 1 else None,
+                                ),
+                            )
+                else:
+                    batch = self.model(batch)
+                    batch.update(batch_info)
+                    batch_for_loss.update(batch_info)
+                    batch_loss = self.validation_lossfunc(batch, batch_for_loss)
+                    loss += batch_loss
+                    if self.log_single_model_compatible_loss:
+                        direct_state = {
+                            "validation_compatible_euler_1_loss": batch_loss.detach(),
+                        }
+                        component_state = self._loss_component_state(
+                            self.validation_lossfunc,
+                            prefix="validation",
+                        )
+                        direct_state.update(component_state)
+                        for component in ("onsite_loss", "hopping_loss"):
+                            source_key = f"validation_{component}"
+                            if source_key in component_state:
+                                direct_state[
+                                    f"validation_compatible_euler_1_{component}"
+                                ] = component_state[source_key]
+                        self._accumulate_metric_state(flow_metric_sums, direct_state)
+                num_batches += 1
+                if fast: break
+        divisor = max(num_batches, 1)
+        if not fast:
+            loss = loss / divisor
+        self._last_flow_validation_state = {
+            key: value / divisor for key, value in flow_metric_sums.items()
+        }
+        return loss

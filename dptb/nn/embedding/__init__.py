@@ -22,6 +22,7 @@ from .lem_light import LemLight
 from .lem_light_v2 import LemLightV2
 from .lem_charge import LemCharge
 from .lem_moe_v3_h0 import LemMoEV3H0
+from .qhflow2_escn import QHFlow2ESCNEmbedding
 from .lem_in_frame import LemInFrame, LemInFrameOpenequi
 from .lem_moe_charge import LemMoECharge
 from .lem_in_frame_heavy import LemInFrameHeavy
@@ -64,6 +65,7 @@ __all__ = [
     "LemMoEV3Edge",
     "LemMoEV3EdgeH0",
     "LemMoEV3H0",
+    "QHFlow2ESCNEmbedding",
     "LemMoETopK",
     "LemSO2Global",
     "LemGlobal",
