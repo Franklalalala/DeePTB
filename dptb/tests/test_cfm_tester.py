@@ -20,7 +20,12 @@ class _FakeBatch:
 
 
 class _EndpointModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.grad_enabled = []
+
     def forward(self, data):
+        self.grad_enabled.append(torch.is_grad_enabled())
         out = data.copy()
         out["node_features"] = torch.full_like(data["node_h0"], 2.0)
         out["edge_features"] = torch.full_like(data["edge_h0"], 4.0)
@@ -70,3 +75,5 @@ def test_tester_reports_cfm_sampling_metrics_instead_of_using_direct_loss(monkey
     assert observed[0]["test_direct_target_fed_loss"].item() == 0.0
     assert observed[0]["test_cfm_euler_1_loss"].item() == 0.0
     assert observed[0]["test_cfm_euler_3_loss"].item() == 0.0
+    assert tester.model.grad_enabled
+    assert not any(tester.model.grad_enabled)

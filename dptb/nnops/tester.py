@@ -86,63 +86,65 @@ class Tester(BaseTester):
 
         batch_for_loss = batch.copy() # make a shallow copy in case the model change the batch data
         if self.flow_cfm.enabled:
-            state = {'field': 'iteration'}
-            if self.log_direct_target_fed_loss:
-                direct_batch = batch.copy()
-                like = direct_batch.get(
-                    self.flow_cfm.node_target_key,
-                    direct_batch.get(self.flow_cfm.edge_target_key),
-                )
-                direct_batch[self.flow_cfm.flow_time_key] = torch.ones(
-                    self.flow_cfm._num_graphs(direct_batch),
-                    device=like.device,
-                    dtype=like.dtype,
-                )
-                direct_pred = self.model(direct_batch)
-                direct_pred.update(batch_info)
-                batch_for_loss.update(batch_info)
-                direct_loss = self.test_lossfunc(direct_pred, batch_for_loss)
-                state["test_direct_target_fed_loss"] = direct_loss.detach()
-                state.update(
-                    self._loss_component_state(
-                        self.test_lossfunc,
-                        prefix="test_direct_target_fed",
+            with torch.no_grad():
+                state = {'field': 'iteration'}
+                if self.log_direct_target_fed_loss:
+                    direct_batch = batch.copy()
+                    like = direct_batch.get(
+                        self.flow_cfm.node_target_key,
+                        direct_batch.get(self.flow_cfm.edge_target_key),
                     )
-                )
+                    direct_batch[self.flow_cfm.flow_time_key] = torch.ones(
+                        self.flow_cfm._num_graphs(direct_batch),
+                        device=like.device,
+                        dtype=like.dtype,
+                    )
+                    direct_pred = self.model(direct_batch)
+                    direct_pred.update(batch_info)
+                    batch_for_loss.update(batch_info)
+                    direct_loss = self.test_lossfunc(direct_pred, batch_for_loss)
+                    state["test_direct_target_fed_loss"] = direct_loss.detach()
+                    state.update(
+                        self._loss_component_state(
+                            self.test_lossfunc,
+                            prefix="test_direct_target_fed",
+                        )
+                    )
 
-            primary_loss = None
-            for num_steps in self.flow_cfm.validation_ode_steps:
-                sampled = self.flow_cfm.sample(self.model, batch, num_steps=num_steps)
-                sampled.update(batch_info)
-                batch_for_loss.update(batch_info)
-                sample_loss = self.test_lossfunc(sampled, batch_for_loss)
-                prefix = f"test_cfm_euler_{num_steps}"
-                state[f"{prefix}_loss"] = sample_loss.detach()
-                component_state = self._loss_component_state(self.test_lossfunc, prefix=prefix)
-                state.update(component_state)
+                primary_loss = None
+                for num_steps in self.flow_cfm.validation_ode_steps:
+                    sampled = self.flow_cfm.sample(self.model, batch, num_steps=num_steps)
+                    sampled.update(batch_info)
+                    batch_for_loss.update(batch_info)
+                    sample_loss = self.test_lossfunc(sampled, batch_for_loss)
+                    prefix = f"test_cfm_euler_{num_steps}"
+                    state[f"{prefix}_loss"] = sample_loss.detach()
+                    component_state = self._loss_component_state(self.test_lossfunc, prefix=prefix)
+                    state.update(component_state)
+                    if primary_loss is None:
+                        primary_loss = sample_loss
+                        for component in ("onsite_loss", "hopping_loss"):
+                            source_key = f"{prefix}_{component}"
+                            if source_key in component_state:
+                                state[f"test_{component}"] = component_state[source_key]
                 if primary_loss is None:
-                    primary_loss = sample_loss
-                    for component in ("onsite_loss", "hopping_loss"):
-                        source_key = f"{prefix}_{component}"
-                        if source_key in component_state:
-                            state[f"test_{component}"] = component_state[source_key]
-            if primary_loss is None:
-                raise ValueError("CFM testing requires at least one positive flow_ode_steps value.")
-            state["test_loss"] = primary_loss.detach()
+                    raise ValueError("CFM testing requires at least one positive flow_ode_steps value.")
+                state["test_loss"] = primary_loss.detach()
             self.call_plugins(queue_name='iteration', time=self.iter, **state)
             self.iter += 1
             return primary_loss.detach()
 
         #TODO: the rescale/normalization can be added here
-        batch = self.model(batch)
+        with torch.no_grad():
+            batch = self.model(batch)
 
-        #TODO: this could make the loss function unjitable since t he batchinfo in batch and batch_for_loss does not necessarily 
-        #       match the torch.Tensor requiresment, should be improved further
+            #TODO: this could make the loss function unjitable since t he batchinfo in batch and batch_for_loss does not necessarily
+            #       match the torch.Tensor requiresment, should be improved further
 
-        batch.update(batch_info)
-        batch_for_loss.update(batch_info)
+            batch.update(batch_info)
+            batch_for_loss.update(batch_info)
 
-        loss = self.test_lossfunc(batch, batch_for_loss)
+            loss = self.test_lossfunc(batch, batch_for_loss)
 
         state = {'field':'iteration', "test_loss": loss.detach()}
         state.update(self._loss_component_state(self.test_lossfunc, prefix="test"))

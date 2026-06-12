@@ -72,7 +72,9 @@ class QHFlow2ESCNEmbedding(nn.Module):
     This is a diagnostic bridge: DPTB still owns LMDB loading, CFM target
     construction, and e3tb feature order, while QHFlow2 supplies the message
     passing backbone. The current DPTB node/edge features are pooled into a
-    graph-level Hamiltonian context for the QHFlow2 matrix input path.
+    graph-level Hamiltonian context for the QHFlow2 matrix input path. The
+    node/edge heads are dense adapters supervised in DPTB RME order; they do
+    not by themselves prove an architecture-level m-order/equivariant contract.
     """
 
     def __init__(
@@ -89,6 +91,11 @@ class QHFlow2ESCNEmbedding(nn.Module):
         context_hidden: int = 256,
         head_hidden: int = 256,
         ham_context_mode: str = "features",
+        h0_node_key: str = _keys.NODE_H0_KEY,
+        h0_edge_key: str = _keys.EDGE_H0_KEY,
+        fallback_node_key: str = _keys.NODE_FEATURES_KEY,
+        fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
+        strict_ham_context_h0: bool = True,
         use_flow_time_embedding: bool = True,
         flow_time_key: str = "flow_time",
         allow_missing_flow_time: bool = False,
@@ -111,6 +118,11 @@ class QHFlow2ESCNEmbedding(nn.Module):
                 "QHFlow2ESCNEmbedding ham_context_mode must be 'features' or 'zero', "
                 f"got {self.ham_context_mode!r}"
             )
+        self.h0_node_key = str(h0_node_key)
+        self.h0_edge_key = str(h0_edge_key)
+        self.fallback_node_key = str(fallback_node_key)
+        self.fallback_edge_key = str(fallback_edge_key)
+        self.strict_ham_context_h0 = bool(strict_ham_context_h0)
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
         if not self.use_flow_time_embedding:
             raise ValueError(
@@ -214,9 +226,18 @@ class QHFlow2ESCNEmbedding(nn.Module):
         data: AtomicDataDict.Type,
         h0_key: str,
         feature_key: str,
+        *,
+        label: str,
     ) -> torch.Tensor | None:
         value = data.get(h0_key, None)
         if value is None:
+            if self.strict_ham_context_h0:
+                raise KeyError(
+                    "QHFlow2ESCNEmbedding ham_context_mode='features' requires "
+                    f"`{h0_key}` for the {label} context. Disable "
+                    "strict_ham_context_h0 only for an explicit target-fed ablation, "
+                    "or use ham_context_mode='zero'."
+                )
             value = data.get(feature_key, None)
         return value
 
@@ -262,7 +283,12 @@ class QHFlow2ESCNEmbedding(nn.Module):
                 dtype=self.dtype,
             )
 
-        node = self._context_value(data, _keys.NODE_H0_KEY, _keys.NODE_FEATURES_KEY)
+        node = self._context_value(
+            data,
+            self.h0_node_key,
+            self.fallback_node_key,
+            label="node",
+        )
         if node is None:
             node = torch.zeros(batch.numel(), self.rme_dim, device=batch.device, dtype=self.dtype)
         node_ctx = self._masked_graph_mean(
@@ -272,7 +298,12 @@ class QHFlow2ESCNEmbedding(nn.Module):
             data.get("expert_node_mask", None),
         )
 
-        edge = self._context_value(data, _keys.EDGE_H0_KEY, _keys.EDGE_FEATURES_KEY)
+        edge = self._context_value(
+            data,
+            self.h0_edge_key,
+            self.fallback_edge_key,
+            label="edge",
+        )
         if edge is None:
             edge_ctx = torch.zeros(num_graphs, self.rme_dim, device=batch.device, dtype=self.dtype)
         elif edge.shape[0] == 0:

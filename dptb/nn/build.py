@@ -327,6 +327,31 @@ def _maybe_enable_legacy_swiglu_s2_compat(model_options: dict, state_dict: dict)
     return patched
 
 
+def _align_qhflow2_escn_with_flow_options(model_options: dict, train_options: dict):
+    if not model_options or not train_options:
+        return model_options
+    embedding = model_options.get("embedding", None)
+    if not isinstance(embedding, dict) or embedding.get("method") != "qhflow2_escn":
+        return model_options
+    flow_options = train_options.get("flow_options", None)
+    if not isinstance(flow_options, dict) or not flow_options.get("enabled", False):
+        return model_options
+
+    patched = copy.deepcopy(model_options)
+    embedding = patched.setdefault("embedding", {})
+    for flow_key, embedding_key in (
+        ("node_h0_key", "h0_node_key"),
+        ("edge_h0_key", "h0_edge_key"),
+        ("node_target_key", "fallback_node_key"),
+        ("edge_target_key", "fallback_edge_key"),
+        ("flow_time_key", "flow_time_key"),
+        ("strict_ham_context_h0", "strict_ham_context_h0"),
+    ):
+        if flow_key in flow_options and embedding_key not in embedding:
+            embedding[embedding_key] = flow_options[flow_key]
+    return patched
+
+
 def _build_ensemble_from_wrapper_state(wrapper_state_dict, distance_ranges, init_nnenv, init_nnsk, init_mixed,
                                        init_dftbsk, model_options, common_options):
     ckpt_num_experts = _count_experts_in_state_dict(wrapper_state_dict)
@@ -391,6 +416,7 @@ def build_model(
         del ckptconfig
 
     model_options = _maybe_enable_legacy_swiglu_s2_compat(model_options, ckpt_state_dict)
+    model_options = _align_qhflow2_escn_with_flow_options(model_options, train_options)
 
     if model_options.get("dftbsk"):
         assert not model_options.get("nnsk"), "There should only be one of the dftbsk and nnsk in model_options."

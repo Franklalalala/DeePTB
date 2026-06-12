@@ -196,6 +196,7 @@ def flow_options():
         Argument("detach_interpolated_h0", bool, optional=True, default=True),
         Argument("warn_missing_h0", bool, optional=True, default=True),
         Argument("strict_h0", bool, optional=True, default=True),
+        Argument("strict_ham_context_h0", bool, optional=True, default=True),
     ]
     return Argument(
         "flow_options",
@@ -1272,7 +1273,6 @@ def slem_h0():
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False),
-        Argument("ham_context_mode", str, optional=True, default="features"),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
         Argument("flow_time_max_positions", int, optional=True, default=2000),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0),
@@ -1297,6 +1297,11 @@ def qhflow2_escn():
         Argument("context_hidden", int, optional=True, default=256),
         Argument("head_hidden", int, optional=True, default=256),
         Argument("ham_context_mode", str, optional=True, default="features"),
+        Argument("h0_node_key", str, optional=True, default="node_h0"),
+        Argument("h0_edge_key", str, optional=True, default="edge_h0"),
+        Argument("fallback_node_key", str, optional=True, default="node_features"),
+        Argument("fallback_edge_key", str, optional=True, default="edge_features"),
+        Argument("strict_ham_context_h0", bool, optional=True, default=True),
         Argument("use_flow_time_embedding", bool, optional=True, default=True),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
         Argument("allow_missing_flow_time", bool, optional=True, default=False),
