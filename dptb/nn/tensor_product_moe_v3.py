@@ -247,6 +247,22 @@ def _select_wigner_block(wigner_D_all, l: int, offsets, dims):
     return wigner_D_all[:, start:start + dim, start:start + dim]
 
 
+def _wigner_rotation_covers_lmax(wigner_D_all, l_max: int, offsets, dims) -> bool:
+    if wigner_D_all is None:
+        return False
+    if l_max <= 0:
+        return True
+    if isinstance(wigner_D_all, SO2WignerBlocks):
+        return len(wigner_D_all.blocks) > l_max
+    if not torch.is_tensor(wigner_D_all) or wigner_D_all.dim() < 3:
+        return False
+    required_dim = offsets[l_max] + dims[l_max]
+    return (
+        wigner_D_all.shape[-2] >= required_dim
+        and wigner_D_all.shape[-1] >= required_dim
+    )
+
+
 @dataclass(frozen=True)
 class _SO2EntryPlan:
     l: int
@@ -1650,18 +1666,19 @@ class SO2_Linear(torch.nn.Module):
         return out.contiguous(), wigner_D_all
 
     def _ensure_wigner_rotation(self, R, wigner_D_all):
-        if wigner_D_all is not None:
+        needs_rotation = (self.rotate_in or self.rotate_out) and self.l_max > 0
+        if not needs_rotation:
             return wigner_D_all
-        if (self.rotate_in or self.rotate_out) and self.l_max > 0:
-            angle = xyz_to_angles(R[:, [1, 2, 0]])
-            return _make_wigner_rotation(
-                self.l_max,
-                angle[0],
-                angle[1],
-                torch.zeros_like(angle[0]),
-                self.wigner_apply_mode,
-            )
-        return None
+        if _wigner_rotation_covers_lmax(wigner_D_all, self.l_max, self.offsets, self.dims):
+            return wigner_D_all
+        angle = xyz_to_angles(R[:, [1, 2, 0]])
+        return _make_wigner_rotation(
+            self.l_max,
+            angle[0],
+            angle[1],
+            torch.zeros_like(angle[0]),
+            self.wigner_apply_mode,
+        )
 
     def _direct_rotate_pack_m(self, x, m: int, wigner_D_all):
         n, _ = x.shape

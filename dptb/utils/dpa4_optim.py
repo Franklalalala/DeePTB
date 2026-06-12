@@ -98,6 +98,61 @@ class WarmupStableDecayLR(torch.optim.lr_scheduler.LRScheduler):
         return self.get_lr_at_step(self.last_epoch)
 
 
+class WarmupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
+    """Linear warmup followed by ReduceLROnPlateau.
+
+    The class intentionally subclasses ``ReduceLROnPlateau`` so existing
+    trainer code keeps passing the monitored loss metric to ``step``.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup_steps: int = 0,
+        warmup_lr: NumberOrList = 0.0,
+        **plateau_options,
+    ) -> None:
+        self.warmup_steps = int(warmup_steps)
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be >= 0 for warmup_rop scheduler")
+
+        n_groups = len(optimizer.param_groups)
+        self.target_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.warmup_lrs = _as_float_list(warmup_lr, n_groups, "warmup_lr")
+        self.warmup_step = 0
+
+        super().__init__(optimizer=optimizer, **plateau_options)
+
+        if self.warmup_steps > 0:
+            self._set_lrs(self.warmup_lrs)
+
+    def _set_lrs(self, lrs: Sequence[float]) -> None:
+        for param_group, lr in zip(self.optimizer.param_groups, lrs):
+            param_group["lr"] = float(lr)
+        self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+
+    def _warmup_lrs_for_step(self, step: int) -> List[float]:
+        if self.warmup_steps == 0:
+            return list(self.target_lrs)
+        progress = min(max(int(step), 0), self.warmup_steps) / self.warmup_steps
+        return [
+            float(warmup_lr + (target_lr - warmup_lr) * progress)
+            for warmup_lr, target_lr in zip(self.warmup_lrs, self.target_lrs)
+        ]
+
+    def step(self, metrics=None, epoch=None):  # type: ignore[override]
+        if self.warmup_step < self.warmup_steps:
+            self.warmup_step += 1
+            if epoch is None:
+                self.last_epoch += 1
+            else:
+                self.last_epoch = epoch
+            self._set_lrs(self._warmup_lrs_for_step(self.warmup_step))
+            return None
+
+        return super().step(metrics, epoch=epoch)
+
+
 class HybridMuon(Optimizer):
     """DPA4-style hybrid Muon/AdamW optimizer.
 

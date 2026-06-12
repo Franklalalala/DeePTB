@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from dptb.nnops.multi_trainer import MultiTrainer
-from dptb.utils.argcheck import train_options
+from dptb.utils.argcheck import chk_avg_per_iter, train_options
 from dptb.utils.tools import get_lr_scheduler, get_optimizer
 
 
@@ -31,6 +31,42 @@ def test_wsd_scheduler_matches_dpa4_warmup_stable_decay_formula():
     halfway_decay = 1.0e-5 + 0.5 * (1.0e-3 - 1.0e-5)
     assert scheduler.get_lr_at_step(8) == pytest.approx([halfway_decay])
     assert scheduler.get_lr_at_step(10) == pytest.approx([1.0e-5])
+
+
+def test_warmup_rop_scheduler_warms_up_then_uses_plateau_semantics():
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([param], lr=1.0)
+
+    scheduler = get_lr_scheduler(
+        type="warmup_rop",
+        optimizer=optimizer,
+        warmup_steps=2,
+        warmup_lr=0.1,
+        factor=0.5,
+        patience=0,
+        min_lr=0.2,
+    )
+
+    assert isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+
+    scheduler.step(1.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.55)
+
+    scheduler.step(1.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+
+    scheduler.step(1.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+
+    scheduler.step(2.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+
+    scheduler.step(3.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.25)
+
+    scheduler.step(4.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.2)
 
 
 def test_hybrid_muon_routes_matrix_params_to_muon_and_vectors_to_adamw():
@@ -212,3 +248,38 @@ def test_train_options_accepts_hybrid_muon_optimizer_and_wsd_scheduler():
     assert normalized["allow_unoptimized_trainables"] is False
     assert normalized["lr_scheduler"]["type"] == "wsd"
     assert normalized["lr_scheduler"]["decay_type"] == "cosine"
+
+
+def test_train_options_accepts_hybrid_muon_optimizer_and_warmup_rop_scheduler():
+    normalized = train_options().normalize_value(
+        {
+            "num_epoch": 1,
+            "optimizer": {
+                "type": "HybridMuon",
+                "lr": 1.0e-2,
+                "weight_decay": 1.0e-2,
+                "muon_clip": True,
+                "muon_clip_rms": 0.2,
+            },
+            "lr_scheduler": {
+                "type": "warmup_rop",
+                "warmup_steps": 20_000,
+                "warmup_lr": 1.0e-5,
+                "factor": 0.95,
+                "patience": 2_000,
+                "min_lr": 1.0e-5,
+            },
+            "update_lr_per_iter": True,
+        }
+    )
+
+    assert normalized["optimizer"]["type"] == "HybridMuon"
+    assert normalized["optimizer"]["muon_clip"] is True
+    assert normalized["optimizer"]["muon_clip_rms"] == pytest.approx(0.2)
+    assert normalized["lr_scheduler"]["type"] == "warmup_rop"
+    assert normalized["lr_scheduler"]["warmup_steps"] == 20_000
+    assert normalized["lr_scheduler"]["warmup_lr"] == pytest.approx(1.0e-5)
+    assert normalized["lr_scheduler"]["factor"] == pytest.approx(0.95)
+    assert normalized["lr_scheduler"]["patience"] == 2_000
+    assert normalized["lr_scheduler"]["min_lr"] == pytest.approx(1.0e-5)
+    assert chk_avg_per_iter({"train_options": normalized}) is True

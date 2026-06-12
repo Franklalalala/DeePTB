@@ -21,7 +21,7 @@ import yaml
 import torch.optim as optim
 import logging
 import random
-from dptb.utils.dpa4_optim import HybridMuon, WarmupStableDecayLR
+from dptb.utils.dpa4_optim import HybridMuon, WarmupReduceLROnPlateau, WarmupStableDecayLR
 from ase.neighborlist import neighbor_list
 from ase.io.trajectory import Trajectory
 import ase
@@ -158,6 +158,8 @@ def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
         scheduler = optim.lr_scheduler.LinearLR(optimizer=optimizer, **sch_options)
     elif type == "rop":
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, **sch_options)
+    elif type == "warmup_rop":
+        scheduler = WarmupReduceLROnPlateau(optimizer=optimizer, **sch_options)
     elif type == 'cos':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, **sch_options)
     elif type == 'wsd':
@@ -165,7 +167,7 @@ def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
     elif type == "cyclic":
         scheduler = optim.lr_scheduler.CyclicLR(optimizer=optimizer, **sch_options)
     else:
-        raise RuntimeError("Scheduler should be exp/linear/rop/cos/wsd/cyclic..., not {}".format(type))
+        raise RuntimeError("Scheduler should be exp/linear/rop/warmup_rop/cos/wsd/cyclic..., not {}".format(type))
 
     return scheduler
 

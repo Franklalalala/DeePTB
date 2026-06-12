@@ -129,6 +129,51 @@ def test_so2_rejects_too_small_external_wigner_dense():
         layer(x, R, None, wigner_D_all=too_small)
 
 
+def test_so2_recomputes_reused_compact_wigner_when_lmax_grows():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260613)
+    first = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        radial_emb=False,
+        num_experts=2,
+        num_shared_experts=0,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="streamed_m_major_ref",
+    ).to(dtype=torch.float64)
+    second = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o + 1x2e",
+        radial_emb=False,
+        num_experts=2,
+        num_shared_experts=0,
+        rotate_in=True,
+        rotate_out=True,
+        wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="streamed_m_major_ref",
+    ).to(dtype=torch.float64)
+
+    R = torch.randn(4, 3, dtype=torch.float64)
+    coeffs = torch.tensor([[0.3, 0.7], [0.6, 0.4]], dtype=torch.float64)
+    mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=(2, 2))
+    x_first = torch.randn(4, first.irreps_in.dim, dtype=torch.float64)
+    _, small_wigner = first(x_first, R, mole_globals)
+    assert len(small_wigner.blocks) == 2
+
+    x_second = torch.randn(4, second.irreps_in.dim, dtype=torch.float64)
+    out_reused, grown_wigner = second(x_second, R, mole_globals, wigner_D_all=small_wigner)
+    out_fresh, fresh_wigner = second(x_second, R, mole_globals, wigner_D_all=None)
+
+    assert len(grown_wigner.blocks) == 3
+    assert len(fresh_wigner.blocks) == 3
+    torch.testing.assert_close(out_reused, out_fresh, atol=1e-9, rtol=1e-9)
+
+
 def test_so2_streamed_cueq_indexed_linear_matches_staged_if_available():
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
