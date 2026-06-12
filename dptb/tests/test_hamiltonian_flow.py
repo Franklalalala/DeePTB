@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from dptb.nnops.flow import HamiltonianCFM
+from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
 from dptb.nnops.trainer import Trainer
 
 
@@ -205,3 +205,78 @@ def test_euler_sampler_reaches_constant_predicted_endpoint(num_steps):
     assert torch.allclose(sampled["node_features"], torch.full((3, 1), 2.0))
     assert torch.allclose(sampled["edge_features"], torch.full((2, 1), 4.0))
     assert torch.equal(sampled["flow_time"], torch.ones(2))
+
+
+def test_build_hamiltonian_flow_selects_pixel_meanflow_objective():
+    flow = build_hamiltonian_flow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+        }
+    )
+
+    assert isinstance(flow, HamiltonianPixelMeanFlow)
+    assert flow.model_in_loss is True
+
+
+def test_pixel_meanflow_aggressive_profile_sets_opt_in_knobs():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"profile": "aggressive"},
+        }
+    )
+
+    assert flow.meanflow_profile == "aggressive"
+    assert flow.meanflow_jvp_tangent == "boundary"
+    assert flow.meanflow_norm_p == pytest.approx(1.0)
+    assert flow.meanflow_aux_boundary_v_weight > 0.0
+
+
+def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+            "meanflow": {
+                "aux_endpoint_weight": 0.0,
+                "jvp_backend": "finite_difference",
+                "fd_eps": 1.0e-4,
+            },
+        }
+    )
+    r = torch.tensor([0.2, 0.3])
+    t = torch.tensor([0.5, 0.7])
+
+    loss, state = flow.loss_with_model(_ConstantEndpoint(), _two_graph_batch(), _two_graph_ref(), r=r, t=t)
+
+    assert loss.item() == pytest.approx(0.0, abs=1.0e-6)
+    assert state["train_flow_h"].item() == pytest.approx(float((t - r).mean()), abs=1.0e-6)
+    assert state["train_flow_onsite_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+    assert state["train_flow_hopping_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_pixel_meanflow_one_step_sampler_reaches_constant_endpoint():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+        }
+    )
+
+    sampled = flow.sample(_ConstantEndpoint(), _two_graph_batch(), num_steps=1)
+
+    assert torch.allclose(sampled["node_features"], torch.full((3, 1), 2.0))
+    assert torch.allclose(sampled["edge_features"], torch.full((2, 1), 4.0))
+    assert torch.equal(sampled["flow_time"], torch.zeros(2))
+    assert torch.equal(sampled["flow_time_r"], torch.zeros(2))
+    assert torch.equal(sampled["flow_time_h"], torch.zeros(2))

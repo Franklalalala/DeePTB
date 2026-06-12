@@ -172,6 +172,7 @@ def flow_options():
     )
     args = [
         Argument("enabled", bool, optional=True, default=False),
+        Argument("objective", str, optional=True, default="cfm"),
         Argument("mode", str, optional=True, default="residual"),
         Argument("prior", str, optional=True, default="zero"),
         Argument("node_h0_key", str, optional=True, default="node_h0"),
@@ -179,6 +180,10 @@ def flow_options():
         Argument("node_target_key", str, optional=True, default="node_features"),
         Argument("edge_target_key", str, optional=True, default="edge_features"),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
+        Argument("flow_time_r_key", str, optional=True, default="flow_time_r"),
+        Argument("flow_time_t_key", str, optional=True, default="flow_time_t"),
+        Argument("flow_time_h_key", str, optional=True, default="flow_time_h"),
+        Argument("meanflow", dict, optional=True, default={}),
         Argument("time_sampling", str, optional=True, default="uniform"),
         Argument("t_min", (int, float), optional=True, default=0.0),
         Argument("t_max", (int, float), optional=True, default=0.999),
@@ -1447,6 +1452,7 @@ def slem_h0():
     doc_h0_self_edge_tol = "Tolerance used to detect self-edges in `self_edge` node mode. Default: `1e-8`."
     doc_use_flow_time_embedding = "Whether to inject graph-level flow time into scalar channels before message passing. Default: `False`."
     doc_flow_time_key = "Graph-level flow time key written by train_options.flow_options. Default: `flow_time`."
+    doc_flow_time_keys = "Optional list of graph-level time keys to embed and sum, e.g. [`flow_time_t`, `flow_time_r`, `flow_time_h`] for Pixel MeanFlow."
     doc_flow_time_max_positions = "Scale used by the sinusoidal flow-time embedding. Default: `2000`."
     doc_flow_time_missing_value = "Fallback normalized time when flow_time is absent. Default: `0.0`."
 
@@ -1463,6 +1469,7 @@ def slem_h0():
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),
         Argument("flow_time_key", str, optional=True, default="flow_time", doc=doc_flow_time_key),
+        Argument("flow_time_keys", list, optional=True, default=[], doc=doc_flow_time_keys),
         Argument("flow_time_max_positions", int, optional=True, default=2000, doc=doc_flow_time_max_positions),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
     ]

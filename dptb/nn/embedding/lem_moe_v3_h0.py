@@ -31,6 +31,7 @@ class LemMoEV3H0(LemMoEV3):
         h0_self_edge_tol: float = 1e-8,
         use_flow_time_embedding: bool = False,
         flow_time_key: str = "flow_time",
+        flow_time_keys: Any = None,
         flow_time_max_positions: int = 2000,
         flow_time_missing_value: float = 0.0,
         env_embed_multiplicity: int = 32,
@@ -43,6 +44,7 @@ class LemMoEV3H0(LemMoEV3):
             FlowTimeConditioner(
                 scalar_channels=env_embed_multiplicity,
                 flow_time_key=flow_time_key,
+                flow_time_keys=flow_time_keys,
                 max_positions=flow_time_max_positions,
                 missing_time_value=flow_time_missing_value,
             )

@@ -17,7 +17,7 @@ from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
 from dptb.nn.activation_recompute import configure_activation_recompute
-from dptb.nnops.flow import HamiltonianCFM
+from dptb.nnops.flow import build_hamiltonian_flow
 from dptb.nnops.loss import Loss
 
 log = logging.getLogger(__name__)
@@ -113,7 +113,7 @@ class Trainer(BaseTrainer):
                 idp=self.model.hamiltonian.idp,
             )
 
-        self.flow_cfm = HamiltonianCFM(
+        self.flow_cfm = build_hamiltonian_flow(
             train_options.get("flow_options", None),
             idp=self.model.hamiltonian.idp,
             dtype=self.dtype,
@@ -197,11 +197,14 @@ class Trainer(BaseTrainer):
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
         if self.flow_cfm.enabled:
-            batch, batch_for_loss, flow_ctx = self.flow_cfm.prepare_batch(batch, batch_for_loss)
-            batch = self.model(batch)
-            batch.update(batch_info)
-            batch_for_loss.update(batch_info)
-            loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
+            if getattr(self.flow_cfm, "model_in_loss", False):
+                loss, flow_state = self.flow_cfm.loss_with_model(self.model, batch, batch_for_loss)
+            else:
+                batch, batch_for_loss, flow_ctx = self.flow_cfm.prepare_batch(batch, batch_for_loss)
+                batch = self.model(batch)
+                batch.update(batch_info)
+                batch_for_loss.update(batch_info)
+                loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
             if self.flow_cfm.log_train_compatible_loss:
                 flow_state.update(
                     self._compatible_loss_state(
@@ -425,6 +428,49 @@ class Trainer(BaseTrainer):
                 batch_for_loss = batch.copy()
                 if self.flow_cfm.enabled:
                     original_batch = batch.copy()
+                    if getattr(self.flow_cfm, "model_in_loss", False):
+                        batch_for_loss.update(batch_info)
+                        random_t_loss, _ = self.flow_cfm.loss_with_model(
+                            self.model, original_batch, batch_for_loss, prefix="validation"
+                        )
+                        loss += random_t_loss
+                        flow_metric_sums["validation_flow_random_t_loss"] = (
+                            flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
+                            + random_t_loss.detach()
+                        )
+                        num_graphs = self.flow_cfm._num_graphs(original_batch)
+                        zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
+                        one_t = torch.ones(num_graphs, device=self.device, dtype=self.dtype)
+                        one_step_loss, _ = self.flow_cfm.loss_with_model(
+                            self.model,
+                            original_batch,
+                            batch_for_loss,
+                            prefix="validation_one_step",
+                            r=zero_t,
+                            t=one_t,
+                        )
+                        flow_metric_sums["validation_flow_one_step_loss"] = (
+                            flow_metric_sums.get("validation_flow_one_step_loss", 0.0)
+                            + one_step_loss.detach()
+                        )
+                        for num_steps in self.flow_cfm.validation_ode_steps:
+                            sampled = self.flow_cfm.sample(
+                                self.model, original_batch, num_steps=num_steps
+                            )
+                            sampled.update(batch_info)
+                            if self.flow_cfm.log_validation_compatible_loss:
+                                self._accumulate_metric_state(
+                                    flow_metric_sums,
+                                    self._compatible_loss_state(
+                                        self.validation_lossfunc,
+                                        sampled,
+                                        batch_for_loss,
+                                        prefix=f"validation_compatible_euler_{num_steps}",
+                                        legacy_prefix="validation" if int(num_steps) == 1 else None,
+                                    ),
+                                )
+                        num_batches += 1
+                        continue
                     flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
                         original_batch, batch_for_loss
                     )
