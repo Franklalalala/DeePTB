@@ -28,6 +28,14 @@ _WIGNER_STATIC_CACHE = {}
 log = logging.getLogger(__name__)
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) not in ("", "0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+def _eval_reentrant_safe_enabled() -> bool:
+    return (not torch.is_grad_enabled()) and _env_truthy("DPTB_SO2_EVAL_REENTRANT_SAFE", "0")
+
+
 def _ensure_torch_fx_symbolic_tracing_compat():
     try:
         import torch.fx._symbolic_trace as symbolic_trace
@@ -981,6 +989,9 @@ class MOLELinear(nn.Module):
         # 4. 执行线性变换
         # 根据系统大小拆分 Input，因为每个系统(Graph)对应一个混合后的权重
         mode = self.mole_linear_mode
+        if (not self.training) and _eval_reentrant_safe_enabled() and mode in {"cueq_indexed_linear", "cublas_grouped"}:
+            mode = os.environ.get("DPTB_MOLE_EVAL_SAFE_LINEAR_MODE", "indexed_ref")
+            mode = _normalize_mole_linear_mode(mode)
         if mode != "split_loop":
             graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
             if graph_index.numel() != x.shape[0]:
@@ -1262,9 +1273,17 @@ class SO2_Linear(torch.nn.Module):
             latents: Latent features for radial embedding
             wigner_D_all: Precomputed Wigner D matrices (optional)
         """
-        if self.so2_fusion_mode == "streamed_m_major_ref":
+        so2_fusion_mode = self.so2_fusion_mode
+        if (not self.training) and _eval_reentrant_safe_enabled() and so2_fusion_mode in {
+            "streamed_m_major_fused_p0",
+            "streamed_m_major_persistent_grouped_p1",
+        }:
+            so2_fusion_mode = os.environ.get("DPTB_SO2_EVAL_SAFE_FUSION_MODE", "streamed_m_major_ref")
+            so2_fusion_mode = _normalize_so2_fusion_mode(so2_fusion_mode)
+
+        if so2_fusion_mode == "streamed_m_major_ref":
             return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
-        if self.so2_fusion_mode == "streamed_m_major_cueq":
+        if so2_fusion_mode == "streamed_m_major_cueq":
             return self._forward_streamed_m_major_grouped(
                 x,
                 R,
@@ -1273,7 +1292,7 @@ class SO2_Linear(torch.nn.Module):
                 wigner_D_all,
                 route="streamed_m_major_cueq",
             )
-        if self.so2_fusion_mode == "streamed_m_major_persistent_grouped_p1":
+        if so2_fusion_mode == "streamed_m_major_persistent_grouped_p1":
             from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
 
             fused_result = try_forward_so2_moe_persistent_grouped_p1(
@@ -1296,7 +1315,7 @@ class SO2_Linear(torch.nn.Module):
                 wigner_D_all,
                 route="streamed_m_major_cueq",
             )
-        if self.so2_fusion_mode == "streamed_m_major_fused_p0":
+        if so2_fusion_mode == "streamed_m_major_fused_p0":
             from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
 
             fused_result = try_forward_so2_moe_fused_p0(

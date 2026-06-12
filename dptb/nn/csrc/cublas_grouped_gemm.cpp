@@ -32,6 +32,7 @@ static torch::Tensor copy_pointer_array_to_device(
 }
 
 static void configure_math(cublasHandle_t handle, bool fast_tf32) {
+  check_cublas(cublasSetStream(handle, at::cuda::getCurrentCUDAStream()));
   check_cublas(cublasSetMathMode(
       handle, fast_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
 }

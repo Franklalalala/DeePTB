@@ -100,6 +100,20 @@ class _ConstantEndpoint(torch.nn.Module):
         return data
 
 
+class _EndpointWithTransientState(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.saw_transient_on_input = []
+
+    def forward(self, data):
+        self.saw_transient_on_input.append("transient_backend_state" in data)
+        out = data.copy()
+        out["node_features"] = torch.full_like(data["node_h0"], 2.0)
+        out["edge_features"] = torch.full_like(data["edge_h0"], 4.0)
+        out["transient_backend_state"] = torch.ones((), dtype=data["node_h0"].dtype)
+        return out
+
+
 @pytest.mark.parametrize("num_steps", [1, 3])
 def test_euler_sampler_reaches_constant_predicted_endpoint(num_steps):
     flow = HamiltonianCFM(
@@ -116,4 +130,21 @@ def test_euler_sampler_reaches_constant_predicted_endpoint(num_steps):
     assert torch.allclose(sampled["node_features"], torch.full((3, 1), 2.0))
     assert torch.allclose(sampled["edge_features"], torch.full((2, 1), 4.0))
     assert torch.equal(sampled["flow_time"], torch.ones(2))
+
+
+def test_euler_sampler_does_not_feed_model_transient_keys_back_into_next_step():
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "prior": "zero",
+            "omit_time_scaling": True,
+            "strict_h0": True,
+        }
+    )
+    model = _EndpointWithTransientState()
+
+    sampled = flow.sample(model, _two_graph_batch(), num_steps=2)
+
+    assert model.saw_transient_on_input == [False, False]
+    assert "transient_backend_state" not in sampled
 
