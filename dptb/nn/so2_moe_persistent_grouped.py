@@ -444,24 +444,29 @@ def _prepare_route_layout(
     graph_index = graph_index.reshape(-1).to(dtype=torch.long)
     assume_sorted = _flag("DPTB_SO2_MOE_PERSISTENT_P1_ASSUME_SORTED")
     nosync_layout = _flag("DPTB_SO2_MOE_PERSISTENT_P1_NOSYNC_LAYOUT", "0")
+    fresh_layout = _flag("DPTB_SO2_DISABLE_ROUTE_LAYOUT_CACHE", "0") or (
+        (not torch.is_grad_enabled()) and _flag("DPTB_SO2_EVAL_FRESH_ROUTE_LAYOUT", "1")
+    )
     if not nosync_layout:
-        key = (
-            str(graph_index.device),
-            int(graph_index.data_ptr()),
-            int(graph_index.numel()),
-            int(getattr(graph_index, "_version", 0)),
-            int(n_routes),
-            int(n_m),
-            int(block_m),
-            int(block_n),
-            tuple(int(v) for v in out_ptr.detach().cpu().tolist()),
-            bool(raw_pair_tiles),
-            bool(assume_sorted),
-        )
-        cached = _LAYOUT_CACHE.get(key)
-        if cached is not None:
-            _LAYOUT_CACHE.move_to_end(key)
-            return cached
+        key = None
+        if not fresh_layout:
+            key = (
+                str(graph_index.device),
+                int(graph_index.data_ptr()),
+                int(graph_index.numel()),
+                int(getattr(graph_index, "_version", 0)),
+                int(n_routes),
+                int(n_m),
+                int(block_m),
+                int(block_n),
+                tuple(int(v) for v in out_ptr.detach().cpu().tolist()),
+                bool(raw_pair_tiles),
+                bool(assume_sorted),
+            )
+            cached = _LAYOUT_CACHE.get(key)
+            if cached is not None:
+                _LAYOUT_CACHE.move_to_end(key)
+                return cached
 
         if graph_index.numel() == 0:
             edge_order = torch.empty((0,), dtype=torch.long, device=graph_index.device)
@@ -492,30 +497,33 @@ def _prepare_route_layout(
             prefix = torch.tensor(pref, dtype=torch.long, device=graph_index.device).contiguous()
 
         cached = (edge_order.contiguous(), route_ptr.contiguous(), prefix.contiguous())
-        _LAYOUT_CACHE[key] = cached
-        while len(_LAYOUT_CACHE) > _LAYOUT_CACHE_MAX:
-            _LAYOUT_CACHE.popitem(last=False)
+        if key is not None:
+            _LAYOUT_CACHE[key] = cached
+            while len(_LAYOUT_CACHE) > _LAYOUT_CACHE_MAX:
+                _LAYOUT_CACHE.popitem(last=False)
         return cached
 
-    key = (
-        str(graph_index.device),
-        int(graph_index.data_ptr()),
-        int(graph_index.numel()),
-        int(getattr(graph_index, "_version", 0)),
-        int(n_routes),
-        int(n_m),
-        int(block_m),
-        int(block_n),
-        int(out_ptr.data_ptr()),
-        int(out_ptr.numel()),
-        int(getattr(out_ptr, "_version", 0)),
-        bool(raw_pair_tiles),
-        bool(assume_sorted),
-    )
-    cached = _LAYOUT_CACHE.get(key)
-    if cached is not None:
-        _LAYOUT_CACHE.move_to_end(key)
-        return cached
+    key = None
+    if not fresh_layout:
+        key = (
+            str(graph_index.device),
+            int(graph_index.data_ptr()),
+            int(graph_index.numel()),
+            int(getattr(graph_index, "_version", 0)),
+            int(n_routes),
+            int(n_m),
+            int(block_m),
+            int(block_n),
+            int(out_ptr.data_ptr()),
+            int(out_ptr.numel()),
+            int(getattr(out_ptr, "_version", 0)),
+            bool(raw_pair_tiles),
+            bool(assume_sorted),
+        )
+        cached = _LAYOUT_CACHE.get(key)
+        if cached is not None:
+            _LAYOUT_CACHE.move_to_end(key)
+            return cached
 
     if graph_index.numel() == 0:
         edge_order = torch.empty((0,), dtype=torch.long, device=graph_index.device)
@@ -544,9 +552,10 @@ def _prepare_route_layout(
         prefix[1:] = torch.cumsum(problem_tiles, dim=0)
 
     cached = (edge_order.contiguous(), route_ptr.contiguous(), prefix.contiguous())
-    _LAYOUT_CACHE[key] = cached
-    while len(_LAYOUT_CACHE) > _LAYOUT_CACHE_MAX:
-        _LAYOUT_CACHE.popitem(last=False)
+    if key is not None:
+        _LAYOUT_CACHE[key] = cached
+        while len(_LAYOUT_CACHE) > _LAYOUT_CACHE_MAX:
+            _LAYOUT_CACHE.popitem(last=False)
     return cached
 
 

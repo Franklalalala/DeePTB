@@ -8,6 +8,10 @@ from torch import fx
 from e3nn import o3
 from torch_scatter import scatter_mean
 from e3nn.o3 import Linear, SphericalHarmonics, FullyConnectedTensorProduct, TensorProduct
+try:
+    from e3nn.o3._linear import _codegen_linear as _e3nn_codegen_linear
+except Exception:  # pragma: no cover - defensive for older e3nn variants
+    _e3nn_codegen_linear = None
 from dptb.data import AtomicDataDict
 from dptb.nn.embedding.emb import Embedding
 from ..radial_basis import BesselBasis
@@ -35,6 +39,60 @@ from math import ceil
 import logging
 
 log = logging.getLogger(__name__)
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) not in ("", "0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+def _eval_safe_e3nn_linear_enabled() -> bool:
+    return (not torch.is_grad_enabled()) and (
+        _env_truthy("DPTB_E3NN_LINEAR_EVAL_REENTRANT_SAFE", "0")
+        or _env_truthy("DPTB_SO2_EVAL_REENTRANT_SAFE", "0")
+    )
+
+
+def _eval_safe_e3nn_linear(linear: Linear, features: torch.Tensor) -> torch.Tensor:
+    if linear.training or not _eval_safe_e3nn_linear_enabled():
+        return linear(features)
+    if _e3nn_codegen_linear is None:
+        raise RuntimeError(
+            "DPTB e3nn eval-safe Linear fallback requires e3nn.o3._linear._codegen_linear"
+        )
+    if not linear.shared_weights:
+        raise RuntimeError("DPTB e3nn eval-safe Linear fallback currently requires shared_weights=True")
+    if linear.weight.ndim != 1 or linear.bias.ndim > 1:
+        raise RuntimeError(
+            "DPTB e3nn eval-safe Linear fallback currently supports only f_in=f_out=None Linear modules"
+        )
+
+    meta = (
+        str(linear.irreps_in),
+        str(linear.irreps_out),
+        tuple(linear.instructions),
+        bool(linear.shared_weights),
+        bool(linear._optimize_einsums),
+        int(linear.weight_numel),
+        int(linear.bias_numel),
+    )
+    graph = linear.__dict__.get("_dptb_eval_safe_graph")
+    if graph is None or linear.__dict__.get("_dptb_eval_safe_graph_meta") != meta:
+        graph, weight_numel, bias_numel = _e3nn_codegen_linear(
+            linear.irreps_in,
+            linear.irreps_out,
+            linear.instructions,
+            None,
+            None,
+            shared_weights=linear.shared_weights,
+            optimize_einsums=linear._optimize_einsums,
+        )
+        if weight_numel != linear.weight_numel or bias_numel != linear.bias_numel:
+            raise RuntimeError(
+                "DPTB e3nn eval-safe Linear fallback generated incompatible weight layout"
+            )
+        linear.__dict__["_dptb_eval_safe_graph"] = graph
+        linear.__dict__["_dptb_eval_safe_graph_meta"] = meta
+    return linear.__dict__["_dptb_eval_safe_graph"](features, linear.weight, linear.bias)
 
 
 def _normalize_onehot_tp_mode(mode: Optional[str]) -> str:
@@ -692,8 +750,8 @@ class LemMoEV3(torch.nn.Module):
                 dtype=node_features.dtype,
             )
             node_features = torch.cat([node_features, pad], dim=0)
-        out_node_features = self.out_node(node_features)
-        out_edge_features = self.out_edge(edge_features)
+        out_node_features = _eval_safe_e3nn_linear(self.out_node, node_features)
+        out_edge_features = _eval_safe_e3nn_linear(self.out_edge, edge_features)
 
         if self.use_out_onehot_tp:
             out_node_features = out_node_features + _apply_onehot_tp(

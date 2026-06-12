@@ -10,7 +10,7 @@ from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
-from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
+from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp, _eval_safe_e3nn_linear
 from .lem_moe_v3_h0_helpers import H0InitLayer
 from .flow_time import FlowTimeConditioner
 
@@ -162,8 +162,8 @@ class LemMoEV3H0(LemMoEV3):
             )
             node_features = torch.cat([node_features, pad], dim=0)
 
-        out_node_features = self.out_node(node_features)
-        out_edge_features = self.out_edge(edge_features)
+        out_node_features = _eval_safe_e3nn_linear(self.out_node, node_features)
+        out_edge_features = _eval_safe_e3nn_linear(self.out_edge, edge_features)
 
         if self.use_out_onehot_tp:
             out_node_features = out_node_features + _apply_onehot_tp(

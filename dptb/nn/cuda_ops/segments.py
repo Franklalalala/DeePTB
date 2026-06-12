@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
@@ -19,6 +20,10 @@ class SegmentLayout:
 
 
 _LAYOUT_CACHES: dict[str, OrderedDict[tuple, SegmentLayout]] = {}
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) not in ("", "0", "false", "False", "FALSE", "no", "No", "NO")
 
 
 def _cache_for(name: str) -> OrderedDict[tuple, SegmentLayout]:
@@ -44,21 +49,27 @@ def repeated_segment_layout(
         raise ValueError(f"repeat must be >= 1, got {repeat}")
 
     graph_index = graph_index.reshape(-1).to(dtype=torch.long)
-    key = (
-        int(repeat),
-        graph_index.device.type,
-        graph_index.device.index,
-        int(graph_index.data_ptr()),
-        int(graph_index.numel()),
-        int(getattr(graph_index, "_version", 0)),
-        int(num_routes),
-        bool(assume_sorted),
+    fresh_layout = _truthy_env("DPTB_SO2_DISABLE_ROUTE_LAYOUT_CACHE", "0") or (
+        (not torch.is_grad_enabled()) and _truthy_env("DPTB_SO2_EVAL_FRESH_ROUTE_LAYOUT", "1")
     )
-    cache = _cache_for(cache_name)
-    cached = cache.get(key)
-    if cached is not None:
-        cache.move_to_end(key)
-        return cached
+    key = None
+    cache = None
+    if not fresh_layout:
+        key = (
+            int(repeat),
+            graph_index.device.type,
+            graph_index.device.index,
+            int(graph_index.data_ptr()),
+            int(graph_index.numel()),
+            int(getattr(graph_index, "_version", 0)),
+            int(num_routes),
+            bool(assume_sorted),
+        )
+        cache = _cache_for(cache_name)
+        cached = cache.get(key)
+        if cached is not None:
+            cache.move_to_end(key)
+            return cached
 
     if repeat == 1:
         flat_graph = graph_index.contiguous()
@@ -88,9 +99,10 @@ def repeated_segment_layout(
         sorted_index=sorted_graph,
         ptr_cpu=ptr.to(device="cpu", dtype=torch.long).contiguous(),
     )
-    cache[key] = layout
-    while len(cache) > int(max_entries):
-        cache.popitem(last=False)
+    if cache is not None and key is not None:
+        cache[key] = layout
+        while len(cache) > int(max_entries):
+            cache.popitem(last=False)
     return layout
 
 

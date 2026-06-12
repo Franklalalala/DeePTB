@@ -522,9 +522,9 @@ class HamiltonianCFM:
         """Euler-integrate the endpoint-parameterized flow from the configured prior."""
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
-        state = data.copy()
-        node_current = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
-        edge_current = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
+        base_state = data.copy()
+        node_current = self._sampling_base(base_state, self.node_h0_key, self.node_target_key, "node")
+        edge_current = self._sampling_base(base_state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_current is None and edge_current is None:
             raise KeyError("Flow sampling requires node and/or edge Hamiltonian start features.")
 
@@ -535,11 +535,12 @@ class HamiltonianCFM:
                 edge_current = edge_current + self._prior_like(edge_current, self.edge_sigma)
 
         like = node_current if node_current is not None else edge_current
-        num_graphs = self._num_graphs(state)
+        num_graphs = self._num_graphs(base_state)
         dt = 1.0 / float(num_steps)
         for step in range(num_steps):
             cur_t = float(step) * dt
             graph_t = torch.full((num_graphs,), cur_t, device=like.device, dtype=like.dtype)
+            state = base_state.copy()
             if node_current is not None:
                 state[self.node_h0_key] = node_current
                 if self.overwrite_feature_keys:
@@ -557,8 +558,8 @@ class HamiltonianCFM:
             if edge_current is not None:
                 endpoint = prediction[self.edge_target_key]
                 edge_current = edge_current + dt * (endpoint - edge_current) / denom
-            state = prediction.copy()
 
+        state = base_state.copy()
         if node_current is not None:
             state[self.node_h0_key] = node_current
             state[self.node_target_key] = node_current
