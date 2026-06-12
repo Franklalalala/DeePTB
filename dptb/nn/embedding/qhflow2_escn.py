@@ -12,7 +12,7 @@ from torch import nn
 from torch_scatter import scatter_mean
 
 from dptb.data import AtomicDataDict, _keys
-from dptb.data.AtomicDataDict import with_batch
+from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
 
 
@@ -34,6 +34,12 @@ def _default_qhflow2_src() -> str:
 
 def _ensure_qhflow2_src(path: str | None = None) -> None:
     src = path or os.environ.get("QHFLOW2_SRC") or _default_qhflow2_src()
+    expected = Path(src) / "models" / "modules" / "escn_backbone_v4.py"
+    if not expected.is_file():
+        raise FileNotFoundError(
+            "QHFlow2 source was not found. Set `qhflow2_src` or QHFLOW2_SRC to "
+            f"the QHFlow2 `src` directory; expected {expected}."
+        )
     if src and src not in sys.path:
         sys.path.insert(0, src)
 
@@ -85,6 +91,7 @@ class QHFlow2ESCNEmbedding(nn.Module):
         ham_context_mode: str = "features",
         use_flow_time_embedding: bool = True,
         flow_time_key: str = "flow_time",
+        allow_missing_flow_time: bool = False,
         qhflow2_src: str | None = None,
         **kwargs: Any,
     ):
@@ -105,7 +112,13 @@ class QHFlow2ESCNEmbedding(nn.Module):
                 f"got {self.ham_context_mode!r}"
             )
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
+        if not self.use_flow_time_embedding:
+            raise ValueError(
+                "QHFlow2ESCNEmbedding requires use_flow_time_embedding=True; "
+                "the vendored eSCN Hamiltonian backbone unconditionally consumes its time message."
+            )
         self.flow_time_key = flow_time_key
+        self.allow_missing_flow_time = bool(allow_missing_flow_time)
 
         self.idp.get_irreps(no_parity=False)
         self.idp.get_orbpair_maps()
@@ -178,7 +191,12 @@ class QHFlow2ESCNEmbedding(nn.Module):
     def _flow_time(self, data: AtomicDataDict.Type, batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
         value = data.get(self.flow_time_key, None)
         if value is None:
-            return torch.zeros(num_graphs, device=batch.device, dtype=self.dtype)
+            if self.allow_missing_flow_time:
+                return torch.zeros(num_graphs, device=batch.device, dtype=self.dtype)
+            raise KeyError(
+                f"QHFlow2ESCNEmbedding requires one `{self.flow_time_key}` value per graph. "
+                "Set allow_missing_flow_time=true only for an explicit t=0 evaluation."
+            )
         value = torch.as_tensor(value, device=batch.device, dtype=self.dtype).reshape(-1)
         if value.numel() == 1:
             return value.expand(num_graphs)
@@ -186,7 +204,47 @@ class QHFlow2ESCNEmbedding(nn.Module):
             return value
         if value.numel() == batch.numel():
             return scatter_mean(value, batch, dim=0, dim_size=num_graphs)
-        return value[:1].expand(num_graphs)
+        raise ValueError(
+            f"`{self.flow_time_key}` must be scalar, per-graph ({num_graphs}), or "
+            f"per-node ({batch.numel()}); got {value.numel()} values."
+        )
+
+    def _context_value(
+        self,
+        data: AtomicDataDict.Type,
+        h0_key: str,
+        feature_key: str,
+    ) -> torch.Tensor | None:
+        value = data.get(h0_key, None)
+        if value is None:
+            value = data.get(feature_key, None)
+        return value
+
+    def _masked_graph_mean(
+        self,
+        value: torch.Tensor,
+        graph_index: torch.Tensor,
+        num_graphs: int,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        value = value.to(dtype=self.dtype)
+        graph_index = graph_index.to(device=value.device, dtype=torch.long)
+        if mask is not None:
+            mask = torch.as_tensor(mask, device=value.device, dtype=torch.bool).reshape(-1)
+            if mask.numel() != value.shape[0]:
+                raise ValueError(
+                    f"Expert mask length {mask.numel()} does not match context rows {value.shape[0]}."
+                )
+            value = value[mask]
+            graph_index = graph_index[mask]
+        if value.shape[0] == 0:
+            return torch.zeros(
+                num_graphs,
+                self.rme_dim,
+                device=graph_index.device,
+                dtype=self.dtype,
+            )
+        return scatter_mean(value, graph_index, dim=0, dim_size=num_graphs)
 
     def _ham_context(
         self,
@@ -204,27 +262,36 @@ class QHFlow2ESCNEmbedding(nn.Module):
                 dtype=self.dtype,
             )
 
-        node = data.get(_keys.NODE_FEATURES_KEY, None)
+        node = self._context_value(data, _keys.NODE_H0_KEY, _keys.NODE_FEATURES_KEY)
         if node is None:
             node = torch.zeros(batch.numel(), self.rme_dim, device=batch.device, dtype=self.dtype)
-        node = node.to(dtype=self.dtype)
-        node_ctx = scatter_mean(node, batch, dim=0, dim_size=num_graphs)
+        node_ctx = self._masked_graph_mean(
+            node,
+            batch,
+            num_graphs,
+            data.get("expert_node_mask", None),
+        )
 
-        edge = data.get(_keys.EDGE_FEATURES_KEY, None)
+        edge = self._context_value(data, _keys.EDGE_H0_KEY, _keys.EDGE_FEATURES_KEY)
         if edge is None:
             edge_ctx = torch.zeros(num_graphs, self.rme_dim, device=batch.device, dtype=self.dtype)
         elif edge.shape[0] == 0:
             edge_ctx = torch.zeros(num_graphs, self.rme_dim, device=batch.device, dtype=self.dtype)
         else:
-            edge = edge.to(dtype=self.dtype)
             edge_batch = batch[edge_index[0]]
-            edge_ctx = scatter_mean(edge, edge_batch, dim=0, dim_size=num_graphs)
+            edge_ctx = self._masked_graph_mean(
+                edge,
+                edge_batch,
+                num_graphs,
+                data.get("expert_edge_mask", None),
+            )
 
         context = torch.cat([node_ctx, edge_ctx], dim=-1)
         return self.context_proj(context).reshape(num_graphs, self.matrix_l, self.hidden_size)
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         data = with_batch(data)
+        data = with_edge_vectors(data, with_lengths=True)
         pos = data[_keys.POSITIONS_KEY].to(dtype=self.dtype)
         batch = data[_keys.BATCH_KEY].long()
         edge_index = data[_keys.EDGE_INDEX_KEY].long()
@@ -235,9 +302,10 @@ class QHFlow2ESCNEmbedding(nn.Module):
         atomic_numbers = atomic_numbers_value.long().reshape(-1, 1)
         num_graphs = self._num_graphs(batch)
 
-        src, dst = edge_index[0], edge_index[1]
-        edge_vec = pos[src] - pos[dst]
-        edge_len = torch.linalg.norm(edge_vec, dim=-1)
+        # DPTB stores dst-src vectors; QHFlow2's non-OTF graph path expects src-dst.
+        # Negating the PBC-aware DPTB vector preserves the QHFlow2 convention.
+        edge_vec = -data[_keys.EDGE_VECTORS_KEY].to(dtype=self.dtype)
+        edge_len = data[_keys.EDGE_LENGTH_KEY].to(dtype=self.dtype)
         ham_context = self._ham_context(data, batch, edge_index, num_graphs)
 
         qh_data = _QHFlowData(

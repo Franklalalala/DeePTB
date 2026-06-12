@@ -68,7 +68,7 @@ class LemMoEV3H0(LemMoEV3):
             )
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
-        if not self.use_h0_init:
+        if not self.use_h0_init and self.flow_time_conditioner is None:
             return super().forward(data)
 
         preserved_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
@@ -94,6 +94,7 @@ class LemMoEV3H0(LemMoEV3):
 
         global_feat = scatter_mean(node_one_hot, batch, dim=0)
         coeffs, monitor_val, expert_load_cv = self.router(global_feat)
+        topk_indices, topk_values = self.router.last_topk()
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
 
@@ -106,17 +107,29 @@ class LemMoEV3H0(LemMoEV3):
                 "Precomputed LEM cutoff coefficients cannot be used when edge_length requires gradients. "
                 "Set train_options.precompute_lem_cutoff_coeffs=false for force/stress/virial training."
             )
-        latents, node_features, edge_features, cutoff_coeffs, active_edges = self.init_layer(
-            data,
-            edge_index,
-            atom_type,
-            bond_type,
-            edge_sh,
-            edge_length,
-            edge_one_hot,
-            precomputed_active_edges,
-            precomputed_cutoff_coeffs,
-        )
+        if self.use_h0_init:
+            latents, node_features, edge_features, cutoff_coeffs, active_edges = self.init_layer(
+                data,
+                edge_index,
+                atom_type,
+                bond_type,
+                edge_sh,
+                edge_length,
+                edge_one_hot,
+                precomputed_active_edges,
+                precomputed_cutoff_coeffs,
+            )
+        else:
+            latents, node_features, edge_features, cutoff_coeffs, active_edges = self.init_layer(
+                edge_index,
+                atom_type,
+                bond_type,
+                edge_sh,
+                edge_length,
+                edge_one_hot,
+                precomputed_active_edges,
+                precomputed_cutoff_coeffs,
+            )
         if self.flow_time_conditioner is not None:
             node_features = self.flow_time_conditioner(node_features, data)
 
@@ -127,12 +140,23 @@ class LemMoEV3H0(LemMoEV3):
 
         edge_one_hot = edge_one_hot[active_edges]
         if precomputed_split_sizes is not None:
-            mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=precomputed_split_sizes)
+            mole_globals = MOLEGlobals(
+                coefficients=coeffs,
+                split_sizes=precomputed_split_sizes,
+                topk_indices=topk_indices,
+                topk_values=topk_values,
+            )
         else:
             edge_batch = batch[edge_index[0][active_edges]]
             num_systems = coeffs.shape[0]
             edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(coefficients=coeffs, sizes=edge_sizes)
+            mole_globals = MOLEGlobals(
+                coefficients=coeffs,
+                sizes=edge_sizes,
+                graph_index=edge_batch,
+                topk_indices=topk_indices,
+                topk_values=topk_values,
+            )
 
         data[_keys.EDGE_OVERLAP_KEY] = latents
         wigner_D_all = None

@@ -642,6 +642,8 @@ def test_options():
         Argument("batch_size", int, optional=True, default=1, doc=doc_batch_size),
         Argument("display_freq", int, optional=True, default=1, doc=doc_display_freq),
         Argument("use_tensorboard", bool, optional=True, default=False, doc=doc_use_tensorboard),
+        Argument("flow_ode_steps", list, optional=True, default=[1, 3, 10]),
+        Argument("log_direct_target_fed_loss", bool, optional=True, default=True),
         loss_options()
     ]
 
@@ -1010,7 +1012,7 @@ def embedding():
             Argument("lem_moe_v3", dict, slem()),
             Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
-            Argument("qhflow2_escn", dict, slem_h0()),
+            Argument("qhflow2_escn", dict, qhflow2_escn()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_moe", dict, slem()),
             Argument("lem_so2", dict, slem()),
@@ -1274,6 +1276,31 @@ def slem_h0():
         Argument("flow_time_key", str, optional=True, default="flow_time"),
         Argument("flow_time_max_positions", int, optional=True, default=2000),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0),
+    ]
+
+
+def qhflow2_escn():
+    return [
+        Argument("hidden_size", int, optional=True, default=128),
+        Argument("sh_lmax", int, optional=True, default=4),
+        Argument("num_gnn_layers", int, optional=True, default=5),
+        Argument("num_ham_gnn_layers", int, optional=True, default=2),
+        Argument("esen_max_radius", [float, int], optional=True, default=5.0),
+        Argument(
+            "r_max",
+            [float, int, dict, None],
+            optional=True,
+            default=None,
+            doc="Optional DPTB dataset graph cutoff; the QHFlow2 backbone uses esen_max_radius.",
+        ),
+        Argument("matrix_l", int, optional=True, default=6),
+        Argument("context_hidden", int, optional=True, default=256),
+        Argument("head_hidden", int, optional=True, default=256),
+        Argument("ham_context_mode", str, optional=True, default="features"),
+        Argument("use_flow_time_embedding", bool, optional=True, default=True),
+        Argument("flow_time_key", str, optional=True, default="flow_time"),
+        Argument("allow_missing_flow_time", bool, optional=True, default=False),
+        Argument("qhflow2_src", [str, None], optional=True, default=None),
     ]
 
 
@@ -2381,7 +2408,9 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "qhflow2_escn", "lem_moe_v3_edge_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] == "qhflow2_escn":
+            r_max = embedding.get("r_max") or embedding["esen_max_radius"]
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")

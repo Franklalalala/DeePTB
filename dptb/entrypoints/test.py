@@ -72,6 +72,7 @@ def _test(
 
     f = torch.load(run_opt["init_model"], weights_only=False)
     jdata["model_options"] = f["config"]["model_options"]
+    flow_options = f["config"].get("train_options", {}).get("flow_options", {})
     del f
     
     cutoff_options = collect_cutoffs(jdata)
@@ -87,6 +88,7 @@ def _test(
         common_options=jdata["common_options"],
         model = model,
         test_datasets=test_datasets,
+        flow_options=flow_options,
     )
 
     # register the plugin in tester, to tract training info
@@ -98,12 +100,28 @@ def _test(
                 interval=[(1, 'iteration'), (1, 'epoch')],
             )
         )
+    flow_fields = []
+    if bool(flow_options.get("enabled", False)):
+        if bool(jdata["test_options"].get("log_direct_target_fed_loss", True)):
+            flow_fields.append("test_direct_target_fed_loss")
+        for num_steps in jdata["test_options"].get(
+            "flow_ode_steps",
+            flow_options.get("validation_ode_steps", [1, 3, 10]),
+        ):
+            flow_fields.append(f"test_cfm_euler_{int(num_steps)}_loss")
+        for test_field in flow_fields:
+            tester.register_plugin(
+                ScalarFieldMonitor(
+                    stat_name=test_field,
+                    interval=[(1, 'iteration'), (1, 'epoch')],
+                )
+            )
 
     if bool(jdata.get("test_options", {}).get("use_tensorboard", False)):
         tb_dir = os.path.join(str(output), "tensorboard_logs") if output else "./tensorboard_logs"
         tester.register_plugin(TensorBoardMonitor(interval=[(1, 'epoch')], log_dir=tb_dir))
 
-    tester.register_plugin(Logger(["test_loss", "test_onsite_loss", "test_hopping_loss"],
+    tester.register_plugin(Logger(["test_loss", "test_onsite_loss", "test_hopping_loss", *flow_fields],
         interval=[(1, 'iteration'), (1, 'epoch')]))
     
     for q in tester.plugin_queues.values():
