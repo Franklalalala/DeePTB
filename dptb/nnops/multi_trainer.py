@@ -254,6 +254,7 @@ class MultiTrainer(Trainer):
         )
         self.common_options = common_options
         self.train_options = train_options
+        self.allow_unoptimized_trainables = bool(self.train_options.get("allow_unoptimized_trainables", False))
         if self.use_reference:
             self.reference_datasets = getattr(self, "reference_datesets", None)
         else:
@@ -543,7 +544,7 @@ class MultiTrainer(Trainer):
             del self.lr_scheduler
 
         self._maybe_rebuild_loaders_in_multi_trainer()
-        self._warn_non_expert_trainables()
+        self._check_non_expert_trainables()
         self._t_last_iter_end: Optional[float] = None
         self._reset_display_window_buffers()
 
@@ -1405,7 +1406,7 @@ class MultiTrainer(Trainer):
     # sanity checks
     # ---------------------------------------------------------------------
 
-    def _warn_non_expert_trainables(self):
+    def _check_non_expert_trainables(self):
         expert_param_ids = {id(p) for expert in self.model.experts for p in expert.parameters()}
         outside = [
             name for name, p in self.model.named_parameters()
@@ -1414,10 +1415,15 @@ class MultiTrainer(Trainer):
         if outside:
             preview = outside[:10]
             suffix = "" if len(outside) <= 10 else f" ... (+{len(outside) - 10} more)"
-            log.warning(
+            message = (
                 "Found trainable params outside `model.experts`. "
-                "Isolated optimizers will NOT update them: %s%s",
-                preview, suffix
+                f"Isolated optimizers will NOT update them: {preview}{suffix}"
+            )
+            if self.allow_unoptimized_trainables:
+                log.warning(message)
+                return
+            raise RuntimeError(
+                message + ". Set train_options.allow_unoptimized_trainables=true to explicitly allow this."
             )
 
     # ---------------------------------------------------------------------

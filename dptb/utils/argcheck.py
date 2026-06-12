@@ -251,6 +251,10 @@ def train_options():
         "Each element is merged into the shared `lr_scheduler` config for the corresponding expert. "
         "This allows per-expert `patience`, `factor`, `min_lr`, or even scheduler `type`."
     )
+    doc_allow_unoptimized_trainables = (
+        "Set true to allow MultiTrainer trainable parameters outside model.experts even though isolated "
+        "expert optimizers will not update them. Default: False."
+    )
     doc_optimizer = "\
         The optimizer setting for selecting the gradient optimizer of model training. Optimizer supported includes `Adam`, `AdamW`, `SGD` and `LBFGS` \n\n\
         For more information about these optmization algorithm, we refer to:\n\n\
@@ -531,6 +535,7 @@ def train_options():
         Argument("expert_lrs", list, optional=True, default=[], doc=doc_expert_lrs),
         Argument("expert_optimizer_overrides", list, optional=True, default=[], doc=doc_expert_optimizer_overrides),
         Argument("expert_lr_scheduler_overrides", list, optional=True, default=[], doc=doc_expert_lr_scheduler_overrides),
+        Argument("allow_unoptimized_trainables", bool, optional=True, default=False, doc=doc_allow_unoptimized_trainables),
         # save / log
         Argument("save_freq", int, optional=True, default=10, doc=doc_save_freq),
         Argument("validation_freq", int, optional=True, default=10, doc=doc_validation_freq),
@@ -665,27 +670,35 @@ def HybridMuon():
     doc_lr = "learning rate. Default: 1e-3"
     doc_weight_decay = "decoupled weight decay for Muon-routed matrix parameters. Default: 1e-3"
     doc_muon_beta = "momentum coefficient for Muon-routed matrix parameters. Default: 0.95"
-    doc_muon_scale = "DPA4 update-RMS matching scale gamma. Default: 0.18"
+    doc_muon_scale = "Muon update scale gamma. Default: 0.2"
     doc_adam_betas = "Adam-family beta coefficients for vector/scalar parameters. Default: (0.9, 0.999)"
     doc_adam_eps = "Adam-family epsilon for vector/scalar parameters. Default: 1e-20"
     doc_matrix_min_dim = "Minimum trailing matrix dimension for Muon routing. Default: 2"
-    doc_magma_lite = "Set true to enable DPA4 Magma-lite momentum-alignment damping for Muon blocks. Default: True"
+    doc_muon_ns_steps = "Number of Newton-Schulz fast iterations. Default: 5"
+    doc_muon_ns_polish_steps = "Number of optional Newton-Schulz polish iterations. Default: 0"
+    doc_magma_lite = "Set true to enable DPA4 Magma-lite momentum-alignment damping for Muon blocks. Default: False"
     doc_magma_temperature = "Temperature for Magma-lite alignment sigmoid. DPA4 uses 2.0."
     doc_magma_ema_beta = "EMA coefficient for Magma-lite damping scores. DPA4 uses 0.9."
     doc_magma_min_scale = "Lower bound for Magma-lite damping scale. DPA4 uses 0.1."
+    doc_muon_clip = "Set true to apply an opt-in emergency cap to scaled Muon update RMS per matrix block. Default: False"
+    doc_muon_clip_rms = "Opt-in Muon update RMS cap. Default: 0.4"
 
     return [
         Argument("lr", float, optional=True, default=1e-3, doc=doc_lr),
         Argument("weight_decay", float, optional=True, default=1e-3, doc=doc_weight_decay),
         Argument("muon_beta", float, optional=True, default=0.95, doc=doc_muon_beta),
-        Argument("muon_scale", float, optional=True, default=0.18, doc=doc_muon_scale),
+        Argument("muon_scale", float, optional=True, default=0.2, doc=doc_muon_scale),
         Argument("adam_betas", list, optional=True, default=[0.9, 0.999], doc=doc_adam_betas),
         Argument("adam_eps", float, optional=True, default=1e-20, doc=doc_adam_eps),
         Argument("matrix_min_dim", int, optional=True, default=2, doc=doc_matrix_min_dim),
-        Argument("magma_lite", bool, optional=True, default=True, doc=doc_magma_lite),
+        Argument("muon_ns_steps", int, optional=True, default=5, doc=doc_muon_ns_steps),
+        Argument("muon_ns_polish_steps", int, optional=True, default=0, doc=doc_muon_ns_polish_steps),
+        Argument("magma_lite", bool, optional=True, default=False, doc=doc_magma_lite),
         Argument("magma_temperature", float, optional=True, default=2.0, doc=doc_magma_temperature),
         Argument("magma_ema_beta", float, optional=True, default=0.9, doc=doc_magma_ema_beta),
         Argument("magma_min_scale", float, optional=True, default=0.1, doc=doc_magma_min_scale),
+        Argument("muon_clip", bool, optional=True, default=False, doc=doc_muon_clip),
+        Argument("muon_clip_rms", float, optional=True, default=0.4, doc=doc_muon_clip_rms),
     ]
 
 def SGD():

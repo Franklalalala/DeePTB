@@ -116,14 +116,18 @@ class HybridMuon(Optimizer):
         lr: float = 1.0e-3,
         weight_decay: float = 1.0e-3,
         muon_beta: float = 0.95,
-        muon_scale: float = 0.18,
+        muon_scale: float = 0.2,
         adam_betas: Sequence[float] = (0.9, 0.999),
         adam_eps: float = 1.0e-20,
         matrix_min_dim: int = 2,
-        magma_lite: bool = True,
+        muon_ns_steps: int = 5,
+        muon_ns_polish_steps: int = 0,
+        magma_lite: bool = False,
         magma_temperature: float = 2.0,
         magma_ema_beta: float = 0.9,
         magma_min_scale: float = 0.1,
+        muon_clip: bool = False,
+        muon_clip_rms: float = 0.4,
     ) -> None:
         if lr <= 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -142,12 +146,18 @@ class HybridMuon(Optimizer):
             raise ValueError(f"Invalid adam_eps: {adam_eps}")
         if matrix_min_dim < 1:
             raise ValueError(f"Invalid matrix_min_dim: {matrix_min_dim}")
+        if muon_ns_steps < 1:
+            raise ValueError(f"Invalid muon_ns_steps: {muon_ns_steps}")
+        if muon_ns_polish_steps < 0:
+            raise ValueError(f"Invalid muon_ns_polish_steps: {muon_ns_polish_steps}")
         if magma_temperature <= 0.0:
             raise ValueError(f"Invalid magma_temperature: {magma_temperature}")
         if not (0.0 <= magma_ema_beta < 1.0):
             raise ValueError(f"Invalid magma_ema_beta: {magma_ema_beta}")
         if not (0.0 <= magma_min_scale <= 1.0):
             raise ValueError(f"Invalid magma_min_scale: {magma_min_scale}")
+        if muon_clip_rms <= 0.0:
+            raise ValueError(f"Invalid muon_clip_rms: {muon_clip_rms}")
 
         defaults = dict(
             lr=float(lr),
@@ -157,13 +167,18 @@ class HybridMuon(Optimizer):
             adam_betas=(beta1, beta2),
             adam_eps=float(adam_eps),
             matrix_min_dim=int(matrix_min_dim),
+            muon_ns_steps=int(muon_ns_steps),
+            muon_ns_polish_steps=int(muon_ns_polish_steps),
             magma_lite=bool(magma_lite),
             magma_temperature=float(magma_temperature),
             magma_ema_beta=float(magma_ema_beta),
             magma_min_scale=float(magma_min_scale),
+            muon_clip=bool(muon_clip),
+            muon_clip_rms=float(muon_clip_rms),
         )
         super().__init__(params, defaults)
         self.route_counts = self._count_routes()
+        self.route_numel = self._count_route_numel()
 
     @staticmethod
     def _effective_shape(param: torch.Tensor) -> List[int]:
@@ -174,15 +189,28 @@ class HybridMuon(Optimizer):
         shape = cls._effective_shape(param)
         return len(shape) >= 2 and min(shape[-2:]) >= matrix_min_dim
 
+    def _uses_muon_param(self, param: torch.Tensor, group) -> bool:
+        return self._uses_muon(param, group["matrix_min_dim"])
+
+    def _effective_shape_for_param(self, param: torch.Tensor, group) -> List[int]:
+        return self._effective_shape(param)
+
     def _count_routes(self):
         counts = {"muon": 0, "adam": 0}
         for group in self.param_groups:
-            matrix_min_dim = group["matrix_min_dim"]
             for param in group["params"]:
-                if self._uses_muon(param, matrix_min_dim):
+                if self._uses_muon_param(param, group):
                     counts["muon"] += 1
                 else:
                     counts["adam"] += 1
+        return counts
+
+    def _count_route_numel(self):
+        counts = {"muon": 0, "adam": 0}
+        for group in self.param_groups:
+            for param in group["params"]:
+                route = "muon" if self._uses_muon_param(param, group) else "adam"
+                counts[route] += int(param.numel())
         return counts
 
     @classmethod
@@ -197,17 +225,26 @@ class HybridMuon(Optimizer):
             return tensor.unsqueeze(0)
         return tensor.reshape(-1, tensor.shape[-2], tensor.shape[-1])
 
-    @classmethod
-    def _orthogonalize(cls, update: torch.Tensor) -> torch.Tensor:
+    def _reshape_to_matrix_batch_for_param(self, tensor: torch.Tensor, group, param: torch.Tensor) -> torch.Tensor:
+        effective_shape = self._effective_shape_for_param(param, group)
+        tensor = tensor.reshape(effective_shape)
+        if tensor.ndim == 2:
+            return tensor.unsqueeze(0)
+        return tensor.reshape(-1, tensor.shape[-2], tensor.shape[-1])
+
+    def _orthogonalize(self, update: torch.Tensor, group, param: torch.Tensor) -> torch.Tensor:
         original_shape = update.shape
-        x = cls._reshape_to_matrix_batch(update.float())
+        x = self._reshape_to_matrix_batch_for_param(update.float(), group, param)
         transposed = x.shape[-2] > x.shape[-1]
         if transposed:
             x = x.transpose(-2, -1)
 
         denom = x.norm(dim=(-2, -1), keepdim=True).clamp_min(1.0e-30)
         x = x / denom
-        coeffs = [cls._FAST_COEFF] * 8 + [cls._POLISH_COEFF] * 2
+        coeffs = (
+            [self._FAST_COEFF] * group["muon_ns_steps"]
+            + [self._POLISH_COEFF] * group["muon_ns_polish_steps"]
+        )
         for a, b, c in coeffs:
             gram = x @ x.transpose(-2, -1)
             gram2 = gram @ gram
@@ -227,7 +264,6 @@ class HybridMuon(Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             weight_decay = group["weight_decay"]
-            matrix_min_dim = group["matrix_min_dim"]
             for param in group["params"]:
                 if param.grad is None:
                     continue
@@ -235,10 +271,10 @@ class HybridMuon(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("HybridMuon does not support sparse gradients")
 
-                if self._uses_muon(param, matrix_min_dim):
+                if self._uses_muon_param(param, group):
                     self._muon_step(param, grad, group, lr, weight_decay)
                 else:
-                    self._adamw_step(param, grad, group, lr)
+                    self._adamw_step(param, grad, group, lr, weight_decay)
 
         return loss
 
@@ -252,19 +288,20 @@ class HybridMuon(Optimizer):
 
         momentum = state["momentum_buffer"]
         beta = group["muon_beta"]
-        momentum.mul_(beta).add_(grad, alpha=1.0 - beta)
-        update = momentum.mul(beta).add(grad, alpha=1.0 - beta)
-        ortho_update = self._orthogonalize(update)
+        momentum.mul_(beta).add_(grad)
+        update = momentum * beta + grad
+        ortho_update = self._orthogonalize(update, group, param)
         if group["magma_lite"]:
             ortho_update = ortho_update * self._magma_lite_scale(param, grad, update, group, state)
-        effective_shape = self._effective_shape(update)
+        effective_shape = self._effective_shape_for_param(param, group)
         rows, cols = int(effective_shape[-2]), int(effective_shape[-1])
-        scale = lr * group["muon_scale"] * math.sqrt(max(rows, cols))
-        param.add_(ortho_update, alpha=-scale)
+        scaled_update = ortho_update * (group["muon_scale"] * math.sqrt(max(rows, cols)))
+        scaled_update = self._clip_muon_update(param, scaled_update, group, state)
+        param.add_(scaled_update, alpha=-lr)
 
     def _magma_lite_scale(self, param, grad, update, group, state):
-        grad_blocks = self._reshape_to_matrix_batch(grad.float())
-        update_blocks = self._reshape_to_matrix_batch(update.float())
+        grad_blocks = self._reshape_to_matrix_batch_for_param(grad.float(), group, param)
+        update_blocks = self._reshape_to_matrix_batch_for_param(update.float(), group, param)
         numerator = (grad_blocks * update_blocks).sum(dim=(-2, -1))
         denom = (
             grad_blocks.norm(dim=(-2, -1))
@@ -283,19 +320,45 @@ class HybridMuon(Optimizer):
         ema.mul_(group["magma_ema_beta"]).add_(score, alpha=1.0 - group["magma_ema_beta"])
 
         scale = group["magma_min_scale"] + (1.0 - group["magma_min_scale"]) * ema
-        effective_shape = self._effective_shape(param)
+        effective_shape = self._effective_shape_for_param(param, group)
         if len(effective_shape) == 2:
             scale_view = scale.reshape(1, 1)
         else:
             scale_view = scale.reshape(*effective_shape[:-2], 1, 1)
         return scale_view.expand(effective_shape).reshape(param.shape).to(dtype=param.dtype)
 
-    def _adamw_step(self, param, grad, group, lr):
+    def _clip_muon_update(self, param, scaled_update, group, state):
+        blocks = self._reshape_to_matrix_batch_for_param(scaled_update.float(), group, param)
+        rms = blocks.pow(2).mean(dim=(-2, -1)).sqrt()
+        if group["muon_clip"]:
+            clip_scale = (group["muon_clip_rms"] / rms.clamp_min(1.0e-30)).clamp(max=1.0)
+        else:
+            clip_scale = torch.ones_like(rms)
+        state["muon_update_rms"] = rms.detach()
+        state["muon_clip_scale"] = clip_scale.detach()
+
+        if not group["muon_clip"]:
+            return scaled_update
+
+        effective_shape = self._effective_shape_for_param(param, group)
+        if len(effective_shape) == 2:
+            scale_view = clip_scale.reshape(1, 1)
+        else:
+            scale_view = clip_scale.reshape(*effective_shape[:-2], 1, 1)
+        return (
+            scaled_update.reshape(effective_shape)
+            * scale_view.expand(effective_shape).to(dtype=scaled_update.dtype)
+        ).reshape(param.shape)
+
+    def _adamw_step(self, param, grad, group, lr, weight_decay):
         state = self.state[param]
         if len(state) == 0:
             state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
             state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
             state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+
+        if weight_decay != 0.0:
+            param.mul_(1.0 - lr * weight_decay)
 
         beta1, beta2 = group["adam_betas"]
         exp_avg = state["exp_avg"]

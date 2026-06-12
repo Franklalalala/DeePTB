@@ -512,6 +512,17 @@ def test_multi_trainer_expert_optimizer_uses_unwrapped_expert_parameters():
     assert "opt = _make_opt_for_expert(idx)" in trainer_text
 
 
+def test_multi_trainer_fails_fast_for_trainables_outside_experts_by_default():
+    trainer_text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    check = _method_source(trainer_text, "_check_non_expert_trainables")
+
+    assert 'self.allow_unoptimized_trainables = bool(self.train_options.get("allow_unoptimized_trainables", False))' in trainer_text
+    assert "if self.allow_unoptimized_trainables:" in check
+    assert "log.warning(" in check
+    assert "raise RuntimeError(" in check
+    assert "Isolated optimizers will NOT update them" in check
+
+
 def test_saver_uses_unwrapped_local_expert_state_dict_for_ddp_wrapped_expert():
     saver_text = _read_repo_text("dptb/plugins/saver.py")
     gather_dist_states = _method_source(saver_text, "_gather_dist_states")
