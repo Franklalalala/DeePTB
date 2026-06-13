@@ -205,7 +205,9 @@ class Trainer(BaseTrainer):
                 batch.update(batch_info)
                 batch_for_loss.update(batch_info)
                 loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
-            if self.flow_cfm.log_train_compatible_loss:
+            if self.flow_cfm.log_train_compatible_loss and not getattr(
+                self.flow_cfm, "model_in_loss", False
+            ):
                 flow_state.update(
                     self._compatible_loss_state(
                         lossfunc,

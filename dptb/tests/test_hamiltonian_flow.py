@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
+from dptb.nnops import trainer as trainer_module
 from dptb.nnops.trainer import Trainer
 
 
@@ -221,6 +222,42 @@ def test_build_hamiltonian_flow_selects_pixel_meanflow_objective():
     assert flow.model_in_loss is True
 
 
+def test_pixel_meanflow_conservative_defaults_to_paper_boundary_tangent():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"profile": "conservative"},
+        }
+    )
+
+    assert flow.meanflow_profile == "conservative"
+    assert flow.meanflow_jvp_tangent == "boundary"
+    assert flow.meanflow_norm_p == pytest.approx(0.0)
+    assert flow.meanflow_aux_boundary_v_weight == pytest.approx(0.0)
+
+
+def test_pixel_meanflow_du_dt_backend_is_explicit_finite_difference():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"du_dt_backend": "finite_difference"},
+        }
+    )
+
+    assert flow.meanflow_du_dt_backend == "finite_difference"
+
+    with pytest.raises(NotImplementedError, match="finite_difference"):
+        HamiltonianPixelMeanFlow(
+            {
+                "enabled": True,
+                "objective": "pixel_meanflow",
+                "meanflow": {"du_dt_backend": "jvp"},
+            }
+        )
+
+
 def test_pixel_meanflow_aggressive_profile_sets_opt_in_knobs():
     flow = HamiltonianPixelMeanFlow(
         {
@@ -234,6 +271,53 @@ def test_pixel_meanflow_aggressive_profile_sets_opt_in_knobs():
     assert flow.meanflow_jvp_tangent == "boundary"
     assert flow.meanflow_norm_p == pytest.approx(1.0)
     assert flow.meanflow_aux_boundary_v_weight > 0.0
+
+
+class _ModelInLossFlow:
+    enabled = True
+    model_in_loss = True
+    log_train_compatible_loss = True
+    compatible_loss_to_legacy_keys = True
+
+    def loss_with_model(self, model, batch, batch_for_loss):
+        assert model is _UNUSED_MODEL
+        assert batch is not batch_for_loss
+        return torch.tensor(7.0, requires_grad=True), {"train_flow_loss": torch.tensor(7.0)}
+
+
+class _FakeBatch:
+    __slices__ = {}
+    __cumsum__ = {}
+    __cat_dims__ = {}
+    __num_nodes_list__ = []
+    __data_class__ = object
+
+    def to(self, device):
+        return self
+
+
+_UNUSED_MODEL = object()
+
+
+def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.flow_cfm = _ModelInLossFlow()
+    trainer.model = _UNUSED_MODEL
+
+    def fake_to_dict(batch):
+        return {"raw_batch": True}
+
+    def fail_compatible(*args, **kwargs):
+        raise AssertionError("model-in-loss pMF must not log raw-batch train compatible loss")
+
+    monkeypatch.setattr(trainer_module.AtomicData, "to_AtomicDataDict", fake_to_dict)
+    monkeypatch.setattr(Trainer, "_compatible_loss_state", staticmethod(fail_compatible))
+
+    loss = trainer._loss_on_batch(_FakeBatch(), _ComponentLoss())
+
+    assert loss.item() == pytest.approx(7.0)
+    assert trainer._last_flow_state["train_flow_loss"].item() == pytest.approx(7.0)
 
 
 def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():

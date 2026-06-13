@@ -623,15 +623,20 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_tr_uniform_prob = float(mf.get("tr_uniform_prob", 0.10))
         self.meanflow_min_t = float(mf.get("min_t", 0.05))
         self.meanflow_fd_eps = float(mf.get("fd_eps", 1.0e-3))
+        self.meanflow_du_dt_backend = str(
+            mf.get("du_dt_backend", mf.get("jvp_backend", "finite_difference"))
+        ).lower()
+        if self.meanflow_du_dt_backend != "finite_difference":
+            raise NotImplementedError(
+                "DeePTB pixel MeanFlow currently supports finite_difference du/dt only."
+            )
         self.meanflow_norm_eps = float(mf.get("norm_eps", 0.01))
         self.meanflow_norm_p = float(mf.get("norm_p", 1.0 if aggressive else 0.0))
         self.meanflow_aux_endpoint_weight = float(mf.get("aux_endpoint_weight", 0.05))
         self.meanflow_aux_boundary_v_weight = float(
             mf.get("aux_boundary_v_weight", 0.10 if aggressive else 0.0)
         )
-        self.meanflow_jvp_tangent = str(
-            mf.get("jvp_tangent", "boundary" if aggressive else "path")
-        ).lower()
+        self.meanflow_jvp_tangent = str(mf.get("jvp_tangent", "boundary")).lower()
         if self.meanflow_jvp_tangent not in {"path", "boundary"}:
             raise ValueError("pixel_meanflow.jvp_tangent must be 'path' or 'boundary'.")
 
@@ -646,11 +651,12 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         if self.enabled:
             log.info(
                 "Pixel MeanFlow enabled: profile=%s sampling=%s min_t=%.3g "
-                "data_prop=%.3g jvp_tangent=%s norm_p=%.3g aux_x=%.3g aux_v=%.3g",
+                "data_prop=%.3g du_dt=%s jvp_tangent=%s norm_p=%.3g aux_x=%.3g aux_v=%.3g",
                 self.meanflow_profile,
                 self.meanflow_time_sampling,
                 self.meanflow_min_t,
                 self.meanflow_data_proportion,
+                self.meanflow_du_dt_backend,
                 self.meanflow_jvp_tangent,
                 self.meanflow_norm_p,
                 self.meanflow_aux_endpoint_weight,
