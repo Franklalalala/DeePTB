@@ -41,3 +41,25 @@ def test_conditioner_requires_one_time_per_graph():
 
     with pytest.raises(ValueError, match="one value per graph"):
         conditioner(torch.zeros(3, 4), data)
+
+
+def test_conditioner_can_use_two_time_meanflow_channels():
+    conditioner = FlowTimeConditioner(
+        scalar_channels=4,
+        flow_time_key="flow_time",
+        flow_time_keys=("flow_time_t", "flow_time_r", "flow_time_h"),
+        max_positions=2000,
+    )
+    node_features = torch.zeros(2, 4)
+    base = {
+        "batch": torch.tensor([0, 1], dtype=torch.long),
+        "flow_time": torch.tensor([0.8, 0.8]),
+        "flow_time_t": torch.tensor([0.8, 0.8]),
+        "flow_time_r": torch.tensor([0.2, 0.6]),
+        "flow_time_h": torch.tensor([0.6, 0.2]),
+    }
+
+    conditioned = conditioner(node_features, base)
+
+    assert conditioned.shape == node_features.shape
+    assert not torch.allclose(conditioned[0], conditioned[1])

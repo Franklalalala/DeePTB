@@ -44,6 +44,25 @@ class CFMContext:
     edge_prior: Optional[torch.Tensor]
 
 
+@dataclass
+class PixelMFContext:
+    r: torch.Tensor
+    t: torch.Tensor
+    fm_mask: torch.Tensor
+    node_r: Optional[torch.Tensor]
+    node_t: Optional[torch.Tensor]
+    edge_r: Optional[torch.Tensor]
+    edge_t: Optional[torch.Tensor]
+    node_base: Optional[torch.Tensor]
+    edge_base: Optional[torch.Tensor]
+    node_clean: Optional[torch.Tensor]
+    edge_clean: Optional[torch.Tensor]
+    node_state: Optional[torch.Tensor]
+    edge_state: Optional[torch.Tensor]
+    node_prior: Optional[torch.Tensor]
+    edge_prior: Optional[torch.Tensor]
+
+
 class HamiltonianCFM:
     """Trainer-side residual conditional flow matching helper.
 
@@ -114,6 +133,7 @@ class HamiltonianCFM:
         self.validation_ode_steps = tuple(
             sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
         )
+        self.apply_to_reference = bool(options.get("apply_to_reference", False))
         self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
         self.log_train_compatible_loss = bool(
             options.get("log_train_compatible_loss", self.log_compatible_loss)
@@ -565,3 +585,574 @@ class HamiltonianCFM:
             state[self.edge_target_key] = edge_current
         state[self.flow_time_key] = torch.ones(num_graphs, device=like.device, dtype=like.dtype)
         return state
+
+
+class HamiltonianPixelMeanFlow(HamiltonianCFM):
+    """Pixel MeanFlow objective for residual Hamiltonian endpoint predictors.
+
+    The model still predicts the clean endpoint residual ``x``.  The pMF average
+    velocity is induced by ``u=(z_t-x_theta)/t`` for
+    ``z_t=(1-t)x+t eps`` and trained through
+    ``u+(t-r) stopgrad(d u/dt)`` against the path velocity ``eps-x``.
+    """
+
+    model_in_loss = True
+
+    def __init__(
+        self,
+        options: Optional[Dict[str, Any]],
+        *,
+        idp: Any = None,
+        dtype: Any = torch.float32,
+        device: Any = torch.device("cpu"),
+    ) -> None:
+        super().__init__(options, idp=idp, dtype=dtype, device=device)
+        options = dict(options or {})
+        mf = dict(options.get("meanflow", options.get("pixel_meanflow", {})) or {})
+        profile = str(mf.get("profile", options.get("meanflow_profile", "conservative"))).lower()
+        if bool(mf.get("aggressive", options.get("meanflow_aggressive", False))):
+            profile = "aggressive"
+        if profile not in {"conservative", "aggressive"}:
+            raise ValueError("pixel meanflow profile must be 'conservative' or 'aggressive'.")
+        aggressive = profile == "aggressive"
+
+        self.meanflow_profile = profile
+        self.meanflow_time_sampling = str(mf.get("time_sampling", "logit_normal")).lower()
+        self.meanflow_p_mean = float(mf.get("p_mean", -0.4))
+        self.meanflow_p_std = float(mf.get("p_std", 1.0))
+        self.meanflow_data_proportion = float(mf.get("data_proportion", 0.50))
+        self.meanflow_tr_uniform_prob = float(mf.get("tr_uniform_prob", 0.10))
+        self.meanflow_min_t = float(mf.get("min_t", 0.05))
+        self.meanflow_fd_eps = float(mf.get("fd_eps", 1.0e-3))
+        self.meanflow_du_dt_backend = str(
+            mf.get("du_dt_backend", mf.get("jvp_backend", "finite_difference"))
+        ).lower()
+        if self.meanflow_du_dt_backend != "finite_difference":
+            raise NotImplementedError(
+                "DeePTB pixel MeanFlow currently supports finite_difference du/dt only."
+            )
+        self.meanflow_norm_eps = float(mf.get("norm_eps", 0.01))
+        self.meanflow_norm_p = float(mf.get("norm_p", 1.0 if aggressive else 0.0))
+        self.meanflow_aux_endpoint_weight = float(mf.get("aux_endpoint_weight", 0.05))
+        self.meanflow_aux_boundary_v_weight = float(
+            mf.get("aux_boundary_v_weight", 0.10 if aggressive else 0.0)
+        )
+        self.meanflow_jvp_tangent = str(mf.get("jvp_tangent", "boundary")).lower()
+        if self.meanflow_jvp_tangent not in {"path", "boundary"}:
+            raise ValueError("pixel_meanflow.jvp_tangent must be 'path' or 'boundary'.")
+
+        self.flow_time_r_key = str(options.get("flow_time_r_key", "flow_time_r"))
+        self.flow_time_t_key = str(options.get("flow_time_t_key", "flow_time_t"))
+        self.flow_time_h_key = str(options.get("flow_time_h_key", "flow_time_h"))
+        self.log_train_compatible_loss = bool(mf.get("log_train_compatible_loss", False))
+        self.log_validation_compatible_loss = bool(
+            mf.get("log_validation_compatible_loss", self.log_validation_compatible_loss)
+        )
+
+        if self.enabled:
+            log.info(
+                "Pixel MeanFlow enabled: profile=%s sampling=%s min_t=%.3g "
+                "data_prop=%.3g du_dt=%s jvp_tangent=%s norm_p=%.3g aux_x=%.3g aux_v=%.3g",
+                self.meanflow_profile,
+                self.meanflow_time_sampling,
+                self.meanflow_min_t,
+                self.meanflow_data_proportion,
+                self.meanflow_du_dt_backend,
+                self.meanflow_jvp_tangent,
+                self.meanflow_norm_p,
+                self.meanflow_aux_endpoint_weight,
+                self.meanflow_aux_boundary_v_weight,
+            )
+
+    def _sample_time_base(
+        self,
+        num_graphs: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.meanflow_time_sampling == "uniform":
+            return torch.rand(num_graphs, device=device, dtype=dtype)
+        if self.meanflow_time_sampling == "logit_normal":
+            raw = torch.randn(num_graphs, device=device, dtype=dtype)
+            return torch.sigmoid(raw * self.meanflow_p_std + self.meanflow_p_mean)
+        raise ValueError(f"Unsupported pixel meanflow time sampling {self.meanflow_time_sampling!r}.")
+
+    def _sample_rt(
+        self,
+        *,
+        num_graphs: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        t = self._sample_time_base(num_graphs, device=device, dtype=dtype)
+        r = self._sample_time_base(num_graphs, device=device, dtype=dtype)
+        if self.meanflow_tr_uniform_prob > 0.0:
+            use_uniform = torch.rand(num_graphs, device=device) < self.meanflow_tr_uniform_prob
+            t = torch.where(use_uniform, torch.rand(num_graphs, device=device, dtype=dtype), t)
+            r = torch.where(use_uniform, torch.rand(num_graphs, device=device, dtype=dtype), r)
+        fm_mask = torch.rand(num_graphs, device=device) < self.meanflow_data_proportion
+        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        t = t.clamp(min=self.meanflow_min_t, max=1.0)
+        r = torch.minimum(r.clamp(min=0.0, max=1.0), t)
+        r = torch.where(fm_mask, t, r)
+        return r, t, fm_mask
+
+    def _write_times(self, data: AtomicDataDict.Type, r: torch.Tensor, t: torch.Tensor) -> None:
+        tt = t.detach()
+        rr = r.detach()
+        hh = (t - r).detach()
+        data[self.flow_time_key] = tt
+        data[self.flow_time_t_key] = tt
+        data[self.flow_time_r_key] = rr
+        data[self.flow_time_h_key] = hh
+        data["t"] = tt
+        data["r"] = rr
+        data["meanflow_h"] = hh
+
+    @staticmethod
+    def _view_time(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        return t.reshape((-1,) + (1,) * (like.ndim - 1)).clamp_min(1.0e-8)
+
+    def prepare_batch(
+        self,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        r: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> Tuple[AtomicDataDict.Type, AtomicDataDict.Type, PixelMFContext]:
+        if not self.enabled:
+            raise RuntimeError("HamiltonianPixelMeanFlow.prepare_batch called while disabled")
+
+        data = data.copy()
+        ref_data = ref_data.copy()
+        node_target = ref_data.get(self.node_target_key, None)
+        edge_target = ref_data.get(self.edge_target_key, None)
+        if node_target is None and edge_target is None:
+            raise KeyError(
+                "Pixel MeanFlow requires node and/or edge Hamiltonian targets in ref_data; "
+                f"looked for `{self.node_target_key}` and `{self.edge_target_key}`."
+            )
+
+        like = node_target if node_target is not None else edge_target
+        device = like.device
+        dtype = like.dtype if torch.is_floating_point(like) else self.dtype
+        num_graphs = self._num_graphs(data)
+        if r is None or t is None:
+            r, t, fm_mask = self._sample_rt(num_graphs=num_graphs, device=device, dtype=dtype)
+        else:
+            r = self._normalize_t(r, num_graphs=num_graphs, device=device, dtype=dtype)
+            t = self._normalize_t(t, num_graphs=num_graphs, device=device, dtype=dtype)
+            t, r = torch.maximum(t, r), torch.minimum(t, r)
+            t = t.clamp(min=self.meanflow_min_t, max=1.0)
+            r = torch.minimum(r.clamp(min=0.0, max=1.0), t)
+            fm_mask = torch.isclose(r, t)
+
+        node_t, edge_t = self._expand_graph_times(
+            data,
+            t,
+            node_count=None if node_target is None else node_target.shape[0],
+            edge_count=None if edge_target is None else edge_target.shape[0],
+        )
+        node_r, edge_r = self._expand_graph_times(
+            data,
+            r,
+            node_count=None if node_target is None else node_target.shape[0],
+            edge_count=None if edge_target is None else edge_target.shape[0],
+        )
+
+        node_base = edge_base = node_clean = edge_clean = None
+        node_state = edge_state = node_prior = edge_prior = None
+        if node_target is not None:
+            node_target = node_target.to(device=device, dtype=dtype)
+            node_base = self._base_like(data, node_target, self.node_h0_key, "node")
+            node_clean = node_target - node_base if self.mode == "residual" else node_target
+            node_prior = self._prior_like(node_clean, self.node_sigma)
+            node_t_view = node_t.reshape((-1,) + (1,) * (node_clean.ndim - 1))
+            node_state = (1.0 - node_t_view) * node_clean + node_t_view * node_prior
+            current = node_base + node_state if self.mode == "residual" else node_state
+            if self.detach_interpolated_h0:
+                current = current.detach()
+            data[self.node_h0_key] = current
+            if self.overwrite_feature_keys:
+                data[self.node_target_key] = current
+        if edge_target is not None:
+            edge_target = edge_target.to(device=device, dtype=dtype)
+            edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
+            edge_clean = edge_target - edge_base if self.mode == "residual" else edge_target
+            edge_prior = self._prior_like(edge_clean, self.edge_sigma)
+            edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_clean.ndim - 1))
+            edge_state = (1.0 - edge_t_view) * edge_clean + edge_t_view * edge_prior
+            current = edge_base + edge_state if self.mode == "residual" else edge_state
+            if self.detach_interpolated_h0:
+                current = current.detach()
+            data[self.edge_h0_key] = current
+            if self.overwrite_feature_keys:
+                data[self.edge_target_key] = current
+
+        self._write_times(data, r, t)
+        self._write_times(ref_data, r, t)
+        return data, ref_data, PixelMFContext(
+            r=r,
+            t=t,
+            fm_mask=fm_mask,
+            node_r=node_r,
+            node_t=node_t,
+            edge_r=edge_r,
+            edge_t=edge_t,
+            node_base=node_base,
+            edge_base=edge_base,
+            node_clean=node_clean,
+            edge_clean=edge_clean,
+            node_state=node_state,
+            edge_state=edge_state,
+            node_prior=node_prior,
+            edge_prior=edge_prior,
+        )
+
+    def _predict_clean(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        ctx: PixelMFContext,
+        node_state: Optional[torch.Tensor],
+        edge_state: Optional[torch.Tensor],
+        *,
+        r: torch.Tensor,
+        t: torch.Tensor,
+    ) -> Tuple[AtomicDataDict.Type, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        model_data = data.copy()
+        if node_state is not None:
+            node_current = ctx.node_base + node_state if self.mode == "residual" else node_state
+            model_data[self.node_h0_key] = node_current
+            if self.overwrite_feature_keys:
+                model_data[self.node_target_key] = node_current
+        if edge_state is not None:
+            edge_current = ctx.edge_base + edge_state if self.mode == "residual" else edge_state
+            model_data[self.edge_h0_key] = edge_current
+            if self.overwrite_feature_keys:
+                model_data[self.edge_target_key] = edge_current
+        self._write_times(model_data, r, t)
+        pred = model(model_data)
+        node_x = None
+        if ctx.node_clean is not None and self.node_target_key in pred:
+            node_pred = pred[self.node_target_key]
+            node_x = node_pred - ctx.node_base if self.mode == "residual" else node_pred
+        edge_x = None
+        if ctx.edge_clean is not None and self.edge_target_key in pred:
+            edge_pred = pred[self.edge_target_key]
+            edge_x = edge_pred - ctx.edge_base if self.mode == "residual" else edge_pred
+        return pred, node_x, edge_x
+
+    @staticmethod
+    def _adaptive_metric_stats(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+        loss_type: str,
+        *,
+        norm_p: float = 0.0,
+        norm_eps: float = 0.01,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask_f = mask.to(device=diff.device, dtype=diff.dtype)
+        if mask_f.shape != diff.shape:
+            mask_f = mask_f.expand_as(diff)
+        reduce_dims = tuple(range(1, diff.ndim))
+        count = mask_f.sum(dim=reduce_dims).clamp_min(1.0)
+        sq = (diff.square() * mask_f).sum(dim=reduce_dims) / count
+        ab = (diff.abs() * mask_f).sum(dim=reduce_dims) / count
+        if loss_type == "l1_rmse":
+            per_item = 0.5 * (ab + torch.sqrt(sq + 1e-12))
+        else:
+            per_item = sq
+        if norm_p != 0.0:
+            per_item = per_item / (per_item.detach() + norm_eps).pow(norm_p)
+        return per_item.mean(), sq.mean(), ab.mean()
+
+    def _component_meanflow_loss(
+        self,
+        *,
+        diff_prefix: str,
+        pred_x: torch.Tensor,
+        boundary_x: Optional[torch.Tensor],
+        clean: torch.Tensor,
+        prior: torch.Tensor,
+        state_z: torch.Tensor,
+        comp_r: torch.Tensor,
+        comp_t: torch.Tensor,
+        pred_x_eps: torch.Tensor,
+        mask: torch.Tensor,
+        weight: float,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        t_view = self._view_time(comp_t, state_z)
+        h_view = (comp_t - comp_r).reshape((-1,) + (1,) * (state_z.ndim - 1))
+        target_v = prior - clean
+        u = (state_z - pred_x) / t_view
+        if self.meanflow_jvp_tangent == "boundary" and boundary_x is not None:
+            tangent = (state_z - boundary_x) / t_view
+        else:
+            tangent = target_v
+        signed_dt = torch.where(
+            comp_t <= 1.0 - self.meanflow_fd_eps,
+            comp_t.new_full(comp_t.shape, self.meanflow_fd_eps),
+            comp_t.new_full(comp_t.shape, -self.meanflow_fd_eps),
+        )
+        t_eps = (comp_t + signed_dt).clamp(min=self.meanflow_min_t, max=1.0)
+        signed_dt = t_eps - comp_t
+        dt_view = self._view_time(signed_dt, state_z)
+        u_eps = (state_z + dt_view * tangent.detach() - pred_x_eps) / self._view_time(
+            t_eps, state_z
+        )
+        du_dt = ((u_eps - u.detach()) / dt_view).detach()
+        compound_v = u + h_view * du_dt
+
+        velocity_loss, velocity_mse, velocity_mae = self._adaptive_metric_stats(
+            compound_v - target_v,
+            mask,
+            self.loss_type,
+            norm_p=self.meanflow_norm_p,
+            norm_eps=self.meanflow_norm_eps,
+        )
+        endpoint_loss, endpoint_mse, endpoint_mae = self._adaptive_metric_stats(
+            pred_x - clean,
+            mask,
+            self.loss_type,
+        )
+        boundary_loss = endpoint_loss.new_zeros(())
+        boundary_mse = endpoint_loss.new_zeros(())
+        boundary_mae = endpoint_loss.new_zeros(())
+        if boundary_x is not None:
+            boundary_v = (state_z - boundary_x) / t_view
+            boundary_loss, boundary_mse, boundary_mae = self._adaptive_metric_stats(
+                boundary_v - target_v,
+                mask,
+                self.loss_type,
+                norm_p=self.meanflow_norm_p,
+                norm_eps=self.meanflow_norm_eps,
+            )
+        total = weight * (
+            velocity_loss
+            + self.meanflow_aux_endpoint_weight * endpoint_loss
+            + self.meanflow_aux_boundary_v_weight * boundary_loss
+        )
+        state = {
+            f"{diff_prefix}_velocity_loss": velocity_loss.detach(),
+            f"{diff_prefix}_velocity_mse": velocity_mse.detach(),
+            f"{diff_prefix}_velocity_mae": velocity_mae.detach(),
+            f"{diff_prefix}_endpoint_loss": endpoint_loss.detach(),
+            f"{diff_prefix}_endpoint_mse": endpoint_mse.detach(),
+            f"{diff_prefix}_endpoint_mae": endpoint_mae.detach(),
+            f"{diff_prefix}_boundary_v_loss": boundary_loss.detach(),
+            f"{diff_prefix}_boundary_v_mse": boundary_mse.detach(),
+            f"{diff_prefix}_boundary_v_mae": boundary_mae.detach(),
+        }
+        return total, state
+
+    def loss_with_model(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        prefix: str = "train",
+        r: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        data, ref_data, ctx = self.prepare_batch(data, ref_data, r=r, t=t)
+        _, node_x, edge_x = self._predict_clean(
+            model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.r, t=ctx.t
+        )
+        need_boundary = (
+            self.meanflow_jvp_tangent == "boundary"
+            or self.meanflow_aux_boundary_v_weight > 0.0
+        )
+        node_x_boundary = edge_x_boundary = None
+        if need_boundary:
+            _, node_x_boundary, edge_x_boundary = self._predict_clean(
+                model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.t, t=ctx.t
+            )
+
+        node_state_eps = edge_state_eps = None
+        if ctx.node_state is not None:
+            if self.meanflow_jvp_tangent == "boundary" and node_x_boundary is not None:
+                tangent = (ctx.node_state - node_x_boundary) / self._view_time(ctx.node_t, ctx.node_state)
+            else:
+                tangent = ctx.node_prior - ctx.node_clean
+            node_dt = torch.where(
+                ctx.node_t <= 1.0 - self.meanflow_fd_eps,
+                ctx.node_t.new_full(ctx.node_t.shape, self.meanflow_fd_eps),
+                ctx.node_t.new_full(ctx.node_t.shape, -self.meanflow_fd_eps),
+            )
+            node_dt = (ctx.node_t + node_dt).clamp(min=self.meanflow_min_t, max=1.0) - ctx.node_t
+            node_state_eps = ctx.node_state + self._view_time(node_dt, ctx.node_state) * tangent.detach()
+        if ctx.edge_state is not None:
+            if self.meanflow_jvp_tangent == "boundary" and edge_x_boundary is not None:
+                tangent = (ctx.edge_state - edge_x_boundary) / self._view_time(ctx.edge_t, ctx.edge_state)
+            else:
+                tangent = ctx.edge_prior - ctx.edge_clean
+            edge_dt = torch.where(
+                ctx.edge_t <= 1.0 - self.meanflow_fd_eps,
+                ctx.edge_t.new_full(ctx.edge_t.shape, self.meanflow_fd_eps),
+                ctx.edge_t.new_full(ctx.edge_t.shape, -self.meanflow_fd_eps),
+            )
+            edge_dt = (ctx.edge_t + edge_dt).clamp(min=self.meanflow_min_t, max=1.0) - ctx.edge_t
+            edge_state_eps = ctx.edge_state + self._view_time(edge_dt, ctx.edge_state) * tangent.detach()
+        graph_dt = torch.where(
+            ctx.t <= 1.0 - self.meanflow_fd_eps,
+            ctx.t.new_full(ctx.t.shape, self.meanflow_fd_eps),
+            ctx.t.new_full(ctx.t.shape, -self.meanflow_fd_eps),
+        )
+        t_eps = (ctx.t + graph_dt).clamp(min=self.meanflow_min_t, max=1.0)
+        with torch.no_grad():
+            _, node_x_eps, edge_x_eps = self._predict_clean(
+                model,
+                data,
+                ctx,
+                node_state_eps if node_state_eps is not None else ctx.node_state,
+                edge_state_eps if edge_state_eps is not None else ctx.edge_state,
+                r=ctx.r,
+                t=t_eps,
+            )
+
+        total = None
+        state: Dict[str, torch.Tensor] = {
+            f"{prefix}_flow_r": ctx.r.detach().mean(),
+            f"{prefix}_flow_t": ctx.t.detach().mean(),
+            f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
+            f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
+        }
+        if ctx.node_clean is not None and node_x is not None:
+            comp_total, comp_state = self._component_meanflow_loss(
+                diff_prefix=f"{prefix}_flow_onsite",
+                pred_x=node_x,
+                boundary_x=node_x_boundary,
+                clean=ctx.node_clean,
+                prior=ctx.node_prior,
+                state_z=ctx.node_state,
+                comp_r=ctx.node_r,
+                comp_t=ctx.node_t,
+                pred_x_eps=node_x_eps,
+                mask=self._node_mask(data, node_x),
+                weight=self.node_weight,
+            )
+            total = comp_total if total is None else total + comp_total
+            state.update(comp_state)
+        if ctx.edge_clean is not None and edge_x is not None:
+            comp_total, comp_state = self._component_meanflow_loss(
+                diff_prefix=f"{prefix}_flow_hopping",
+                pred_x=edge_x,
+                boundary_x=edge_x_boundary,
+                clean=ctx.edge_clean,
+                prior=ctx.edge_prior,
+                state_z=ctx.edge_state,
+                comp_r=ctx.edge_r,
+                comp_t=ctx.edge_t,
+                pred_x_eps=edge_x_eps,
+                mask=self._edge_mask(data, edge_x),
+                weight=self.edge_weight,
+            )
+            total = comp_total if total is None else total + comp_total
+            state.update(comp_state)
+        if total is None:
+            raise KeyError("Pixel MeanFlow could not compute a loss from configured node/edge targets.")
+        if self.router_z_loss_coef > 0.0:
+            # The main prediction is intentionally not retained; keep router regularization
+            # out of pMF unless a future model-level integration returns it explicitly.
+            log.debug("z_loss_coef is ignored by HamiltonianPixelMeanFlow.loss_with_model")
+        state[f"{prefix}_flow_loss"] = total.detach()
+        self.last_state = state
+        return total, state
+
+    def loss(self, pred_data: AtomicDataDict.Type, ref_data: AtomicDataDict.Type, ctx: PixelMFContext):
+        raise RuntimeError("HamiltonianPixelMeanFlow requires loss_with_model(model, data, ref_data).")
+
+    def sample(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        *,
+        num_steps: int,
+    ) -> AtomicDataDict.Type:
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+        state = data.copy()
+        node_base = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
+        edge_base = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
+        if node_base is None and edge_base is None:
+            raise KeyError("Pixel MeanFlow sampling requires node and/or edge Hamiltonian start features.")
+        node_z = None if node_base is None else self._prior_like(torch.zeros_like(node_base), self.node_sigma)
+        edge_z = None if edge_base is None else self._prior_like(torch.zeros_like(edge_base), self.edge_sigma)
+        like = node_z if node_z is not None else edge_z
+        num_graphs = self._num_graphs(state)
+        grid = torch.linspace(1.0, 0.0, num_steps + 1, device=like.device, dtype=like.dtype)
+        ctx = PixelMFContext(
+            r=grid.new_full((num_graphs,), 0.0),
+            t=grid.new_full((num_graphs,), 1.0),
+            fm_mask=torch.zeros(num_graphs, device=like.device, dtype=torch.bool),
+            node_r=None,
+            node_t=None,
+            edge_r=None,
+            edge_t=None,
+            node_base=node_base,
+            edge_base=edge_base,
+            node_clean=None if node_z is None else torch.zeros_like(node_z),
+            edge_clean=None if edge_z is None else torch.zeros_like(edge_z),
+            node_state=node_z,
+            edge_state=edge_z,
+            node_prior=node_z,
+            edge_prior=edge_z,
+        )
+        for step in range(num_steps):
+            t = torch.full((num_graphs,), float(grid[step].item()), device=like.device, dtype=like.dtype)
+            t = t.clamp_min(self.meanflow_min_t)
+            r = torch.full((num_graphs,), float(grid[step + 1].item()), device=like.device, dtype=like.dtype)
+            ctx.r, ctx.t = r, t
+            ctx.node_t, ctx.edge_t = self._expand_graph_times(
+                state,
+                t,
+                node_count=None if node_z is None else node_z.shape[0],
+                edge_count=None if edge_z is None else edge_z.shape[0],
+            )
+            ctx.node_r, ctx.edge_r = self._expand_graph_times(
+                state,
+                r,
+                node_count=None if node_z is None else node_z.shape[0],
+                edge_count=None if edge_z is None else edge_z.shape[0],
+            )
+            _, node_x, edge_x = self._predict_clean(model, state, ctx, node_z, edge_z, r=r, t=t)
+            if node_z is not None:
+                node_h = (ctx.node_t - ctx.node_r).reshape((-1,) + (1,) * (node_z.ndim - 1))
+                node_z = node_z - node_h * (
+                    (node_z - node_x) / self._view_time(ctx.node_t, node_z)
+                )
+                ctx.node_state = node_z
+            if edge_z is not None:
+                edge_h = (ctx.edge_t - ctx.edge_r).reshape((-1,) + (1,) * (edge_z.ndim - 1))
+                edge_z = edge_z - edge_h * (
+                    (edge_z - edge_x) / self._view_time(ctx.edge_t, edge_z)
+                )
+                ctx.edge_state = edge_z
+        out = state.copy()
+        if node_z is not None:
+            out[self.node_h0_key] = node_base + node_z if self.mode == "residual" else node_z
+            out[self.node_target_key] = out[self.node_h0_key]
+        if edge_z is not None:
+            out[self.edge_h0_key] = edge_base + edge_z if self.mode == "residual" else edge_z
+            out[self.edge_target_key] = out[self.edge_h0_key]
+        zero = torch.zeros(num_graphs, device=like.device, dtype=like.dtype)
+        self._write_times(out, zero, zero)
+        return out
+
+
+def build_hamiltonian_flow(
+    options: Optional[Dict[str, Any]],
+    *,
+    idp: Any = None,
+    dtype: Any = torch.float32,
+    device: Any = torch.device("cpu"),
+) -> HamiltonianCFM:
+    options = dict(options or {})
+    objective = str(options.get("objective", options.get("type", "cfm"))).lower()
+    if objective in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
+        return HamiltonianPixelMeanFlow(options, idp=idp, dtype=dtype, device=device)
+    return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)
