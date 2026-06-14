@@ -133,6 +133,7 @@ class HamiltonianCFM:
         self.validation_ode_steps = tuple(
             sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
         )
+        self.apply_to_reference = bool(options.get("apply_to_reference", False))
         self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
         self.log_train_compatible_loss = bool(
             options.get("log_train_compatible_loss", self.log_compatible_loss)

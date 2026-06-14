@@ -15,6 +15,7 @@ Minimal paper-conservative flow fragment:
     "prior": "zero",
     "overwrite_feature_keys": true,
     "validation_ode_steps": [1, 3],
+    "apply_to_reference": false,
     "meanflow": {
       "profile": "conservative",
       "jvp_tangent": "boundary",
@@ -43,6 +44,11 @@ The model must receive the two-time conditioning keys:
   }
 }
 ```
+
+Place this embedding block under your active `model_options.embedding` or
+`lem_moe_v3_h0` embedding config. It is not a top-level config section.
+For DeePTB residual correction smokes, prefer `prior: "zero"`; Gaussian
+residual priors should be separate ablations.
 
 Use the aggressive profile only as a separate ablation. It enables extra
 stabilizers such as adaptive normalization and boundary-velocity auxiliary

@@ -273,9 +273,24 @@ def test_pixel_meanflow_aggressive_profile_sets_opt_in_knobs():
     assert flow.meanflow_aux_boundary_v_weight > 0.0
 
 
+def test_flow_apply_to_reference_defaults_false_and_can_opt_in():
+    default_flow = HamiltonianPixelMeanFlow({"enabled": True, "objective": "pixel_meanflow"})
+    opt_in_flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "apply_to_reference": True,
+        }
+    )
+
+    assert default_flow.apply_to_reference is False
+    assert opt_in_flow.apply_to_reference is True
+
+
 class _ModelInLossFlow:
     enabled = True
     model_in_loss = True
+    apply_to_reference = False
     log_train_compatible_loss = True
     compatible_loss_to_legacy_keys = True
 
@@ -318,6 +333,43 @@ def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
 
     assert loss.item() == pytest.approx(7.0)
     assert trainer._last_flow_state["train_flow_loss"].item() == pytest.approx(7.0)
+
+
+def test_loss_on_batch_can_skip_flow_for_reference_batch(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.flow_cfm = _ModelInLossFlow()
+
+    class ReferenceModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, batch):
+            self.calls += 1
+            pred = batch.copy()
+            pred["node_features"] = pred["node_features"] + 2.0
+            pred["edge_features"] = pred["edge_features"] + 3.0
+            return pred
+
+    def fail_loss_with_model(*args, **kwargs):
+        raise AssertionError("reference batches should not enter pMF loss_with_model by default")
+
+    def fake_to_dict(batch):
+        return {
+            "node_features": torch.tensor([[1.0]]),
+            "edge_features": torch.tensor([[2.0]]),
+        }
+
+    model = ReferenceModel()
+    trainer.model = model
+    monkeypatch.setattr(trainer.flow_cfm, "loss_with_model", fail_loss_with_model)
+    monkeypatch.setattr(trainer_module.AtomicData, "to_AtomicDataDict", fake_to_dict)
+
+    loss = trainer._loss_on_batch(_FakeBatch(), _ComponentLoss(), use_flow=False)
+
+    assert loss.item() == pytest.approx(2.5)
+    assert trainer._last_flow_state == {}
+    assert model.calls == 1
 
 
 def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():

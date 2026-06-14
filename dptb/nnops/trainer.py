@@ -191,12 +191,12 @@ class Trainer(BaseTrainer):
         frequency = max(int(getattr(self, "optimizer_diagnostics_freq", 1)), 1)
         return self.iter == 1 or self.iter % frequency == 0
 
-    def _loss_on_batch(self, batch, lossfunc):
+    def _loss_on_batch(self, batch, lossfunc, *, use_flow=True):
         batch = batch.to(self.device)
         batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
-        if self.flow_cfm.enabled:
+        if use_flow and self.flow_cfm.enabled:
             if getattr(self.flow_cfm, "model_in_loss", False):
                 loss, flow_state = self.flow_cfm.loss_with_model(self.model, batch, batch_for_loss)
             else:
@@ -300,7 +300,7 @@ class Trainer(BaseTrainer):
 
         dynamic_batch_state = self._dynamic_batch_state_from_batch(batch)
 
-        loss = self._loss_on_batch(batch, self.train_lossfunc)
+        loss = self._loss_on_batch(batch, self.train_lossfunc, use_flow=True)
         loss_for_log = loss.detach()
         loss.backward()
         del loss
@@ -308,7 +308,11 @@ class Trainer(BaseTrainer):
         ref_component_state = {}
         if ref_batch is not None:
             reference_lossfunc = getattr(self, "reference_lossfunc", self.train_lossfunc)
-            ref_loss = self._loss_on_batch(ref_batch, reference_lossfunc)
+            ref_loss = self._loss_on_batch(
+                ref_batch,
+                reference_lossfunc,
+                use_flow=self.flow_cfm.apply_to_reference,
+            )
             loss_for_log = loss_for_log + ref_loss.detach()
             ref_loss.backward()
             ref_component_state = self._loss_component_state(reference_lossfunc, prefix="ref")

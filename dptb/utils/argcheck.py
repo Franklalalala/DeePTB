@@ -203,6 +203,7 @@ def flow_options():
         Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
         Argument("component_reduction", str, optional=True, default="global_elements"),
         Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
+        Argument("apply_to_reference", bool, optional=True, default=False),
         Argument("log_compatible_loss", bool, optional=True, default=True),
         Argument("log_train_compatible_loss", bool, optional=True, default=True),
         Argument("log_validation_compatible_loss", bool, optional=True, default=True),
