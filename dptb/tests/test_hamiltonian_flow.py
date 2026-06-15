@@ -1,9 +1,14 @@
+from pathlib import Path
+import importlib
+
 import pytest
 import torch
 
 from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
 from dptb.nnops import trainer as trainer_module
 from dptb.nnops.trainer import Trainer
+
+train_entrypoint = importlib.import_module("dptb.entrypoints.train")
 
 
 def _two_graph_batch():
@@ -92,8 +97,53 @@ def test_global_element_reduction_does_not_equal_weight_node_and_edge_components
     assert loss.item() == pytest.approx(7.0)
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert "train_onsite_loss" not in state
-    assert "train_hopping_loss" not in state
+    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+
+
+def test_cfm_writes_default_legacy_train_tags_and_router_stats():
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "omit_time_scaling": True,
+        }
+    )
+    data, ref, ctx = flow.prepare_batch(_two_graph_batch(), _two_graph_ref(), t=torch.zeros(2))
+    pred = {
+        "batch": data["batch"],
+        "edge_index": data["edge_index"],
+        "node_features": ref["node_features"] + 1.0,
+        "edge_features": ref["edge_features"] + 3.0,
+        "mean_max_prob": torch.tensor(0.75),
+        "expert_load_cv": torch.tensor(0.25),
+    }
+
+    _, state = flow.loss(pred, ref, ctx)
+
+    assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
+    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    assert state["mean_max_prob"].item() == pytest.approx(0.75)
+    assert state["expert_load_cv"].item() == pytest.approx(0.25)
+
+
+def test_single_trainer_effective_expert_lr_state_uses_global_optimizer_lr():
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([param], lr=0.0125)
+    state = {}
+
+    Trainer._add_effective_expert_lr_state(state, optimizer=optimizer, num_experts=2)
+
+    assert state["expert_0_lr"] == pytest.approx(0.0125)
+    assert state["expert_1_lr"] == pytest.approx(0.0125)
+
+
+def test_single_train_entrypoint_passes_train_options_to_build_model():
+    text = Path(train_entrypoint.__file__).read_text(encoding="utf-8")
+    build_call = text[text.index("model = build_model("): text.index("trainer = Trainer(")]
+
+    assert 'train_options=jdata["train_options"]' in build_call
 
 
 class _ComponentLoss(torch.nn.Module):

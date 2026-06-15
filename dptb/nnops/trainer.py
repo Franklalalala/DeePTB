@@ -39,6 +39,7 @@ class Trainer(BaseTrainer):
 
         # init the object
         self.model = model.to(self.device)
+        self.num_experts = int(getattr(self.model, "num_experts", 0) or 0)
         self.activation_recompute_state = configure_activation_recompute(
             self.model,
             train_options.get("activation_recompute", None),
@@ -166,6 +167,15 @@ class Trainer(BaseTrainer):
             if hasattr(batch, attr):
                 state[key] = getattr(batch, attr)
         return state
+
+    @staticmethod
+    def _add_effective_expert_lr_state(state, *, optimizer, num_experts):
+        num_experts = int(num_experts or 0)
+        if num_experts <= 0 or not optimizer.param_groups:
+            return
+        lr_for_expert_tags = float(optimizer.param_groups[0]["lr"])
+        for i in range(num_experts):
+            state[f"expert_{i}_lr"] = lr_for_expert_tags
 
     @staticmethod
     def _batch_info(batch):
@@ -340,6 +350,11 @@ class Trainer(BaseTrainer):
             "lr": self.optimizer.state_dict()["param_groups"][0]['lr'],
             "total_grad_norm": total_norm.item()
         }
+        self._add_effective_expert_lr_state(
+            state,
+            optimizer=self.optimizer,
+            num_experts=getattr(self, "num_experts", getattr(self.model, "num_experts", 0)),
+        )
         state.update(dynamic_batch_state)
         if not self.flow_cfm.enabled:
             state.update(self._loss_component_state(self.train_lossfunc))

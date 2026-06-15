@@ -144,7 +144,6 @@ class HamiltonianCFM:
         self.compatible_loss_to_legacy_keys = bool(
             options.get("compatible_loss_to_legacy_keys", True)
         )
-
         # Loss and regularization.
         self.loss_type = str(options.get("loss_type", "mse")).lower()
         if self.loss_type not in {"mse", "l1_rmse"}:
@@ -471,7 +470,9 @@ class HamiltonianCFM:
             total = self.node_weight * node_loss if total is None else total + self.node_weight * node_loss
             total_numerator = self.node_weight * node_numerator
             total_count = self.node_weight * node_count
-            state["train_flow_onsite_loss"] = node_loss.detach()
+            node_loss_detached = node_loss.detach()
+            state["train_flow_onsite_loss"] = node_loss_detached
+            state["train_onsite_loss"] = node_loss_detached
 
         edge_loss = None
         if ctx.edge_target is not None and self.edge_target_key in pred_data:
@@ -489,7 +490,9 @@ class HamiltonianCFM:
             else:
                 total_numerator = total_numerator + self.edge_weight * edge_numerator
                 total_count = total_count + self.edge_weight * edge_count
-            state["train_flow_hopping_loss"] = edge_loss.detach()
+            edge_loss_detached = edge_loss.detach()
+            state["train_flow_hopping_loss"] = edge_loss_detached
+            state["train_hopping_loss"] = edge_loss_detached
 
         if total is None:
             raise KeyError(
@@ -499,11 +502,14 @@ class HamiltonianCFM:
         if self.component_reduction == "global_elements":
             total = total_numerator / total_count.clamp_min(1.0)
 
-        if self.router_z_loss_coef > 0.0 and "mean_max_prob" in pred_data:
-            z_loss = pred_data["mean_max_prob"]
-            if torch.is_tensor(z_loss):
-                total = total + self.router_z_loss_coef * z_loss
-                state["mean_max_prob"] = z_loss.detach()
+        mean_max_prob = pred_data.get("mean_max_prob", None)
+        if torch.is_tensor(mean_max_prob):
+            state["mean_max_prob"] = mean_max_prob.detach()
+            if self.router_z_loss_coef > 0.0:
+                total = total + self.router_z_loss_coef * mean_max_prob
+        expert_load_cv = pred_data.get("expert_load_cv", None)
+        if torch.is_tensor(expert_load_cv):
+            state["expert_load_cv"] = expert_load_cv.detach()
 
         state["train_flow_loss"] = total.detach()
         self.last_state = state

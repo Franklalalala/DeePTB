@@ -514,7 +514,12 @@ def train(
         # include the init model and from scratch
         # build model will handle the init model cases where the model options provided is not equals to the ones in checkpoint.
         checkpoint = init_model if init_model else None
-        model = build_model(checkpoint=checkpoint, model_options=jdata["model_options"], common_options=jdata["common_options"])
+        model = build_model(
+            checkpoint=checkpoint,
+            model_options=jdata["model_options"],
+            common_options=jdata["common_options"],
+            train_options=jdata["train_options"],
+        )
         scale_type = jdata["model_options"]["prediction"].get('scale_type', "scale_w_back_grad")
         if scale_type == 'no_scale':
             log.info('Skip the E3statistics part, since the scale_type is no_scale')
