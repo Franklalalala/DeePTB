@@ -1783,6 +1783,9 @@ class Validationer(Monitor):
         stats = self.trainer.stats.setdefault(self.stat_name, {})
         val = self.trainer.validation(fast=self.fast_mode)
         self._sync_flow_metrics(epoch=True, time=epoch)
+        flow_validation_state = getattr(self.trainer, "_last_flow_validation_state", {})
+        if self.stat_name in flow_validation_state:
+            val = flow_validation_state[self.stat_name]
         if torch.is_tensor(val):
             val = val.detach()
             if val.ndim > 0:
