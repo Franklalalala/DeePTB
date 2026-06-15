@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -97,11 +98,11 @@ def test_global_element_reduction_does_not_equal_weight_node_and_edge_components
     assert loss.item() == pytest.approx(7.0)
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
-    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
 
 
-def test_cfm_writes_default_legacy_train_tags_and_router_stats():
+def test_cfm_keeps_flow_metrics_out_of_legacy_train_tags_and_router_stats():
     flow = HamiltonianCFM(
         {
             "enabled": True,
@@ -122,8 +123,8 @@ def test_cfm_writes_default_legacy_train_tags_and_router_stats():
 
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
-    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
     assert state["mean_max_prob"].item() == pytest.approx(0.75)
     assert state["expert_load_cv"].item() == pytest.approx(0.25)
 
@@ -213,6 +214,46 @@ def test_flow_compatible_loss_state_explicit_legacy_mapping():
     assert state["train_hopping_loss"].item() == pytest.approx(2.0)
     assert lossfunc.last_onsite_loss.item() == pytest.approx(123.0)
     assert lossfunc.last_hopping_loss.item() == pytest.approx(456.0)
+
+
+def test_flow_compatible_loss_state_can_write_legacy_only_tags():
+    lossfunc = _ComponentLoss()
+    pred, ref = _pred_ref()
+
+    state = Trainer._compatible_loss_state(
+        lossfunc,
+        pred,
+        ref,
+        prefix="train",
+        legacy_prefix=None,
+    )
+
+    assert state["train_loss"].item() == pytest.approx(2.0)
+    assert state["train_onsite_loss"].item() == pytest.approx(2.0)
+    assert state["train_hopping_loss"].item() == pytest.approx(2.0)
+    assert not any(key.startswith("train_compatible") for key in state)
+
+
+def test_flow_validation_compatible_state_prefers_legacy_tags_without_extra():
+    trainer = object.__new__(Trainer)
+    trainer.flow_cfm = SimpleNamespace(
+        compatible_loss_to_legacy_keys=True,
+        log_validation_compatible_loss=True,
+    )
+    lossfunc = _ComponentLoss()
+    pred, ref = _pred_ref()
+
+    state = trainer._flow_validation_compatible_state(
+        lossfunc,
+        pred,
+        ref,
+        num_steps=1,
+    )
+
+    assert state["validation_loss"].item() == pytest.approx(2.0)
+    assert state["validation_onsite_loss"].item() == pytest.approx(2.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(2.0)
+    assert not any(key.startswith("validation_compatible") for key in state)
 
 
 def test_flow_compatible_loss_state_maps_validation_components_only():
@@ -362,6 +403,65 @@ class _FakeBatch:
 
 
 _UNUSED_MODEL = object()
+
+
+class _EndpointOffsetModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bias = torch.nn.Parameter(torch.tensor(0.0))
+        self.calls = 0
+
+    def forward(self, data):
+        self.calls += 1
+        pred = data.copy()
+        pred["node_features"] = torch.full_like(data["node_features"], 2.0) + self.bias
+        pred["edge_features"] = torch.full_like(data["edge_features"], 4.0) + self.bias
+        return pred
+
+
+def test_loss_on_batch_logs_legacy_compatible_loss_without_extra_tags(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.model = _EndpointOffsetModel()
+    trainer.flow_cfm = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "full",
+            "prior": "zero",
+            "omit_time_scaling": True,
+            "loss_type": "mse",
+            "log_train_compatible_loss": False,
+            "compatible_loss_to_legacy_keys": True,
+        }
+    )
+    trainer.flow_cfm._sample_t = lambda *, num_graphs, device, dtype: torch.zeros(
+        num_graphs, device=device, dtype=dtype
+    )
+
+    def fake_to_dict(batch):
+        return {
+            "batch": torch.zeros(2, dtype=torch.long),
+            "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+            "node_h0": torch.zeros(2, 1),
+            "edge_h0": torch.zeros(1, 1),
+            "node_features": torch.zeros(2, 1),
+            "edge_features": torch.zeros(1, 1),
+        }
+
+    monkeypatch.setattr(trainer_module.AtomicData, "to_AtomicDataDict", fake_to_dict)
+
+    loss = trainer._loss_on_batch(_FakeBatch(), _ComponentLoss())
+    state = trainer._last_flow_state
+
+    assert trainer.model.calls == 1
+    assert loss.item() == pytest.approx(8.0)
+    assert state["train_flow_loss"].item() == pytest.approx(8.0)
+    assert state["train_flow_onsite_loss"].item() == pytest.approx(4.0)
+    assert state["train_flow_hopping_loss"].item() == pytest.approx(16.0)
+    assert state["train_loss"].item() == pytest.approx(3.0)
+    assert state["train_onsite_loss"].item() == pytest.approx(2.0)
+    assert state["train_hopping_loss"].item() == pytest.approx(4.0)
+    assert not any(key.startswith("train_compatible") for key in state)
 
 
 def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):

@@ -1455,7 +1455,7 @@ class MultiTrainer(Trainer):
         return expert_edge_mask, expert_node_mask
 
     def _validate_lem_cutoff_precompute_options(self):
-        loss_options_text = repr(self.train_options).lower()
+        loss_options_text = repr(self.train_options.get("loss_options", {})).lower()
         geometry_terms = ("force", "forces", "stress", "virial")
         if any(term in loss_options_text for term in geometry_terms):
             raise ValueError(

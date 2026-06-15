@@ -861,6 +861,30 @@ def test_multitrainer_base_options_disable_dynamic_batch_before_rebuild():
     assert base_options["dynamic_batch"]["calibrate"] is True
 
 
+def test_lem_cutoff_precompute_geometry_guard_uses_loss_options_only():
+    trainer = MultiTrainer.__new__(MultiTrainer)
+    trainer.train_options = {
+        "flow_options": {
+            "enabled": True,
+            "objective": "cfm",
+            "non_loss_force_note": "metadata outside loss_options",
+        },
+        "loss_options": {
+            "train": {"method": "hamil_abs"},
+            "validation": {"method": "hamil_abs"},
+        },
+    }
+
+    trainer._validate_lem_cutoff_precompute_options()
+
+    trainer.train_options["loss_options"] = {
+        "train": {"method": "force"},
+        "validation": {"method": "hamil_abs"},
+    }
+    with pytest.raises(ValueError, match="force/stress/virial"):
+        trainer._validate_lem_cutoff_precompute_options()
+
+
 class _DummyTagger:
     @contextmanager
     def tag(self, *args, **kwargs):
