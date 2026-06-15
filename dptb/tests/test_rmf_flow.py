@@ -51,6 +51,16 @@ def _rmf_options():
     }
 
 
+def _empty_multitrainer_for_pack():
+    trainer = MultiTrainer.__new__(MultiTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.dtype = torch.float32
+    trainer.log_single_model_compatible_loss = True
+    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.train_lossfunc = object()
+    return trainer
+
+
 def test_euclidean_rmf_manifold_ops_shape_and_values():
     manifold = build_rmf_manifold("euclidean")
     assert isinstance(manifold, EuclideanManifold)
@@ -104,6 +114,78 @@ def test_rmf_flow_matching_samples_remain_equal_after_endpoint_clamp(monkeypatch
     assert fm_mask.all()
     assert torch.allclose(r, t)
     assert torch.allclose(r, torch.full_like(r, 1.0 - flow.rmf_endpoint_eps))
+
+
+def test_rmf_rejects_unimplemented_semigroup_objective():
+    options = _rmf_options()
+    options["rmf_options"] = dict(options["rmf_options"], objective="semigroup")
+
+    with pytest.raises(NotImplementedError, match="source_time_fd"):
+        HamiltonianRiemannianMeanFlow(options)
+
+
+def test_rmf_endpoint_loss_ignores_inactive_distance_expert_rows():
+    flow = HamiltonianRiemannianMeanFlow(_rmf_options())
+    flow.meanflow_aux_endpoint_weight = 0.0
+    clean = torch.zeros(4, 1)
+    prior = torch.zeros_like(clean)
+    state_z = torch.zeros_like(clean)
+    target_v = torch.zeros_like(clean)
+    pred_x = torch.tensor([[1.0], [3.0], [100.0], [100.0]])
+    mask = torch.tensor([[True], [True], [False], [False]])
+
+    _, state = flow._component_rmf_loss(
+        diff_prefix="train_flow_hopping",
+        pred_x=pred_x,
+        clean=clean,
+        prior=prior,
+        state_z=state_z,
+        target_v=target_v,
+        comp_r=torch.full((4,), 0.25),
+        comp_t=torch.full((4,), 0.25),
+        pred_x_eps=pred_x,
+        mask=mask,
+        weight=1.0,
+    )
+
+    assert state["train_flow_hopping_endpoint_loss"].item() == pytest.approx(5.0)
+    assert state["train_flow_hopping_endpoint_mse"].item() == pytest.approx(5.0)
+    assert state["train_flow_hopping_endpoint_mae"].item() == pytest.approx(2.0)
+    assert state["train_flow_hopping_endpoint_l1_sum"].item() == pytest.approx(4.0)
+    assert state["train_flow_hopping_endpoint_mse_sum"].item() == pytest.approx(10.0)
+    assert state["train_flow_hopping_endpoint_count"].item() == pytest.approx(2.0)
+
+
+def test_multitrainer_flow_metrics_keep_endpoint_counts_for_validation_pack():
+    trainer = _empty_multitrainer_for_pack()
+    flow_state = {
+        "validation_flow_onsite_endpoint_loss": torch.tensor(5.0),
+        "validation_flow_hopping_endpoint_loss": torch.tensor(13.0),
+        "validation_flow_onsite_endpoint_l1_sum": torch.tensor(4.0),
+        "validation_flow_onsite_endpoint_mse_sum": torch.tensor(10.0),
+        "validation_flow_onsite_endpoint_count": torch.tensor(2.0),
+        "validation_flow_hopping_endpoint_l1_sum": torch.tensor(8.0),
+        "validation_flow_hopping_endpoint_mse_sum": torch.tensor(20.0),
+        "validation_flow_hopping_endpoint_count": torch.tensor(4.0),
+    }
+
+    metrics = trainer._snapshot_flow_metrics(flow_state, "validation")
+    payload = {
+        "loss_detached": torch.tensor(99.0),
+        "onsite_weighted_sum": torch.tensor(0.0),
+        "hopping_weighted_sum": torch.tensor(0.0),
+        "active_nodes": torch.tensor(1.0),
+        "active_edges": torch.tensor(1.0),
+        "grad_norm": torch.tensor(0.0),
+        "z_values": [],
+        "load_cv_values": [],
+        **metrics,
+    }
+    pack = trainer._make_step_pack(payload)
+
+    assert metrics["last_onsite_count"].item() == pytest.approx(2.0)
+    assert metrics["last_hopping_count"].item() == pytest.approx(4.0)
+    assert trainer._compute_compatible_loss_from_pack(pack, object()) is not None
 
 
 class _EndpointModel(torch.nn.Module):
