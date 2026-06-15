@@ -1976,12 +1976,30 @@ class MultiTrainer(Trainer):
                 self._flow_state_value(state, "expert_load_cv", f"{prefix}_expert_load_cv"),
                 allow_none=True,
             ),
-            "last_onsite_l1_sum": None,
-            "last_onsite_mse_sum": None,
-            "last_onsite_count": None,
-            "last_hopping_l1_sum": None,
-            "last_hopping_mse_sum": None,
-            "last_hopping_count": None,
+            "last_onsite_l1_sum": self._as_scalar_tensor(
+                self._flow_state_value(state, f"{prefix}_flow_onsite_endpoint_l1_sum"),
+                allow_none=True,
+            ),
+            "last_onsite_mse_sum": self._as_scalar_tensor(
+                self._flow_state_value(state, f"{prefix}_flow_onsite_endpoint_mse_sum"),
+                allow_none=True,
+            ),
+            "last_onsite_count": self._as_scalar_tensor(
+                self._flow_state_value(state, f"{prefix}_flow_onsite_endpoint_count"),
+                allow_none=True,
+            ),
+            "last_hopping_l1_sum": self._as_scalar_tensor(
+                self._flow_state_value(state, f"{prefix}_flow_hopping_endpoint_l1_sum"),
+                allow_none=True,
+            ),
+            "last_hopping_mse_sum": self._as_scalar_tensor(
+                self._flow_state_value(state, f"{prefix}_flow_hopping_endpoint_mse_sum"),
+                allow_none=True,
+            ),
+            "last_hopping_count": self._as_scalar_tensor(
+                self._flow_state_value(state, f"{prefix}_flow_hopping_endpoint_count"),
+                allow_none=True,
+            ),
         }
 
     # ---------------------------------------------------------------------
@@ -2317,18 +2335,22 @@ class MultiTrainer(Trainer):
     def _make_step_pack(self, payload: Dict[str, Any]) -> torch.Tensor:
         vec = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=self.device)
 
+        def _payload_value(primary: str, fallback: str, default=0.0):
+            value = payload.get(primary, None)
+            return payload.get(fallback, default) if value is None else value
+
         vec[self._P_LOSS_OPT_SUM] = self._as_scalar_tensor(payload.get("loss_detached", 0.0))
         vec[self._P_ONSITE_WEIGHTED_SUM] = self._as_scalar_tensor(payload.get("onsite_weighted_sum", 0.0))
         vec[self._P_HOPPING_WEIGHTED_SUM] = self._as_scalar_tensor(payload.get("hopping_weighted_sum", 0.0))
         vec[self._P_ACTIVE_NODES_SUM] = self._as_scalar_tensor(payload.get("active_nodes", 0.0))
         vec[self._P_ACTIVE_EDGES_SUM] = self._as_scalar_tensor(payload.get("active_edges", 0.0))
 
-        vec[self._P_ONSITE_L1_SUM] = self._as_scalar_tensor(payload.get("onsite_l1_sum", 0.0))
-        vec[self._P_ONSITE_MSE_SUM] = self._as_scalar_tensor(payload.get("onsite_mse_sum", 0.0))
-        vec[self._P_ONSITE_CNT_SUM] = self._as_scalar_tensor(payload.get("onsite_cnt", 0.0))
-        vec[self._P_HOPPING_L1_SUM] = self._as_scalar_tensor(payload.get("hopping_l1_sum", 0.0))
-        vec[self._P_HOPPING_MSE_SUM] = self._as_scalar_tensor(payload.get("hopping_mse_sum", 0.0))
-        vec[self._P_HOPPING_CNT_SUM] = self._as_scalar_tensor(payload.get("hopping_cnt", 0.0))
+        vec[self._P_ONSITE_L1_SUM] = self._as_scalar_tensor(_payload_value("onsite_l1_sum", "last_onsite_l1_sum"))
+        vec[self._P_ONSITE_MSE_SUM] = self._as_scalar_tensor(_payload_value("onsite_mse_sum", "last_onsite_mse_sum"))
+        vec[self._P_ONSITE_CNT_SUM] = self._as_scalar_tensor(_payload_value("onsite_cnt", "last_onsite_count"))
+        vec[self._P_HOPPING_L1_SUM] = self._as_scalar_tensor(_payload_value("hopping_l1_sum", "last_hopping_l1_sum"))
+        vec[self._P_HOPPING_MSE_SUM] = self._as_scalar_tensor(_payload_value("hopping_mse_sum", "last_hopping_mse_sum"))
+        vec[self._P_HOPPING_CNT_SUM] = self._as_scalar_tensor(_payload_value("hopping_cnt", "last_hopping_count"))
 
         z_vals = [self._as_scalar_tensor(z, default=0.0) for z in payload.get("z_values", []) if z is not None]
         if z_vals:

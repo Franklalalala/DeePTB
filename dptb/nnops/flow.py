@@ -876,9 +876,29 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             per_item = 0.5 * (ab + torch.sqrt(sq + 1e-12))
         else:
             per_item = sq
+        active = mask_f.reshape(mask_f.shape[0], -1).sum(dim=1) > 0
+        if not bool(active.any()):
+            zero = diff.sum() * 0.0
+            return zero, zero, zero
+        per_item = per_item[active]
+        sq = sq[active]
+        ab = ab[active]
         if norm_p != 0.0:
             per_item = per_item / (per_item.detach() + norm_eps).pow(norm_p)
         return per_item.mean(), sq.mean(), ab.mean()
+
+    @staticmethod
+    def _masked_element_sums(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask_f = mask.to(device=diff.device, dtype=diff.dtype)
+        if mask_f.shape != diff.shape:
+            mask_f = mask_f.expand_as(diff)
+        count = mask_f.sum()
+        abs_sum = (diff.abs() * mask_f).sum()
+        sq_sum = (diff.square() * mask_f).sum()
+        return abs_sum.detach(), sq_sum.detach(), count.detach()
 
     def _component_meanflow_loss(
         self,
@@ -1192,6 +1212,23 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
         options = dict(options or {})
         rmf = dict(options.get("rmf_options", options.get("rmf", {})) or {})
         self.rmf_options = rmf
+        objective = str(rmf.get("objective", "source_time_fd") or "source_time_fd").lower()
+        objective_aliases = {
+            "source_time_fd": "source_time_fd",
+            "eulerian_fd": "source_time_fd",
+        }
+        unsupported_objectives = {"semigroup", "smf", "lagrangian", "lmf"}
+        if objective in unsupported_objectives:
+            raise NotImplementedError(
+                "Hamiltonian RMF currently implements only "
+                "rmf_options.objective='source_time_fd' (alias 'eulerian_fd')."
+            )
+        if objective not in objective_aliases:
+            raise ValueError(
+                "Unsupported rmf_options.objective "
+                f"{objective!r}; use 'source_time_fd' or 'eulerian_fd'."
+            )
+        self.rmf_objective = objective_aliases[objective]
         self.rmf_endpoint_eps = float(rmf.get("endpoint_eps", options.get("rmf_endpoint_eps", self.t_eps)))
         if not (0.0 < self.rmf_endpoint_eps < 1.0):
             raise ValueError("RMF endpoint_eps must be in (0, 1).")
@@ -1213,9 +1250,10 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
         if self.enabled:
             log.info(
                 "Hamiltonian RMF enabled: manifold=%s source=time_r target=time_t "
-                "endpoint_eps=%.3g",
+                "endpoint_eps=%.3g objective=%s",
                 self.manifold.name,
                 self.rmf_endpoint_eps,
+                self.rmf_objective,
             )
 
     def _sample_st(
@@ -1409,11 +1447,15 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
             norm_p=self.meanflow_norm_p,
             norm_eps=self.meanflow_norm_eps,
         )
-        endpoint_loss, endpoint_mse, endpoint_mae = self._adaptive_metric_stats(
-            pred_x - clean,
+        endpoint_diff = pred_x - clean
+        endpoint_loss, _, _ = self._metric_stats(endpoint_diff, mask, self.loss_type)
+        endpoint_l1_sum, endpoint_mse_sum, endpoint_count = self._masked_element_sums(
+            endpoint_diff,
             mask,
-            self.loss_type,
         )
+        endpoint_denom = endpoint_count.to(dtype=endpoint_mse_sum.dtype).clamp_min(1.0)
+        endpoint_mse = endpoint_mse_sum / endpoint_denom
+        endpoint_mae = endpoint_l1_sum / endpoint_denom
         total = weight * (velocity_loss + self.meanflow_aux_endpoint_weight * endpoint_loss)
         state = {
             f"{diff_prefix}_loss": total.detach(),
@@ -1423,6 +1465,9 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
             f"{diff_prefix}_endpoint_loss": endpoint_loss.detach(),
             f"{diff_prefix}_endpoint_mse": endpoint_mse.detach(),
             f"{diff_prefix}_endpoint_mae": endpoint_mae.detach(),
+            f"{diff_prefix}_endpoint_l1_sum": endpoint_l1_sum,
+            f"{diff_prefix}_endpoint_mse_sum": endpoint_mse_sum,
+            f"{diff_prefix}_endpoint_count": endpoint_count,
         }
         return total, state
 
