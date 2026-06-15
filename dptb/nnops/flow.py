@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.nnops.rmf_manifold import build_rmf_manifold
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,12 @@ class PixelMFContext:
     edge_state: Optional[torch.Tensor]
     node_prior: Optional[torch.Tensor]
     edge_prior: Optional[torch.Tensor]
+
+
+@dataclass
+class RMFContext(PixelMFContext):
+    node_velocity: Optional[torch.Tensor]
+    edge_velocity: Optional[torch.Tensor]
 
 
 class HamiltonianCFM:
@@ -1148,6 +1155,469 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         return out
 
 
+class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
+    """Torch-native Riemannian MeanFlow for Hamiltonian residual CFM.
+
+    RMF is strictly opt-in through ``flow_options.type/objective = 'rmf'``.
+    The implementation keeps DeePTB's current SOC ``uu_real`` semantics: H0 is
+    the fixed-graph start, the target is the real-H residual endpoint, and the
+    model output is converted back to residual coordinates before the RMF loss.
+
+    The shipped manifold is Euclidean.  That makes the RMF path mathematically
+    equivalent to a geodesic in residual space while leaving a clean interface for
+    later curved manifolds.  No JAX code or dependency is imported.
+
+    The model predicts the final residual endpoint from the forward source state
+    at ``r``.  The finite-difference target follows the source-time identity
+    ``u - (t-r) du/dr = v``.
+    """
+
+    model_in_loss = True
+
+    @staticmethod
+    def _view_signed_time(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        view = t.reshape((-1,) + (1,) * (like.ndim - 1))
+        sign = torch.where(view < 0.0, -torch.ones_like(view), torch.ones_like(view))
+        return torch.where(view.abs() < 1.0e-8, sign * 1.0e-8, view)
+
+    def __init__(
+        self,
+        options: Optional[Dict[str, Any]],
+        *,
+        idp: Any = None,
+        dtype: Any = torch.float32,
+        device: Any = torch.device("cpu"),
+    ) -> None:
+        super().__init__(options, idp=idp, dtype=dtype, device=device)
+        options = dict(options or {})
+        rmf = dict(options.get("rmf_options", options.get("rmf", {})) or {})
+        self.rmf_options = rmf
+        self.rmf_endpoint_eps = float(rmf.get("endpoint_eps", options.get("rmf_endpoint_eps", self.t_eps)))
+        if not (0.0 < self.rmf_endpoint_eps < 1.0):
+            raise ValueError("RMF endpoint_eps must be in (0, 1).")
+        manifold_cfg = rmf.get("manifold", options.get("manifold", "euclidean"))
+        self.manifold = build_rmf_manifold(manifold_cfg)
+        time_sampler_cfg = options.get("time_sampler", None)
+        if isinstance(time_sampler_cfg, str) and time_sampler_cfg:
+            self.meanflow_time_sampling = time_sampler_cfg.lower()
+        elif isinstance(time_sampler_cfg, dict):
+            self.meanflow_time_sampling = str(
+                time_sampler_cfg.get("type", self.meanflow_time_sampling)
+            ).lower()
+            if "p_mean" in time_sampler_cfg:
+                self.meanflow_p_mean = float(time_sampler_cfg["p_mean"])
+            if "p_std" in time_sampler_cfg:
+                self.meanflow_p_std = float(time_sampler_cfg["p_std"])
+        self.time_sampler = time_sampler_cfg or self.meanflow_time_sampling
+
+        if self.enabled:
+            log.info(
+                "Hamiltonian RMF enabled: manifold=%s source=time_r target=time_t "
+                "endpoint_eps=%.3g",
+                self.manifold.name,
+                self.rmf_endpoint_eps,
+            )
+
+    def _sample_st(
+        self,
+        *,
+        num_graphs: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample ordered source/target times ``r <= t`` for forward RMF."""
+        t = self._sample_time_base(num_graphs, device=device, dtype=dtype)
+        r = self._sample_time_base(num_graphs, device=device, dtype=dtype)
+        if self.meanflow_tr_uniform_prob > 0.0:
+            use_uniform = torch.rand(num_graphs, device=device) < self.meanflow_tr_uniform_prob
+            t = torch.where(use_uniform, torch.rand(num_graphs, device=device, dtype=dtype), t)
+            r = torch.where(use_uniform, torch.rand(num_graphs, device=device, dtype=dtype), r)
+        fm_mask = torch.rand(num_graphs, device=device) < self.meanflow_data_proportion
+        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        t = t.clamp(min=0.0, max=1.0)
+        max_source = 1.0 - self.rmf_endpoint_eps
+        r = torch.minimum(r.clamp(min=0.0, max=max_source), t)
+        fm_time = torch.minimum(t, t.new_full(t.shape, max_source))
+        r = torch.where(fm_mask, fm_time, r)
+        t = torch.where(fm_mask, fm_time, t)
+        t = torch.maximum(t, r)
+        return r, t, fm_mask
+
+    def _write_times(self, data: AtomicDataDict.Type, r: torch.Tensor, t: torch.Tensor) -> None:
+        """Write RMF two-time conditioning.
+
+        ``flow_time`` remains a backwards-compatible single source-time key;
+        multi-time embeddings should use ``flow_time_r``, ``flow_time_t``, and
+        ``flow_time_h``.
+        """
+        rr = r.detach()
+        tt = t.detach()
+        hh = (t - r).detach()
+        data[self.flow_time_key] = rr
+        data[self.flow_time_t_key] = tt
+        data[self.flow_time_r_key] = rr
+        data[self.flow_time_h_key] = hh
+        data["t"] = tt
+        data["r"] = rr
+        data["meanflow_h"] = hh
+
+    def prepare_batch(
+        self,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        r: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> Tuple[AtomicDataDict.Type, AtomicDataDict.Type, RMFContext]:
+        if not self.enabled:
+            raise RuntimeError("HamiltonianRiemannianMeanFlow.prepare_batch called while disabled")
+
+        data = data.copy()
+        ref_data = ref_data.copy()
+        node_target = ref_data.get(self.node_target_key, None)
+        edge_target = ref_data.get(self.edge_target_key, None)
+        if node_target is None and edge_target is None:
+            raise KeyError(
+                "RMF requires node and/or edge Hamiltonian targets in ref_data; "
+                f"looked for `{self.node_target_key}` and `{self.edge_target_key}`."
+            )
+
+        like = node_target if node_target is not None else edge_target
+        device = like.device
+        dtype = like.dtype if torch.is_floating_point(like) else self.dtype
+        num_graphs = self._num_graphs(data)
+        max_source = 1.0 - self.rmf_endpoint_eps
+        if r is None or t is None:
+            r, t, fm_mask = self._sample_st(num_graphs=num_graphs, device=device, dtype=dtype)
+        else:
+            r = self._normalize_t(r, num_graphs=num_graphs, device=device, dtype=dtype)
+            t = self._normalize_t(t, num_graphs=num_graphs, device=device, dtype=dtype)
+            t, r = torch.maximum(t, r), torch.minimum(t, r)
+            requested_equal = torch.isclose(r, t)
+            t = t.clamp(min=0.0, max=1.0)
+            r = torch.minimum(r.clamp(min=0.0, max=max_source), t)
+            t = torch.where(requested_equal, r, t)
+            fm_mask = torch.isclose(r, t)
+        t = torch.maximum(t, r)
+
+        node_r, edge_r = self._expand_graph_times(
+            data,
+            r,
+            node_count=None if node_target is None else node_target.shape[0],
+            edge_count=None if edge_target is None else edge_target.shape[0],
+        )
+        node_t, edge_t = self._expand_graph_times(
+            data,
+            t,
+            node_count=None if node_target is None else node_target.shape[0],
+            edge_count=None if edge_target is None else edge_target.shape[0],
+        )
+
+        node_base = edge_base = node_clean = edge_clean = None
+        node_state = edge_state = node_prior = edge_prior = None
+        node_velocity = edge_velocity = None
+        if node_target is not None:
+            node_target = node_target.to(device=device, dtype=dtype)
+            node_base = self._base_like(data, node_target, self.node_h0_key, "node")
+            node_clean = node_target - node_base if self.mode == "residual" else node_target
+            node_prior = self._prior_like(node_clean, self.node_sigma)
+            node_state = self.manifold.geodesic_interpolate(node_prior, node_clean, node_r)
+            node_velocity = self.manifold.tangent_velocity(node_prior, node_clean, node_r)
+            current = node_base + node_state if self.mode == "residual" else node_state
+            if self.detach_interpolated_h0:
+                current = current.detach()
+            data[self.node_h0_key] = current
+            if self.overwrite_feature_keys:
+                data[self.node_target_key] = current
+        if edge_target is not None:
+            edge_target = edge_target.to(device=device, dtype=dtype)
+            edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
+            edge_clean = edge_target - edge_base if self.mode == "residual" else edge_target
+            edge_prior = self._prior_like(edge_clean, self.edge_sigma)
+            edge_state = self.manifold.geodesic_interpolate(edge_prior, edge_clean, edge_r)
+            edge_velocity = self.manifold.tangent_velocity(edge_prior, edge_clean, edge_r)
+            current = edge_base + edge_state if self.mode == "residual" else edge_state
+            if self.detach_interpolated_h0:
+                current = current.detach()
+            data[self.edge_h0_key] = current
+            if self.overwrite_feature_keys:
+                data[self.edge_target_key] = current
+
+        self._write_times(data, r, t)
+        self._write_times(ref_data, r, t)
+        return data, ref_data, RMFContext(
+            r=r,
+            t=t,
+            fm_mask=fm_mask,
+            node_r=node_r,
+            node_t=node_t,
+            edge_r=edge_r,
+            edge_t=edge_t,
+            node_base=node_base,
+            edge_base=edge_base,
+            node_clean=node_clean,
+            edge_clean=edge_clean,
+            node_state=node_state,
+            edge_state=edge_state,
+            node_prior=node_prior,
+            edge_prior=edge_prior,
+            node_velocity=node_velocity,
+            edge_velocity=edge_velocity,
+        )
+
+    def _component_rmf_loss(
+        self,
+        *,
+        diff_prefix: str,
+        pred_x: torch.Tensor,
+        clean: torch.Tensor,
+        prior: torch.Tensor,
+        state_z: torch.Tensor,
+        target_v: torch.Tensor,
+        comp_r: torch.Tensor,
+        comp_t: torch.Tensor,
+        pred_x_eps: torch.Tensor,
+        mask: torch.Tensor,
+        weight: float,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        source_denom = self._view_time((1.0 - comp_r).clamp_min(self.rmf_endpoint_eps), state_z)
+        h_view = (comp_t - comp_r).reshape((-1,) + (1,) * (state_z.ndim - 1)).clamp_min(0.0)
+        u = self.manifold.logmap(state_z, pred_x) / source_denom
+
+        signed_ds = torch.where(
+            comp_r <= 1.0 - self.rmf_endpoint_eps - self.meanflow_fd_eps,
+            comp_r.new_full(comp_r.shape, self.meanflow_fd_eps),
+            comp_r.new_full(comp_r.shape, -self.meanflow_fd_eps),
+        )
+        r_eps = (comp_r + signed_ds).clamp(min=0.0, max=1.0 - self.rmf_endpoint_eps)
+        signed_ds = r_eps - comp_r
+        ds_view = self._view_signed_time(signed_ds, state_z)
+        state_eps = self.manifold.geodesic_interpolate(prior, clean, r_eps)
+        u_eps = self.manifold.logmap(state_eps, pred_x_eps) / self._view_time(
+            (1.0 - r_eps).clamp_min(self.rmf_endpoint_eps),
+            state_z,
+        )
+        du_ds = ((u_eps - u.detach()) / ds_view).detach()
+        # The state and finite difference are both evaluated at the forward
+        # source time r, so the source-time MeanFlow identity uses a minus sign.
+        compound_v = u - h_view * du_ds
+
+        velocity_loss, velocity_mse, velocity_mae = self._adaptive_metric_stats(
+            compound_v - target_v,
+            mask,
+            self.loss_type,
+            norm_p=self.meanflow_norm_p,
+            norm_eps=self.meanflow_norm_eps,
+        )
+        endpoint_loss, endpoint_mse, endpoint_mae = self._adaptive_metric_stats(
+            pred_x - clean,
+            mask,
+            self.loss_type,
+        )
+        total = weight * (velocity_loss + self.meanflow_aux_endpoint_weight * endpoint_loss)
+        state = {
+            f"{diff_prefix}_loss": total.detach(),
+            f"{diff_prefix}_velocity_loss": velocity_loss.detach(),
+            f"{diff_prefix}_velocity_mse": velocity_mse.detach(),
+            f"{diff_prefix}_velocity_mae": velocity_mae.detach(),
+            f"{diff_prefix}_endpoint_loss": endpoint_loss.detach(),
+            f"{diff_prefix}_endpoint_mse": endpoint_mse.detach(),
+            f"{diff_prefix}_endpoint_mae": endpoint_mae.detach(),
+        }
+        return total, state
+
+    def loss_with_model(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        prefix: str = "train",
+        r: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        data, ref_data, ctx = self.prepare_batch(data, ref_data, r=r, t=t)
+        pred, node_x, edge_x = self._predict_clean(
+            model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.r, t=ctx.t
+        )
+
+        graph_dr = torch.where(
+            ctx.r <= 1.0 - self.rmf_endpoint_eps - self.meanflow_fd_eps,
+            ctx.r.new_full(ctx.r.shape, self.meanflow_fd_eps),
+            ctx.r.new_full(ctx.r.shape, -self.meanflow_fd_eps),
+        )
+        r_eps = (ctx.r + graph_dr).clamp(min=0.0, max=1.0 - self.rmf_endpoint_eps)
+        node_r_eps, edge_r_eps = self._expand_graph_times(
+            data,
+            r_eps,
+            node_count=None if ctx.node_state is None else ctx.node_state.shape[0],
+            edge_count=None if ctx.edge_state is None else ctx.edge_state.shape[0],
+        )
+        node_state_eps = None
+        if ctx.node_state is not None:
+            node_state_eps = self.manifold.geodesic_interpolate(
+                ctx.node_prior, ctx.node_clean, node_r_eps
+            )
+        edge_state_eps = None
+        if ctx.edge_state is not None:
+            edge_state_eps = self.manifold.geodesic_interpolate(
+                ctx.edge_prior, ctx.edge_clean, edge_r_eps
+            )
+        with torch.no_grad():
+            _, node_x_eps, edge_x_eps = self._predict_clean(
+                model,
+                data,
+                ctx,
+                node_state_eps if node_state_eps is not None else ctx.node_state,
+                edge_state_eps if edge_state_eps is not None else ctx.edge_state,
+                r=r_eps,
+                t=ctx.t,
+            )
+
+        total = None
+        state: Dict[str, torch.Tensor] = {
+            f"{prefix}_flow_r": ctx.r.detach().mean(),
+            f"{prefix}_flow_t": ctx.t.detach().mean(),
+            f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
+            f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
+        }
+        onsite_legacy = None
+        hopping_legacy = None
+        if ctx.node_clean is not None and node_x is not None:
+            comp_total, comp_state = self._component_rmf_loss(
+                diff_prefix=f"{prefix}_flow_onsite",
+                pred_x=node_x,
+                clean=ctx.node_clean,
+                prior=ctx.node_prior,
+                state_z=ctx.node_state,
+                target_v=ctx.node_velocity,
+                comp_r=ctx.node_r,
+                comp_t=ctx.node_t,
+                pred_x_eps=node_x_eps,
+                mask=self._node_mask(data, node_x),
+                weight=self.node_weight,
+            )
+            total = comp_total if total is None else total + comp_total
+            state.update(comp_state)
+            onsite_legacy = comp_state[f"{prefix}_flow_onsite_endpoint_loss"]
+        if ctx.edge_clean is not None and edge_x is not None:
+            comp_total, comp_state = self._component_rmf_loss(
+                diff_prefix=f"{prefix}_flow_hopping",
+                pred_x=edge_x,
+                clean=ctx.edge_clean,
+                prior=ctx.edge_prior,
+                state_z=ctx.edge_state,
+                target_v=ctx.edge_velocity,
+                comp_r=ctx.edge_r,
+                comp_t=ctx.edge_t,
+                pred_x_eps=edge_x_eps,
+                mask=self._edge_mask(data, edge_x),
+                weight=self.edge_weight,
+            )
+            total = comp_total if total is None else total + comp_total
+            state.update(comp_state)
+            hopping_legacy = comp_state[f"{prefix}_flow_hopping_endpoint_loss"]
+        if total is None:
+            raise KeyError("RMF could not compute a loss from configured node/edge targets.")
+
+        mean_max_prob = pred.get("mean_max_prob", None)
+        if torch.is_tensor(mean_max_prob):
+            key = "mean_max_prob" if prefix == "train" else f"{prefix}_mean_max_prob"
+            state[key] = mean_max_prob.detach()
+            if self.router_z_loss_coef > 0.0:
+                total = total + self.router_z_loss_coef * mean_max_prob.mean()
+        expert_load_cv = pred.get("expert_load_cv", None)
+        if torch.is_tensor(expert_load_cv):
+            key = "expert_load_cv" if prefix == "train" else f"{prefix}_expert_load_cv"
+            state[key] = expert_load_cv.detach()
+        if prefix == "train":
+            if onsite_legacy is not None:
+                state["train_onsite_loss"] = onsite_legacy
+            if hopping_legacy is not None:
+                state["train_hopping_loss"] = hopping_legacy
+        state[f"{prefix}_flow_loss"] = total.detach()
+        self.last_state = state
+        return total, state
+
+    def sample(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        *,
+        num_steps: int,
+    ) -> AtomicDataDict.Type:
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+        state = data.copy()
+        node_base = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
+        edge_base = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
+        if node_base is None and edge_base is None:
+            raise KeyError("RMF sampling requires node and/or edge Hamiltonian start features.")
+        node_z = None if node_base is None else self._prior_like(torch.zeros_like(node_base), self.node_sigma)
+        edge_z = None if edge_base is None else self._prior_like(torch.zeros_like(edge_base), self.edge_sigma)
+        like = node_z if node_z is not None else edge_z
+        num_graphs = self._num_graphs(state)
+        grid = torch.linspace(0.0, 1.0, num_steps + 1, device=like.device, dtype=like.dtype)
+        ctx = RMFContext(
+            r=grid.new_full((num_graphs,), 0.0),
+            t=grid.new_full((num_graphs,), 1.0),
+            fm_mask=torch.zeros(num_graphs, device=like.device, dtype=torch.bool),
+            node_r=None,
+            node_t=None,
+            edge_r=None,
+            edge_t=None,
+            node_base=node_base,
+            edge_base=edge_base,
+            node_clean=None if node_z is None else torch.zeros_like(node_z),
+            edge_clean=None if edge_z is None else torch.zeros_like(edge_z),
+            node_state=node_z,
+            edge_state=edge_z,
+            node_prior=node_z,
+            edge_prior=edge_z,
+            node_velocity=None,
+            edge_velocity=None,
+        )
+        for step in range(num_steps):
+            r_cur = float(grid[step].item())
+            t_next = float(grid[step + 1].item())
+            r = torch.full((num_graphs,), min(r_cur, 1.0 - self.rmf_endpoint_eps), device=like.device, dtype=like.dtype)
+            t = torch.full((num_graphs,), t_next, device=like.device, dtype=like.dtype)
+            ctx.r, ctx.t = r, t
+            ctx.node_r, ctx.edge_r = self._expand_graph_times(
+                state,
+                r,
+                node_count=None if node_z is None else node_z.shape[0],
+                edge_count=None if edge_z is None else edge_z.shape[0],
+            )
+            ctx.node_t, ctx.edge_t = self._expand_graph_times(
+                state,
+                t,
+                node_count=None if node_z is None else node_z.shape[0],
+                edge_count=None if edge_z is None else edge_z.shape[0],
+            )
+            _, node_x, edge_x = self._predict_clean(model, state, ctx, node_z, edge_z, r=r, t=t)
+            if node_z is not None:
+                denom = self._view_time((1.0 - ctx.node_r).clamp_min(self.rmf_endpoint_eps), node_z)
+                node_h = (ctx.node_t - ctx.node_r).reshape((-1,) + (1,) * (node_z.ndim - 1))
+                node_z = self.manifold.expmap(node_z, node_h * self.manifold.logmap(node_z, node_x) / denom)
+                ctx.node_state = node_z
+            if edge_z is not None:
+                denom = self._view_time((1.0 - ctx.edge_r).clamp_min(self.rmf_endpoint_eps), edge_z)
+                edge_h = (ctx.edge_t - ctx.edge_r).reshape((-1,) + (1,) * (edge_z.ndim - 1))
+                edge_z = self.manifold.expmap(edge_z, edge_h * self.manifold.logmap(edge_z, edge_x) / denom)
+                ctx.edge_state = edge_z
+        out = state.copy()
+        if node_z is not None:
+            out[self.node_h0_key] = node_base + node_z if self.mode == "residual" else node_z
+            out[self.node_target_key] = out[self.node_h0_key]
+        if edge_z is not None:
+            out[self.edge_h0_key] = edge_base + edge_z if self.mode == "residual" else edge_z
+            out[self.edge_target_key] = out[self.edge_h0_key]
+        one = torch.ones(num_graphs, device=like.device, dtype=like.dtype)
+        self._write_times(out, one, one)
+        return out
+
+
 def build_hamiltonian_flow(
     options: Optional[Dict[str, Any]],
     *,
@@ -1156,7 +1626,21 @@ def build_hamiltonian_flow(
     device: Any = torch.device("cpu"),
 ) -> HamiltonianCFM:
     options = dict(options or {})
-    objective = str(options.get("objective", options.get("type", "cfm"))).lower()
+    objective = str(options.get("objective", "") or "").lower()
+    flow_type = str(options.get("type", "") or "").lower()
+    if objective in {"", "cfm"} and flow_type not in {"", "cfm"}:
+        objective = flow_type
+    if not objective:
+        objective = "cfm"
     if objective in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
         return HamiltonianPixelMeanFlow(options, idp=idp, dtype=dtype, device=device)
+    if objective in {
+        "rmf",
+        "riemannian_meanflow",
+        "riemannian_mean_flow",
+        "riemannian_flow",
+        "manifold_meanflow",
+        "manifold_mean_flow",
+    }:
+        return HamiltonianRiemannianMeanFlow(options, idp=idp, dtype=dtype, device=device)
     return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)

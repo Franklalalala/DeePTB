@@ -1940,11 +1940,65 @@ class MultiTrainer(Trainer):
 
         return out
 
+    @staticmethod
+    def _flow_state_value(state: Dict[str, Any], *keys: str):
+        for key in keys:
+            value = state.get(key, None)
+            if value is not None:
+                return value
+        return None
+
+    def _snapshot_flow_metrics(self, state: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        return {
+            "onsite": self._as_scalar_tensor(
+                self._flow_state_value(
+                    state,
+                    f"{prefix}_onsite_loss",
+                    f"{prefix}_flow_onsite_endpoint_loss",
+                    f"{prefix}_flow_onsite_loss",
+                ),
+                default=0.0,
+            ),
+            "hopping": self._as_scalar_tensor(
+                self._flow_state_value(
+                    state,
+                    f"{prefix}_hopping_loss",
+                    f"{prefix}_flow_hopping_endpoint_loss",
+                    f"{prefix}_flow_hopping_loss",
+                ),
+                default=0.0,
+            ),
+            "z_loss": self._as_scalar_tensor(
+                self._flow_state_value(state, "mean_max_prob", f"{prefix}_mean_max_prob"),
+                allow_none=True,
+            ),
+            "expert_load_cv": self._as_scalar_tensor(
+                self._flow_state_value(state, "expert_load_cv", f"{prefix}_expert_load_cv"),
+                allow_none=True,
+            ),
+            "last_onsite_l1_sum": None,
+            "last_onsite_mse_sum": None,
+            "last_onsite_count": None,
+            "last_hopping_l1_sum": None,
+            "last_hopping_mse_sum": None,
+            "last_hopping_count": None,
+        }
+
     # ---------------------------------------------------------------------
     # core expert fwd/loss
     # ---------------------------------------------------------------------
 
-    def _run_one_expert_loss(self, batch_dict, batch_info, criterion, expert_idx, range_dis, capture_metrics=False):
+    def _run_one_expert_loss(
+        self,
+        batch_dict,
+        batch_info,
+        criterion,
+        expert_idx,
+        range_dis,
+        capture_metrics=False,
+        use_flow=True,
+        flow_prefix="train",
+    ):
         with self._tagger.tag("expert/prepare_masks", it=self.iter, expert=expert_idx):
             expert_edge_mask, expert_node_mask = self._prepare_expert_masks(batch_dict, range_dis, expert_idx)
 
@@ -1952,6 +2006,40 @@ class MultiTrainer(Trainer):
         batch_copy["expert_edge_mask"] = expert_edge_mask
         batch_copy["expert_node_mask"] = expert_node_mask
         batch_copy["expert_idx"] = int(expert_idx)
+
+        if use_flow and self.flow_cfm.enabled:
+            batch_for_loss = batch_copy.copy()
+            with self._tagger.tag("expert/flow_loss", it=self.iter, expert=expert_idx):
+                with cuda_cache_memory_context(
+                    iteration=self.iter,
+                    stage="expert/flow_loss",
+                    expert=expert_idx,
+                ):
+                    if getattr(self.flow_cfm, "model_in_loss", False):
+                        loss, flow_state = self.flow_cfm.loss_with_model(
+                            self.model,
+                            batch_copy,
+                            batch_for_loss,
+                            prefix=flow_prefix,
+                        )
+                    else:
+                        flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                            batch_copy,
+                            batch_for_loss,
+                        )
+                        pred_batch = self.model(flow_batch)
+                        pred_batch.update(batch_info)
+                        flow_ref.update(batch_info)
+                        loss, flow_state = self.flow_cfm.loss(pred_batch, flow_ref, flow_ctx)
+
+            out = {
+                "loss": loss,
+                "active_nodes": expert_node_mask.sum().detach(),
+                "active_edges": expert_edge_mask.sum().detach(),
+            }
+            if capture_metrics:
+                out.update(self._snapshot_flow_metrics(flow_state, flow_prefix))
+            return out
 
         with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
             with cuda_cache_memory_context(
@@ -1982,7 +2070,7 @@ class MultiTrainer(Trainer):
 
     def _build_train_payload(
         self, batch_dict, batch_info, expert_idx, range_dis,
-        ref_batch_dict=None, ref_batch_info=None, criterion=None
+        ref_batch_dict=None, ref_batch_info=None, criterion=None, flow_prefix="train"
     ):
         if criterion is None:
             criterion = self.train_lossfunc
@@ -1993,7 +2081,9 @@ class MultiTrainer(Trainer):
             criterion=criterion,
             expert_idx=expert_idx,
             range_dis=range_dis,
-            capture_metrics=True
+            capture_metrics=True,
+            use_flow=True,
+            flow_prefix=flow_prefix,
         )
 
         total_loss = main["loss"]
@@ -2024,7 +2114,9 @@ class MultiTrainer(Trainer):
                 criterion=criterion,
                 expert_idx=expert_idx,
                 range_dis=range_dis,
-                capture_metrics=True
+                capture_metrics=True,
+                use_flow=bool(getattr(self.flow_cfm, "apply_to_reference", False)),
+                flow_prefix=flow_prefix,
             )
 
             total_loss = total_loss + ref_res["loss"]
@@ -3130,6 +3222,7 @@ class MultiTrainer(Trainer):
                         ref_batch_dict=None,
                         ref_batch_info=None,
                         criterion=self.validation_lossfunc,
+                        flow_prefix="validation",
                     )
 
                     payload["loss_detached"] = payload["loss"].detach()
@@ -3156,7 +3249,8 @@ class MultiTrainer(Trainer):
                                 criterion=self.validation_lossfunc,
                                 expert_idx=expert_idx,
                                 range_dis=range_dis,
-                                capture_metrics=True
+                                capture_metrics=True,
+                                flow_prefix="validation",
                             )
                             payloads.append({
                                 "onsite_l1_sum": res.get("last_onsite_l1_sum", None),
