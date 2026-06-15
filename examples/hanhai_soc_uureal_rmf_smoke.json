@@ -1,0 +1,91 @@
+{
+  "common_options": {
+    "basis": {
+      "H": ["1s"]
+    },
+    "device": "cpu",
+    "dtype": "float32",
+    "has_soc": true,
+    "nextham_uureal_mask": true,
+    "full_soc_prediction": false,
+    "overlap": false,
+    "seed": 3982377700
+  },
+  "train_options": {
+    "num_epoch": 1,
+    "batch_size": 1,
+    "ref_batch_size": 1,
+    "val_batch_size": 1,
+    "display_freq": 1,
+    "validation_freq": 1,
+    "save_freq": 0,
+    "use_tensorboard": true,
+    "update_lr_per_iter": true,
+    "distance_ranges": [[0.0, 3.5], [3.5, 8.0]],
+    "optimizer": {
+      "type": "AdamW",
+      "lr": 1.0e-4,
+      "weight_decay": 0.0
+    },
+    "lr_scheduler": {
+      "type": "exp",
+      "gamma": 0.999
+    },
+    "loss_options": {
+      "train": {"method": "hamil_abs"},
+      "validation": {"method": "hamil_abs"},
+      "reference": {"method": "hamil_abs"}
+    },
+    "flow_options": {
+      "enabled": true,
+      "type": "rmf",
+      "objective": "rmf",
+      "mode": "residual",
+      "prior": "zero",
+      "manifold": "euclidean",
+      "node_h0_key": "node_h0",
+      "edge_h0_key": "edge_h0",
+      "node_target_key": "node_features",
+      "edge_target_key": "edge_features",
+      "overwrite_feature_keys": true,
+      "compatible_loss_to_legacy_keys": true,
+      "validation_ode_steps": [1],
+      "time_sampler": {
+        "type": "logit_normal",
+        "p_mean": -0.4,
+        "p_std": 1.0,
+        "same_time_probability": 0.5,
+        "tr_uniform_prob": 0.1,
+        "min_t": 0.05
+      },
+      "meanflow": {
+        "fd_eps": 0.001,
+        "du_dt_backend": "finite_difference",
+        "jvp_tangent": "path",
+        "aux_endpoint_weight": 0.05,
+        "aux_boundary_v_weight": 0.0,
+        "norm_p": 0.0,
+        "norm_eps": 0.01
+      },
+      "rmf_options": {
+        "objective": "eulerian_meanflow",
+        "prediction": "x1"
+      }
+    }
+  },
+  "model_options": {
+    "embedding": {"method": "lem_moe_v3_h0"},
+    "prediction": {"method": "slem"}
+  },
+  "data_options": {
+    "train": {
+      "root": "PATH_TO_HANHAI_SOC_UUREAL_SMOKE/train"
+    },
+    "validation": {
+      "root": "PATH_TO_HANHAI_SOC_UUREAL_SMOKE/validation"
+    },
+    "reference": {
+      "root": "PATH_TO_HANHAI_SOC_UUREAL_SMOKE/reference"
+    }
+  }
+}
