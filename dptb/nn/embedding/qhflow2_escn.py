@@ -38,6 +38,48 @@ def _ensure_qhflow2_src(path: str | None = None) -> None:
         sys.path.insert(0, src)
 
 
+def _snapshot_root_logger_state() -> dict[str, Any]:
+    import logging
+
+    root = logging.getLogger()
+    return {
+        "handlers": list(root.handlers),
+        "level": root.level,
+        "propagate": root.propagate,
+        "disabled": root.disabled,
+        "filters": list(root.filters),
+    }
+
+
+def _restore_root_logger_state(state: dict[str, Any]) -> None:
+    import logging
+
+    root = logging.getLogger()
+    original_handlers = list(state["handlers"])
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        if handler not in original_handlers:
+            handler.close()
+    for handler in original_handlers:
+        root.addHandler(handler)
+
+    root.setLevel(state["level"])
+    root.propagate = state["propagate"]
+    root.disabled = state["disabled"]
+    root.filters[:] = list(state["filters"])
+
+
+def _import_qhflow2_escn_backbone(qhflow2_src: str | None = None):
+    state = _snapshot_root_logger_state()
+    try:
+        _ensure_qhflow2_src(qhflow2_src)
+        from models.modules.escn_backbone_v4 import eSCNMDBackbone_ham
+
+        return eSCNMDBackbone_ham
+    finally:
+        _restore_root_logger_state(state)
+
+
 class _QHFlowData(dict):
     def __init__(self, *args: Any, num_graphs: int, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -89,8 +131,7 @@ class QHFlow2ESCNEmbedding(nn.Module):
         **kwargs: Any,
     ):
         super().__init__()
-        _ensure_qhflow2_src(qhflow2_src)
-        from models.modules.escn_backbone_v4 import eSCNMDBackbone_ham
+        eSCNMDBackbone_ham = _import_qhflow2_escn_backbone(qhflow2_src)
 
         self.idp = idp
         self.dtype = dtype
