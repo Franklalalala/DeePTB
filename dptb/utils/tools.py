@@ -164,6 +164,18 @@ def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
 
     return scheduler
 
+
+def lr_scheduler_requires_metric(scheduler) -> bool:
+    return (
+        isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau)
+        or bool(getattr(scheduler, "requires_metric", False))
+    )
+
+
+def lr_scheduler_can_step_without_metric(scheduler) -> bool:
+    can_step = getattr(scheduler, "can_step_without_metric", None)
+    return bool(callable(can_step) and can_step())
+
 def j_must_have(
     jdata: Dict[str, "_DICT_VAL"], key: str, deprecated_key: List[str] = []
 ) -> "_DICT_VAL":
