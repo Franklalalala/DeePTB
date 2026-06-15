@@ -349,7 +349,7 @@ class Trainer(BaseTrainer):
             ref_loss = self._loss_on_batch(
                 ref_batch,
                 reference_lossfunc,
-                use_flow=self.flow_cfm.apply_to_reference,
+                use_flow=bool(getattr(self.flow_cfm, "apply_to_reference", False)),
             )
             loss_for_log = loss_for_log + ref_loss.detach()
             ref_loss.backward()

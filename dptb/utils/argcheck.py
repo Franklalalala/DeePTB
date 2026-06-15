@@ -173,8 +173,12 @@ def flow_options():
     args = [
         Argument("enabled", bool, optional=True, default=False),
         Argument("objective", str, optional=True, default="cfm"),
+        Argument("type", str, optional=True, default="cfm"),
         Argument("mode", str, optional=True, default="residual"),
         Argument("prior", str, optional=True, default="zero"),
+        Argument("manifold", [str, dict], optional=True, default="euclidean"),
+        Argument("time_sampler", [str, dict, None], optional=True, default=None),
+        Argument("rmf_options", dict, optional=True, default={}),
         Argument("node_h0_key", str, optional=True, default="node_h0"),
         Argument("edge_h0_key", str, optional=True, default="edge_h0"),
         Argument("node_target_key", str, optional=True, default="node_features"),
