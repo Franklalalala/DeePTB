@@ -342,6 +342,77 @@ def test_te_prior_respects_node_edge_masks_and_active_rows():
     assert torch.all(ctx.edge_prior[2] == 0)
 
 
+def test_te_prior_mask_alignment_fails_closed_for_present_but_short_masks():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    data[AtomicDataDict.ATOM_TYPE_KEY] = data[AtomicDataDict.ATOM_TYPE_KEY][:2]
+    flow = _flow("te", device=device, dtype=dtype, te_prior_mode="irrep")
+    flow.idp.mask_to_nrme = flow.idp.mask_to_nrme[:, :2]
+
+    torch.manual_seed(17)
+    _out, _ref, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    assert torch.all(ctx.node_prior[2] == 0)
+    assert torch.all(ctx.node_prior[:, 2:] == 0)
+
+
+def test_typewise_te_prior_uses_unsorted_raw_slices_end_to_end():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    data, ref = _make_batch(device=device, dtype=dtype)
+    flow = _flow("te", device=device, dtype=dtype, te_prior_mode="typewise")
+    flow.idp = _UnsortedIrrepIDP(device=device)
+    flow.idp.mask_to_nrme = torch.tensor(
+        [
+            [1, 1, 0, 1],
+            [0, 0, 0, 0],
+        ],
+        device=device,
+        dtype=torch.bool,
+    )
+    flow.idp.mask_to_erme = torch.zeros((2, 4), device=device, dtype=torch.bool)
+
+    def unit_radius(row_count, active_dim, graph_index, *, device, dtype):
+        return active_dim.to(device=device, dtype=dtype).sqrt()
+
+    flow._te_radius = unit_radius
+
+    torch.manual_seed(23)
+    _out, _ref, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    node_res = ref[_keys.NODE_FEATURES_KEY] - data[_keys.NODE_H0_KEY]
+    type0_rows = data[AtomicDataDict.ATOM_TYPE_KEY] == 0
+    raw_l1_scale = node_res[type0_rows][:, :3][:, [0, 1]].square().mean().sqrt()
+    raw_l0_scale = node_res[type0_rows][:, 3].square().mean().sqrt()
+
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(ctx.node_prior[0, :3]),
+        raw_l1_scale * torch.sqrt(torch.tensor(2.0, device=device, dtype=dtype)),
+    )
+    torch.testing.assert_close(torch.linalg.vector_norm(ctx.node_prior[0, 3:4]), raw_l0_scale)
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(ctx.node_prior[2, :3]),
+        raw_l1_scale * torch.sqrt(torch.tensor(2.0, device=device, dtype=dtype)),
+    )
+    torch.testing.assert_close(torch.linalg.vector_norm(ctx.node_prior[2, 3:4]), raw_l0_scale)
+    assert torch.all(ctx.node_prior[type0_rows, 2] == 0)
+    assert torch.all(ctx.node_prior[~type0_rows] == 0)
+    assert torch.all(ctx.edge_prior == 0)
+
+
+def test_block_te_alias_defaults_to_block_mode_unless_explicit():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    flow = _flow("block-te", device=device, dtype=dtype)
+    explicit = _flow("block_te", device=device, dtype=dtype, te_prior_mode="irrep")
+
+    assert flow.prior == "block_te"
+    assert flow.te_prior_mode == "block"
+    assert explicit.te_prior_mode == "irrep"
+
+
 def test_te_prior_is_reproducible_under_deterministic_seed():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32

@@ -109,6 +109,10 @@ class HamiltonianCFM:
 
         # In DeePTB, zero prior means the inference start state is exactly physical H0.
         # Gaussian is available for QHFlow-style noisy residual priors.
+        # The TE aliases are feature-space approximations over masked
+        # node_h0/edge_h0 rows. They do not materialize dense Tensor-Expansion
+        # or Clebsch-Gordan products and should not be interpreted as strict
+        # dense TE/CG priors.
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
         allowed_priors = {"zero", "gaussian", "residual_gaussian", *self._te_prior_names}
@@ -591,7 +595,24 @@ class HamiltonianCFM:
             return torch.zeros_like(like)
 
         mask = self._prior_mask(data, like, label)
-        slices = None if self.te_prior_mode == "block" else self._te_irrep_slices(like.shape[-1])
+        if self.te_prior_mode == "block":
+            slices = None
+        else:
+            if like.ndim < 2:
+                raise ValueError(
+                    f"flow_options.te_prior_mode={self.te_prior_mode!r} requires "
+                    "DeePTB RME feature rows with rank >= 2; use te_prior_mode='block' "
+                    "for unstructured tensors."
+                )
+            slices = self._te_irrep_slices(like.shape[-1])
+            if slices is None:
+                raise ValueError(
+                    f"flow_options.te_prior_mode={self.te_prior_mode!r} requires "
+                    "idp.orbpair_irreps raw feature spans to match "
+                    f"{label or 'unknown'} feature_dim={like.shape[-1]}; "
+                    "use te_prior_mode='block' for whole-row structured noise."
+                )
+
         if like.ndim < 2 or slices is None:
             slices = ((0, like.shape[-1], -1),) if like.ndim >= 2 else ((0, like.numel(), -1),)
             noise = self._block_structured_prior_like(like, mask, data, label)
