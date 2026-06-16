@@ -468,18 +468,14 @@ class HamiltonianCFM:
         irreps = getattr(self.idp, "orbpair_irreps", None)
         if irreps is None:
             return None
-        try:
-            irreps = irreps.sort()[0].simplify()
-        except Exception:
-            try:
-                irreps = irreps.simplify()
-            except Exception:
-                pass
+        # Feature rows follow OrbitalMapper/orbpair_maps order. Sorting irreps
+        # changes contiguous feature spans and breaks mask/typewise TE priors.
+        raw_irreps = irreps
 
         slices = []
         offset = 0
         try:
-            for mul, ir in irreps:
+            for mul, ir in raw_irreps:
                 degree = int(getattr(ir, "l", 0))
                 width = int(getattr(ir, "dim", 2 * degree + 1))
                 for _ in range(int(mul)):

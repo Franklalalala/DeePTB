@@ -17,8 +17,8 @@ class _FakeIr:
 class _FakeIrreps:
     """Minimal e3nn.Irreps-like object for flow-prior unit tests."""
 
-    def __init__(self):
-        self._items = [(1, _FakeIr(0)), (1, _FakeIr(1))]
+    def __init__(self, items=None):
+        self._items = list(items or [(1, _FakeIr(0)), (1, _FakeIr(1))])
         self.dim = 4
 
     def sort(self):
@@ -29,6 +29,14 @@ class _FakeIrreps:
 
     def __iter__(self):
         return iter(self._items)
+
+
+class _UnsortedFakeIrreps(_FakeIrreps):
+    def __init__(self):
+        super().__init__([(1, _FakeIr(1)), (1, _FakeIr(0))])
+
+    def sort(self):
+        return (_FakeIrreps([(1, _FakeIr(0)), (1, _FakeIr(1))]), None)
 
 
 class _FakeIDP:
@@ -50,6 +58,12 @@ class _FakeIDP:
             device=device,
             dtype=torch.bool,
         )
+
+
+class _UnsortedIrrepIDP(_FakeIDP):
+    def __init__(self, *, device: torch.device):
+        super().__init__(device=device)
+        self.orbpair_irreps = _UnsortedFakeIrreps()
 
 
 def _make_batch(*, device: torch.device, dtype: torch.dtype):
@@ -104,6 +118,20 @@ def _flow(prior: str, *, device: torch.device, dtype: torch.dtype, **extra) -> H
     }
     opts.update(extra)
     return HamiltonianCFM(opts, idp=_FakeIDP(device=device), device=device, dtype=dtype)
+
+
+def test_te_irrep_slices_preserve_raw_feature_order():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    opts = {
+        "enabled": True,
+        "mode": "residual",
+        "prior": "te",
+        "te_prior_mode": "irrep",
+    }
+    flow = HamiltonianCFM(opts, idp=_UnsortedIrrepIDP(device=device), device=device, dtype=dtype)
+
+    assert flow._te_irrep_slices(4) == ((0, 3, 1), (3, 4, 0))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
