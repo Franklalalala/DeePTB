@@ -2016,6 +2016,43 @@ class MultiTrainer(Trainer):
             ),
         }
 
+    def _combine_compatible_component_losses(
+        self,
+        *,
+        onsite_loss: torch.Tensor,
+        onsite_cnt: Optional[torch.Tensor],
+        hopping_loss: torch.Tensor,
+        hopping_cnt: Optional[torch.Tensor],
+        onsite_boost: bool,
+        onsite_boost_w: float,
+    ) -> Optional[torch.Tensor]:
+        def _has_count(cnt) -> bool:
+            if cnt is None:
+                return False
+            if torch.is_tensor(cnt):
+                return float(cnt.detach().item()) > 0.0
+            return float(cnt) > 0.0
+
+        has_onsite = _has_count(onsite_cnt)
+        has_hopping = _has_count(hopping_cnt)
+        if not has_onsite and not has_hopping:
+            return None
+
+        if onsite_boost:
+            total = onsite_loss.new_zeros(())
+            if has_onsite:
+                total = total + float(onsite_boost_w) * onsite_loss
+            if has_hopping:
+                total = total + hopping_loss
+            return total
+
+        components = []
+        if has_onsite:
+            components.append(onsite_loss)
+        if has_hopping:
+            components.append(hopping_loss)
+        return torch.stack(components).mean()
+
     # ---------------------------------------------------------------------
     # core expert fwd/loss
     # ---------------------------------------------------------------------
@@ -2245,9 +2282,6 @@ class MultiTrainer(Trainer):
                 if z is not None:
                     z_vals.append(z)
 
-        if onsite_cnt is None and hopping_cnt is None:
-            return None
-
         def _safe_mean(sum_t, cnt_t):
             if sum_t is None or cnt_t is None:
                 return torch.zeros((), dtype=self.dtype, device=self.device)
@@ -2266,10 +2300,16 @@ class MultiTrainer(Trainer):
         onsite_boost_w = self._maybe_call_or_value(getattr(loss_module, "_current_onsite_weight", None), default=1.0)
         z_coef = float(getattr(loss_module, "z_loss_coef", 0.0))
 
-        if onsite_boost:
-            total = onsite_boost_w * onsite_loss + hopping_loss
-        else:
-            total = 0.5 * (onsite_loss + hopping_loss)
+        total = self._combine_compatible_component_losses(
+            onsite_loss=onsite_loss,
+            onsite_cnt=onsite_cnt,
+            hopping_loss=hopping_loss,
+            hopping_cnt=hopping_cnt,
+            onsite_boost=onsite_boost,
+            onsite_boost_w=onsite_boost_w,
+        )
+        if total is None:
+            return None
 
         if z_coef > 0.0 and len(z_vals) > 0:
             z_mean = torch.stack([z.to(self.device, dtype=self.dtype) for z in z_vals]).mean()
@@ -2306,10 +2346,16 @@ class MultiTrainer(Trainer):
         onsite_boost_w = self._maybe_call_or_value(getattr(loss_module, "_current_onsite_weight", None), default=1.0)
         z_coef = float(getattr(loss_module, "z_loss_coef", 0.0))
 
-        if onsite_boost:
-            total = onsite_boost_w * onsite_loss + hopping_loss
-        else:
-            total = 0.5 * (onsite_loss + hopping_loss)
+        total = self._combine_compatible_component_losses(
+            onsite_loss=onsite_loss,
+            onsite_cnt=onsite_cnt,
+            hopping_loss=hopping_loss,
+            hopping_cnt=hopping_cnt,
+            onsite_boost=onsite_boost,
+            onsite_boost_w=onsite_boost_w,
+        )
+        if total is None:
+            return None
 
         if z_coef > 0.0 and float(pack[self._P_Z_CNT].item()) > 0.0:
             total = total + z_coef * (pack[self._P_Z_SUM] / pack[self._P_Z_CNT].clamp_min(1.0))
