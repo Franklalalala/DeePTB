@@ -220,6 +220,7 @@ class Trainer(BaseTrainer):
                 flow_state.update(
                     self._flow_train_compatible_state(lossfunc, batch, batch_for_loss)
                 )
+            self._merge_flow_train_canonical_state(flow_state)
             self._last_flow_state = flow_state
             return loss
         self._last_flow_state = {}
@@ -304,8 +305,28 @@ class Trainer(BaseTrainer):
             )
         return {}
 
+    @staticmethod
+    def _merge_flow_train_canonical_state(state):
+        if "train_loss" not in state and "train_flow_loss" in state:
+            state["train_loss"] = state["train_flow_loss"]
+
+        for component in ("onsite", "hopping"):
+            canonical_key = f"train_{component}_loss"
+            if canonical_key in state:
+                continue
+            for flow_key in (
+                f"train_flow_{component}_endpoint_loss",
+                f"train_flow_{component}_loss",
+            ):
+                if flow_key in state:
+                    state[canonical_key] = state[flow_key]
+                    break
+
     def _flow_validation_compatible_state(self, lossfunc, pred_data, ref_data, *, num_steps):
-        if int(num_steps) == 1 and self.flow_cfm.compatible_loss_to_legacy_keys:
+        if int(num_steps) == 1 and (
+            getattr(self.flow_cfm, "compatible_loss_to_legacy_keys", False)
+            or getattr(self.flow_cfm, "log_validation_compatible_loss", False)
+        ):
             return self._compatible_loss_state(
                 lossfunc,
                 pred_data,

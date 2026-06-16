@@ -542,6 +542,7 @@ def _multi_train_impl(
                 )
             )
             log_field.append("validation_loss")
+            log_field.extend(["validation_onsite_loss", "validation_hopping_loss"])
 
         avg_per_iter = chk_avg_per_iter(jdata)
 

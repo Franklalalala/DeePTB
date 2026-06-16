@@ -1607,6 +1607,7 @@ class TensorBoardMonitor(Plugin):
 
     def epoch(self, **kwargs):
         epoch = kwargs.get("time", self.trainer.ep)
+        iteration = kwargs.get("iteration", getattr(self.trainer, "iter", epoch))
 
         lr = self._get_stat('lr', 'last', None)
         train_loss_mean = self._get_stat('train_loss', 'epoch_mean', None)
@@ -1624,17 +1625,17 @@ class TensorBoardMonitor(Plugin):
         total_grad_norm_mean = self._get_stat('total_grad_norm', 'epoch_mean', None)
 
         if lr is not None:
-            self.writer.add_scalar('lr/epoch', lr, epoch)
+            self.writer.add_scalar('lr_epoch', lr, epoch)
         if train_loss_mean is not None:
-            self.writer.add_scalar('train_loss_mean/epoch', train_loss_mean, epoch)
+            self.writer.add_scalar('train_loss_epoch', train_loss_mean, epoch)
         if train_loss_opt_mean is not None:
-            self.writer.add_scalar('train_loss_opt_mean/epoch', train_loss_opt_mean, epoch)
+            self.writer.add_scalar('train_loss_opt_epoch', train_loss_opt_mean, epoch)
         if test_loss_mean is not None:
-            self.writer.add_scalar('test_loss_mean/epoch', test_loss_mean, epoch)
+            self.writer.add_scalar('test_loss_epoch', test_loss_mean, epoch)
         if validation_loss_mean is not None:
-            self.writer.add_scalar('validation_loss_mean/epoch', validation_loss_mean, epoch)
+            self.writer.add_scalar('validation_loss_iter', validation_loss_mean, iteration)
         if total_grad_norm_mean is not None:
-            self.writer.add_scalar('total_grad_norm_mean/epoch', total_grad_norm_mean, epoch)
+            self.writer.add_scalar('total_grad_norm_epoch', total_grad_norm_mean, epoch)
 
         for name in sorted(self.trainer.stats):
             if not name.startswith((
@@ -1648,17 +1649,17 @@ class TensorBoardMonitor(Plugin):
                 continue
             value = self._get_stat(name, 'epoch_mean', None)
             if value is not None:
-                self.writer.add_scalar(f'{name}_mean/epoch', value, epoch)
+                self.writer.add_scalar(f'{name}_epoch', value, epoch)
 
         if 'train_onsite_loss' in self.trainer.stats:
             self.writer.add_scalar(
-                'train_onsite_loss_mean/epoch',
+                'train_onsite_loss_epoch',
                 self._get_stat('train_onsite_loss', 'epoch_mean', 0.0),
                 epoch
             )
         if 'train_hopping_loss' in self.trainer.stats:
             self.writer.add_scalar(
-                'train_hopping_loss_mean/epoch',
+                'train_hopping_loss_epoch',
                 self._get_stat('train_hopping_loss', 'epoch_mean', 0.0),
                 epoch
             )
@@ -1667,25 +1668,25 @@ class TensorBoardMonitor(Plugin):
             and self._epoch_stat_updated('validation_onsite_loss', epoch)
         ):
             self.writer.add_scalar(
-                'validation_onsite_loss_mean/epoch',
+                'validation_onsite_loss',
                 self._get_stat('validation_onsite_loss', 'epoch_mean', 0.0),
-                epoch
+                iteration
             )
         if (
             'validation_hopping_loss' in self.trainer.stats
             and self._epoch_stat_updated('validation_hopping_loss', epoch)
         ):
             self.writer.add_scalar(
-                'validation_hopping_loss_mean/epoch',
+                'validation_hopping_loss',
                 self._get_stat('validation_hopping_loss', 'epoch_mean', 0.0),
-                epoch
+                iteration
             )
         if (
             'test_onsite_loss' in self.trainer.stats
             and self._epoch_stat_updated('test_onsite_loss', epoch)
         ):
             self.writer.add_scalar(
-                'test_onsite_loss_mean/epoch',
+                'test_onsite_loss_epoch',
                 self._get_stat('test_onsite_loss', 'epoch_mean', 0.0),
                 epoch
             )
@@ -1694,19 +1695,19 @@ class TensorBoardMonitor(Plugin):
             and self._epoch_stat_updated('test_hopping_loss', epoch)
         ):
             self.writer.add_scalar(
-                'test_hopping_loss_mean/epoch',
+                'test_hopping_loss_epoch',
                 self._get_stat('test_hopping_loss', 'epoch_mean', 0.0),
                 epoch
             )
         if 'mean_max_prob' in self.trainer.stats:
             self.writer.add_scalar(
-                'mean_max_prob_mean/epoch',
+                'mean_max_prob_epoch',
                 self._get_stat('mean_max_prob', 'epoch_mean', 0.0),
                 epoch
             )
         if 'expert_load_cv' in self.trainer.stats:
             self.writer.add_scalar(
-                'expert_load_cv_mean/epoch',
+                'expert_load_cv_epoch',
                 self._get_stat('expert_load_cv', 'epoch_mean', 0.0),
                 epoch
             )
@@ -1719,13 +1720,13 @@ class TensorBoardMonitor(Plugin):
 
             if onsite_key in self.trainer.stats:
                 self.writer.add_scalar(
-                    f'Expert_Onsite_Epoch_Mean/Expert_{i}',
+                    f'Expert_Onsite_Epoch/Expert_{i}',
                     self._get_stat(onsite_key, 'epoch_mean', 0.0),
                     epoch
                 )
             if hopping_key in self.trainer.stats:
                 self.writer.add_scalar(
-                    f'Expert_Hopping_Epoch_Mean/Expert_{i}',
+                    f'Expert_Hopping_Epoch/Expert_{i}',
                     self._get_stat(hopping_key, 'epoch_mean', 0.0),
                     epoch
                 )
@@ -1759,21 +1760,21 @@ class TensorBoardMonitor(Plugin):
         total_grad_norm = self._get_value('total_grad_norm', 'last', kwargs, default=None)
 
         if lr is not None:
-            self.writer.add_scalar('lr_iter/iteration', lr, iteration)
+            self.writer.add_scalar('lr_iter', lr, iteration)
         if train_loss is not None:
-            self.writer.add_scalar('train_loss_iter/iteration', train_loss, iteration)
+            self.writer.add_scalar('train_loss_iter', train_loss, iteration)
         if train_loss_opt is not None:
-            self.writer.add_scalar('train_loss_opt_iter/iteration', train_loss_opt, iteration)
+            self.writer.add_scalar('train_loss_opt_iter', train_loss_opt, iteration)
         if train_onsite is not None:
-            self.writer.add_scalar('train_onsite_loss_iter/iteration', train_onsite, iteration)
+            self.writer.add_scalar('train_onsite_loss_iter', train_onsite, iteration)
         if train_hopping is not None:
-            self.writer.add_scalar('train_hopping_loss_iter/iteration', train_hopping, iteration)
+            self.writer.add_scalar('train_hopping_loss_iter', train_hopping, iteration)
         if mean_max_prob is not None:
-            self.writer.add_scalar('mean_max_prob_iter/iteration', mean_max_prob, iteration)
+            self.writer.add_scalar('mean_max_prob_iter', mean_max_prob, iteration)
         if expert_load_cv is not None:
-            self.writer.add_scalar('expert_load_cv_iter/iteration', expert_load_cv, iteration)
+            self.writer.add_scalar('expert_load_cv_iter', expert_load_cv, iteration)
         if total_grad_norm is not None:
-            self.writer.add_scalar('total_grad_norm_iter/iteration', total_grad_norm, iteration)
+            self.writer.add_scalar('total_grad_norm_iter', total_grad_norm, iteration)
 
         flow_names = {
             name for name in self.trainer.stats
@@ -1796,11 +1797,11 @@ class TensorBoardMonitor(Plugin):
         for name in sorted(flow_names):
             value = self._get_value(name, 'last', kwargs, default=None)
             if value is not None:
-                self.writer.add_scalar(f'{name}_iter/iteration', value, iteration)
+                self.writer.add_scalar(f'{name}_iter', value, iteration)
 
         latest_avg_iter_loss = self._get_stat('train_loss', 'latest_avg_iter_loss', None)
         if latest_avg_iter_loss is not None:
-            self.writer.add_scalar('latest_avg_loss/iteration', latest_avg_iter_loss, iteration)
+            self.writer.add_scalar('latest_avg_loss_iter', latest_avg_iter_loss, iteration)
 
         num_experts = getattr(self.trainer, 'num_experts', 0)
         for i in range(num_experts):
@@ -1832,11 +1833,17 @@ class TensorBoardMonitor(Plugin):
 
 
 class CleanCompatibleTensorBoardMonitor(Plugin):
-    """Write only directly comparable validation components and learning rate."""
+    """Write the canonical comparable train/validation TensorBoard scalars."""
 
-    _COMPONENTS = (
-        ("validation_onsite_loss", "valid_onsite_loss"),
-        ("validation_hopping_loss", "valid_hopping_loss"),
+    _TRAIN_TAGS = (
+        ("train_loss", "train_loss_iter"),
+        ("train_onsite_loss", "train_onsite_loss_iter"),
+        ("train_hopping_loss", "train_hopping_loss_iter"),
+    )
+    _VALIDATION_TAGS = (
+        ("validation_loss", "validation_loss_iter"),
+        ("validation_onsite_loss", "validation_onsite_loss"),
+        ("validation_hopping_loss", "validation_hopping_loss"),
     )
 
     def __init__(self, interval, log_dir, flush_every=20):
@@ -1858,24 +1865,30 @@ class CleanCompatibleTensorBoardMonitor(Plugin):
             return float(value.item())
         return float(value)
 
-    def _stat_value(self, name, key):
-        return self._to_float(self.trainer.stats.get(name, {}).get(key))
+    def _stat_value(self, name, key, default=None):
+        return self._to_float(self.trainer.stats.get(name, {}).get(key, default))
+
+    def _value(self, name, key, kwargs=None):
+        if kwargs is not None and name in kwargs:
+            return self._to_float(kwargs[name])
+        return self._stat_value(name, key)
 
     def iteration(self, **kwargs):
         iteration = kwargs.get("time", self.trainer.iter)
-        lr = self._to_float(kwargs.get("lr"))
-        if lr is None:
-            lr = self._stat_value("lr", "last")
+        lr = self._value("lr", "last", kwargs)
         if lr is not None:
             self.writer.add_scalar("lr_iter", lr, iteration)
 
-        for stat_name, tag_prefix in self._COMPONENTS:
-            stat = self.trainer.stats.get(stat_name, {})
-            if stat.get("last_updated") != iteration:
-                continue
-            value = self._to_float(stat.get("last"))
+        for stat_name, tag in self._TRAIN_TAGS:
+            value = self._value(stat_name, "last", kwargs)
             if value is not None:
-                self.writer.add_scalar(f"{tag_prefix}_iter", value, iteration)
+                self.writer.add_scalar(tag, value, iteration)
+
+        num_experts = getattr(self.trainer, "num_experts", 0)
+        for i in range(num_experts):
+            lr_val = self._value(f"expert_{i}_lr", "last", kwargs)
+            if lr_val is not None:
+                self.writer.add_scalar(f"Expert_LR_Iter/Expert_{i}", lr_val, iteration)
 
         if self.flush_every and iteration % self.flush_every == 0:
             self.writer.flush()
@@ -1887,13 +1900,12 @@ class CleanCompatibleTensorBoardMonitor(Plugin):
         if lr is not None:
             self.writer.add_scalar("lr_epoch", lr, epoch)
 
-        for stat_name, tag_prefix in self._COMPONENTS:
+        for stat_name, tag in self._VALIDATION_TAGS:
             stat = self.trainer.stats.get(stat_name, {})
             if stat.get("epoch_last_updated") != epoch:
                 continue
             value = self._to_float(stat.get("epoch_mean"))
             if value is not None:
-                self.writer.add_scalar(f"{tag_prefix}_epoch", value, epoch)
-                self.writer.add_scalar(f"{tag_prefix}_iter", value, iteration)
+                self.writer.add_scalar(tag, value, iteration)
 
         self.writer.flush()

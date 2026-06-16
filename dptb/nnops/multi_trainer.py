@@ -2348,6 +2348,69 @@ class MultiTrainer(Trainer):
 
         return total.detach()
 
+    def _validation_component_state_from_pack(
+        self,
+        pack: torch.Tensor,
+        *,
+        loss: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        state: Dict[str, torch.Tensor] = {}
+        if loss is not None:
+            state["validation_loss"] = loss.detach() if torch.is_tensor(loss) else torch.as_tensor(
+                float(loss), dtype=self.dtype, device=self.device
+            )
+
+        def _component_loss(
+            *,
+            weighted_sum_idx: int,
+            active_count_idx: int,
+            l1_sum_idx: int,
+            mse_sum_idx: int,
+            count_idx: int,
+        ) -> Optional[torch.Tensor]:
+            count = pack[count_idx]
+            if float(count.detach().item()) > 0.0:
+                denom = count.to(dtype=self.dtype).clamp_min(1.0)
+                l1_mean = pack[l1_sum_idx] / denom
+                mse_mean = pack[mse_sum_idx] / denom
+                return 0.5 * (l1_mean + torch.sqrt(mse_mean))
+
+            active_count = pack[active_count_idx]
+            if float(active_count.detach().item()) > 0.0:
+                return pack[weighted_sum_idx] / active_count.to(dtype=self.dtype).clamp_min(1.0)
+            return None
+
+        onsite_loss = _component_loss(
+            weighted_sum_idx=self._P_ONSITE_WEIGHTED_SUM,
+            active_count_idx=self._P_ACTIVE_NODES_SUM,
+            l1_sum_idx=self._P_ONSITE_L1_SUM,
+            mse_sum_idx=self._P_ONSITE_MSE_SUM,
+            count_idx=self._P_ONSITE_CNT_SUM,
+        )
+        hopping_loss = _component_loss(
+            weighted_sum_idx=self._P_HOPPING_WEIGHTED_SUM,
+            active_count_idx=self._P_ACTIVE_EDGES_SUM,
+            l1_sum_idx=self._P_HOPPING_L1_SUM,
+            mse_sum_idx=self._P_HOPPING_MSE_SUM,
+            count_idx=self._P_HOPPING_CNT_SUM,
+        )
+        if onsite_loss is not None:
+            state["validation_onsite_loss"] = onsite_loss.detach()
+        if hopping_loss is not None:
+            state["validation_hopping_loss"] = hopping_loss.detach()
+        return state
+
+    def _validation_component_state_from_payloads(
+        self,
+        payloads: List[Dict[str, Any]],
+        *,
+        loss: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        pack = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=self.device)
+        for payload in payloads:
+            pack = pack + self._make_step_pack(payload)
+        return self._validation_component_state_from_pack(pack, loss=loss)
+
     def _compute_local_compatible_loss_from_payload(self, payload: Dict[str, Any], criterion=None) -> torch.Tensor:
         out = self._compute_stitched_loss_by_reduce([payload], criterion=criterion)
         if out is None:
@@ -3274,9 +3337,12 @@ class MultiTrainer(Trainer):
     def validation(self, fast=True):
         with torch.no_grad():
             total_loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
+            validation_metric_sums: Dict[str, torch.Tensor] = {}
+            validation_metric_batches = 0
             self.model.eval()
 
             for batch in self.validation_loader:
+                validation_state = None
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
@@ -3306,6 +3372,10 @@ class MultiTrainer(Trainer):
                             loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
                     else:
                         loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
+                    validation_state = self._validation_component_state_from_pack(
+                        reduced_pack,
+                        loss=loss_i,
+                    )
 
                 else:
                     if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
@@ -3336,11 +3406,37 @@ class MultiTrainer(Trainer):
                         if loss_i is None:
                             with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
                                 loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
+                            validation_state = {
+                                "validation_loss": loss_i.detach(),
+                            }
+                            validation_state.update(
+                                self._loss_component_state(
+                                    self.validation_lossfunc,
+                                    prefix="validation",
+                                )
+                            )
+                        else:
+                            validation_state = self._validation_component_state_from_payloads(
+                                payloads,
+                                loss=loss_i,
+                            )
                     else:
                         with self._tagger.tag("validation/full_forward_stitched", it=self.iter):
                             loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
+                        validation_state = {
+                            "validation_loss": loss_i.detach(),
+                        }
+                        validation_state.update(
+                            self._loss_component_state(
+                                self.validation_lossfunc,
+                                prefix="validation",
+                            )
+                        )
 
                 total_loss = total_loss + loss_i.detach()
+                if validation_state:
+                    self._accumulate_metric_state(validation_metric_sums, validation_state)
+                    validation_metric_batches += 1
 
                 if fast:
                     break
@@ -3348,6 +3444,10 @@ class MultiTrainer(Trainer):
         if not fast:
             total_loss = total_loss / len(self.validation_loader)
 
+        divisor = max(validation_metric_batches, 1)
+        self._last_flow_validation_state = {
+            key: value / divisor for key, value in validation_metric_sums.items()
+        }
         return total_loss
 
     # ---------------------------------------------------------------------

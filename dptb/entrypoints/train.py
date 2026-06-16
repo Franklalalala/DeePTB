@@ -555,8 +555,11 @@ def train(
             "validation_flow_random_t_loss",
             "validation_flow_t0_loss",
         ])
-        for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
-            flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
+        validation_ode_steps = [
+            int(num_steps) for num_steps in flow_options.get("validation_ode_steps", [1, 3])
+        ]
+        for num_steps in validation_ode_steps:
+            flow_log_fields.append(f"validation_flow_euler_{num_steps}_loss")
         if flow_options.get("log_train_compatible_loss", flow_options.get("log_compatible_loss", True)):
             flow_log_fields.extend([
                 "train_compatible_loss",
@@ -565,14 +568,17 @@ def train(
             ])
         if flow_options.get("log_validation_compatible_loss", flow_options.get("log_compatible_loss", True)):
             flow_log_fields.extend([
+                "validation_loss",
                 "validation_onsite_loss",
                 "validation_hopping_loss",
             ])
-            for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
+            for num_steps in validation_ode_steps:
+                if num_steps == 1:
+                    continue
                 flow_log_fields.extend([
-                    f"validation_compatible_euler_{int(num_steps)}_loss",
-                    f"validation_compatible_euler_{int(num_steps)}_onsite_loss",
-                    f"validation_compatible_euler_{int(num_steps)}_hopping_loss",
+                    f"validation_compatible_euler_{num_steps}_loss",
+                    f"validation_compatible_euler_{num_steps}_onsite_loss",
+                    f"validation_compatible_euler_{num_steps}_hopping_loss",
                 ])
         log_field.extend(flow_log_fields)
         flow_scalar_fields = list(flow_log_fields)

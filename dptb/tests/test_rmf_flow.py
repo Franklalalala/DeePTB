@@ -188,6 +188,26 @@ def test_multitrainer_flow_metrics_keep_endpoint_counts_for_validation_pack():
     assert trainer._compute_compatible_loss_from_pack(pack, object()) is not None
 
 
+def test_multitrainer_validation_component_state_uses_flow_weighted_fallback_without_counts():
+    trainer = _empty_multitrainer_for_pack()
+    pack = torch.zeros((trainer._PACK_LEN,), dtype=trainer.dtype)
+    pack[trainer._P_LOSS_OPT_SUM] = 7.0
+    pack[trainer._P_STEP_COUNT] = 1.0
+    pack[trainer._P_ONSITE_WEIGHTED_SUM] = 20.0
+    pack[trainer._P_ACTIVE_NODES_SUM] = 4.0
+    pack[trainer._P_HOPPING_WEIGHTED_SUM] = 18.0
+    pack[trainer._P_ACTIVE_EDGES_SUM] = 6.0
+
+    state = trainer._validation_component_state_from_pack(
+        pack,
+        loss=torch.tensor(7.0),
+    )
+
+    assert state["validation_loss"].item() == pytest.approx(7.0)
+    assert state["validation_onsite_loss"].item() == pytest.approx(5.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
+
+
 def test_multitrainer_compatible_pack_skips_zero_count_components():
     trainer = _empty_multitrainer_for_pack()
     pack = torch.zeros((trainer._PACK_LEN,), dtype=trainer.dtype)
