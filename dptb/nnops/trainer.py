@@ -206,7 +206,8 @@ class Trainer(BaseTrainer):
         batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
-        if use_flow and self.flow_cfm.enabled:
+        flow_cfm = getattr(self, "flow_cfm", None)
+        if use_flow and flow_cfm is not None and flow_cfm.enabled:
             if getattr(self.flow_cfm, "model_in_loss", False):
                 loss, flow_state = self.flow_cfm.loss_with_model(self.model, batch, batch_for_loss)
             else:
@@ -344,12 +345,13 @@ class Trainer(BaseTrainer):
         del loss
 
         ref_component_state = {}
+        flow_cfm = getattr(self, "flow_cfm", None)
         if ref_batch is not None:
             reference_lossfunc = getattr(self, "reference_lossfunc", self.train_lossfunc)
             ref_loss = self._loss_on_batch(
                 ref_batch,
                 reference_lossfunc,
-                use_flow=bool(getattr(self.flow_cfm, "apply_to_reference", False)),
+                use_flow=bool(getattr(flow_cfm, "apply_to_reference", False)),
             )
             loss_for_log = loss_for_log + ref_loss.detach()
             ref_loss.backward()
@@ -384,7 +386,7 @@ class Trainer(BaseTrainer):
             num_experts=getattr(self, "num_experts", getattr(self.model, "num_experts", 0)),
         )
         state.update(dynamic_batch_state)
-        if not self.flow_cfm.enabled:
+        if flow_cfm is None or not flow_cfm.enabled:
             state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
         state.update(getattr(self, "_last_flow_state", {}))

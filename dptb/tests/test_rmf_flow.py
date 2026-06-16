@@ -188,6 +188,40 @@ def test_multitrainer_flow_metrics_keep_endpoint_counts_for_validation_pack():
     assert trainer._compute_compatible_loss_from_pack(pack, object()) is not None
 
 
+def test_multitrainer_compatible_pack_skips_zero_count_components():
+    trainer = _empty_multitrainer_for_pack()
+    pack = torch.zeros((trainer._PACK_LEN,), dtype=trainer.dtype)
+    pack[trainer._P_ONSITE_L1_SUM] = 999.0
+    pack[trainer._P_ONSITE_MSE_SUM] = 999.0
+    pack[trainer._P_ONSITE_CNT_SUM] = 0.0
+    pack[trainer._P_HOPPING_L1_SUM] = 4.0
+    pack[trainer._P_HOPPING_MSE_SUM] = 10.0
+    pack[trainer._P_HOPPING_CNT_SUM] = 2.0
+
+    loss = trainer._compute_compatible_loss_from_pack(pack, object())
+
+    expected_hopping = 0.5 * (torch.tensor(2.0) + torch.sqrt(torch.tensor(5.0)))
+    assert loss.item() == pytest.approx(expected_hopping.item())
+
+
+def test_multitrainer_compatible_payload_skips_zero_count_components():
+    trainer = _empty_multitrainer_for_pack()
+    payload = {
+        "onsite_l1_sum": torch.tensor(999.0),
+        "onsite_mse_sum": torch.tensor(999.0),
+        "onsite_cnt": torch.tensor(0.0),
+        "hopping_l1_sum": torch.tensor(4.0),
+        "hopping_mse_sum": torch.tensor(10.0),
+        "hopping_cnt": torch.tensor(2.0),
+        "z_values": [],
+    }
+
+    loss = trainer._compute_stitched_loss_by_reduce([payload], object())
+
+    expected_hopping = 0.5 * (torch.tensor(2.0) + torch.sqrt(torch.tensor(5.0)))
+    assert loss.item() == pytest.approx(expected_hopping.item())
+
+
 class _EndpointModel(torch.nn.Module):
     def __init__(self):
         super().__init__()

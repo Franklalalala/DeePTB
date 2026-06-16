@@ -8,6 +8,7 @@ import torch
 from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
 from dptb.nnops import trainer as trainer_module
 from dptb.nnops.trainer import Trainer
+from dptb.utils.argcheck import flow_options
 
 train_entrypoint = importlib.import_module("dptb.entrypoints.train")
 
@@ -313,6 +314,28 @@ def test_build_hamiltonian_flow_selects_pixel_meanflow_objective():
     assert flow.model_in_loss is True
 
 
+def test_flow_options_argcheck_accepts_pixel_meanflow_config_keys():
+    schema = flow_options()
+
+    value = schema.normalize_value(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "flow_time_r_key": "flow_time_r",
+            "flow_time_t_key": "flow_time_t",
+            "flow_time_h_key": "flow_time_h",
+            "meanflow": {
+                "profile": "conservative",
+                "jvp_tangent": "boundary",
+                "du_dt_backend": "finite_difference",
+            },
+        }
+    )
+    schema.check_value(value, strict=True)
+
+    assert value["meanflow"]["profile"] == "conservative"
+
+
 def test_pixel_meanflow_conservative_defaults_to_paper_boundary_tangent():
     flow = HamiltonianPixelMeanFlow(
         {
@@ -546,6 +569,72 @@ def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():
     assert state["train_flow_h"].item() == pytest.approx(float((t - r).mean()), abs=1.0e-6)
     assert state["train_flow_onsite_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
     assert state["train_flow_hopping_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_pixel_meanflow_endpoint_counts_match_cfm_compatible_validation_semantics():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+        }
+    )
+    clean = torch.zeros(4, 1)
+    prior = torch.zeros_like(clean)
+    state_z = torch.zeros_like(clean)
+    pred_x = torch.tensor([[1.0], [3.0], [100.0], [100.0]])
+    mask = torch.tensor([[True], [True], [False], [False]])
+
+    _, state = flow._component_meanflow_loss(
+        diff_prefix="validation_flow_hopping",
+        pred_x=pred_x,
+        boundary_x=None,
+        clean=clean,
+        prior=prior,
+        state_z=state_z,
+        comp_r=torch.full((4,), 0.25),
+        comp_t=torch.full((4,), 0.50),
+        pred_x_eps=pred_x,
+        mask=mask,
+        weight=1.0,
+    )
+
+    assert state["validation_flow_hopping_endpoint_loss"].item() == pytest.approx(5.0)
+    assert state["validation_flow_hopping_endpoint_mse"].item() == pytest.approx(5.0)
+    assert state["validation_flow_hopping_endpoint_mae"].item() == pytest.approx(2.0)
+    assert state["validation_flow_hopping_endpoint_l1_sum"].item() == pytest.approx(4.0)
+    assert state["validation_flow_hopping_endpoint_mse_sum"].item() == pytest.approx(10.0)
+    assert state["validation_flow_hopping_endpoint_count"].item() == pytest.approx(2.0)
+
+
+def test_pixel_meanflow_train_legacy_tags_use_endpoint_residual_loss():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+            "meanflow": {"aux_endpoint_weight": 0.0},
+        }
+    )
+    model = _EndpointOffsetModel()
+    model.bias.data.fill_(1.0)
+
+    _, state = flow.loss_with_model(
+        model,
+        _two_graph_batch(),
+        _two_graph_ref(),
+        r=torch.tensor([0.25, 0.25]),
+        t=torch.tensor([0.50, 0.50]),
+    )
+
+    assert state["train_flow_onsite_endpoint_loss"].item() == pytest.approx(1.0)
+    assert state["train_flow_hopping_endpoint_loss"].item() == pytest.approx(1.0)
+    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["train_hopping_loss"].item() == pytest.approx(1.0)
 
 
 def test_pixel_meanflow_one_step_sampler_reaches_constant_endpoint():

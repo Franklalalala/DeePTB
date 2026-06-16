@@ -944,11 +944,19 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             norm_p=self.meanflow_norm_p,
             norm_eps=self.meanflow_norm_eps,
         )
-        endpoint_loss, endpoint_mse, endpoint_mae = self._adaptive_metric_stats(
-            pred_x - clean,
+        endpoint_diff = pred_x - clean
+        endpoint_loss, _, _ = self._adaptive_metric_stats(
+            endpoint_diff,
             mask,
             self.loss_type,
         )
+        endpoint_l1_sum, endpoint_mse_sum, endpoint_count = self._masked_element_sums(
+            endpoint_diff,
+            mask,
+        )
+        endpoint_denom = endpoint_count.to(dtype=endpoint_mse_sum.dtype).clamp_min(1.0)
+        endpoint_mse = endpoint_mse_sum / endpoint_denom
+        endpoint_mae = endpoint_l1_sum / endpoint_denom
         boundary_loss = endpoint_loss.new_zeros(())
         boundary_mse = endpoint_loss.new_zeros(())
         boundary_mae = endpoint_loss.new_zeros(())
@@ -973,6 +981,9 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             f"{diff_prefix}_endpoint_loss": endpoint_loss.detach(),
             f"{diff_prefix}_endpoint_mse": endpoint_mse.detach(),
             f"{diff_prefix}_endpoint_mae": endpoint_mae.detach(),
+            f"{diff_prefix}_endpoint_l1_sum": endpoint_l1_sum,
+            f"{diff_prefix}_endpoint_mse_sum": endpoint_mse_sum,
+            f"{diff_prefix}_endpoint_count": endpoint_count,
             f"{diff_prefix}_boundary_v_loss": boundary_loss.detach(),
             f"{diff_prefix}_boundary_v_mse": boundary_mse.detach(),
             f"{diff_prefix}_boundary_v_mae": boundary_mae.detach(),
@@ -1052,6 +1063,8 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
             f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
         }
+        onsite_legacy = None
+        hopping_legacy = None
         if ctx.node_clean is not None and node_x is not None:
             comp_total, comp_state = self._component_meanflow_loss(
                 diff_prefix=f"{prefix}_flow_onsite",
@@ -1068,6 +1081,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
+            onsite_legacy = comp_state[f"{prefix}_flow_onsite_endpoint_loss"]
         if ctx.edge_clean is not None and edge_x is not None:
             comp_total, comp_state = self._component_meanflow_loss(
                 diff_prefix=f"{prefix}_flow_hopping",
@@ -1084,12 +1098,18 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
+            hopping_legacy = comp_state[f"{prefix}_flow_hopping_endpoint_loss"]
         if total is None:
             raise KeyError("Pixel MeanFlow could not compute a loss from configured node/edge targets.")
         if self.router_z_loss_coef > 0.0:
             # The main prediction is intentionally not retained; keep router regularization
             # out of pMF unless a future model-level integration returns it explicitly.
             log.debug("z_loss_coef is ignored by HamiltonianPixelMeanFlow.loss_with_model")
+        if prefix == "train":
+            if onsite_legacy is not None:
+                state["train_onsite_loss"] = onsite_legacy
+            if hopping_legacy is not None:
+                state["train_hopping_loss"] = hopping_legacy
         state[f"{prefix}_flow_loss"] = total.detach()
         self.last_state = state
         return total, state
