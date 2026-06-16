@@ -116,16 +116,25 @@ class HamiltonianCFM:
 
         # In DeePTB, zero prior means the inference start state is exactly physical H0.
         # Gaussian is available for QHFlow-style noisy residual priors.
-        self.prior = str(options.get("prior", "zero")).lower()
-        if self.prior not in {"zero", "gaussian", "residual_gaussian"}:
+        self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
+        self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
+        allowed_priors = {"zero", "gaussian", "residual_gaussian", *self._te_prior_names}
+        if self.prior not in allowed_priors:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
-                "use 'zero', 'gaussian', or 'residual_gaussian'."
+                "use 'zero', 'gaussian', 'residual_gaussian', or 'te'."
             )
 
         self.node_sigma = float(options.get("node_sigma", 1.0))
         self.edge_sigma = float(options.get("edge_sigma", 1.0))
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
+        self.te_prior_sigma = float(options.get("te_prior_sigma", 1.0))
+        self.te_prior_mode = str(options.get("te_prior_mode", "irrep")).lower().replace("-", "_")
+        if self.te_prior_mode == "type":
+            self.te_prior_mode = "typewise"
+        if self.te_prior_mode not in {"irrep", "block", "typewise"}:
+            raise ValueError("flow_options.te_prior_mode must be 'irrep', 'block', or 'typewise'.")
+        self.te_prior_per_graph = bool(options.get("te_prior_per_graph", True))
 
         # Time sampling.  QHFlow uses U(0,1); we expose a t0 mass so the network
         # explicitly sees the physical-H0 one-step inference point.
@@ -300,11 +309,293 @@ class HamiltonianCFM:
                 base = torch.zeros_like(target)
         return base
 
-    def _prior_like(self, residual: torch.Tensor, sigma: float) -> torch.Tensor:
+    @staticmethod
+    def _align_bool_mask(mask: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(device=like.device, dtype=torch.bool)
+        if mask.ndim == 1:
+            mask = mask.reshape(-1, 1)
+        if mask.shape[0] < like.shape[0]:
+            pad = torch.ones(
+                like.shape[0] - mask.shape[0],
+                mask.shape[1],
+                device=like.device,
+                dtype=torch.bool,
+            )
+            mask = torch.cat([mask, pad], dim=0)
+        elif mask.shape[0] > like.shape[0]:
+            mask = mask[: like.shape[0]]
+
+        if mask.shape[-1] == 1:
+            return mask.expand_as(like)
+        if mask.shape[-1] < like.shape[-1]:
+            pad = torch.ones(
+                mask.shape[0],
+                like.shape[-1] - mask.shape[-1],
+                device=like.device,
+                dtype=torch.bool,
+            )
+            mask = torch.cat([mask, pad], dim=-1)
+        elif mask.shape[-1] > like.shape[-1]:
+            mask = mask[:, : like.shape[-1]]
+        return mask.expand_as(like)
+
+    def _prior_mask(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        like: torch.Tensor,
+        label: Optional[str],
+    ) -> torch.Tensor:
+        mask = torch.ones_like(like, dtype=torch.bool, device=like.device)
+        if data is None or self.idp is None or like.ndim < 2:
+            return mask
+
+        if label == "node":
+            type_key = AtomicDataDict.ATOM_TYPE_KEY
+            mask_table = getattr(self.idp, "mask_to_nrme", None)
+            expert_key = "expert_node_mask"
+        elif label == "edge":
+            type_key = AtomicDataDict.EDGE_TYPE_KEY
+            mask_table = getattr(self.idp, "mask_to_erme", None)
+            expert_key = "expert_edge_mask"
+        else:
+            return mask
+
+        types = data.get(type_key, None)
+        if types is not None and mask_table is not None:
+            row_types = types.to(device=like.device, dtype=torch.long).reshape(-1)
+            if row_types.numel() > 0:
+                row_types = row_types[: like.shape[0]]
+                table = mask_table.to(device=like.device, dtype=torch.bool)
+                row_types = row_types.clamp(min=0, max=max(table.shape[0] - 1, 0))
+                type_mask = table.index_select(0, row_types)
+                mask = mask & self._align_bool_mask(type_mask, like)
+
+        expert_mask = data.get(expert_key, None)
+        if expert_mask is not None:
+            mask = mask & self._align_bool_mask(expert_mask, like)
+        return mask
+
+    def _row_graph_index(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        count: int,
+        label: Optional[str],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if count <= 0 or data is None:
+            return torch.zeros(count, device=device, dtype=torch.long)
+
+        batch = data.get(_keys.BATCH_KEY, None)
+        if batch is None or batch.numel() == 0:
+            return torch.zeros(count, device=device, dtype=torch.long)
+        batch = batch.to(device=device, dtype=torch.long).reshape(-1)
+
+        if label == "node":
+            if batch.numel() < count:
+                batch = torch.cat([batch, batch.new_zeros(count - batch.numel())], dim=0)
+            return batch[:count]
+
+        if label == "edge":
+            edge_index = data.get(_keys.EDGE_INDEX_KEY, None)
+            if edge_index is None or edge_index.numel() == 0:
+                return torch.zeros(count, device=device, dtype=torch.long)
+            centers = edge_index[0].to(device=device, dtype=torch.long).reshape(-1)
+            if centers.numel() < count:
+                centers = torch.cat([centers, centers.new_zeros(count - centers.numel())], dim=0)
+            centers = centers[:count].clamp(min=0, max=max(batch.numel() - 1, 0))
+            return batch.index_select(0, centers)
+
+        return torch.zeros(count, device=device, dtype=torch.long)
+
+    def _row_type_index(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        count: int,
+        label: Optional[str],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if count <= 0 or data is None:
+            return None
+        if label == "node":
+            key = AtomicDataDict.ATOM_TYPE_KEY
+        elif label == "edge":
+            key = AtomicDataDict.EDGE_TYPE_KEY
+        else:
+            return None
+        values = data.get(key, None)
+        if values is None:
+            return None
+        values = values.to(device=device, dtype=torch.long).reshape(-1)
+        if values.numel() < count:
+            values = torch.cat([values, values.new_zeros(count - values.numel())], dim=0)
+        return values[:count]
+
+    def _te_irrep_slices(self, feature_dim: int) -> Optional[Tuple[Tuple[int, int, int], ...]]:
+        if self.idp is None:
+            return None
+        irreps = getattr(self.idp, "orbpair_irreps", None)
+        if irreps is None:
+            return None
+        try:
+            irreps = irreps.sort()[0].simplify()
+        except Exception:
+            try:
+                irreps = irreps.simplify()
+            except Exception:
+                pass
+
+        slices = []
+        offset = 0
+        try:
+            for mul, ir in irreps:
+                degree = int(getattr(ir, "l", 0))
+                width = int(getattr(ir, "dim", 2 * degree + 1))
+                for _ in range(int(mul)):
+                    slices.append((offset, offset + width, degree))
+                    offset += width
+        except Exception:
+            return None
+        if offset != int(feature_dim):
+            return None
+        return tuple(slices)
+
+    def _te_radius(
+        self,
+        row_count: int,
+        active_dim: torch.Tensor,
+        graph_index: Optional[torch.Tensor],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.te_prior_per_graph and graph_index is not None and graph_index.numel() == row_count:
+            num_graphs = int(graph_index.max().detach().item()) + 1 if row_count > 0 else 1
+            radius = torch.randn(num_graphs, 1, device=device, dtype=dtype).index_select(0, graph_index)
+        else:
+            radius = torch.randn(row_count, 1, device=device, dtype=dtype)
+        return radius * active_dim.sqrt()
+
+    def _block_structured_prior_like(
+        self,
+        like: torch.Tensor,
+        mask: torch.Tensor,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> torch.Tensor:
+        if like.ndim < 2:
+            return torch.randn_like(like)
+        mask_f = mask.to(device=like.device, dtype=like.dtype)
+        raw = torch.randn_like(like) * mask_f
+        norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
+        direction = raw / norm
+        active_dim = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+        radius = self._te_radius(
+            like.shape[0], active_dim, graph_index, device=like.device, dtype=like.dtype
+        )
+        return direction * radius * mask_f
+
+    def _apply_typewise_residual_scale(
+        self,
+        noise: torch.Tensor,
+        reference: torch.Tensor,
+        mask: torch.Tensor,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+        slices: Tuple[Tuple[int, int, int], ...],
+        *,
+        reference_scale: bool,
+    ) -> torch.Tensor:
+        if self.te_prior_mode != "typewise" or not reference_scale:
+            return noise
+        type_index = self._row_type_index(data, noise.shape[0], label, noise.device)
+        if type_index is None or noise.ndim < 2:
+            return noise
+
+        out = noise.clone()
+        ref = reference.detach().to(device=noise.device, dtype=noise.dtype)
+        mask_f = mask.to(device=noise.device, dtype=noise.dtype)
+        for type_value in torch.unique(type_index).detach().cpu().tolist():
+            rows = type_index == int(type_value)
+            if not bool(rows.any().detach().cpu().item()):
+                continue
+            for start, end, _degree in slices:
+                seg_mask = mask_f[rows, start:end]
+                count = seg_mask.sum()
+                if not bool((count > 0).detach().cpu().item()):
+                    continue
+                rms = ((ref[rows, start:end].square() * seg_mask).sum() / count).sqrt()
+                if not bool(torch.isfinite(rms).detach().cpu().item()):
+                    continue
+                out[rows, start:end] = out[rows, start:end] * rms.clamp_min(
+                    self.residual_sigma_floor
+                )
+        return out
+
+    def _te_prior_like(
+        self,
+        like: torch.Tensor,
+        sigma: float,
+        *,
+        data: Optional[AtomicDataDict.Type] = None,
+        label: Optional[str] = None,
+        reference_scale: bool = True,
+    ) -> torch.Tensor:
+        if like.numel() == 0:
+            return torch.zeros_like(like)
+
+        mask = self._prior_mask(data, like, label)
+        slices = None if self.te_prior_mode == "block" else self._te_irrep_slices(like.shape[-1])
+        if like.ndim < 2 or slices is None:
+            slices = ((0, like.shape[-1], -1),) if like.ndim >= 2 else ((0, like.numel(), -1),)
+            noise = self._block_structured_prior_like(like, mask, data, label)
+        else:
+            noise = torch.zeros_like(like)
+            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+            for start, end, _degree in slices:
+                seg_mask = mask[:, start:end].to(device=like.device, dtype=like.dtype)
+                raw = torch.randn(like.shape[0], end - start, device=like.device, dtype=like.dtype)
+                raw = raw * seg_mask
+                norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
+                direction = raw / norm
+                active_dim = seg_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                radius = self._te_radius(
+                    like.shape[0], active_dim, graph_index, device=like.device, dtype=like.dtype
+                )
+                noise[:, start:end] = direction * radius * seg_mask
+
+        noise = self._apply_typewise_residual_scale(
+            noise,
+            like,
+            mask,
+            data,
+            label,
+            slices,
+            reference_scale=reference_scale,
+        )
+        return noise * (float(sigma) * self.te_prior_sigma)
+
+    def _prior_like(
+        self,
+        residual: torch.Tensor,
+        sigma: float,
+        *,
+        data: Optional[AtomicDataDict.Type] = None,
+        label: Optional[str] = None,
+        reference_scale: bool = True,
+    ) -> torch.Tensor:
         if self.prior == "zero":
             return torch.zeros_like(residual)
         if self.prior == "gaussian":
             return torch.randn_like(residual) * sigma
+        if self.prior in self._te_prior_names:
+            return self._te_prior_like(
+                residual,
+                sigma,
+                data=data,
+                label=label,
+                reference_scale=reference_scale,
+            )
         # residual_gaussian: match global residual scale, useful as a rough TE/GOE proxy.
         scale = residual.detach().std().clamp_min(self.residual_sigma_floor)
         return torch.randn_like(residual) * scale * sigma
@@ -353,7 +644,7 @@ class HamiltonianCFM:
             node_target = node_target.to(device=device, dtype=dtype)
             node_base = self._base_like(data, node_target, self.node_h0_key, "node")
             node_res = node_target - node_base
-            node_prior = self._prior_like(node_res, self.node_sigma)
+            node_prior = self._prior_like(node_res, self.node_sigma, data=data, label="node")
             node_t_view = node_t.reshape((-1,) + (1,) * (node_target.ndim - 1))
             node_current = node_base + (1.0 - node_t_view) * node_prior + node_t_view * node_res
             if self.detach_interpolated_h0:
@@ -366,7 +657,7 @@ class HamiltonianCFM:
             edge_target = edge_target.to(device=device, dtype=dtype)
             edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
             edge_res = edge_target - edge_base
-            edge_prior = self._prior_like(edge_res, self.edge_sigma)
+            edge_prior = self._prior_like(edge_res, self.edge_sigma, data=data, label="edge")
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_target.ndim - 1))
             edge_current = edge_base + (1.0 - edge_t_view) * edge_prior + edge_t_view * edge_res
             if self.detach_interpolated_h0:
@@ -559,9 +850,21 @@ class HamiltonianCFM:
 
         if self.prior != "zero":
             if node_current is not None:
-                node_current = node_current + self._prior_like(node_current, self.node_sigma)
+                node_current = node_current + self._prior_like(
+                    node_current,
+                    self.node_sigma,
+                    data=state,
+                    label="node",
+                    reference_scale=False,
+                )
             if edge_current is not None:
-                edge_current = edge_current + self._prior_like(edge_current, self.edge_sigma)
+                edge_current = edge_current + self._prior_like(
+                    edge_current,
+                    self.edge_sigma,
+                    data=state,
+                    label="edge",
+                    reference_scale=False,
+                )
 
         like = node_current if node_current is not None else edge_current
         num_graphs = self._num_graphs(state)
@@ -779,7 +1082,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             node_target = node_target.to(device=device, dtype=dtype)
             node_base = self._base_like(data, node_target, self.node_h0_key, "node")
             node_clean = node_target - node_base if self.mode == "residual" else node_target
-            node_prior = self._prior_like(node_clean, self.node_sigma)
+            node_prior = self._prior_like(node_clean, self.node_sigma, data=data, label="node")
             node_t_view = node_t.reshape((-1,) + (1,) * (node_clean.ndim - 1))
             node_state = (1.0 - node_t_view) * node_clean + node_t_view * node_prior
             current = node_base + node_state if self.mode == "residual" else node_state
@@ -792,7 +1095,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             edge_target = edge_target.to(device=device, dtype=dtype)
             edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
             edge_clean = edge_target - edge_base if self.mode == "residual" else edge_target
-            edge_prior = self._prior_like(edge_clean, self.edge_sigma)
+            edge_prior = self._prior_like(edge_clean, self.edge_sigma, data=data, label="edge")
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_clean.ndim - 1))
             edge_state = (1.0 - edge_t_view) * edge_clean + edge_t_view * edge_prior
             current = edge_base + edge_state if self.mode == "residual" else edge_state
@@ -1131,8 +1434,20 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         edge_base = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_base is None and edge_base is None:
             raise KeyError("Pixel MeanFlow sampling requires node and/or edge Hamiltonian start features.")
-        node_z = None if node_base is None else self._prior_like(torch.zeros_like(node_base), self.node_sigma)
-        edge_z = None if edge_base is None else self._prior_like(torch.zeros_like(edge_base), self.edge_sigma)
+        node_z = None if node_base is None else self._prior_like(
+            torch.zeros_like(node_base),
+            self.node_sigma,
+            data=state,
+            label="node",
+            reference_scale=False,
+        )
+        edge_z = None if edge_base is None else self._prior_like(
+            torch.zeros_like(edge_base),
+            self.edge_sigma,
+            data=state,
+            label="edge",
+            reference_scale=False,
+        )
         like = node_z if node_z is not None else edge_z
         num_graphs = self._num_graphs(state)
         grid = torch.linspace(1.0, 0.0, num_steps + 1, device=like.device, dtype=like.dtype)
@@ -1378,7 +1693,7 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
             node_target = node_target.to(device=device, dtype=dtype)
             node_base = self._base_like(data, node_target, self.node_h0_key, "node")
             node_clean = node_target - node_base if self.mode == "residual" else node_target
-            node_prior = self._prior_like(node_clean, self.node_sigma)
+            node_prior = self._prior_like(node_clean, self.node_sigma, data=data, label="node")
             node_state = self.manifold.geodesic_interpolate(node_prior, node_clean, node_r)
             node_velocity = self.manifold.tangent_velocity(node_prior, node_clean, node_r)
             current = node_base + node_state if self.mode == "residual" else node_state
@@ -1391,7 +1706,7 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
             edge_target = edge_target.to(device=device, dtype=dtype)
             edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
             edge_clean = edge_target - edge_base if self.mode == "residual" else edge_target
-            edge_prior = self._prior_like(edge_clean, self.edge_sigma)
+            edge_prior = self._prior_like(edge_clean, self.edge_sigma, data=data, label="edge")
             edge_state = self.manifold.geodesic_interpolate(edge_prior, edge_clean, edge_r)
             edge_velocity = self.manifold.tangent_velocity(edge_prior, edge_clean, edge_r)
             current = edge_base + edge_state if self.mode == "residual" else edge_state
@@ -1618,8 +1933,20 @@ class HamiltonianRiemannianMeanFlow(HamiltonianPixelMeanFlow):
         edge_base = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_base is None and edge_base is None:
             raise KeyError("RMF sampling requires node and/or edge Hamiltonian start features.")
-        node_z = None if node_base is None else self._prior_like(torch.zeros_like(node_base), self.node_sigma)
-        edge_z = None if edge_base is None else self._prior_like(torch.zeros_like(edge_base), self.edge_sigma)
+        node_z = None if node_base is None else self._prior_like(
+            torch.zeros_like(node_base),
+            self.node_sigma,
+            data=state,
+            label="node",
+            reference_scale=False,
+        )
+        edge_z = None if edge_base is None else self._prior_like(
+            torch.zeros_like(edge_base),
+            self.edge_sigma,
+            data=state,
+            label="edge",
+            reference_scale=False,
+        )
         like = node_z if node_z is not None else edge_z
         num_graphs = self._num_graphs(state)
         grid = torch.linspace(0.0, 1.0, num_steps + 1, device=like.device, dtype=like.dtype)
