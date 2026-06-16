@@ -3422,23 +3422,23 @@ class MultiTrainer(Trainer):
                                 "load_cv_values": [res["expert_load_cv"]] if res.get("expert_load_cv", None) is not None else [],
                             })
 
+                        batch_validation_pack = self._validation_pack_from_payloads(payloads)
                         with self._tagger.tag("validation/compute_reduce_loss", it=self.iter):
                             loss_i = self._compute_stitched_loss_by_reduce(payloads, self.validation_lossfunc)
 
                         if loss_i is None:
                             with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
                                 loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
-                            validation_state = {
-                                "validation_loss": loss_i.detach(),
-                            }
-                            validation_state.update(
-                                self._loss_component_state(
-                                    self.validation_lossfunc,
-                                    prefix="validation",
-                                )
+                            validation_state = self._validation_component_state_from_pack(
+                                batch_validation_pack,
+                                loss=loss_i,
                             )
+                            for key, value in self._loss_component_state(
+                                self.validation_lossfunc,
+                                prefix="validation",
+                            ).items():
+                                validation_state.setdefault(key, value)
                         else:
-                            batch_validation_pack = self._validation_pack_from_payloads(payloads)
                             validation_state = self._validation_component_state_from_pack(
                                 batch_validation_pack,
                                 loss=loss_i,

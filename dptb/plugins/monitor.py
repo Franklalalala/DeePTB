@@ -1557,6 +1557,12 @@ class TensorBoardMonitor(Plugin):
     - iteration / epoch 均支持 expert_i_lr
     - 优先使用 kwargs["time"] 作为 step
     """
+    _VALIDATION_TAGS = (
+        ("validation_loss", "validation_loss_iter"),
+        ("validation_onsite_loss", "validation_onsite_loss"),
+        ("validation_hopping_loss", "validation_hopping_loss"),
+    )
+
     def __init__(self, interval, log_dir='./tensorboard_logs', flush_every=20):
         super(TensorBoardMonitor, self).__init__(interval=interval)
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -1798,6 +1804,14 @@ class TensorBoardMonitor(Plugin):
             value = self._get_value(name, 'last', kwargs, default=None)
             if value is not None:
                 self.writer.add_scalar(f'{name}_iter', value, iteration)
+
+        for stat_name, tag in self._VALIDATION_TAGS:
+            stat = self.trainer.stats.get(stat_name, {})
+            if stat.get("last_updated") != iteration:
+                continue
+            value = self._to_float(stat.get("last"))
+            if value is not None:
+                self.writer.add_scalar(tag, value, iteration)
 
         latest_avg_iter_loss = self._get_stat('train_loss', 'latest_avg_iter_loss', None)
         if latest_avg_iter_loss is not None:

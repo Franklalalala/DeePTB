@@ -64,7 +64,7 @@ def _empty_multitrainer_for_pack():
     return trainer
 
 
-def _multitrainer_validation_fixture(*, results):
+def _multitrainer_validation_fixture(*, results, reduce_loss=7.0, full_loss=11.0):
     trainer = _empty_multitrainer_for_pack()
     trainer.validation_lossfunc = object()
     trainer.distributed_expert = False
@@ -96,7 +96,13 @@ def _multitrainer_validation_fixture(*, results):
         }
 
     trainer._run_one_expert_loss = fake_run_one_expert_loss
-    trainer._compute_stitched_loss_by_reduce = lambda payloads, criterion=None: torch.tensor(7.0)
+    trainer._compute_stitched_loss_by_reduce = (
+        lambda payloads, criterion=None: None
+        if reduce_loss is None
+        else torch.tensor(reduce_loss)
+    )
+    trainer._run_full_batch_loss = lambda batch_dict, batch_info, criterion: torch.tensor(full_loss)
+    trainer._loss_component_state = lambda criterion, prefix: {}
     return trainer
 
 
@@ -249,6 +255,8 @@ def test_multitrainer_validation_component_state_uses_flow_weighted_fallback_wit
 
 def test_multitrainer_validation_keeps_active_fallback_fields_for_old_cfm_without_counts():
     trainer = _multitrainer_validation_fixture(
+        reduce_loss=None,
+        full_loss=13.0,
         results=[
             {
                 "onsite": 5.0,
@@ -262,13 +270,14 @@ def test_multitrainer_validation_keeps_active_fallback_fields_for_old_cfm_withou
     trainer.validation(fast=True)
 
     state = trainer._last_flow_validation_state
-    assert state["validation_loss"].item() == pytest.approx(7.0)
+    assert state["validation_loss"].item() == pytest.approx(13.0)
     assert state["validation_onsite_loss"].item() == pytest.approx(5.0)
     assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
 
 
 def test_multitrainer_full_validation_components_are_globally_weighted():
     trainer = _multitrainer_validation_fixture(
+        reduce_loss=None,
         results=[
             {"onsite": 10.0, "hopping": 2.0, "active_nodes": 1.0, "active_edges": 1.0},
             {"onsite": 0.0, "hopping": 4.0, "active_nodes": 9.0, "active_edges": 3.0},

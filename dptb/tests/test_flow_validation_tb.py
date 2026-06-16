@@ -62,6 +62,9 @@ def test_tensorboard_iteration_uses_canonical_tag_names_without_suffix_groups():
             "train_onsite_loss": {"last": 2.0},
             "train_hopping_loss": {"last": 3.0},
             "train_flow_loss": {"last": 4.0},
+            "validation_loss": {"last": 5.0, "last_updated": 11},
+            "validation_onsite_loss": {"last": 6.0, "last_updated": 11},
+            "validation_hopping_loss": {"last": 7.0, "last_updated": 11},
             "expert_0_lr": {"last": 0.125},
         },
     )
@@ -80,6 +83,9 @@ def test_tensorboard_iteration_uses_canonical_tag_names_without_suffix_groups():
     assert recorded["train_onsite_loss_iter"] == pytest.approx((2.0, trainer.iter))
     assert recorded["train_hopping_loss_iter"] == pytest.approx((3.0, trainer.iter))
     assert recorded["train_flow_loss_iter"] == pytest.approx((4.0, trainer.iter))
+    assert recorded["validation_loss_iter"] == pytest.approx((5.0, trainer.iter))
+    assert recorded["validation_onsite_loss"] == pytest.approx((6.0, trainer.iter))
+    assert recorded["validation_hopping_loss"] == pytest.approx((7.0, trainer.iter))
     assert recorded["Expert_LR_Iter/Expert_0"] == pytest.approx((0.125, trainer.iter))
     assert "train_loss_iter/iteration" not in recorded
 
