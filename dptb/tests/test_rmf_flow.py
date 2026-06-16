@@ -246,6 +246,32 @@ def test_multitrainer_validation_snapshot_reads_base_cfm_train_flow_components()
     assert metrics["hopping"].item() == pytest.approx(4.5)
 
 
+def test_multitrainer_validation_snapshot_does_not_mix_legacy_fallback_with_validation_keys():
+    trainer = _empty_multitrainer_for_pack()
+    flow_state = {
+        "validation_flow_onsite_loss": torch.tensor(1.25),
+        "train_flow_hopping_loss": torch.tensor(9.0),
+    }
+
+    metrics = trainer._snapshot_flow_metrics(flow_state, "validation")
+
+    assert metrics["onsite"].item() == pytest.approx(1.25)
+    assert metrics["hopping"].item() == pytest.approx(0.0)
+
+
+def test_multitrainer_validation_snapshot_ignores_bare_train_component_fallback():
+    trainer = _empty_multitrainer_for_pack()
+    flow_state = {
+        "train_onsite_loss": torch.tensor(2.5),
+        "train_hopping_loss": torch.tensor(4.5),
+    }
+
+    metrics = trainer._snapshot_flow_metrics(flow_state, "validation")
+
+    assert metrics["onsite"].item() == pytest.approx(0.0)
+    assert metrics["hopping"].item() == pytest.approx(0.0)
+
+
 def test_multitrainer_validation_component_state_uses_flow_weighted_fallback_without_counts():
     trainer = _empty_multitrainer_for_pack()
     pack = torch.zeros((trainer._PACK_LEN,), dtype=trainer.dtype)
@@ -279,7 +305,7 @@ def test_multitrainer_compatible_pack_uses_active_fallback_without_endpoint_coun
     assert loss.item() == pytest.approx(4.0)
 
 
-def test_multitrainer_validation_keeps_active_fallback_fields_for_old_cfm_without_counts():
+def test_multitrainer_validation_uses_active_fallback_loss_for_old_cfm_without_counts():
     trainer = _multitrainer_validation_fixture(
         reduce_loss=None,
         full_loss=13.0,
@@ -296,7 +322,7 @@ def test_multitrainer_validation_keeps_active_fallback_fields_for_old_cfm_withou
     trainer.validation(fast=True)
 
     state = trainer._last_flow_validation_state
-    assert state["validation_loss"].item() == pytest.approx(13.0)
+    assert state["validation_loss"].item() == pytest.approx(4.0)
     assert state["validation_onsite_loss"].item() == pytest.approx(5.0)
     assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
 

@@ -1949,17 +1949,33 @@ class MultiTrainer(Trainer):
         return None
 
     def _snapshot_flow_metrics(self, state: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        validation_component_keys = tuple(
+            key
+            for component in ("onsite", "hopping")
+            for key in (
+                f"validation_{component}_loss",
+                f"validation_flow_{component}_endpoint_loss",
+                f"validation_flow_{component}_loss",
+            )
+        )
+        has_validation_component_state = (
+            prefix == "validation"
+            and any(key in state for key in validation_component_keys)
+        )
+
         def _component_keys(component: str) -> Tuple[str, ...]:
             keys = [
                 f"{prefix}_{component}_loss",
                 f"{prefix}_flow_{component}_endpoint_loss",
                 f"{prefix}_flow_{component}_loss",
             ]
-            if prefix == "validation":
+            if prefix == "validation" and not has_validation_component_state:
+                # HamiltonianCFM.loss() is the legacy non-model-in-loss path and
+                # cannot receive flow_prefix. Keep this fallback narrow to that
+                # exact legacy flow namespace; do not accept bare train_* losses.
                 keys.extend([
                     f"train_flow_{component}_endpoint_loss",
                     f"train_flow_{component}_loss",
-                    f"train_{component}_loss",
                 ])
             return tuple(keys)
 
@@ -3465,6 +3481,11 @@ class MultiTrainer(Trainer):
                         batch_validation_pack = self._validation_pack_from_payloads(payloads)
                         with self._tagger.tag("validation/compute_reduce_loss", it=self.iter):
                             loss_i = self._compute_stitched_loss_by_reduce(payloads, self.validation_lossfunc)
+                            if loss_i is None:
+                                loss_i = self._compute_compatible_loss_from_pack(
+                                    batch_validation_pack,
+                                    self.validation_lossfunc,
+                                )
 
                         if loss_i is None:
                             with self._tagger.tag("validation/fallback_full_forward", it=self.iter):

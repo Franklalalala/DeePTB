@@ -158,7 +158,10 @@ def flow_options():
         "Trainer-side conditional flow matching for Hamiltonian prediction. "
         "When enabled, DeePTB replaces node_h0/edge_h0 by an interpolated "
         "Hamiltonian state H_t and trains the existing model to predict the "
-        "clean target Hamiltonian, following a QHFlow2-style residual CFM path."
+        "clean target Hamiltonian, following a QHFlow2-style residual CFM path. "
+        "The te/structured_te/block_te/te_like priors are masked feature-space "
+        "approximations over DeePTB H0 rows; they are not dense Clebsch-Gordan "
+        "tensor expansions."
     )
     args = [
         Argument("enabled", bool, optional=True, default=False),

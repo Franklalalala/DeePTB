@@ -166,6 +166,33 @@ def test_te_prior_respects_node_edge_masks_and_active_rows():
     assert torch.all(ctx.edge_prior[2] == 0)
 
 
+def test_te_prior_mask_alignment_fails_closed_for_present_but_short_masks():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    data[AtomicDataDict.ATOM_TYPE_KEY] = data[AtomicDataDict.ATOM_TYPE_KEY][:2]
+    flow = _flow("te", device=device, dtype=dtype, te_prior_mode="irrep")
+    flow.idp.mask_to_nrme = flow.idp.mask_to_nrme[:, :2]
+
+    torch.manual_seed(17)
+    _out, _ref, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    assert torch.all(ctx.node_prior[2] == 0)
+    assert torch.all(ctx.node_prior[:, 2:] == 0)
+
+
+def test_block_te_alias_defaults_to_block_mode_unless_explicit():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    flow = _flow("block-te", device=device, dtype=dtype)
+    explicit = _flow("block_te", device=device, dtype=dtype, te_prior_mode="irrep")
+
+    assert flow.prior == "block_te"
+    assert flow.te_prior_mode == "block"
+    assert explicit.te_prior_mode == "irrep"
+
+
 def test_te_prior_is_reproducible_under_deterministic_seed():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32

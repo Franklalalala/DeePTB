@@ -116,6 +116,10 @@ class HamiltonianCFM:
 
         # In DeePTB, zero prior means the inference start state is exactly physical H0.
         # Gaussian is available for QHFlow-style noisy residual priors.
+        # The TE aliases are feature-space approximations over masked
+        # node_h0/edge_h0 rows. They do not materialize dense Tensor-Expansion
+        # or Clebsch-Gordan products and should not be interpreted as strict
+        # dense TE priors.
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
         allowed_priors = {"zero", "gaussian", "residual_gaussian", *self._te_prior_names}
@@ -129,7 +133,8 @@ class HamiltonianCFM:
         self.edge_sigma = float(options.get("edge_sigma", 1.0))
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
         self.te_prior_sigma = float(options.get("te_prior_sigma", 1.0))
-        self.te_prior_mode = str(options.get("te_prior_mode", "irrep")).lower().replace("-", "_")
+        default_te_prior_mode = "block" if self.prior == "block_te" else "irrep"
+        self.te_prior_mode = str(options.get("te_prior_mode", default_te_prior_mode)).lower().replace("-", "_")
         if self.te_prior_mode == "type":
             self.te_prior_mode = "typewise"
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
@@ -310,14 +315,20 @@ class HamiltonianCFM:
         return base
 
     @staticmethod
-    def _align_bool_mask(mask: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    def _align_bool_mask(mask: torch.Tensor, like: torch.Tensor, *, pad_value: bool = False) -> torch.Tensor:
         mask = mask.to(device=like.device, dtype=torch.bool)
-        if mask.ndim == 1:
+        if mask.ndim == 0:
+            mask = mask.reshape(1, 1)
+        elif mask.ndim == 1:
             mask = mask.reshape(-1, 1)
+        elif mask.ndim > 2:
+            mask = mask.reshape(mask.shape[0], -1)
+
+        fill = bool(pad_value)
         if mask.shape[0] < like.shape[0]:
-            pad = torch.ones(
-                like.shape[0] - mask.shape[0],
-                mask.shape[1],
+            pad = torch.full(
+                (like.shape[0] - mask.shape[0], mask.shape[1]),
+                fill_value=fill,
                 device=like.device,
                 dtype=torch.bool,
             )
@@ -326,17 +337,21 @@ class HamiltonianCFM:
             mask = mask[: like.shape[0]]
 
         if mask.shape[-1] == 1:
+            while mask.ndim < like.ndim:
+                mask = mask.unsqueeze(-1)
             return mask.expand_as(like)
         if mask.shape[-1] < like.shape[-1]:
-            pad = torch.ones(
-                mask.shape[0],
-                like.shape[-1] - mask.shape[-1],
+            pad = torch.full(
+                (mask.shape[0], like.shape[-1] - mask.shape[-1]),
+                fill_value=fill,
                 device=like.device,
                 dtype=torch.bool,
             )
             mask = torch.cat([mask, pad], dim=-1)
         elif mask.shape[-1] > like.shape[-1]:
             mask = mask[:, : like.shape[-1]]
+        while mask.ndim < like.ndim:
+            mask = mask.unsqueeze(-1)
         return mask.expand_as(like)
 
     def _prior_mask(
@@ -362,13 +377,30 @@ class HamiltonianCFM:
 
         types = data.get(type_key, None)
         if types is not None and mask_table is not None:
-            row_types = types.to(device=like.device, dtype=torch.long).reshape(-1)
-            if row_types.numel() > 0:
-                row_types = row_types[: like.shape[0]]
-                table = mask_table.to(device=like.device, dtype=torch.bool)
-                row_types = row_types.clamp(min=0, max=max(table.shape[0] - 1, 0))
-                type_mask = table.index_select(0, row_types)
-                mask = mask & self._align_bool_mask(type_mask, like)
+            table = mask_table.to(device=like.device, dtype=torch.bool)
+            if table.ndim == 0:
+                table = table.reshape(1, 1)
+            elif table.ndim == 1:
+                table = table.reshape(-1, 1)
+            elif table.ndim > 2:
+                table = table.reshape(table.shape[0], -1)
+
+            type_mask = torch.zeros(
+                like.shape[0],
+                table.shape[1],
+                device=like.device,
+                dtype=torch.bool,
+            )
+            if table.shape[0] > 0:
+                row_types = types.to(device=like.device, dtype=torch.long).reshape(-1)
+                take = min(int(row_types.numel()), int(like.shape[0]))
+                if take > 0:
+                    raw_types = row_types[:take]
+                    valid = (raw_types >= 0) & (raw_types < table.shape[0])
+                    valid_rows = torch.arange(take, device=like.device, dtype=torch.long)[valid]
+                    if valid_rows.numel() > 0:
+                        type_mask[valid_rows] = table.index_select(0, raw_types[valid])
+            mask = mask & self._align_bool_mask(type_mask, like)
 
         expert_mask = data.get(expert_key, None)
         if expert_mask is not None:
@@ -541,6 +573,12 @@ class HamiltonianCFM:
         label: Optional[str] = None,
         reference_scale: bool = True,
     ) -> torch.Tensor:
+        """Sample TE-like noise directly in DeePTB feature space.
+
+        This operates on node_h0/edge_h0 feature rows after idp and expert masks
+        are aligned. It is not a dense TE/CG tensor expansion and should remain
+        documented as a structured feature-space approximation.
+        """
         if like.numel() == 0:
             return torch.zeros_like(like)
 
