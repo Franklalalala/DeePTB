@@ -118,3 +118,34 @@ def test_clean_compatible_tensorboard_writes_train_and_validation_canonical_tags
     assert recorded["validation_loss_iter"] == pytest.approx((4.0, trainer.iter))
     assert recorded["validation_onsite_loss"] == pytest.approx((5.0, trainer.iter))
     assert recorded["validation_hopping_loss"] == pytest.approx((6.0, trainer.iter))
+
+
+def test_clean_compatible_tensorboard_writes_iteration_validation_canonical_tags():
+    trainer = SimpleNamespace(
+        iter=30,
+        ep=5,
+        num_experts=0,
+        stats={
+            "lr": {"last": 0.01},
+            "train_loss": {"last": 1.0},
+            "train_onsite_loss": {"last": 2.0},
+            "train_hopping_loss": {"last": 3.0},
+            "validation_loss": {"last": 4.0, "last_updated": 30},
+            "validation_onsite_loss": {"last": 5.0, "last_updated": 30},
+            "validation_hopping_loss": {"last": 6.0, "last_updated": 30},
+        },
+    )
+    recorded = {}
+    tensorboard = object.__new__(CleanCompatibleTensorBoardMonitor)
+    tensorboard.trainer = trainer
+    tensorboard.flush_every = 0
+    tensorboard.writer = SimpleNamespace(
+        add_scalar=lambda tag, value, step: recorded.setdefault(tag, (value, step)),
+        flush=lambda: None,
+    )
+
+    tensorboard.iteration(time=trainer.iter)
+
+    assert recorded["validation_loss_iter"] == pytest.approx((4.0, trainer.iter))
+    assert recorded["validation_onsite_loss"] == pytest.approx((5.0, trainer.iter))
+    assert recorded["validation_hopping_loss"] == pytest.approx((6.0, trainer.iter))

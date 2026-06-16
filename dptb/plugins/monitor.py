@@ -1890,6 +1890,14 @@ class CleanCompatibleTensorBoardMonitor(Plugin):
             if lr_val is not None:
                 self.writer.add_scalar(f"Expert_LR_Iter/Expert_{i}", lr_val, iteration)
 
+        for stat_name, tag in self._VALIDATION_TAGS:
+            stat = self.trainer.stats.get(stat_name, {})
+            if stat.get("last_updated") != iteration:
+                continue
+            value = self._to_float(stat.get("last"))
+            if value is not None:
+                self.writer.add_scalar(tag, value, iteration)
+
         if self.flush_every and iteration % self.flush_every == 0:
             self.writer.flush()
 

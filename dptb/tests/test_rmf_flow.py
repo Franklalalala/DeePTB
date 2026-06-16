@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import torch
 import pytest
 
@@ -58,6 +61,42 @@ def _empty_multitrainer_for_pack():
     trainer.log_single_model_compatible_loss = True
     trainer.log_single_model_compatible_loss_mode = "reduce"
     trainer.train_lossfunc = object()
+    return trainer
+
+
+def _multitrainer_validation_fixture(*, results):
+    trainer = _empty_multitrainer_for_pack()
+    trainer.validation_lossfunc = object()
+    trainer.distributed_expert = False
+    trainer.iter = 1
+    trainer.distance_ranges = [None]
+    trainer.validation_loader = [object() for _ in results]
+    trainer.model = SimpleNamespace(eval=lambda: None)
+    trainer._tagger = SimpleNamespace(tag=lambda *args, **kwargs: nullcontext())
+    trainer._prepare_batch_bundle = lambda batch, with_lengths=True: ({}, {})
+
+    result_iter = iter(results)
+
+    def fake_run_one_expert_loss(**kwargs):
+        result = next(result_iter)
+        return {
+            "loss": torch.tensor(result.get("loss", 0.0)),
+            "onsite": torch.tensor(result["onsite"]),
+            "hopping": torch.tensor(result["hopping"]),
+            "active_nodes": torch.tensor(result["active_nodes"]),
+            "active_edges": torch.tensor(result["active_edges"]),
+            "last_onsite_l1_sum": None,
+            "last_onsite_mse_sum": None,
+            "last_onsite_count": None,
+            "last_hopping_l1_sum": None,
+            "last_hopping_mse_sum": None,
+            "last_hopping_count": None,
+            "z_loss": None,
+            "expert_load_cv": None,
+        }
+
+    trainer._run_one_expert_loss = fake_run_one_expert_loss
+    trainer._compute_stitched_loss_by_reduce = lambda payloads, criterion=None: torch.tensor(7.0)
     return trainer
 
 
@@ -206,6 +245,41 @@ def test_multitrainer_validation_component_state_uses_flow_weighted_fallback_wit
     assert state["validation_loss"].item() == pytest.approx(7.0)
     assert state["validation_onsite_loss"].item() == pytest.approx(5.0)
     assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
+
+
+def test_multitrainer_validation_keeps_active_fallback_fields_for_old_cfm_without_counts():
+    trainer = _multitrainer_validation_fixture(
+        results=[
+            {
+                "onsite": 5.0,
+                "hopping": 3.0,
+                "active_nodes": 4.0,
+                "active_edges": 6.0,
+            }
+        ]
+    )
+
+    trainer.validation(fast=True)
+
+    state = trainer._last_flow_validation_state
+    assert state["validation_loss"].item() == pytest.approx(7.0)
+    assert state["validation_onsite_loss"].item() == pytest.approx(5.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
+
+
+def test_multitrainer_full_validation_components_are_globally_weighted():
+    trainer = _multitrainer_validation_fixture(
+        results=[
+            {"onsite": 10.0, "hopping": 2.0, "active_nodes": 1.0, "active_edges": 1.0},
+            {"onsite": 0.0, "hopping": 4.0, "active_nodes": 9.0, "active_edges": 3.0},
+        ]
+    )
+
+    trainer.validation(fast=False)
+
+    state = trainer._last_flow_validation_state
+    assert state["validation_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(3.5)
 
 
 def test_multitrainer_compatible_pack_skips_zero_count_components():

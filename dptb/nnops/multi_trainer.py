@@ -2406,10 +2406,14 @@ class MultiTrainer(Trainer):
         *,
         loss: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        pack = self._validation_pack_from_payloads(payloads)
+        return self._validation_component_state_from_pack(pack, loss=loss)
+
+    def _validation_pack_from_payloads(self, payloads: List[Dict[str, Any]]) -> torch.Tensor:
         pack = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=self.device)
         for payload in payloads:
             pack = pack + self._make_step_pack(payload)
-        return self._validation_component_state_from_pack(pack, loss=loss)
+        return pack
 
     def _compute_local_compatible_loss_from_payload(self, payload: Dict[str, Any], criterion=None) -> torch.Tensor:
         out = self._compute_stitched_loss_by_reduce([payload], criterion=criterion)
@@ -3339,10 +3343,13 @@ class MultiTrainer(Trainer):
             total_loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
             validation_metric_sums: Dict[str, torch.Tensor] = {}
             validation_metric_batches = 0
+            validation_pack = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=self.device)
+            validation_pack_batches = 0
             self.model.eval()
 
             for batch in self.validation_loader:
                 validation_state = None
+                batch_validation_pack = None
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
@@ -3376,6 +3383,7 @@ class MultiTrainer(Trainer):
                         reduced_pack,
                         loss=loss_i,
                     )
+                    batch_validation_pack = reduced_pack
 
                 else:
                     if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
@@ -3390,7 +3398,20 @@ class MultiTrainer(Trainer):
                                 capture_metrics=True,
                                 flow_prefix="validation",
                             )
+                            if torch.is_tensor(res["loss"]):
+                                loss_detached = res["loss"].detach()
+                            else:
+                                loss_detached = torch.as_tensor(
+                                    float(res["loss"]),
+                                    dtype=self.dtype,
+                                    device=self.device,
+                                )
                             payloads.append({
+                                "loss_detached": loss_detached,
+                                "onsite_weighted_sum": res["onsite"] * res["active_nodes"].to(dtype=self.dtype),
+                                "hopping_weighted_sum": res["hopping"] * res["active_edges"].to(dtype=self.dtype),
+                                "active_nodes": res["active_nodes"],
+                                "active_edges": res["active_edges"],
                                 "onsite_l1_sum": res.get("last_onsite_l1_sum", None),
                                 "onsite_mse_sum": res.get("last_onsite_mse_sum", None),
                                 "onsite_cnt": res.get("last_onsite_count", None),
@@ -3398,6 +3419,7 @@ class MultiTrainer(Trainer):
                                 "hopping_mse_sum": res.get("last_hopping_mse_sum", None),
                                 "hopping_cnt": res.get("last_hopping_count", None),
                                 "z_values": [res["z_loss"]] if res.get("z_loss", None) is not None else [],
+                                "load_cv_values": [res["expert_load_cv"]] if res.get("expert_load_cv", None) is not None else [],
                             })
 
                         with self._tagger.tag("validation/compute_reduce_loss", it=self.iter):
@@ -3416,8 +3438,9 @@ class MultiTrainer(Trainer):
                                 )
                             )
                         else:
-                            validation_state = self._validation_component_state_from_payloads(
-                                payloads,
+                            batch_validation_pack = self._validation_pack_from_payloads(payloads)
+                            validation_state = self._validation_component_state_from_pack(
+                                batch_validation_pack,
                                 loss=loss_i,
                             )
                     else:
@@ -3434,6 +3457,9 @@ class MultiTrainer(Trainer):
                         )
 
                 total_loss = total_loss + loss_i.detach()
+                if batch_validation_pack is not None:
+                    validation_pack = validation_pack + batch_validation_pack
+                    validation_pack_batches += 1
                 if validation_state:
                     self._accumulate_metric_state(validation_metric_sums, validation_state)
                     validation_metric_batches += 1
@@ -3444,10 +3470,24 @@ class MultiTrainer(Trainer):
         if not fast:
             total_loss = total_loss / len(self.validation_loader)
 
-        divisor = max(validation_metric_batches, 1)
-        self._last_flow_validation_state = {
-            key: value / divisor for key, value in validation_metric_sums.items()
-        }
+        validation_state = {}
+        if validation_pack_batches > 0:
+            validation_state.update(
+                self._validation_component_state_from_pack(
+                    validation_pack,
+                    loss=total_loss,
+                )
+            )
+        if validation_metric_batches > 0:
+            divisor = max(validation_metric_batches, 1)
+            validation_state.update(
+                {
+                    key: value / divisor
+                    for key, value in validation_metric_sums.items()
+                    if key not in validation_state
+                }
+            )
+        self._last_flow_validation_state = validation_state
         return total_loss
 
     # ---------------------------------------------------------------------
