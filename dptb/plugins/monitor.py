@@ -1510,6 +1510,9 @@ class Validationer(Monitor):
         if kwargs.get('field') == "iteration":
             value = self.trainer.validation(fast=True)
             self._record_flow_validation_state(epoch=False, time=kwargs.get("time"))
+            flow_validation_state = getattr(self.trainer, "_last_flow_validation_state", {})
+            if self.stat_name in flow_validation_state:
+                value = flow_validation_state[self.stat_name]
             return value
 
     def _record_flow_validation_state(self, epoch=False, time=None):
@@ -1801,6 +1804,11 @@ class TensorBoardMonitor(Plugin):
             ))
         )
         for name in sorted(flow_names):
+            from_kwargs = name in kwargs
+            if name.startswith("validation_") and not from_kwargs:
+                stat = self.trainer.stats.get(name, {})
+                if stat.get("last_updated") != iteration:
+                    continue
             value = self._get_value(name, 'last', kwargs, default=None)
             if value is not None:
                 self.writer.add_scalar(f'{name}_iter', value, iteration)

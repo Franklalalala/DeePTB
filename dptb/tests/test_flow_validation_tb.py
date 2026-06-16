@@ -52,6 +52,18 @@ def test_flow_validation_legacy_total_uses_compatible_loss_in_stats_and_tensorbo
     )
 
 
+def test_flow_validation_iteration_returns_compatible_loss_value():
+    trainer = _FlowValidationTrainer()
+    validationer = Validationer(interval=[(1, "iteration")], fast_mode=True)
+    validationer.register(trainer)
+
+    value = validationer._get_value(field="iteration", time=trainer.iter)
+
+    assert float(value.detach().item()) == pytest.approx(2.0)
+    assert trainer.stats["validation_loss"]["last"] == pytest.approx(2.0)
+    assert trainer.stats["validation_loss"]["last_updated"] == trainer.iter
+
+
 def test_tensorboard_iteration_uses_canonical_tag_names_without_suffix_groups():
     trainer = SimpleNamespace(
         iter=11,
@@ -88,6 +100,37 @@ def test_tensorboard_iteration_uses_canonical_tag_names_without_suffix_groups():
     assert recorded["validation_hopping_loss"] == pytest.approx((7.0, trainer.iter))
     assert recorded["Expert_LR_Iter/Expert_0"] == pytest.approx((0.125, trainer.iter))
     assert "train_loss_iter/iteration" not in recorded
+
+
+def test_tensorboard_iteration_skips_stale_validation_flow_stats_from_trainer_stats():
+    trainer = SimpleNamespace(
+        iter=12,
+        ep=3,
+        num_experts=0,
+        stats={
+            "train_flow_loss": {"last": 4.0},
+            "validation_flow_random_t_loss": {"last": 9.0, "last_updated": 11},
+            "validation_compatible_euler_1_loss": {"last": 8.0, "last_updated": 11},
+        },
+    )
+    recorded = {}
+    tensorboard = object.__new__(TensorBoardMonitor)
+    tensorboard.trainer = trainer
+    tensorboard.flush_every = 0
+    tensorboard.writer = SimpleNamespace(
+        add_scalar=lambda tag, value, step: recorded.__setitem__(tag, (value, step)),
+        flush=lambda: None,
+    )
+
+    tensorboard.iteration(
+        time=trainer.iter,
+        validation_flow_t0_loss=torch.tensor(6.0),
+    )
+
+    assert recorded["train_flow_loss_iter"] == pytest.approx((4.0, trainer.iter))
+    assert recorded["validation_flow_t0_loss_iter"] == pytest.approx((6.0, trainer.iter))
+    assert "validation_flow_random_t_loss_iter" not in recorded
+    assert "validation_compatible_euler_1_loss_iter" not in recorded
 
 
 def test_clean_compatible_tensorboard_writes_train_and_validation_canonical_tags():

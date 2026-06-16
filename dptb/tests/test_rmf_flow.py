@@ -233,6 +233,19 @@ def test_multitrainer_flow_metrics_keep_endpoint_counts_for_validation_pack():
     assert trainer._compute_compatible_loss_from_pack(pack, object()) is not None
 
 
+def test_multitrainer_validation_snapshot_reads_base_cfm_train_flow_components():
+    trainer = _empty_multitrainer_for_pack()
+    flow_state = {
+        "train_flow_onsite_loss": torch.tensor(2.5),
+        "train_flow_hopping_loss": torch.tensor(4.5),
+    }
+
+    metrics = trainer._snapshot_flow_metrics(flow_state, "validation")
+
+    assert metrics["onsite"].item() == pytest.approx(2.5)
+    assert metrics["hopping"].item() == pytest.approx(4.5)
+
+
 def test_multitrainer_validation_component_state_uses_flow_weighted_fallback_without_counts():
     trainer = _empty_multitrainer_for_pack()
     pack = torch.zeros((trainer._PACK_LEN,), dtype=trainer.dtype)
@@ -251,6 +264,19 @@ def test_multitrainer_validation_component_state_uses_flow_weighted_fallback_wit
     assert state["validation_loss"].item() == pytest.approx(7.0)
     assert state["validation_onsite_loss"].item() == pytest.approx(5.0)
     assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
+
+
+def test_multitrainer_compatible_pack_uses_active_fallback_without_endpoint_counts():
+    trainer = _empty_multitrainer_for_pack()
+    pack = torch.zeros((trainer._PACK_LEN,), dtype=trainer.dtype)
+    pack[trainer._P_ONSITE_WEIGHTED_SUM] = 20.0
+    pack[trainer._P_ACTIVE_NODES_SUM] = 4.0
+    pack[trainer._P_HOPPING_WEIGHTED_SUM] = 18.0
+    pack[trainer._P_ACTIVE_EDGES_SUM] = 6.0
+
+    loss = trainer._compute_compatible_loss_from_pack(pack, object())
+
+    assert loss.item() == pytest.approx(4.0)
 
 
 def test_multitrainer_validation_keeps_active_fallback_fields_for_old_cfm_without_counts():
@@ -356,6 +382,45 @@ class _OracleEndpointModel(torch.nn.Module):
         out[_keys.NODE_FEATURES_KEY] = self.node_target.to(data[_keys.NODE_H0_KEY])
         out[_keys.EDGE_FEATURES_KEY] = self.edge_target.to(data[_keys.EDGE_H0_KEY])
         return out
+
+
+def test_multitrainer_validation_flow_capture_uses_real_base_cfm_components():
+    data, _ref = _toy_batch()
+    trainer = MultiTrainer.__new__(MultiTrainer)
+    trainer.iter = 1
+    trainer.device = torch.device("cpu")
+    trainer.dtype = torch.float32
+    trainer._tagger = SimpleNamespace(tag=lambda *args, **kwargs: nullcontext())
+    trainer.model = _EndpointModel()
+    trainer._prepare_expert_masks = lambda batch, distance_range, expert_idx: (
+        torch.ones(data[_keys.EDGE_H0_KEY].shape[0], dtype=torch.bool),
+        torch.ones(data[_keys.NODE_H0_KEY].shape[0], dtype=torch.bool),
+    )
+    trainer.flow_cfm = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+            "omit_time_scaling": True,
+        }
+    )
+    trainer.flow_cfm._sample_t = lambda *, num_graphs, device, dtype: torch.zeros(
+        num_graphs, device=device, dtype=dtype
+    )
+
+    result = trainer._run_one_expert_loss(
+        batch_dict=data,
+        batch_info={},
+        criterion=object(),
+        expert_idx=0,
+        range_dis=None,
+        capture_metrics=True,
+        flow_prefix="validation",
+    )
+
+    assert result["onsite"].item() == pytest.approx(0.04)
+    assert result["hopping"].item() == pytest.approx(0.04)
 
 
 def test_rmf_forward_loss_backward_and_legacy_train_tags():
