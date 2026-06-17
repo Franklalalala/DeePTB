@@ -225,6 +225,22 @@ def _make_wigner_rotation(l_max, alpha, beta, gamma, wigner_apply_mode: str):
     return batch_wigner_D(l_max, alpha, beta, gamma, _Jd)
 
 
+def _wigner_covers_lmax(wigner_D_all, l_max: int, wigner_apply_mode: str) -> bool:
+    if wigner_D_all is None:
+        return False
+    if isinstance(wigner_D_all, SO2WignerBlocks):
+        return wigner_apply_mode == "compact_blocks" and len(wigner_D_all.blocks) > l_max
+    if not torch.is_tensor(wigner_D_all):
+        return False
+    needed_dim = (l_max + 1) ** 2
+    return (
+        wigner_apply_mode == "full_dense"
+        and wigner_D_all.dim() >= 3
+        and wigner_D_all.shape[-2] >= needed_dim
+        and wigner_D_all.shape[-1] >= needed_dim
+    )
+
+
 def _select_wigner_block(wigner_D_all, l: int, offsets, dims):
     if wigner_D_all is None:
         raise ValueError(
@@ -1337,25 +1353,14 @@ class SO2_Linear(torch.nn.Module):
                 route="streamed_m_major_cueq",
             )
 
+        wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
+
         n, _ = x.shape
         if self.radial_emb:
             if latents is None:
                 raise ValueError("SO2_Linear requires latents when radial_emb=True.")
             weights = self.radial_emb(latents)
         x_ = torch.zeros_like(x)
-
-        # === 1. 旋转矩阵准备 (Rotate Control) ===
-        if wigner_D_all is None:
-            # 只有当需要 rotate_in 或者 rotate_out 时才必须计算 D
-            if (self.rotate_in or self.rotate_out) and self.l_max > 0:
-                angle = xyz_to_angles(R[:, [1, 2, 0]])
-                wigner_D_all = _make_wigner_rotation(
-                    self.l_max,
-                    angle[0],
-                    angle[1],
-                    torch.zeros_like(angle[0]),
-                    self.wigner_apply_mode,
-                )
 
         # === 2. Rotate In (Global -> Local) ===
         groups = defaultdict(list)
@@ -1439,7 +1444,7 @@ class SO2_Linear(torch.nn.Module):
         return out.contiguous(), wigner_D_all
 
     def _ensure_wigner_rotation(self, R, wigner_D_all):
-        if wigner_D_all is not None:
+        if _wigner_covers_lmax(wigner_D_all, self.l_max, self.wigner_apply_mode):
             return wigner_D_all
         if (self.rotate_in or self.rotate_out) and self.l_max > 0:
             angle = xyz_to_angles(R[:, [1, 2, 0]])
@@ -1450,7 +1455,7 @@ class SO2_Linear(torch.nn.Module):
                 torch.zeros_like(angle[0]),
                 self.wigner_apply_mode,
             )
-        return None
+        return wigner_D_all
 
     def _direct_rotate_pack_m(self, x, m: int, wigner_D_all):
         n, _ = x.shape

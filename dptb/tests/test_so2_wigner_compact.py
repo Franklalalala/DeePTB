@@ -39,7 +39,7 @@ def test_compact_wigner_config_is_threaded_to_lem():
     argcheck_source = ARGCHECK_SOURCE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     assert 'so2_wigner_apply_mode: str = "compact_blocks"' in lem_source
-    assert 'so2_fusion_mode: str = "staged"' in lem_source
+    assert 'so2_fusion_mode: str = "streamed_m_major_cueq"' in lem_source
     assert "wigner_apply_mode=so2_wigner_apply_mode" in lem_source
     assert "so2_fusion_mode=so2_fusion_mode" in lem_source
     assert 'Argument("so2_wigner_apply_mode", str' in argcheck_source
@@ -79,6 +79,51 @@ def test_so2_linear_default_mode_is_compact_blocks():
     layer = SO2_Linear("1x0e + 1x1e", "1x0e + 1x1e")
 
     assert layer.wigner_apply_mode == "compact_blocks"
+
+
+def test_so2_linear_recomputes_compact_wigner_when_reused_lmax_is_too_small():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(23)
+    small = SO2_Linear(
+        "1x0e + 1x1e",
+        "1x0e + 1x1e",
+        num_experts=3,
+        num_shared_experts=1,
+        wigner_apply_mode="compact_blocks",
+    ).to(dtype=torch.float64)
+    large = SO2_Linear(
+        "1x0e + 1x2e",
+        "1x0e + 1x2e",
+        num_experts=3,
+        num_shared_experts=1,
+        wigner_apply_mode="compact_blocks",
+    ).to(dtype=torch.float64)
+    R = torch.randn(4, 3, dtype=torch.float64)
+    coeffs = torch.tensor(
+        [[0.2, 0.3, 0.5], [0.4, 0.4, 0.2]],
+        dtype=torch.float64,
+    )
+    mole_globals = MOLEGlobals(coefficients=coeffs, split_sizes=(2, 2))
+
+    _, small_wigner = small(
+        torch.randn(4, small.irreps_in.dim, dtype=torch.float64),
+        R,
+        mole_globals,
+    )
+    out, large_wigner = large(
+        torch.randn(4, large.irreps_in.dim, dtype=torch.float64),
+        R,
+        mole_globals,
+        wigner_D_all=small_wigner,
+    )
+
+    assert hasattr(large_wigner, "block")
+    assert len(small_wigner.blocks) == 2
+    assert len(large_wigner.blocks) == 3
+    assert out.shape == (4, large.irreps_out.dim)
 
 
 def test_so2_linear_compact_mode_matches_full_dense_forward_and_grad():
