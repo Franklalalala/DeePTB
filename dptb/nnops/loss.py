@@ -4,7 +4,7 @@ from torch.nn.functional import mse_loss
 from dptb.utils.register import Register
 from dptb.nn.energy import Eigenvalues
 from dptb.nn.hamiltonian import E3Hamiltonian
-from dptb.nnops.layout import project_uureal_to_like
+from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 from typing import Any, Union, Dict
 from dptb.data import AtomicDataDict, AtomicData
 from dptb.data.transforms import OrbitalMapper
@@ -711,7 +711,17 @@ class HamilLossAbs(nn.Module):
             raw_pre_node = data[AtomicDataDict.NODE_FEATURES_KEY]
             raw_tgt_node = ref_data[AtomicDataDict.NODE_FEATURES_KEY]
             raw_pre_node, _raw_mask = project_uureal_to_like(self.idp, raw_pre_node, raw_tgt_node)
-            final_node_mask, _mask_raw = project_uureal_to_like(self.idp, final_node_mask, raw_tgt_node)
+            if raw_pre_node.shape != raw_tgt_node.shape:
+                raise ValueError(
+                    "node prediction layout does not match target layout; "
+                    "check nextham_uureal_mask/mask_uureal propagation."
+                )
+            final_node_mask = normalize_idp_mask_layout(
+                self.idp,
+                final_node_mask,
+                raw_tgt_node,
+                label="node idp mask",
+            )
 
             diff_node = (raw_pre_node - raw_tgt_node) * final_node_mask
             abs_node = diff_node.abs()
@@ -747,7 +757,17 @@ class HamilLossAbs(nn.Module):
             raw_pre_edge = data[AtomicDataDict.EDGE_FEATURES_KEY]
             raw_tgt_edge = ref_data[AtomicDataDict.EDGE_FEATURES_KEY]
             raw_pre_edge, _raw_mask = project_uureal_to_like(self.idp, raw_pre_edge, raw_tgt_edge)
-            final_edge_mask, _mask_raw = project_uureal_to_like(self.idp, final_edge_mask, raw_tgt_edge)
+            if raw_pre_edge.shape != raw_tgt_edge.shape:
+                raise ValueError(
+                    "edge prediction layout does not match target layout; "
+                    "check nextham_uureal_mask/mask_uureal propagation."
+                )
+            final_edge_mask = normalize_idp_mask_layout(
+                self.idp,
+                final_edge_mask,
+                raw_tgt_edge,
+                label="edge idp mask",
+            )
 
             diff_edge = (raw_pre_edge - raw_tgt_edge) * final_edge_mask
             abs_edge = diff_edge.abs()
