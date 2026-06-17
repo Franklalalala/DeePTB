@@ -127,7 +127,8 @@ class HamiltonianCFM:
         self.edge_sigma = float(options.get("edge_sigma", 1.0))
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
         self.te_prior_sigma = float(options.get("te_prior_sigma", 1.0))
-        self.te_prior_mode = str(options.get("te_prior_mode", "irrep")).lower().replace("-", "_")
+        default_te_prior_mode = "block" if self.prior == "block_te" else "irrep"
+        self.te_prior_mode = str(options.get("te_prior_mode", default_te_prior_mode)).lower().replace("-", "_")
         if self.te_prior_mode == "type":
             self.te_prior_mode = "typewise"
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
@@ -308,14 +309,20 @@ class HamiltonianCFM:
         return base
 
     @staticmethod
-    def _align_bool_mask(mask: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    def _align_bool_mask(mask: torch.Tensor, like: torch.Tensor, *, pad_value: bool = False) -> torch.Tensor:
         mask = mask.to(device=like.device, dtype=torch.bool)
-        if mask.ndim == 1:
+        if mask.ndim == 0:
+            mask = mask.reshape(1, 1)
+        elif mask.ndim == 1:
             mask = mask.reshape(-1, 1)
+        elif mask.ndim > 2:
+            mask = mask.reshape(mask.shape[0], -1)
+
+        fill = bool(pad_value)
         if mask.shape[0] < like.shape[0]:
-            pad = torch.ones(
-                like.shape[0] - mask.shape[0],
-                mask.shape[1],
+            pad = torch.full(
+                (like.shape[0] - mask.shape[0], mask.shape[1]),
+                fill_value=fill,
                 device=like.device,
                 dtype=torch.bool,
             )
@@ -324,17 +331,21 @@ class HamiltonianCFM:
             mask = mask[: like.shape[0]]
 
         if mask.shape[-1] == 1:
+            while mask.ndim < like.ndim:
+                mask = mask.unsqueeze(-1)
             return mask.expand_as(like)
         if mask.shape[-1] < like.shape[-1]:
-            pad = torch.ones(
-                mask.shape[0],
-                like.shape[-1] - mask.shape[-1],
+            pad = torch.full(
+                (mask.shape[0], like.shape[-1] - mask.shape[-1]),
+                fill_value=fill,
                 device=like.device,
                 dtype=torch.bool,
             )
             mask = torch.cat([mask, pad], dim=-1)
         elif mask.shape[-1] > like.shape[-1]:
             mask = mask[:, : like.shape[-1]]
+        while mask.ndim < like.ndim:
+            mask = mask.unsqueeze(-1)
         return mask.expand_as(like)
 
     def _project_raw_feature_table(self, table: torch.Tensor, feature_dim: int) -> torch.Tensor:
