@@ -7,6 +7,7 @@ from torch import nn
 from types import SimpleNamespace
 
 from dptb.nnops import trainer as trainer_mod
+from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
 
 
@@ -181,6 +182,28 @@ def test_build_dataset_forwards_nextham_uureal_mask_to_orbital_mapper(tmp_path, 
     assert captured["orbital_mapper_kwargs"]["has_soc"] is True
     assert captured["orbital_mapper_kwargs"]["nextham_uureal_mask"] is True
     assert captured["dataset_kwargs"]["type_mapper"] is not None
+
+
+def test_cutoff_precompute_validator_ignores_muon_force_route_key():
+    trainer = MultiTrainer.__new__(MultiTrainer)
+    trainer.train_options = {
+        "precompute_lem_cutoff_coeffs": True,
+        "muon_force_name_patterns": [],
+        "loss_options": {"train": {"method": "hamil_abs"}},
+    }
+
+    trainer._validate_lem_cutoff_precompute_options()
+
+
+def test_cutoff_precompute_validator_rejects_geometry_loss_option():
+    trainer = MultiTrainer.__new__(MultiTrainer)
+    trainer.train_options = {
+        "precompute_lem_cutoff_coeffs": True,
+        "loss_options": {"train": {"method": "hamil_abs", "force_weight": 1.0}},
+    }
+
+    with pytest.raises(ValueError, match="force/stress/virial"):
+        trainer._validate_lem_cutoff_precompute_options()
 
 
 def _fake_trainer(monkeypatch):

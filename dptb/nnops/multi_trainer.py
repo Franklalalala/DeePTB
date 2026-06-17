@@ -1454,10 +1454,43 @@ class MultiTrainer(Trainer):
 
         return expert_edge_mask, expert_node_mask
 
-    def _validate_lem_cutoff_precompute_options(self):
-        loss_options_text = repr(self.train_options).lower()
+    @staticmethod
+    def _truthy_config_value(value):
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "none", "no", "off"}
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) > 0
+        return bool(value)
+
+    @classmethod
+    def _contains_geometry_gradient_option(cls, value, *, path=()):
         geometry_terms = ("force", "forces", "stress", "virial")
-        if any(term in loss_options_text for term in geometry_terms):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key).lower()
+                if key_text == "muon_force_name_patterns":
+                    continue
+                child_path = path + (key_text,)
+                if any(term in key_text for term in geometry_terms) and cls._truthy_config_value(child):
+                    return True
+                if cls._contains_geometry_gradient_option(child, path=child_path):
+                    return True
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(cls._contains_geometry_gradient_option(item, path=path) for item in value)
+        if "loss_options" in path and isinstance(value, str):
+            text = value.lower()
+            return any(term in text for term in geometry_terms) and cls._truthy_config_value(value)
+        return False
+
+    def _validate_lem_cutoff_precompute_options(self):
+        if self._contains_geometry_gradient_option(self.train_options):
             raise ValueError(
                 "precompute_lem_cutoff_coeffs=True is incompatible with force/stress/virial "
                 "or other geometry-gradient losses."
