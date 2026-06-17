@@ -273,7 +273,7 @@ def train_options():
         "This allows per-expert `patience`, `factor`, `min_lr`, or even scheduler `type`."
     )
     doc_optimizer = "\
-        The optimizer setting for selecting the gradient optimizer of model training. Optimizer supported includes `Adam`, `AdamW`, `SGD` and `LBFGS` \n\n\
+        The optimizer setting for selecting the gradient optimizer of model training. Optimizer supported includes `Adam`, `AdamW`, `HybridMuon`, `SGD` and `LBFGS` \n\n\
         For more information about these optmization algorithm, we refer to:\n\n\
         - `Adam`: [Adam: A Method for Stochastic Optimization.](https://arxiv.org/abs/1412.6980)\n\n\
         - `AdamW`: [AdamW: Decoupled Weight Decay Regularization.](https://arxiv.org/abs/1711.05101)\n\n\
@@ -687,6 +687,67 @@ def Adam():
         Argument("amsgrad", bool, optional=True, default=False, doc=doc_amsgrad)
     ]
 
+def HybridMuon():
+    doc_lr = "learning rate. Default: 1e-3"
+    doc_weight_decay = "decoupled weight decay for Muon and AdamW fallback parameters. Default: 1e-3"
+    doc_muon_beta = "momentum coefficient for Muon-routed matrix parameters. Default: 0.95"
+    doc_muon_scale = "DPA4 update-RMS matching scale gamma. Default: 0.18"
+    doc_adam_betas = "Adam-family beta coefficients for vector/scalar parameters. Default: (0.9, 0.999)"
+    doc_adam_eps = "Adam-family epsilon for vector/scalar parameters. Default: 1e-20"
+    doc_matrix_min_dim = "Minimum trailing matrix dimension for Muon routing. Default: 2"
+    doc_magma_lite = "Set true to enable DPA4 Magma-lite momentum-alignment damping for Muon blocks. Default: True"
+    doc_magma_temperature = "Temperature for Magma-lite alignment sigmoid. DPA4 uses 2.0."
+    doc_magma_ema_beta = "EMA coefficient for Magma-lite damping scores. DPA4 uses 0.9."
+    doc_magma_min_scale = "Lower bound for Magma-lite damping scale. DPA4 uses 0.1."
+    doc_muon_1d_route_mode = "Flattened 1D weight routing mode: auto/force/off. Default: auto"
+    doc_muon_1d_include = "Name patterns eligible for automatic flattened 1D Muon routing."
+    doc_muon_1d_exclude = "Name patterns excluded from flattened 1D Muon routing."
+    doc_muon_1d_min_numel = "Minimum flattened 1D weight size for Muon routing. Default: 16"
+    doc_muon_1d_max_aspect = "Maximum factorized matrix aspect ratio. Default: 64"
+    doc_muon_1d_allow_degenerate = "Allow unfactorable 1D weights to use a 1 x N matrix. Default: False"
+    doc_muon_force_patterns = "Optional name patterns that force eligible 1D tensors through Muon."
+    doc_muon_clip = "Enable Muon update clipping. Default: True"
+    doc_muon_clip_mode = "Muon clip mode: auto/fixed/rms/off. Default: auto"
+    doc_muon_clip_rms = "Hard cap for scaled Muon update RMS. Default: 0.6"
+    doc_muon_clip_auto_beta = "EMA beta for automatic relative-step clipping. Default: 0.98"
+    doc_muon_clip_auto_mult = "EMA multiplier for automatic relative-step clipping. Default: 3.0"
+    doc_muon_clip_auto_std_mult = "Standard-deviation multiplier for automatic clipping. Default: 2.0"
+    doc_muon_clip_min_ratio = "Minimum relative-step cap. Default: 0.01"
+    doc_muon_clip_max_ratio = "Maximum relative-step cap. Default: 0.25"
+    doc_muon_clip_param_rms_floor = "Parameter RMS floor for relative-step clipping. Default: 1e-3"
+    doc_muon_clip_warmup_steps = "Per-parameter steps before automatic clipping activates. Default: 5"
+
+    return [
+        Argument("lr", float, optional=True, default=1e-3, doc=doc_lr),
+        Argument("weight_decay", float, optional=True, default=1e-3, doc=doc_weight_decay),
+        Argument("muon_beta", float, optional=True, default=0.95, doc=doc_muon_beta),
+        Argument("muon_scale", float, optional=True, default=0.18, doc=doc_muon_scale),
+        Argument("adam_betas", list, optional=True, default=[0.9, 0.999], doc=doc_adam_betas),
+        Argument("adam_eps", float, optional=True, default=1e-20, doc=doc_adam_eps),
+        Argument("matrix_min_dim", int, optional=True, default=2, doc=doc_matrix_min_dim),
+        Argument("magma_lite", bool, optional=True, default=True, doc=doc_magma_lite),
+        Argument("magma_temperature", float, optional=True, default=2.0, doc=doc_magma_temperature),
+        Argument("magma_ema_beta", float, optional=True, default=0.9, doc=doc_magma_ema_beta),
+        Argument("magma_min_scale", float, optional=True, default=0.1, doc=doc_magma_min_scale),
+        Argument("muon_1d_route_mode", str, optional=True, default="auto", doc=doc_muon_1d_route_mode),
+        Argument("muon_1d_include_name_patterns", list, optional=True, default=["*weight*", "*tensor_product*"], doc=doc_muon_1d_include),
+        Argument("muon_1d_exclude_name_patterns", list, optional=True, default=["*bias*", "*norm*", "*scale*", "*shift*", "*offset*", "*res_update*", "*bessel*", "*cutoff*", "*temperature*", "*freq*", "*router*"], doc=doc_muon_1d_exclude),
+        Argument("muon_1d_min_numel", int, optional=True, default=16, doc=doc_muon_1d_min_numel),
+        Argument("muon_1d_max_aspect_ratio", float, optional=True, default=64.0, doc=doc_muon_1d_max_aspect),
+        Argument("muon_1d_allow_degenerate_matrix", bool, optional=True, default=False, doc=doc_muon_1d_allow_degenerate),
+        Argument("muon_force_name_patterns", list, optional=True, default=[], doc=doc_muon_force_patterns),
+        Argument("muon_clip", bool, optional=True, default=True, doc=doc_muon_clip),
+        Argument("muon_clip_mode", str, optional=True, default="auto", doc=doc_muon_clip_mode),
+        Argument("muon_clip_rms", float, optional=True, default=0.6, doc=doc_muon_clip_rms),
+        Argument("muon_clip_auto_beta", float, optional=True, default=0.98, doc=doc_muon_clip_auto_beta),
+        Argument("muon_clip_auto_mult", float, optional=True, default=3.0, doc=doc_muon_clip_auto_mult),
+        Argument("muon_clip_auto_std_mult", float, optional=True, default=2.0, doc=doc_muon_clip_auto_std_mult),
+        Argument("muon_clip_min_ratio", float, optional=True, default=0.01, doc=doc_muon_clip_min_ratio),
+        Argument("muon_clip_max_ratio", float, optional=True, default=0.25, doc=doc_muon_clip_max_ratio),
+        Argument("muon_clip_param_rms_floor", float, optional=True, default=1e-3, doc=doc_muon_clip_param_rms_floor),
+        Argument("muon_clip_warmup_steps", int, optional=True, default=5, doc=doc_muon_clip_warmup_steps),
+    ]
+
 def SGD():
     doc_lr = "learning rate. Default: 1e-3"
     doc_weight_decay = "weight decay (L2 penalty), Default: 0"
@@ -737,11 +798,12 @@ def LBFGS():
     ]
 
 def optimizer():
-    doc_type = "select type of optimizer, support type includes: `Adam`, `AdamW`, `SGD` and `LBFGS`. Default: `Adam`"
+    doc_type = "select type of optimizer, support type includes: `Adam`, `AdamW`, `HybridMuon`, `SGD` and `LBFGS`. Default: `Adam`"
 
     return Variant("type", [
             Argument("Adam", dict, Adam()),
             Argument("AdamW", dict, Adam()),
+            Argument("HybridMuon", dict, HybridMuon()),
             Argument("SGD", dict, SGD()),
             Argument("RMSprop", dict, RMSprop()),
             Argument("LBFGS", dict, LBFGS()),
@@ -2574,7 +2636,7 @@ def normalize_skf2nnsk(data):
 
     doc_lr_scheduler = "The learning rate scheduler tools settings, the lr scheduler is used to scales down the learning rate during the training process. Proper setting can make the training more stable and efficient. The supported lr schedular includes: `Exponential Decaying (exp)`, `Linear multiplication (linear)`"
     doc_optimizer = "\
-        The optimizer setting for selecting the gradient optimizer of model training. Optimizer supported includes `Adam`, `AdamW`, `SGD` and `LBFGS` \n\n\
+        The optimizer setting for selecting the gradient optimizer of model training. Optimizer supported includes `Adam`, `AdamW`, `HybridMuon`, `SGD` and `LBFGS` \n\n\
         For more information about these optmization algorithm, we refer to:\n\n\
         - `Adam`: [Adam: A Method for Stochastic Optimization.](https://arxiv.org/abs/1412.6980)\n\n\
         - `AdamW`: [AdamW: Decoupled Weight Decay Regularization.](https://arxiv.org/abs/1711.05101)\n\n\

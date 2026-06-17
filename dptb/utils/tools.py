@@ -21,6 +21,7 @@ import yaml
 import torch.optim as optim
 import logging
 import random
+from dptb.utils.dpa4_optim import HybridMuon
 from ase.neighborlist import neighbor_list
 from ase.io.trajectory import Trajectory
 import ase
@@ -138,6 +139,17 @@ def get_optimizer(type: str, model_param, lr: float, **options: dict):
         optimizer = optim.Adam(params=model_param, lr=lr, **options)
     elif type == 'AdamW':
         optimizer = optim.AdamW(params=model_param, lr=lr, **options)
+    elif type == 'HybridMuon':
+        optimizer = HybridMuon(params=model_param, lr=lr, **options)
+        summary = optimizer.route_summary()
+        log.info(
+            "HybridMuon routes: params_muon=%s/%s, flat_1d_muon=%s, fallback_adamw=%s, groups=%s",
+            summary.get("params_muon"),
+            summary.get("params_total"),
+            summary.get("params_1d_muon"),
+            summary.get("params_adam"),
+            len(optimizer.param_groups),
+        )
     elif type == 'SGD':
         optimizer = optim.SGD(params=model_param, lr=lr, **options)
     elif type == 'RMSprop':
@@ -145,7 +157,7 @@ def get_optimizer(type: str, model_param, lr: float, **options: dict):
     elif type == 'LBFGS':
         optimizer = optim.LBFGS(params=model_param, lr=lr, **options)
     else:
-        raise RuntimeError("Optimizer should be Adam/AdamW/SGD/RMSprop, not {}".format(type))
+        raise RuntimeError("Optimizer should be Adam/AdamW/HybridMuon/SGD/RMSprop, not {}".format(type))
     return optimizer
 
 def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
