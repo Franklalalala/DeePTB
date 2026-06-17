@@ -116,10 +116,17 @@ class NNENV(nn.Module):
         self.scale_type = scale_type
 
         self.has_soc = has_soc
+        self.nextham_uureal_mask = bool(kwargs.get("nextham_uureal_mask", False))
         print(f'NNENV soc flag: {self.has_soc}')
 
         if basis is not None:
-            self.idp = OrbitalMapper(basis, method=self.method, device=self.device, has_soc=has_soc)
+            self.idp = OrbitalMapper(
+                basis,
+                method=self.method,
+                device=self.device,
+                has_soc=has_soc,
+                nextham_uureal_mask=self.nextham_uureal_mask,
+            )
             if idp is not None:
                 assert idp == self.idp, "The basis of idp and basis should be the same."
         else:

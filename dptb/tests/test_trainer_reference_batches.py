@@ -2,6 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 from torch import nn
+from types import SimpleNamespace
 
 from dptb.nnops import trainer as trainer_mod
 from dptb.nnops.trainer import Trainer
@@ -83,6 +84,101 @@ class CountingSGD(torch.optim.SGD):
 
 def _batch_to_dict(batch):
     return {"name": batch.name, "x": batch.x}
+
+
+def test_trainer_builds_flow_with_loss_idp_when_loss_uses_compressed_layout(monkeypatch):
+    model_idp = object()
+    loss_idp = object()
+    captured = {}
+
+    class MinimalModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self.hamiltonian = SimpleNamespace(idp=model_idp)
+
+    class MinimalDataset:
+        get_Hamiltonian = True
+        get_DM = False
+
+    def fake_loss(**kwargs):
+        assert kwargs["idp"] is model_idp
+        return SimpleNamespace(idp=loss_idp)
+
+    def fake_flow(options, *, idp, dtype, device):
+        captured["idp"] = idp
+        captured["dtype"] = dtype
+        captured["device"] = device
+        return SimpleNamespace(enabled=False)
+
+    monkeypatch.setattr(trainer_mod, "DataLoader", lambda **kwargs: [])
+    monkeypatch.setattr(trainer_mod, "Loss", fake_loss)
+    monkeypatch.setattr(trainer_mod, "build_hamiltonian_flow", fake_flow)
+    monkeypatch.setattr(trainer_mod, "get_optimizer", lambda **kwargs: SimpleNamespace(param_groups=[{"lr": 0.1}]))
+    monkeypatch.setattr(trainer_mod, "get_lr_scheduler", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(trainer_mod, "configure_activation_recompute", lambda *args, **kwargs: {})
+
+    Trainer(
+        train_options={
+            "optimizer": {"type": "Adam", "lr": 0.1},
+            "lr_scheduler": {"type": "exp", "gamma": 1.0},
+            "update_lr_per_iter": False,
+            "clip_grad": 1.0,
+            "batch_size": 1,
+            "loss_options": {"train": {"method": "hamil_abs"}},
+            "flow_options": {"enabled": True},
+        },
+        common_options={
+            "dtype": "float32",
+            "device": "cpu",
+            "basis": {"Si": ["3s", "3p"]},
+            "has_soc": True,
+            "nextham_uureal_mask": True,
+        },
+        model=MinimalModel(),
+        train_datasets=MinimalDataset(),
+    )
+
+    assert captured["idp"] is loss_idp
+
+
+def test_build_dataset_forwards_nextham_uureal_mask_to_orbital_mapper(tmp_path, monkeypatch):
+    from dptb.data import build as data_build_mod
+
+    captured = {}
+    set_dir = tmp_path / "set.0"
+    set_dir.mkdir()
+    (set_dir / "data.mdb").write_text("")
+
+    class FakeOrbitalMapper:
+        def __init__(self, **kwargs):
+            captured["orbital_mapper_kwargs"] = kwargs
+
+    class FakeLMDBDataset:
+        def __init__(self, **kwargs):
+            captured["dataset_kwargs"] = kwargs
+
+    monkeypatch.setattr(data_build_mod, "OrbitalMapper", FakeOrbitalMapper)
+    monkeypatch.setattr(data_build_mod, "LMDBDataset", FakeLMDBDataset)
+
+    dataset = data_build_mod.build_dataset(
+        root=str(tmp_path).replace("\\", "/"),
+        type="LMDBDataset",
+        prefix="set",
+        separator=".",
+        get_Hamiltonian=True,
+        r_max=1.0,
+        er_max=None,
+        oer_max=None,
+        basis={"Si": ["3s", "3p"]},
+        has_soc=True,
+        nextham_uureal_mask=True,
+    )
+
+    assert isinstance(dataset, FakeLMDBDataset)
+    assert captured["orbital_mapper_kwargs"]["has_soc"] is True
+    assert captured["orbital_mapper_kwargs"]["nextham_uureal_mask"] is True
+    assert captured["dataset_kwargs"]["type_mapper"] is not None
 
 
 def _fake_trainer(monkeypatch):

@@ -354,6 +354,19 @@ class HamiltonianCFM:
             mask = mask.unsqueeze(-1)
         return mask.expand_as(like)
 
+    def _project_raw_feature_table(self, table: torch.Tensor, feature_dim: int) -> torch.Tensor:
+        if table.ndim < 2 or table.shape[-1] == int(feature_dim) or self.idp is None:
+            return table
+        raw_mask = getattr(self.idp, "mask_uureal", None)
+        if raw_mask is None:
+            return table
+        raw_mask = raw_mask.to(device=table.device, dtype=torch.bool).reshape(-1)
+        if raw_mask.numel() != table.shape[-1]:
+            return table
+        if int(raw_mask.sum().detach().cpu().item()) != int(feature_dim):
+            return table
+        return table[:, raw_mask]
+
     def _prior_mask(
         self,
         data: Optional[AtomicDataDict.Type],
@@ -384,6 +397,7 @@ class HamiltonianCFM:
                 table = table.reshape(-1, 1)
             elif table.ndim > 2:
                 table = table.reshape(table.shape[0], -1)
+            table = self._project_raw_feature_table(table, like.shape[-1])
 
             type_mask = torch.zeros(
                 like.shape[0],
@@ -467,7 +481,15 @@ class HamiltonianCFM:
             return None
         irreps = getattr(self.idp, "orbpair_irreps", None)
         if irreps is None:
-            return None
+            get_irreps = getattr(self.idp, "get_irreps", None)
+            if not callable(get_irreps):
+                return None
+            try:
+                irreps = get_irreps()
+            except Exception:
+                return None
+            if irreps is None:
+                return None
         # Feature rows follow OrbitalMapper/orbpair_maps order. Sorting irreps
         # changes contiguous feature spans and breaks mask/typewise raw-slice priors.
         raw_irreps = irreps
@@ -484,7 +506,25 @@ class HamiltonianCFM:
         except Exception:
             return None
         if offset != int(feature_dim):
-            return None
+            raw_mask = getattr(self.idp, "mask_uureal", None)
+            if raw_mask is None:
+                return None
+            raw_mask = raw_mask.to(dtype=torch.bool).reshape(-1)
+            if raw_mask.numel() != offset:
+                return None
+            if int(raw_mask.sum().detach().cpu().item()) != int(feature_dim):
+                return None
+            projected_slices = []
+            compressed_offset = 0
+            for start, end, degree in slices:
+                kept = int(raw_mask[start:end].sum().detach().cpu().item())
+                if kept <= 0:
+                    continue
+                projected_slices.append((compressed_offset, compressed_offset + kept, degree))
+                compressed_offset += kept
+            if compressed_offset != int(feature_dim):
+                return None
+            return tuple(projected_slices)
         return tuple(slices)
 
     def _te_radius(
@@ -755,6 +795,29 @@ class HamiltonianCFM:
             mask = mask & data["expert_edge_mask"].to(device=mask.device).unsqueeze(-1)
         return mask.to(device=pred.device)
 
+    def _project_loss_layout(
+        self,
+        pred: torch.Tensor,
+        mask: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pred.ndim < 2 or target.ndim < 2 or pred.shape[-1] == target.shape[-1] or self.idp is None:
+            return pred, mask
+        raw_mask = getattr(self.idp, "mask_uureal", None)
+        if raw_mask is None:
+            return pred, mask
+        raw_mask = raw_mask.to(device=pred.device, dtype=torch.bool).reshape(-1)
+        if raw_mask.numel() != pred.shape[-1]:
+            return pred, mask
+        if int(raw_mask.sum().detach().cpu().item()) != int(target.shape[-1]):
+            return pred, mask
+        pred = pred[..., raw_mask]
+        if mask.ndim >= 2 and mask.shape[-1] == raw_mask.numel():
+            mask = mask[..., raw_mask]
+        else:
+            mask = self._align_bool_mask(mask, pred)
+        return pred, mask
+
     @staticmethod
     def _metric_stats(
         diff: torch.Tensor,
@@ -812,6 +875,7 @@ class HamiltonianCFM:
             pred = pred_data[self.node_target_key]
             target = ref_data[self.node_target_key].to(device=pred.device, dtype=pred.dtype)
             mask = self._node_mask(pred_data, pred)
+            pred, mask = self._project_loss_layout(pred, mask, target)
             node_weights = self._time_weight(ctx.node_t)
             node_loss, node_numerator, node_count = self._metric_stats(
                 pred - target, mask, self.loss_type, node_weights
@@ -827,6 +891,7 @@ class HamiltonianCFM:
             pred = pred_data[self.edge_target_key]
             target = ref_data[self.edge_target_key].to(device=pred.device, dtype=pred.dtype)
             mask = self._edge_mask(pred_data, pred)
+            pred, mask = self._project_loss_layout(pred, mask, target)
             edge_weights = self._time_weight(ctx.edge_t)
             edge_loss, edge_numerator, edge_count = self._metric_stats(
                 pred - target, mask, self.loss_type, edge_weights
