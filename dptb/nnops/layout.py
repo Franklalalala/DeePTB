@@ -49,3 +49,43 @@ def project_uureal_to_like(
     if raw_mask is None:
         return tensor, None
     return tensor[..., raw_mask], raw_mask
+
+
+def normalize_idp_mask_layout(
+    idp: Any,
+    mask: torch.Tensor,
+    like: torch.Tensor,
+    *,
+    label: str,
+) -> torch.Tensor:
+    mask = mask.to(device=like.device, dtype=torch.bool)
+    if mask.ndim == 0:
+        mask = mask.reshape(1, 1)
+    elif mask.ndim == 1:
+        mask = mask.reshape(-1, 1)
+    elif mask.ndim > 2:
+        mask = mask.reshape(mask.shape[0], -1)
+
+    mask, _raw_mask = project_uureal_to_like(idp, mask, like)
+    if mask.ndim >= 2 and mask.shape[0] == like.shape[0] and mask.shape[-1] == like.shape[-1]:
+        return mask
+
+    if mask.ndim >= 2 and mask.shape[-1] == 1 and mask.shape[0] in {1, like.shape[0]}:
+        while mask.ndim < like.ndim:
+            mask = mask.unsqueeze(-1)
+        return mask.expand_as(like)
+
+    if mask.ndim >= 2 and mask.shape[0] == like.shape[0]:
+        compressed_for_raw = uureal_projection_mask(
+            idp,
+            raw_width=int(like.shape[-1]),
+            target_width=int(mask.shape[-1]),
+            device=like.device,
+        )
+        if compressed_for_raw is not None:
+            return mask
+
+    raise ValueError(
+        f"{label} layout does not match prediction layout; "
+        "check nextham_uureal_mask/mask_uureal propagation."
+    )

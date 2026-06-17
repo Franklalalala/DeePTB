@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from dptb.data import AtomicDataDict, _keys
-from dptb.nnops.layout import project_uureal_to_like
+from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 
 log = logging.getLogger(__name__)
 
@@ -755,13 +755,7 @@ class HamiltonianCFM:
         mask = self.idp.mask_to_nrme.to(device=atom_types.device)[atom_types]
         if "expert_node_mask" in data:
             mask = mask & data["expert_node_mask"].to(device=mask.device).unsqueeze(-1)
-        mask = mask.to(device=pred.device)
-        mask, _raw_mask = project_uureal_to_like(self.idp, mask, pred)
-        if mask.ndim >= 2 and (
-            mask.shape[0] != pred.shape[0] or mask.shape[-1] != pred.shape[-1]
-        ):
-            mask = self._align_bool_mask(mask, pred)
-        return mask
+        return normalize_idp_mask_layout(self.idp, mask, pred, label="node idp mask")
 
     def _edge_mask(self, data: AtomicDataDict.Type, pred: torch.Tensor) -> torch.Tensor:
         if self.idp is None or AtomicDataDict.EDGE_TYPE_KEY not in data:
@@ -770,13 +764,7 @@ class HamiltonianCFM:
         mask = self.idp.mask_to_erme.to(device=edge_types.device)[edge_types]
         if "expert_edge_mask" in data:
             mask = mask & data["expert_edge_mask"].to(device=mask.device).unsqueeze(-1)
-        mask = mask.to(device=pred.device)
-        mask, _raw_mask = project_uureal_to_like(self.idp, mask, pred)
-        if mask.ndim >= 2 and (
-            mask.shape[0] != pred.shape[0] or mask.shape[-1] != pred.shape[-1]
-        ):
-            mask = self._align_bool_mask(mask, pred)
-        return mask
+        return normalize_idp_mask_layout(self.idp, mask, pred, label="edge idp mask")
 
     def _project_loss_layout(
         self,
@@ -785,11 +773,12 @@ class HamiltonianCFM:
         target: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pred, _raw_mask = project_uureal_to_like(self.idp, pred, target)
-        mask, _mask_raw = project_uureal_to_like(self.idp, mask, pred)
-        if mask.ndim >= 2 and (
-            mask.shape[0] != pred.shape[0] or mask.shape[-1] != pred.shape[-1]
-        ):
-            mask = self._align_bool_mask(mask, pred)
+        if pred.shape != target.shape:
+            raise ValueError(
+                "prediction layout does not match target layout; "
+                "check nextham_uureal_mask/mask_uureal propagation."
+            )
+        mask = normalize_idp_mask_layout(self.idp, mask, pred, label="loss idp mask")
         return pred, mask
 
     @staticmethod
