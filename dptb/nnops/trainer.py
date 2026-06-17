@@ -114,9 +114,10 @@ class Trainer(BaseTrainer):
                 idp=self.model.hamiltonian.idp,
             )
 
+        flow_idp = getattr(self.train_lossfunc, "idp", self.model.hamiltonian.idp)
         self.flow_cfm = build_hamiltonian_flow(
             train_options.get("flow_options", None),
-            idp=self.model.hamiltonian.idp,
+            idp=flow_idp,
             dtype=self.dtype,
             device=self.device,
         )
