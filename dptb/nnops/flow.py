@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.nnops.layout import project_uureal_to_like
 from dptb.nnops.rmf_manifold import build_rmf_manifold
 
 log = logging.getLogger(__name__)
@@ -357,15 +358,9 @@ class HamiltonianCFM:
     def _project_raw_feature_table(self, table: torch.Tensor, feature_dim: int) -> torch.Tensor:
         if table.ndim < 2 or table.shape[-1] == int(feature_dim) or self.idp is None:
             return table
-        raw_mask = getattr(self.idp, "mask_uureal", None)
-        if raw_mask is None:
-            return table
-        raw_mask = raw_mask.to(device=table.device, dtype=torch.bool).reshape(-1)
-        if raw_mask.numel() != table.shape[-1]:
-            return table
-        if int(raw_mask.sum().detach().cpu().item()) != int(feature_dim):
-            return table
-        return table[:, raw_mask]
+        like = table.new_empty((table.shape[0], int(feature_dim)))
+        table, _raw_mask = project_uureal_to_like(self.idp, table, like)
+        return table
 
     def _prior_mask(
         self,
@@ -784,7 +779,13 @@ class HamiltonianCFM:
         mask = self.idp.mask_to_nrme.to(device=atom_types.device)[atom_types]
         if "expert_node_mask" in data:
             mask = mask & data["expert_node_mask"].to(device=mask.device).unsqueeze(-1)
-        return mask.to(device=pred.device)
+        mask = mask.to(device=pred.device)
+        mask, _raw_mask = project_uureal_to_like(self.idp, mask, pred)
+        if mask.ndim >= 2 and (
+            mask.shape[0] != pred.shape[0] or mask.shape[-1] != pred.shape[-1]
+        ):
+            mask = self._align_bool_mask(mask, pred)
+        return mask
 
     def _edge_mask(self, data: AtomicDataDict.Type, pred: torch.Tensor) -> torch.Tensor:
         if self.idp is None or AtomicDataDict.EDGE_TYPE_KEY not in data:
@@ -793,7 +794,13 @@ class HamiltonianCFM:
         mask = self.idp.mask_to_erme.to(device=edge_types.device)[edge_types]
         if "expert_edge_mask" in data:
             mask = mask & data["expert_edge_mask"].to(device=mask.device).unsqueeze(-1)
-        return mask.to(device=pred.device)
+        mask = mask.to(device=pred.device)
+        mask, _raw_mask = project_uureal_to_like(self.idp, mask, pred)
+        if mask.ndim >= 2 and (
+            mask.shape[0] != pred.shape[0] or mask.shape[-1] != pred.shape[-1]
+        ):
+            mask = self._align_bool_mask(mask, pred)
+        return mask
 
     def _project_loss_layout(
         self,
@@ -801,20 +808,11 @@ class HamiltonianCFM:
         mask: torch.Tensor,
         target: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if pred.ndim < 2 or target.ndim < 2 or pred.shape[-1] == target.shape[-1] or self.idp is None:
-            return pred, mask
-        raw_mask = getattr(self.idp, "mask_uureal", None)
-        if raw_mask is None:
-            return pred, mask
-        raw_mask = raw_mask.to(device=pred.device, dtype=torch.bool).reshape(-1)
-        if raw_mask.numel() != pred.shape[-1]:
-            return pred, mask
-        if int(raw_mask.sum().detach().cpu().item()) != int(target.shape[-1]):
-            return pred, mask
-        pred = pred[..., raw_mask]
-        if mask.ndim >= 2 and mask.shape[-1] == raw_mask.numel():
-            mask = mask[..., raw_mask]
-        else:
+        pred, _raw_mask = project_uureal_to_like(self.idp, pred, target)
+        mask, _mask_raw = project_uureal_to_like(self.idp, mask, pred)
+        if mask.ndim >= 2 and (
+            mask.shape[0] != pred.shape[0] or mask.shape[-1] != pred.shape[-1]
+        ):
             mask = self._align_bool_mask(mask, pred)
         return pred, mask
 
@@ -1001,9 +999,11 @@ class HamiltonianCFM:
             denom = max(1.0 - cur_t, self.t_eps)
             if node_current is not None:
                 endpoint = prediction[self.node_target_key]
+                endpoint, _raw_mask = project_uureal_to_like(self.idp, endpoint, node_current)
                 node_current = node_current + dt * (endpoint - node_current) / denom
             if edge_current is not None:
                 endpoint = prediction[self.edge_target_key]
+                endpoint, _raw_mask = project_uureal_to_like(self.idp, endpoint, edge_current)
                 edge_current = edge_current + dt * (endpoint - edge_current) / denom
             state = prediction.copy()
 
@@ -1268,10 +1268,12 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         node_x = None
         if ctx.node_clean is not None and self.node_target_key in pred:
             node_pred = pred[self.node_target_key]
+            node_pred, _raw_mask = project_uureal_to_like(self.idp, node_pred, ctx.node_clean)
             node_x = node_pred - ctx.node_base if self.mode == "residual" else node_pred
         edge_x = None
         if ctx.edge_clean is not None and self.edge_target_key in pred:
             edge_pred = pred[self.edge_target_key]
+            edge_pred, _raw_mask = project_uureal_to_like(self.idp, edge_pred, ctx.edge_clean)
             edge_x = edge_pred - ctx.edge_base if self.mode == "residual" else edge_pred
         return pred, node_x, edge_x
 
