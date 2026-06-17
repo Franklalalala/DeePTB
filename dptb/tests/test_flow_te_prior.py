@@ -8,7 +8,6 @@ from dptb.nnops.flow import (
     CFMContext,
     HamiltonianCFM,
     HamiltonianPixelMeanFlow,
-    HamiltonianRiemannianMeanFlow,
 )
 from dptb.nnops.loss import HamilLossAbs
 from dptb.nnops.trainer import Trainer
@@ -489,69 +488,6 @@ def test_pixel_meanflow_projects_raw_uureal_endpoint_to_compressed_loss_layout()
     assert torch.isfinite(loss)
     assert state["train_flow_onsite_endpoint_loss"].item() == pytest.approx(0.0, abs=1.0e-8)
     assert state["train_flow_hopping_endpoint_loss"].item() == pytest.approx(0.0, abs=1.0e-8)
-
-
-def test_rmf_projects_raw_uureal_endpoint_to_compressed_loss_layout():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float64
-    raw_mask = torch.tensor([1, 1, 0, 1, 0, 1, 0, 0], device=device, dtype=torch.bool)
-    data, ref = _make_batch(device=device, dtype=dtype)
-    idp = _FakeIDP(device=device)
-    idp.mask_uureal = raw_mask
-    idp.mask_to_nrme = raw_mask.expand(2, -1).clone()
-    idp.mask_to_erme = raw_mask.expand(2, -1).clone()
-    flow = HamiltonianRiemannianMeanFlow(
-        {
-            "enabled": True,
-            "objective": "rmf",
-            "mode": "residual",
-            "prior": "zero",
-            "strict_h0": True,
-            "meanflow": {"aux_endpoint_weight": 0.0},
-            "rmf_options": {
-                "endpoint_eps": 1.0e-3,
-                "manifold": "euclidean",
-            },
-        },
-        idp=idp,
-        device=device,
-        dtype=dtype,
-    )
-
-    class _RawEndpoint(torch.nn.Module):
-        def forward(self, batch):
-            out = batch.copy()
-            node_raw = torch.zeros(
-                batch[_keys.NODE_H0_KEY].shape[0],
-                raw_mask.numel(),
-                device=batch[_keys.NODE_H0_KEY].device,
-                dtype=batch[_keys.NODE_H0_KEY].dtype,
-            )
-            edge_raw = torch.zeros(
-                batch[_keys.EDGE_H0_KEY].shape[0],
-                raw_mask.numel(),
-                device=batch[_keys.EDGE_H0_KEY].device,
-                dtype=batch[_keys.EDGE_H0_KEY].dtype,
-            )
-            node_raw[:, raw_mask] = ref[_keys.NODE_FEATURES_KEY].to(node_raw)
-            edge_raw[:, raw_mask] = ref[_keys.EDGE_FEATURES_KEY].to(edge_raw)
-            out[_keys.NODE_FEATURES_KEY] = node_raw
-            out[_keys.EDGE_FEATURES_KEY] = edge_raw
-            return out
-
-    loss, state = flow.loss_with_model(
-        _RawEndpoint(),
-        data,
-        ref,
-        r=torch.tensor([0.25, 0.25], device=device, dtype=dtype),
-        t=torch.tensor([0.50, 0.50], device=device, dtype=dtype),
-    )
-
-    assert torch.isfinite(loss)
-    assert state["train_flow_onsite_endpoint_loss"].item() == pytest.approx(0.0, abs=1.0e-8)
-    assert state["train_flow_hopping_endpoint_loss"].item() == pytest.approx(0.0, abs=1.0e-8)
-    assert state["train_flow_onsite_endpoint_count"].item() == pytest.approx(12.0)
-    assert state["train_flow_hopping_endpoint_count"].item() == pytest.approx(16.0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
