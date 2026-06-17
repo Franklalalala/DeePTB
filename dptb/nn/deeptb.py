@@ -7,6 +7,7 @@ from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
 from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian
+from dptb.nn.blockwise_hamiltonian import BlockwiseE3Hamiltonian
 from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
 from e3nn.o3 import Linear
@@ -112,6 +113,7 @@ class NNENV(nn.Module):
         self.prediction = prediction
 
         prediction_copy = prediction.copy()
+        self.blockwise_hamiltonian = bool(prediction_copy.get("blockwise_hamiltonian", False))
         scale_type = prediction_copy.get("scale_type")
         self.scale_type = scale_type
 
@@ -276,13 +278,29 @@ class NNENV(nn.Module):
                     )
 
         elif self.method == "e3tb":
-            self.hamiltonian = E3Hamiltonian(
+            hamiltonian_cls = BlockwiseE3Hamiltonian if self.blockwise_hamiltonian else E3Hamiltonian
+            blockwise_ham_kwargs = {}
+            if self.blockwise_hamiltonian:
+                for key in (
+                    "node_pad_shape",
+                    "edge_pad_shape",
+                    "symmetrize_onsite",
+                    "complete_edges",
+                    "strict_complete_edges",
+                    "add_h0",
+                    "full_output_node_field",
+                    "full_output_edge_field",
+                ):
+                    if key in prediction_copy:
+                        blockwise_ham_kwargs[key] = prediction_copy[key]
+            self.hamiltonian = hamiltonian_cls(
                 edge_field=AtomicDataDict.EDGE_FEATURES_KEY,
                 node_field=AtomicDataDict.NODE_FEATURES_KEY,
                 idp=self.embedding.idp,
                 dtype=self.dtype,
                 device=self.device,
-                soc=self.has_soc
+                soc=self.has_soc,
+                **blockwise_ham_kwargs,
             )
 
             if overlap:

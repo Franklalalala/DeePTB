@@ -1450,6 +1450,10 @@ def e3tb_prediction():
     doc_scale_type = ("Which scale method to use. Can be no_scale, "
                       "scale_wo_back_grad (the scale parameter will not engage the back grad computation graph), "
                       "scale_w_back_grad (the scale parameter will engage the back grad computation graph)")
+    doc_blockwise_hamiltonian = (
+        "If true, materialize E3 Hamiltonian feature predictions into AO block tensors "
+        "for block-wise loss. This is non-SOC AO/block supervision, not a block-native head."
+    )
 
     nn = [
         Argument("scales_trainable", bool, optional=True, default=False, doc=doc_scales_trainable),
@@ -1458,6 +1462,15 @@ def e3tb_prediction():
         Argument("activation", str, optional=True, default="tanh", doc=doc_activation),
         Argument("scale_type", str, optional=True, default="scale_w_back_grad", doc=doc_scale_type),
         Argument("if_batch_normalized", bool, optional=True, default=False, doc=doc_if_batch_normalized),
+        Argument("blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_blockwise_hamiltonian),
+        Argument("node_pad_shape", [list, None], optional=True, default=None, doc="Padded node AO block shape for blockwise Hamiltonian output."),
+        Argument("edge_pad_shape", [list, None], optional=True, default=None, doc="Padded edge AO block shape for blockwise Hamiltonian output."),
+        Argument("symmetrize_onsite", bool, optional=True, default=True, doc="Hermitian-complete onsite AO blocks in blockwise output."),
+        Argument("complete_edges", bool, optional=True, default=True, doc="Fill missing edge AO entries from reverse directed edges in blockwise output."),
+        Argument("strict_complete_edges", bool, optional=True, default=False, doc="Fail if reverse-edge completion leaves unresolved valid AO entries."),
+        Argument("add_h0", bool, optional=True, default=False, doc="Also expose full H block tensors by adding converted H0 blocks to delta predictions."),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for full node Hamiltonian blocks when add_h0 is true."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for full edge Hamiltonian blocks when add_h0 is true."),
     ]
 
     return nn
@@ -1729,6 +1742,23 @@ def loss_options():
         Argument("skdata", str, optional=False, doc="The path to the skfile or sk database."),
     ]
 
+    hamil_blockwise = [
+        Argument("pred_node_block_key", str, optional=True, default="node_hamil_blocks"),
+        Argument("pred_edge_block_key", str, optional=True, default="edge_hamil_blocks"),
+        Argument("target_node_block_key", str, optional=True, default="node_delta_hamil_blocks"),
+        Argument("target_edge_block_key", str, optional=True, default="edge_delta_hamil_blocks"),
+        Argument("target_node_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
+        Argument("target_edge_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
+        Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, feature_compatible."),
+        Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
+        Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
+        Argument("log_feature_compatible", bool, optional=True, default=True),
+        Argument("feature_log_no_grad", bool, optional=True, default=True),
+        Argument("distributed_log_reduce", bool, optional=True, default=True),
+        Argument("expose_component_sums", bool, optional=True, default=True),
+        Argument("eps", float, optional=True, default=1e-12),
+    ]
+
     loss_args = Variant("method", [
         # Argument("hamil", dict, sub_fields=hamil),
         Argument("eigvals", dict, sub_fields=eigvals),
@@ -1743,6 +1773,8 @@ def loss_options():
         Argument("hamil_blas", dict, sub_fields=hamil),
         Argument("hamil_wt", dict, sub_fields=hamil+wt),
         Argument("eig_ham", dict, sub_fields=hamil+eigvals+eig_ham),
+        Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
+        Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
     ], optional=False, doc=doc_method)
 
 

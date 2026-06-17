@@ -1720,3 +1720,9 @@ class HamilLossAnalysis(object):
             out.append(tensor)
 
         return torch.cat(out, dim=-1).squeeze(0)
+
+
+try:
+    from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss  # noqa: F401
+except Exception as _blockwise_exc:  # pragma: no cover
+    log.warning("Could not register hamil_blockwise_nextham: %s", _blockwise_exc)

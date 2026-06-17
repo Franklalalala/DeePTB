@@ -495,6 +495,58 @@ class LMDBDataset(AtomicDataset):
                 atomicdata[AtomicDataDict.NODE_H0_KEY] = torch.as_tensor(node_h0)
                 atomicdata[AtomicDataDict.EDGE_H0_KEY] = torch.as_tensor(edge_h0)
 
+        # Optional AO-block targets/H0 produced by tools/convert_feature_lmdb_to_blockwise.py.
+        # Keeping this side-channel here leaves the feature training path unchanged.
+        for blockwise_key in (
+            AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
+            AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
+            AtomicDataDict.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+            AtomicDataDict.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+            AtomicDataDict.NODE_H0_BLOCKS_KEY,
+            AtomicDataDict.EDGE_H0_BLOCKS_KEY,
+            AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY,
+            AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY,
+        ):
+            if blockwise_key in data_dict:
+                atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
+
+        if (
+            self.get_Hamiltonian
+            and blocks is not False
+            and blocks is not None
+            and AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY not in atomicdata
+        ):
+            from dptb.data.interfaces.blockwise_tensor import attach_block_tensors, block_dict_to_ordered_tensors
+
+            start_id = 0 if "0_0_0_0_0" in blocks else 1
+            target_blocks = block_dict_to_ordered_tensors(
+                atomicdata,
+                self.type_mapper,
+                blocks,
+                start_id=start_id,
+                complete_edges=True,
+                strict_complete_edges=False,
+            )
+            attach_block_tensors(atomicdata, target_blocks, prefix="delta_hamil")
+
+        if (
+            self.get_H0
+            and h0_blocks is not None
+            and AtomicDataDict.NODE_H0_BLOCKS_KEY not in atomicdata
+        ):
+            from dptb.data.interfaces.blockwise_tensor import attach_block_tensors, block_dict_to_ordered_tensors
+
+            start_id = 0 if "0_0_0_0_0" in h0_blocks else 1
+            target_h0_blocks = block_dict_to_ordered_tensors(
+                atomicdata,
+                self.type_mapper,
+                h0_blocks,
+                start_id=start_id,
+                complete_edges=True,
+                strict_complete_edges=False,
+            )
+            attach_block_tensors(atomicdata, target_h0_blocks, prefix="h0")
+
         return atomicdata
 
     def E3statistics(self, model: torch.nn.Module = None):
