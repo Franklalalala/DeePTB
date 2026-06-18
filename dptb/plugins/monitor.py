@@ -844,6 +844,7 @@ class Monitor(Plugin):
             return
 
         stats['last'] = val
+        stats['last_updated'] = kwargs.get("time", getattr(self.trainer, "iter", None))
 
         if self.with_epoch_average:
             curr_s, curr_c = stats.get('epoch_stats', (0, 0))
@@ -1757,6 +1758,8 @@ class Validationer(Monitor):
         stats.setdefault('log_iter_fields', self.log_iter_fields)
         stats.setdefault('log_epoch_fields', self.log_epoch_fields)
         stats['last'] = val
+        if time is not None:
+            stats['last_updated'] = time
         previous_avg = stats.get('running_avg', 0.0)
         stats['running_avg'] = previous_avg * self.smoothing + val * (1 - self.smoothing)
         if epoch:
@@ -1836,6 +1839,10 @@ class TensorBoardMonitor(Plugin):
     def _epoch_stat_updated(self, name, epoch):
         stat = self.trainer.stats.get(name, {})
         return stat.get('epoch_last_updated') == epoch
+
+    def _iter_stat_updated(self, name, iteration):
+        stat = self.trainer.stats.get(name, {})
+        return stat.get('last_updated') == iteration
 
     def _memory_names(self, kwargs=None):
         names = {
@@ -1969,6 +1976,21 @@ class TensorBoardMonitor(Plugin):
         mean_max_prob = self._get_value('mean_max_prob', 'last', kwargs, default=None)
         expert_load_cv = self._get_value('expert_load_cv', 'last', kwargs, default=None)
         total_grad_norm = self._get_value('total_grad_norm', 'last', kwargs, default=None)
+        validation_loss = (
+            self._get_stat('validation_loss', 'last', None)
+            if self._iter_stat_updated('validation_loss', iteration)
+            else None
+        )
+        validation_onsite = (
+            self._get_stat('validation_onsite_loss', 'last', None)
+            if self._iter_stat_updated('validation_onsite_loss', iteration)
+            else None
+        )
+        validation_hopping = (
+            self._get_stat('validation_hopping_loss', 'last', None)
+            if self._iter_stat_updated('validation_hopping_loss', iteration)
+            else None
+        )
 
         if lr is not None:
             self.writer.add_scalar('lr_iter/iteration', lr, iteration)
@@ -1986,6 +2008,12 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('expert_load_cv_iter/iteration', expert_load_cv, iteration)
         if total_grad_norm is not None:
             self.writer.add_scalar('total_grad_norm_iter/iteration', total_grad_norm, iteration)
+        if validation_loss is not None:
+            self.writer.add_scalar('validation_loss_iter/iteration', validation_loss, iteration)
+        if validation_onsite is not None:
+            self.writer.add_scalar('validation_onsite_loss_iter/iteration', validation_onsite, iteration)
+        if validation_hopping is not None:
+            self.writer.add_scalar('validation_hopping_loss_iter/iteration', validation_hopping, iteration)
 
         flow_names = {
             name for name in self.trainer.stats

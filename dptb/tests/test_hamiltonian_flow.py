@@ -1,12 +1,15 @@
 from pathlib import Path
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
 from dptb.nnops import trainer as trainer_module
+from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
+from dptb.plugins.monitor import TensorBoardMonitor
 
 train_entrypoint = importlib.import_module("dptb.entrypoints.train")
 
@@ -362,6 +365,122 @@ class _FakeBatch:
 
 
 _UNUSED_MODEL = object()
+
+
+class _NoopTagger:
+    def tag(self, *args, **kwargs):
+        class _Ctx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return _Ctx()
+
+
+class _FlowPreparedModel:
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, batch):
+        self.seen = batch.copy()
+        out = batch.copy()
+        out["node_features"] = batch["node_h0"].clone()
+        out["edge_features"] = batch["edge_h0"].clone()
+        return out
+
+
+class _PreparedFlow:
+    enabled = True
+    model_in_loss = False
+    log_train_compatible_loss = False
+    compatible_loss_to_legacy_keys = True
+
+    def __init__(self):
+        self.prepare_called = False
+        self.loss_called = False
+
+    def prepare_batch(self, batch, ref_batch):
+        self.prepare_called = True
+        out = batch.copy()
+        ref = ref_batch.copy()
+        out["node_h0"] = batch["node_h0"] + 10.0
+        out["edge_h0"] = batch["edge_h0"] + 20.0
+        return out, ref, object()
+
+    def loss(self, pred, ref, ctx):
+        self.loss_called = True
+        assert torch.equal(pred["node_features"], pred["node_h0"])
+        assert torch.equal(pred["edge_features"], pred["edge_h0"])
+        loss = pred["node_features"].sum() * 0.0 + torch.tensor(5.0)
+        return loss, {
+            "train_flow_loss": torch.tensor(5.0),
+            "train_onsite_loss": torch.tensor(2.0),
+            "train_hopping_loss": torch.tensor(3.0),
+        }
+
+
+def test_multitrainer_expert_payload_applies_flow_before_model():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 1
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer._tagger = _NoopTagger()
+    trainer.flow_cfm = _PreparedFlow()
+    trainer.model = _FlowPreparedModel()
+    trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
+        torch.ones(batch["edge_h0"].shape[0], dtype=torch.bool),
+        torch.ones(batch["node_h0"].shape[0], dtype=torch.bool),
+    )
+
+    batch = _two_graph_batch()
+    result = trainer._run_one_expert_loss(
+        batch,
+        batch_info={},
+        criterion=_ComponentLoss(),
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+        capture_metrics=True,
+    )
+
+    assert trainer.flow_cfm.prepare_called
+    assert trainer.flow_cfm.loss_called
+    assert torch.equal(trainer.model.seen["node_h0"], batch["node_h0"] + 10.0)
+    assert torch.equal(trainer.model.seen["edge_h0"], batch["edge_h0"] + 20.0)
+    assert result["loss"].item() == pytest.approx(5.0)
+    assert result["onsite"].item() == pytest.approx(2.0)
+    assert result["hopping"].item() == pytest.approx(3.0)
+
+
+def test_tensorboard_monitor_writes_fresh_validation_iter_tags():
+    writes = []
+
+    class _Writer:
+        def add_scalar(self, tag, value, step):
+            writes.append((tag, float(value), int(step)))
+
+        def flush(self):
+            pass
+
+    monitor = object.__new__(TensorBoardMonitor)
+    monitor.writer = _Writer()
+    monitor.flush_every = 0
+    monitor.trainer = SimpleNamespace(
+        iter=1000,
+        num_experts=0,
+        stats={
+            "validation_loss": {"last": 0.5, "last_updated": 1000},
+            "validation_onsite_loss": {"last": 0.2, "last_updated": 1000},
+            "validation_hopping_loss": {"last": 0.3, "last_updated": 1000},
+        },
+    )
+
+    monitor.iteration(time=1000)
+
+    assert ("validation_loss_iter/iteration", 0.5, 1000) in writes
+    assert ("validation_onsite_loss_iter/iteration", 0.2, 1000) in writes
+    assert ("validation_hopping_loss_iter/iteration", 0.3, 1000) in writes
 
 
 def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
