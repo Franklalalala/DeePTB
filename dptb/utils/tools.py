@@ -171,10 +171,55 @@ def get_lr_scheduler(type: str, optimizer: optim.Optimizer, **sch_options):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, **sch_options)
     elif type == "cyclic":
         scheduler = optim.lr_scheduler.CyclicLR(optimizer=optimizer, **sch_options)
+    elif type == "qhflow_poly":
+        scheduler = _make_qhflow_poly_lr_scheduler(optimizer=optimizer, **sch_options)
     else:
-        raise RuntimeError("Scheduler should be exp/linear/rop/cyclic..., not {}".format(type))
+        raise RuntimeError("Scheduler should be exp/linear/rop/cyclic/qhflow_poly..., not {}".format(type))
 
     return scheduler
+
+
+def _make_qhflow_poly_lr_scheduler(
+    optimizer: optim.Optimizer,
+    warmup_step: int = 1000,
+    num_training_steps: int = 200000,
+    end_lr: float = 1.0e-9,
+    scheduler_power: float = 1.0,
+    last_epoch: int = -1,
+):
+    warmup_step = int(warmup_step)
+    num_training_steps = int(num_training_steps)
+    end_lr = float(end_lr)
+    scheduler_power = float(scheduler_power)
+    if warmup_step < 0:
+        raise ValueError("warmup_step must be >= 0 for qhflow_poly scheduler")
+    if num_training_steps <= warmup_step:
+        raise ValueError("num_training_steps must be larger than warmup_step for qhflow_poly scheduler")
+    if end_lr < 0:
+        raise ValueError("end_lr must be >= 0 for qhflow_poly scheduler")
+    if scheduler_power <= 0:
+        raise ValueError("scheduler_power must be > 0 for qhflow_poly scheduler")
+
+    base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    end_factors = [
+        0.0 if base_lr <= 0 else min(max(end_lr / base_lr, 0.0), 1.0)
+        for base_lr in base_lrs
+    ]
+
+    def lr_factor(step: int, end_factor: float):
+        step = max(0, int(step))
+        if warmup_step > 0 and step < warmup_step:
+            return max(float(step) / float(warmup_step), 1.0e-12)
+        progress = (step - warmup_step) / float(num_training_steps - warmup_step)
+        progress = min(max(progress, 0.0), 1.0)
+        decay = (1.0 - progress) ** scheduler_power
+        return end_factor + (1.0 - end_factor) * decay
+
+    lr_lambdas = [
+        (lambda step, end_factor=end_factor: lr_factor(step, end_factor))
+        for end_factor in end_factors
+    ]
+    return optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lr_lambdas, last_epoch=last_epoch)
 
 
 def lr_scheduler_requires_metric(scheduler) -> bool:
