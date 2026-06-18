@@ -1987,11 +1987,86 @@ class MultiTrainer(Trainer):
 
         return out
 
+    def _flow_state_with_prefix(self, state: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        if prefix == "train":
+            return dict(state)
+        out = {}
+        for key, value in state.items():
+            if key.startswith("train_"):
+                out[f"{prefix}_{key[len('train_'):]}"] = value
+            else:
+                out[key] = value
+        return out
+
+    def _flow_state_scalar(self, state: Dict[str, Any], *names, default=0.0, allow_none=False):
+        for name in names:
+            if name in state and state[name] is not None:
+                return self._as_scalar_tensor(state[name], default=default, allow_none=allow_none)
+        return self._as_scalar_tensor(None, default=default, allow_none=allow_none)
+
+    def _payload_metrics_from_flow_state(
+        self,
+        state: Dict[str, Any],
+        *,
+        prefix: str,
+    ) -> Dict[str, Any]:
+        return {
+            "onsite": self._flow_state_scalar(
+                state,
+                f"{prefix}_onsite_loss",
+                f"{prefix}_flow_onsite_loss",
+                default=0.0,
+            ),
+            "hopping": self._flow_state_scalar(
+                state,
+                f"{prefix}_hopping_loss",
+                f"{prefix}_flow_hopping_loss",
+                default=0.0,
+            ),
+            "z_loss": self._flow_state_scalar(
+                state,
+                "mean_max_prob",
+                f"{prefix}_mean_max_prob",
+                default=0.0,
+                allow_none=True,
+            ),
+            "expert_load_cv": self._flow_state_scalar(
+                state,
+                "expert_load_cv",
+                f"{prefix}_expert_load_cv",
+                default=0.0,
+                allow_none=True,
+            ),
+            "last_onsite_l1_sum": None,
+            "last_onsite_mse_sum": None,
+            "last_onsite_count": None,
+            "last_hopping_l1_sum": None,
+            "last_hopping_mse_sum": None,
+            "last_hopping_count": None,
+        }
+
+    def _pack_component_state(self, pack: torch.Tensor, *, prefix: str) -> Dict[str, torch.Tensor]:
+        onsite_cnt = pack[self._P_ACTIVE_NODES_SUM].to(dtype=self.dtype).clamp_min(1.0)
+        hopping_cnt = pack[self._P_ACTIVE_EDGES_SUM].to(dtype=self.dtype).clamp_min(1.0)
+        return {
+            f"{prefix}_onsite_loss": (pack[self._P_ONSITE_WEIGHTED_SUM] / onsite_cnt).detach(),
+            f"{prefix}_hopping_loss": (pack[self._P_HOPPING_WEIGHTED_SUM] / hopping_cnt).detach(),
+        }
+
     # ---------------------------------------------------------------------
     # core expert fwd/loss
     # ---------------------------------------------------------------------
 
-    def _run_one_expert_loss(self, batch_dict, batch_info, criterion, expert_idx, range_dis, capture_metrics=False):
+    def _run_one_expert_loss(
+        self,
+        batch_dict,
+        batch_info,
+        criterion,
+        expert_idx,
+        range_dis,
+        capture_metrics=False,
+        flow_prefix="train",
+    ):
         with self._tagger.tag("expert/prepare_masks", it=self.iter, expert=expert_idx):
             expert_edge_mask, expert_node_mask = self._prepare_expert_masks(batch_dict, range_dis, expert_idx)
 
@@ -1999,6 +2074,76 @@ class MultiTrainer(Trainer):
         batch_copy["expert_edge_mask"] = expert_edge_mask
         batch_copy["expert_node_mask"] = expert_node_mask
         batch_copy["expert_idx"] = int(expert_idx)
+
+        active_nodes = expert_node_mask.sum().detach()
+        active_edges = expert_edge_mask.sum().detach()
+
+        flow_enabled = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
+        if flow_enabled:
+            batch_for_loss = batch_copy.copy()
+            if getattr(self.flow_cfm, "model_in_loss", False):
+                with self._tagger.tag("expert/flow_loss_with_model", it=self.iter, expert=expert_idx):
+                    loss, flow_state = self.flow_cfm.loss_with_model(
+                        self.model,
+                        batch_copy,
+                        batch_for_loss,
+                    )
+                flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
+            else:
+                with self._tagger.tag("expert/flow_prepare_batch", it=self.iter, expert=expert_idx):
+                    flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                        batch_copy,
+                        batch_for_loss,
+                    )
+
+                with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
+                    with cuda_cache_memory_context(
+                        iteration=self.iter,
+                        stage="expert/model_forward",
+                        expert=expert_idx,
+                    ):
+                        pred_batch = self.model(flow_batch)
+
+                pred_batch["global_step"] = int(self.iter)
+                pred_batch.setdefault("expert_edge_mask", expert_edge_mask)
+                pred_batch.setdefault("expert_node_mask", expert_node_mask)
+                pred_batch.setdefault("expert_idx", int(expert_idx))
+                pred_batch.update(batch_info)
+                flow_ref.update(batch_info)
+
+                with self._tagger.tag("expert/flow_loss", it=self.iter, expert=expert_idx):
+                    loss, flow_state = self.flow_cfm.loss(pred_batch, flow_ref, flow_ctx)
+
+                flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
+                compatible_enabled = (
+                    getattr(self.flow_cfm, "log_train_compatible_loss", False)
+                    if flow_prefix == "train"
+                    else getattr(self.flow_cfm, "log_validation_compatible_loss", False)
+                )
+                if compatible_enabled:
+                    compatible_prefix = f"{flow_prefix}_compatible"
+                    legacy_prefix = (
+                        flow_prefix
+                        if getattr(self.flow_cfm, "compatible_loss_to_legacy_keys", True)
+                        else None
+                    )
+                    flow_state.update(
+                        Trainer._compatible_loss_state(
+                            criterion,
+                            pred_batch,
+                            flow_ref,
+                            prefix=compatible_prefix,
+                            legacy_prefix=legacy_prefix,
+                        )
+                    )
+
+            out = {
+                "loss": loss,
+                "active_nodes": active_nodes,
+                "active_edges": active_edges,
+            }
+            out.update(self._payload_metrics_from_flow_state(flow_state, prefix=flow_prefix))
+            return out
 
         with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
             with cuda_cache_memory_context(
@@ -2020,8 +2165,8 @@ class MultiTrainer(Trainer):
 
         out = {
             "loss": loss,
-            "active_nodes": expert_node_mask.sum().detach(),
-            "active_edges": expert_edge_mask.sum().detach(),
+            "active_nodes": active_nodes,
+            "active_edges": active_edges,
         }
         if capture_metrics:
             out.update(self._snapshot_loss_metrics(criterion))
@@ -2029,7 +2174,7 @@ class MultiTrainer(Trainer):
 
     def _build_train_payload(
         self, batch_dict, batch_info, expert_idx, range_dis,
-        ref_batch_dict=None, ref_batch_info=None, criterion=None
+        ref_batch_dict=None, ref_batch_info=None, criterion=None, flow_prefix="train"
     ):
         if criterion is None:
             criterion = self.train_lossfunc
@@ -2040,7 +2185,8 @@ class MultiTrainer(Trainer):
             criterion=criterion,
             expert_idx=expert_idx,
             range_dis=range_dis,
-            capture_metrics=True
+            capture_metrics=True,
+            flow_prefix=flow_prefix,
         )
 
         total_loss = main["loss"]
@@ -2071,7 +2217,8 @@ class MultiTrainer(Trainer):
                 criterion=criterion,
                 expert_idx=expert_idx,
                 range_dis=range_dis,
-                capture_metrics=True
+                capture_metrics=True,
+                flow_prefix=flow_prefix,
             )
 
             total_loss = total_loss + ref_res["loss"]
@@ -3189,6 +3336,8 @@ class MultiTrainer(Trainer):
     def validation(self, fast=True):
         with torch.no_grad():
             total_loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
+            validation_metric_sums: Dict[str, Any] = {}
+            num_batches = 0
             self.model.eval()
 
             for batch in self.validation_loader:
@@ -3205,6 +3354,7 @@ class MultiTrainer(Trainer):
                         ref_batch_dict=None,
                         ref_batch_info=None,
                         criterion=self.validation_lossfunc,
+                        flow_prefix="validation",
                     )
 
                     payload["loss_detached"] = payload["loss"].detach()
@@ -3221,9 +3371,15 @@ class MultiTrainer(Trainer):
                     else:
                         loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
 
+                    self._accumulate_metric_state(
+                        validation_metric_sums,
+                        self._pack_component_state(reduced_pack, prefix="validation"),
+                    )
+
                 else:
                     if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
                         payloads = []
+                        local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
                         for expert_idx, range_dis in enumerate(self.distance_ranges):
                             res = self._run_one_expert_loss(
                                 batch_dict=batch_dict,
@@ -3231,8 +3387,11 @@ class MultiTrainer(Trainer):
                                 criterion=self.validation_lossfunc,
                                 expert_idx=expert_idx,
                                 range_dis=range_dis,
-                                capture_metrics=True
+                                capture_metrics=True,
+                                flow_prefix="validation",
                             )
+                            res["loss_detached"] = res["loss"].detach()
+                            local_pack = local_pack + self._make_step_pack(res)
                             payloads.append({
                                 "onsite_l1_sum": res.get("last_onsite_l1_sum", None),
                                 "onsite_mse_sum": res.get("last_onsite_mse_sum", None),
@@ -3247,19 +3406,54 @@ class MultiTrainer(Trainer):
                             loss_i = self._compute_stitched_loss_by_reduce(payloads, self.validation_lossfunc)
 
                         if loss_i is None:
-                            with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
-                                loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
+                            if bool(getattr(getattr(self, "flow_cfm", None), "enabled", False)):
+                                loss_i = local_pack[self._P_LOSS_OPT_SUM].detach() / local_pack[
+                                    self._P_STEP_COUNT
+                                ].clamp_min(1.0)
+                                self._accumulate_metric_state(
+                                    validation_metric_sums,
+                                    self._pack_component_state(local_pack, prefix="validation"),
+                                )
+                            else:
+                                with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
+                                    loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
+                                    fallback_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
+                                    self._accumulate_metric_state(
+                                        validation_metric_sums,
+                                        {
+                                            "validation_onsite_loss": fallback_metrics["onsite"],
+                                            "validation_hopping_loss": fallback_metrics["hopping"],
+                                        },
+                                    )
+                        else:
+                            self._accumulate_metric_state(
+                                validation_metric_sums,
+                                self._pack_component_state(local_pack, prefix="validation"),
+                            )
                     else:
                         with self._tagger.tag("validation/full_forward_stitched", it=self.iter):
                             loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
+                        full_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
+                        self._accumulate_metric_state(
+                            validation_metric_sums,
+                            {
+                                "validation_onsite_loss": full_metrics["onsite"],
+                                "validation_hopping_loss": full_metrics["hopping"],
+                            },
+                        )
 
                 total_loss = total_loss + loss_i.detach()
+                num_batches += 1
 
                 if fast:
                     break
 
         if not fast:
             total_loss = total_loss / len(self.validation_loader)
+        divisor = max(num_batches, 1)
+        self._last_flow_validation_state = {
+            key: value / divisor for key, value in validation_metric_sums.items()
+        }
 
         return total_loss
 
