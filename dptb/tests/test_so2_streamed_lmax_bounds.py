@@ -106,7 +106,7 @@ def test_so2_radial_requires_latents(so2_fusion_mode):
         layer(x, R, None, latents=None)
 
 
-def test_so2_rejects_too_small_external_wigner_dense():
+def test_so2_recomputes_too_small_external_wigner_dense():
     torch = pytest.importorskip("torch")
     pytest.importorskip("e3nn")
     from dptb.nn.tensor_product_moe_v3 import SO2_Linear
@@ -125,8 +125,52 @@ def test_so2_rejects_too_small_external_wigner_dense():
     R = torch.randn(3, 3)
     too_small = torch.eye(1).repeat(3, 1, 1)
 
-    with pytest.raises(ValueError, match="l_max|block"):
-        layer(x, R, None, wigner_D_all=too_small)
+    out, wigner = layer(x, R, None, wigner_D_all=too_small)
+
+    assert out.shape == (3, layer.irreps_out.dim)
+    assert wigner.shape[-2:] == ((layer.l_max + 1) ** 2, (layer.l_max + 1) ** 2)
+
+
+def test_so2_streamed_skips_stale_wigner_when_rotation_disabled():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("e3nn")
+    from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
+
+    torch.manual_seed(20260618)
+    dtype = torch.float64
+    coeffs = torch.tensor([[0.35, 0.65], [0.7, 0.3]], dtype=dtype)
+    globals_ = MOLEGlobals(coefficients=coeffs, split_sizes=(1, 2))
+    R = torch.randn(3, 3, dtype=dtype)
+    small = SO2_Linear(
+        irreps_in="1x0e + 1x1o",
+        irreps_out="1x0e + 1x1o",
+        num_experts=2,
+        num_shared_experts=0,
+        wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="streamed_m_major_ref",
+    ).to(dtype=dtype)
+    large = SO2_Linear(
+        irreps_in="1x0e + 1x7o",
+        irreps_out="1x0e + 1x7o",
+        num_experts=2,
+        num_shared_experts=0,
+        rotate_in=False,
+        rotate_out=False,
+        wigner_apply_mode="compact_blocks",
+        so2_fusion_mode="streamed_m_major_cueq",
+    ).to(dtype=dtype)
+
+    _, stale_wigner = small(torch.randn(3, small.irreps_in.dim, dtype=dtype), R, globals_)
+    out, returned_wigner = large(
+        torch.randn(3, large.irreps_in.dim, dtype=dtype),
+        R,
+        globals_,
+        wigner_D_all=stale_wigner,
+    )
+
+    assert len(stale_wigner.blocks) == 2
+    assert returned_wigner is stale_wigner
+    assert out.shape == (3, large.irreps_out.dim)
 
 
 def test_so2_streamed_cueq_indexed_linear_matches_staged_if_available():

@@ -1273,11 +1273,9 @@ class SO2_Linear(torch.nn.Module):
             m: tuple(entry for entry in self._out_entry_plans if entry.l >= m)
             for m in range(self.m_max + 1)
         }
-        self._active_rot_l = tuple(sorted({
-            entry.l for entry in self._in_entry_plans if entry.l > 0
-        } | {
-            entry.l for entry in self._out_entry_plans if entry.l > 0
-        }))
+        self._input_rot_l = tuple(sorted({entry.l for entry in self._in_entry_plans if entry.l > 0}))
+        self._output_rot_l = tuple(sorted({entry.l for entry in self._out_entry_plans if entry.l > 0}))
+        self._active_rot_l = tuple(sorted(set(self._input_rot_l) | set(self._output_rot_l)))
         self._route_warned = set()
 
     def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
@@ -1444,18 +1442,19 @@ class SO2_Linear(torch.nn.Module):
         return out.contiguous(), wigner_D_all
 
     def _ensure_wigner_rotation(self, R, wigner_D_all):
-        if _wigner_covers_lmax(wigner_D_all, self.l_max, self.wigner_apply_mode):
+        required_lmax = self._required_wigner_lmax()
+        if required_lmax <= 0:
             return wigner_D_all
-        if (self.rotate_in or self.rotate_out) and self.l_max > 0:
-            angle = xyz_to_angles(R[:, [1, 2, 0]])
-            return _make_wigner_rotation(
-                self.l_max,
-                angle[0],
-                angle[1],
-                torch.zeros_like(angle[0]),
-                self.wigner_apply_mode,
-            )
-        return wigner_D_all
+        if _wigner_covers_lmax(wigner_D_all, required_lmax, self.wigner_apply_mode):
+            return wigner_D_all
+        angle = xyz_to_angles(R[:, [1, 2, 0]])
+        return _make_wigner_rotation(
+            required_lmax,
+            angle[0],
+            angle[1],
+            torch.zeros_like(angle[0]),
+            self.wigner_apply_mode,
+        )
 
     def _direct_rotate_pack_m(self, x, m: int, wigner_D_all):
         n, _ = x.shape
@@ -1591,8 +1590,22 @@ class SO2_Linear(torch.nn.Module):
             return {}
         return {
             l: _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-            for l in self._active_rot_l
+            for l in self._required_wigner_l_values()
         }
+
+    def _required_wigner_l_values(self) -> Tuple[int, ...]:
+        if self.rotate_in and self.rotate_out:
+            return self._active_rot_l
+        needed = set()
+        if self.rotate_in:
+            needed.update(self._input_rot_l)
+        if self.rotate_out:
+            needed.update(self._output_rot_l)
+        return tuple(sorted(needed))
+
+    def _required_wigner_lmax(self) -> int:
+        l_values = self._required_wigner_l_values()
+        return l_values[-1] if l_values else 0
 
     def _gather_input_l_groups(self, x: torch.Tensor) -> Dict[int, torch.Tensor]:
         return {
