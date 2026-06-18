@@ -2357,19 +2357,24 @@ class MultiTrainer(Trainer):
         onsite_cnt = pack[self._P_ONSITE_CNT_SUM]
         hopping_cnt = pack[self._P_HOPPING_CNT_SUM]
 
-        if float(onsite_cnt.item()) <= 0.0 and float(hopping_cnt.item()) <= 0.0:
-            return None
-
         def _safe_mean(sum_t, cnt_t):
             return sum_t / cnt_t.to(dtype=self.dtype).clamp_min(1.0)
 
-        onsite_l1_mean = _safe_mean(pack[self._P_ONSITE_L1_SUM], onsite_cnt)
-        onsite_mse_mean = _safe_mean(pack[self._P_ONSITE_MSE_SUM], onsite_cnt)
-        hopping_l1_mean = _safe_mean(pack[self._P_HOPPING_L1_SUM], hopping_cnt)
-        hopping_mse_mean = _safe_mean(pack[self._P_HOPPING_MSE_SUM], hopping_cnt)
+        if float(onsite_cnt.item()) > 0.0 or float(hopping_cnt.item()) > 0.0:
+            onsite_l1_mean = _safe_mean(pack[self._P_ONSITE_L1_SUM], onsite_cnt)
+            onsite_mse_mean = _safe_mean(pack[self._P_ONSITE_MSE_SUM], onsite_cnt)
+            hopping_l1_mean = _safe_mean(pack[self._P_HOPPING_L1_SUM], hopping_cnt)
+            hopping_mse_mean = _safe_mean(pack[self._P_HOPPING_MSE_SUM], hopping_cnt)
 
-        onsite_loss = 0.5 * (onsite_l1_mean + torch.sqrt(onsite_mse_mean))
-        hopping_loss = 0.5 * (hopping_l1_mean + torch.sqrt(hopping_mse_mean))
+            onsite_loss = 0.5 * (onsite_l1_mean + torch.sqrt(onsite_mse_mean))
+            hopping_loss = 0.5 * (hopping_l1_mean + torch.sqrt(hopping_mse_mean))
+        else:
+            active_nodes = pack[self._P_ACTIVE_NODES_SUM]
+            active_edges = pack[self._P_ACTIVE_EDGES_SUM]
+            if float(active_nodes.item()) <= 0.0 and float(active_edges.item()) <= 0.0:
+                return None
+            onsite_loss = _safe_mean(pack[self._P_ONSITE_WEIGHTED_SUM], active_nodes)
+            hopping_loss = _safe_mean(pack[self._P_HOPPING_WEIGHTED_SUM], active_edges)
 
         loss_module = self._resolve_loss_module(criterion)
         onsite_boost = bool(getattr(loss_module, "onsite_boost", False))

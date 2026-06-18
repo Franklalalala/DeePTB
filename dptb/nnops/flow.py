@@ -159,6 +159,9 @@ class HamiltonianCFM:
         self.compatible_loss_to_legacy_keys = bool(
             options.get("compatible_loss_to_legacy_keys", True)
         )
+        if self.enabled:
+            self.log_train_compatible_loss = True
+            self.log_validation_compatible_loss = True
         # Loss and regularization.
         self.loss_type = str(options.get("loss_type", "mse")).lower()
         if self.loss_type not in {"mse", "l1_rmse"}:

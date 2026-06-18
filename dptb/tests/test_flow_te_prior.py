@@ -10,6 +10,7 @@ from dptb.nnops.flow import (
     HamiltonianPixelMeanFlow,
 )
 from dptb.nnops.loss import HamilLossAbs
+from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
 from dptb.utils.argcheck import common_options, flow_options
 
@@ -82,6 +83,16 @@ class _LazyIrrepIDP(_FakeIDP):
         self.get_irreps_calls += 1
         self.orbpair_irreps = _FakeIrreps()
         return self.orbpair_irreps
+
+
+class _FakeCompatibleLoss:
+    onsite_boost = False
+    z_loss_coef = 0.0
+
+    def __call__(self, pred_data, ref_data):
+        self.last_onsite_loss = torch.tensor(1.25)
+        self.last_hopping_loss = torch.tensor(0.25)
+        return torch.tensor(0.75)
 
 
 def _make_batch(*, device: torch.device, dtype: torch.dtype):
@@ -713,3 +724,51 @@ def test_common_options_argcheck_accepts_nextham_uureal_mask():
 
     assert value["has_soc"] is True
     assert value["nextham_uureal_mask"] is True
+
+
+def test_cfm_forces_compatible_clean_logging_even_when_config_disables_it():
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "log_compatible_loss": False,
+            "log_train_compatible_loss": False,
+            "log_validation_compatible_loss": False,
+        }
+    )
+
+    assert flow.log_train_compatible_loss is True
+    assert flow.log_validation_compatible_loss is True
+    assert flow.compatible_loss_to_legacy_keys is True
+
+
+def test_compatible_loss_state_copies_total_loss_to_legacy_prefix():
+    state = Trainer._compatible_loss_state(
+        _FakeCompatibleLoss(),
+        {},
+        {},
+        prefix="train_compatible",
+        legacy_prefix="train",
+    )
+
+    assert state["train_compatible_loss"].item() == pytest.approx(0.75)
+    assert state["train_loss"].item() == pytest.approx(0.75)
+    assert state["train_onsite_loss"].item() == pytest.approx(1.25)
+    assert state["train_hopping_loss"].item() == pytest.approx(0.25)
+
+
+def test_compatible_pack_loss_falls_back_to_weighted_clean_components():
+    trainer = object.__new__(MultiTrainer)
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer.log_single_model_compatible_loss = True
+    trainer.log_single_model_compatible_loss_mode = "reduce"
+
+    pack = torch.zeros(MultiTrainer._PACK_LEN, dtype=torch.float32)
+    pack[MultiTrainer._P_ONSITE_WEIGHTED_SUM] = 4.0
+    pack[MultiTrainer._P_HOPPING_WEIGHTED_SUM] = 2.0
+    pack[MultiTrainer._P_ACTIVE_NODES_SUM] = 2.0
+    pack[MultiTrainer._P_ACTIVE_EDGES_SUM] = 4.0
+
+    loss = trainer._compute_compatible_loss_from_pack(pack, _FakeCompatibleLoss())
+
+    assert loss.item() == pytest.approx(1.25)

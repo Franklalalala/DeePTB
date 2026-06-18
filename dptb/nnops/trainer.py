@@ -287,8 +287,11 @@ class Trainer(BaseTrainer):
                     setattr(loss_obj, attr, value)
 
         if legacy_prefix is not None:
+            loss_key = f"{prefix}_loss"
             onsite_key = f"{prefix}_onsite_loss"
             hopping_key = f"{prefix}_hopping_loss"
+            if loss_key in state:
+                state[f"{legacy_prefix}_loss"] = state[loss_key]
             if onsite_key in state:
                 state[f"{legacy_prefix}_onsite_loss"] = state[onsite_key]
             if hopping_key in state:
