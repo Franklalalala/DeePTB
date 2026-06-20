@@ -5,6 +5,33 @@ from typing import Any, Optional, Tuple
 import torch
 
 
+def _uureal_mask_cache(idp: Any):
+    raw_mask = getattr(idp, "mask_uureal", None)
+    if raw_mask is None:
+        return None
+    source_id = id(raw_mask)
+    cache = getattr(idp, "_dptb_uureal_mask_cache", None)
+    if isinstance(cache, dict) and cache.get("source_id") == source_id:
+        return cache
+
+    if torch.is_tensor(raw_mask):
+        mask_cpu = raw_mask.detach().to(device="cpu", dtype=torch.bool).reshape(-1)
+    else:
+        mask_cpu = torch.as_tensor(raw_mask, device="cpu", dtype=torch.bool).reshape(-1)
+    cache = {
+        "source_id": source_id,
+        "mask_cpu": mask_cpu,
+        "numel": int(mask_cpu.numel()),
+        "count": int(mask_cpu.sum().item()),
+        "device_masks": {},
+    }
+    try:
+        setattr(idp, "_dptb_uureal_mask_cache", cache)
+    except Exception:
+        pass
+    return cache
+
+
 def uureal_projection_mask(
     idp: Any,
     *,
@@ -17,15 +44,23 @@ def uureal_projection_mask(
     raw_mask = getattr(idp, "mask_uureal", None)
     if raw_mask is None:
         return None
-    if torch.is_tensor(raw_mask):
-        raw_mask = raw_mask.to(device=device or raw_mask.device, dtype=torch.bool).reshape(-1)
-    else:
-        raw_mask = torch.as_tensor(raw_mask, device=device, dtype=torch.bool).reshape(-1)
-    if raw_mask.numel() != int(raw_width):
+    cache = _uureal_mask_cache(idp)
+    if cache is None:
         return None
-    if int(raw_mask.sum().detach().cpu().item()) != int(target_width):
+    if cache["numel"] != int(raw_width) or cache["count"] != int(target_width):
         return None
-    return raw_mask
+
+    if device is None:
+        device = raw_mask.device if torch.is_tensor(raw_mask) else torch.device("cpu")
+    device = torch.device(device)
+    device_key = str(device)
+    device_masks = cache.get("device_masks", {})
+    mask = device_masks.get(device_key)
+    if mask is None:
+        mask = cache["mask_cpu"].to(device=device, dtype=torch.bool)
+        device_masks[device_key] = mask
+        cache["device_masks"] = device_masks
+    return mask
 
 
 def project_uureal_to_like(

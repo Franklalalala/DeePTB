@@ -2069,7 +2069,24 @@ class MultiTrainer(Trainer):
             ),
         }
 
-    def _pack_component_state(self, pack: torch.Tensor, *, prefix: str) -> Dict[str, torch.Tensor]:
+    def _pack_component_state(
+        self,
+        pack: torch.Tensor,
+        *,
+        prefix: str,
+        criterion=None,
+    ) -> Dict[str, torch.Tensor]:
+        compatible_state = self._compute_compatible_state_from_pack(
+            pack,
+            criterion=criterion,
+            prefix=prefix,
+        )
+        if compatible_state is not None:
+            return {
+                f"{prefix}_onsite_loss": compatible_state[f"{prefix}_onsite_loss"],
+                f"{prefix}_hopping_loss": compatible_state[f"{prefix}_hopping_loss"],
+            }
+
         onsite_cnt = pack[self._P_ACTIVE_NODES_SUM].to(dtype=self.dtype).clamp_min(1.0)
         hopping_cnt = pack[self._P_ACTIVE_EDGES_SUM].to(dtype=self.dtype).clamp_min(1.0)
         return {
@@ -2407,7 +2424,14 @@ class MultiTrainer(Trainer):
 
         return total.detach()
 
-    def _compute_compatible_loss_from_pack(self, pack: torch.Tensor, criterion=None):
+    def _compute_compatible_state_from_pack(
+        self,
+        pack: torch.Tensor,
+        criterion=None,
+        *,
+        prefix: str = "train",
+        global_step=None,
+    ):
         if criterion is None:
             criterion = self.train_lossfunc
 
@@ -2418,6 +2442,8 @@ class MultiTrainer(Trainer):
         hopping_cnt = pack[self._P_HOPPING_CNT_SUM]
         loss_module = self._resolve_loss_module(criterion)
         reduce_from_stats = getattr(loss_module, "compatible_loss_from_stats", None)
+        if global_step is None:
+            global_step = getattr(self, "iter", None)
 
         def _safe_mean(sum_t, cnt_t):
             return sum_t / cnt_t.to(dtype=self.dtype).clamp_min(1.0)
@@ -2435,9 +2461,13 @@ class MultiTrainer(Trainer):
                     hopping_mse_sum=pack[self._P_HOPPING_MSE_SUM],
                     hopping_count=hopping_cnt,
                     z_loss=z_loss,
-                    global_step=self.iter,
+                    global_step=global_step,
                 )
-                return total.detach()
+                return {
+                    f"{prefix}_loss": total.detach(),
+                    f"{prefix}_onsite_loss": _onsite_loss.detach(),
+                    f"{prefix}_hopping_loss": _hopping_loss.detach(),
+                }
 
             onsite_l1_mean = _safe_mean(pack[self._P_ONSITE_L1_SUM], onsite_cnt)
             onsite_mse_mean = _safe_mean(pack[self._P_ONSITE_MSE_SUM], onsite_cnt)
@@ -2466,7 +2496,22 @@ class MultiTrainer(Trainer):
         if z_coef > 0.0 and float(pack[self._P_Z_CNT].item()) > 0.0:
             total = total + z_coef * (pack[self._P_Z_SUM] / pack[self._P_Z_CNT].clamp_min(1.0))
 
-        return total.detach()
+        return {
+            f"{prefix}_loss": total.detach(),
+            f"{prefix}_onsite_loss": onsite_loss.detach(),
+            f"{prefix}_hopping_loss": hopping_loss.detach(),
+        }
+
+    def _compute_compatible_loss_from_pack(self, pack: torch.Tensor, criterion=None, *, global_step=None):
+        state = self._compute_compatible_state_from_pack(
+            pack,
+            criterion=criterion,
+            prefix="train",
+            global_step=global_step,
+        )
+        if state is None:
+            return None
+        return state["train_loss"]
 
     def _compute_local_compatible_loss_from_payload(self, payload: Dict[str, Any], criterion=None) -> torch.Tensor:
         out = self._compute_stitched_loss_by_reduce([payload], criterion=criterion)
@@ -2602,11 +2647,30 @@ class MultiTrainer(Trainer):
         total_steps = max(raw_total_steps, 1.0)
 
         train_loss_opt_mean = reduced_pack[self._P_LOSS_OPT_SUM] / total_steps
-        compatible_train_loss = self._compute_compatible_loss_from_pack(reduced_pack, self.train_lossfunc)
-        train_loss_show = compatible_train_loss if compatible_train_loss is not None else train_loss_opt_mean
+        compatible_train_state = self._compute_compatible_state_from_pack(
+            reduced_pack,
+            self.train_lossfunc,
+            prefix="train",
+            global_step=time_idx,
+        )
+        train_loss_show = (
+            compatible_train_state["train_loss"]
+            if compatible_train_state is not None
+            else train_loss_opt_mean
+        )
 
         global_onsite = reduced_pack[self._P_ONSITE_WEIGHTED_SUM] / reduced_pack[self._P_ACTIVE_NODES_SUM].clamp_min(1.0)
         global_hopping = reduced_pack[self._P_HOPPING_WEIGHTED_SUM] / reduced_pack[self._P_ACTIVE_EDGES_SUM].clamp_min(1.0)
+        train_onsite_show = (
+            compatible_train_state["train_onsite_loss"]
+            if compatible_train_state is not None
+            else global_onsite
+        )
+        train_hopping_show = (
+            compatible_train_state["train_hopping_loss"]
+            if compatible_train_state is not None
+            else global_hopping
+        )
         total_grad_norm_mean = reduced_pack[self._P_GRAD_NORM_SUM] / reduced_pack[self._P_STEP_COUNT].clamp_min(1.0)
 
         avg_lr = sum(float(vec[3].item()) for vec in gathered) / max(len(gathered), 1)
@@ -2618,8 +2682,8 @@ class MultiTrainer(Trainer):
             "train_loss_opt": train_loss_opt_mean.detach() if torch.is_tensor(train_loss_opt_mean) else torch.tensor(float(train_loss_opt_mean), device=self.device, dtype=self.dtype),
             "lr": float(avg_lr),
             "total_grad_norm": float(total_grad_norm_mean.item()),
-            "train_onsite_loss": float(global_onsite.item()),
-            "train_hopping_loss": float(global_hopping.item()),
+            "train_onsite_loss": float(train_onsite_show.item()),
+            "train_hopping_loss": float(train_hopping_show.item()),
         }
 
         expert_metrics: Dict[int, List[torch.Tensor]] = {}
@@ -2702,6 +2766,8 @@ class MultiTrainer(Trainer):
         return metric
 
     def _local_scheduler_requires_metric(self) -> bool:
+        if not self.update_lr_per_iter:
+            return False
         if self.distributed_expert:
             sch = self.lr_schedulers[self.local_expert_idx]
             return sch is not None and lr_scheduler_requires_metric(sch)
@@ -3290,11 +3356,33 @@ class MultiTrainer(Trainer):
                 global_onsite = global_onsite_sum / max(total_active_nodes, 1)
                 global_hopping = global_hopping_sum / max(total_active_edges, 1)
 
-                with self._tagger.tag("iteration/compute_train_loss_compatible(reduce)", it=self.iter):
-                    comparable_train_loss = self._compute_stitched_loss_by_reduce(reduce_payloads, self.train_lossfunc)
+                local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
+                for payload in reduce_payloads:
+                    local_pack = local_pack + self._make_step_pack(payload)
 
-                final_train_loss = comparable_train_loss if comparable_train_loss is not None else total_loss_opt
+                with self._tagger.tag("iteration/compute_train_loss_compatible(reduce)", it=self.iter):
+                    compatible_train_state = self._compute_compatible_state_from_pack(
+                        local_pack,
+                        self.train_lossfunc,
+                        prefix="train",
+                    )
+
+                final_train_loss = (
+                    compatible_train_state["train_loss"]
+                    if compatible_train_state is not None
+                    else total_loss_opt
+                )
                 self._local_scheduler_step(final_train_loss)
+                train_onsite_show = (
+                    self._to_float_scalar(compatible_train_state["train_onsite_loss"])
+                    if compatible_train_state is not None
+                    else global_onsite
+                )
+                train_hopping_show = (
+                    self._to_float_scalar(compatible_train_state["train_hopping_loss"])
+                    if compatible_train_state is not None
+                    else global_hopping
+                )
 
                 # ---------------- NEW: make lr consistent: use mean lr across experts ----------------
                 avg_lr = sum(float(opt.param_groups[0]['lr']) for opt in self.optimizers) / max(len(self.optimizers), 1)
@@ -3307,8 +3395,8 @@ class MultiTrainer(Trainer):
                     "train_loss_opt": total_loss_opt,
                     "lr": avg_lr,
                     "total_grad_norm": sum(expert_grad_norms) / max(len(expert_grad_norms), 1),
-                    "train_onsite_loss": global_onsite,
-                    "train_hopping_loss": global_hopping,
+                    "train_onsite_loss": train_onsite_show,
+                    "train_hopping_loss": train_hopping_show,
                 }
 
                 for i in range(self.num_experts):
@@ -3468,7 +3556,11 @@ class MultiTrainer(Trainer):
 
                     self._accumulate_metric_state(
                         validation_metric_sums,
-                        self._pack_component_state(reduced_pack, prefix="validation"),
+                        self._pack_component_state(
+                            reduced_pack,
+                            prefix="validation",
+                            criterion=self.validation_lossfunc,
+                        ),
                     )
 
                 else:
@@ -3507,7 +3599,11 @@ class MultiTrainer(Trainer):
                                 ].clamp_min(1.0)
                                 self._accumulate_metric_state(
                                     validation_metric_sums,
-                                    self._pack_component_state(local_pack, prefix="validation"),
+                                    self._pack_component_state(
+                                        local_pack,
+                                        prefix="validation",
+                                        criterion=self.validation_lossfunc,
+                                    ),
                                 )
                             else:
                                 with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
@@ -3523,7 +3619,11 @@ class MultiTrainer(Trainer):
                         else:
                             self._accumulate_metric_state(
                                 validation_metric_sums,
-                                self._pack_component_state(local_pack, prefix="validation"),
+                                self._pack_component_state(
+                                    local_pack,
+                                    prefix="validation",
+                                    criterion=self.validation_lossfunc,
+                                ),
                             )
                     else:
                         with self._tagger.tag("validation/full_forward_stitched", it=self.iter):

@@ -1779,13 +1779,17 @@ class Validationer(Monitor):
         if kwargs.get('field') == "iteration":
             val = self.trainer.validation(fast=True)
             self._sync_flow_metrics(epoch=False, time=kwargs.get("time"))
-            return val
+            flow_state = getattr(self.trainer, "_last_flow_validation_state", {})
+            return flow_state.get("validation_loss", val)
 
     def epoch(self, **kwargs):
         epoch = kwargs.get("time", self.trainer.ep)
         stats = self.trainer.stats.setdefault(self.stat_name, {})
         val = self.trainer.validation(fast=self.fast_mode)
         self._sync_flow_metrics(epoch=True, time=epoch)
+        flow_state = getattr(self.trainer, "_last_flow_validation_state", {})
+        if "validation_loss" in flow_state:
+            val = flow_state["validation_loss"]
         if torch.is_tensor(val):
             val = val.detach()
             if val.ndim > 0:

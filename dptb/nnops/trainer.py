@@ -613,21 +613,31 @@ class Trainer(BaseTrainer):
                             self.model, original_batch, num_steps=num_steps
                         )
                         sampled.update(batch_info)
-                        sample_loss, _ = self.flow_cfm.loss(sampled, t0_ref, t0_ctx)
+                        sample_loss, sample_state = self.flow_cfm.loss(sampled, t0_ref, t0_ctx)
                         key = f"validation_flow_euler_{num_steps}_loss"
                         flow_metric_sums[key] = (
                             flow_metric_sums.get(key, 0.0) + sample_loss.detach()
                         )
                         if self.flow_cfm.log_validation_compatible_loss:
-                            self._accumulate_metric_state(
-                                flow_metric_sums,
-                                self._compatible_loss_state(
+                            compatible_state = self._compatible_loss_state_from_flow_stats(
+                                self.validation_lossfunc,
+                                sample_state,
+                                source_prefix=f"validation_compatible_euler_{num_steps}",
+                                prefix=f"validation_compatible_euler_{num_steps}",
+                                legacy_prefix="validation" if int(num_steps) == 1 else None,
+                                global_step=getattr(self, "iter", None),
+                            )
+                            if compatible_state is None:
+                                compatible_state = self._compatible_loss_state(
                                     self.validation_lossfunc,
                                     sampled,
                                     t0_ref,
                                     prefix=f"validation_compatible_euler_{num_steps}",
                                     legacy_prefix="validation" if int(num_steps) == 1 else None,
-                                ),
+                                )
+                            self._accumulate_metric_state(
+                                flow_metric_sums,
+                                compatible_state,
                             )
                 else:
                     batch = self.model(batch)

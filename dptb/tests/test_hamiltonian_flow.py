@@ -11,7 +11,7 @@ from dptb.nnops.loss import HamilLossAbs
 from dptb.nnops import trainer as trainer_module
 from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
-from dptb.plugins.monitor import TensorBoardMonitor
+from dptb.plugins.monitor import TensorBoardMonitor, Validationer
 
 train_entrypoint = importlib.import_module("dptb.entrypoints.train")
 
@@ -238,6 +238,15 @@ def _masked_stats(diff, mask):
     }
 
 
+def _scalar(value):
+    if torch.is_tensor(value):
+        value = value.detach()
+        if value.ndim > 0:
+            value = value.mean()
+        return float(value.item())
+    return float(value)
+
+
 @pytest.mark.parametrize(
     "loss_kwargs",
     [
@@ -271,6 +280,8 @@ def test_hamil_abs_compatible_stats_match_forward_semantics(loss_kwargs):
     }
 
     forward_total = lossfunc(pred, ref)
+    forward_onsite = lossfunc.last_onsite_loss.detach().clone()
+    forward_hopping = lossfunc.last_hopping_loss.detach().clone()
     node_mask = idp.mask_to_nrme[pred[AtomicDataDict.ATOM_TYPE_KEY].flatten()]
     edge_mask = idp.mask_to_erme[pred[AtomicDataDict.EDGE_TYPE_KEY].flatten()]
     node_stats = _masked_stats(
@@ -294,8 +305,8 @@ def test_hamil_abs_compatible_stats_match_forward_semantics(loss_kwargs):
     )
 
     torch.testing.assert_close(stats_total, forward_total.detach())
-    torch.testing.assert_close(stats_onsite, lossfunc.last_onsite_loss)
-    torch.testing.assert_close(stats_hopping, lossfunc.last_hopping_loss)
+    torch.testing.assert_close(stats_onsite, forward_onsite)
+    torch.testing.assert_close(stats_hopping, forward_hopping)
 
 
 def _pred_ref():
@@ -650,6 +661,106 @@ def test_multitrainer_non_display_step_does_not_run_full_compatible_loss():
     assert result["hopping"].item() > 0.0
 
 
+def _trainer_for_compatible_pack(lossfunc):
+    trainer = object.__new__(MultiTrainer)
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer.train_lossfunc = lossfunc
+    trainer.log_single_model_compatible_loss = True
+    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.iter = 2
+    return trainer
+
+
+def _pack_with_conflicting_active_component_means():
+    pack = torch.zeros(MultiTrainer._PACK_LEN, dtype=torch.float32)
+    pack[MultiTrainer._P_LOSS_OPT_SUM] = 5.0
+    pack[MultiTrainer._P_STEP_COUNT] = 1.0
+    pack[MultiTrainer._P_ONSITE_WEIGHTED_SUM] = 99.0
+    pack[MultiTrainer._P_HOPPING_WEIGHTED_SUM] = 77.0
+    pack[MultiTrainer._P_ACTIVE_NODES_SUM] = 1.0
+    pack[MultiTrainer._P_ACTIVE_EDGES_SUM] = 1.0
+    pack[MultiTrainer._P_ONSITE_L1_SUM] = 4.0
+    pack[MultiTrainer._P_ONSITE_MSE_SUM] = 10.0
+    pack[MultiTrainer._P_ONSITE_CNT_SUM] = 2.0
+    pack[MultiTrainer._P_HOPPING_L1_SUM] = 3.0
+    pack[MultiTrainer._P_HOPPING_MSE_SUM] = 9.0
+    pack[MultiTrainer._P_HOPPING_CNT_SUM] = 3.0
+    return pack
+
+
+def test_compatible_pack_component_tags_use_same_stats_semantics_as_total():
+    trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
+    state = trainer._pack_component_state(
+        _pack_with_conflicting_active_component_means(),
+        prefix="validation",
+        criterion=trainer.train_lossfunc,
+    )
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+    assert state["validation_onsite_loss"].item() == pytest.approx(onsite)
+    assert state["validation_hopping_loss"].item() == pytest.approx(hopping)
+
+
+def test_display_window_component_tags_use_compatible_stats_semantics():
+    trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
+    trainer.distributed_expert = False
+    trainer.num_experts = 1
+    trainer.world_size = 1
+    trainer._tagger = _NoopTagger()
+    trainer.display_sync_freq = 1
+    trainer._display_window_pack_local = _pack_with_conflicting_active_component_means()
+    trainer._display_window_dynamic_batch_pack_local = torch.zeros(
+        MultiTrainer._DB_PACK_LEN, dtype=torch.float32
+    )
+    trainer._gather_cuda_memory_metrics = lambda: {}
+    trainer._all_reduce_ = lambda tensor, name=None: tensor
+    trainer._gather_display_window_expert_metrics = lambda: [
+        torch.tensor([99.0, 77.0, 0.0, 0.1, 1.0, 1.0])
+    ]
+    trainer._rank_to_expert_idx = lambda rank_idx: 0
+    trainer._add_optimizer_diagnostics_to_state = lambda state: None
+    trainer._add_cuda_memory_state = lambda state, metrics: None
+    trainer._reset_display_window_buffers = lambda: None
+
+    state = trainer._flush_display_window(time_idx=2)
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+    total = 0.5 * (onsite + hopping)
+    assert _scalar(state["train_loss"]) == pytest.approx(total)
+    assert _scalar(state["train_onsite_loss"]) == pytest.approx(onsite)
+    assert _scalar(state["train_hopping_loss"]) == pytest.approx(hopping)
+
+
+def test_validationer_preserves_clean_validation_loss_from_flow_state():
+    class _TrainerWithFlowValidation:
+        def __init__(self):
+            self.stats = {}
+            self.ep = 3
+            self._last_flow_validation_state = {}
+
+        def validation(self, fast=True):
+            self._last_flow_validation_state = {
+                "validation_loss": torch.tensor(1.25),
+                "validation_onsite_loss": torch.tensor(0.5),
+                "validation_hopping_loss": torch.tensor(2.0),
+            }
+            return torch.tensor(99.0)
+
+    trainer = _TrainerWithFlowValidation()
+    validationer = Validationer(interval=1)
+    validationer.trainer = trainer
+
+    value = validationer._get_value(field="iteration", time=10)
+    assert _scalar(value) == pytest.approx(1.25)
+    assert trainer.stats["validation_loss"]["last"] == pytest.approx(1.25)
+
+    validationer.epoch(time=3)
+    assert trainer.stats["validation_loss"]["epoch_mean"] == pytest.approx(1.25)
+
+
 def test_non_metric_scheduler_does_not_reduce_compatible_scalar():
     param = torch.nn.Parameter(torch.tensor(1.0))
     optimizer = torch.optim.SGD([param], lr=0.1)
@@ -666,6 +777,19 @@ def test_non_metric_scheduler_does_not_reduce_compatible_scalar():
     )
 
     trainer._local_scheduler_step(None)
+
+
+def test_disabled_iter_scheduler_does_not_request_metric():
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+    trainer = object.__new__(MultiTrainer)
+    trainer.update_lr_per_iter = False
+    trainer.distributed_expert = True
+    trainer.local_expert_idx = 0
+    trainer.lr_schedulers = [scheduler]
+
+    assert trainer._local_scheduler_requires_metric() is False
 
 
 def test_tensorboard_monitor_writes_fresh_validation_iter_tags():

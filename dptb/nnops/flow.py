@@ -182,6 +182,7 @@ class HamiltonianCFM:
             )
 
         self.last_state: Dict[str, torch.Tensor] = {}
+        self._te_irrep_slices_cache: Dict[int, Optional[Tuple[Tuple[int, int, int], ...]]] = {}
         if self.enabled:
             log.info(
                 "Hamiltonian CFM enabled: mode=%s prior=%s t=[%.3g, %.3g] t0_prob=%.3g loss=%s",
@@ -468,19 +469,29 @@ class HamiltonianCFM:
         return values[:count]
 
     def _te_irrep_slices(self, feature_dim: int) -> Optional[Tuple[Tuple[int, int, int], ...]]:
+        feature_dim = int(feature_dim)
+        cache = getattr(self, "_te_irrep_slices_cache", None)
+        if isinstance(cache, dict) and feature_dim in cache:
+            return cache[feature_dim]
+
+        def _remember(value):
+            if isinstance(cache, dict):
+                cache[feature_dim] = value
+            return value
+
         if self.idp is None:
-            return None
+            return _remember(None)
         irreps = getattr(self.idp, "orbpair_irreps", None)
         if irreps is None:
             get_irreps = getattr(self.idp, "get_irreps", None)
             if not callable(get_irreps):
-                return None
+                return _remember(None)
             try:
                 irreps = get_irreps()
             except Exception:
-                return None
+                return _remember(None)
             if irreps is None:
-                return None
+                return _remember(None)
         # Feature rows follow OrbitalMapper/orbpair_maps order. Sorting irreps
         # changes contiguous feature spans and breaks mask/typewise raw-slice priors.
         raw_irreps = irreps
@@ -495,28 +506,28 @@ class HamiltonianCFM:
                     slices.append((offset, offset + width, degree))
                     offset += width
         except Exception:
-            return None
-        if offset != int(feature_dim):
+            return _remember(None)
+        if offset != feature_dim:
             raw_mask = getattr(self.idp, "mask_uureal", None)
             if raw_mask is None:
-                return None
-            raw_mask = raw_mask.to(dtype=torch.bool).reshape(-1)
+                return _remember(None)
+            raw_mask = raw_mask.detach().to(device="cpu", dtype=torch.bool).reshape(-1)
             if raw_mask.numel() != offset:
-                return None
-            if int(raw_mask.sum().detach().cpu().item()) != int(feature_dim):
-                return None
+                return _remember(None)
+            if int(raw_mask.sum().item()) != feature_dim:
+                return _remember(None)
             projected_slices = []
             compressed_offset = 0
             for start, end, degree in slices:
-                kept = int(raw_mask[start:end].sum().detach().cpu().item())
+                kept = int(raw_mask[start:end].sum().item())
                 if kept <= 0:
                     continue
                 projected_slices.append((compressed_offset, compressed_offset + kept, degree))
                 compressed_offset += kept
-            if compressed_offset != int(feature_dim):
-                return None
-            return tuple(projected_slices)
-        return tuple(slices)
+            if compressed_offset != feature_dim:
+                return _remember(None)
+            return _remember(tuple(projected_slices))
+        return _remember(tuple(slices))
 
     def _te_radius(
         self,
@@ -526,13 +537,45 @@ class HamiltonianCFM:
         *,
         device: torch.device,
         dtype: torch.dtype,
+        num_graphs: Optional[int] = None,
     ) -> torch.Tensor:
         if self.te_prior_per_graph and graph_index is not None and graph_index.numel() == row_count:
-            num_graphs = int(graph_index.max().detach().item()) + 1 if row_count > 0 else 1
+            if num_graphs is None:
+                num_graphs = int(graph_index.max().detach().item()) + 1 if row_count > 0 else 1
             radius = torch.randn(num_graphs, 1, device=device, dtype=dtype).index_select(0, graph_index)
         else:
             radius = torch.randn(row_count, 1, device=device, dtype=dtype)
         return radius * active_dim.sqrt()
+
+    def _te_radius_for_prior(
+        self,
+        row_count: int,
+        active_dim: torch.Tensor,
+        graph_index: Optional[torch.Tensor],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        num_graphs: Optional[int] = None,
+    ) -> torch.Tensor:
+        try:
+            return self._te_radius(
+                row_count,
+                active_dim,
+                graph_index,
+                device=device,
+                dtype=dtype,
+                num_graphs=num_graphs,
+            )
+        except TypeError as exc:
+            if "num_graphs" not in str(exc):
+                raise
+            return self._te_radius(
+                row_count,
+                active_dim,
+                graph_index,
+                device=device,
+                dtype=dtype,
+            )
 
     def _block_structured_prior_like(
         self,
@@ -540,6 +583,8 @@ class HamiltonianCFM:
         mask: torch.Tensor,
         data: Optional[AtomicDataDict.Type],
         label: Optional[str],
+        *,
+        num_graphs: Optional[int] = None,
     ) -> torch.Tensor:
         if like.ndim < 2:
             return torch.randn_like(like)
@@ -549,8 +594,13 @@ class HamiltonianCFM:
         direction = raw / norm
         active_dim = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
         graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
-        radius = self._te_radius(
-            like.shape[0], active_dim, graph_index, device=like.device, dtype=like.dtype
+        radius = self._te_radius_for_prior(
+            like.shape[0],
+            active_dim,
+            graph_index,
+            device=like.device,
+            dtype=like.dtype,
+            num_graphs=num_graphs,
         )
         return direction * radius * mask_f
 
@@ -611,6 +661,7 @@ class HamiltonianCFM:
         data: Optional[AtomicDataDict.Type] = None,
         label: Optional[str] = None,
         reference_scale: bool = True,
+        num_graphs: Optional[int] = None,
     ) -> torch.Tensor:
         if like.numel() == 0:
             return torch.zeros_like(like)
@@ -636,7 +687,13 @@ class HamiltonianCFM:
 
         if like.ndim < 2 or slices is None:
             slices = ((0, like.shape[-1], -1),) if like.ndim >= 2 else ((0, like.numel(), -1),)
-            noise = self._block_structured_prior_like(like, mask, data, label)
+            noise = self._block_structured_prior_like(
+                like,
+                mask,
+                data,
+                label,
+                num_graphs=num_graphs,
+            )
         else:
             noise = torch.zeros_like(like)
             graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
@@ -647,8 +704,13 @@ class HamiltonianCFM:
                 norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
                 direction = raw / norm
                 active_dim = seg_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                radius = self._te_radius(
-                    like.shape[0], active_dim, graph_index, device=like.device, dtype=like.dtype
+                radius = self._te_radius_for_prior(
+                    like.shape[0],
+                    active_dim,
+                    graph_index,
+                    device=like.device,
+                    dtype=like.dtype,
+                    num_graphs=num_graphs,
                 )
                 noise[:, start:end] = direction * radius * seg_mask
 
@@ -671,6 +733,7 @@ class HamiltonianCFM:
         data: Optional[AtomicDataDict.Type] = None,
         label: Optional[str] = None,
         reference_scale: bool = True,
+        num_graphs: Optional[int] = None,
     ) -> torch.Tensor:
         if self.prior == "zero":
             return torch.zeros_like(residual)
@@ -683,6 +746,7 @@ class HamiltonianCFM:
                 data=data,
                 label=label,
                 reference_scale=reference_scale,
+                num_graphs=num_graphs,
             )
         # residual_gaussian: match global residual scale, useful as a rough TE/GOE proxy.
         scale = residual.detach().std().clamp_min(self.residual_sigma_floor)
@@ -732,7 +796,13 @@ class HamiltonianCFM:
             node_target = node_target.to(device=device, dtype=dtype)
             node_base = self._base_like(data, node_target, self.node_h0_key, "node")
             node_res = node_target - node_base
-            node_prior = self._prior_like(node_res, self.node_sigma, data=data, label="node")
+            node_prior = self._prior_like(
+                node_res,
+                self.node_sigma,
+                data=data,
+                label="node",
+                num_graphs=num_graphs,
+            )
             node_t_view = node_t.reshape((-1,) + (1,) * (node_target.ndim - 1))
             node_current = node_base + (1.0 - node_t_view) * node_prior + node_t_view * node_res
             if self.detach_interpolated_h0:
@@ -745,7 +815,13 @@ class HamiltonianCFM:
             edge_target = edge_target.to(device=device, dtype=dtype)
             edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
             edge_res = edge_target - edge_base
-            edge_prior = self._prior_like(edge_res, self.edge_sigma, data=data, label="edge")
+            edge_prior = self._prior_like(
+                edge_res,
+                self.edge_sigma,
+                data=data,
+                label="edge",
+                num_graphs=num_graphs,
+            )
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_target.ndim - 1))
             edge_current = edge_base + (1.0 - edge_t_view) * edge_prior + edge_t_view * edge_res
             if self.detach_interpolated_h0:

@@ -741,6 +741,25 @@ def test_validation_t0_call_with_te_prior_keeps_prepare_batch_signature():
     assert ctx.edge_current.shape == ref[_keys.EDGE_FEATURES_KEY].shape
 
 
+def test_te_prior_passes_num_graphs_to_radius_once_per_batch():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    flow = _flow("te", device=device, dtype=dtype, te_prior_mode="irrep")
+    seen_num_graphs = []
+
+    def radius(row_count, active_dim, graph_index, *, device, dtype, num_graphs=None):
+        seen_num_graphs.append(num_graphs)
+        return active_dim.to(device=device, dtype=dtype).sqrt()
+
+    flow._te_radius = radius
+
+    flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    assert seen_num_graphs
+    assert all(value == 2 for value in seen_num_graphs)
+
+
 def test_flow_options_argcheck_accepts_te_prior_config_keys():
     schema = flow_options()
 
