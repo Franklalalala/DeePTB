@@ -687,6 +687,59 @@ class HamilLossAbs(nn.Module):
         progress = min(self._step / max(self.onsite_boost_steps, 1), 1.0)
         return self.onsite_boost_max - (self.onsite_boost_max - 1.0) * progress
 
+    def compatible_loss_from_stats(
+        self,
+        *,
+        onsite_l1_sum: torch.Tensor,
+        onsite_mse_sum: torch.Tensor,
+        onsite_count: torch.Tensor,
+        hopping_l1_sum: torch.Tensor,
+        hopping_mse_sum: torch.Tensor,
+        hopping_count: torch.Tensor,
+        z_loss=None,
+        global_step=None,
+    ):
+        """Rebuild the non-CFM clean HamilLossAbs values from reduced stats."""
+        if global_step is not None:
+            self._step = int(global_step)
+
+        onsite_loss = _l1_rmse_loss_from_sums(
+            abs_sum=onsite_l1_sum,
+            square_sum=onsite_mse_sum,
+            count=onsite_count,
+        )
+        hopping_loss = _l1_rmse_loss_from_sums(
+            abs_sum=hopping_l1_sum,
+            square_sum=hopping_mse_sum,
+            count=hopping_count,
+        )
+
+        self.last_onsite_l1_sum = onsite_l1_sum.detach()
+        self.last_onsite_mse_sum = onsite_mse_sum.detach()
+        self.last_onsite_count = onsite_count.detach()
+        self.last_hopping_l1_sum = hopping_l1_sum.detach()
+        self.last_hopping_mse_sum = hopping_mse_sum.detach()
+        self.last_hopping_count = hopping_count.detach()
+        self.last_onsite_loss = onsite_loss.detach()
+        self.last_hopping_loss = hopping_loss.detach()
+
+        if self.onsite_boost:
+            total_loss = self._current_onsite_weight() * onsite_loss + hopping_loss
+        elif self.element_average:
+            total_loss = _l1_rmse_loss_from_sums(
+                abs_sum=onsite_l1_sum + hopping_l1_sum,
+                square_sum=onsite_mse_sum + hopping_mse_sum,
+                count=onsite_count + hopping_count,
+            )
+        else:
+            total_loss = 0.5 * (onsite_loss + hopping_loss)
+
+        self.last_z_loss = z_loss.detach() if isinstance(z_loss, torch.Tensor) else z_loss
+        if self.z_loss_coef > 0 and isinstance(z_loss, torch.Tensor):
+            total_loss = total_loss + self.z_loss_coef * z_loss
+
+        return total_loss.detach(), onsite_loss.detach(), hopping_loss.detach()
+
     def forward(self, data: AtomicDataDict, ref_data: AtomicDataDict):
         if "global_step" in data:
             try:

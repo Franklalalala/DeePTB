@@ -147,6 +147,12 @@ class Trainer(BaseTrainer):
         "last_hopping_loss",
         "last_z_loss",
         "expert_load_cv",
+        "last_onsite_l1_sum",
+        "last_onsite_mse_sum",
+        "last_onsite_count",
+        "last_hopping_l1_sum",
+        "last_hopping_mse_sum",
+        "last_hopping_count",
     )
 
     @staticmethod
@@ -219,8 +225,18 @@ class Trainer(BaseTrainer):
             if self.flow_cfm.log_train_compatible_loss and not getattr(
                 self.flow_cfm, "model_in_loss", False
             ):
-                flow_state.update(
-                    self._compatible_loss_state(
+                compatible_state = self._compatible_loss_state_from_flow_stats(
+                    lossfunc,
+                    flow_state,
+                    source_prefix="train",
+                    prefix="train_compatible",
+                    legacy_prefix=(
+                        "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
+                    ),
+                    global_step=getattr(self, "iter", None),
+                )
+                if compatible_state is None:
+                    compatible_state = self._compatible_loss_state(
                         lossfunc,
                         batch,
                         batch_for_loss,
@@ -229,7 +245,8 @@ class Trainer(BaseTrainer):
                             "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
                         ),
                     )
-                )
+                flow_state.update(compatible_state)
+            flow_state.pop("_compatible_clean_stats", None)
             self._last_flow_state = flow_state
             return loss
         self._last_flow_state = {}
@@ -296,6 +313,78 @@ class Trainer(BaseTrainer):
                 state[f"{legacy_prefix}_onsite_loss"] = state[onsite_key]
             if hopping_key in state:
                 state[f"{legacy_prefix}_hopping_loss"] = state[hopping_key]
+        return state
+
+    @staticmethod
+    def _compatible_loss_state_from_flow_stats(
+        lossfunc,
+        flow_state,
+        *,
+        source_prefix,
+        prefix,
+        legacy_prefix=None,
+        global_step=None,
+    ):
+        stats = flow_state.get("_compatible_clean_stats", None)
+        if not isinstance(stats, dict):
+            return None
+
+        required = (
+            "onsite_l1_sum",
+            "onsite_mse_sum",
+            "onsite_count",
+            "hopping_l1_sum",
+            "hopping_mse_sum",
+            "hopping_count",
+        )
+        if any(stats.get(key, None) is None for key in required):
+            return None
+
+        loss_obj = Trainer._loss_component_source(lossfunc)
+        reduce_from_stats = getattr(loss_obj, "compatible_loss_from_stats", None)
+        if not callable(reduce_from_stats):
+            return None
+
+        z_loss = flow_state.get(
+            "mean_max_prob",
+            flow_state.get(f"{source_prefix}_mean_max_prob", None),
+        )
+        compatible_loss, onsite_loss, hopping_loss = reduce_from_stats(
+            onsite_l1_sum=stats["onsite_l1_sum"],
+            onsite_mse_sum=stats["onsite_mse_sum"],
+            onsite_count=stats["onsite_count"],
+            hopping_l1_sum=stats["hopping_l1_sum"],
+            hopping_mse_sum=stats["hopping_mse_sum"],
+            hopping_count=stats["hopping_count"],
+            z_loss=z_loss,
+            global_step=global_step,
+        )
+
+        state = {
+            f"{prefix}_loss": compatible_loss.detach(),
+            f"{prefix}_onsite_loss": onsite_loss.detach(),
+            f"{prefix}_hopping_loss": hopping_loss.detach(),
+        }
+
+        def _detached_scalar(value, like=compatible_loss, default=0.0):
+            if value is None:
+                value = default
+            if torch.is_tensor(value):
+                return value.detach()
+            return like.new_tensor(float(value))
+
+        state[f"{prefix}_mean_max_prob"] = _detached_scalar(z_loss)
+        state[f"{prefix}_expert_load_cv"] = _detached_scalar(
+            flow_state.get(
+                "expert_load_cv",
+                flow_state.get(f"{source_prefix}_expert_load_cv", None),
+            )
+        )
+
+        if legacy_prefix is not None:
+            state[f"{legacy_prefix}_loss"] = state[f"{prefix}_loss"]
+            state[f"{legacy_prefix}_onsite_loss"] = state[f"{prefix}_onsite_loss"]
+            state[f"{legacy_prefix}_hopping_loss"] = state[f"{prefix}_hopping_loss"]
         return state
 
     @staticmethod

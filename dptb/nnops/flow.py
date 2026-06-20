@@ -574,21 +574,33 @@ class HamiltonianCFM:
         out = noise.clone()
         ref = reference.detach().to(device=noise.device, dtype=noise.dtype)
         mask_f = mask.to(device=noise.device, dtype=noise.dtype)
-        for type_value in torch.unique(type_index).detach().cpu().tolist():
-            rows = type_index == int(type_value)
-            if not bool(rows.any().detach().cpu().item()):
-                continue
-            for start, end, _degree in slices:
-                seg_mask = mask_f[rows, start:end]
-                count = seg_mask.sum()
-                if not bool((count > 0).detach().cpu().item()):
-                    continue
-                rms = ((ref[rows, start:end].square() * seg_mask).sum() / count).sqrt()
-                if not bool(torch.isfinite(rms).detach().cpu().item()):
-                    continue
-                out[rows, start:end] = out[rows, start:end] * rms.clamp_min(
-                    self.residual_sigma_floor
-                )
+        _types, inverse = torch.unique(type_index, sorted=True, return_inverse=True)
+        num_types = int(_types.numel())
+        if num_types == 0:
+            return out
+
+        for start, end, _degree in slices:
+            seg_mask = mask_f[:, start:end]
+            row_count = seg_mask.sum(dim=-1)
+            row_square_sum = (ref[:, start:end].square() * seg_mask).sum(dim=-1)
+
+            type_count = torch.zeros(
+                num_types, device=noise.device, dtype=noise.dtype
+            ).scatter_add_(0, inverse, row_count)
+            type_square_sum = torch.zeros_like(type_count).scatter_add_(
+                0, inverse, row_square_sum
+            )
+
+            rms = torch.sqrt(type_square_sum / type_count.clamp_min(1.0))
+            valid = (type_count > 0) & torch.isfinite(rms)
+            scale_by_type = torch.where(
+                valid,
+                rms.clamp_min(self.residual_sigma_floor),
+                torch.ones_like(rms),
+            )
+            out[:, start:end] = (
+                out[:, start:end] * scale_by_type.index_select(0, inverse).unsqueeze(-1)
+            )
         return out
 
     def _te_prior_like(
@@ -820,6 +832,25 @@ class HamiltonianCFM:
         metric = 0.5 * (l1 + rmse)
         return metric, metric * count, count
 
+    @staticmethod
+    def _compatible_clean_stats(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+        component: str,
+    ) -> Dict[str, torch.Tensor]:
+        """Collect non-CFM HamilLossAbs reductions from an already aligned diff."""
+        with torch.no_grad():
+            diff = diff.detach()
+            mask_f = mask.to(device=diff.device, dtype=diff.dtype)
+            abs_sum = (diff.abs() * mask_f).sum()
+            square_sum = (diff.square() * mask_f).sum()
+            count = mask_f.sum()
+        return {
+            f"{component}_l1_sum": abs_sum.detach(),
+            f"{component}_mse_sum": square_sum.detach(),
+            f"{component}_count": count.detach(),
+        }
+
     def _time_weight(self, t: torch.Tensor) -> torch.Tensor:
         if self.omit_time_scaling or self.endpoint_weight_power == 0.0:
             return torch.ones_like(t)
@@ -853,10 +884,15 @@ class HamiltonianCFM:
             target = ref_data[self.node_target_key].to(device=pred.device, dtype=pred.dtype)
             mask = self._node_mask(pred_data, pred)
             pred, mask = self._project_loss_layout(pred, mask, target)
+            node_diff = pred - target
             node_weights = self._time_weight(ctx.node_t)
             node_loss, node_numerator, node_count = self._metric_stats(
-                pred - target, mask, self.loss_type, node_weights
+                node_diff, mask, self.loss_type, node_weights
             )
+            if self.log_train_compatible_loss or self.log_validation_compatible_loss:
+                state.setdefault("_compatible_clean_stats", {}).update(
+                    self._compatible_clean_stats(node_diff, mask, "onsite")
+                )
             total = self.node_weight * node_loss if total is None else total + self.node_weight * node_loss
             total_numerator = self.node_weight * node_numerator
             total_count = self.node_weight * node_count
@@ -870,10 +906,15 @@ class HamiltonianCFM:
             target = ref_data[self.edge_target_key].to(device=pred.device, dtype=pred.dtype)
             mask = self._edge_mask(pred_data, pred)
             pred, mask = self._project_loss_layout(pred, mask, target)
+            edge_diff = pred - target
             edge_weights = self._time_weight(ctx.edge_t)
             edge_loss, edge_numerator, edge_count = self._metric_stats(
-                pred - target, mask, self.loss_type, edge_weights
+                edge_diff, mask, self.loss_type, edge_weights
             )
+            if self.log_train_compatible_loss or self.log_validation_compatible_loss:
+                state.setdefault("_compatible_clean_stats", {}).update(
+                    self._compatible_clean_stats(edge_diff, mask, "hopping")
+                )
             total = self.edge_weight * edge_loss if total is None else total + self.edge_weight * edge_loss
             if total_numerator is None:
                 total_numerator = self.edge_weight * edge_numerator

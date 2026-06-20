@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
+from dptb.data import AtomicDataDict
+from dptb.nnops.loss import HamilLossAbs
 from dptb.nnops import trainer as trainer_module
 from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
@@ -165,6 +167,137 @@ class _ComponentLoss(torch.nn.Module):
         return 0.5 * (onsite + hopping)
 
 
+class _StatsCompatibleLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+        self.stats_calls = 0
+        self.onsite_boost = False
+        self.element_average = False
+        self.z_loss_coef = 0.0
+
+    def forward(self, pred, ref):
+        self.forward_calls += 1
+        raise AssertionError("compatible logging must not re-run the full criterion")
+
+    def compatible_loss_from_stats(
+        self,
+        *,
+        onsite_l1_sum,
+        onsite_mse_sum,
+        onsite_count,
+        hopping_l1_sum,
+        hopping_mse_sum,
+        hopping_count,
+        z_loss=None,
+        global_step=None,
+    ):
+        self.stats_calls += 1
+        onsite = 0.5 * (
+            onsite_l1_sum / onsite_count.clamp_min(1.0)
+            + torch.sqrt(onsite_mse_sum / onsite_count.clamp_min(1.0) + 1e-12)
+        )
+        hopping = 0.5 * (
+            hopping_l1_sum / hopping_count.clamp_min(1.0)
+            + torch.sqrt(hopping_mse_sum / hopping_count.clamp_min(1.0) + 1e-12)
+        )
+        return 0.5 * (onsite + hopping), onsite, hopping
+
+
+def _compatible_clean_stats():
+    return {
+        "_compatible_clean_stats": {
+            "onsite_l1_sum": torch.tensor(4.0),
+            "onsite_mse_sum": torch.tensor(10.0),
+            "onsite_count": torch.tensor(2.0),
+            "hopping_l1_sum": torch.tensor(3.0),
+            "hopping_mse_sum": torch.tensor(9.0),
+            "hopping_count": torch.tensor(3.0),
+        },
+        "mean_max_prob": torch.tensor(0.75),
+        "expert_load_cv": torch.tensor(0.25),
+    }
+
+
+class _LossIDP:
+    def __init__(self):
+        self.mask_to_nrme = torch.tensor(
+            [[True, True, False], [True, False, True]]
+        )
+        self.mask_to_erme = torch.tensor(
+            [[True, False, True], [False, True, True]]
+        )
+
+
+def _masked_stats(diff, mask):
+    mask_f = mask.to(dtype=diff.dtype)
+    return {
+        "l1_sum": (diff.abs() * mask_f).sum(),
+        "mse_sum": (diff.square() * mask_f).sum(),
+        "count": mask_f.sum().to(dtype=diff.dtype),
+    }
+
+
+@pytest.mark.parametrize(
+    "loss_kwargs",
+    [
+        {"element_average": False, "z_loss_coef": 0.2},
+        {"element_average": True, "z_loss_coef": 0.2},
+        {"onsite_boost": True, "onsite_boost_steps": 100, "onsite_boost_max": 3.0},
+    ],
+)
+def test_hamil_abs_compatible_stats_match_forward_semantics(loss_kwargs):
+    idp = _LossIDP()
+    lossfunc = HamilLossAbs(idp=idp, dtype=torch.float64, **loss_kwargs)
+    pred = {
+        AtomicDataDict.ATOM_TYPE_KEY: torch.tensor([0, 1]),
+        AtomicDataDict.EDGE_TYPE_KEY: torch.tensor([0, 1]),
+        AtomicDataDict.NODE_FEATURES_KEY: torch.tensor(
+            [[1.0, -2.0, 9.0], [3.0, 8.0, -4.0]], dtype=torch.float64
+        ),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.tensor(
+            [[5.0, 7.0, -6.0], [11.0, -8.0, 2.0]], dtype=torch.float64
+        ),
+        "mean_max_prob": torch.tensor(0.25, dtype=torch.float64),
+        "global_step": 25,
+    }
+    ref = {
+        AtomicDataDict.NODE_FEATURES_KEY: torch.tensor(
+            [[0.5, -1.0, 0.0], [1.0, 0.0, -1.0]], dtype=torch.float64
+        ),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.tensor(
+            [[3.0, 0.0, -2.0], [0.0, -5.0, 3.0]], dtype=torch.float64
+        ),
+    }
+
+    forward_total = lossfunc(pred, ref)
+    node_mask = idp.mask_to_nrme[pred[AtomicDataDict.ATOM_TYPE_KEY].flatten()]
+    edge_mask = idp.mask_to_erme[pred[AtomicDataDict.EDGE_TYPE_KEY].flatten()]
+    node_stats = _masked_stats(
+        pred[AtomicDataDict.NODE_FEATURES_KEY] - ref[AtomicDataDict.NODE_FEATURES_KEY],
+        node_mask,
+    )
+    edge_stats = _masked_stats(
+        pred[AtomicDataDict.EDGE_FEATURES_KEY] - ref[AtomicDataDict.EDGE_FEATURES_KEY],
+        edge_mask,
+    )
+
+    stats_total, stats_onsite, stats_hopping = lossfunc.compatible_loss_from_stats(
+        onsite_l1_sum=node_stats["l1_sum"],
+        onsite_mse_sum=node_stats["mse_sum"],
+        onsite_count=node_stats["count"],
+        hopping_l1_sum=edge_stats["l1_sum"],
+        hopping_mse_sum=edge_stats["mse_sum"],
+        hopping_count=edge_stats["count"],
+        z_loss=pred["mean_max_prob"],
+        global_step=pred["global_step"],
+    )
+
+    torch.testing.assert_close(stats_total, forward_total.detach())
+    torch.testing.assert_close(stats_onsite, lossfunc.last_onsite_loss)
+    torch.testing.assert_close(stats_hopping, lossfunc.last_hopping_loss)
+
+
 def _pred_ref():
     pred = {
         "node_features": torch.tensor([[1.0], [3.0]], requires_grad=True),
@@ -198,6 +331,28 @@ def test_flow_compatible_loss_state_uses_no_grad_and_restores_side_effects():
 
     assert lossfunc.last_onsite_loss.item() == pytest.approx(123.0)
     assert lossfunc.last_hopping_loss.item() == pytest.approx(456.0)
+
+
+def test_flow_stats_fast_path_preserves_compatible_and_legacy_semantics():
+    lossfunc = _StatsCompatibleLoss()
+    state = Trainer._compatible_loss_state_from_flow_stats(
+        lossfunc,
+        _compatible_clean_stats(),
+        source_prefix="train",
+        prefix="train_compatible",
+        legacy_prefix="train",
+        global_step=17,
+    )
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+    total = 0.5 * (onsite + hopping)
+    assert lossfunc.forward_calls == 0
+    assert lossfunc.stats_calls == 1
+    assert state["train_compatible_loss"].item() == pytest.approx(total)
+    assert state["train_loss"].item() == pytest.approx(total)
+    assert state["train_onsite_loss"].item() == pytest.approx(onsite)
+    assert state["train_hopping_loss"].item() == pytest.approx(hopping)
 
 
 def test_flow_compatible_loss_state_explicit_legacy_mapping():
@@ -421,6 +576,17 @@ class _PreparedFlow:
         }
 
 
+class _PreparedFlowWithStats(_PreparedFlow):
+    log_train_compatible_loss = True
+
+    def loss(self, pred, ref, ctx):
+        self.loss_called = True
+        return pred["node_features"].sum() * 0.0 + torch.tensor(5.0), {
+            "train_flow_loss": torch.tensor(5.0),
+            **_compatible_clean_stats(),
+        }
+
+
 def test_multitrainer_expert_payload_applies_flow_before_model():
     trainer = object.__new__(MultiTrainer)
     trainer.iter = 1
@@ -451,6 +617,55 @@ def test_multitrainer_expert_payload_applies_flow_before_model():
     assert result["loss"].item() == pytest.approx(5.0)
     assert result["onsite"].item() == pytest.approx(2.0)
     assert result["hopping"].item() == pytest.approx(3.0)
+
+
+def test_multitrainer_non_display_step_does_not_run_full_compatible_loss():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 2
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer._tagger = _NoopTagger()
+    trainer.flow_cfm = _PreparedFlowWithStats()
+    trainer.model = _FlowPreparedModel()
+    trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
+        torch.ones(batch["edge_h0"].shape[0], dtype=torch.bool),
+        torch.ones(batch["node_h0"].shape[0], dtype=torch.bool),
+    )
+    lossfunc = _StatsCompatibleLoss()
+
+    result = trainer._run_one_expert_loss(
+        _two_graph_batch(),
+        batch_info={},
+        criterion=lossfunc,
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+        capture_metrics=True,
+    )
+
+    assert lossfunc.forward_calls == 0
+    assert lossfunc.stats_calls == 1
+    assert result["last_onsite_count"].item() == pytest.approx(2.0)
+    assert result["last_hopping_count"].item() == pytest.approx(3.0)
+    assert result["onsite"].item() > 0.0
+    assert result["hopping"].item() > 0.0
+
+
+def test_non_metric_scheduler_does_not_reduce_compatible_scalar():
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    trainer = object.__new__(MultiTrainer)
+    trainer.update_lr_per_iter = True
+    trainer.distributed_expert = True
+    trainer.local_expert_idx = 0
+    trainer.lr_schedulers = [scheduler]
+    trainer.iter = 2
+    trainer._tagger = _NoopTagger()
+    trainer._mean_expert_dp_scalar = lambda value: pytest.fail(
+        "metric-free scheduler must not all_reduce a scalar"
+    )
+
+    trainer._local_scheduler_step(None)
 
 
 def test_tensorboard_monitor_writes_fresh_validation_iter_tags():

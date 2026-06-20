@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
@@ -186,6 +188,56 @@ def test_typewise_te_prior_lazily_initializes_orbpair_irreps():
 
     assert flow.idp.get_irreps_calls == 1
     assert flow.idp.orbpair_irreps is not None
+
+
+def test_typewise_residual_scale_stays_on_device_and_matches_group_reduction():
+    source = inspect.getsource(HamiltonianCFM._apply_typewise_residual_scale)
+    assert ".cpu()" not in source
+    assert ".item()" not in source
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    flow = _flow("te", device=device, dtype=dtype, te_prior_mode="typewise")
+    noise = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0],
+         [2.0, 3.0, 4.0, 5.0],
+         [3.0, 4.0, 5.0, 6.0]],
+        device=device,
+        dtype=dtype,
+    )
+    reference = torch.tensor(
+        [[2.0, 4.0, 3.0, 5.0],
+         [7.0, 8.0, 0.0, 0.0],
+         [6.0, 8.0, 7.0, 9.0]],
+        device=device,
+        dtype=dtype,
+    )
+    mask = torch.tensor(
+        [[1, 1, 1, 1],
+         [1, 1, 0, 0],
+         [1, 1, 1, 1]],
+        device=device,
+        dtype=torch.bool,
+    )
+    data = {
+        AtomicDataDict.ATOM_TYPE_KEY: torch.tensor(
+            [0, 1, 0], device=device, dtype=torch.long
+        )
+    }
+    slices = ((0, 2, 1), (2, 4, 0))
+
+    out = flow._apply_typewise_residual_scale(
+        noise, reference, mask, data, "node", slices, reference_scale=True
+    )
+
+    type0_first = torch.tensor([2.0, 4.0, 6.0, 8.0], device=device, dtype=dtype).square().mean().sqrt()
+    type1_first = torch.tensor([7.0, 8.0], device=device, dtype=dtype).square().mean().sqrt()
+    type0_second = torch.tensor([3.0, 5.0, 7.0, 9.0], device=device, dtype=dtype).square().mean().sqrt()
+    expected = noise.clone()
+    expected[[0, 2], 0:2] *= type0_first
+    expected[1, 0:2] *= type1_first
+    expected[[0, 2], 2:4] *= type0_second
+    torch.testing.assert_close(out, expected)
 
 
 def test_typewise_te_prior_projects_uureal_raw_layout_to_compressed_features():
