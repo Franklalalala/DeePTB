@@ -132,10 +132,11 @@ class NNENV(nn.Module):
         )
         print(f'NNENV soc flag: {self.has_soc}')
 
+        mapper_method = "e3tb" if self.method == "block_native" else self.method
         if basis is not None:
             self.idp = OrbitalMapper(
                 basis,
-                method=self.method,
+                method=mapper_method,
                 device=self.device,
                 has_soc=has_soc,
                 nextham_uureal_mask=self.nextham_uureal_mask,
@@ -160,6 +161,11 @@ class NNENV(nn.Module):
         n_species = len(self.basis.keys())
         # initialize the embedding layer
         self.embedding = Embedding(**embedding, dtype=dtype, device=device, idp=self.idp, n_atom=n_species)
+        embedding_uses_block_native = bool(getattr(self.embedding, "use_block_native_output", False))
+        if self.method == "block_native" and not embedding_uses_block_native:
+            raise ValueError("prediction.method='block_native' requires embedding.rme_head_mode='block_native_linear'.")
+        if self.method != "block_native" and embedding_uses_block_native:
+            raise ValueError("embedding.rme_head_mode='block_native_linear' requires prediction.method='block_native'.")
         
         # initialize the prediction layer
             
@@ -271,6 +277,17 @@ class NNENV(nn.Module):
                 
                 # raise NotImplementedError("The overlap prediction is not implemented for e3tb method.")
 
+        elif prediction_copy.get("method") == "block_native":
+            if overlap:
+                raise NotImplementedError("block_native prediction does not support overlap.")
+            if self.scale_type not in (None, "no_scale"):
+                raise ValueError("block_native prediction requires scale_type='no_scale' or omitted.")
+            block_decoder = str(prediction_copy.get("block_decoder", "linear")).lower()
+            if block_decoder != "linear":
+                raise NotImplementedError(
+                    "block_native currently supports only block_decoder='linear'; "
+                    f"got {block_decoder!r}."
+                )
         else:
             raise NotImplementedError("The prediction model {} is not implemented.".format(prediction_copy["method"]))
 
@@ -327,6 +344,8 @@ class NNENV(nn.Module):
                     dtype=self.dtype, 
                     device=self.device,
                     )
+        elif self.method == "block_native":
+            pass
 
 
     def forward(self, data: AtomicDataDict.Type):
@@ -334,6 +353,8 @@ class NNENV(nn.Module):
             self.idp(data)
 
         data = self.embedding(data)
+        if self.method == "block_native":
+            return data
         if hasattr(self, "overlap") and self.method == "sktb":
             data[AtomicDataDict.EDGE_OVERLAP_KEY] = data[AtomicDataDict.EDGE_FEATURES_KEY]
 

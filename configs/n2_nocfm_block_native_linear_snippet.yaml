@@ -1,0 +1,42 @@
+# Experimental Plan-B block-native output path.
+#
+# This writes explicit padded AO blocks to node_hamiltonian / edge_hamiltonian
+# and bypasses E3Hamiltonian.  It is not compatible with the existing RME
+# feature losses until a block-native loss/evaluator is added.
+
+common_options:
+  basis:
+    C: 3s2p1d
+  device: cpu
+  dtype: float32
+  overlap: false
+
+model_options:
+  embedding:
+    method: lem_moe_v3
+    n_layers: 1
+    avg_num_neighbors: 1
+    r_max: 5.0
+    irreps_hidden: 8x0e+8x1o+8x2e+8x3o+8x4e
+    env_embed_multiplicity: 4
+    latent_dim: 16
+    latent_channels: [16, 16]
+    edge_one_hot_dim: 8
+    num_experts: 1
+    num_shared_experts: 1
+    use_out_onehot_tp: false
+    use_layer_onehot_tp: false
+    tp_radial_emb: false
+    mole_linear_mode: indexed_ref
+    so2_fusion_mode: streamed_m_major_fused_p0
+    rme_head_mode: block_native_linear
+    rme_fusion_init: 0.0
+  prediction:
+    method: block_native
+    scale_type: no_scale
+    block_decoder: linear
+    blockwise_hamiltonian: true
+
+train_options:
+  flow_options:
+    enabled: false

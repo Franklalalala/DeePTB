@@ -1350,6 +1350,10 @@ def slem():
     doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
+    doc_rme_head_mode = "Output head: `legacy_linear`, `rme_nocg_fusion`, or experimental `block_native_linear`. The fusion mode preserves the OrbitalMapper RME contract; block-native writes explicit AO blocks and must be paired with prediction.method=block_native."
+    doc_rme_fusion_rank = "Low-rank scalar-conditioning width for `rme_nocg_fusion`. Default: 16."
+    doc_rme_fusion_init = "Stddev of the final residual fusion projection. 0.0 starts exactly at the legacy linear head."
+    doc_rme_fusion_condition = "Condition source for RME fusion. Currently only `scalar_0e`."
     doc_node_message_aggregation = "Node message aggregation mode. Supported: `scatter` for the legacy sum, `single_head_0e` for DPA4-style envelope-gated scalar attention."
     doc_num_focus = "Number of post-activation 0e focus gates. Values larger than 1 enable DPA4-style channel focus routing."
     doc_focus_attention_dim = "Hidden dimension of the single-head 0e attention query/key projections."
@@ -1394,6 +1398,10 @@ def slem():
         Argument("edge_one_hot_dim", int, optional=True, default=128, doc="The dimension of edge_one_hot."),
         Argument("use_out_onehot_tp", bool, optional=True, default=True, doc="Whether to use out_onehot_tp."),
         Argument("use_layer_onehot_tp", bool, optional=True, default=True, doc="Whether to use layer_onehot_tp."),
+        Argument("rme_head_mode", str, optional=True, default="legacy_linear", doc=doc_rme_head_mode),
+        Argument("rme_fusion_rank", int, optional=True, default=16, doc=doc_rme_fusion_rank),
+        Argument("rme_fusion_init", [float, int], optional=True, default=0.0, doc=doc_rme_fusion_init),
+        Argument("rme_fusion_condition", str, optional=True, default="scalar_0e", doc=doc_rme_fusion_condition),
         Argument("res_update", bool, optional=True, default=True, doc="Whether to use residual update."),
         Argument("res_update_ratios", float, optional=True, default=0.5, doc="The ratios of residual update, should in (0,1)."),
         Argument("norm_bottleneck_ratio", float, optional=True, default=0.1, doc="The ratios of norm bottle neck gate."),
@@ -1508,12 +1516,13 @@ def slem_edge_h0():
 
 
 def prediction():
-    doc_method = "The options to indicate the prediction model. Can be sktb or e3tb."
+    doc_method = "The options to indicate the prediction model. Can be sktb, e3tb, or block_native."
     doc_nn = "neural network options for prediction model."
 
     return Variant("method", [
             Argument("sktb", dict, sktb_prediction(), doc=doc_nn),
             Argument("e3tb", dict, e3tb_prediction(), doc=doc_nn),
+            Argument("block_native", dict, block_native_prediction(), doc=doc_nn),
         ], optional=False, doc=doc_method)
 
 def sktb_prediction():
@@ -1550,6 +1559,18 @@ def e3tb_prediction():
     ]
 
     return nn
+
+
+def block_native_prediction():
+    doc_scale_type = "Block-native decoder bypasses RME scale/shift and E3Hamiltonian; use no_scale."
+    doc_block_decoder = "Experimental block-native decoder backend. Currently only `linear` is implemented."
+    doc_blockwise_hamiltonian = "Whether the downstream consumer expects explicit AO Hamiltonian blocks."
+
+    return [
+        Argument("scale_type", str, optional=True, default="no_scale", doc=doc_scale_type),
+        Argument("block_decoder", str, optional=True, default="linear", doc=doc_block_decoder),
+        Argument("blockwise_hamiltonian", bool, optional=True, default=True, doc=doc_blockwise_hamiltonian),
+    ]
 
 
 

@@ -431,10 +431,10 @@ def build_model(
                     log.error("The embedding method must be se2 for sktb prediction in nnenv mode.")
                     raise ValueError("The embedding method must be se2 for sktb prediction in deeptb mode.")
 
-            if model_options["prediction"]['method'] == 'e3tb':
+            if model_options["prediction"]['method'] in {'e3tb', 'block_native'}:
                 if model_options['embedding']['method'] in ['se2']:
-                    log.error("The embedding method can not be se2 for e3tb prediction in deeptb mode.")
-                    raise ValueError("The embedding method can not be se2 for e3tb prediction in deeptb mode.")
+                    log.error("The embedding method can not be se2 for e3tb/block_native prediction in deeptb mode.")
+                    raise ValueError("The embedding method can not be se2 for e3tb/block_native prediction in deeptb mode.")
         else:
             raise ValueError("Model_options are not set correctly!")
 
