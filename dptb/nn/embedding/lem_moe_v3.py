@@ -28,6 +28,10 @@ from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3,
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
+from .rme_nocg_fusion_head import (
+    RMENoCGFusionHead,
+    normalize_rme_head_mode,
+)
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
@@ -1052,6 +1056,10 @@ class LemMoEV3(torch.nn.Module):
             edge_one_hot_dim: int = 128,
             use_out_onehot_tp: bool = True,
             use_layer_onehot_tp: bool = True,
+            rme_head_mode: str = "legacy_linear",
+            rme_fusion_rank: int = 16,
+            rme_fusion_init: float = 0.0,
+            rme_fusion_condition: str = "scalar_0e",
             res_update: bool = True,
             res_update_ratios: Optional[List[float]] = None,
             res_update_ratios_learnable: bool = False,
@@ -1143,6 +1151,10 @@ class LemMoEV3(torch.nn.Module):
             full_soc_prediction=self.full_soc_prediction,
         )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
+        self.rme_head_mode = normalize_rme_head_mode(rme_head_mode)
+        self.rme_fusion_rank = int(rme_fusion_rank)
+        self.rme_fusion_init = float(rme_fusion_init)
+        self.rme_fusion_condition = str(rme_fusion_condition)
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
@@ -1163,6 +1175,13 @@ class LemMoEV3(torch.nn.Module):
             "mole_linear_m0_mode", mole_linear_m0_mode
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
+        log.info(
+            "  - RME Head: mode=%s rank=%d init=%g condition=%s",
+            self.rme_head_mode,
+            self.rme_fusion_rank,
+            self.rme_fusion_init,
+            self.rme_fusion_condition,
+        )
         log.info(f"  - SO2 Expert Mixing Mode: {self.so2_expert_mixing_mode}")
         log.info(
             "  - DPA4-style Focus/Aggregation: "
@@ -1347,10 +1366,43 @@ class LemMoEV3(torch.nn.Module):
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.idp.orbpair_irreps,
             ))
-        self.out_edge = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
-                               internal_weights=True, biases=True)
-        self.out_node = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
-                               internal_weights=True, biases=True)
+        legacy_out_edge = Linear(
+            self.layers[-1].irreps_out,
+            self.idp.orbpair_irreps,
+            shared_weights=True,
+            internal_weights=True,
+            biases=True,
+        )
+        legacy_out_node = Linear(
+            self.layers[-1].irreps_out,
+            self.idp.orbpair_irreps,
+            shared_weights=True,
+            internal_weights=True,
+            biases=True,
+        )
+        if self.rme_head_mode == "legacy_linear":
+            self.out_edge = legacy_out_edge
+            self.out_node = legacy_out_node
+        else:
+            fusion_kwargs = {
+                "rank": self.rme_fusion_rank,
+                "init": self.rme_fusion_init,
+                "condition": self.rme_fusion_condition,
+                "dtype": self.dtype,
+                "device": self.device,
+            }
+            self.out_edge = RMENoCGFusionHead(
+                self.layers[-1].irreps_out,
+                self.idp.orbpair_irreps,
+                legacy=legacy_out_edge,
+                **fusion_kwargs,
+            )
+            self.out_node = RMENoCGFusionHead(
+                self.layers[-1].irreps_out,
+                self.idp.orbpair_irreps,
+                legacy=legacy_out_node,
+                **fusion_kwargs,
+            )
 
     @property
     def out_edge_irreps(self):
@@ -1359,6 +1411,25 @@ class LemMoEV3(torch.nn.Module):
     @property
     def out_node_irreps(self):
         return self.idp.orbpair_irreps
+
+    def _apply_rme_output_heads(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+        node_one_hot: torch.Tensor,
+        edge_one_hot: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        out_node_features = self.out_node(node_features)
+        out_edge_features = self.out_edge(edge_features)
+
+        if self.use_out_onehot_tp:
+            out_node_features = out_node_features + _apply_onehot_tp(
+                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
+            )
+            out_edge_features = out_edge_features + _apply_onehot_tp(
+                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
+            )
+        return out_node_features, out_edge_features
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         preserved_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
@@ -1470,16 +1541,9 @@ class LemMoEV3(torch.nn.Module):
                 dtype=node_features.dtype,
             )
             node_features = torch.cat([node_features, pad], dim=0)
-        out_node_features = self.out_node(node_features)
-        out_edge_features = self.out_edge(edge_features)
-
-        if self.use_out_onehot_tp:
-            out_node_features = out_node_features + _apply_onehot_tp(
-                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
-            )
-            out_edge_features = out_edge_features + _apply_onehot_tp(
-                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
-            )
+        out_node_features, out_edge_features = self._apply_rme_output_heads(
+            node_features, edge_features, node_one_hot, edge_one_hot
+        )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
         data[_keys.EDGE_FEATURES_KEY] = torch.zeros(edge_index.shape[1], self.idp.orbpair_irreps.dim, dtype=self.dtype,

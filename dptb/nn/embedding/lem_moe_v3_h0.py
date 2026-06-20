@@ -178,16 +178,9 @@ class LemMoEV3H0(LemMoEV3):
             )
             node_features = torch.cat([node_features, pad], dim=0)
 
-        out_node_features = self.out_node(node_features)
-        out_edge_features = self.out_edge(edge_features)
-
-        if self.use_out_onehot_tp:
-            out_node_features = out_node_features + _apply_onehot_tp(
-                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
-            )
-            out_edge_features = out_edge_features + _apply_onehot_tp(
-                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
-            )
+        out_node_features, out_edge_features = self._apply_rme_output_heads(
+            node_features, edge_features, node_one_hot, edge_one_hot
+        )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
         data[_keys.EDGE_FEATURES_KEY] = torch.zeros(
