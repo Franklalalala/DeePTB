@@ -17,6 +17,7 @@ from e3nn import o3
 
 _LEGACY_MODE = "legacy_linear"
 _FUSION_MODE = "rme_nocg_fusion"
+_BLOCK_NATIVE_MODE = "block_native_linear"
 
 
 def normalize_rme_head_mode(mode: Optional[str]) -> str:
@@ -27,9 +28,11 @@ def normalize_rme_head_mode(mode: Optional[str]) -> str:
         "linear": _LEGACY_MODE,
         "nocg": _FUSION_MODE,
         "rme_fusion": _FUSION_MODE,
+        "block_native": _BLOCK_NATIVE_MODE,
+        "block_linear": _BLOCK_NATIVE_MODE,
     }
     normalized = aliases.get(normalized, normalized)
-    allowed = {_LEGACY_MODE, _FUSION_MODE}
+    allowed = {_LEGACY_MODE, _FUSION_MODE, _BLOCK_NATIVE_MODE}
     if normalized not in allowed:
         raise ValueError(
             f"rme_head_mode must be one of {sorted(allowed)}, got {mode!r}."
