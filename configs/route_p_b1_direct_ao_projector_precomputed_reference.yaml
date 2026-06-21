@@ -27,7 +27,7 @@ model_options:
     tp_radial_emb: false
     mole_linear_mode: indexed_ref
     so2_fusion_mode: streamed_m_major_ref
-    rme_head_mode: direct_ao_projector
+    output_route: p_b1_reference
     ao_projector_channels: 0
     ao_projector_backend: precomputed
     ao_projector_bank_path: assets/spd_ao_projectors.json

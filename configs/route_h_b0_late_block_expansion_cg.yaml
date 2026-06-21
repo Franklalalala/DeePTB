@@ -25,7 +25,7 @@ model_options:
     tp_radial_emb: false
     mole_linear_mode: indexed_ref
     so2_fusion_mode: streamed_m_major_ref
-    rme_head_mode: late_block_expansion_cg
+    output_route: h_b0
     rme_fusion_rank: 4
     rme_fusion_init: 0.0
   prediction:

@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Build smoke for the six output-head routes.
-
-The route matrix is split by final LEM contract:
-
-ordinary hidden:
-  h_a0: hidden -> no-CG RME -> E3Hamiltonian
-  h_a1: hidden -> ICT RME -> E3Hamiltonian
-  h_b0: hidden -> Wigner AO block
-  h_b1: hidden -> ICT AO block
-
-AO-pair recontract:
-  p_b0: AO-pair irreps -> reference Wigner projector -> AO block
-  p_b1: AO-pair irreps -> precomputed reference projector bank -> AO block
-"""
+"""Build smoke for the six canonical output routes from the route registry."""
 
 from __future__ import annotations
 
@@ -26,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from dptb.nn.build import build_model
+from dptb.nn.embedding.output_routes import OFFICIAL_OUTPUT_ROUTES
 
 
 BASIS = {"H": "2s1p", "O": "3s2p1d"}
@@ -35,25 +23,13 @@ AO_WIDTH = 14
 
 ROUTES = {
     "h_a0": {
-        "mode": "late_rme_expansion_nocg",
-        "head": "LateRMEExpansionNoCGHead",
-        "final_contract": "ordinary_hidden",
-        "uses_ict": False,
         "prediction": {"method": "e3tb", "scale_type": "no_scale"},
     },
     "h_a1": {
-        "mode": "late_rme_cartesian_hybrid",
-        "head": "LateRMECartesianHybridHead",
-        "final_contract": "ordinary_hidden",
-        "uses_ict": True,
         "extra_embedding": {"rme_cartesian_scope": "all"},
         "prediction": {"method": "e3tb", "scale_type": "no_scale"},
     },
     "h_b0": {
-        "mode": "late_block_expansion_cg",
-        "head": "LateBlockExpansionCGHead",
-        "final_contract": "ordinary_hidden",
-        "uses_ict": False,
         "prediction": {
             "method": "block_native",
             "block_decoder": "expansion_cg",
@@ -62,10 +38,6 @@ ROUTES = {
         },
     },
     "h_b1": {
-        "mode": "late_block_cartesian_projector",
-        "head": "LateBlockCartesianProjectorHead",
-        "final_contract": "ordinary_hidden",
-        "uses_ict": True,
         "prediction": {
             "method": "block_native",
             "block_decoder": "cartesian_projector",
@@ -74,10 +46,6 @@ ROUTES = {
         },
     },
     "p_b0": {
-        "mode": "direct_ao_projector",
-        "head": "AOAngularProjectorHead",
-        "final_contract": "ao_pair",
-        "uses_ict": False,
         "extra_embedding": {"ao_projector_backend": "reference_wigner"},
         "prediction": {
             "method": "block_native",
@@ -86,15 +54,10 @@ ROUTES = {
             "scale_type": "no_scale",
         },
     },
-    "p_b1": {
-        "mode": "direct_ao_projector",
-        "head": "AOAngularProjectorHead",
-        "final_contract": "ao_pair",
-        "uses_ict": False,
-        "uses_precomputed_projector": True,
+    "p_b1_ict": {
         "extra_embedding": {
             "ao_projector_backend": "precomputed",
-            "ao_projector_bank_path": "assets/spd_ao_projectors.json",
+            "ao_projector_bank_path": "assets/spd_ao_projectors_ict.json",
         },
         "prediction": {
             "method": "block_native",
@@ -106,7 +69,7 @@ ROUTES = {
 }
 
 
-def embedding_options(spec: dict) -> dict:
+def embedding_options(route_name: str, route: dict) -> dict:
     options = {
         "method": "lem_moe_v3",
         "n_layers": 1,
@@ -127,16 +90,15 @@ def embedding_options(spec: dict) -> dict:
         "tp_radial_emb": False,
         "mole_linear_mode": "indexed_ref",
         "so2_fusion_mode": "streamed_m_major_ref",
-        "rme_head_mode": spec["mode"],
+        "output_route": route_name,
         "rme_fusion_rank": 4,
         "rme_fusion_init": 0.0,
-        "rme_cartesian_scope": "missing_only",
     }
-    options.update(spec.get("extra_embedding", {}))
+    options.update(route.get("extra_embedding", {}))
     return options
 
 
-def build_route(name: str, spec: dict):
+def build_route(name: str, route: dict):
     model = build_model(
         common_options={
             "basis": BASIS,
@@ -145,20 +107,31 @@ def build_route(name: str, spec: dict):
             "device": "cpu",
         },
         model_options={
-            "embedding": embedding_options(spec),
-            "prediction": spec["prediction"],
+            "embedding": embedding_options(name, route),
+            "prediction": route["prediction"],
         },
         train_options={},
         no_check=True,
     )
     embedding = model.embedding
+    spec = embedding.output_route_spec
+    assert spec.canonical_name == name
     final_irreps = embedding.layers[-1].irreps_out
-    if spec["final_contract"] == "ordinary_hidden":
+    if spec.final_irreps_kind == "ordinary_hidden":
         assert final_irreps == o3.Irreps(ORDINARY_HIDDEN)
-    else:
+    elif spec.final_irreps_kind == "ao_pair":
         assert final_irreps.dim == AO_WIDTH * AO_WIDTH
-    assert type(embedding.out_node).__name__ == spec["head"]
-    assert getattr(embedding.out_node, "uses_ict") is spec["uses_ict"]
+    else:
+        assert final_irreps == embedding.idp.orbpair_irreps.sort()[0].simplify()
+
+    assert type(embedding.out_node).__name__ == spec.head_class_name
+    assert getattr(embedding.out_node, "uses_ict", False) is spec.uses_ict
+    assert getattr(
+        embedding.out_node, "uses_precomputed_projector", False
+    ) is spec.uses_precomputed_projector
+    assert hasattr(model, "hamiltonian") is spec.uses_e3hamiltonian
+    assert embedding.out_node.output_contract == spec.output_contract
+
     if name == "h_a1":
         assert embedding.out_node.coverage_report["product_paths"] > 0
     if name == "h_b1":
@@ -166,36 +139,32 @@ def build_route(name: str, spec: dict):
         assert embedding.out_node.coverage_report["product_paths"] == 0
         assert not hasattr(embedding.out_node, "left")
         assert not hasattr(embedding.out_node, "right")
-    if name == "p_b1":
-        assert embedding.out_node.uses_precomputed_projector is True
-        assert embedding.out_node.projector_source == "reference_wigner"
-    if spec["prediction"]["method"] == "block_native":
-        assert not hasattr(model, "hamiltonian")
-        assert embedding.out_node.output_contract == "ao_block"
-    else:
-        assert hasattr(model, "hamiltonian")
-        assert embedding.out_node.output_contract == "rme"
-    return {
-        "route": name,
-        "mode": embedding.rme_head_mode,
-        "head": type(embedding.out_node).__name__,
-        "final_contract": spec["final_contract"],
-        "final_dim": final_irreps.dim,
-        "output_contract": embedding.out_node.output_contract,
-        "uses_ict": getattr(embedding.out_node, "uses_ict"),
-        "uses_precomputed_projector": getattr(
-            embedding.out_node, "uses_precomputed_projector", False
-        ),
-        "projector_source": getattr(embedding.out_node, "projector_source", None),
-        "uses_e3hamiltonian": hasattr(model, "hamiltonian"),
-    }
+    if name == "p_b1_ict":
+        assert embedding.out_node.projector_source == "cartesian_ict"
+        assert embedding.out_node.projector_provenance.generator_id == (
+            "deeptb.cartesian_stf_3j/v1"
+        )
+
+    result = spec.metadata()
+    result.update(
+        {
+            "route": name,
+            "final_dim": final_irreps.dim,
+            "projector_source": getattr(embedding.out_node, "projector_source", None),
+        }
+    )
+    return result
 
 
 def main() -> int:
-    bank = ROOT / "assets" / "spd_ao_projectors.json"
+    if tuple(ROUTES) != OFFICIAL_OUTPUT_ROUTES:
+        raise RuntimeError(
+            f"Smoke routes {tuple(ROUTES)!r} != registry {OFFICIAL_OUTPUT_ROUTES!r}."
+        )
+    bank = ROOT / "assets" / "spd_ao_projectors_ict.json"
     if not bank.exists():
         raise FileNotFoundError(bank)
-    results = [build_route(name, spec) for name, spec in ROUTES.items()]
+    results = [build_route(name, route) for name, route in ROUTES.items()]
     print(json.dumps(results, indent=2, sort_keys=True))
     print("OUTPUT_HEAD_ROUTE_MATRIX_SMOKE_PASS")
     return 0

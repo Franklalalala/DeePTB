@@ -21,13 +21,11 @@ try:
         _projector_key,
         build_ao_decoder_irreps,
         export_projector_bank,
-        load_projector_bank,
+        load_projector_bank_with_provenance,
         normalize_projector_backend,
-        projector_bank_source,
         reference_projector,
         required_projector_keys,
         shell_l,
-        source_uses_ict,
     )
 except ImportError:  # standalone package-level tests
     from ao_projector_bank import (
@@ -36,13 +34,11 @@ except ImportError:  # standalone package-level tests
         _projector_key,
         build_ao_decoder_irreps,
         export_projector_bank,
-        load_projector_bank,
+        load_projector_bank_with_provenance,
         normalize_projector_backend,
-        projector_bank_source,
         reference_projector,
         required_projector_keys,
         shell_l,
-        source_uses_ict,
     )
 
 
@@ -132,12 +128,14 @@ class AOAngularProjectorHead(torch.nn.Module):
             coefficient_kwargs["device"] = device
 
         loaded_bank = None
+        self.projector_provenance = None
         if self.projector_backend == _PRECOMPUTED_BACKEND:
-            self.projector_source = projector_bank_source(self.projector_bank_path)
-            self.uses_ict = source_uses_ict(self.projector_source)
-            loaded_bank = load_projector_bank(
+            loaded_bank, provenance = load_projector_bank_with_provenance(
                 self.projector_bank_path, self.full_basis
             )
+            self.projector_provenance = provenance
+            self.projector_source = provenance.source
+            self.uses_ict = provenance.uses_ict
         else:
             self.uses_ict = False
 

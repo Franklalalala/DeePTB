@@ -1350,7 +1350,8 @@ def slem():
     doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
-    doc_rme_head_mode = "Output head route. Baselines: `legacy_linear`, `rme_nocg_fusion`, `block_native_linear`. Ordinary-hidden routes: `late_rme_expansion_nocg`, `late_rme_cartesian_hybrid`, `late_block_expansion_cg`, `late_block_cartesian_projector`. AO-pair recontract route: `direct_ao_projector`."
+    doc_output_route = "Canonical output route. Official matrix: `h_a0`, `h_a1`, `h_b0`, `h_b1`, `p_b0`, `p_b1_ict`. Controls: `legacy_rme`, `rme_fusion`, `p_b1_reference`, `debug_block_linear`."
+    doc_rme_head_mode = "Deprecated output-route alias retained for old configs/checkpoints. Prefer `output_route`."
     doc_rme_fusion_rank = "Low-rank scalar-conditioning width for output heads. Default: 16."
     doc_rme_fusion_init = "Stddev of dynamic output-head projections. 0.0 disables dynamic residual/path weights at initialization."
     doc_rme_fusion_condition = "Condition source for output heads. Currently only `scalar_0e`."
@@ -1404,11 +1405,12 @@ def slem():
         Argument("edge_one_hot_dim", int, optional=True, default=128, doc="The dimension of edge_one_hot."),
         Argument("use_out_onehot_tp", bool, optional=True, default=True, doc="Whether to use out_onehot_tp."),
         Argument("use_layer_onehot_tp", bool, optional=True, default=True, doc="Whether to use layer_onehot_tp."),
-        Argument("rme_head_mode", str, optional=True, default="legacy_linear", doc=doc_rme_head_mode),
+        Argument("output_route", [str, None], optional=True, default=None, doc=doc_output_route),
+        Argument("rme_head_mode", [str, None], optional=True, default=None, doc=doc_rme_head_mode),
         Argument("rme_fusion_rank", int, optional=True, default=16, doc=doc_rme_fusion_rank),
         Argument("rme_fusion_init", [float, int], optional=True, default=0.0, doc=doc_rme_fusion_init),
         Argument("rme_fusion_condition", str, optional=True, default="scalar_0e", doc=doc_rme_fusion_condition),
-        Argument("rme_cartesian_scope", str, optional=True, default="missing_only", doc=doc_rme_cartesian_scope),
+        Argument("rme_cartesian_scope", [str, None], optional=True, default=None, doc=doc_rme_cartesian_scope),
         Argument("rme_ict_scope", [str, None], optional=True, default=None, doc=doc_rme_cartesian_scope),
         Argument("ao_projector_channels", int, optional=True, default=0, doc=doc_ao_projector_channels),
         Argument("ao_projector_normalization", str, optional=True, default="e3hamiltonian", doc=doc_ao_projector_normalization),

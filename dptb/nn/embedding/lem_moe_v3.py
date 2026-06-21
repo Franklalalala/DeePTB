@@ -28,16 +28,15 @@ from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3,
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
-from .rme_nocg_fusion_head import (
-    RMENoCGFusionHead,
-    normalize_rme_head_mode,
+from .ao_projector_bank import build_ao_decoder_irreps
+from .output_routes import (
+    OutputHeadContext,
+    build_output_heads,
+    effective_product_scope,
+    resolve_output_route,
+    select_final_irreps,
 )
-from .late_rme_expansion_nocg import LateRMEExpansionNoCGHead
-from .late_rme_cartesian_hybrid import LateRMECartesianHybridHead
-from .late_block_expansion_cg import LateBlockExpansionCGHead
-from .late_block_cartesian_projector import LateBlockCartesianProjectorHead
-from .ao_angular_projector import AOAngularProjectorHead, build_ao_decoder_irreps
-from .block_native_head import BlockNativeLinearHead, apply_ao_basis_mask
+from .block_native_head import apply_ao_basis_mask
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
@@ -1062,11 +1061,12 @@ class LemMoEV3(torch.nn.Module):
             edge_one_hot_dim: int = 128,
             use_out_onehot_tp: bool = True,
             use_layer_onehot_tp: bool = True,
-            rme_head_mode: str = "legacy_linear",
+            output_route: Optional[str] = None,
+            rme_head_mode: Optional[str] = None,
             rme_fusion_rank: int = 16,
             rme_fusion_init: float = 0.0,
             rme_fusion_condition: str = "scalar_0e",
-            rme_cartesian_scope: str = "missing_only",
+            rme_cartesian_scope: Optional[str] = None,
             rme_ict_scope: Optional[str] = None,
             ao_projector_channels: int = 0,
             ao_projector_normalization: str = "e3hamiltonian",
@@ -1164,27 +1164,36 @@ class LemMoEV3(torch.nn.Module):
             full_soc_prediction=self.full_soc_prediction,
         )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
-        self.rme_head_mode = normalize_rme_head_mode(rme_head_mode)
-        self.use_late_rme_nocg_output = self.rme_head_mode == "late_rme_expansion_nocg"
-        self.use_late_rme_ict_output = self.rme_head_mode == "late_rme_cartesian_hybrid"
-        self.use_late_rme_output = (
-            self.use_late_rme_nocg_output or self.use_late_rme_ict_output
+        self.output_route_spec = resolve_output_route(
+            output_route=output_route,
+            legacy_mode=rme_head_mode,
+            projector_backend=ao_projector_backend,
+            projector_bank_path=ao_projector_bank_path,
         )
-        self.use_late_block_wigner_output = self.rme_head_mode == "late_block_expansion_cg"
-        self.use_late_block_ict_output = self.rme_head_mode == "late_block_cartesian_projector"
-        self.use_direct_ao_output = self.rme_head_mode == "direct_ao_projector"
-        self.use_block_native_output = self.rme_head_mode in {
-            "block_native_linear",
-            "late_block_expansion_cg",
-            "late_block_cartesian_projector",
-            "direct_ao_projector",
-        }
-        self.output_head_contract = "ao_block" if self.use_block_native_output else "rme"
+        self.output_route_name = self.output_route_spec.canonical_name
+        # Historical public attributes remain available for old checkpoints and callers.
+        self.rme_head_mode = self.output_route_spec.legacy_mode
+        self.use_block_native_output = self.output_route_spec.is_block_native
+        self.output_head_contract = self.output_route_spec.output_contract
         self.rme_fusion_rank = int(rme_fusion_rank)
         self.rme_fusion_init = float(rme_fusion_init)
         self.rme_fusion_condition = str(rme_fusion_condition)
-        self.rme_cartesian_scope = str(
-            rme_cartesian_scope if rme_ict_scope is None else rme_ict_scope
+        if rme_ict_scope is not None:
+            if (
+                rme_cartesian_scope is not None
+                and str(rme_cartesian_scope).strip().lower()
+                != str(rme_ict_scope).strip().lower()
+            ):
+                raise ValueError(
+                    "rme_ict_scope conflicts with rme_cartesian_scope; use only "
+                    "rme_cartesian_scope."
+                )
+            log.warning(
+                "rme_ict_scope is deprecated; use rme_cartesian_scope instead."
+            )
+            rme_cartesian_scope = rme_ict_scope
+        self.rme_cartesian_scope = effective_product_scope(
+            self.output_route_spec, rme_cartesian_scope
         )
         self.ao_projector_channels = int(ao_projector_channels)
         self.ao_projector_normalization = str(ao_projector_normalization)
@@ -1212,7 +1221,9 @@ class LemMoEV3(torch.nn.Module):
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
         log.info(
-            "  - Output Head: mode=%s contract=%s rank=%d init=%g condition=%s",
+            "  - Output Head: route=%s legacy_mode=%s contract=%s rank=%d "
+            "init=%g condition=%s",
+            self.output_route_name,
             self.rme_head_mode,
             self.output_head_contract,
             self.rme_fusion_rank,
@@ -1273,7 +1284,7 @@ class LemMoEV3(torch.nn.Module):
             build_ao_decoder_irreps(
                 self.idp.full_basis, channels=self.ao_projector_channels
             )
-            if self.use_direct_ao_output
+            if self.output_route_spec.final_irreps_kind == "ao_pair"
             else None
         )
 
@@ -1331,16 +1342,16 @@ class LemMoEV3(torch.nn.Module):
                 irreps_in = irreps_hidden
 
             if i == n_layers - 1:
-                if self.use_direct_ao_output:
-                    assert self.ao_decoder_irreps is not None
-                    irreps_out = self.ao_decoder_irreps
-                    use_interpolation_tp = False
-                elif self.use_late_rme_output or self.use_block_native_output:
-                    irreps_out = irreps_hidden
-                    use_interpolation_tp = False
-                else:
-                    irreps_out = orbpair_irreps.sort()[0].simplify()
-                    use_interpolation_tp = bool(use_interpolation_out)
+                irreps_out = select_final_irreps(
+                    self.output_route_spec,
+                    ordinary_hidden=irreps_hidden,
+                    orbpair_irreps=orbpair_irreps,
+                    ao_pair_irreps=self.ao_decoder_irreps,
+                )
+                use_interpolation_tp = bool(
+                    use_interpolation_out
+                    and self.output_route_spec.final_irreps_kind == "orbpair"
+                )
             else:
                 irreps_out = irreps_hidden
                 use_interpolation_tp = False
@@ -1406,11 +1417,14 @@ class LemMoEV3(torch.nn.Module):
             if use_interpolation_tp:
                 print(f'Use interpolation SO2 layer in layer {i}')
 
-        self.use_out_onehot_tp = bool(use_out_onehot_tp) and not self.use_block_native_output
+        self.use_out_onehot_tp = (
+            bool(use_out_onehot_tp)
+            and self.output_route_spec.output_contract == "rme"
+        )
         if self.use_out_onehot_tp:
             onehot_irreps_in = (
                 self.idp.orbpair_irreps
-                if self.use_late_rme_output
+                if self.output_route_spec.onehot_after_head
                 else self.layers[-1].irreps_out
             )
             self.out_node_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
@@ -1426,155 +1440,41 @@ class LemMoEV3(torch.nn.Module):
         max_norb = int(getattr(self.idp, "full_basis_norb", 0))
         if max_norb <= 0:
             max_norb = sum(int(v) for v in getattr(self.idp, "basis_to_full_basis", {}).values())
-        if self.use_block_native_output:
-            block_kwargs = {
-                "rank": self.rme_fusion_rank,
-                "init": self.rme_fusion_init,
-                "condition": self.rme_fusion_condition,
-                "dtype": self.dtype,
-                "device": self.device,
-            }
-            if self.use_late_block_wigner_output:
-                self.out_edge = LateBlockExpansionCGHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.full_basis,
-                    symmetrize=False,
-                    **block_kwargs,
-                )
-                self.out_node = LateBlockExpansionCGHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.full_basis,
-                    symmetrize=True,
-                    **block_kwargs,
-                )
-                return
-            if self.use_late_block_ict_output:
-                ict_kwargs = dict(block_kwargs)
-                ict_kwargs["product_scope"] = self.rme_cartesian_scope
-                self.out_edge = LateBlockCartesianProjectorHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.full_basis,
-                    symmetrize=False,
-                    **ict_kwargs,
-                )
-                self.out_node = LateBlockCartesianProjectorHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.full_basis,
-                    symmetrize=True,
-                    **ict_kwargs,
-                )
-                return
-            if self.use_direct_ao_output:
-                ao_kwargs = dict(block_kwargs)
-                ao_kwargs.update(
-                    {
-                        "normalization": self.ao_projector_normalization,
-                        "basis_convention": self.ao_projector_basis_convention,
-                        "projector_backend": self.ao_projector_backend,
-                        "projector_bank_path": self.ao_projector_bank_path,
-                    }
-                )
-                self.out_edge = AOAngularProjectorHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.full_basis,
-                    symmetrize=False,
-                    **ao_kwargs,
-                )
-                self.out_node = AOAngularProjectorHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.full_basis,
-                    symmetrize=True,
-                    **ao_kwargs,
-                )
-                return
-            self.out_edge = BlockNativeLinearHead(
-                self.layers[-1].irreps_out,
-                max_norb,
-                symmetrize=False,
-                init=self.rme_fusion_init,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self.out_node = BlockNativeLinearHead(
-                self.layers[-1].irreps_out,
-                max_norb,
-                symmetrize=True,
-                init=self.rme_fusion_init,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            return
-        legacy_out_edge = Linear(
-            self.layers[-1].irreps_out,
-            self.idp.orbpair_irreps,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
+        head_context = OutputHeadContext(
+            final_irreps=self.layers[-1].irreps_out,
+            orbpair_irreps=self.idp.orbpair_irreps,
+            full_basis=tuple(self.idp.full_basis),
+            max_norb=max_norb,
+            rank=self.rme_fusion_rank,
+            init=self.rme_fusion_init,
+            condition=self.rme_fusion_condition,
+            product_scope=self.rme_cartesian_scope,
+            ao_projector_normalization=self.ao_projector_normalization,
+            ao_projector_basis_convention=self.ao_projector_basis_convention,
+            ao_projector_backend=self.ao_projector_backend,
+            ao_projector_bank_path=self.ao_projector_bank_path,
+            dtype=self.dtype,
+            device=self.device,
         )
-        legacy_out_node = Linear(
-            self.layers[-1].irreps_out,
-            self.idp.orbpair_irreps,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
+        self.out_edge, self.out_node = build_output_heads(
+            self.output_route_spec, head_context
         )
-        if self.rme_head_mode == "legacy_linear":
-            self.out_edge = legacy_out_edge
-            self.out_node = legacy_out_node
-        else:
-            fusion_kwargs = {
-                "rank": self.rme_fusion_rank,
-                "init": self.rme_fusion_init,
-                "condition": self.rme_fusion_condition,
-                "dtype": self.dtype,
-                "device": self.device,
-            }
-            if self.use_late_rme_nocg_output:
-                head_cls = LateRMEExpansionNoCGHead
-                self.out_edge = head_cls(
-                    self.layers[-1].irreps_out,
-                    self.idp.orbpair_irreps,
-                    **fusion_kwargs,
-                )
-                self.out_node = head_cls(
-                    self.layers[-1].irreps_out,
-                    self.idp.orbpair_irreps,
-                    **fusion_kwargs,
-                )
-            elif self.use_late_rme_ict_output:
-                ict_kwargs = dict(fusion_kwargs)
-                ict_kwargs["product_scope"] = self.rme_cartesian_scope
-                self.out_edge = LateRMECartesianHybridHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.orbpair_irreps,
-                    **ict_kwargs,
-                )
-                self.out_node = LateRMECartesianHybridHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.orbpair_irreps,
-                    **ict_kwargs,
-                )
-            else:
-                self.out_edge = RMENoCGFusionHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.orbpair_irreps,
-                    legacy=legacy_out_edge,
-                    **fusion_kwargs,
-                )
-                self.out_node = RMENoCGFusionHead(
-                    self.layers[-1].irreps_out,
-                    self.idp.orbpair_irreps,
-                    legacy=legacy_out_node,
-                    **fusion_kwargs,
-                )
 
     @property
     def out_edge_irreps(self):
-        return None if self.use_block_native_output else self.idp.orbpair_irreps
+        return (
+            None
+            if self.output_route_spec.output_contract == "ao_block"
+            else self.idp.orbpair_irreps
+        )
 
     @property
     def out_node_irreps(self):
-        return None if self.use_block_native_output else self.idp.orbpair_irreps
+        return (
+            None
+            if self.output_route_spec.output_contract == "ao_block"
+            else self.idp.orbpair_irreps
+        )
 
     def _apply_rme_output_heads(
         self,
@@ -1588,10 +1488,14 @@ class LemMoEV3(torch.nn.Module):
 
         if self.use_out_onehot_tp:
             node_tp_input = (
-                out_node_features if self.use_late_rme_output else node_features
+                out_node_features
+                if self.output_route_spec.onehot_after_head
+                else node_features
             )
             edge_tp_input = (
-                out_edge_features if self.use_late_rme_output else edge_features
+                out_edge_features
+                if self.output_route_spec.onehot_after_head
+                else edge_features
             )
             out_node_features = out_node_features + _apply_onehot_tp(
                 self.out_node_ele_tp, node_tp_input, node_one_hot, self.onehot_tp_mode
