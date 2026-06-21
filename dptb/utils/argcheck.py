@@ -1350,10 +1350,16 @@ def slem():
     doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
     doc_mole_linear_m0_mode = "Legacy Triton route compatibility key. The 0425-stable branch accepts only `standard` or null; non-standard Triton values belong on the Triton experiment branch."
     doc_onehot_tp_mode = "Backend for scalar onehot tensor products. The 0422-cueq-fastest branch supports only `scalar_fast`, storing a lightweight scalar-onehot module and applying TP as direct per-irrep scaling/mixing."
-    doc_rme_head_mode = "Output head: `legacy_linear`, `rme_nocg_fusion`, or experimental `block_native_linear`. The fusion mode preserves the OrbitalMapper RME contract; block-native writes explicit AO blocks and must be paired with prediction.method=block_native."
-    doc_rme_fusion_rank = "Low-rank scalar-conditioning width for `rme_nocg_fusion`. Default: 16."
-    doc_rme_fusion_init = "Stddev of the final residual fusion projection. 0.0 starts exactly at the legacy linear head."
-    doc_rme_fusion_condition = "Condition source for RME fusion. Currently only `scalar_0e`."
+    doc_rme_head_mode = "Output head route. Baselines: `legacy_linear`, `rme_nocg_fusion`, `block_native_linear`. Ordinary-hidden routes: `late_rme_expansion_nocg`, `late_rme_cartesian_hybrid`, `late_block_expansion_cg`, `late_block_cartesian_projector`. AO-pair recontract route: `direct_ao_projector`."
+    doc_rme_fusion_rank = "Low-rank scalar-conditioning width for output heads. Default: 16."
+    doc_rme_fusion_init = "Stddev of dynamic output-head projections. 0.0 disables dynamic residual/path weights at initialization."
+    doc_rme_fusion_condition = "Condition source for output heads. Currently only `scalar_0e`."
+    doc_rme_cartesian_scope = "ICT/Cartesian product scope for `late_rme_cartesian_hybrid` and `late_block_cartesian_projector`: `missing_only` or `all`."
+    doc_ao_projector_channels = "Direct AO-pair decoder multiplicity. `0` builds the complete ordered AO-pair representation with dimension max_norb^2; positive values are compressed ablations."
+    doc_ao_projector_normalization = "AO-pair projector normalization. Currently `e3hamiltonian`."
+    doc_ao_projector_basis = "AO-pair projector basis convention. Currently `deeptb_real_ao`."
+    doc_ao_projector_backend = "AO-pair projector source: `reference_wigner` or convention-checked `precomputed` bank."
+    doc_ao_projector_bank_path = "Path to projector bank JSON when ao_projector_backend=`precomputed`."
     doc_node_message_aggregation = "Node message aggregation mode. Supported: `scatter` for the legacy sum, `single_head_0e` for DPA4-style envelope-gated scalar attention."
     doc_num_focus = "Number of post-activation 0e focus gates. Values larger than 1 enable DPA4-style channel focus routing."
     doc_focus_attention_dim = "Hidden dimension of the single-head 0e attention query/key projections."
@@ -1402,6 +1408,13 @@ def slem():
         Argument("rme_fusion_rank", int, optional=True, default=16, doc=doc_rme_fusion_rank),
         Argument("rme_fusion_init", [float, int], optional=True, default=0.0, doc=doc_rme_fusion_init),
         Argument("rme_fusion_condition", str, optional=True, default="scalar_0e", doc=doc_rme_fusion_condition),
+        Argument("rme_cartesian_scope", str, optional=True, default="missing_only", doc=doc_rme_cartesian_scope),
+        Argument("rme_ict_scope", [str, None], optional=True, default=None, doc=doc_rme_cartesian_scope),
+        Argument("ao_projector_channels", int, optional=True, default=0, doc=doc_ao_projector_channels),
+        Argument("ao_projector_normalization", str, optional=True, default="e3hamiltonian", doc=doc_ao_projector_normalization),
+        Argument("ao_projector_basis_convention", str, optional=True, default="deeptb_real_ao", doc=doc_ao_projector_basis),
+        Argument("ao_projector_backend", str, optional=True, default="reference_wigner", doc=doc_ao_projector_backend),
+        Argument("ao_projector_bank_path", [str, None], optional=True, default=None, doc=doc_ao_projector_bank_path),
         Argument("res_update", bool, optional=True, default=True, doc="Whether to use residual update."),
         Argument("res_update_ratios", float, optional=True, default=0.5, doc="The ratios of residual update, should in (0,1)."),
         Argument("norm_bottleneck_ratio", float, optional=True, default=0.1, doc="The ratios of norm bottle neck gate."),
@@ -1563,7 +1576,7 @@ def e3tb_prediction():
 
 def block_native_prediction():
     doc_scale_type = "Block-native decoder bypasses RME scale/shift and E3Hamiltonian; use no_scale."
-    doc_block_decoder = "Experimental block-native decoder backend. Currently only `linear` is implemented."
+    doc_block_decoder = "Block-native decoder backend: `linear`, `expansion_cg`, `cartesian_projector`, or `ao_projector`."
     doc_blockwise_hamiltonian = "Whether the downstream consumer expects explicit AO Hamiltonian blocks."
 
     return [

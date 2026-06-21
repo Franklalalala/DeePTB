@@ -17,7 +17,12 @@ from e3nn import o3
 
 _LEGACY_MODE = "legacy_linear"
 _FUSION_MODE = "rme_nocg_fusion"
+_LATE_RME_NOCG_MODE = "late_rme_expansion_nocg"
+_LATE_RME_ICT_MODE = "late_rme_cartesian_hybrid"
 _BLOCK_NATIVE_MODE = "block_native_linear"
+_LATE_BLOCK_WIGNER_MODE = "late_block_expansion_cg"
+_LATE_BLOCK_ICT_MODE = "late_block_cartesian_projector"
+_DIRECT_AO_PROJECTOR_MODE = "direct_ao_projector"
 
 
 def normalize_rme_head_mode(mode: Optional[str]) -> str:
@@ -28,11 +33,30 @@ def normalize_rme_head_mode(mode: Optional[str]) -> str:
         "linear": _LEGACY_MODE,
         "nocg": _FUSION_MODE,
         "rme_fusion": _FUSION_MODE,
+        "late_nocg": _LATE_RME_NOCG_MODE,
+        "late_rme_nocg": _LATE_RME_NOCG_MODE,
+        "late_rme_ict_hybrid": _LATE_RME_ICT_MODE,
+        "late_rme_cartesian": _LATE_RME_ICT_MODE,
         "block_native": _BLOCK_NATIVE_MODE,
         "block_linear": _BLOCK_NATIVE_MODE,
+        "expansion_cg": _LATE_BLOCK_WIGNER_MODE,
+        "late_block_wigner": _LATE_BLOCK_WIGNER_MODE,
+        "late_block_ict_projector": _LATE_BLOCK_ICT_MODE,
+        "late_block_cartesian": _LATE_BLOCK_ICT_MODE,
+        "ao_projector": _DIRECT_AO_PROJECTOR_MODE,
+        "direct_ao": _DIRECT_AO_PROJECTOR_MODE,
     }
     normalized = aliases.get(normalized, normalized)
-    allowed = {_LEGACY_MODE, _FUSION_MODE, _BLOCK_NATIVE_MODE}
+    allowed = {
+        _LEGACY_MODE,
+        _FUSION_MODE,
+        _LATE_RME_NOCG_MODE,
+        _LATE_RME_ICT_MODE,
+        _BLOCK_NATIVE_MODE,
+        _LATE_BLOCK_WIGNER_MODE,
+        _LATE_BLOCK_ICT_MODE,
+        _DIRECT_AO_PROJECTOR_MODE,
+    }
     if normalized not in allowed:
         raise ValueError(
             f"rme_head_mode must be one of {sorted(allowed)}, got {mode!r}."

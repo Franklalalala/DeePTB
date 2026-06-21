@@ -161,11 +161,23 @@ class NNENV(nn.Module):
         n_species = len(self.basis.keys())
         # initialize the embedding layer
         self.embedding = Embedding(**embedding, dtype=dtype, device=device, idp=self.idp, n_atom=n_species)
+        head_mode = str(getattr(self.embedding, "rme_head_mode", "legacy_linear"))
         embedding_uses_block_native = bool(getattr(self.embedding, "use_block_native_output", False))
         if self.method == "block_native" and not embedding_uses_block_native:
-            raise ValueError("prediction.method='block_native' requires embedding.rme_head_mode='block_native_linear'.")
+            raise ValueError("prediction.method='block_native' requires a direct-AO output head.")
         if self.method != "block_native" and embedding_uses_block_native:
-            raise ValueError("embedding.rme_head_mode='block_native_linear' requires prediction.method='block_native'.")
+            raise ValueError(
+                f"embedding.rme_head_mode={head_mode!r} requires "
+                "prediction.method='block_native'."
+            )
+        if head_mode in {
+            "late_rme_expansion_nocg",
+            "late_rme_cartesian_hybrid",
+        } and self.method != "e3tb":
+            raise ValueError(
+                f"embedding.rme_head_mode={head_mode!r} preserves the RME "
+                "contract and requires prediction.method='e3tb'."
+            )
         
         # initialize the prediction layer
             
@@ -283,10 +295,27 @@ class NNENV(nn.Module):
             if self.scale_type not in (None, "no_scale"):
                 raise ValueError("block_native prediction requires scale_type='no_scale' or omitted.")
             block_decoder = str(prediction_copy.get("block_decoder", "linear")).lower()
-            if block_decoder != "linear":
+            if block_decoder not in {"linear", "expansion_cg", "cartesian_projector", "ao_projector"}:
                 raise NotImplementedError(
-                    "block_native currently supports only block_decoder='linear'; "
+                    "block_native supports block_decoder in "
+                    "{'linear', 'expansion_cg', 'cartesian_projector', 'ao_projector'}; "
                     f"got {block_decoder!r}."
+                )
+            expected_decoder = {
+                "block_native_linear": "linear",
+                "late_block_expansion_cg": "expansion_cg",
+                "late_block_cartesian_projector": "cartesian_projector",
+                "direct_ao_projector": "ao_projector",
+            }.get(head_mode)
+            if expected_decoder is None:
+                raise ValueError(
+                    f"embedding.rme_head_mode={head_mode!r} is not a block-native head."
+                )
+            if block_decoder != expected_decoder:
+                raise ValueError(
+                    f"prediction.block_decoder={block_decoder!r} does not match "
+                    f"embedding.rme_head_mode={head_mode!r}; expected "
+                    f"{expected_decoder!r}."
                 )
         else:
             raise NotImplementedError("The prediction model {} is not implemented.".format(prediction_copy["method"]))

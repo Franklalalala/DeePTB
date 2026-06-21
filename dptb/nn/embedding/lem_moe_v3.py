@@ -32,6 +32,11 @@ from .rme_nocg_fusion_head import (
     RMENoCGFusionHead,
     normalize_rme_head_mode,
 )
+from .late_rme_expansion_nocg import LateRMEExpansionNoCGHead
+from .late_rme_cartesian_hybrid import LateRMECartesianHybridHead
+from .late_block_expansion_cg import LateBlockExpansionCGHead
+from .late_block_cartesian_projector import LateBlockCartesianProjectorHead
+from .ao_angular_projector import AOAngularProjectorHead, build_ao_decoder_irreps
 from .block_native_head import BlockNativeLinearHead, apply_ao_basis_mask
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
@@ -1061,6 +1066,13 @@ class LemMoEV3(torch.nn.Module):
             rme_fusion_rank: int = 16,
             rme_fusion_init: float = 0.0,
             rme_fusion_condition: str = "scalar_0e",
+            rme_cartesian_scope: str = "missing_only",
+            rme_ict_scope: Optional[str] = None,
+            ao_projector_channels: int = 0,
+            ao_projector_normalization: str = "e3hamiltonian",
+            ao_projector_basis_convention: str = "deeptb_real_ao",
+            ao_projector_backend: str = "reference_wigner",
+            ao_projector_bank_path: Optional[str] = None,
             res_update: bool = True,
             res_update_ratios: Optional[List[float]] = None,
             res_update_ratios_learnable: bool = False,
@@ -1153,10 +1165,32 @@ class LemMoEV3(torch.nn.Module):
         )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
         self.rme_head_mode = normalize_rme_head_mode(rme_head_mode)
-        self.use_block_native_output = self.rme_head_mode == "block_native_linear"
+        self.use_late_rme_nocg_output = self.rme_head_mode == "late_rme_expansion_nocg"
+        self.use_late_rme_ict_output = self.rme_head_mode == "late_rme_cartesian_hybrid"
+        self.use_late_rme_output = (
+            self.use_late_rme_nocg_output or self.use_late_rme_ict_output
+        )
+        self.use_late_block_wigner_output = self.rme_head_mode == "late_block_expansion_cg"
+        self.use_late_block_ict_output = self.rme_head_mode == "late_block_cartesian_projector"
+        self.use_direct_ao_output = self.rme_head_mode == "direct_ao_projector"
+        self.use_block_native_output = self.rme_head_mode in {
+            "block_native_linear",
+            "late_block_expansion_cg",
+            "late_block_cartesian_projector",
+            "direct_ao_projector",
+        }
+        self.output_head_contract = "ao_block" if self.use_block_native_output else "rme"
         self.rme_fusion_rank = int(rme_fusion_rank)
         self.rme_fusion_init = float(rme_fusion_init)
         self.rme_fusion_condition = str(rme_fusion_condition)
+        self.rme_cartesian_scope = str(
+            rme_cartesian_scope if rme_ict_scope is None else rme_ict_scope
+        )
+        self.ao_projector_channels = int(ao_projector_channels)
+        self.ao_projector_normalization = str(ao_projector_normalization)
+        self.ao_projector_basis_convention = str(ao_projector_basis_convention)
+        self.ao_projector_backend = str(ao_projector_backend)
+        self.ao_projector_bank_path = ao_projector_bank_path
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
@@ -1178,8 +1212,9 @@ class LemMoEV3(torch.nn.Module):
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
         log.info(
-            "  - Output Head: mode=%s rank=%d init=%g condition=%s",
+            "  - Output Head: mode=%s contract=%s rank=%d init=%g condition=%s",
             self.rme_head_mode,
+            self.output_head_contract,
             self.rme_fusion_rank,
             self.rme_fusion_init,
             self.rme_fusion_condition,
@@ -1234,6 +1269,13 @@ class LemMoEV3(torch.nn.Module):
 
         irreps_sh = o3.Irreps([(1, (i, (-1) ** i)) for i in range(lmax + 1)])
         orbpair_irreps = self.idp.orbpair_irreps.sort()[0].simplify()
+        self.ao_decoder_irreps = (
+            build_ao_decoder_irreps(
+                self.idp.full_basis, channels=self.ao_projector_channels
+            )
+            if self.use_direct_ao_output
+            else None
+        )
 
         irreps_out = []
         for mul, ir1 in irreps_hidden:
@@ -1288,9 +1330,17 @@ class LemMoEV3(torch.nn.Module):
             else:
                 irreps_in = irreps_hidden
 
-            if i == n_layers - 1 and not self.use_block_native_output:
-                irreps_out = orbpair_irreps.sort()[0].simplify()
-                use_interpolation_tp = bool(use_interpolation_out)
+            if i == n_layers - 1:
+                if self.use_direct_ao_output:
+                    assert self.ao_decoder_irreps is not None
+                    irreps_out = self.ao_decoder_irreps
+                    use_interpolation_tp = False
+                elif self.use_late_rme_output or self.use_block_native_output:
+                    irreps_out = irreps_hidden
+                    use_interpolation_tp = False
+                else:
+                    irreps_out = orbpair_irreps.sort()[0].simplify()
+                    use_interpolation_tp = bool(use_interpolation_out)
             else:
                 irreps_out = irreps_hidden
                 use_interpolation_tp = False
@@ -1358,13 +1408,18 @@ class LemMoEV3(torch.nn.Module):
 
         self.use_out_onehot_tp = bool(use_out_onehot_tp) and not self.use_block_native_output
         if self.use_out_onehot_tp:
+            onehot_irreps_in = (
+                self.idp.orbpair_irreps
+                if self.use_late_rme_output
+                else self.layers[-1].irreps_out
+            )
             self.out_node_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
-                irreps_in1=self.layers[-1].irreps_out,
+                irreps_in1=onehot_irreps_in,
                 irreps_in2='95x0e',
                 irreps_out=self.idp.orbpair_irreps,
             ))
             self.out_edge_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
-                irreps_in1=self.layers[-1].irreps_out,
+                irreps_in1=onehot_irreps_in,
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.idp.orbpair_irreps,
             ))
@@ -1372,6 +1427,66 @@ class LemMoEV3(torch.nn.Module):
         if max_norb <= 0:
             max_norb = sum(int(v) for v in getattr(self.idp, "basis_to_full_basis", {}).values())
         if self.use_block_native_output:
+            block_kwargs = {
+                "rank": self.rme_fusion_rank,
+                "init": self.rme_fusion_init,
+                "condition": self.rme_fusion_condition,
+                "dtype": self.dtype,
+                "device": self.device,
+            }
+            if self.use_late_block_wigner_output:
+                self.out_edge = LateBlockExpansionCGHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.full_basis,
+                    symmetrize=False,
+                    **block_kwargs,
+                )
+                self.out_node = LateBlockExpansionCGHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.full_basis,
+                    symmetrize=True,
+                    **block_kwargs,
+                )
+                return
+            if self.use_late_block_ict_output:
+                ict_kwargs = dict(block_kwargs)
+                ict_kwargs["product_scope"] = self.rme_cartesian_scope
+                self.out_edge = LateBlockCartesianProjectorHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.full_basis,
+                    symmetrize=False,
+                    **ict_kwargs,
+                )
+                self.out_node = LateBlockCartesianProjectorHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.full_basis,
+                    symmetrize=True,
+                    **ict_kwargs,
+                )
+                return
+            if self.use_direct_ao_output:
+                ao_kwargs = dict(block_kwargs)
+                ao_kwargs.update(
+                    {
+                        "normalization": self.ao_projector_normalization,
+                        "basis_convention": self.ao_projector_basis_convention,
+                        "projector_backend": self.ao_projector_backend,
+                        "projector_bank_path": self.ao_projector_bank_path,
+                    }
+                )
+                self.out_edge = AOAngularProjectorHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.full_basis,
+                    symmetrize=False,
+                    **ao_kwargs,
+                )
+                self.out_node = AOAngularProjectorHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.full_basis,
+                    symmetrize=True,
+                    **ao_kwargs,
+                )
+                return
             self.out_edge = BlockNativeLinearHead(
                 self.layers[-1].irreps_out,
                 max_norb,
@@ -1414,26 +1529,52 @@ class LemMoEV3(torch.nn.Module):
                 "dtype": self.dtype,
                 "device": self.device,
             }
-            self.out_edge = RMENoCGFusionHead(
-                self.layers[-1].irreps_out,
-                self.idp.orbpair_irreps,
-                legacy=legacy_out_edge,
-                **fusion_kwargs,
-            )
-            self.out_node = RMENoCGFusionHead(
-                self.layers[-1].irreps_out,
-                self.idp.orbpair_irreps,
-                legacy=legacy_out_node,
-                **fusion_kwargs,
-            )
+            if self.use_late_rme_nocg_output:
+                head_cls = LateRMEExpansionNoCGHead
+                self.out_edge = head_cls(
+                    self.layers[-1].irreps_out,
+                    self.idp.orbpair_irreps,
+                    **fusion_kwargs,
+                )
+                self.out_node = head_cls(
+                    self.layers[-1].irreps_out,
+                    self.idp.orbpair_irreps,
+                    **fusion_kwargs,
+                )
+            elif self.use_late_rme_ict_output:
+                ict_kwargs = dict(fusion_kwargs)
+                ict_kwargs["product_scope"] = self.rme_cartesian_scope
+                self.out_edge = LateRMECartesianHybridHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.orbpair_irreps,
+                    **ict_kwargs,
+                )
+                self.out_node = LateRMECartesianHybridHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.orbpair_irreps,
+                    **ict_kwargs,
+                )
+            else:
+                self.out_edge = RMENoCGFusionHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.orbpair_irreps,
+                    legacy=legacy_out_edge,
+                    **fusion_kwargs,
+                )
+                self.out_node = RMENoCGFusionHead(
+                    self.layers[-1].irreps_out,
+                    self.idp.orbpair_irreps,
+                    legacy=legacy_out_node,
+                    **fusion_kwargs,
+                )
 
     @property
     def out_edge_irreps(self):
-        return self.idp.orbpair_irreps
+        return None if self.use_block_native_output else self.idp.orbpair_irreps
 
     @property
     def out_node_irreps(self):
-        return self.idp.orbpair_irreps
+        return None if self.use_block_native_output else self.idp.orbpair_irreps
 
     def _apply_rme_output_heads(
         self,
@@ -1446,11 +1587,17 @@ class LemMoEV3(torch.nn.Module):
         out_edge_features = self.out_edge(edge_features)
 
         if self.use_out_onehot_tp:
+            node_tp_input = (
+                out_node_features if self.use_late_rme_output else node_features
+            )
+            edge_tp_input = (
+                out_edge_features if self.use_late_rme_output else edge_features
+            )
             out_node_features = out_node_features + _apply_onehot_tp(
-                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
+                self.out_node_ele_tp, node_tp_input, node_one_hot, self.onehot_tp_mode
             )
             out_edge_features = out_edge_features + _apply_onehot_tp(
-                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
+                self.out_edge_ele_tp, edge_tp_input, edge_one_hot, self.onehot_tp_mode
             )
         return out_node_features, out_edge_features
 

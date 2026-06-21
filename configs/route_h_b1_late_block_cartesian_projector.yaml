@@ -1,0 +1,38 @@
+# H-B1: ordinary hidden -> ICT/Cartesian projector -> AO block.
+common_options:
+  basis: {H: 2s1p, O: 3s2p1d}
+  overlap: false
+  dtype: float32
+  device: cpu
+model_options:
+  embedding:
+    method: lem_moe_v3
+    irreps_hidden: 4x0e+4x1o+4x1e+4x2e+4x2o+4x3o+4x3e+4x4e
+    avg_num_neighbors: 2.0
+    r_max: 4.0
+    n_layers: 1
+    env_embed_multiplicity: 4
+    latent_dim: 8
+    latent_channels: [8]
+    edge_one_hot_dim: 4
+    num_experts: 1
+    num_shared_experts: 1
+    top_k: 1
+    universal: true
+    use_layer_onehot_tp: false
+    use_out_onehot_tp: false
+    use_interpolation_out: false
+    tp_radial_emb: false
+    mole_linear_mode: indexed_ref
+    so2_fusion_mode: streamed_m_major_ref
+    rme_head_mode: late_block_cartesian_projector
+    rme_cartesian_scope: missing_only
+    rme_fusion_rank: 4
+    rme_fusion_init: 0.0
+  prediction:
+    method: block_native
+    block_decoder: cartesian_projector
+    blockwise_hamiltonian: true
+    scale_type: no_scale
+train_options:
+  flow_options: {enabled: false}
