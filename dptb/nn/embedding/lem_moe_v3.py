@@ -1739,12 +1739,12 @@ class LemMoEV3(torch.nn.Module):
                 node_features, edge_features, atom_type, edge_index, active_edges
             )
             data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
-            data[_keys.EDGE_HAMILTONIAN_KEY] = torch.zeros(
-                edge_index.shape[1],
-                self.out_edge.max_norb,
-                self.out_edge.max_norb,
-                dtype=self.dtype,
-                device=self.device,
+            data[_keys.EDGE_HAMILTONIAN_KEY] = out_edge_blocks.new_zeros(
+                (
+                    edge_index.shape[1],
+                    self.out_edge.max_norb,
+                    self.out_edge.max_norb,
+                )
             )
             data[_keys.EDGE_HAMILTONIAN_KEY] = torch.index_copy(
                 data[_keys.EDGE_HAMILTONIAN_KEY], 0, active_edges, out_edge_blocks
@@ -1758,8 +1758,9 @@ class LemMoEV3(torch.nn.Module):
         )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
-        data[_keys.EDGE_FEATURES_KEY] = torch.zeros(edge_index.shape[1], self.idp.orbpair_irreps.dim, dtype=self.dtype,
-                                                    device=self.device)
+        data[_keys.EDGE_FEATURES_KEY] = out_edge_features.new_zeros(
+            (edge_index.shape[1], self.idp.orbpair_irreps.dim)
+        )
         data[_keys.EDGE_FEATURES_KEY] = torch.index_copy(data[_keys.EDGE_FEATURES_KEY], 0, active_edges,
                                                          out_edge_features)
 

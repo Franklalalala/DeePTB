@@ -17,9 +17,18 @@ class BlockNativeLinearHead(torch.nn.Module):
     """Project final equivariant features directly to padded AO blocks.
 
     This is a minimal block-native decoder used to validate the Plan-B routing
-    contract.  Onsite blocks are symmetrized explicitly; directed edge blocks
-    are left directed.
+    contract.  It is intentionally a debug/control baseline: the dense linear
+    projection is not an SO(3)/O(3) AO decoder.  Onsite blocks are symmetrized
+    explicitly; directed edge blocks are left directed.
     """
+
+    performs_angular_coupling = False
+    output_contract = "ao_block"
+    bypasses_rme = True
+    bypasses_e3hamiltonian = True
+    uses_ict = False
+    is_equivariant_output = False
+    debug_only = True
 
     def __init__(
         self,

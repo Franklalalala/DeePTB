@@ -23,9 +23,11 @@ try:
         export_projector_bank,
         load_projector_bank,
         normalize_projector_backend,
+        projector_bank_source,
         reference_projector,
         required_projector_keys,
         shell_l,
+        source_uses_ict,
     )
 except ImportError:  # standalone package-level tests
     from ao_projector_bank import (
@@ -36,9 +38,11 @@ except ImportError:  # standalone package-level tests
         export_projector_bank,
         load_projector_bank,
         normalize_projector_backend,
+        projector_bank_source,
         reference_projector,
         required_projector_keys,
         shell_l,
+        source_uses_ict,
     )
 
 
@@ -85,10 +89,11 @@ class AOAngularProjectorHead(torch.nn.Module):
         self.normalization = str(normalization).strip().lower()
         self.basis_convention = str(basis_convention).strip().lower()
         self.projector_backend = normalize_projector_backend(projector_backend)
-        self.uses_ict = self.projector_backend == _PRECOMPUTED_BACKEND
+        self.uses_precomputed_projector = self.projector_backend == _PRECOMPUTED_BACKEND
         self.projector_bank_path = (
             None if projector_bank_path in (None, "") else str(projector_bank_path)
         )
+        self.projector_source = _REFERENCE_BACKEND
 
         if not self.full_basis:
             raise ValueError("full_basis must contain at least one AO shell.")
@@ -128,9 +133,13 @@ class AOAngularProjectorHead(torch.nn.Module):
 
         loaded_bank = None
         if self.projector_backend == _PRECOMPUTED_BACKEND:
+            self.projector_source = projector_bank_source(self.projector_bank_path)
+            self.uses_ict = source_uses_ict(self.projector_source)
             loaded_bank = load_projector_bank(
                 self.projector_bank_path, self.full_basis
             )
+        else:
+            self.uses_ict = False
 
         self._shell_specs = []
         ao_terms = []

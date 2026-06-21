@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the Route-B angular-projector interchange schema."""
+"""Export a reference-Wigner AO angular-projector bank."""
 
 from __future__ import annotations
 
@@ -25,7 +25,8 @@ def main() -> int:
     parser.add_argument(
         "--source",
         default="reference_wigner",
-        help="provenance label; a Cartesian/ICT exporter should set its own label",
+        choices=("reference_wigner",),
+        help="provenance label for this reference exporter",
     )
     args = parser.parse_args()
     path = export_projector_bank(args.output, args.shell, source=args.source)

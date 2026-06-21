@@ -139,24 +139,6 @@ class LateBlockCartesianProjectorHead(torch.nn.Module):
             persistent=False,
         )
 
-        self.left = o3.Linear(
-            self.irreps_in,
-            self.irreps_in,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
-        )
-        self.right = o3.Linear(
-            self.irreps_in,
-            self.irreps_in,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
-        )
-        if dtype is not None or device is not None:
-            self.left = self.left.to(dtype=dtype, device=device)
-            self.right = self.right.to(dtype=dtype, device=device)
-
         self.shell_couplings = torch.nn.ModuleDict()
         self.irrep_couplings = torch.nn.ModuleDict()
         self.direct_paths: List[_DirectBlockPath] = []
@@ -290,6 +272,25 @@ class LateBlockCartesianProjectorHead(torch.nn.Module):
             )
         if weight_offset <= 0:
             raise ValueError("late_block_cartesian_projector constructed no paths.")
+
+        if self.product_paths:
+            self.left = o3.Linear(
+                self.irreps_in,
+                self.irreps_in,
+                shared_weights=True,
+                internal_weights=True,
+                biases=True,
+            )
+            self.right = o3.Linear(
+                self.irreps_in,
+                self.irreps_in,
+                shared_weights=True,
+                internal_weights=True,
+                biases=True,
+            )
+            if dtype is not None or device is not None:
+                self.left = self.left.to(dtype=dtype, device=device)
+                self.right = self.right.to(dtype=dtype, device=device)
 
         self.weight_numel = int(weight_offset)
         self._pair_fan_in = pair_fan_in

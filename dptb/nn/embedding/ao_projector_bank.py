@@ -21,6 +21,10 @@ _ANGULAR_L = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
 _PROJECTOR_SCHEMA = "deeptb.ao_angular_projector/v1"
 _REFERENCE_BACKEND = "reference_wigner"
 _PRECOMPUTED_BACKEND = "precomputed"
+_REFERENCE_SOURCES = {
+    "reference_wigner",
+    "reference_fixture_replaceable_by_cartesian_ict",
+}
 
 
 def shell_l(shell: str) -> int:
@@ -121,6 +125,14 @@ def export_projector_bank(
     A Cartesian/ICT generator should emit the same schema after converting its
     tensors to ``deeptb_real_ao`` ordering and ``e3hamiltonian`` normalization.
     """
+    source = str(source).strip().lower()
+    if source != "reference_wigner":
+        raise ValueError(
+            "export_projector_bank writes reference Wigner projectors only; "
+            "source must be 'reference_wigner'. Use an external ICT/Cartesian "
+            "generator for non-reference provenance."
+        )
+
     path = Path(path)
     projectors = {}
     for key in required_projector_keys(full_basis):
@@ -138,6 +150,33 @@ def export_projector_bank(
     return path
 
 
+def _validated_projector_payload(path: Union[str, Path]) -> Mapping[str, object]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("schema") != _PROJECTOR_SCHEMA:
+        raise ValueError(
+            f"Unsupported projector schema {payload.get('schema')!r}; "
+            f"expected {_PROJECTOR_SCHEMA!r}."
+        )
+    if payload.get("normalization") != "e3hamiltonian":
+        raise ValueError("Projector bank normalization must be 'e3hamiltonian'.")
+    if payload.get("basis_convention") != "deeptb_real_ao":
+        raise ValueError("Projector bank basis must be 'deeptb_real_ao'.")
+    return payload
+
+
+def projector_bank_source(path: Union[str, Path]) -> str:
+    return str(_validated_projector_payload(path).get("source", ""))
+
+
+def source_uses_ict(source: Optional[str]) -> bool:
+    normalized = str(source or "").strip().lower()
+    if not normalized or normalized in _REFERENCE_SOURCES:
+        return False
+    if normalized.startswith("reference_"):
+        return False
+    return "ict" in normalized or "cartesian" in normalized
+
+
 def load_projector_bank(
     path: Union[str, Path],
     full_basis: Sequence[str],
@@ -151,17 +190,7 @@ def load_projector_bank(
     normalization.  Such a bank is accepted only after conversion into the
     exact latent/AO convention used by this DeePTB checkout.
     """
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema") != _PROJECTOR_SCHEMA:
-        raise ValueError(
-            f"Unsupported projector schema {payload.get('schema')!r}; "
-            f"expected {_PROJECTOR_SCHEMA!r}."
-        )
-    if payload.get("normalization") != "e3hamiltonian":
-        raise ValueError("Projector bank normalization must be 'e3hamiltonian'.")
-    if payload.get("basis_convention") != "deeptb_real_ao":
-        raise ValueError("Projector bank basis must be 'deeptb_real_ao'.")
-
+    payload = _validated_projector_payload(path)
     raw = payload.get("projectors")
     if not isinstance(raw, Mapping):
         raise ValueError("Projector bank must contain a 'projectors' mapping.")

@@ -1,4 +1,6 @@
-# P-B1: AO-pair final irreps -> precomputed ICT/projector bank -> AO block.
+# P-B1: AO-pair final irreps -> precomputed reference projector bank -> AO block.
+# This is a projector-bank/provenance route, not a true ICT-bank route until
+# a Cartesian/ICT-generated bank is supplied with non-reference provenance.
 common_options:
   basis: {H: 2s1p, O: 3s2p1d}
   overlap: false

@@ -48,7 +48,7 @@ def test_ordinary_hidden_rme_heads_keep_rme_contract():
         irreps_out,
         rank=4,
         init=0.0,
-        product_scope="missing_only",
+        product_scope="all",
         dtype=torch.float64,
     )
 
@@ -56,6 +56,8 @@ def test_ordinary_hidden_rme_heads_keep_rme_contract():
     assert nocg.performs_angular_coupling is False
     assert ict.output_contract == "rme"
     assert ict.performs_angular_coupling is True
+    assert ict.uses_ict is True
+    assert ict.coverage_report["product_paths"] > 0
     assert nocg(x).shape == (5, irreps_out.dim)
     assert ict(x).shape == (5, irreps_out.dim)
 
@@ -90,6 +92,10 @@ def test_ordinary_hidden_block_heads_bypass_rme_and_e3hamiltonian():
     assert ict.output_contract == "ao_block"
     assert ict.bypasses_rme
     assert ict.uses_ict is True
+    assert ict.coverage_report["direct_paths"] > 0
+    assert ict.coverage_report["product_paths"] == 0
+    assert not hasattr(ict, "left")
+    assert not hasattr(ict, "right")
     assert wigner(x).shape == (6, 4, 4)
     assert ict(x).shape == (6, 4, 4)
 
@@ -114,11 +120,9 @@ def test_ao_pair_recontract_supports_reference_and_precomputed_backends(tmp_path
         rank=4,
         dtype=torch.float64,
     )
-    bank_path = export_projector_bank(
-        tmp_path / "ict_projectors.json", full_basis, source="ict_cartesian"
-    )
+    bank_path = export_projector_bank(tmp_path / "reference_projectors.json", full_basis)
     payload = json.loads(Path(bank_path).read_text(encoding="utf-8"))
-    assert payload["source"] == "ict_cartesian"
+    assert payload["source"] == "reference_wigner"
 
     precomputed = AOAngularProjectorHead(
         irreps,
@@ -133,9 +137,22 @@ def test_ao_pair_recontract_supports_reference_and_precomputed_backends(tmp_path
     assert reference.output_contract == "ao_block"
     assert reference.uses_ict is False
     assert precomputed.output_contract == "ao_block"
-    assert precomputed.uses_ict is True
+    assert precomputed.uses_precomputed_projector is True
+    assert precomputed.projector_source == "reference_wigner"
+    assert precomputed.uses_ict is False
     assert reference(x).shape == (3, 4, 4)
     assert precomputed(x).shape == (3, 4, 4)
+
+
+def test_reference_projector_exporter_does_not_forge_ict_source(tmp_path):
+    from dptb.nn.embedding.ao_projector_bank import export_projector_bank
+
+    with pytest.raises(ValueError, match="reference_wigner"):
+        export_projector_bank(
+            tmp_path / "bad_projectors.json",
+            ("s", "p"),
+            source="ict_cartesian",
+        )
 
 
 def test_ao_pair_decoder_requires_complete_irreps():
@@ -234,7 +251,12 @@ def _build_route(mode, prediction, extra_embedding=None):
 def test_ordinary_hidden_model_routes_keep_final_hidden_contract(
     mode, head_name, uses_ict, prediction
 ):
-    model = _build_route(mode, prediction)
+    extra_embedding = (
+        {"rme_cartesian_scope": "all"}
+        if mode == "late_rme_cartesian_hybrid"
+        else None
+    )
+    model = _build_route(mode, prediction, extra_embedding)
     embedding = model.embedding
 
     assert embedding.layers[-1].irreps_out == o3.Irreps(ORDINARY_HIDDEN)
@@ -246,11 +268,17 @@ def test_ordinary_hidden_model_routes_keep_final_hidden_contract(
     else:
         assert hasattr(model, "hamiltonian")
         assert embedding.out_node.output_contract == "rme"
+    if mode == "late_rme_cartesian_hybrid":
+        assert embedding.out_node.coverage_report["product_paths"] > 0
+    if mode == "late_block_cartesian_projector":
+        assert embedding.out_node.coverage_report["product_paths"] == 0
+        assert not hasattr(embedding.out_node, "left")
+        assert not hasattr(embedding.out_node, "right")
 
 
 @pytest.mark.parametrize(
     ("backend", "uses_ict"),
-    [("reference_wigner", False), ("precomputed", True)],
+    [("reference_wigner", False), ("precomputed", False)],
 )
 def test_ao_pair_recontract_model_routes_change_final_layer_to_ao_pair_irreps(
     tmp_path, backend, uses_ict
@@ -263,7 +291,7 @@ def test_ao_pair_recontract_model_routes_change_final_layer_to_ao_pair_irreps(
         from dptb.nn.embedding.ao_projector_bank import export_projector_bank
 
         bank = export_projector_bank(
-            tmp_path / "ict_projectors.json", ("s", "s", "s", "p", "p", "d")
+            tmp_path / "reference_projectors.json", ("s", "s", "s", "p", "p", "d")
         )
         extra["ao_projector_bank_path"] = str(bank)
     model = _build_route(
@@ -282,3 +310,4 @@ def test_ao_pair_recontract_model_routes_change_final_layer_to_ao_pair_irreps(
     assert embedding.layers[-1].irreps_out.dim == 14 * 14
     assert type(embedding.out_node).__name__ == "AOAngularProjectorHead"
     assert embedding.out_node.uses_ict is uses_ict
+    assert embedding.out_node.uses_precomputed_projector is (backend == "precomputed")

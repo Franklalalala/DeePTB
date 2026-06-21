@@ -24,6 +24,16 @@ def test_block_native_head_shapes_and_onsite_symmetry():
     assert torch.allclose(blocks, blocks.transpose(-1, -2), atol=1e-6)
 
 
+def test_block_native_linear_is_marked_debug_nonequivariant():
+    head = BlockNativeLinearHead("3x0e+2x1o", max_norb=4, symmetrize=True)
+    assert head.output_contract == "ao_block"
+    assert head.bypasses_rme is True
+    assert head.bypasses_e3hamiltonian is True
+    assert head.uses_ict is False
+    assert head.is_equivariant_output is False
+    assert head.debug_only is True
+
+
 def test_block_native_edge_head_is_directed():
     irreps = o3.Irreps("2x0e+1x1o")
     head = BlockNativeLinearHead(irreps, max_norb=3, symmetrize=False, init=0.01)

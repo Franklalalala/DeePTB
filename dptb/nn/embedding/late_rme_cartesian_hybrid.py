@@ -90,7 +90,7 @@ class LateRMECartesianHybridHead(torch.nn.Module):
         self.condition = str(condition).strip().lower()
         self.product_scope = str(product_scope).strip().lower()
         self.output_is_rme = True
-        self.uses_cartesian_angular_coupling = True
+        self.uses_cartesian_angular_coupling = False
 
         if self.rank <= 0:
             raise ValueError("rme_fusion_rank must be positive, got {}.".format(rank))
@@ -130,26 +130,6 @@ class LateRMECartesianHybridHead(torch.nn.Module):
             torch.tensor(scalar_indices, dtype=torch.long, device=projector_device),
             persistent=False,
         )
-
-        # Separate equivariant projections keep the two product factors learned
-        # and avoid the symmetry collapse x*x can impose on odd coupled channels.
-        self.left = o3.Linear(
-            self.irreps_in,
-            self.irreps_in,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
-        )
-        self.right = o3.Linear(
-            self.irreps_in,
-            self.irreps_in,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
-        )
-        if dtype is not None or device is not None:
-            self.left = self.left.to(dtype=dtype, device=device)
-            self.right = self.right.to(dtype=dtype, device=device)
 
         self.couplings = torch.nn.ModuleDict()
         self.direct_paths: List[_DirectPath] = []
@@ -242,6 +222,29 @@ class LateRMECartesianHybridHead(torch.nn.Module):
             )
         if weight_offset <= 0:
             raise ValueError("late_rme_cartesian_hybrid constructed no paths.")
+
+        self.uses_ict = bool(self.product_paths)
+        self.uses_cartesian_angular_coupling = self.uses_ict
+        if self.product_paths:
+            # Separate equivariant projections keep the two product factors learned
+            # and avoid the symmetry collapse x*x can impose on odd coupled channels.
+            self.left = o3.Linear(
+                self.irreps_in,
+                self.irreps_in,
+                shared_weights=True,
+                internal_weights=True,
+                biases=True,
+            )
+            self.right = o3.Linear(
+                self.irreps_in,
+                self.irreps_in,
+                shared_weights=True,
+                internal_weights=True,
+                biases=True,
+            )
+            if dtype is not None or device is not None:
+                self.left = self.left.to(dtype=dtype, device=device)
+                self.right = self.right.to(dtype=dtype, device=device)
 
         self.weight_numel = int(weight_offset)
         self._output_fan_in = tuple(output_fan_in)

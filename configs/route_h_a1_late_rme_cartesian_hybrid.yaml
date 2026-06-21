@@ -26,7 +26,9 @@ model_options:
     mole_linear_mode: indexed_ref
     so2_fusion_mode: streamed_m_major_ref
     rme_head_mode: late_rme_cartesian_hybrid
-    rme_cartesian_scope: missing_only
+    # The ordinary hidden layout already covers each target (l, parity).
+    # Use all so H-A1 actually exercises Cartesian/ICT product paths.
+    rme_cartesian_scope: all
     rme_fusion_rank: 4
     rme_fusion_init: 0.0
   prediction:

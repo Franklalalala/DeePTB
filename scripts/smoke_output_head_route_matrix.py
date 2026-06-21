@@ -11,7 +11,7 @@ ordinary hidden:
 
 AO-pair recontract:
   p_b0: AO-pair irreps -> reference Wigner projector -> AO block
-  p_b1: AO-pair irreps -> precomputed ICT/projector bank -> AO block
+  p_b1: AO-pair irreps -> precomputed reference projector bank -> AO block
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ ROUTES = {
         "head": "LateRMECartesianHybridHead",
         "final_contract": "ordinary_hidden",
         "uses_ict": True,
+        "extra_embedding": {"rme_cartesian_scope": "all"},
         "prediction": {"method": "e3tb", "scale_type": "no_scale"},
     },
     "h_b0": {
@@ -89,7 +90,8 @@ ROUTES = {
         "mode": "direct_ao_projector",
         "head": "AOAngularProjectorHead",
         "final_contract": "ao_pair",
-        "uses_ict": True,
+        "uses_ict": False,
+        "uses_precomputed_projector": True,
         "extra_embedding": {
             "ao_projector_backend": "precomputed",
             "ao_projector_bank_path": "assets/spd_ao_projectors.json",
@@ -157,6 +159,16 @@ def build_route(name: str, spec: dict):
         assert final_irreps.dim == AO_WIDTH * AO_WIDTH
     assert type(embedding.out_node).__name__ == spec["head"]
     assert getattr(embedding.out_node, "uses_ict") is spec["uses_ict"]
+    if name == "h_a1":
+        assert embedding.out_node.coverage_report["product_paths"] > 0
+    if name == "h_b1":
+        assert embedding.out_node.coverage_report["direct_paths"] > 0
+        assert embedding.out_node.coverage_report["product_paths"] == 0
+        assert not hasattr(embedding.out_node, "left")
+        assert not hasattr(embedding.out_node, "right")
+    if name == "p_b1":
+        assert embedding.out_node.uses_precomputed_projector is True
+        assert embedding.out_node.projector_source == "reference_wigner"
     if spec["prediction"]["method"] == "block_native":
         assert not hasattr(model, "hamiltonian")
         assert embedding.out_node.output_contract == "ao_block"
@@ -171,6 +183,10 @@ def build_route(name: str, spec: dict):
         "final_dim": final_irreps.dim,
         "output_contract": embedding.out_node.output_contract,
         "uses_ict": getattr(embedding.out_node, "uses_ict"),
+        "uses_precomputed_projector": getattr(
+            embedding.out_node, "uses_precomputed_projector", False
+        ),
+        "projector_source": getattr(embedding.out_node, "projector_source", None),
         "uses_e3hamiltonian": hasattr(model, "hamiltonian"),
     }
 
