@@ -1563,6 +1563,10 @@ def e3tb_prediction():
     doc_scale_type = ("Which scale method to use. Can be no_scale, "
                       "scale_wo_back_grad (the scale parameter will not engage the back grad computation graph), "
                       "scale_w_back_grad (the scale parameter will engage the back grad computation graph)")
+    doc_blockwise_hamiltonian = (
+        "If true, materialize E3 Hamiltonian feature predictions into AO block tensors "
+        "for block-wise loss. This is non-SOC AO/block supervision, not a block-native head."
+    )
 
     nn = [
         Argument("scales_trainable", bool, optional=True, default=False, doc=doc_scales_trainable),
@@ -1571,6 +1575,15 @@ def e3tb_prediction():
         Argument("activation", str, optional=True, default="tanh", doc=doc_activation),
         Argument("scale_type", str, optional=True, default="scale_w_back_grad", doc=doc_scale_type),
         Argument("if_batch_normalized", bool, optional=True, default=False, doc=doc_if_batch_normalized),
+        Argument("blockwise_hamiltonian", bool, optional=True, default=False, doc=doc_blockwise_hamiltonian),
+        Argument("node_pad_shape", [list, None], optional=True, default=None, doc="Padded node AO block shape for blockwise Hamiltonian output."),
+        Argument("edge_pad_shape", [list, None], optional=True, default=None, doc="Padded edge AO block shape for blockwise Hamiltonian output."),
+        Argument("symmetrize_onsite", bool, optional=True, default=True, doc="Hermitian-complete onsite AO blocks in blockwise output."),
+        Argument("complete_edges", bool, optional=True, default=True, doc="Fill missing edge AO entries from reverse directed edges in blockwise output."),
+        Argument("strict_complete_edges", bool, optional=True, default=False, doc="Fail if reverse-edge completion leaves unresolved valid AO entries."),
+        Argument("add_h0", bool, optional=True, default=False, doc="Also expose full H block tensors by adding converted H0 blocks to delta predictions."),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for full node Hamiltonian blocks when add_h0 is true."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for full edge Hamiltonian blocks when add_h0 is true."),
     ]
 
     return nn
