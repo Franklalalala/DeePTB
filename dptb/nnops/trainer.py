@@ -98,23 +98,25 @@ class Trainer(BaseTrainer):
             self.validation_loader = DataLoader(dataset=self.validation_datasets,
                                                 batch_size=train_options["val_batch_size"], shuffle=True)
 
+        loss_idp = self._model_loss_idp()
+
         # loss function
         self.train_lossfunc = Loss(
             **self._loss_kwargs(train_options["loss_options"]["train"], common_options),
-            idp=self.model.hamiltonian.idp,
+            idp=loss_idp,
         )
         if self.use_validation:
             self.validation_lossfunc = Loss(
                 **self._loss_kwargs(train_options["loss_options"]["validation"], common_options),
-                idp=self.model.hamiltonian.idp,
+                idp=loss_idp,
             )
         if self.use_reference:
             self.reference_lossfunc = Loss(
                 **self._loss_kwargs(train_options["loss_options"]["reference"], common_options),
-                idp=self.model.hamiltonian.idp,
+                idp=loss_idp,
             )
 
-        flow_idp = getattr(self.train_lossfunc, "idp", self.model.hamiltonian.idp)
+        flow_idp = getattr(self.train_lossfunc, "idp", loss_idp)
         self.flow_cfm = build_hamiltonian_flow(
             train_options.get("flow_options", None),
             idp=flow_idp,
@@ -130,6 +132,25 @@ class Trainer(BaseTrainer):
                                                      'uniform'], "The onsite function should be none or uniform for the skints loss function."
             log.info("The skints loss function is used for training, the model.transform is then set to False.")
             self.model.transform = False
+
+    def _model_loss_idp(self):
+        model = self.model
+        hamiltonian = getattr(model, "hamiltonian", None)
+        if hamiltonian is not None and getattr(hamiltonian, "idp", None) is not None:
+            return hamiltonian.idp
+        embedding = getattr(model, "embedding", None)
+        if embedding is not None and getattr(embedding, "idp", None) is not None:
+            return embedding.idp
+        experts = getattr(model, "experts", None)
+        if experts:
+            first = experts[0]
+            hamiltonian = getattr(first, "hamiltonian", None)
+            if hamiltonian is not None and getattr(hamiltonian, "idp", None) is not None:
+                return hamiltonian.idp
+            embedding = getattr(first, "embedding", None)
+            if embedding is not None and getattr(embedding, "idp", None) is not None:
+                return embedding.idp
+        raise AttributeError("Could not resolve OrbitalMapper idp from model hamiltonian or embedding.")
 
     @staticmethod
     def _loss_component_source(lossfunc):
