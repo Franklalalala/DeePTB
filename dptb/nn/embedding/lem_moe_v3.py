@@ -9,6 +9,11 @@ from e3nn import o3
 from torch_scatter import scatter_add, scatter_max, scatter_mean
 from e3nn.o3 import Linear, SphericalHarmonics, FullyConnectedTensorProduct, TensorProduct
 from dptb.data import AtomicDataDict
+from dptb.data.interfaces.blockwise_tensor import (
+    BlockTensorResult,
+    attach_prediction_block_tensors,
+    infer_block_shapes,
+)
 from dptb.nn.embedding.emb import Embedding
 from ..radial_basis import BesselBasis
 from ..base import ScalarMLPFunction
@@ -1652,6 +1657,18 @@ class LemMoEV3(torch.nn.Module):
             )
             data[_keys.EDGE_HAMILTONIAN_KEY] = torch.index_copy(
                 data[_keys.EDGE_HAMILTONIAN_KEY], 0, active_edges, out_edge_blocks
+            )
+            node_shapes, edge_shapes = infer_block_shapes(
+                data, self.idp, device=out_node_blocks.device
+            )
+            attach_prediction_block_tensors(
+                data,
+                BlockTensorResult(
+                    node_blocks=data[_keys.NODE_HAMILTONIAN_KEY],
+                    edge_blocks=data[_keys.EDGE_HAMILTONIAN_KEY],
+                    node_shapes=node_shapes,
+                    edge_shapes=edge_shapes,
+                ),
             )
             data.pop(_keys.LEM_ACTIVE_EDGES_KEY, None)
             data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)

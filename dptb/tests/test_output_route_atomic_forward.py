@@ -6,12 +6,21 @@ import pytest
 import torch
 
 from dptb.data import _keys
+from dptb.data.interfaces.blockwise_tensor import (
+    EDGE_DELTA_HAMIL_BLOCKS_KEY,
+    EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    EDGE_PRED_HAMIL_BLOCKS_KEY,
+    NODE_DELTA_HAMIL_BLOCKS_KEY,
+    NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    NODE_PRED_HAMIL_BLOCKS_KEY,
+)
 from dptb.nn.build import build_model
 from dptb.nn.embedding.cartesian_ict_bank import (
     export_cartesian_ict_projector_bank,
 )
 from dptb.nn.embedding.cartesian_projector import ao_shell_layout
 from dptb.nn.embedding.output_routes import get_output_route_spec
+from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
 
 
 BASIS = {"H": "1s", "O": "1s1p"}
@@ -145,6 +154,8 @@ def test_real_atomicdata_forward_backward_and_e3_routing(route, tmp_path):
     else:
         assert _keys.NODE_HAMILTONIAN_KEY in output
         assert _keys.EDGE_HAMILTONIAN_KEY in output
+        assert NODE_PRED_HAMIL_BLOCKS_KEY in output
+        assert EDGE_PRED_HAMIL_BLOCKS_KEY in output
         assert output[_keys.NODE_HAMILTONIAN_KEY].shape[-2:] == (
             model.idp.full_basis_norb,
             model.idp.full_basis_norb,
@@ -153,6 +164,12 @@ def test_real_atomicdata_forward_backward_and_e3_routing(route, tmp_path):
             model.idp.full_basis_norb,
             model.idp.full_basis_norb,
         )
+        output[NODE_DELTA_HAMIL_BLOCKS_KEY] = output[NODE_PRED_HAMIL_BLOCKS_KEY].detach().clone()
+        output[EDGE_DELTA_HAMIL_BLOCKS_KEY] = output[EDGE_PRED_HAMIL_BLOCKS_KEY].detach().clone()
+        output[NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = output["node_hamil_block_shape"].clone()
+        output[EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = output["edge_hamil_block_shape"].clone()
+        block_loss = HamilBlockwiseNexTHamLoss(idp=model.idp)(output)
+        assert torch.isfinite(block_loss)
         loss = (
             output[_keys.NODE_HAMILTONIAN_KEY].square().mean()
             + output[_keys.EDGE_HAMILTONIAN_KEY].square().mean()

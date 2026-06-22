@@ -7,6 +7,11 @@ from torch_scatter import scatter_mean
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
+from dptb.data.interfaces.blockwise_tensor import (
+    BlockTensorResult,
+    attach_prediction_block_tensors,
+    infer_block_shapes,
+)
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
@@ -195,6 +200,18 @@ class LemMoEV3H0(LemMoEV3):
                 0,
                 active_edges,
                 out_edge_blocks,
+            )
+            node_shapes, edge_shapes = infer_block_shapes(
+                data, self.idp, device=out_node_blocks.device
+            )
+            attach_prediction_block_tensors(
+                data,
+                BlockTensorResult(
+                    node_blocks=data[_keys.NODE_HAMILTONIAN_KEY],
+                    edge_blocks=data[_keys.EDGE_HAMILTONIAN_KEY],
+                    node_shapes=node_shapes,
+                    edge_shapes=edge_shapes,
+                ),
             )
             data.pop(_keys.LEM_ACTIVE_EDGES_KEY, None)
             data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
