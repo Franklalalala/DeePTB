@@ -1854,6 +1854,23 @@ def loss_options():
         Argument("skdata", str, optional=False, doc="The path to the skfile or sk database."),
     ]
 
+    hamil_blockwise = [
+        Argument("pred_node_block_key", str, optional=True, default="node_hamil_blocks"),
+        Argument("pred_edge_block_key", str, optional=True, default="edge_hamil_blocks"),
+        Argument("target_node_block_key", str, optional=True, default="node_delta_hamil_blocks"),
+        Argument("target_edge_block_key", str, optional=True, default="edge_delta_hamil_blocks"),
+        Argument("target_node_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
+        Argument("target_edge_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
+        Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, feature_compatible."),
+        Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
+        Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
+        Argument("log_feature_compatible", bool, optional=True, default=True),
+        Argument("feature_log_no_grad", bool, optional=True, default=True),
+        Argument("distributed_log_reduce", bool, optional=True, default=True),
+        Argument("expose_component_sums", bool, optional=True, default=True),
+        Argument("eps", float, optional=True, default=1e-12),
+    ]
+
     loss_args = Variant("method", [
         # Argument("hamil", dict, sub_fields=hamil),
         Argument("eigvals", dict, sub_fields=eigvals),
@@ -1868,6 +1885,8 @@ def loss_options():
         Argument("hamil_blas", dict, sub_fields=hamil),
         Argument("hamil_wt", dict, sub_fields=hamil+wt),
         Argument("eig_ham", dict, sub_fields=hamil+eigvals+eig_ham),
+        Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
+        Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
     ], optional=False, doc=doc_method)
 
 
