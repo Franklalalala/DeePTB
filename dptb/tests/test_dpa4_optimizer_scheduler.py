@@ -156,6 +156,32 @@ def test_warmup_rop_state_dict_restores_plateau_state_after_warmup():
     assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(optimizer.param_groups[0]["lr"])
 
 
+def test_qhflow_poly_scheduler_warms_then_polynomially_decays():
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([param], lr=1.0e-3)
+
+    scheduler = get_lr_scheduler(
+        type="qhflow_poly",
+        optimizer=optimizer,
+        warmup_step=2,
+        num_training_steps=10,
+        end_lr=1.0e-5,
+        scheduler_power=1.0,
+    )
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-15)
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(5.0e-4)
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-3)
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(8.7625e-4)
+
+
 def test_hybrid_muon_routes_matrix_params_to_muon_and_vectors_to_adamw():
     matrix = torch.nn.Parameter(torch.zeros(3, 4))
     vector = torch.nn.Parameter(torch.zeros(4))
@@ -430,3 +456,29 @@ def test_train_options_accepts_warmup_rop_scheduler():
     assert normalized["lr_scheduler"]["warmup_steps"] == 5_000
     assert normalized["lr_scheduler"]["warmup_lr"] == 1.0e-6
     assert chk_avg_per_iter({"train_options": normalized}) is True
+
+
+def test_train_options_accepts_qhflow_poly_scheduler():
+    normalized = train_options().normalize_value(
+        {
+            "num_epoch": 1,
+            "optimizer": {
+                "type": "AdamW",
+                "lr": 1.0e-3,
+            },
+            "lr_scheduler": {
+                "type": "qhflow_poly",
+                "warmup_step": 1_000,
+                "num_training_steps": 200_000,
+                "end_lr": 1.0e-9,
+                "scheduler_power": 1.0,
+            },
+            "update_lr_per_iter": True,
+        }
+    )
+
+    assert normalized["lr_scheduler"]["type"] == "qhflow_poly"
+    assert normalized["lr_scheduler"]["warmup_step"] == 1_000
+    assert normalized["lr_scheduler"]["num_training_steps"] == 200_000
+    assert normalized["lr_scheduler"]["end_lr"] == 1.0e-9
+    assert chk_avg_per_iter({"train_options": normalized}) is False

@@ -940,6 +940,20 @@ def CosineAnnealingLR():
         Argument("eta_min", float, optional=True, default=0, doc=doc_eta_min),
     ]
 
+def QHFlowPolynomialLR():
+    doc_warmup = "Number of linear warmup steps before polynomial decay. Default: 1000."
+    doc_total = "Total number of scheduler steps. Default: 200000."
+    doc_end_lr = "Final learning rate reached at num_training_steps. Default: 1e-9."
+    doc_power = "Polynomial decay power. QHFlow2 water config uses 1.0. Default: 1.0."
+
+    return [
+        Argument("warmup_step", int, optional=True, default=1000, doc=doc_warmup),
+        Argument("num_training_steps", int, optional=True, default=200000, doc=doc_total),
+        Argument("end_lr", float, optional=True, default=1.0e-9, doc=doc_end_lr),
+        Argument("scheduler_power", float, optional=True, default=1.0, doc=doc_power),
+        Argument("last_epoch", int, optional=True, default=-1),
+    ]
+
 def WarmupStableDecayLR():
     doc_total_steps = "Total number of optimizer steps for DPA4 warmup-stable-decay scheduling."
     doc_warmup_steps = "Number of linear warmup steps. DPA4 tables use 5000."
@@ -974,7 +988,7 @@ def WarmupReduceOnPlateau():
     ]
 
 def lr_scheduler():
-    doc_type = "select type of lr_scheduler, support type includes `exp`, `linear`, `rop`, `warmup_rop`, `cos`, `wsd`, and `cyclic`"
+    doc_type = "select type of lr_scheduler, support type includes `exp`, `linear`, `rop`, `warmup_rop`, `cos`, `wsd`, `cyclic`, and `qhflow_poly`"
 
     return Variant("type", [
             Argument("exp", dict, ExponentialLR()),
@@ -983,7 +997,8 @@ def lr_scheduler():
             Argument("warmup_rop", dict, WarmupReduceOnPlateau(), doc="warmup_rop: linear warmup followed by reduce on plateau"),
             Argument("cos", dict, CosineAnnealingLR(), doc="cos: cosine annealing"),
             Argument("wsd", dict, WarmupStableDecayLR(), doc="wsd: DPA4 warmup-stable-decay"),
-            Argument("cyclic", dict, CyclicLR(), doc="Cyclic learning rate")
+            Argument("cyclic", dict, CyclicLR(), doc="Cyclic learning rate"),
+            Argument("qhflow_poly", dict, QHFlowPolynomialLR(), doc="QHFlow2-style warmup plus polynomial decay")
         ],optional=True, default_tag="exp", doc=doc_type)
 
 
