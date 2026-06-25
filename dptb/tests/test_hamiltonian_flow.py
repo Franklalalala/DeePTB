@@ -530,6 +530,154 @@ class _FakeBatch:
         return self
 
 
+class _ValidationIdentityModel:
+    def eval(self):
+        return None
+
+    def __call__(self, batch):
+        out = batch.copy()
+        out["node_features"] = batch["node_features"].clone()
+        out["edge_features"] = batch["edge_features"].clone()
+        return out
+
+
+class _ValidationEndpointModel:
+    def eval(self):
+        return None
+
+    def __call__(self, batch):
+        out = batch.copy()
+        out["node_features"] = torch.ones_like(batch["node_features"])
+        out["edge_features"] = torch.full_like(batch["edge_features"], 2.0)
+        return out
+
+
+class _ValidationPreparedFlow:
+    enabled = True
+    model_in_loss = False
+    log_validation_compatible_loss = True
+    compatible_loss_to_legacy_keys = False
+    validation_ode_steps = (1,)
+
+    def _num_graphs(self, batch):
+        return 1
+
+    def prepare_batch(self, batch, ref_batch, t=None):
+        return batch.copy(), ref_batch.copy(), object()
+
+    def loss(self, pred, ref, ctx):
+        return torch.tensor(3.0), {"validation_compatible_euler_1_loss": torch.tensor(9.0)}
+
+    def sample(self, model, batch, *, num_steps):
+        return model(batch)
+
+
+class _EulerOnlyValidationFlow:
+    enabled = True
+    model_in_loss = False
+    log_validation_compatible_loss = True
+    compatible_loss_to_legacy_keys = True
+    validation_ode_steps = (1,)
+    log_validation_random_t_loss = False
+    log_validation_t0_loss = False
+    log_validation_flow_euler_loss = False
+
+    def __init__(self):
+        self.sample_calls = 0
+
+    def _num_graphs(self, batch):
+        return 1
+
+    def prepare_batch(self, *args, **kwargs):
+        raise AssertionError("Euler-only validation should not prepare random-t/t0 batches")
+
+    def loss(self, *args, **kwargs):
+        raise AssertionError("Euler-only validation should not compute flow validation loss")
+
+    def sample(self, model, batch, *, num_steps):
+        assert num_steps == 1
+        self.sample_calls += 1
+        return model(batch)
+
+
+def test_validation_compatible_loss_respects_legacy_key_flag(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.dtype = torch.float32
+    trainer.model = _ValidationIdentityModel()
+    trainer.flow_cfm = _ValidationPreparedFlow()
+    trainer.validation_loader = [_FakeBatch()]
+    trainer.validation_lossfunc = _ComponentLoss()
+    trainer.iter = 3
+
+    monkeypatch.setattr(
+        trainer_module.AtomicData,
+        "to_AtomicDataDict",
+        lambda batch: _two_graph_batch(),
+    )
+
+    def fake_compatible_from_stats(
+        lossfunc,
+        stats,
+        *,
+        source_prefix,
+        prefix,
+        legacy_prefix=None,
+        global_step=None,
+    ):
+        assert legacy_prefix is None
+        return {f"{prefix}_loss": torch.tensor(9.0)}
+
+    monkeypatch.setattr(
+        Trainer,
+        "_compatible_loss_state_from_flow_stats",
+        staticmethod(fake_compatible_from_stats),
+    )
+
+    loss = trainer.validation(fast=True)
+
+    assert loss.item() == pytest.approx(3.0)
+    assert "validation_loss" not in trainer._last_flow_validation_state
+    assert trainer._last_flow_validation_state[
+        "validation_compatible_euler_1_loss"
+    ].item() == pytest.approx(9.0)
+
+
+def test_validation_euler_only_compatible_maps_to_legacy_loss(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.dtype = torch.float32
+    trainer.model = _ValidationEndpointModel()
+    trainer.flow_cfm = _EulerOnlyValidationFlow()
+    trainer.validation_loader = [_FakeBatch()]
+    trainer.validation_lossfunc = _ComponentLoss()
+    trainer.iter = 4
+
+    monkeypatch.setattr(
+        trainer_module.AtomicData,
+        "to_AtomicDataDict",
+        lambda batch: _two_graph_batch(),
+    )
+
+    loss = trainer.validation(fast=True)
+
+    assert loss.item() == pytest.approx(0.0)
+    assert trainer.flow_cfm.sample_calls == 1
+    assert "validation_flow_random_t_loss" not in trainer._last_flow_validation_state
+    assert "validation_flow_t0_loss" not in trainer._last_flow_validation_state
+    assert "validation_flow_euler_1_loss" not in trainer._last_flow_validation_state
+    assert trainer._last_flow_validation_state[
+        "validation_compatible_euler_1_loss"
+    ].item() == pytest.approx(1.5)
+    assert trainer._last_flow_validation_state["validation_loss"].item() == pytest.approx(1.5)
+    assert trainer._last_flow_validation_state[
+        "validation_onsite_loss"
+    ].item() == pytest.approx(1.0)
+    assert trainer._last_flow_validation_state[
+        "validation_hopping_loss"
+    ].item() == pytest.approx(2.0)
+
+
 _UNUSED_MODEL = object()
 
 

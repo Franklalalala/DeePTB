@@ -150,6 +150,15 @@ class HamiltonianCFM:
         )
         self.apply_to_reference = bool(options.get("apply_to_reference", False))
         self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
+        self.log_validation_random_t_loss = bool(
+            options.get("log_validation_random_t_loss", True)
+        )
+        self.log_validation_t0_loss = bool(
+            options.get("log_validation_t0_loss", True)
+        )
+        self.log_validation_flow_euler_loss = bool(
+            options.get("log_validation_flow_euler_loss", True)
+        )
         self.log_train_compatible_loss = bool(
             options.get("log_train_compatible_loss", self.log_compatible_loss)
         )

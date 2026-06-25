@@ -549,11 +549,14 @@ def train(
             "train_flow_hopping_loss",
             "train_flow_t",
             "train_flow_weight",
-            "validation_flow_random_t_loss",
-            "validation_flow_t0_loss",
         ])
-        for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
-            flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
+        if flow_options.get("log_validation_random_t_loss", True):
+            flow_log_fields.append("validation_flow_random_t_loss")
+        if flow_options.get("log_validation_t0_loss", True):
+            flow_log_fields.append("validation_flow_t0_loss")
+        if flow_options.get("log_validation_flow_euler_loss", True):
+            for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
+                flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
         if flow_options.get("log_train_compatible_loss", flow_options.get("log_compatible_loss", True)):
             flow_log_fields.extend([
                 "train_compatible_loss",

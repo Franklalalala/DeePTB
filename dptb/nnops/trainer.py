@@ -563,37 +563,54 @@ class Trainer(BaseTrainer):
                 batch_for_loss = batch.copy()
                 if self.flow_cfm.enabled:
                     original_batch = batch.copy()
+                    log_random_t = getattr(self.flow_cfm, "log_validation_random_t_loss", True)
+                    log_t0 = getattr(self.flow_cfm, "log_validation_t0_loss", True)
+                    log_flow_euler = getattr(
+                        self.flow_cfm, "log_validation_flow_euler_loss", True
+                    )
                     if getattr(self.flow_cfm, "model_in_loss", False):
                         batch_for_loss.update(batch_info)
-                        random_t_loss, _ = self.flow_cfm.loss_with_model(
-                            self.model, original_batch, batch_for_loss, prefix="validation"
-                        )
-                        loss += random_t_loss
-                        flow_metric_sums["validation_flow_random_t_loss"] = (
-                            flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
-                            + random_t_loss.detach()
-                        )
+                        if log_random_t:
+                            random_t_loss, _ = self.flow_cfm.loss_with_model(
+                                self.model, original_batch, batch_for_loss, prefix="validation"
+                            )
+                            loss += random_t_loss
+                            flow_metric_sums["validation_flow_random_t_loss"] = (
+                                flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
+                                + random_t_loss.detach()
+                            )
                         num_graphs = self.flow_cfm._num_graphs(original_batch)
                         zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
                         one_t = torch.ones(num_graphs, device=self.device, dtype=self.dtype)
-                        one_step_loss, _ = self.flow_cfm.loss_with_model(
-                            self.model,
-                            original_batch,
-                            batch_for_loss,
-                            prefix="validation_one_step",
-                            r=zero_t,
-                            t=one_t,
-                        )
-                        flow_metric_sums["validation_flow_one_step_loss"] = (
-                            flow_metric_sums.get("validation_flow_one_step_loss", 0.0)
-                            + one_step_loss.detach()
-                        )
+                        if log_t0:
+                            one_step_loss, _ = self.flow_cfm.loss_with_model(
+                                self.model,
+                                original_batch,
+                                batch_for_loss,
+                                prefix="validation_one_step",
+                                r=zero_t,
+                                t=one_t,
+                            )
+                            flow_metric_sums["validation_flow_one_step_loss"] = (
+                                flow_metric_sums.get("validation_flow_one_step_loss", 0.0)
+                                + one_step_loss.detach()
+                            )
                         for num_steps in self.flow_cfm.validation_ode_steps:
                             sampled = self.flow_cfm.sample(
                                 self.model, original_batch, num_steps=num_steps
                             )
                             sampled.update(batch_info)
                             if self.flow_cfm.log_validation_compatible_loss:
+                                legacy_prefix = (
+                                    "validation"
+                                    if int(num_steps) == 1
+                                    and getattr(
+                                        self.flow_cfm,
+                                        "compatible_loss_to_legacy_keys",
+                                        True,
+                                    )
+                                    else None
+                                )
                                 self._accumulate_metric_state(
                                     flow_metric_sums,
                                     self._compatible_loss_state(
@@ -601,60 +618,89 @@ class Trainer(BaseTrainer):
                                         sampled,
                                         batch_for_loss,
                                         prefix=f"validation_compatible_euler_{num_steps}",
-                                        legacy_prefix="validation" if int(num_steps) == 1 else None,
+                                        legacy_prefix=legacy_prefix,
                                     ),
                                 )
                         num_batches += 1
                         continue
-                    flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
-                        original_batch, batch_for_loss
-                    )
-                    flow_pred = self.model(flow_batch)
-                    random_t_loss, _ = self.flow_cfm.loss(flow_pred, flow_ref, flow_ctx)
-                    loss += random_t_loss
-                    flow_metric_sums["validation_flow_random_t_loss"] = (
-                        flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
-                        + random_t_loss.detach()
-                    )
+                    if log_random_t:
+                        flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                            original_batch, batch_for_loss
+                        )
+                        flow_pred = self.model(flow_batch)
+                        random_t_loss, _ = self.flow_cfm.loss(flow_pred, flow_ref, flow_ctx)
+                        loss += random_t_loss
+                        flow_metric_sums["validation_flow_random_t_loss"] = (
+                            flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
+                            + random_t_loss.detach()
+                        )
 
                     num_graphs = self.flow_cfm._num_graphs(original_batch)
                     zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
-                    t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
-                        original_batch, batch_for_loss, t=zero_t
-                    )
-                    t0_pred = self.model(t0_batch)
-                    t0_pred.update(batch_info)
-                    t0_ref.update(batch_info)
-                    t0_loss, _ = self.flow_cfm.loss(t0_pred, t0_ref, t0_ctx)
-                    flow_metric_sums["validation_flow_t0_loss"] = (
-                        flow_metric_sums.get("validation_flow_t0_loss", 0.0) + t0_loss.detach()
-                    )
+                    t0_ref = None
+                    t0_ctx = None
+                    if log_t0 or log_flow_euler:
+                        t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
+                            original_batch, batch_for_loss, t=zero_t
+                        )
+                        if log_t0:
+                            t0_pred = self.model(t0_batch)
+                            t0_pred.update(batch_info)
+                            t0_ref.update(batch_info)
+                            t0_loss, _ = self.flow_cfm.loss(t0_pred, t0_ref, t0_ctx)
+                            flow_metric_sums["validation_flow_t0_loss"] = (
+                                flow_metric_sums.get("validation_flow_t0_loss", 0.0)
+                                + t0_loss.detach()
+                            )
                     for num_steps in self.flow_cfm.validation_ode_steps:
                         sampled = self.flow_cfm.sample(
                             self.model, original_batch, num_steps=num_steps
                         )
                         sampled.update(batch_info)
-                        sample_loss, sample_state = self.flow_cfm.loss(sampled, t0_ref, t0_ctx)
-                        key = f"validation_flow_euler_{num_steps}_loss"
-                        flow_metric_sums[key] = (
-                            flow_metric_sums.get(key, 0.0) + sample_loss.detach()
-                        )
-                        if self.flow_cfm.log_validation_compatible_loss:
-                            compatible_state = self._compatible_loss_state_from_flow_stats(
-                                self.validation_lossfunc,
-                                sample_state,
-                                source_prefix=f"validation_compatible_euler_{num_steps}",
-                                prefix=f"validation_compatible_euler_{num_steps}",
-                                legacy_prefix="validation" if int(num_steps) == 1 else None,
-                                global_step=getattr(self, "iter", None),
+                        sample_state = None
+                        if log_flow_euler:
+                            if t0_ref is None or t0_ctx is None:
+                                _t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
+                                    original_batch, batch_for_loss, t=zero_t
+                                )
+                                t0_ref.update(batch_info)
+                            sample_loss, sample_state = self.flow_cfm.loss(
+                                sampled, t0_ref, t0_ctx
                             )
+                            key = f"validation_flow_euler_{num_steps}_loss"
+                            flow_metric_sums[key] = (
+                                flow_metric_sums.get(key, 0.0) + sample_loss.detach()
+                            )
+                        if self.flow_cfm.log_validation_compatible_loss:
+                            legacy_prefix = (
+                                "validation"
+                                if int(num_steps) == 1
+                                and getattr(
+                                    self.flow_cfm,
+                                    "compatible_loss_to_legacy_keys",
+                                    True,
+                                )
+                                else None
+                            )
+                            compatible_state = None
+                            if sample_state is not None:
+                                compatible_state = self._compatible_loss_state_from_flow_stats(
+                                    self.validation_lossfunc,
+                                    sample_state,
+                                    source_prefix=f"validation_compatible_euler_{num_steps}",
+                                    prefix=f"validation_compatible_euler_{num_steps}",
+                                    legacy_prefix=legacy_prefix,
+                                    global_step=getattr(self, "iter", None),
+                                )
                             if compatible_state is None:
+                                compatible_ref = t0_ref if t0_ref is not None else batch_for_loss.copy()
+                                compatible_ref.update(batch_info)
                                 compatible_state = self._compatible_loss_state(
                                     self.validation_lossfunc,
                                     sampled,
-                                    t0_ref,
+                                    compatible_ref,
                                     prefix=f"validation_compatible_euler_{num_steps}",
-                                    legacy_prefix="validation" if int(num_steps) == 1 else None,
+                                    legacy_prefix=legacy_prefix,
                                 )
                             self._accumulate_metric_state(
                                 flow_metric_sums,
