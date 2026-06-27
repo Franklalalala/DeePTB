@@ -1109,6 +1109,67 @@ def test_tensorboard_monitor_writes_fresh_validation_iter_tags():
     assert ("validation_hopping_loss_iter/iteration", 0.3, 1000) in writes
 
 
+def test_tensorboard_monitor_writes_epoch_validation_on_iteration_axis():
+    writes = []
+
+    class _Writer:
+        def add_scalar(self, tag, value, step):
+            writes.append((tag, float(value), int(step)))
+
+        def flush(self):
+            pass
+
+    monitor = object.__new__(TensorBoardMonitor)
+    monitor.writer = _Writer()
+    monitor.flush_every = 0
+    monitor.trainer = SimpleNamespace(
+        iter=4321,
+        ep=4,
+        num_experts=0,
+        stats={
+            "validation_loss": {
+                "epoch_mean": 0.5,
+                "last": 0.5,
+                "epoch_last_updated": 4,
+            },
+            "validation_onsite_loss": {
+                "epoch_mean": 0.2,
+                "last": 0.2,
+                "epoch_last_updated": 4,
+            },
+            "validation_hopping_loss": {
+                "epoch_mean": 0.3,
+                "last": 0.3,
+                "epoch_last_updated": 4,
+            },
+            "validation_compatible_euler_1_loss": {
+                "epoch_mean": 0.5,
+                "last": 0.5,
+                "epoch_last_updated": 4,
+            },
+            "validation_compatible_euler_1_onsite_loss": {
+                "epoch_mean": 0.2,
+                "last": 0.2,
+                "epoch_last_updated": 4,
+            },
+            "validation_compatible_euler_1_hopping_loss": {
+                "epoch_mean": 0.3,
+                "last": 0.3,
+                "epoch_last_updated": 4,
+            },
+        },
+    )
+
+    monitor.epoch(time=4)
+
+    assert ("validation_loss_iter/iteration", 0.5, 4321) in writes
+    assert ("validation_onsite_loss_iter/iteration", 0.2, 4321) in writes
+    assert ("validation_hopping_loss_iter/iteration", 0.3, 4321) in writes
+    assert ("validation_compatible_euler_1_loss_iter/iteration", 0.5, 4321) in writes
+    assert ("validation_compatible_euler_1_onsite_loss_iter/iteration", 0.2, 4321) in writes
+    assert ("validation_compatible_euler_1_hopping_loss_iter/iteration", 0.3, 4321) in writes
+
+
 def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
     trainer = object.__new__(Trainer)
     trainer.device = torch.device("cpu")

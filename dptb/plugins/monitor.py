@@ -1867,6 +1867,52 @@ class TensorBoardMonitor(Plugin):
             return
         self.writer.add_scalar(tag, self._get_stat(stat_name, 'epoch_mean', 0.0), epoch)
 
+    def _write_validation_iter_stat_from_epoch(self, stat_name, tag, epoch, iteration_step):
+        if stat_name not in self.trainer.stats:
+            return
+        if not self._epoch_stat_updated(stat_name, epoch):
+            return
+        value = self._get_stat(stat_name, 'epoch_mean', None)
+        if value is None:
+            value = self._get_stat(stat_name, 'last', None)
+        if value is not None:
+            self.writer.add_scalar(tag, value, iteration_step)
+
+    def _write_epoch_validation_iter_tags(self, epoch):
+        iteration_step = getattr(self.trainer, "iter", None)
+        if iteration_step is None:
+            return
+        iteration_step = int(iteration_step)
+
+        self._write_validation_iter_stat_from_epoch(
+            'validation_loss',
+            'validation_loss_iter/iteration',
+            epoch,
+            iteration_step,
+        )
+        self._write_validation_iter_stat_from_epoch(
+            'validation_onsite_loss',
+            'validation_onsite_loss_iter/iteration',
+            epoch,
+            iteration_step,
+        )
+        self._write_validation_iter_stat_from_epoch(
+            'validation_hopping_loss',
+            'validation_hopping_loss_iter/iteration',
+            epoch,
+            iteration_step,
+        )
+
+        for name in sorted(self.trainer.stats):
+            if not name.startswith(("validation_flow_", "validation_compatible_")):
+                continue
+            self._write_validation_iter_stat_from_epoch(
+                name,
+                f'{name}_iter/iteration',
+                epoch,
+                iteration_step,
+            )
+
     def epoch(self, **kwargs):
         epoch = kwargs.get("time", self.trainer.ep)
 
@@ -1967,6 +2013,7 @@ class TensorBoardMonitor(Plugin):
             if overall_max is not None:
                 self.writer.add_scalar(f'CUDA_Memory_Overall_Max/{name}', overall_max, epoch)
 
+        self._write_epoch_validation_iter_tags(epoch)
         self.writer.flush()
 
     def iteration(self, **kwargs):
