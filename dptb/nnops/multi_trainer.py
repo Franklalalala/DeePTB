@@ -3543,7 +3543,7 @@ class MultiTrainer(Trainer):
             "validation/flow_sample_euler",
             it=self.iter,
             expert=expert_idx,
-            num_steps=int(num_steps),
+            extra=f"steps={int(num_steps)}",
         ):
             sampled = self.flow_cfm.sample(
                 self.model,
@@ -3564,7 +3564,7 @@ class MultiTrainer(Trainer):
             "validation/euler_compatible_loss",
             it=self.iter,
             expert=expert_idx,
-            num_steps=int(num_steps),
+            extra=f"steps={int(num_steps)}",
         ):
             loss = criterion(sampled, batch_for_loss)
         metrics = self._snapshot_loss_metrics(criterion)
@@ -3671,7 +3671,7 @@ class MultiTrainer(Trainer):
                             with self._tagger.tag(
                                 "validation/reduce_euler_metrics_dist",
                                 it=self.iter,
-                                num_steps=int(num_steps),
+                                extra=f"steps={int(num_steps)}",
                             ):
                                 reduced_pack = self._make_step_pack(payload)
                                 self._all_reduce_(

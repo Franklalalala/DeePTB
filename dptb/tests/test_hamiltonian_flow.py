@@ -821,7 +821,7 @@ _UNUSED_MODEL = object()
 
 
 class _NoopTagger:
-    def tag(self, *args, **kwargs):
+    def tag(self, name, *, it=None, expert=None, extra=""):
         class _Ctx:
             def __enter__(self):
                 return None
