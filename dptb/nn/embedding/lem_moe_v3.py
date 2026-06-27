@@ -9,11 +9,6 @@ from e3nn import o3
 from torch_scatter import scatter_add, scatter_max, scatter_mean
 from e3nn.o3 import Linear, SphericalHarmonics, FullyConnectedTensorProduct, TensorProduct
 from dptb.data import AtomicDataDict
-from dptb.data.interfaces.blockwise_tensor import (
-    BlockTensorResult,
-    attach_prediction_block_tensors,
-    infer_block_shapes,
-)
 from dptb.nn.embedding.emb import Embedding
 from ..radial_basis import BesselBasis
 from ..base import ScalarMLPFunction
@@ -33,15 +28,6 @@ from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3,
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
-from .ao_projector_bank import build_ao_decoder_irreps
-from .output_routes import (
-    OutputHeadContext,
-    build_output_heads,
-    effective_product_scope,
-    resolve_output_route,
-    select_final_irreps,
-)
-from .block_native_head import apply_ao_basis_mask
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
@@ -529,151 +515,6 @@ class GatedEdgeAggregation(torch.nn.Module):
         return gated
 
 
-class EdgeMessageValueGate(torch.nn.Module):
-    """Query-dependent sigmoid gate applied to edge values before aggregation."""
-
-    def __init__(
-            self,
-            irreps: o3.Irreps,
-            query_scalar_dim: int,
-            message_scalar_dim: int,
-            hidden_dim: int = 0,
-            sparsity_threshold: float = 1.0e-2,
-            dtype: Union[str, torch.dtype] = torch.float32,
-            device: Union[str, torch.device] = torch.device("cpu"),
-    ):
-        super().__init__()
-        self.irreps = o3.Irreps(irreps)
-        if query_scalar_dim < 1:
-            raise ValueError(f"query_scalar_dim must be >= 1, got {query_scalar_dim!r}")
-        if message_scalar_dim < 1:
-            raise ValueError(f"message_scalar_dim must be >= 1, got {message_scalar_dim!r}")
-        feature_gate_index, gate_dim = _equivariant_gate_feature_index(self.irreps)
-        if gate_dim < 1:
-            raise ValueError("EdgeMessageValueGate requires a non-empty output irreps.")
-        self.query_scalar_dim = int(query_scalar_dim)
-        self.message_scalar_dim = int(message_scalar_dim)
-        self.gate_dim = int(gate_dim)
-        self.sparsity_threshold = float(sparsity_threshold)
-        self.register_buffer("feature_gate_index", feature_gate_index.to(device=device))
-        input_dim = self.query_scalar_dim + self.message_scalar_dim
-        hidden_dim = int(hidden_dim or 0)
-        if hidden_dim > 0:
-            self.gate = torch.nn.Sequential(
-                torch.nn.Linear(input_dim, hidden_dim, dtype=dtype, device=device),
-                torch.nn.SiLU(),
-                torch.nn.Linear(hidden_dim, self.gate_dim, dtype=dtype, device=device),
-            )
-            torch.nn.init.zeros_(self.gate[-1].weight)
-            torch.nn.init.zeros_(self.gate[-1].bias)
-        else:
-            self.gate = torch.nn.Linear(input_dim, self.gate_dim, dtype=dtype, device=device)
-            torch.nn.init.zeros_(self.gate.weight)
-            torch.nn.init.zeros_(self.gate.bias)
-        self.last_stats: Optional[Dict[str, float]] = None
-        self.last_heatmap = None
-
-    _tensor_stat = staticmethod(GatedEdgeAggregation._tensor_stat)
-    _sparsity = staticmethod(GatedEdgeAggregation._sparsity)
-    _top_edge_share_stats = GatedEdgeAggregation._top_edge_share_stats
-
-    def _record_stats(
-            self,
-            gate_values: torch.Tensor,
-            pre_gate: torch.Tensor,
-            post_gate: torch.Tensor,
-            dst_index: torch.Tensor,
-            dim_size: int,
-    ) -> None:
-        with torch.no_grad():
-            gate_det = gate_values.detach().float()
-            pre_det = pre_gate.detach().float()
-            post_det = post_gate.detach().float()
-            top_mean, top_max, active_edges, nodes_with_edges = self._top_edge_share_stats(
-                dst_index,
-                post_gate,
-                dim_size,
-            )
-            self.last_stats = {
-                "gate_mean": self._tensor_stat(gate_det, "mean"),
-                "gate_std": self._tensor_stat(gate_det, "std"),
-                "gate_min": self._tensor_stat(gate_det, "min"),
-                "gate_max": self._tensor_stat(gate_det, "max"),
-                "gate_sparsity_lt_0_1": self._sparsity(gate_det, 0.1),
-                "gate_sparsity_lt_1e_2": self._sparsity(gate_det, 1.0e-2),
-                "pre_sparsity_lt_1e_2": self._sparsity(pre_det, self.sparsity_threshold),
-                "post_sparsity_lt_1e_2": self._sparsity(post_det, self.sparsity_threshold),
-                "pre_activation_max": self._tensor_stat(pre_det.abs(), "max"),
-                "post_activation_max": self._tensor_stat(post_det.abs(), "max"),
-                "top_edge_share_mean": top_mean,
-                "top_edge_share_max": top_max,
-                "active_edges": active_edges,
-                "nodes_with_edges": nodes_with_edges,
-            }
-
-    def forward(
-            self,
-            message: torch.Tensor,
-            query_scalars: torch.Tensor,
-            message_scalars: torch.Tensor,
-            dst_index: torch.Tensor,
-            dim_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        if message.shape[0] != dst_index.numel():
-            raise ValueError(
-                "message and dst_index must describe the same number of edges, "
-                f"got {message.shape[0]} and {dst_index.numel()}."
-            )
-        if message_scalars.shape[0] != message.shape[0]:
-            raise ValueError(
-                "message_scalars and message must have the same leading dimension, "
-                f"got {message_scalars.shape[0]} and {message.shape[0]}."
-            )
-        if query_scalars.shape[-1] != self.query_scalar_dim:
-            raise ValueError(
-                f"query scalar dim mismatch: got {query_scalars.shape[-1]}, "
-                f"expected {self.query_scalar_dim}."
-            )
-        if message_scalars.shape[-1] != self.message_scalar_dim:
-            raise ValueError(
-                f"message scalar dim mismatch: got {message_scalars.shape[-1]}, "
-                f"expected {self.message_scalar_dim}."
-            )
-        if dst_index.numel() == 0:
-            self.last_stats = {
-                key: 0.0
-                for key in (
-                    "gate_mean",
-                    "gate_std",
-                    "gate_min",
-                    "gate_max",
-                    "gate_sparsity_lt_0_1",
-                    "gate_sparsity_lt_1e_2",
-                    "pre_sparsity_lt_1e_2",
-                    "post_sparsity_lt_1e_2",
-                    "pre_activation_max",
-                    "post_activation_max",
-                    "top_edge_share_mean",
-                    "top_edge_share_max",
-                    "active_edges",
-                    "nodes_with_edges",
-                )
-            }
-            return message
-        query_per_edge = query_scalars.index_select(0, dst_index)
-        gate_input = torch.cat([query_per_edge, message_scalars], dim=-1)
-        gate_values = torch.sigmoid(self.gate(gate_input))
-        feature_gate = gate_values.index_select(
-            1,
-            self.feature_gate_index.to(device=message.device),
-        )
-        gated = message * feature_gate
-        if dim_size is None:
-            dim_size = int(dst_index.max().item()) + 1
-        self._record_stats(gate_values, message, gated, dst_index, int(dim_size))
-        return gated
-
-
 class SingleHead0eEnvelopeAttention(torch.nn.Module):
     """Single-head destination attention from 0e scalars with cutoff envelope gating."""
 
@@ -1066,18 +907,6 @@ class LemMoEV3(torch.nn.Module):
             edge_one_hot_dim: int = 128,
             use_out_onehot_tp: bool = True,
             use_layer_onehot_tp: bool = True,
-            output_route: Optional[str] = None,
-            rme_head_mode: Optional[str] = None,
-            rme_fusion_rank: int = 16,
-            rme_fusion_init: float = 0.0,
-            rme_fusion_condition: str = "scalar_0e",
-            rme_cartesian_scope: Optional[str] = None,
-            rme_ict_scope: Optional[str] = None,
-            ao_projector_channels: int = 0,
-            ao_projector_normalization: str = "e3hamiltonian",
-            ao_projector_basis_convention: str = "deeptb_real_ao",
-            ao_projector_backend: str = "reference_wigner",
-            ao_projector_bank_path: Optional[str] = None,
             res_update: bool = True,
             res_update_ratios: Optional[List[float]] = None,
             res_update_ratios_learnable: bool = False,
@@ -1109,8 +938,6 @@ class LemMoEV3(torch.nn.Module):
             edge_attention_query_layer_norm: bool = False,
             edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
-            edge_message_value_gate: bool = False,
-            edge_message_value_gate_hidden_dim: int = 0,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             universal: Optional[bool] = False,
@@ -1169,42 +996,6 @@ class LemMoEV3(torch.nn.Module):
             full_soc_prediction=self.full_soc_prediction,
         )
         self.onehot_tp_mode = _normalize_onehot_tp_mode(onehot_tp_mode)
-        self.output_route_spec = resolve_output_route(
-            output_route=output_route,
-            legacy_mode=rme_head_mode,
-            projector_backend=ao_projector_backend,
-            projector_bank_path=ao_projector_bank_path,
-        )
-        self.output_route_name = self.output_route_spec.canonical_name
-        # Historical public attributes remain available for old checkpoints and callers.
-        self.rme_head_mode = self.output_route_spec.legacy_mode
-        self.use_block_native_output = self.output_route_spec.is_block_native
-        self.output_head_contract = self.output_route_spec.output_contract
-        self.rme_fusion_rank = int(rme_fusion_rank)
-        self.rme_fusion_init = float(rme_fusion_init)
-        self.rme_fusion_condition = str(rme_fusion_condition)
-        if rme_ict_scope is not None:
-            if (
-                rme_cartesian_scope is not None
-                and str(rme_cartesian_scope).strip().lower()
-                != str(rme_ict_scope).strip().lower()
-            ):
-                raise ValueError(
-                    "rme_ict_scope conflicts with rme_cartesian_scope; use only "
-                    "rme_cartesian_scope."
-                )
-            log.warning(
-                "rme_ict_scope is deprecated; use rme_cartesian_scope instead."
-            )
-            rme_cartesian_scope = rme_ict_scope
-        self.rme_cartesian_scope = effective_product_scope(
-            self.output_route_spec, rme_cartesian_scope
-        )
-        self.ao_projector_channels = int(ao_projector_channels)
-        self.ao_projector_normalization = str(ao_projector_normalization)
-        self.ao_projector_basis_convention = str(ao_projector_basis_convention)
-        self.ao_projector_backend = str(ao_projector_backend)
-        self.ao_projector_bank_path = ao_projector_bank_path
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
@@ -1216,8 +1007,6 @@ class LemMoEV3(torch.nn.Module):
         self.edge_attention_query_layer_norm = bool(edge_attention_query_layer_norm)
         self.edge_attention_qk_layer_norm = bool(edge_attention_qk_layer_norm)
         self.edge_message_env_weight = bool(edge_message_env_weight)
-        self.edge_message_value_gate = bool(edge_message_value_gate)
-        self.edge_message_value_gate_hidden_dim = int(edge_message_value_gate_hidden_dim or 0)
         self.so2_m_linear_mode = _normalize_stable_standard_compat_mode(
             "so2_m_linear_mode", so2_m_linear_mode
         )
@@ -1225,16 +1014,6 @@ class LemMoEV3(torch.nn.Module):
             "mole_linear_m0_mode", mole_linear_m0_mode
         )
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
-        log.info(
-            "  - Output Head: route=%s legacy_mode=%s contract=%s rank=%d "
-            "init=%g condition=%s",
-            self.output_route_name,
-            self.rme_head_mode,
-            self.output_head_contract,
-            self.rme_fusion_rank,
-            self.rme_fusion_init,
-            self.rme_fusion_condition,
-        )
         log.info(f"  - SO2 Expert Mixing Mode: {self.so2_expert_mixing_mode}")
         log.info(
             "  - DPA4-style Focus/Aggregation: "
@@ -1247,9 +1026,7 @@ class LemMoEV3(torch.nn.Module):
             f"edge_attention_key_layer_norm={self.edge_attention_key_layer_norm}, "
             f"edge_attention_query_layer_norm={self.edge_attention_query_layer_norm}, "
             f"edge_attention_qk_layer_norm={self.edge_attention_qk_layer_norm}, "
-            f"edge_message_env_weight={self.edge_message_env_weight}, "
-            f"edge_message_value_gate={self.edge_message_value_gate}, "
-            f"edge_message_value_gate_hidden_dim={self.edge_message_value_gate_hidden_dim}"
+            f"edge_message_env_weight={self.edge_message_env_weight}"
         )
 
         if basis is not None:
@@ -1285,13 +1062,6 @@ class LemMoEV3(torch.nn.Module):
 
         irreps_sh = o3.Irreps([(1, (i, (-1) ** i)) for i in range(lmax + 1)])
         orbpair_irreps = self.idp.orbpair_irreps.sort()[0].simplify()
-        self.ao_decoder_irreps = (
-            build_ao_decoder_irreps(
-                self.idp.full_basis, channels=self.ao_projector_channels
-            )
-            if self.output_route_spec.final_irreps_kind == "ao_pair"
-            else None
-        )
 
         irreps_out = []
         for mul, ir1 in irreps_hidden:
@@ -1347,16 +1117,8 @@ class LemMoEV3(torch.nn.Module):
                 irreps_in = irreps_hidden
 
             if i == n_layers - 1:
-                irreps_out = select_final_irreps(
-                    self.output_route_spec,
-                    ordinary_hidden=irreps_hidden,
-                    orbpair_irreps=orbpair_irreps,
-                    ao_pair_irreps=self.ao_decoder_irreps,
-                )
-                use_interpolation_tp = bool(
-                    use_interpolation_out
-                    and self.output_route_spec.final_irreps_kind == "orbpair"
-                )
+                irreps_out = orbpair_irreps.sort()[0].simplify()
+                use_interpolation_tp = bool(use_interpolation_out)
             else:
                 irreps_out = irreps_hidden
                 use_interpolation_tp = False
@@ -1410,8 +1172,6 @@ class LemMoEV3(torch.nn.Module):
                 edge_attention_query_layer_norm=self.edge_attention_query_layer_norm,
                 edge_attention_qk_layer_norm=self.edge_attention_qk_layer_norm,
                 edge_message_env_weight=self.edge_message_env_weight,
-                edge_message_value_gate=self.edge_message_value_gate,
-                edge_message_value_gate_hidden_dim=self.edge_message_value_gate_hidden_dim,
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
@@ -1422,116 +1182,30 @@ class LemMoEV3(torch.nn.Module):
             if use_interpolation_tp:
                 print(f'Use interpolation SO2 layer in layer {i}')
 
-        self.use_out_onehot_tp = (
-            bool(use_out_onehot_tp)
-            and self.output_route_spec.output_contract == "rme"
-        )
+        self.use_out_onehot_tp = use_out_onehot_tp
         if self.use_out_onehot_tp:
-            onehot_irreps_in = (
-                self.idp.orbpair_irreps
-                if self.output_route_spec.onehot_after_head
-                else self.layers[-1].irreps_out
-            )
             self.out_node_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
-                irreps_in1=onehot_irreps_in,
+                irreps_in1=self.layers[-1].irreps_out,
                 irreps_in2='95x0e',
                 irreps_out=self.idp.orbpair_irreps,
             ))
             self.out_edge_ele_tp = ScalarOnehotTP.from_e3nn(FullyConnectedTensorProduct(
-                irreps_in1=onehot_irreps_in,
+                irreps_in1=self.layers[-1].irreps_out,
                 irreps_in2=f'{edge_one_hot_dim}x0e',
                 irreps_out=self.idp.orbpair_irreps,
             ))
-        max_norb = int(getattr(self.idp, "full_basis_norb", 0))
-        if max_norb <= 0:
-            max_norb = sum(int(v) for v in getattr(self.idp, "basis_to_full_basis", {}).values())
-        head_context = OutputHeadContext(
-            final_irreps=self.layers[-1].irreps_out,
-            orbpair_irreps=self.idp.orbpair_irreps,
-            full_basis=tuple(self.idp.full_basis),
-            max_norb=max_norb,
-            rank=self.rme_fusion_rank,
-            init=self.rme_fusion_init,
-            condition=self.rme_fusion_condition,
-            product_scope=self.rme_cartesian_scope,
-            ao_projector_normalization=self.ao_projector_normalization,
-            ao_projector_basis_convention=self.ao_projector_basis_convention,
-            ao_projector_backend=self.ao_projector_backend,
-            ao_projector_bank_path=self.ao_projector_bank_path,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.out_edge, self.out_node = build_output_heads(
-            self.output_route_spec, head_context
-        )
+        self.out_edge = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
+                               internal_weights=True, biases=True)
+        self.out_node = Linear(self.layers[-1].irreps_out, self.idp.orbpair_irreps, shared_weights=True,
+                               internal_weights=True, biases=True)
 
     @property
     def out_edge_irreps(self):
-        return (
-            None
-            if self.output_route_spec.output_contract == "ao_block"
-            else self.idp.orbpair_irreps
-        )
+        return self.idp.orbpair_irreps
 
     @property
     def out_node_irreps(self):
-        return (
-            None
-            if self.output_route_spec.output_contract == "ao_block"
-            else self.idp.orbpair_irreps
-        )
-
-    def _apply_rme_output_heads(
-        self,
-        node_features: torch.Tensor,
-        edge_features: torch.Tensor,
-        node_one_hot: torch.Tensor,
-        edge_one_hot: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        out_node_features = self.out_node(node_features)
-        out_edge_features = self.out_edge(edge_features)
-
-        if self.use_out_onehot_tp:
-            node_tp_input = (
-                out_node_features
-                if self.output_route_spec.onehot_after_head
-                else node_features
-            )
-            edge_tp_input = (
-                out_edge_features
-                if self.output_route_spec.onehot_after_head
-                else edge_features
-            )
-            out_node_features = out_node_features + _apply_onehot_tp(
-                self.out_node_ele_tp, node_tp_input, node_one_hot, self.onehot_tp_mode
-            )
-            out_edge_features = out_edge_features + _apply_onehot_tp(
-                self.out_edge_ele_tp, edge_tp_input, edge_one_hot, self.onehot_tp_mode
-            )
-        return out_node_features, out_edge_features
-
-    def _apply_block_native_output_heads(
-        self,
-        node_features: torch.Tensor,
-        edge_features: torch.Tensor,
-        atom_type: torch.Tensor,
-        edge_index: torch.Tensor,
-        active_edges: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        out_node_blocks = self.out_node(node_features)
-        out_edge_blocks = self.out_edge(edge_features)
-
-        basis_mask = self.idp.mask_to_basis.to(device=node_features.device)
-        atom_type = atom_type.to(device=node_features.device, dtype=torch.long).flatten()
-        node_masks = basis_mask[atom_type]
-        out_node_blocks = apply_ao_basis_mask(out_node_blocks, node_masks)
-
-        edge_index = edge_index.to(device=node_features.device)
-        active_edges = active_edges.to(device=node_features.device, dtype=torch.long).reshape(-1)
-        row_masks = basis_mask[atom_type[edge_index[0, active_edges]]]
-        col_masks = basis_mask[atom_type[edge_index[1, active_edges]]]
-        out_edge_blocks = apply_ao_basis_mask(out_edge_blocks, row_masks, col_masks)
-        return out_node_blocks, out_edge_blocks
+        return self.idp.orbpair_irreps
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         preserved_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
@@ -1643,45 +1317,20 @@ class LemMoEV3(torch.nn.Module):
                 dtype=node_features.dtype,
             )
             node_features = torch.cat([node_features, pad], dim=0)
-        if self.use_block_native_output:
-            out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
-                node_features, edge_features, atom_type, edge_index, active_edges
+        out_node_features = self.out_node(node_features)
+        out_edge_features = self.out_edge(edge_features)
+
+        if self.use_out_onehot_tp:
+            out_node_features = out_node_features + _apply_onehot_tp(
+                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
             )
-            data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
-            data[_keys.EDGE_HAMILTONIAN_KEY] = out_edge_blocks.new_zeros(
-                (
-                    edge_index.shape[1],
-                    self.out_edge.max_norb,
-                    self.out_edge.max_norb,
-                )
+            out_edge_features = out_edge_features + _apply_onehot_tp(
+                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
             )
-            data[_keys.EDGE_HAMILTONIAN_KEY] = torch.index_copy(
-                data[_keys.EDGE_HAMILTONIAN_KEY], 0, active_edges, out_edge_blocks
-            )
-            node_shapes, edge_shapes = infer_block_shapes(
-                data, self.idp, device=out_node_blocks.device
-            )
-            attach_prediction_block_tensors(
-                data,
-                BlockTensorResult(
-                    node_blocks=data[_keys.NODE_HAMILTONIAN_KEY],
-                    edge_blocks=data[_keys.EDGE_HAMILTONIAN_KEY],
-                    node_shapes=node_shapes,
-                    edge_shapes=edge_shapes,
-                ),
-            )
-            data.pop(_keys.LEM_ACTIVE_EDGES_KEY, None)
-            data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
-            data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)
-            return data
-        out_node_features, out_edge_features = self._apply_rme_output_heads(
-            node_features, edge_features, node_one_hot, edge_one_hot
-        )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
-        data[_keys.EDGE_FEATURES_KEY] = out_edge_features.new_zeros(
-            (edge_index.shape[1], self.idp.orbpair_irreps.dim)
-        )
+        data[_keys.EDGE_FEATURES_KEY] = torch.zeros(edge_index.shape[1], self.idp.orbpair_irreps.dim, dtype=self.dtype,
+                                                    device=self.device)
         data[_keys.EDGE_FEATURES_KEY] = torch.index_copy(data[_keys.EDGE_FEATURES_KEY], 0, active_edges,
                                                          out_edge_features)
 
@@ -2025,8 +1674,6 @@ class UpdateNode(torch.nn.Module):
             edge_attention_query_layer_norm: bool = False,
             edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
-            edge_message_value_gate: bool = False,
-            edge_message_value_gate_hidden_dim: int = 0,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -2050,8 +1697,6 @@ class UpdateNode(torch.nn.Module):
         self.edge_attention_query_layer_norm = bool(edge_attention_query_layer_norm)
         self.edge_attention_qk_layer_norm = bool(edge_attention_qk_layer_norm)
         self.edge_message_env_weight = bool(edge_message_env_weight)
-        self.edge_message_value_gate_enabled = bool(edge_message_value_gate)
-        self.edge_message_value_gate_hidden_dim = int(edge_message_value_gate_hidden_dim or 0)
 
         self.register_buffer(
             "env_sum_normalizations",
@@ -2162,17 +1807,6 @@ class UpdateNode(torch.nn.Module):
             )
         else:
             self.node_attention = None
-        if self.edge_message_value_gate_enabled:
-            self.edge_message_gate = EdgeMessageValueGate(
-                self.irreps_out,
-                query_scalar_dim=self.irreps_in[0].dim,
-                message_scalar_dim=self.irreps_out[0].dim,
-                hidden_dim=self.edge_message_value_gate_hidden_dim,
-                dtype=dtype,
-                device=device,
-            )
-        else:
-            self.edge_message_gate = None
         if self.edge_aggregation_gated_attention:
             self.edge_aggregation_gate = GatedEdgeAggregation(
                 self.irreps_out,
@@ -2266,16 +1900,6 @@ class UpdateNode(torch.nn.Module):
             weighted_message = message
         active_edge_center = edge_center[active_edges]
         active_edge_neighbor = edge_neighbor[active_edges]
-        edge_message_gate = getattr(self, "edge_message_gate", None)
-        if edge_message_gate is not None:
-            node_scalars = node_in[:, :self.irreps_in[0].dim]
-            weighted_message = edge_message_gate(
-                weighted_message,
-                node_scalars,
-                scalars,
-                active_edge_center,
-                dim_size=node_features.shape[0],
-            )
         if self.node_attention is None:
             new_node_features = scatter(
                 weighted_message,
@@ -2664,8 +2288,6 @@ class Layer(torch.nn.Module):
             edge_attention_query_layer_norm: bool = False,
             edge_attention_qk_layer_norm: bool = False,
             edge_message_env_weight: bool = True,
-            edge_message_value_gate: bool = False,
-            edge_message_value_gate_hidden_dim: int = 0,
             dtype: Union[str, torch.dtype] = torch.float32,
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
@@ -2756,8 +2378,6 @@ class Layer(torch.nn.Module):
             edge_attention_query_layer_norm=edge_attention_query_layer_norm,
             edge_attention_qk_layer_norm=edge_attention_qk_layer_norm,
             edge_message_env_weight=edge_message_env_weight,
-            edge_message_value_gate=edge_message_value_gate,
-            edge_message_value_gate_hidden_dim=edge_message_value_gate_hidden_dim,
         )
 
         self.node_ffn = None
