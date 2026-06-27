@@ -600,6 +600,77 @@ class _EulerOnlyValidationFlow:
         return model(batch)
 
 
+class _MultiEulerValidationFlow:
+    enabled = True
+    model_in_loss = False
+    log_validation_compatible_loss = True
+    compatible_loss_to_legacy_keys = True
+    validation_ode_steps = (1, 3)
+
+    def __init__(self):
+        self.sample_calls = []
+
+    def prepare_batch(self, *args, **kwargs):
+        raise AssertionError("MultiTrainer compatible validation should not use random-t batches")
+
+    def loss(self, *args, **kwargs):
+        raise AssertionError("MultiTrainer compatible validation should not use flow loss")
+
+    def sample(self, model, batch, *, num_steps):
+        assert "expert_node_mask" in batch
+        assert "expert_edge_mask" in batch
+        self.sample_calls.append(int(num_steps))
+        out = batch.copy()
+        out["node_features"] = torch.full_like(batch["node_features"], float(num_steps))
+        out["edge_features"] = torch.full_like(batch["edge_features"], float(2 * num_steps))
+        return out
+
+
+class _StatsForwardLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.last_onsite_loss = None
+        self.last_hopping_loss = None
+        self.last_z_loss = None
+        self.expert_load_cv = None
+
+    def forward(self, pred, ref):
+        node_mask = pred.get(
+            "expert_node_mask",
+            torch.ones(pred["node_features"].shape[0], dtype=torch.bool),
+        ).to(dtype=pred["node_features"].dtype).unsqueeze(-1)
+        edge_mask = pred.get(
+            "expert_edge_mask",
+            torch.ones(pred["edge_features"].shape[0], dtype=torch.bool),
+        ).to(dtype=pred["edge_features"].dtype).unsqueeze(-1)
+
+        node_diff = (pred["node_features"] - ref["node_features"]) * node_mask
+        edge_diff = (pred["edge_features"] - ref["edge_features"]) * edge_mask
+        self.last_onsite_l1_sum = node_diff.abs().sum().detach()
+        self.last_onsite_mse_sum = node_diff.square().sum().detach()
+        self.last_onsite_count = node_mask.sum().detach()
+        self.last_hopping_l1_sum = edge_diff.abs().sum().detach()
+        self.last_hopping_mse_sum = edge_diff.square().sum().detach()
+        self.last_hopping_count = edge_mask.sum().detach()
+        onsite = 0.5 * (
+            self.last_onsite_l1_sum / self.last_onsite_count.clamp_min(1.0)
+            + torch.sqrt(
+                self.last_onsite_mse_sum / self.last_onsite_count.clamp_min(1.0)
+                + 1e-12
+            )
+        )
+        hopping = 0.5 * (
+            self.last_hopping_l1_sum / self.last_hopping_count.clamp_min(1.0)
+            + torch.sqrt(
+                self.last_hopping_mse_sum / self.last_hopping_count.clamp_min(1.0)
+                + 1e-12
+            )
+        )
+        self.last_onsite_loss = onsite.detach()
+        self.last_hopping_loss = hopping.detach()
+        return 0.5 * (onsite + hopping)
+
+
 def test_validation_compatible_loss_respects_legacy_key_flag(monkeypatch):
     trainer = object.__new__(Trainer)
     trainer.device = torch.device("cpu")
@@ -676,6 +747,74 @@ def test_validation_euler_only_compatible_maps_to_legacy_loss(monkeypatch):
     assert trainer._last_flow_validation_state[
         "validation_hopping_loss"
     ].item() == pytest.approx(2.0)
+
+
+def test_flow_sample_preserves_expert_masks_across_euler_steps():
+    class _MaskCheckingModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, batch):
+            self.calls += 1
+            assert "expert_node_mask" in batch
+            assert "expert_edge_mask" in batch
+            assert "expert_idx" in batch
+            out = batch.copy()
+            out["node_features"] = batch["node_h0"] + 1.0
+            out["edge_features"] = batch["edge_h0"] + 1.0
+            return out
+
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "prior": "zero",
+            "strict_h0": True,
+        }
+    )
+    data = _two_graph_batch()
+    data["expert_node_mask"] = torch.ones(3, dtype=torch.bool)
+    data["expert_edge_mask"] = torch.ones(2, dtype=torch.bool)
+    data["expert_idx"] = 0
+    model = _MaskCheckingModel()
+
+    flow.sample(model, data, num_steps=3)
+
+    assert model.calls == 3
+
+
+def test_multitrainer_validation_uses_euler_sample_for_compatible_legacy_loss():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 11
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer._tagger = _NoopTagger()
+    trainer.model = _ValidationIdentityModel()
+    trainer.flow_cfm = _MultiEulerValidationFlow()
+    trainer.validation_loader = [_FakeBatch()]
+    trainer.validation_lossfunc = _StatsForwardLoss()
+    trainer.distributed_expert = True
+    trainer.local_expert_idx = 0
+    trainer.distance_ranges = [(0.0, 1.0)]
+    trainer.world_size = 1
+    trainer.log_single_model_compatible_loss = True
+    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer._prepare_batch_bundle = lambda batch, with_lengths=True: (_two_graph_batch(), {})
+    trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
+        torch.ones(batch["edge_features"].shape[0], dtype=torch.bool),
+        torch.ones(batch["node_features"].shape[0], dtype=torch.bool),
+    )
+    trainer._all_reduce_ = lambda tensor, name=None: tensor
+
+    loss = trainer.validation(fast=True)
+
+    assert trainer.flow_cfm.sample_calls == [1, 3]
+    assert loss.item() == pytest.approx(1.5)
+    state = trainer._last_flow_validation_state
+    assert state["validation_loss"].item() == pytest.approx(1.5)
+    assert state["validation_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(2.0)
+    assert state["validation_compatible_euler_1_loss"].item() == pytest.approx(1.5)
+    assert state["validation_compatible_euler_3_loss"].item() == pytest.approx(4.5)
 
 
 _UNUSED_MODEL = object()

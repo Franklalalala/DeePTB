@@ -1093,6 +1093,12 @@ class HamiltonianCFM:
         for step in range(num_steps):
             cur_t = float(step) * dt
             graph_t = torch.full((num_graphs,), cur_t, device=like.device, dtype=like.dtype)
+            carry_keys = (
+                "expert_edge_mask",
+                "expert_node_mask",
+                "expert_idx",
+            )
+            carried = {key: state[key] for key in carry_keys if key in state}
             if node_current is not None:
                 state[self.node_h0_key] = node_current
                 if self.overwrite_feature_keys:
@@ -1113,6 +1119,7 @@ class HamiltonianCFM:
                 endpoint, _raw_mask = project_uureal_to_like(self.idp, endpoint, edge_current)
                 edge_current = edge_current + dt * (endpoint - edge_current) / denom
             state = prediction.copy()
+            state.update(carried)
 
         if node_current is not None:
             state[self.node_h0_key] = node_current

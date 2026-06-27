@@ -3516,6 +3516,129 @@ class MultiTrainer(Trainer):
 
         return criterion(pred_batch, batch_for_loss)
 
+    def _build_validation_euler_payload(
+        self,
+        batch_dict,
+        batch_info,
+        criterion,
+        expert_idx,
+        range_dis,
+        *,
+        num_steps: int,
+    ):
+        with self._tagger.tag("validation/prepare_euler_masks", it=self.iter, expert=expert_idx):
+            expert_edge_mask, expert_node_mask = self._prepare_expert_masks(
+                batch_dict, range_dis, expert_idx
+            )
+
+        batch_copy = batch_dict.copy()
+        batch_copy["expert_edge_mask"] = expert_edge_mask
+        batch_copy["expert_node_mask"] = expert_node_mask
+        batch_copy["expert_idx"] = int(expert_idx)
+
+        active_nodes = expert_node_mask.sum().detach()
+        active_edges = expert_edge_mask.sum().detach()
+
+        with self._tagger.tag(
+            "validation/flow_sample_euler",
+            it=self.iter,
+            expert=expert_idx,
+            num_steps=int(num_steps),
+        ):
+            sampled = self.flow_cfm.sample(
+                self.model,
+                batch_copy,
+                num_steps=int(num_steps),
+            )
+
+        sampled["global_step"] = int(self.iter)
+        sampled["expert_edge_mask"] = expert_edge_mask
+        sampled["expert_node_mask"] = expert_node_mask
+        sampled["expert_idx"] = int(expert_idx)
+        sampled.update(batch_info)
+
+        batch_for_loss = batch_copy.copy()
+        batch_for_loss.update(batch_info)
+
+        with self._tagger.tag(
+            "validation/euler_compatible_loss",
+            it=self.iter,
+            expert=expert_idx,
+            num_steps=int(num_steps),
+        ):
+            loss = criterion(sampled, batch_for_loss)
+        metrics = self._snapshot_loss_metrics(criterion)
+
+        onsite_weighted_sum = metrics["onsite"] * active_nodes.to(dtype=self.dtype)
+        hopping_weighted_sum = metrics["hopping"] * active_edges.to(dtype=self.dtype)
+
+        return {
+            "loss": loss,
+            "loss_detached": loss.detach() if torch.is_tensor(loss) else loss,
+            "expert_onsite": metrics["onsite"].detach(),
+            "expert_hopping": metrics["hopping"].detach(),
+            "onsite_weighted_sum": onsite_weighted_sum.detach(),
+            "hopping_weighted_sum": hopping_weighted_sum.detach(),
+            "active_nodes": active_nodes.detach(),
+            "active_edges": active_edges.detach(),
+            "onsite_l1_sum": metrics["last_onsite_l1_sum"].detach()
+            if torch.is_tensor(metrics["last_onsite_l1_sum"])
+            else None,
+            "onsite_mse_sum": metrics["last_onsite_mse_sum"].detach()
+            if torch.is_tensor(metrics["last_onsite_mse_sum"])
+            else None,
+            "onsite_cnt": metrics["last_onsite_count"].detach()
+            if torch.is_tensor(metrics["last_onsite_count"])
+            else None,
+            "hopping_l1_sum": metrics["last_hopping_l1_sum"].detach()
+            if torch.is_tensor(metrics["last_hopping_l1_sum"])
+            else None,
+            "hopping_mse_sum": metrics["last_hopping_mse_sum"].detach()
+            if torch.is_tensor(metrics["last_hopping_mse_sum"])
+            else None,
+            "hopping_cnt": metrics["last_hopping_count"].detach()
+            if torch.is_tensor(metrics["last_hopping_count"])
+            else None,
+            "z_values": [metrics["z_loss"].detach()]
+            if torch.is_tensor(metrics["z_loss"])
+            else ([] if metrics["z_loss"] is None else [metrics["z_loss"]]),
+            "load_cv_values": [metrics["expert_load_cv"].detach()]
+            if torch.is_tensor(metrics["expert_load_cv"])
+            else ([] if metrics["expert_load_cv"] is None else [metrics["expert_load_cv"]]),
+        }
+
+    def _validation_euler_state_from_pack(
+        self,
+        pack: torch.Tensor,
+        criterion,
+        *,
+        num_steps: int,
+    ) -> Dict[str, torch.Tensor]:
+        state: Dict[str, torch.Tensor] = {}
+        compatible_prefix = f"validation_compatible_euler_{int(num_steps)}"
+        compatible_state = self._compute_compatible_state_from_pack(
+            pack,
+            criterion=criterion,
+            prefix=compatible_prefix,
+            global_step=getattr(self, "iter", None),
+        )
+        if compatible_state is not None:
+            state.update(compatible_state)
+
+        if int(num_steps) == 1 and getattr(
+            self.flow_cfm, "compatible_loss_to_legacy_keys", True
+        ):
+            legacy_state = self._compute_compatible_state_from_pack(
+                pack,
+                criterion=criterion,
+                prefix="validation",
+                global_step=getattr(self, "iter", None),
+            )
+            if legacy_state is not None:
+                state.update(legacy_state)
+
+        return state
+
     def validation(self, fast=True):
         with torch.no_grad():
             total_loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
@@ -3527,44 +3650,117 @@ class MultiTrainer(Trainer):
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
+                flow_euler_validation = bool(
+                    getattr(getattr(self, "flow_cfm", None), "enabled", False)
+                    and getattr(self.flow_cfm, "log_validation_compatible_loss", False)
+                )
+
                 if self.distributed_expert:
                     local_idx = self.local_expert_idx
-                    payload = self._build_train_payload(
-                        batch_dict=batch_dict,
-                        batch_info=batch_info,
-                        expert_idx=local_idx,
-                        range_dis=self.distance_ranges[local_idx],
-                        ref_batch_dict=None,
-                        ref_batch_info=None,
-                        criterion=self.validation_lossfunc,
-                        flow_prefix="validation",
-                    )
-
-                    payload["loss_detached"] = payload["loss"].detach()
-
-                    with self._tagger.tag("validation/reduce_packed_metrics_dist", it=self.iter):
-                        reduced_pack = self._make_step_pack(payload)
-                        self._all_reduce_(reduced_pack, name="dist/all_reduce(validation_metrics_packed)")
-
-                    if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
-                        with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
-                            loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
+                    if flow_euler_validation:
+                        loss_i = None
+                        for num_steps in self.flow_cfm.validation_ode_steps:
+                            payload = self._build_validation_euler_payload(
+                                batch_dict=batch_dict,
+                                batch_info=batch_info,
+                                criterion=self.validation_lossfunc,
+                                expert_idx=local_idx,
+                                range_dis=self.distance_ranges[local_idx],
+                                num_steps=int(num_steps),
+                            )
+                            with self._tagger.tag(
+                                "validation/reduce_euler_metrics_dist",
+                                it=self.iter,
+                                num_steps=int(num_steps),
+                            ):
+                                reduced_pack = self._make_step_pack(payload)
+                                self._all_reduce_(
+                                    reduced_pack,
+                                    name=f"dist/all_reduce(validation_euler_{int(num_steps)}_metrics_packed)",
+                                )
+                            state = self._validation_euler_state_from_pack(
+                                reduced_pack,
+                                self.validation_lossfunc,
+                                num_steps=int(num_steps),
+                            )
+                            self._accumulate_metric_state(validation_metric_sums, state)
+                            if loss_i is None:
+                                loss_i = state.get(
+                                    "validation_loss",
+                                    state.get(
+                                        f"validation_compatible_euler_{int(num_steps)}_loss",
+                                        None,
+                                    ),
+                                )
                         if loss_i is None:
-                            loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
+                            loss_i = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
                     else:
-                        loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
-
-                    self._accumulate_metric_state(
-                        validation_metric_sums,
-                        self._pack_component_state(
-                            reduced_pack,
-                            prefix="validation",
+                        payload = self._build_train_payload(
+                            batch_dict=batch_dict,
+                            batch_info=batch_info,
+                            expert_idx=local_idx,
+                            range_dis=self.distance_ranges[local_idx],
+                            ref_batch_dict=None,
+                            ref_batch_info=None,
                             criterion=self.validation_lossfunc,
-                        ),
-                    )
+                            flow_prefix="validation",
+                        )
+
+                        payload["loss_detached"] = payload["loss"].detach()
+
+                        with self._tagger.tag("validation/reduce_packed_metrics_dist", it=self.iter):
+                            reduced_pack = self._make_step_pack(payload)
+                            self._all_reduce_(reduced_pack, name="dist/all_reduce(validation_metrics_packed)")
+
+                        if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
+                            with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
+                                loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
+                            if loss_i is None:
+                                loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
+                        else:
+                            loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
+
+                        self._accumulate_metric_state(
+                            validation_metric_sums,
+                            self._pack_component_state(
+                                reduced_pack,
+                                prefix="validation",
+                                criterion=self.validation_lossfunc,
+                            ),
+                        )
 
                 else:
-                    if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
+                    if flow_euler_validation:
+                        loss_i = None
+                        for num_steps in self.flow_cfm.validation_ode_steps:
+                            local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
+                            for expert_idx, range_dis in enumerate(self.distance_ranges):
+                                payload = self._build_validation_euler_payload(
+                                    batch_dict=batch_dict,
+                                    batch_info=batch_info,
+                                    criterion=self.validation_lossfunc,
+                                    expert_idx=expert_idx,
+                                    range_dis=range_dis,
+                                    num_steps=int(num_steps),
+                                )
+                                local_pack = local_pack + self._make_step_pack(payload)
+                            state = self._validation_euler_state_from_pack(
+                                local_pack,
+                                self.validation_lossfunc,
+                                num_steps=int(num_steps),
+                            )
+                            self._accumulate_metric_state(validation_metric_sums, state)
+                            if loss_i is None:
+                                loss_i = state.get(
+                                    "validation_loss",
+                                    state.get(
+                                        f"validation_compatible_euler_{int(num_steps)}_loss",
+                                        None,
+                                    ),
+                                )
+                        if loss_i is None:
+                            loss_i = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
+                    elif self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
                         payloads = []
                         local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
                         for expert_idx, range_dis in enumerate(self.distance_ranges):
