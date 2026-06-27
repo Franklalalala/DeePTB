@@ -12,7 +12,7 @@ from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
 from e3nn.o3 import Linear
 from dptb.nn.rescale import E3PerSpeciesScaleShift, E3PerEdgeSpeciesScaleShift
-from dptb.nn.embedding.output_routes import validate_prediction_route
+from dptb.nn.embedding.output_routes import resolve_output_route, validate_prediction_route
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
 import logging
 
@@ -20,6 +20,32 @@ log = logging.getLogger(__name__)
 
 """ if this class is called, it suggest user choose a embedding method. If not, it should directly use _sktb.py
 """
+
+
+def _resolve_embedding_output_route_spec(embedding_module, embedding_options, prediction_options):
+    spec = getattr(embedding_module, "output_route_spec", None)
+    if spec is not None:
+        return spec
+
+    spec = resolve_output_route(
+        output_route=embedding_options.get("output_route", prediction_options.get("output_route", None)),
+        legacy_mode=embedding_options.get("rme_head_mode", prediction_options.get("rme_head_mode", None)),
+        projector_backend=embedding_options.get(
+            "ao_projector_backend",
+            prediction_options.get("ao_projector_backend", None),
+        ),
+        projector_bank_path=embedding_options.get(
+            "ao_projector_bank_path",
+            prediction_options.get("ao_projector_bank_path", None),
+        ),
+    )
+    if spec.canonical_name != "legacy_rme":
+        raise RuntimeError(
+            "Embedding did not expose output_route_spec for configured "
+            f"output route {spec.canonical_name!r}; route validation cannot be performed."
+        )
+    log.info("Embedding did not expose output_route_spec; assuming legacy_rme route.")
+    return spec
 
 def get_neuron_config(nl):
     """Extracts the configuration of a neural network from a list of layer sizes.
@@ -164,12 +190,11 @@ class NNENV(nn.Module):
         n_species = len(self.basis.keys())
         # initialize the embedding layer
         self.embedding = Embedding(**embedding, dtype=dtype, device=device, idp=self.idp, n_atom=n_species)
-        self.output_route_spec = getattr(self.embedding, "output_route_spec", None)
-        if self.output_route_spec is None:
-            raise RuntimeError(
-                "Embedding did not expose output_route_spec; route validation "
-                "cannot be performed."
-            )
+        self.output_route_spec = _resolve_embedding_output_route_spec(
+            self.embedding,
+            embedding,
+            prediction_copy,
+        )
         validate_prediction_route(self.output_route_spec, prediction_copy)
         if self.output_route_spec.debug_only:
             log.warning(

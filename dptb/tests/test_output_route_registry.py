@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,6 +23,7 @@ from dptb.nn.embedding.output_routes import (
     select_final_irreps,
     validate_prediction_route,
 )
+from dptb.nn.deeptb import _resolve_embedding_output_route_spec
 
 
 def test_official_route_registry_has_exact_six_route_matrix():
@@ -73,6 +75,25 @@ def test_alias_in_canonical_field_emits_deprecation_warning():
     with pytest.warns(DeprecationWarning, match="output_route='h_a0'"):
         spec = resolve_output_route(output_route="late_nocg")
     assert spec.canonical_name == "h_a0"
+
+
+def test_legacy_embedding_without_output_route_spec_defaults_to_legacy_rme():
+    spec = _resolve_embedding_output_route_spec(
+        SimpleNamespace(),
+        embedding_options={},
+        prediction_options={"method": "e3tb"},
+    )
+
+    assert spec.canonical_name == "legacy_rme"
+
+
+def test_legacy_embedding_without_output_route_spec_rejects_new_route():
+    with pytest.raises(RuntimeError, match="output_route_spec"):
+        _resolve_embedding_output_route_spec(
+            SimpleNamespace(),
+            embedding_options={"output_route": "h_a0"},
+            prediction_options={"method": "e3tb"},
+        )
 
 
 def test_legacy_direct_ao_alias_resolves_from_backend_and_provenance(tmp_path):
