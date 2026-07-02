@@ -192,7 +192,7 @@ class LemMoEV3H0(LemMoEV3):
             )
             node_features = torch.cat([node_features, pad], dim=0)
 
-        if self.use_block_native_output:
+        if getattr(self, "use_block_native_output", False):
             out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
                 node_features, edge_features, atom_type, edge_index, active_edges
             )
@@ -227,9 +227,16 @@ class LemMoEV3H0(LemMoEV3):
             data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)
             return data
 
-        out_node_features, out_edge_features = self._apply_rme_output_heads(
-            node_features, edge_features, node_one_hot, edge_one_hot
-        )
+        out_node_features = self.out_node(node_features)
+        out_edge_features = self.out_edge(edge_features)
+
+        if self.use_out_onehot_tp:
+            out_node_features = out_node_features + _apply_onehot_tp(
+                self.out_node_ele_tp, node_features, node_one_hot, self.onehot_tp_mode
+            )
+            out_edge_features = out_edge_features + _apply_onehot_tp(
+                self.out_edge_ele_tp, edge_features, edge_one_hot, self.onehot_tp_mode
+            )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features
         data[_keys.EDGE_FEATURES_KEY] = torch.zeros(
