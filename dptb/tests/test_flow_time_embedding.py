@@ -63,3 +63,54 @@ def test_conditioner_can_use_two_time_meanflow_channels():
 
     assert conditioned.shape == node_features.shape
     assert not torch.allclose(conditioned[0], conditioned[1])
+
+
+def test_conditioner_maps_explicit_edge_batch_to_edge_rows():
+    conditioner = FlowTimeConditioner(
+        scalar_channels=4,
+        flow_time_key="flow_time",
+        max_positions=2000,
+    )
+    edge_features = torch.zeros(4, 9)
+    data = {"flow_time": torch.tensor([0.0, 0.5])}
+    edge_batch = torch.tensor([0, 1, 1, 0], dtype=torch.long)
+
+    conditioned = conditioner(edge_features, data, batch=edge_batch)
+
+    assert conditioned.shape == edge_features.shape
+    assert torch.allclose(conditioned[0], conditioned[3])
+    assert torch.allclose(conditioned[1], conditioned[2])
+    assert not torch.allclose(conditioned[0], conditioned[1])
+    assert torch.count_nonzero(conditioned[:, 4:]) == 0
+
+
+def test_conditioner_accepts_edge_batch_with_graphs_that_have_no_edges():
+    conditioner = FlowTimeConditioner(
+        scalar_channels=4,
+        flow_time_key="flow_time",
+        max_positions=2000,
+    )
+    edge_features = torch.zeros(2, 4)
+    data = {"flow_time": torch.tensor([0.0, 0.5, 0.9])}
+    edge_batch = torch.tensor([0, 2], dtype=torch.long)
+
+    conditioned = conditioner(edge_features, data, batch=edge_batch)
+
+    assert conditioned.shape == edge_features.shape
+    assert not torch.allclose(conditioned[0], conditioned[1])
+
+
+def test_conditioner_accepts_edge_batch_when_trailing_graphs_have_no_edges():
+    conditioner = FlowTimeConditioner(
+        scalar_channels=4,
+        flow_time_key="flow_time",
+        max_positions=2000,
+    )
+    edge_features = torch.zeros(2, 4)
+    data = {"flow_time": torch.tensor([0.0, 0.5, 0.9])}
+    edge_batch = torch.tensor([0, 1], dtype=torch.long)
+
+    conditioned = conditioner(edge_features, data, batch=edge_batch)
+
+    assert conditioned.shape == edge_features.shape
+    assert not torch.allclose(conditioned[0], conditioned[1])

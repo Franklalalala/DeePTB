@@ -32,7 +32,7 @@ def sinusoidal_time_embedding(
 
 
 class FlowTimeConditioner(torch.nn.Module):
-    """Inject one time embedding per graph into node scalar channels."""
+    """Inject one time embedding per graph into row-wise scalar channels."""
 
     def __init__(
         self,
@@ -82,22 +82,43 @@ class FlowTimeConditioner(torch.nn.Module):
             )
         return graph_t
 
-    def forward(self, node_features: torch.Tensor, data: Dict[str, Any]) -> torch.Tensor:
-        batch = data.get(_keys.BATCH_KEY, None)
+    def forward(
+        self,
+        features: torch.Tensor,
+        data: Dict[str, Any],
+        *,
+        batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        explicit_batch = batch is not None
         if batch is None:
-            batch = torch.zeros(node_features.shape[0], device=node_features.device, dtype=torch.long)
+            batch = data.get(_keys.BATCH_KEY, None)
+        if batch is None:
+            batch = torch.zeros(features.shape[0], device=features.device, dtype=torch.long)
         else:
-            batch = batch[: node_features.shape[0]].to(device=node_features.device, dtype=torch.long)
-        num_graphs = int(batch.max().item()) + 1 if batch.numel() else 1
+            batch = batch.to(device=features.device, dtype=torch.long)
+            if explicit_batch and batch.numel() != features.shape[0]:
+                raise ValueError(
+                    "explicit flow-time batch must contain one graph index per feature row "
+                    f"({features.shape[0]}), got {batch.numel()}."
+                )
+            batch = batch[: features.shape[0]]
         time_keys = self.flow_time_keys or (self.flow_time_key,)
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() else 1
+        for key in time_keys:
+            graph_t = data.get(key, None)
+            if graph_t is None:
+                continue
+            graph_t_count = torch.as_tensor(graph_t).reshape(-1).numel()
+            if graph_t_count > 1:
+                num_graphs = max(num_graphs, int(graph_t_count))
         graph_embedding = None
         for idx, key in enumerate(time_keys):
             graph_t = self._graph_time(
                 data,
                 key,
                 num_graphs=num_graphs,
-                device=node_features.device,
-                dtype=node_features.dtype,
+                device=features.device,
+                dtype=features.dtype,
             )
             key_embedding = sinusoidal_time_embedding(
                 graph_t,
@@ -111,7 +132,7 @@ class FlowTimeConditioner(torch.nn.Module):
                 )
             graph_embedding = key_embedding if graph_embedding is None else graph_embedding + key_embedding
         node_embedding = graph_embedding.index_select(0, batch)
-        conditioned = node_features.clone()
+        conditioned = features.clone()
         conditioned[:, : self.scalar_channels] = (
             conditioned[:, : self.scalar_channels] + node_embedding
         )

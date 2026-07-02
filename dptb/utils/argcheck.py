@@ -1496,6 +1496,7 @@ def slem_h0():
     doc_h0_merge_mode = "How to combine H0-projected features with the base init output. Supported: `replace`, `add`. Default: `replace`."
     doc_h0_self_edge_tol = "Tolerance used to detect self-edges in `self_edge` node mode. Default: `1e-8`."
     doc_use_flow_time_embedding = "Whether to inject graph-level flow time into scalar channels before message passing. Default: `False`."
+    doc_flow_time_condition_edges = "Whether to also inject graph-level flow time into active edge scalar channels when flow-time embedding is enabled. Default: `True`."
     doc_flow_time_key = "Graph-level flow time key written by train_options.flow_options. Default: `flow_time`."
     doc_flow_time_keys = "Optional list of graph-level time keys to embed and sum, e.g. [`flow_time_t`, `flow_time_r`, `flow_time_h`] for Pixel MeanFlow."
     doc_flow_time_max_positions = "Scale used by the sinusoidal flow-time embedding. Default: `2000`."
@@ -1513,6 +1514,7 @@ def slem_h0():
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),
+        Argument("flow_time_condition_edges", bool, optional=True, default=True, doc=doc_flow_time_condition_edges),
         Argument("flow_time_key", str, optional=True, default="flow_time", doc=doc_flow_time_key),
         Argument("flow_time_keys", list, optional=True, default=[], doc=doc_flow_time_keys),
         Argument("flow_time_max_positions", int, optional=True, default=2000, doc=doc_flow_time_max_positions),

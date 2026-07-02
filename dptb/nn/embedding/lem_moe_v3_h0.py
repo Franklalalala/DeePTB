@@ -35,6 +35,7 @@ class LemMoEV3H0(LemMoEV3):
         h0_merge_mode: str = "replace",
         h0_self_edge_tol: float = 1e-8,
         use_flow_time_embedding: bool = False,
+        flow_time_condition_edges: bool = True,
         flow_time_key: str = "flow_time",
         flow_time_keys: Any = None,
         flow_time_max_positions: int = 2000,
@@ -45,6 +46,7 @@ class LemMoEV3H0(LemMoEV3):
         super().__init__(env_embed_multiplicity=env_embed_multiplicity, **kwargs)
         self.use_h0_init = use_h0_init
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
+        self.flow_time_condition_edges = bool(flow_time_condition_edges)
         self.flow_time_conditioner = (
             FlowTimeConditioner(
                 scalar_channels=env_embed_multiplicity,
@@ -127,6 +129,13 @@ class LemMoEV3H0(LemMoEV3):
         )
         if self.flow_time_conditioner is not None:
             node_features = self.flow_time_conditioner(node_features, data)
+            if self.flow_time_condition_edges:
+                edge_batch = batch[edge_index[0][active_edges]]
+                edge_features = self.flow_time_conditioner(
+                    edge_features,
+                    data,
+                    batch=edge_batch,
+                )
 
         node_batch = batch[: node_features.shape[0]]
         if node_features.shape[0] < num_nodes_total:
