@@ -230,6 +230,41 @@ def flow_options():
     )
 
 
+def self_consistency_options():
+    doc = (
+        "WS4-C training-period self-consistency loss (see F:\\claude\\0702_nextham_dm_plan and "
+        "dptb/nnops/self_consistency.py). Every `every_n_steps` steps, a `sample_frac` slice of the "
+        "batch's predicted Hamiltonians is sent to an ABACUS restart_dh hrebuild endpoint "
+        "(dptb.postprocess.hrebuild_server) for one-shot repair; the (stop-gradient) repaired H is used "
+        "as a self-consistency target L_sc = ||H_pred - stopgrad(R(H_pred))||^2_masked "
+        "(Zhang et al., ICML 2024). Off by default. Gap-threshold guard reuses hrebuild's red-line #3 "
+        "refusal for near-metallic systems."
+    )
+    args = [
+        Argument("enabled", bool, optional=True, default=False),
+        Argument("endpoint", str, optional=True, default=""),
+        Argument("every_n_steps", int, optional=True, default=100),
+        Argument("sample_frac", (int, float), optional=True, default=0.1),
+        Argument("weight", (int, float), optional=True, default=0.1),
+        Argument("warmup_epochs", int, optional=True, default=0),
+        Argument("gap_threshold_ev", (int, float), optional=True, default=0.5),
+        Argument("staleness_steps", int, optional=True, default=1,
+                 doc="Double-buffering delay Delta: results requested at step k are consumed at step k+Delta."),
+        Argument("mode", str, optional=True, default="one_shot"),
+        Argument("unlabeled_pool_weight", (int, float), optional=True, default=0.0,
+                 doc="Weight for the semi-supervised L_sc branch on unlabeled structures (0 disables it)."),
+    ]
+    return Argument(
+        "self_consistency",
+        dict,
+        optional=True,
+        default={"enabled": False},
+        sub_fields=args,
+        sub_variants=[],
+        doc=doc,
+    )
+
+
 def activation_recompute_options():
     doc = (
         "Train-time activation recomputation/checkpointing for memory hot paths. "
@@ -693,7 +728,8 @@ def train_options():
         Argument("float32_matmul_precision", str, optional=True, default="", doc=doc_float32_matmul_precision),
 
         flow_options(),
-        loss_options()
+        loss_options(),
+        self_consistency_options(),
     ]
 
     doc_train_options = "Options that define the training behaviour of DeePTB, including optimizer/scheduler, expert split, distributed expert-parallel execution, debugging and profiling."

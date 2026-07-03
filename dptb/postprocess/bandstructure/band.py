@@ -89,6 +89,21 @@ class Band(ElecStruCal):
             eig_solver=eig_solver
         )
 
+        # WS4 hrebuild: optional ABACUS restart_dh one-shot/full-SCF repair
+        # of the predicted H, applied on top of the ordinary model
+        # prediction above. Off by default (kpath_kwargs["repair"] is None
+        # for every existing caller); see dptb/postprocess/hrebuild.py and
+        # the WS4 report for the ABACUS-side machinery this drives.
+        repair_cfg = kpath_kwargs.get("repair", None)
+        eigenvalues_before_repair = None
+        repair_diagnostics = None
+        if repair_cfg is not None:
+            eigenvalues_before_repair = eigenvalues
+            data, eigenvalues, repair_diagnostics = self._apply_hrebuild_repair(
+                data=data, klist=klist, repair_cfg=repair_cfg,
+                override_overlap=override_overlap, eig_solver=eig_solver,
+            )
+
         # get the E_fermi from data
         nel_atom = kpath_kwargs.get('nel_atom', None)
 
@@ -104,12 +119,93 @@ class Band(ElecStruCal):
                             'high_sym_kpoints': high_sym_kpoints,
                             'labels': labels,
                             'eigenvalues': eigenvalues,
+                            'eigenvalues_before_repair': eigenvalues_before_repair,
+                            'repair_diagnostics': repair_diagnostics,
                             'E_fermi': estimated_E_fermi}
 
         if self.results_path is not None:
             np.save(f'{self.results_path}/bandstructure', self.eigenstatus)
 
         return self.eigenstatus
+
+    def _apply_hrebuild_repair(self, data, klist, repair_cfg, override_overlap, eig_solver):
+        """WS4 hrebuild repair step, see ``dptb/postprocess/hrebuild.py``.
+
+        ``repair_cfg`` keys:
+          - ``mode``: ``"one_shot"`` (``scf_nmax 1``) or ``"full_scf"``.
+          - ``endpoint``: path to the ABACUS ``restart_dh`` binary
+            (Phase-A CLI mode) -- a server address for Phase-B is not
+            implemented here yet.
+          - ``pp_orb``: ``{element: dptb.postprocess.hrebuild.PPOrbSpec}``.
+          - ``workdir``: scratch directory for the ABACUS run.
+          - ``gap_threshold_ev``: red-line #3 guard, default 0.5 eV.
+          - optional: ``unit``, ``is_soc``, ``nspin``, ``lspinorb``,
+            ``kmesh``, ``ecutwfc``, ``pp_orb_dir``, ``n_occ``, ``mpi_procs``.
+
+        On repair failure/refusal (e.g. gap below threshold, ABACUS
+        non-zero exit), logs a warning and falls back to the un-repaired
+        prediction rather than raising, so a repair-enabled call degrades
+        gracefully instead of breaking existing band-plotting workflows.
+        """
+        from dptb.postprocess import hrebuild as hb
+        from dptb.data import AtomicDataDict
+
+        try:
+            result = hb.repair_atomic_data(
+                data=data,
+                idp=self.model.idp,
+                pp_orb=repair_cfg["pp_orb"],
+                workdir=repair_cfg["workdir"],
+                abacus_bin=repair_cfg["endpoint"],
+                unit=repair_cfg.get("unit", "eV"),
+                mode=repair_cfg.get("mode", "one_shot"),
+                is_soc=repair_cfg.get("is_soc", False),
+                nspin=repair_cfg.get("nspin", None),
+                lspinorb=repair_cfg.get("lspinorb", 0),
+                kmesh=repair_cfg.get("kmesh", (1, 1, 1)),
+                ecutwfc=repair_cfg.get("ecutwfc", 100.0),
+                pp_orb_dir=repair_cfg.get("pp_orb_dir", "PP_ORB"),
+                n_occ=repair_cfg.get("n_occ", None),
+                gap_threshold_ev=repair_cfg.get("gap_threshold_ev", 0.5),
+                mpi_procs=repair_cfg.get("mpi_procs", 1),
+                input_extra=repair_cfg.get("input_extra", None),
+                sc_guard=repair_cfg.get("sc_guard", True),
+            )
+        except Exception as exc:
+            log.warning(f"[hrebuild] repair raised {type(exc).__name__}: {exc}; falling back to un-repaired H.")
+            return data, data[AtomicDataDict.ENERGY_EIGENVALUE_KEY][0].detach().cpu().numpy(), \
+                {"ok": False, "skipped_reason": f"{type(exc).__name__}: {exc}"}
+
+        if not result.ok:
+            log.warning(f"[hrebuild] repair skipped: {result.skipped_reason}")
+            return data, data[AtomicDataDict.ENERGY_EIGENVALUE_KEY][0].detach().cpu().numpy(), \
+                {"ok": False, "skipped_reason": result.skipped_reason, "gap_ev": result.gap_ev}
+
+        sc_diag = {
+            "sc_residual_mean_ev": result.sc_residual_mean_ev,
+            "sc_residual_max_ev": result.sc_residual_max_ev,
+            "harris_ks_gap_ev": result.harris_ks_gap_ev,
+            "repair_trustworthy": result.repair_trustworthy,
+            "guard_reason": result.guard_reason,
+        }
+        if not result.repair_trustworthy and not repair_cfg.get("force", False):
+            # Repaired H exists but the self-consistency guard rejected using
+            # it (either below the gain floor or outside the contraction
+            # basin -- the latter also flags the *prediction* as suspect).
+            log.warning(f"[hrebuild] repair not applied: {result.guard_reason}")
+            return data, data[AtomicDataDict.ENERGY_EIGENVALUE_KEY][0].detach().cpu().numpy(), \
+                {"ok": False, "skipped_reason": result.guard_reason, "gap_ev": result.gap_ev, **sc_diag}
+
+        data_repaired, eigenvalues_repaired = self.get_eigs(
+            data=data, klist=klist, override_overlap=override_overlap,
+            override_full_h=result.repaired_h5, eig_solver=eig_solver,
+        )
+        diagnostics = {
+            "ok": True, "mode": result.mode, "gap_ev": result.gap_ev,
+            "abacus_returncode": result.abacus_returncode, "workdir": result.workdir,
+            **sc_diag,
+        }
+        return data_repaired, eigenvalues_repaired, diagnostics
 
     @classmethod
     def estimate_E_fermi(cls, eigenvalues: np.array, total_electrons: int, spindeg: int = 2):
