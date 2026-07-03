@@ -409,6 +409,19 @@ class _ConstantEndpoint(torch.nn.Module):
         return data
 
 
+class _GradModeRecordingEndpoint(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.grad_modes = []
+
+    def forward(self, data):
+        self.grad_modes.append(torch.is_grad_enabled())
+        data = data.copy()
+        data["node_features"] = data["node_h0"].clone()
+        data["edge_features"] = data["edge_h0"].clone()
+        return data
+
+
 @pytest.mark.parametrize("num_steps", [1, 3])
 def test_euler_sampler_reaches_constant_predicted_endpoint(num_steps):
     flow = HamiltonianCFM(
@@ -1252,6 +1265,43 @@ def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():
     assert state["train_flow_h"].item() == pytest.approx(float((t - r).mean()), abs=1.0e-6)
     assert state["train_flow_onsite_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
     assert state["train_flow_hopping_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+@pytest.mark.parametrize(
+    ("aux_boundary_v_weight", "expected_grad_modes"),
+    [
+        (0.0, [True, False, False]),
+        (0.2, [True, True, False]),
+    ],
+)
+def test_pixel_meanflow_uses_no_grad_boundary_when_boundary_aux_disabled(
+    aux_boundary_v_weight, expected_grad_modes
+):
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+            "meanflow": {
+                "jvp_tangent": "boundary",
+                "aux_boundary_v_weight": aux_boundary_v_weight,
+                "fd_eps": 1.0e-4,
+            },
+        }
+    )
+    model = _GradModeRecordingEndpoint()
+
+    flow.loss_with_model(
+        model,
+        _two_graph_batch(),
+        _two_graph_ref(),
+        r=torch.tensor([0.2, 0.3]),
+        t=torch.tensor([0.5, 0.7]),
+    )
+
+    assert model.grad_modes == expected_grad_modes
 
 
 def test_pixel_meanflow_one_step_sampler_reaches_constant_endpoint():

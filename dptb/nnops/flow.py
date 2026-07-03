@@ -10,6 +10,7 @@ used by QHFlow/QHFlow2, but is adapted to DeePTB/NextHAM-style physical H0
 features.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -1546,9 +1547,15 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         )
         node_x_boundary = edge_x_boundary = None
         if need_boundary:
-            _, node_x_boundary, edge_x_boundary = self._predict_clean(
-                model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.t, t=ctx.t
+            boundary_context = (
+                nullcontext()
+                if self.meanflow_aux_boundary_v_weight > 0.0
+                else torch.no_grad()
             )
+            with boundary_context:
+                _, node_x_boundary, edge_x_boundary = self._predict_clean(
+                    model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.t, t=ctx.t
+                )
 
         node_state_eps = edge_state_eps = None
         if ctx.node_state is not None:
