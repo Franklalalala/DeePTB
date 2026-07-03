@@ -1272,3 +1272,53 @@ def test_pixel_meanflow_one_step_sampler_reaches_constant_endpoint():
     assert torch.equal(sampled["flow_time"], torch.zeros(2))
     assert torch.equal(sampled["flow_time_r"], torch.zeros(2))
     assert torch.equal(sampled["flow_time_h"], torch.zeros(2))
+
+
+class _ConstantEndpointWithBlocks(torch.nn.Module):
+    """Block-native surrogate: emits feature keys plus Hamiltonian block keys
+    (as a block-native output head would), so pMF sampling can be checked to
+    carry the model's full output surface."""
+
+    def forward(self, data):
+        data = data.copy()
+        data["node_features"] = torch.full_like(data["node_h0"], 2.0)
+        data["edge_features"] = torch.full_like(data["edge_h0"], 4.0)
+        data["node_hamil_blocks"] = torch.full((data["node_h0"].shape[0], 2, 2), 2.0)
+        data["edge_hamil_blocks"] = torch.full((data["edge_h0"].shape[0], 2, 2), 4.0)
+        return data
+
+
+def test_pixel_meanflow_sample_carries_model_block_outputs():
+    # Regression: pMF sample() used to return `state.copy()` of the *input*
+    # data -- no model outputs at all -- so block-consuming losses (blockwise
+    # compatible validation) KeyError'd on node_hamil_blocks/edge_hamil_blocks.
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "prior": "zero",
+            "strict_h0": True,
+        }
+    )
+    sampled = flow.sample(_ConstantEndpointWithBlocks(), _two_graph_batch(), num_steps=1)
+    assert "node_hamil_blocks" in sampled and "edge_hamil_blocks" in sampled
+    assert torch.allclose(sampled["node_hamil_blocks"], torch.full((3, 2, 2), 2.0))
+    # integrated endpoint features still win over the final forward's features
+    assert torch.allclose(sampled["node_features"], torch.full((3, 1), 2.0))
+    assert torch.allclose(sampled["edge_features"], torch.full((2, 1), 4.0))
+    assert torch.equal(sampled["flow_time"], torch.zeros(2))
+
+
+def test_pixel_meanflow_sample_final_forward_opt_out():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "prior": "zero",
+            "strict_h0": True,
+            "meanflow": {"sample_final_forward": False},
+        }
+    )
+    sampled = flow.sample(_ConstantEndpointWithBlocks(), _two_graph_batch(), num_steps=1)
+    assert "node_hamil_blocks" not in sampled
+    assert torch.allclose(sampled["node_features"], torch.full((3, 1), 2.0))

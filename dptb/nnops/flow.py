@@ -1184,6 +1184,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_jvp_tangent = str(mf.get("jvp_tangent", "boundary")).lower()
         if self.meanflow_jvp_tangent not in {"path", "boundary"}:
             raise ValueError("pixel_meanflow.jvp_tangent must be 'path' or 'boundary'.")
+        self.meanflow_sample_final_forward = bool(mf.get("sample_final_forward", True))
 
         self.flow_time_r_key = str(options.get("flow_time_r_key", "flow_time_r"))
         self.flow_time_t_key = str(options.get("flow_time_t_key", "flow_time_t"))
@@ -1192,6 +1193,37 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.log_validation_compatible_loss = bool(
             mf.get("log_validation_compatible_loss", self.log_validation_compatible_loss)
         )
+
+        # A completely disabled validation path returns literal zero from
+        # Trainer.validation(), which is indistinguishable from a perfect model
+        # in the logs. Keep at least the pMF random-time objective on.
+        if self.enabled and not any(
+            (
+                self.log_validation_random_t_loss,
+                self.log_validation_t0_loss,
+                self.log_validation_flow_euler_loss,
+                self.log_validation_compatible_loss,
+            )
+        ):
+            log.warning(
+                "Pixel MeanFlow validation has all validation metrics disabled; "
+                "enabling log_validation_random_t_loss to avoid zero-valued validation logs."
+            )
+            self.log_validation_random_t_loss = True
+
+        # With a sinusoidal time embedding, the finite-difference time step must
+        # stay small relative to the fastest embedding frequency, or du/dt
+        # measures embedding oscillation instead of the path derivative.
+        approx_phase_step = float(mf.get("time_embedding_max_positions", 2000.0)) * self.meanflow_fd_eps
+        if self.enabled and approx_phase_step > 2.0:
+            log.warning(
+                "Pixel MeanFlow finite difference uses fd_eps=%.3g with sinusoidal "
+                "max_positions~%.3g (phase step ~%.3g rad). This can dominate du/dt; "
+                "consider fd_eps<=5e-4 or a smaller flow_time_max_positions ablation.",
+                self.meanflow_fd_eps,
+                float(mf.get("time_embedding_max_positions", 2000.0)),
+                approx_phase_step,
+            )
 
         if self.enabled:
             log.info(
@@ -1566,6 +1598,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             f"{prefix}_flow_t": ctx.t.detach().mean(),
             f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
             f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
+            f"{prefix}_flow_weight": ctx.t.new_tensor(1.0),
         }
         if ctx.node_clean is not None and node_x is not None:
             comp_total, comp_state = self._component_meanflow_loss(
@@ -1583,6 +1616,13 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
+            # Legacy aliases so pMF logs line up with CFM/supervised curves:
+            # *_flow_onsite_loss mirrors the velocity objective; the train_*
+            # keys carry the endpoint error, which is the cross-route
+            # comparable quantity (see plan §4.3).
+            state[f"{prefix}_flow_onsite_loss"] = comp_state[f"{prefix}_flow_onsite_velocity_loss"]
+            if prefix == "train":
+                state["train_onsite_loss"] = comp_state[f"{prefix}_flow_onsite_endpoint_loss"]
         if ctx.edge_clean is not None and edge_x is not None:
             comp_total, comp_state = self._component_meanflow_loss(
                 diff_prefix=f"{prefix}_flow_hopping",
@@ -1599,6 +1639,9 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
+            state[f"{prefix}_flow_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_velocity_loss"]
+            if prefix == "train":
+                state["train_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_endpoint_loss"]
         if total is None:
             raise KeyError("Pixel MeanFlow could not compute a loss from configured node/edge targets.")
         if self.router_z_loss_coef > 0.0:
@@ -1690,14 +1733,43 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                     (edge_z - edge_x) / self._view_time(ctx.edge_t, edge_z)
                 )
                 ctx.edge_state = edge_z
-        out = state.copy()
+        zero = torch.zeros(num_graphs, device=like.device, dtype=like.dtype)
+        if self.meanflow_sample_final_forward:
+            # One extra endpoint-conditioned forward so `out` carries the
+            # model's full output surface -- block-native heads'
+            # node/edge Hamiltonian blocks, router monitors, etc. --
+            # mirroring HamiltonianCFM.sample, whose state is always a
+            # prediction dict. Without this, pMF samples contain no model
+            # outputs at all and block-consuming losses (e.g. the blockwise
+            # compatible validation) KeyError. Disable via
+            # pixel_meanflow.sample_final_forward=false to save one forward
+            # when only the integrated features are needed.
+            final_t = zero.clamp_min(self.meanflow_min_t)
+            ctx.r, ctx.t = zero, final_t
+            ctx.node_t, ctx.edge_t = self._expand_graph_times(
+                state,
+                final_t,
+                node_count=None if node_z is None else node_z.shape[0],
+                edge_count=None if edge_z is None else edge_z.shape[0],
+            )
+            ctx.node_r, ctx.edge_r = self._expand_graph_times(
+                state,
+                zero,
+                node_count=None if node_z is None else node_z.shape[0],
+                edge_count=None if edge_z is None else edge_z.shape[0],
+            )
+            pred, _node_x, _edge_x = self._predict_clean(
+                model, state, ctx, node_z, edge_z, r=zero, t=final_t
+            )
+            out = pred.copy()
+        else:
+            out = state.copy()
         if node_z is not None:
             out[self.node_h0_key] = node_base + node_z if self.mode == "residual" else node_z
             out[self.node_target_key] = out[self.node_h0_key]
         if edge_z is not None:
             out[self.edge_h0_key] = edge_base + edge_z if self.mode == "residual" else edge_z
             out[self.edge_target_key] = out[self.edge_h0_key]
-        zero = torch.zeros(num_graphs, device=like.device, dtype=like.dtype)
         self._write_times(out, zero, zero)
         return out
 

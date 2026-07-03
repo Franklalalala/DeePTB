@@ -571,7 +571,7 @@ class Trainer(BaseTrainer):
                     if getattr(self.flow_cfm, "model_in_loss", False):
                         batch_for_loss.update(batch_info)
                         if log_random_t:
-                            random_t_loss, _ = self.flow_cfm.loss_with_model(
+                            random_t_loss, random_t_state = self.flow_cfm.loss_with_model(
                                 self.model, original_batch, batch_for_loss, prefix="validation"
                             )
                             loss += random_t_loss
@@ -579,11 +579,12 @@ class Trainer(BaseTrainer):
                                 flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
                                 + random_t_loss.detach()
                             )
+                            self._accumulate_metric_state(flow_metric_sums, random_t_state)
                         num_graphs = self.flow_cfm._num_graphs(original_batch)
                         zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
                         one_t = torch.ones(num_graphs, device=self.device, dtype=self.dtype)
                         if log_t0:
-                            one_step_loss, _ = self.flow_cfm.loss_with_model(
+                            one_step_loss, one_step_state = self.flow_cfm.loss_with_model(
                                 self.model,
                                 original_batch,
                                 batch_for_loss,
@@ -595,6 +596,7 @@ class Trainer(BaseTrainer):
                                 flow_metric_sums.get("validation_flow_one_step_loss", 0.0)
                                 + one_step_loss.detach()
                             )
+                            self._accumulate_metric_state(flow_metric_sums, one_step_state)
                         for num_steps in self.flow_cfm.validation_ode_steps:
                             sampled = self.flow_cfm.sample(
                                 self.model, original_batch, num_steps=num_steps

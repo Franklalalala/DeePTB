@@ -39,7 +39,9 @@ class LemMoEV3H0(LemMoEV3):
         flow_time_key: str = "flow_time",
         flow_time_keys: Any = None,
         flow_time_max_positions: int = 2000,
+        flow_time_allow_missing: bool = True,
         flow_time_missing_value: float = 0.0,
+        flow_time_key_weights: Any = None,
         env_embed_multiplicity: int = 32,
         **kwargs: Any,
     ):
@@ -47,13 +49,16 @@ class LemMoEV3H0(LemMoEV3):
         self.use_h0_init = use_h0_init
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
         self.flow_time_condition_edges = bool(flow_time_condition_edges)
+        self._edge_graph_invariant_checked = False
         self.flow_time_conditioner = (
             FlowTimeConditioner(
                 scalar_channels=env_embed_multiplicity,
                 flow_time_key=flow_time_key,
                 flow_time_keys=flow_time_keys,
                 max_positions=flow_time_max_positions,
+                allow_missing_time=flow_time_allow_missing,
                 missing_time_value=flow_time_missing_value,
+                key_weights=flow_time_key_weights,
             )
             if self.use_flow_time_embedding
             else None
@@ -130,7 +135,21 @@ class LemMoEV3H0(LemMoEV3):
         if self.flow_time_conditioner is not None:
             node_features = self.flow_time_conditioner(node_features, data)
             if self.flow_time_condition_edges:
-                edge_batch = batch[edge_index[0][active_edges]]
+                active_src = edge_index[0][active_edges]
+                edge_batch = batch[active_src]
+                if not self._edge_graph_invariant_checked:
+                    # Edge time conditioning indexes graph time by the edge's
+                    # source node; that is only correct if edges never cross
+                    # graphs. Verify once per module (torch.equal syncs the
+                    # GPU, so this must not run every forward).
+                    dst_batch = batch[edge_index[1][active_edges]]
+                    if not torch.equal(edge_batch, dst_batch):
+                        raise ValueError(
+                            "flow-time edge conditioning requires intra-graph active edges; "
+                            "source and destination nodes disagree on graph index. Check "
+                            "radius-graph construction or precomputed active edges."
+                        )
+                    self._edge_graph_invariant_checked = True
                 edge_features = self.flow_time_conditioner(
                     edge_features,
                     data,

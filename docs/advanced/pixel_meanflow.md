@@ -53,3 +53,17 @@ residual priors should be separate ablations.
 Use the aggressive profile only as a separate ablation. It enables extra
 stabilizers such as adaptive normalization and boundary-velocity auxiliary
 loss; those are not required for the paper-conservative path.
+
+## Time-embedding vs finite-difference scale
+
+When the model uses a sinusoidal `FlowTimeConditioner`, keep the finite-difference
+time step small relative to the embedding scale. With the default
+`flow_time_max_positions=2000`, `fd_eps=0.01` moves the fastest sinusoidal phase by
+about 20 radians between the main and finite-difference forward passes. That
+can make the finite-difference `du/dt` term measure time-embedding oscillation
+instead of the intended path derivative. Start with one of:
+
+- `meanflow.fd_eps <= 5e-4` with the default `flow_time_max_positions=2000`;
+- or an explicit `flow_time_max_positions` ablation such as 100-200;
+- and keep `log_validation_random_t_loss` or `log_validation_compatible_loss`
+  enabled so validation does not report zero by construction.

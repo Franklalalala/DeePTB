@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Dict, Optional, Sequence
 
@@ -7,6 +8,8 @@ import torch
 import torch.nn.functional as F
 
 from dptb.data import _keys
+
+log = logging.getLogger(__name__)
 
 
 def sinusoidal_time_embedding(
@@ -40,18 +43,38 @@ class FlowTimeConditioner(torch.nn.Module):
         flow_time_key: str = "flow_time",
         flow_time_keys: Optional[Sequence[str]] = None,
         max_positions: int = 2000,
+        allow_missing_time: bool = True,
         missing_time_value: float = 0.0,
+        key_weights: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         self.scalar_channels = int(scalar_channels)
         self.flow_time_key = str(flow_time_key)
         self.flow_time_keys = tuple(str(key) for key in (flow_time_keys or ()))
         self.max_positions = int(max_positions)
+        # allow_missing_time=True keeps the historical fill-with-missing_time_value
+        # behavior that one-step band inference relies on (no flow_time key in the
+        # data means "start of flow"); set False in training to fail fast on a
+        # silently un-conditioned model.
+        self.allow_missing_time = bool(allow_missing_time)
         self.missing_time_value = float(missing_time_value)
+        self._warned_missing_keys: set = set()
         num_time_keys = max(len(self.flow_time_keys), 1)
+        if key_weights is None:
+            # Historical default: 1-based arange de-correlates multi-key (t/r/h)
+            # embeddings. Checkpoints trained before key_weights existed depend
+            # on this, so None must keep it.
+            weights = torch.arange(1, num_time_keys + 1, dtype=torch.float32)
+        else:
+            weights = torch.as_tensor(tuple(float(v) for v in key_weights), dtype=torch.float32)
+            if int(weights.numel()) != num_time_keys:
+                raise ValueError(
+                    "flow_time key_weights must contain one value per time key "
+                    f"({num_time_keys}), got {int(weights.numel())}."
+                )
         self.register_buffer(
             "_flow_time_key_weights",
-            torch.arange(1, num_time_keys + 1, dtype=torch.float32),
+            weights,
             persistent=False,
         )
 
@@ -66,6 +89,20 @@ class FlowTimeConditioner(torch.nn.Module):
     ) -> torch.Tensor:
         graph_t = data.get(key, None)
         if graph_t is None:
+            if not self.allow_missing_time:
+                raise KeyError(
+                    f"flow-time conditioning is enabled, but `{key}` is missing from the data. "
+                    "Write the flow time into the batch, or set allow_missing_time=True "
+                    "only for an explicit inference/ablation path."
+                )
+            if key not in self._warned_missing_keys:
+                self._warned_missing_keys.add(key)
+                log.warning(
+                    "flow-time key `%s` missing; filling with missing_time_value=%.3g "
+                    "(one-step inference convention). This warning is emitted once per key.",
+                    key,
+                    self.missing_time_value,
+                )
             return torch.full(
                 (num_graphs,),
                 self.missing_time_value,
@@ -89,6 +126,11 @@ class FlowTimeConditioner(torch.nn.Module):
         *,
         batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if features.shape[-1] < self.scalar_channels:
+            raise ValueError(
+                f"flow-time scalar_channels={self.scalar_channels} exceeds "
+                f"feature width {features.shape[-1]}."
+            )
         explicit_batch = batch is not None
         if batch is None:
             batch = data.get(_keys.BATCH_KEY, None)
