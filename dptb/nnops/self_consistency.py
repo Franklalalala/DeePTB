@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -46,16 +47,28 @@ def compute_self_consistency_loss(
 ) -> torch.Tensor:
     """``L_sc = mean((H_pred - stopgrad(R(H_pred)))^2)``, optionally masked
     to active blocks/edges. ``h_repaired`` is detached defensively even if
-    the caller forgot to (gradients must only flow through ``h_pred``)."""
+    the caller forgot to (gradients must only flow through ``h_pred``), and
+    coerced to ``h_pred``'s device/dtype -- real repair endpoints (ABACUS
+    subprocess or the hrebuild server) hand back CPU numpy arrays, not
+    graph-side tensors. ``mask`` may broadcast from leading dims (e.g. a
+    per-sample mask against per-element diffs); the denominator counts
+    *active elements* after broadcast, so masked and unmasked paths agree
+    on scale (per-element mean over the active region)."""
+    if not torch.is_tensor(h_repaired):
+        h_repaired = torch.as_tensor(h_repaired)
+    h_repaired = h_repaired.detach().to(device=h_pred.device, dtype=h_pred.dtype)
     if h_pred.shape != h_repaired.shape:
         raise ValueError(f"shape mismatch: h_pred={h_pred.shape} vs h_repaired={h_repaired.shape}")
-    h_repaired = h_repaired.detach()
     diff = h_pred - h_repaired
+    sq = diff.abs() ** 2  # real-valued even for complex H
     if mask is not None:
-        diff = diff * mask
+        mask = mask.to(device=h_pred.device, dtype=sq.dtype)
+        while mask.ndim < sq.ndim:
+            mask = mask.unsqueeze(-1)
+        mask = mask.expand_as(sq)
         denom = mask.sum().clamp_min(1.0)
-        return (diff.abs() ** 2).sum() / denom
-    return (diff.abs() ** 2).mean()
+        return (sq * mask).sum() / denom
+    return sq.mean()
 
 
 @dataclass
@@ -73,6 +86,10 @@ class SelfConsistencySchedulerConfig:
     staleness_steps: int = 1
     warmup_epochs: int = 0
     max_workers: int = 2
+    # A due-but-unfinished repair is requeued (kept in an overdue pool checked
+    # on every consume call) instead of dropped. With 10-20s ABACUS latency and
+    # a small staleness_steps, dropping would silently turn L_sc into a no-op.
+    retry_unfinished: bool = True
 
 
 class SelfConsistencyScheduler:
@@ -90,6 +107,10 @@ class SelfConsistencyScheduler:
         self.rng = rng
         self._pool = ThreadPoolExecutor(max_workers=config.max_workers)
         self._pending: Dict[int, List[_PendingRequest]] = {}
+        # Requests that came due but whose repair hadn't finished yet; drained
+        # on every maybe_consume call regardless of its step argument (keying
+        # them on step+1 would lose them whenever consume runs on a cadence).
+        self._overdue: List[_PendingRequest] = []
         self._lock = threading.Lock()
 
     def _select_indices(self, n_samples: int) -> List[int]:
@@ -129,23 +150,38 @@ class SelfConsistencyScheduler:
     def maybe_consume(self, step: int, current_samples: Dict[Any, torch.Tensor],
                        timeout: Optional[float] = 0.0) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Returns ``[(h_pred_now, h_repaired), ...]`` for every request
-        due at ``step`` whose future is already done (``timeout=0.0``: skip
-        anything not yet finished rather than blocking training -- allowed
-        staleness means we simply drop it and try again next cadence, we
-        do not accumulate ever-growing backlog). ``current_samples`` maps
-        ``sample_id -> h_pred`` from *this* step's forward pass, so the
-        loss is taken against the live (graph-attached) prediction even
-        though the repair target was computed from an older snapshot."""
+        due at ``step`` whose future is already done (``timeout=0.0``: never
+        blocks training). A due-but-unfinished repair is requeued into the
+        overdue pool and retried on the *next* consume call -- whatever step
+        that is -- so slow-but-healthy ABACUS jobs are not silently discarded
+        (set ``config.retry_unfinished=False`` for the old drop behavior).
+        Backlog stays bounded: only submitted-and-unfinished futures can sit
+        in the pool, and submission itself is cadence-limited.
+        ``current_samples`` maps ``sample_id -> h_pred`` from *this* step's
+        forward pass, so the loss is taken against the live (graph-attached)
+        prediction even though the repair target was computed from an older
+        snapshot."""
         with self._lock:
             due = self._pending.pop(step, [])
+            if self._overdue:
+                due = self._overdue + due
+                self._overdue = []
 
         out = []
+        requeue = []
         for req in due:
             try:
                 if not req.future.done():
                     if timeout and timeout > 0:
-                        h_repaired = req.future.result(timeout=timeout)
+                        try:
+                            h_repaired = req.future.result(timeout=timeout)
+                        except FuturesTimeoutError:
+                            if self.config.retry_unfinished:
+                                requeue.append(req)
+                            continue
                     else:
+                        if self.config.retry_unfinished:
+                            requeue.append(req)
                         continue
                 else:
                     h_repaired = req.future.result()
@@ -159,6 +195,10 @@ class SelfConsistencyScheduler:
                 # sample dropped out of the batch by the time the result matured
                 continue
             out.append((h_pred_now, h_repaired))
+
+        if requeue:
+            with self._lock:
+                self._overdue.extend(requeue)
         return out
 
     def shutdown(self):

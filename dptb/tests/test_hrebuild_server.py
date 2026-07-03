@@ -89,6 +89,90 @@ def test_encode_decode_blocks_roundtrip():
         np.testing.assert_allclose(decoded[k], v)
 
 
+def _can_symlink(tmp_path) -> bool:
+    """os.symlink needs a privilege on Windows; skip rather than fail there."""
+    probe_target = tmp_path / "symlink_probe_target"
+    probe_target.write_text("x")
+    try:
+        os.symlink(str(probe_target), str(tmp_path / "symlink_probe_link"))
+        return True
+    except OSError:
+        return False
+
+
+def test_pp_orb_cache_collision_raises(tmp_path):
+    """Two different files staged under the same entry name must fail loudly
+    (silently serving the first-staged pseudo to a request that meant another
+    one is a wrong-physics bug); restaging the same source is a no-op."""
+    if not _can_symlink(tmp_path):
+        pytest.skip("os.symlink unavailable (Windows without privilege)")
+
+    src_a = tmp_path / "src_a"
+    src_b = tmp_path / "src_b"
+    for d in (src_a, src_b):
+        d.mkdir()
+        (d / "H.upf").write_text(f"pseudo from {d.name}\n")
+
+    cache = hs.PPOrbCache(str(tmp_path / "cache"))
+    staged = cache.stage(str(src_a))
+    assert os.path.samefile(os.path.join(staged, "H.upf"), src_a / "H.upf")
+
+    # same source again: cached, no error
+    assert cache.stage(str(src_a)) == staged
+
+    with pytest.raises(FileExistsError, match="collision"):
+        cache.stage(str(src_b))
+
+
+def test_repair_response_carries_guard_diagnostics_and_passthrough(tmp_path, monkeypatch):
+    """The service must pass input_extra/sc_guard through to one_shot_repair
+    and return the self-consistency guard diagnostics (plus output tails on
+    failure) so remote callers audit repairs with local semantics."""
+    captured = {}
+
+    def fake_repair(**kwargs):
+        captured.update(kwargs)
+        return hb.RepairResult(
+            ok=False, mode=kwargs.get("mode", "one_shot"),
+            skipped_reason="fake failure", abacus_returncode=3,
+            stdout_tail="MOCK RUN LOG TAIL", stderr_tail="MOCK STDERR",
+            workdir=str(kwargs.get("workdir")),
+            sc_residual_mean_ev=1.9e-3, sc_residual_max_ev=2.5e-3, sc_n_common=4,
+            e_kohnsham_ev=-3904.73, e_harris_ev=-3904.51, harris_ks_gap_ev=0.22,
+            repair_trustworthy=True, guard_reason=None,
+        )
+
+    monkeypatch.setattr(hs.hb, "one_shot_repair", fake_repair)
+    service = hs.HrebuildService(scratch_root=str(tmp_path / "scratch"), max_workers=1)
+    try:
+        resp = service.handle_request({
+            "kind": "repair",
+            "blocks_dict": hs.encode_blocks({"0_0_0_0_0": np.eye(1)}),
+            "structure": {
+                "symbols": ["H"],
+                "positions_angstrom": [[0.0, 0.0, 0.0]],
+                "cell_angstrom": np.eye(3).tolist(),
+            },
+            "pp_orb": {"H": {"pseudo": "H.upf", "orbital": "H.orb", "basis": "1s", "mass": 1.008}},
+            "abacus_bin": "abacus",
+            "input_extra": {"scf_thr": 1e-8},
+            "sc_guard": {"max_residual_mean_ev": 0.5},
+        })
+    finally:
+        service.shutdown()
+
+    assert captured["input_extra"] == {"scf_thr": 1e-8}
+    assert captured["sc_guard"] == {"max_residual_mean_ev": 0.5}
+
+    assert resp["ok"] is False
+    assert resp["sc_residual_mean_ev"] == pytest.approx(1.9e-3)
+    assert resp["harris_ks_gap_ev"] == pytest.approx(0.22)
+    assert resp["repair_trustworthy"] is True
+    assert resp["stdout_tail"] == "MOCK RUN LOG TAIL"
+    assert resp["stderr_tail"] == "MOCK STDERR"
+    assert "repaired_blocks" not in resp
+
+
 def test_repair_request_failure_is_reported_not_fatal(running_server):
     """A request pointing at a nonexistent ABACUS binary must come back as
     a clean error response, and the server/connection must stay usable

@@ -35,6 +35,19 @@ class Trainer(BaseTrainer):
             reference_datasets: Union[AtomicDataset, None] = None,
             validation_datasets: Union[AtomicDataset, None] = None,
     ) -> None:
+        # train_options.self_consistency is exposed in the schema (argcheck ::
+        # self_consistency_options) but the SelfConsistencyScheduler is not
+        # wired into Trainer/MultiTrainer loss assembly yet (WS4-C pending).
+        # Fail fast -- before building the model/optimizer -- instead of
+        # silently training without the requested L_sc term.
+        self.self_consistency_options = dict(train_options.get("self_consistency", {}) or {})
+        if bool(self.self_consistency_options.get("enabled", False)):
+            raise NotImplementedError(
+                "train_options.self_consistency.enabled=true, but the self-consistency loss is not "
+                "wired into the Trainer yet -- it would silently train without L_sc. Leave it "
+                "disabled until the submit/consume hook (dptb/nnops/self_consistency.py) lands."
+            )
+
         super(Trainer, self).__init__(dtype=common_options["dtype"], device=common_options["device"])
 
         # init the object

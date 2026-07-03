@@ -102,9 +102,22 @@ class PPOrbCache:
             if source_dir in self._staged:
                 return str(self.cache_root)
             for entry in os.listdir(source_dir):
+                src = os.path.join(source_dir, entry)
                 dst = self.cache_root / entry
-                if not dst.exists():
-                    os.symlink(os.path.join(source_dir, entry), dst)
+                if dst.exists():
+                    # Same file staged from another source dir is fine; a
+                    # *different* file under the same name must fail loudly --
+                    # silently serving the first-staged pseudo/orbital to a
+                    # request that meant another one is a wrong-physics bug.
+                    try:
+                        if os.path.samefile(src, dst):
+                            continue
+                    except OSError:
+                        pass
+                    raise FileExistsError(
+                        f"PP_ORB cache collision for {entry!r}: existing {dst} does not point to {src}"
+                    )
+                os.symlink(src, dst)
             self._staged.add(source_dir)
         return str(self.cache_root)
 
@@ -176,6 +189,8 @@ class HrebuildService:
                 overlap_blocks_dict=overlap_blocks_dict,
                 gap_threshold_ev=req.get("gap_threshold_ev", 0.5),
                 mpi_procs=req.get("mpi_procs", 1),
+                input_extra=req.get("input_extra"),
+                sc_guard=req.get("sc_guard", True),
                 keep_workdir=req.get("keep_workdir", False),
             )
             result = future.result(timeout=req.get("timeout_sec", 600))
@@ -189,9 +204,26 @@ class HrebuildService:
             "gap_ev": result.gap_ev,
             "skipped_reason": result.skipped_reason,
             "abacus_returncode": result.abacus_returncode,
+            # Self-consistency guard diagnostics: remote callers must be able
+            # to audit why a repair was accepted/refused with the exact same
+            # semantics as a local one_shot_repair() call.
+            "workdir": result.workdir,
+            "sc_residual_mean_ev": result.sc_residual_mean_ev,
+            "sc_residual_max_ev": result.sc_residual_max_ev,
+            "sc_n_common": result.sc_n_common,
+            "e_kohnsham_ev": result.e_kohnsham_ev,
+            "e_harris_ev": result.e_harris_ev,
+            "harris_ks_gap_ev": result.harris_ks_gap_ev,
+            "repair_trustworthy": result.repair_trustworthy,
+            "guard_reason": result.guard_reason,
         }
         if result.ok:
             resp["repaired_blocks"] = encode_blocks(result.repaired_blocks)
+        else:
+            # Failed remote ABACUS jobs trap their subprocess output on the
+            # server; ship the tails so the client can act without SSH access.
+            resp["stdout_tail"] = result.stdout_tail
+            resp["stderr_tail"] = result.stderr_tail
         return resp
 
     def shutdown(self):

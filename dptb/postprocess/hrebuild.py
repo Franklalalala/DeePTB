@@ -268,18 +268,44 @@ def one_shot_repair(
     write_kpt(workdir / "KPT", kmesh=kmesh)
     write_input(workdir / "INPUT", mode=mode, ecutwfc=ecutwfc, nspin=nspin, lspinorb=lspinorb, pp_orb_dir=pp_orb_dir, extra=input_extra)
 
-    rc, stdout, stderr = run_abacus(workdir, abacus_bin, mpi_procs=mpi_procs, executor=executor)
-
     # ABACUS names the out_mat_hs2 real-space H(R) CSR "hrs1_nao.csr" (no
     # "data-"/"_SPIN0" decoration) inside OUT.ABACUS -- verified empirically
     # against both the group's own restart_dh smoke tests and this client's
     # own runs (2026-07-03); *not* "data-HR-sparse_SPIN0.csr" (that name is
     # used by a different output path, e.g. out_mat_hr0).
     out_csr = workdir / "OUT.ABACUS" / "hrs1_nao.csr"
+
+    # Fail closed against stale workdir reuse: a previous run may have left an
+    # OUT.ABACUS tree behind, and a failed relaunch must not pass off the old
+    # CSR as a fresh repair. Unlink errors are real errors -- do not swallow.
+    out_csr.unlink(missing_ok=True)
+
+    rc, stdout, stderr = run_abacus(workdir, abacus_bin, mpi_procs=mpi_procs, executor=executor)
+
+    # run_abacus redirects the subprocess's stdout+stderr into workdir/run.log
+    # ("> run.log 2>&1"), so the executor's own streams are normally empty --
+    # the log tail is the only actionable diagnostic for a failed run.
+    stdout_tail = stdout[-2000:] if stdout else ""
+    if not stdout_tail:
+        run_log = workdir / "run.log"
+        if run_log.exists():
+            try:
+                stdout_tail = run_log.read_text(errors="ignore")[-2000:]
+            except OSError:
+                pass
+    stderr_tail = stderr[-2000:] if stderr else ""
+
+    if rc != 0:
+        return RepairResult(
+            ok=False, mode=mode, gap_ev=gap_ev, abacus_returncode=rc,
+            stdout_tail=stdout_tail, stderr_tail=stderr_tail, workdir=str(workdir),
+            skipped_reason=f"ABACUS exited with status {rc}; repair refused",
+        )
+
     if not out_csr.exists():
         return RepairResult(
             ok=False, mode=mode, gap_ev=gap_ev, abacus_returncode=rc,
-            stdout_tail=stdout[-2000:], stderr_tail=stderr[-2000:], workdir=str(workdir),
+            stdout_tail=stdout_tail, stderr_tail=stderr_tail, workdir=str(workdir),
             skipped_reason=f"expected output CSR not found: {out_csr}",
         )
 
@@ -307,7 +333,7 @@ def one_shot_repair(
     return RepairResult(
         ok=True, mode=mode, repaired_blocks=repaired_blocks, repaired_h5=str(h5_path),
         workdir=str(workdir), gap_ev=gap_ev, abacus_returncode=rc,
-        stdout_tail=stdout[-2000:], stderr_tail=stderr[-2000:],
+        stdout_tail=stdout_tail, stderr_tail=stderr_tail,
         sc_residual_mean_ev=residual["residual_mean_ev"],
         sc_residual_max_ev=residual["residual_max_ev"],
         sc_n_common=residual["n_common"],

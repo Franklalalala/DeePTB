@@ -7,6 +7,8 @@ parts that are pure Python and must stay correct under refactors: the
 CSR write/read round trip (both non-SOC and SOC), unit conversion, and the
 gap-threshold guard.
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -96,3 +98,67 @@ def test_gap_guard_refuses_repair_below_threshold():
     allowed, gap = hb.gap_allows_repair(h, s, n_occ=2, gap_threshold_ev=0.1)
     assert allowed
     assert gap == pytest.approx(0.55)
+
+
+# ---------------------------------------------------------------------------
+# one_shot_repair fail-closed behavior (fake executor, no real ABACUS)
+# ---------------------------------------------------------------------------
+
+def _repair_call_fixture(tmp_path):
+    """Toy O-H inputs + a workdir pre-planted with a STALE output CSR, as a
+    reused/dirty workdir would contain after an earlier successful run."""
+    atomic_numbers, basis_dict, blocks = _toy_two_atom_blocks(is_soc=False)
+    structure = hb.StructureSpec(
+        symbols=["O", "H"],
+        positions_angstrom=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.96]]),
+        cell_angstrom=np.eye(3) * 10.0,
+    )
+    pp_orb = {
+        "O": hb.PPOrbSpec(pseudo="O.upf", orbital="O.orb", basis=basis_dict["O"], mass=15.999),
+        "H": hb.PPOrbSpec(pseudo="H.upf", orbital="H.orb", basis=basis_dict["H"], mass=1.008),
+    }
+    workdir = tmp_path / "work"
+    stale_csr = workdir / "OUT.ABACUS" / "hrs1_nao.csr"
+    stale_csr.parent.mkdir(parents=True)
+    hb.write_hr_csr(atomic_numbers, basis_dict, blocks, stale_csr, unit="eV")
+    return blocks, structure, pp_orb, workdir, stale_csr
+
+
+def test_one_shot_repair_fails_closed_on_nonzero_exit(tmp_path):
+    """rc != 0 must refuse the repair even though a (stale) output CSR was
+    lying around, and must surface run.log as the diagnostic tail (run_abacus
+    redirects all ABACUS output there, so executor stdout/stderr are empty)."""
+    blocks, structure, pp_orb, workdir, stale_csr = _repair_call_fixture(tmp_path)
+
+    def failing_executor(wd, command):
+        (Path(wd) / "run.log").write_text("ABACUS FATAL: mock crash\n")
+        return 1, "", ""
+
+    result = hb.one_shot_repair(
+        blocks_dict=blocks, structure=structure, pp_orb=pp_orb,
+        workdir=workdir, abacus_bin="abacus", executor=failing_executor,
+        keep_workdir=True,
+    )
+    assert result.ok is False
+    assert result.abacus_returncode == 1
+    assert "exited with status 1" in result.skipped_reason
+    assert "ABACUS FATAL" in result.stdout_tail
+    assert not stale_csr.exists(), "stale CSR must be removed before launch"
+
+
+def test_one_shot_repair_does_not_reuse_stale_csr(tmp_path):
+    """rc == 0 but no fresh output written (e.g. misconfigured out_mat_hs2):
+    the pre-existing stale CSR must NOT be read back as a 'successful' repair."""
+    blocks, structure, pp_orb, workdir, stale_csr = _repair_call_fixture(tmp_path)
+
+    def noop_executor(wd, command):
+        return 0, "", ""
+
+    result = hb.one_shot_repair(
+        blocks_dict=blocks, structure=structure, pp_orb=pp_orb,
+        workdir=workdir, abacus_bin="abacus", executor=noop_executor,
+        keep_workdir=True,
+    )
+    assert result.ok is False
+    assert "not found" in result.skipped_reason
+    assert result.repaired_blocks is None
