@@ -1969,6 +1969,9 @@ def loss_options():
         Argument("valence_fallback", bool, optional=True, default=True,
                  doc="If n_occ is unresolved, use a closed-shell pseudopotential-valence estimate. "
                      "Set False for all-electron data (where core states are occupied). Default: True"),
+        Argument("all_electron", bool, optional=True, default=False,
+                 doc="If n_occ is unresolved, use n_occ = sum(Z)/2 (neutral closed-shell, all-electron). "
+                     "Correct for all-electron GTO/def2 data; checked before valence_fallback. Default: False"),
         Argument("overlap", bool, optional=True, default=True,
                  doc="Whether an overlap S(k) is assembled and used (non-orthogonal AO basis)."),
         Argument("require_overlap", [bool, None], optional=True, default=None,

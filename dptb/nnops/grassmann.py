@@ -519,6 +519,7 @@ class GrassmannPAlignLoss(nn.Module):
         coeff_base: float = 0.0,
         base_loss_options: Optional[Mapping[str, Any]] = None,
         valence_fallback: bool = True,
+        all_electron: bool = False,
         skip_on_error: bool = False,
         from_density: bool = False,
         density_key: str = "density_matrix",
@@ -550,6 +551,7 @@ class GrassmannPAlignLoss(nn.Module):
         self.coeff_align = float(coeff_align)
         self.coeff_base = float(coeff_base)
         self.valence_fallback = bool(valence_fallback)
+        self.all_electron = bool(all_electron)
         self.skip_on_error = bool(skip_on_error)
         self.require_overlap = bool(self.overlap if require_overlap is None else require_overlap)
         self.last_scalar_state: Dict[str, Tensor] = {}
@@ -594,15 +596,22 @@ class GrassmannPAlignLoss(nn.Module):
                 return int(v.reshape(-1)[0].item()) if torch.is_tensor(v) else int(v)
         if self.n_occ is not None:
             return self.n_occ
-        if self.valence_fallback:
-            z = self._get(data, AtomicDataDict.ATOMIC_NUMBERS_KEY if hasattr(AtomicDataDict, "ATOMIC_NUMBERS_KEY") else "atomic_numbers", None)
-            if z is not None:
-                zs = [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
-                if any(zi not in self._vtab for zi in zs):
-                    return None  # unknown species -> force explicit n_occ, never a silent guess
-                nel = sum(self._vtab[zi] for zi in zs)
-                if nel > 0 and nel % 2 == 0:
-                    return nel // 2
+        z = self._get(data, AtomicDataDict.ATOMIC_NUMBERS_KEY if hasattr(AtomicDataDict, "ATOMIC_NUMBERS_KEY") else "atomic_numbers", None)
+        if self.all_electron and z is not None:
+            # All-electron, neutral, closed-shell: n_occ = (sum of Z) / 2 exactly.
+            # Correct for all-electron GTO/def2 data where core states are occupied
+            # (the pseudopotential-valence table below would undercount).
+            zs = [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
+            nel = sum(zs)
+            if nel > 0 and nel % 2 == 0:
+                return nel // 2
+        if self.valence_fallback and z is not None:
+            zs = [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
+            if any(zi not in self._vtab for zi in zs):
+                return None  # unknown species -> force explicit n_occ, never a silent guess
+            nel = sum(self._vtab[zi] for zi in zs)
+            if nel > 0 and nel % 2 == 0:
+                return nel // 2
         return None
 
     def _num_structures(self, data: Mapping[str, Any]) -> int:
