@@ -409,6 +409,22 @@ class _ConstantEndpoint(torch.nn.Module):
         return data
 
 
+class _NonUniformEndpoint(torch.nn.Module):
+    def forward(self, data):
+        data = data.copy()
+        data["node_features"] = torch.tensor(
+            [[1.0], [2.0], [0.0]],
+            device=data["node_h0"].device,
+            dtype=data["node_h0"].dtype,
+        )
+        data["edge_features"] = torch.tensor(
+            [[1.0], [4.0]],
+            device=data["edge_h0"].device,
+            dtype=data["edge_h0"].dtype,
+        )
+        return data
+
+
 class _GradModeRecordingEndpoint(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -976,6 +992,65 @@ def test_multitrainer_non_display_step_does_not_run_full_compatible_loss():
     assert result["last_hopping_count"].item() == pytest.approx(3.0)
     assert result["onsite"].item() > 0.0
     assert result["hopping"].item() > 0.0
+
+
+def test_pixel_meanflow_train_endpoint_stats_feed_compatible_reducer():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 2
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer._tagger = _NoopTagger()
+    trainer.log_single_model_compatible_loss = True
+    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.flow_cfm = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+            "meanflow": {
+                "aux_endpoint_weight": 0.0,
+                "aux_boundary_v_weight": 0.0,
+                "fd_eps": 1.0e-4,
+            },
+        }
+    )
+    trainer.model = _NonUniformEndpoint()
+    trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
+        torch.ones(batch["edge_h0"].shape[0], dtype=torch.bool),
+        torch.ones(batch["node_h0"].shape[0], dtype=torch.bool),
+    )
+    lossfunc = _StatsCompatibleLoss()
+
+    payload = trainer._build_train_payload(
+        _two_graph_batch(),
+        batch_info={},
+        criterion=lossfunc,
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+    )
+    pack = trainer._make_step_pack(payload)
+    state = trainer._compute_compatible_state_from_pack(
+        pack,
+        criterion=lossfunc,
+        prefix="train",
+    )
+
+    onsite = 0.5 * (1.0 + (5.0 / 3.0) ** 0.5)
+    hopping = 0.5 * (2.5 + (17.0 / 2.0) ** 0.5)
+    total = 0.5 * (onsite + hopping)
+    assert payload["onsite_l1_sum"].item() == pytest.approx(3.0)
+    assert payload["onsite_mse_sum"].item() == pytest.approx(5.0)
+    assert payload["onsite_cnt"].item() == pytest.approx(3.0)
+    assert payload["hopping_l1_sum"].item() == pytest.approx(5.0)
+    assert payload["hopping_mse_sum"].item() == pytest.approx(17.0)
+    assert payload["hopping_cnt"].item() == pytest.approx(2.0)
+    assert state["train_onsite_loss"].item() == pytest.approx(onsite)
+    assert state["train_hopping_loss"].item() == pytest.approx(hopping)
+    assert state["train_loss"].item() == pytest.approx(total)
+    assert lossfunc.forward_calls == 0
+    assert lossfunc.stats_calls == 1
 
 
 def _trainer_for_compatible_pack(lossfunc):

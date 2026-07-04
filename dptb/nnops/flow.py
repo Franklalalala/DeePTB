@@ -1230,15 +1230,18 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.flow_time_r_key = str(options.get("flow_time_r_key", "flow_time_r"))
         self.flow_time_t_key = str(options.get("flow_time_t_key", "flow_time_t"))
         self.flow_time_h_key = str(options.get("flow_time_h_key", "flow_time_h"))
-        # model-in-loss pMF has no raw-batch train_compatible code path; a True
-        # request would only register logger fields that never update and print
-        # as constant zeros, so force it off loudly instead of silently lying.
+        # model-in-loss pMF has no raw-batch train_compatible scalar-field path;
+        # the endpoint-compatible train stats are collected directly from
+        # pred_x-clean below and feed the legacy train_loss reducer. A True
+        # request here would only register separate train_compatible_* logger
+        # fields that never update and print as constant zeros, so force it off
+        # loudly instead of silently lying.
         if bool(mf.get("log_train_compatible_loss", False)) and self.enabled:
             log.warning(
                 "pixel_meanflow.log_train_compatible_loss=true is not supported: "
-                "the model-in-loss pMF objective never computes train_compatible_* "
-                "metrics; forcing it off. Use train_flow_*_endpoint_loss for "
-                "train-side endpoint error."
+                "the model-in-loss pMF objective does not emit separate "
+                "train_compatible_* scalar fields; forcing it off. Endpoint "
+                "stats still feed legacy train_loss/train_*_loss."
             )
         self.log_train_compatible_loss = False
         # Validation stays aligned with no-CFM/CFM by default: sample/euler to
@@ -1896,6 +1899,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             ),
         }
         if ctx.node_clean is not None and node_x is not None:
+            node_mask = self._node_mask(data, node_x)
             comp_total, comp_state = self._component_meanflow_loss(
                 diff_prefix=f"{prefix}_flow_onsite",
                 pred_x=node_x,
@@ -1907,11 +1911,19 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 comp_t=ctx.node_t,
                 pred_x_eps=node_x_eps,
                 pred_x_dot=node_x_dot,
-                mask=self._node_mask(data, node_x),
+                mask=node_mask,
                 weight=self.node_weight,
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
+            if prefix == "train":
+                state.setdefault("_compatible_clean_stats", {}).update(
+                    self._compatible_clean_stats(
+                        node_x - ctx.node_clean,
+                        node_mask,
+                        "onsite",
+                    )
+                )
             # Legacy aliases so pMF logs line up with CFM/supervised curves:
             # *_flow_onsite_loss mirrors the velocity objective; the train_*
             # keys carry the endpoint error, which is the cross-route
@@ -1920,6 +1932,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             if prefix == "train":
                 state["train_onsite_loss"] = comp_state[f"{prefix}_flow_onsite_endpoint_loss"]
         if ctx.edge_clean is not None and edge_x is not None:
+            edge_mask = self._edge_mask(data, edge_x)
             comp_total, comp_state = self._component_meanflow_loss(
                 diff_prefix=f"{prefix}_flow_hopping",
                 pred_x=edge_x,
@@ -1931,11 +1944,19 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 comp_t=ctx.edge_t,
                 pred_x_eps=edge_x_eps,
                 pred_x_dot=edge_x_dot,
-                mask=self._edge_mask(data, edge_x),
+                mask=edge_mask,
                 weight=self.edge_weight,
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
+            if prefix == "train":
+                state.setdefault("_compatible_clean_stats", {}).update(
+                    self._compatible_clean_stats(
+                        edge_x - ctx.edge_clean,
+                        edge_mask,
+                        "hopping",
+                    )
+                )
             state[f"{prefix}_flow_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_velocity_loss"]
             if prefix == "train":
                 state["train_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_endpoint_loss"]
