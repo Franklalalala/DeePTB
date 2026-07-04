@@ -360,7 +360,16 @@ class MOLEGlobals:
 
     @staticmethod
     def _tensor_to_split_tuple(values):
-        values = values.detach().reshape(-1)
+        try:
+            # Fast path for plain host metadata (e.g. precomputed LEM split
+            # sizes): a direct storage read is legal even inside torch.func
+            # regions, whereas detach/reshape would first lift the tensor into
+            # a storageless interpreter wrapper.
+            if values.device.type == "cpu" and values.dim() <= 1 and not values.requires_grad:
+                return tuple(int(v) for v in values.tolist())
+        except RuntimeError:
+            pass
+        values = _functorch_plain(values).detach().reshape(-1)
         if values.device.type != "cpu":
             # Compatibility fallback for direct callers that still pass CUDA sizes.
             values = values.cpu()
@@ -376,7 +385,7 @@ class MOLEGlobals:
         )
         cached = self._indexed_flat_permutation_cache.get(key)
         if cached is None:
-            if flat_graph_index.numel() <= 1 or torch.all(flat_graph_index[1:] >= flat_graph_index[:-1]).item():
+            if flat_graph_index.numel() <= 1 or _functorch_plain(torch.all(flat_graph_index[1:] >= flat_graph_index[:-1])).item():
                 permute_idx = None
                 unpermute_idx = None
                 sorted_graph_index = flat_graph_index
@@ -428,6 +437,24 @@ class MOLEGlobals:
             cached = ptr.to(device=target_device, dtype=torch.long).contiguous()
             self._indexed_segment_ptr_cache[key] = cached
         return cached
+
+
+def _functorch_plain(values):
+    """Unwrap functorch-wrapped non-differentiable metadata tensors.
+
+    Routing indices / split sizes are integer metadata with no tangent; under
+    torch.func transforms (e.g. the pixel-meanflow jvp backend) they can still
+    arrive as storageless interpreter wrappers, which break host-side
+    conversions (.tolist()/.item()). Unwrapping is value-exact for such
+    tensors; on failure the original tensor is returned unchanged.
+    """
+    try:
+        from torch._C import _functorch as _ft
+        while _ft.is_functorch_wrapped_tensor(values):
+            values = _ft.get_unwrapped(values)
+        return values.detach()
+    except Exception:
+        return values
 
 
 def _mole_split_sizes(mole_globals, n_rows: int):
@@ -779,7 +806,7 @@ class MOLELinear(nn.Module):
 
         flat_x = x.reshape(-1, self.in_features)
         flat_expert_index = _expand_route_index_for_leading_dims(expert_index, x)
-        if flat_expert_index.numel() > 1 and not torch.all(flat_expert_index[1:] >= flat_expert_index[:-1]).item():
+        if flat_expert_index.numel() > 1 and not _functorch_plain(torch.all(flat_expert_index[1:] >= flat_expert_index[:-1])).item():
             permute_idx = torch.argsort(flat_expert_index, stable=True)
             sorted_expert_index = flat_expert_index.index_select(0, permute_idx)
             flat_x = flat_x.index_select(0, permute_idx)
@@ -819,7 +846,7 @@ class MOLELinear(nn.Module):
                 f"expert_index has {expert_index.numel()} rows, but input has {x.shape[0]} rows."
             )
         if expert_index.numel() and (
-                int(expert_index.min().item()) < 0 or int(expert_index.max().item()) >= self.num_experts
+                int(_functorch_plain(expert_index.min()).item()) < 0 or int(_functorch_plain(expert_index.max()).item()) >= self.num_experts
         ):
             raise ValueError(f"expert_index values must be in [0, {self.num_experts}).")
 

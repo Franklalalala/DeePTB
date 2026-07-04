@@ -585,7 +585,10 @@ class SingleHead0eEnvelopeAttention(torch.nn.Module):
         if self.latent_bias is not None:
             logits = logits + self.latent_bias(latents).squeeze(-1)
 
-        max_per_node = scatter_max(logits, dst_index, dim=0, dim_size=dim_size)[0]
+        # detached max: softmax is shift-invariant, so the stabilizer carries no
+        # gradient anyway, and torch_scatter's custom kernel must not see
+        # forward-mode dual tensors (jvp backend).
+        max_per_node = scatter_max(logits.detach(), dst_index, dim=0, dim_size=dim_size)[0]
         max_per_node = torch.where(
             torch.isfinite(max_per_node),
             max_per_node,

@@ -177,28 +177,72 @@ memory. Fewer model calls ≠ less work here.
 | pure-torch ref | finite_difference | 7.29 | 26 292 | — |
 | pure-torch ref | jvp | (= fd after fallback) | — | **no — falls back** |
 
-**On the real crystal stack the jvp backend cannot run at all.** Fail-fast
+**On the as-shipped stack the jvp call falls back immediately.** Fail-fast
 (`jvp_fallback=false`) pins the first blocker to
 `e3nn/o3/_spherical_harmonics.py:98` (entered from `lem_moe_v3_h0.py:99`):
 e3nn's SphericalHarmonics is TorchScript-compiled, and under `torch.func.jvp`
 *every* tensor in the transformed region is a storageless functorch wrapper —
 even ones that carry no tangent, like the edge direction vectors — so the JIT
-graph executor dies on `data_ptr()` (`RuntimeError: ... TorchScript
-interpreter ... Cannot access data pointer of Tensor that doesn't have
-storage`). This is knob-independent (cueq and pure-torch ref fail
-identically) and sits *before* the torch_scatter / custom-Function walls; the
-production `streamed_m_major_fused_p0 + cublas_grouped` line adds those on
-top. Enabling jvp for real would therefore require, in order: disabling
-TorchScript across the model (e3nn `jit_script_fx=False` plus dptb's own
-`@torch.jit.script` helpers), replacing `scatter_max`-style torch_scatter
-calls, and adding `jvp` staticmethods to the SO2/grouped-GEMM Functions — none
-of it justified by the measured wall-clock/memory numbers.
+graph executor dies on `data_ptr()`. This is knob-independent (cueq and
+pure-torch ref fail identically). The sticky fallback behaves exactly as
+designed: one warning, `*_flow_du_dt_backend_jvp = 0`, and the run proceeds at
+finite_difference speed — a 5-minute real `dptb train` pair confirmed a
+misconfigured jvp production job degrades gracefully instead of crashing.
 
-The sticky fallback behaves exactly as designed: one warning,
-`*_flow_du_dt_backend_jvp = 0`, and the run proceeds at finite_difference
-speed — a 5-minute real `dptb train` pair on the same configs confirmed a
-misconfigured `du_dt_backend=jvp` production job degrades gracefully to
-fd-equivalent throughput instead of crashing.
+### jvp CAN run on the crystal stack — feasibility ladder (proved on natlan)
+
+Climbing the walls one by one makes jvp fully operational on the real
+`lem_moe_v3_h0` crystal model (no JAX / e3nn-jax port needed):
+
+1. **e3nn eager mode** — `e3nn.set_optimization_defaults(jit_mode="eager")`
+   before model construction (e3nn ≥ 0.5.8 keeps SphericalHarmonics a plain
+   Python function and CodeGenMixin an eager FX module). This repo now does it
+   automatically in both train entrypoints when `du_dt_backend=jvp`
+   (`dptb.nnops.flow.configure_jvp_friendly_backends`).
+2. **softmax stabilizer detach** — `scatter_max(logits.detach(), ...)` in the
+   edge-attention softmax: shift-invariance makes it gradient-free by
+   construction, and torch_scatter's custom kernel never sees dual tensors.
+3. **no `data_ptr()` aliasing checks** — `y is x` replaces
+   `y.data_ptr() == x.data_ptr()` in `eqv3_grid_helpers` (also
+   FakeTensor/compile-friendly).
+4. **routing metadata as plain host values** — split sizes/indices are
+   non-differentiable metadata. `_tensor_to_split_tuple` gets a storage-read
+   fast path (host reads of *plain* tensors are legal inside torch.func
+   regions; running detach/reshape first would lift them into storageless
+   wrappers), remaining `.item()` sites go through a `_functorch_plain`
+   unwrap. The multi_train production path already precomputes
+   `LEM_ACTIVE_EDGE_SPLIT_SIZES` on CPU at batch prep, which is exactly the
+   jvp-safe carrier; the single-Trainer bench replicates that prep.
+
+With those in place (pure-torch ref knobs, `max_samples=4`, 4 graphs / 14.5k
+edges, L40S):
+
+| backend | s/step | peak MB | calls | canary |
+|---|---:|---:|---:|---|
+| finite_difference | 3.75 | 13 921 | 3 | 0 |
+| jvp (live) | 4.44 (+18.5%) | 30 810 (**2.21×**) | 2 | **1** |
+
+Numeric parity at fixed (r, t, seed): velocity-loss rel. diff **2.4e-7**
+(onsite) / **0.0** (hopping) vs fd at eps=5e-4 — the jvp implementation is
+exact on the real stack, and conversely fd's truncation error at the
+production eps is float32-noise-level.
+
+At `max_samples=8` the dual forward OOMs a 46GB L40S (fd peak 21.2 GB →
+dual needs >44 GB), consistent with the 2.2–2.9× activation-memory law.
+
+### What still separates jvp from the production SO2 CUDA line
+
+The production knobs (`streamed_m_major_fused_p0 + cublas_grouped`, used by
+998933/1027717/1027855) run custom `autograd.Function`s without `jvp`
+staticmethods — jvp currently lives only on the pure-torch ref knobs, which
+are ~1.6× slower than cueq at equal batch. Making jvp production-grade would
+take: `jvp` staticmethods for `_GroupedGemmFunction` /
+`_PersistentGroupedP1Function` (matmul-like, mechanical) and accepting the
+~2.2× dual-forward memory (≈ halving max_samples). Until a concrete accuracy
+need appears (e.g. high-frequency time embeddings where fd's phase-step
+pathology returns), finite_difference remains the production default; jvp is
+now a *working* exactness oracle on the crystal stack rather than a
+theoretical one.
 
 Memory-cap note: with `max_samples=32` the same batch (32 graphs / 48.2k
 edges) OOMs a 46GB L40S under pMF's 3-forward step — consistent with hanhai

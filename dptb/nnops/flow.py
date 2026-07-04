@@ -1989,6 +1989,48 @@ def build_hamiltonian_flow(
     return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)
 
 
+def configure_jvp_friendly_backends(flow_options: Optional[Dict[str, Any]]) -> bool:
+    """Best-effort process-level prep for the pixel-meanflow jvp backend.
+
+    TorchScript-compiled e3nn modules (SphericalHarmonics first) reject the
+    storageless dual tensors that torch.func.jvp propagates, so e3nn's
+    jit_mode must be 'eager' before any model is built. No-op unless the
+    resolved flow objective is meanflow-family with du_dt_backend=jvp.
+    Returns True if e3nn was switched.
+    """
+    options = dict(flow_options or {})
+    if not options.get("enabled", False):
+        return False
+    objective = str(options.get("objective", options.get("type", "cfm"))).lower()
+    if objective not in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
+        return False
+    mf = dict(options.get("meanflow", options.get("pixel_meanflow", {})) or {})
+    backend = (
+        str(mf.get("du_dt_backend", mf.get("jvp_backend", "finite_difference")))
+        .lower()
+        .replace("-", "_")
+    )
+    if backend != "jvp":
+        return False
+    try:
+        import e3nn
+
+        e3nn.set_optimization_defaults(jit_mode="eager")
+    except Exception as exc:
+        log.warning(
+            "pixel_meanflow.du_dt_backend=jvp requested but e3nn could not be "
+            "switched to eager jit_mode (%s); the jvp call will likely fall "
+            "back to finite_difference at the first scripted module.",
+            exc,
+        )
+        return False
+    log.info(
+        "pixel_meanflow.du_dt_backend=jvp: switched e3nn jit_mode to 'eager' so "
+        "TorchScript-compiled e3nn modules accept forward-mode dual tensors."
+    )
+    return True
+
+
 def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]:
     """Scalar log fields implied by the *effective* flow flags.
 

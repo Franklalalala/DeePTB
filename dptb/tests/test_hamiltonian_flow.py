@@ -1819,6 +1819,43 @@ def test_pixel_meanflow_jvp_path_tangent_uses_single_model_call():
     assert state["train_flow_explicit_model_calls"].item() == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize(
+    ("flow_options", "expected"),
+    [
+        ({"enabled": True, "objective": "pixel_meanflow", "meanflow": {"du_dt_backend": "jvp"}}, True),
+        ({"enabled": True, "objective": "meanflow", "meanflow": {"jvp_backend": "jvp"}}, True),
+        ({"enabled": True, "objective": "pixel_meanflow"}, False),
+        ({"enabled": True, "objective": "cfm"}, False),
+        ({"enabled": False, "objective": "pixel_meanflow", "meanflow": {"du_dt_backend": "jvp"}}, False),
+        (None, False),
+    ],
+)
+def test_configure_jvp_friendly_backends_switches_e3nn_only_for_jvp(
+    monkeypatch, flow_options, expected
+):
+    from dptb.nnops.flow import configure_jvp_friendly_backends
+
+    e3nn = pytest.importorskip("e3nn")
+    calls = []
+    monkeypatch.setattr(
+        e3nn, "set_optimization_defaults", lambda **kw: calls.append(kw)
+    )
+
+    assert configure_jvp_friendly_backends(flow_options) is expected
+    if expected:
+        assert calls == [{"jit_mode": "eager"}]
+    else:
+        assert calls == []
+
+
+def test_train_entrypoints_prepare_jvp_backends_before_model_build():
+    import dptb.entrypoints.multi_train as multi_train_entrypoint
+
+    for module in (train_entrypoint, multi_train_entrypoint):
+        text = Path(module.__file__).read_text(encoding="utf-8")
+        assert "configure_jvp_friendly_backends" in text
+
+
 def test_pixel_meanflow_jvp_falls_back_to_finite_difference_with_warning(
     monkeypatch, caplog
 ):

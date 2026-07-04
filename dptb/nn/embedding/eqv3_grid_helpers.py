@@ -381,7 +381,10 @@ class EquivariantMergedRMSNormFlat(nn.Module):
 
         orig_dtype = x.dtype
         y = x.to(torch.float32)
-        if y.data_ptr() == x.data_ptr():
+        # identity check instead of data_ptr(): storageless wrapper tensors
+        # (torch.func transforms, fake tensors) reject data_ptr access, and
+        # .to() returns the same object exactly when no conversion happened.
+        if y is x:
             y = y.clone()
 
         if self.center_0e and self.scalar_dim_idx.numel() > 0:

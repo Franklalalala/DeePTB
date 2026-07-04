@@ -1,5 +1,5 @@
 from dptb.nnops.trainer import Trainer
-from dptb.nnops.flow import resolve_flow_log_fields
+from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
 from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
@@ -483,6 +483,8 @@ def train(
         j_must_have(jdata, "train_options")
 
     cutoff_options =collect_cutoffs(jdata)
+    # jvp du/dt backend needs eager e3nn before any module is instantiated.
+    configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
     # setup seed
     setup_seed(seed=jdata["common_options"]["seed"])
 

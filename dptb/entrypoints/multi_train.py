@@ -23,7 +23,7 @@ from pathlib import Path
 
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
-from dptb.nnops.flow import resolve_flow_log_fields
+from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
 from dptb.nnops.ddp_utils import (
     configure_debug_env,
     configure_runtime_perf,
@@ -465,6 +465,8 @@ def _multi_train_impl(
         event_enabled=jdata["train_options"].get("monitor_cuda_cache_events", None),
         event_summary_interval=jdata["train_options"].get("monitor_cuda_cache_event_summary_interval", 0),
     )
+    # jvp du/dt backend needs eager e3nn before any module is instantiated.
+    configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
 
     log.info(f"[MultiTrainer][rank={rank}] distributed_expert = {distributed_expert}")
     log.info(f"[MultiTrainer][rank={rank}] parallel_multi = {parallel_multi}")
