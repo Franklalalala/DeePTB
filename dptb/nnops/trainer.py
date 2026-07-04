@@ -306,6 +306,22 @@ class Trainer(BaseTrainer):
             state["expert_load_cv" if prefix == "train" else f"{prefix}_expert_load_cv"] = expert_load_cv
         if z_loss_comp is not None:
             state["mean_max_prob" if prefix == "train" else f"{prefix}_mean_max_prob"] = z_loss_comp
+
+        # Manifold / subspace-regression losses (grassmann_p_align, riemannian_align,
+        # ...) publish their diagnostics through a `last_scalar_state` dict instead of
+        # the fixed onsite/hopping/z attributes.  Surface them as `{prefix}_{key}` so
+        # chordal / gap / skipped / rank reach the logger and tensorboard instead of
+        # being computed, detached, and discarded.
+        scalar_state = getattr(loss_obj, "last_scalar_state", None)
+        if isinstance(scalar_state, dict):
+            for key, value in scalar_state.items():
+                if value is None:
+                    continue
+                out_key = key if key.startswith(prefix) else f"{prefix}_{key}"
+                state.setdefault(
+                    out_key,
+                    value.detach() if torch.is_tensor(value) else torch.as_tensor(float(value)),
+                )
         return state
 
     @staticmethod

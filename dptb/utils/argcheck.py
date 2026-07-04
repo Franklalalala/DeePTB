@@ -1986,10 +1986,43 @@ def loss_options():
                  doc="Reject metallic/near-degenerate records with HOMO-LUMO gap below this (0 disables)."),
         Argument("check_pred_gap", bool, optional=True, default=False,
                  doc="Also enforce min_gap on the predicted spectrum (can reject early training). Default: False"),
+        Argument("chordal_normalize", bool, optional=True, default=False,
+                 doc="Divide the chordal term by n_occ so its magnitude is size-invariant across systems. Default: False"),
         Argument("eig_floor", float, optional=True, default=1.0e-10,
                  doc="Eigenvalue floor for the S^{1/2} regularization. Default: 1e-10"),
         Argument("skip_on_error", bool, optional=True, default=False,
                  doc="Return a zero loss (fail open) instead of raising on a bad record. Default: False (fail closed)."),
+    ]
+
+    # Near-Fermi subspace-alignment loss (dptb/nnops/riemannian_alignment.py):
+    # PP/PQ/QQ block penalties + spectral moments around the Fermi window.
+    riemannian_p = [
+        Argument("n_occ", [int, None], optional=True, default=None,
+                 doc="Explicit number of occupied orbitals (else dataset key / valence)."),
+        Argument("n_occ_key", str, optional=True, default="n_occ"),
+        Argument("h_pred_key", str, optional=True, default="hamiltonian"),
+        Argument("h_ref_key", str, optional=True, default="hamiltonian"),
+        Argument("overlap_key", str, optional=True, default="overlap"),
+        Argument("e_cut_below_fermi", [float, None], optional=True, default=2.0,
+                 doc="Energy window below the Fermi level included in the alignment."),
+        Argument("e_cut_above_fermi", [float, None], optional=True, default=2.0,
+                 doc="Energy window above the Fermi level included in the alignment."),
+        Argument("lambda_pp", float, optional=True, default=1.0),
+        Argument("lambda_pq", float, optional=True, default=1.0),
+        Argument("lambda_qq", float, optional=True, default=0.02),
+        Argument("lambda_trace", float, optional=True, default=0.05),
+        Argument("lambda_diag", float, optional=True, default=0.1),
+        Argument("moment_orders", [str, int, list], optional=True, default=[1, 2],
+                 doc="Spectral-moment orders matched in the Fermi window."),
+        Argument("gauge_mu", bool, optional=True, default=True),
+        Argument("overlap_eig_floor", float, optional=True, default=1.0e-10),
+        Argument("max_kpoints", [int, None], optional=True, default=8),
+        Argument("random_kpoints", bool, optional=True, default=True),
+        Argument("skip_if_missing_dense", bool, optional=True, default=True),
+        Argument("use_eigenvalue_builder", bool, optional=True, default=True),
+        Argument("coeff_align", float, optional=True, default=1.0),
+        Argument("coeff_base", float, optional=True, default=0.0),
+        Argument("base_loss_options", [dict, None], optional=True, default=None),
     ]
 
     loss_args = Variant("method", [
@@ -2010,6 +2043,8 @@ def loss_options():
         Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
         Argument("grassmann_p_align", dict, sub_fields=grassmann_p),
         Argument("p_regression", dict, sub_fields=grassmann_p),
+        Argument("riemannian_align", dict, sub_fields=riemannian_p),
+        Argument("fermi_projector_align", dict, sub_fields=riemannian_p),
     ], optional=False, doc=doc_method)
 
 

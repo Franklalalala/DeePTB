@@ -7,7 +7,8 @@ import math
 
 import torch
 
-from dptb.nnops.grassmann import (
+# pure math lives in the framework-free core; the loss layer lives in grassmann.py
+from dptb.nnops._manifold_math import (
     occupied_projector,
     chordal_distance_sq,
     principal_angles,
@@ -16,9 +17,11 @@ from dptb.nnops.grassmann import (
     grassmann_log,
     mcweeny_purify,
     idempotency_error,
+    s_half_and_inv,
+)
+from dptb.nnops.grassmann import (
     grassmann_p_loss_single,
     dense_grassmann_p_loss,
-    s_half_and_inv,
 )
 
 torch.manual_seed(0)

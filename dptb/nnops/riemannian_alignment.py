@@ -62,6 +62,13 @@ except Exception:  # pragma: no cover
 
 Tensor = torch.Tensor
 
+# Shared numerical core -- single source, no local redefinition (see _manifold_math).
+from dptb.nnops._manifold_math import (
+    hermitian_part,
+    regularize_overlap,
+    generalized_eigh,
+)
+
 
 def _as_tuple_of_ints(value: Union[str, int, Iterable[int], None], default: Tuple[int, ...]) -> Tuple[int, ...]:
     if value is None:
@@ -76,43 +83,9 @@ def _as_tuple_of_ints(value: Union[str, int, Iterable[int], None], default: Tupl
     return tuple(int(v) for v in value)
 
 
-def hermitian_part(x: Tensor) -> Tensor:
-    """Return ``(x + xᴴ) / 2`` for the last two dimensions."""
-    return 0.5 * (x + x.mH)
-
-
 def _identity_like(h: Tensor) -> Tensor:
     eye = torch.eye(h.shape[-1], device=h.device, dtype=h.dtype)
     return eye.expand(h.shape)
-
-
-def regularize_overlap(s: Tensor, eig_floor: float = 1.0e-10) -> Tensor:
-    """Project an overlap matrix onto the positive definite cone."""
-    s_h = hermitian_part(s)
-    evals, evecs = torch.linalg.eigh(s_h)
-    evals = evals.clamp_min(float(eig_floor))
-    return (evecs * evals.unsqueeze(-2)) @ evecs.mH
-
-
-def generalized_eigh(h: Tensor, s: Optional[Tensor] = None, eig_floor: float = 1.0e-10) -> Tuple[Tensor, Tensor]:
-    """Solve ``H C = S C eps`` and return S-orthonormal eigenvectors.
-
-    ``s=None`` falls back to the ordinary Hermitian eigenproblem.
-    """
-    if h.ndim != 2 or h.shape[-1] != h.shape[-2]:
-        raise ValueError(f"expected a single square dense matrix, got {tuple(h.shape)}")
-    h_h = hermitian_part(h)
-    if s is None:
-        return torch.linalg.eigh(h_h)
-    if s.shape != h.shape:
-        raise ValueError(f"H/S shape mismatch: {tuple(h.shape)} vs {tuple(s.shape)}")
-    s_h = regularize_overlap(s, eig_floor=eig_floor)
-    se, su = torch.linalg.eigh(s_h)
-    inv_sqrt = (su * se.clamp_min(float(eig_floor)).rsqrt().unsqueeze(-2)) @ su.mH
-    h_orth = hermitian_part(inv_sqrt.mH @ h_h @ inv_sqrt)
-    eps, q = torch.linalg.eigh(h_orth)
-    c = inv_sqrt @ q
-    return eps, c
 
 
 def fermi_from_n_occ(eigvals: Tensor, n_occ: int) -> Tensor:

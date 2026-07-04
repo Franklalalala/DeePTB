@@ -17,9 +17,14 @@ Design
 * All geometry is done in the **symmetrically orthogonalized basis** ``S^{1/2}``
   so the overlap becomes identity and standard (orthonormal) Grassmann formulas
   apply.  AO <-> orthogonalized transport uses ``X = S^{1/2}`` / ``X^{-1}``.
-* The occupied projector of ``H`` is a **smooth** function of ``H`` exactly when a
-  HOMO-LUMO gap is present (insulators/semiconductors), so differentiating through
-  ``eigh`` is well conditioned for the intended non-SOC band-regression task.
+* The occupied projector of ``H`` is a **smooth** function of ``H`` when a HOMO-LUMO
+  gap is present (insulators/semiconductors).  The ``eigh`` gradient scales like
+  ``1/gap`` at the occupied/virtual boundary, so it is well conditioned only while
+  that gap stays open.  Guards: eigensolves run in float64 (``_stable_eigh``);
+  ``min_gap`` rejects metallic *reference* records; the optional ``check_pred_gap``
+  rejects a metallic *predicted* spectrum (off by default -- an early-training model
+  can transiently close its gap, and rejecting every such record would stall
+  training); and the trainer's ``clip_grad`` bounds any residual spike.
 * The reference Grassmann point is built under ``no_grad``; gradients flow only
   through the predicted Hamiltonian, exactly mirroring ``riemannian_alignment``.
 * The default training distance is the **chordal** (Frobenius) distance
@@ -34,43 +39,35 @@ Grassmann layer on top of them.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-# --- reuse the legacy manifold-alignment helpers when available ---------------
-try:
-    from dptb.nnops.riemannian_alignment import (
-        hermitian_part,
-        regularize_overlap,
-        generalized_eigh,
-    )
-except Exception:  # pragma: no cover - keep the math core importable standalone
-    def hermitian_part(x: "torch.Tensor") -> "torch.Tensor":
-        return 0.5 * (x + x.mH)
+log = logging.getLogger(__name__)
 
-    def regularize_overlap(s: "torch.Tensor", eig_floor: float = 1.0e-10) -> "torch.Tensor":
-        s_h = hermitian_part(s)
-        evals, evecs = torch.linalg.eigh(s_h)
-        evals = evals.clamp_min(float(eig_floor))
-        return (evecs * evals.unsqueeze(-2)) @ evecs.mH
-
-    def generalized_eigh(h, s=None, eig_floor: float = 1.0e-10):
-        h_h = hermitian_part(h)
-        if s is None:
-            return torch.linalg.eigh(h_h)
-        s_h = regularize_overlap(s, eig_floor=eig_floor)
-        se, su = torch.linalg.eigh(s_h)
-        inv_sqrt = (su * se.clamp_min(float(eig_floor)).rsqrt().unsqueeze(-2)) @ su.mH
-        h_orth = hermitian_part(inv_sqrt.mH @ h_h @ inv_sqrt)
-        eps, q = torch.linalg.eigh(h_orth)
-        return eps, inv_sqrt @ q
+# --- single framework-free numerical core (no fallback redefinition, no drift) ---
+from dptb.nnops._manifold_math import (
+    hermitian_part,
+    regularize_overlap,
+    generalized_eigh,
+    stable_eigh as _stable_eigh,
+    s_half_and_inv,
+    occupied_projector,
+    idempotency_error,
+    chordal_distance_sq,
+    principal_angles,
+    geodesic_distance,
+    grassmann_exp,
+    grassmann_log,
+    mcweeny_purify,
+)
 
 try:
     from dptb.nnops.loss import Loss
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover - lets the loss module import without the registry
     class _DummyLoss:
         @staticmethod
         def register(_name):
@@ -81,7 +78,7 @@ except Exception:  # pragma: no cover
 
 try:
     from dptb.data import AtomicDataDict, _keys
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     class _Keys:
         HAMILTONIAN_KEY = "hamiltonian"
         OVERLAP_KEY = "overlap"
@@ -103,182 +100,21 @@ except Exception:  # pragma: no cover
 
 try:
     from dptb.nn.hr2hk import HR2HK
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     HR2HK = None
 
 Tensor = torch.Tensor
 
 
-# ============================================================================
-# Orthogonalization (S-metric handling)
-# ============================================================================
-def _stable_eigh(a: Tensor) -> Tuple[Tensor, Tensor]:
-    """Hermitian eigendecomposition done in double precision, cast back.
+class SkippableRecord(Exception):
+    """A record that is legitimately unusable for the Grassmann objective.
 
-    float32 ``torch.linalg.eigh`` frequently fails to converge on ill-conditioned
-    inputs (near-linearly-dependent NAO overlaps, random-init predicted H on crystals).
-    Solving in float64/complex128 is far more robust; the dtype casts are autograd-
-    transparent so gradients still flow to the float32 model.
+    Raised ONLY for expected physical/data conditions (metallic / near-degenerate
+    gap, missing overlap for a non-orthonormal basis, unresolved ``n_occ``).  The
+    registered loss swallows *only* this exception under ``skip_on_error`` -- every
+    other error (shape/device/eigh-convergence/HR2HK bug) propagates, so a real bug
+    never turns into a silent zero-loss no-op.
     """
-    hi = torch.complex128 if a.is_complex() else torch.float64
-    w, v = torch.linalg.eigh(a if a.dtype == hi else a.to(hi))
-    w_dtype = torch.float64 if a.dtype in (torch.float64, torch.complex128) else torch.float32
-    return w.to(w_dtype), v.to(a.dtype)
-
-
-def s_half_and_inv(s: Tensor, eig_floor: float = 1.0e-10) -> Tuple[Tensor, Tensor]:
-    """Return ``(S^{1/2}, S^{-1/2})`` for a (regularized) overlap matrix.
-
-    Working in the ``S^{1/2}`` basis turns the generalized eigenproblem into an
-    ordinary one and makes the standard Grassmann formulas apply.
-    """
-    s_h = hermitian_part(s)
-    evals, evecs = _stable_eigh(s_h)
-    evals = evals.clamp_min(float(eig_floor))
-    root = evals.sqrt()
-    x = (evecs * root.unsqueeze(-2)) @ evecs.mH
-    x_inv = (evecs * root.reciprocal().unsqueeze(-2)) @ evecs.mH
-    return hermitian_part(x), hermitian_part(x_inv)
-
-
-def occupied_projector(
-    h: Tensor,
-    s: Optional[Tensor],
-    n_occ: int,
-    *,
-    eig_floor: float = 1.0e-10,
-    return_frame: bool = False,
-    from_density: bool = False,
-) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
-    """Occupied projector ``P`` (orthonormal, symmetric idempotent, rank ``n_occ``).
-
-    The generalized eigenproblem ``M C = S C eps`` is solved in the ``S^{1/2}``
-    basis; ``P = U Uᴴ`` with ``U`` an orthonormal frame for the occupied subspace.
-
-    * ``from_density=False`` (Hamiltonian source): occupied = the ``n_occ`` **lowest**
-      eigenvectors of ``H``.  ``P`` is smooth in ``H`` when the HOMO-LUMO gap is open.
-    * ``from_density=True`` (density-matrix source): ``M`` is a predicted/label
-      **density matrix** whose eigenvalues are occupations; occupied = the ``n_occ``
-      **highest**-occupation eigenvectors.  This is the retraction of a regressed
-      density onto the Grassmann manifold -- the DM-regression route (get_DM).
-
-    With ``return_frame``: also returns the frame ``U`` (N x n_occ) and the full
-    eigenvalue/occupation vector ``eps`` (ascending).
-    """
-    if h.ndim != 2 or h.shape[-1] != h.shape[-2]:
-        raise ValueError(f"expected a single square dense matrix, got {tuple(h.shape)}")
-    n = h.shape[-1]
-    if n_occ <= 0 or n_occ >= n:
-        raise ValueError(f"n_occ must be in [1, N-1], got {n_occ} for N={n}")
-    h_h = hermitian_part(h)
-    if s is None:
-        eps, q = _stable_eigh(h_h)
-    else:
-        x, x_inv = s_half_and_inv(s, eig_floor=eig_floor)
-        # Hamiltonians transform as X^{-1} H X^{-1}.  An AO density kernel D obeys
-        # D S D = D and its orthonormal projector is X D X (X = S^{1/2}); using
-        # X^{-1} for a density selects the WRONG subspace in a non-orthogonal basis.
-        transport = x if from_density else x_inv
-        h_orth = hermitian_part(transport @ h_h @ transport)
-        eps, q = _stable_eigh(h_orth)
-    u = q[:, -n_occ:] if from_density else q[:, :n_occ]  # top occupations vs lowest energies
-    p = u @ u.mH
-    if return_frame:
-        return p, u, eps
-    return p
-
-
-# ============================================================================
-# Distances on the Grassmann manifold
-# ============================================================================
-def chordal_distance_sq(p1: Tensor, p2: Tensor) -> Tensor:
-    """Squared chordal (projector Frobenius) distance ``||P1 - P2||_F^2 / 2``.
-
-    Equal to ``sum_i sin^2(theta_i)`` over principal angles.  Smooth everywhere,
-    including at ``P1 == P2`` -- this is the recommended *loss*.
-    """
-    diff = p1 - p2
-    return 0.5 * (diff.abs() ** 2).sum()
-
-
-def principal_angles(u1: Tensor, u2: Tensor, eps: float = 1.0e-7) -> Tensor:
-    """Principal angles between the column spaces of two orthonormal frames."""
-    m = u1.mH @ u2
-    sv = torch.linalg.svdvals(m).clamp(0.0, 1.0 - eps)
-    return torch.arccos(sv)
-
-
-def geodesic_distance(u1: Tensor, u2: Tensor) -> Tensor:
-    """Grassmann geodesic distance ``||theta||_2`` (diagnostic only).
-
-    Gradient is singular as the distance -> 0, so prefer ``chordal_distance_sq``
-    as a training objective.
-    """
-    theta = principal_angles(u1, u2)
-    return (theta ** 2).sum().sqrt()
-
-
-# ============================================================================
-# Exp / Log maps (for geodesic transport; product-manifold flow story)
-# ============================================================================
-def grassmann_exp(u0: Tensor, delta: Tensor) -> Tensor:
-    """Grassmann exponential: geodesic from frame ``u0`` along tangent ``delta``.
-
-    ``delta`` must be horizontal (``u0ᴴ delta = 0``).  Returns an orthonormal frame
-    for the endpoint subspace (Edelman-Arias-Smith 1998).
-    """
-    q, sv, vh = torch.linalg.svd(delta, full_matrices=False)
-    v = vh.mH
-    cos_s = torch.cos(sv)
-    sin_s = torch.sin(sv)
-    term1 = ((u0 @ v) * cos_s.unsqueeze(-2)) @ vh
-    term2 = (q * sin_s.unsqueeze(-2)) @ vh
-    ut = term1 + term2
-    # numerical re-orthonormalization
-    qq, _ = torch.linalg.qr(ut)
-    return qq
-
-
-def grassmann_log(u0: Tensor, u1: Tensor) -> Tensor:
-    """Grassmann logarithm: horizontal tangent at ``u0`` pointing to ``u1``.
-
-    Requires principal angles ``< pi/2`` (``u0ᴴ u1`` invertible), which holds for
-    nearby subspaces such as ``P(H0) -> P(H_ref)``.
-    """
-    m = u0.mH @ u1
-    u1_perp = u1 - u0 @ m
-    m_inv = torch.linalg.inv(m)
-    b = u1_perp @ m_inv
-    q, sv, vh = torch.linalg.svd(b, full_matrices=False)
-    theta = torch.arctan(sv)
-    return (q * theta.unsqueeze(-2)) @ vh
-
-
-# ============================================================================
-# McWeeny purification (differentiable retraction to the manifold)
-# ============================================================================
-def mcweeny_purify(p: Tensor, n_iter: int = 30, tol: float = 1.0e-10) -> Tensor:
-    """Grand-canonical McWeeny purification ``P <- 3P^2 - 2P^3``.
-
-    Retracts an approximate projector (eigenvalues in ``(0,1)`` with the correct
-    count above ``0.5``) onto the nearest idempotent.  Matrix-multiplies only, so
-    it is a stable differentiable retraction with no eigensolver.
-    """
-    p = hermitian_part(p)
-    for _ in range(int(n_iter)):
-        p2 = p @ p
-        p_next = hermitian_part(3.0 * p2 - 2.0 * (p2 @ p))
-        if float((p_next - p).abs().max()) < tol:
-            p = p_next
-            break
-        p = p_next
-    return p
-
-
-def idempotency_error(p: Tensor) -> Tensor:
-    """``||P^2 - P||_F / max(||P||_F, eps)`` -- a scale-free non-idempotency."""
-    num = (p @ p - p).norm()
-    return num / p.norm().clamp_min(1.0e-30)
 
 
 # ============================================================================
@@ -310,6 +146,7 @@ def grassmann_p_loss_single(
     from_density: bool = False,
     min_gap: float = 0.0,
     check_pred_gap: bool = False,
+    chordal_normalize: bool = False,
 ) -> GrassmannPResult:
     """Single-k Grassmann P-regression loss.
 
@@ -352,6 +189,11 @@ def grassmann_p_loss_single(
     p_pred, u_pred, eps_pred = _project(h_pred, grad=True)
 
     loss_chordal = chordal_distance_sq(p_pred, p_ref)
+    # Raw chordal = sum_i sin^2(theta_i) in [0, n_occ]; its magnitude therefore grows
+    # with n_occ / system size, which distorts the effective LR when mixing systems of
+    # different size (or against a fixed-coeff base loss).  Optionally normalize per
+    # occupied state so the term is O(1) regardless of size.
+    chordal_term = loss_chordal / max(int(n_occ), 1) if chordal_normalize else loss_chordal
 
     loss_eps = h_pred.real.new_zeros(())
     if lambda_eps != 0.0 and not from_density:
@@ -366,7 +208,7 @@ def grassmann_p_loss_single(
             de = de - de.mean()
         loss_eps = (de ** 2).mean()
 
-    loss = lambda_chordal * loss_chordal + lambda_eps * loss_eps
+    loss = lambda_chordal * chordal_term + lambda_eps * loss_eps
     with torch.no_grad():
         geo = geodesic_distance(u_pred, u_ref)
         gap = _boundary_gap(eps_ref).detach()
@@ -375,10 +217,10 @@ def grassmann_p_loss_single(
     if min_gap and float(min_gap) > 0.0:
         kind = "occupation" if from_density else "HOMO-LUMO"
         if (not torch.isfinite(gap)) or float(gap.abs()) < float(min_gap):
-            raise ValueError(f"reference {kind} gap {float(gap):.3g} < min_gap {float(min_gap):.3g} "
-                             "(metallic/near-degenerate: projector is ill-conditioned)")
+            raise SkippableRecord(f"reference {kind} gap {float(gap):.3g} < min_gap {float(min_gap):.3g} "
+                                  "(metallic/near-degenerate: projector is ill-conditioned)")
         if check_pred_gap and ((not torch.isfinite(pred_gap)) or float(pred_gap.abs()) < float(min_gap)):
-            raise ValueError(f"predicted {kind} gap {float(pred_gap):.3g} < min_gap {float(min_gap):.3g}")
+            raise SkippableRecord(f"predicted {kind} gap {float(pred_gap):.3g} < min_gap {float(min_gap):.3g}")
 
     return GrassmannPResult(
         loss=loss,
@@ -416,6 +258,7 @@ def dense_grassmann_p_loss(
     from_density: bool = False,
     min_gap: float = 0.0,
     check_pred_gap: bool = False,
+    chordal_normalize: bool = False,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Batched (over k / matrices) Grassmann P-regression loss."""
     if h_pred.shape != h_ref.shape:
@@ -460,6 +303,7 @@ def dense_grassmann_p_loss(
                 from_density=from_density,
                 min_gap=min_gap,
                 check_pred_gap=check_pred_gap,
+                chordal_normalize=chordal_normalize,
             )
         )
     if not results:
@@ -539,6 +383,7 @@ class GrassmannPAlignLoss(nn.Module):
         density_key: str = "density_matrix",
         min_gap: float = 0.0,
         check_pred_gap: bool = False,
+        chordal_normalize: bool = False,
         require_overlap: Optional[bool] = None,
         **kwargs,
     ) -> None:
@@ -549,6 +394,7 @@ class GrassmannPAlignLoss(nn.Module):
         self.density_key = str(density_key)
         self.min_gap = float(min_gap)
         self.check_pred_gap = bool(check_pred_gap)
+        self.chordal_normalize = bool(chordal_normalize)
         self.dtype = dtype
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.idp = idp
@@ -691,9 +537,9 @@ class GrassmannPAlignLoss(nn.Module):
                     "batch_size=1 (or implement per-structure HR2HK/n_occ before batch>1).")
             n_occ = self._resolve_n_occ(data, ref_data)
             if n_occ is None:
-                if self.skip_on_error:
-                    return self._zero(None)
-                raise KeyError(f"grassmann_p_align needs `{self.n_occ_key}`, an explicit n_occ, or a known-species valence fallback")
+                raise SkippableRecord(
+                    f"grassmann_p_align needs `{self.n_occ_key}`, an explicit n_occ, "
+                    "all_electron, or a known-species valence fallback")
             if self.from_density:
                 # DM route (dataset get_DM). Prefer an explicit dense density field;
                 # otherwise the node/edge feature slots hold density blocks under
@@ -712,8 +558,8 @@ class GrassmannPAlignLoss(nn.Module):
             if self.s2k is not None and self._get(ref_data, AtomicDataDict.EDGE_OVERLAP_KEY) is not None:
                 s = self._build_hk(ref_data, self.s2k, AtomicDataDict.OVERLAP_KEY)
             if self.require_overlap and s is None:
-                raise KeyError("grassmann_p_align: require_overlap is set but no overlap was assembled "
-                               "(a non-orthogonal NAO basis must not be treated as orthonormal)")
+                raise SkippableRecord("grassmann_p_align: require_overlap is set but no overlap was assembled "
+                                      "(a non-orthogonal NAO basis must not be treated as orthonormal)")
             loss, stats = dense_grassmann_p_loss(
                 h_pred, h_ref, s,
                 n_occ=n_occ,
@@ -723,12 +569,18 @@ class GrassmannPAlignLoss(nn.Module):
                 gauge_mu=self.gauge_mu,
                 eig_floor=self.eig_floor,
                 max_kpoints=self.max_kpoints,
+                chordal_normalize=self.chordal_normalize,
                 from_density=self.from_density,
                 min_gap=self.min_gap,
                 check_pred_gap=self.check_pred_gap,
             )
-        except Exception:
+        except SkippableRecord as exc:
+            # Expected physical/data skip (metallic gap, missing overlap, unresolved
+            # n_occ).  Only these are swallowed under skip_on_error; a genuine bug
+            # (shape/device/eigh/HR2HK) is NOT a SkippableRecord and propagates, so it
+            # can never masquerade as a silent zero-loss no-op.
             if self.skip_on_error:
+                log.warning("grassmann_p_align skipped a record: %s", exc)
                 return self._zero(h_pred if torch.is_tensor(h_pred) else h_ref)
             raise
         self.last_scalar_state = {k: (v.detach() if torch.is_tensor(v) else torch.as_tensor(float(v))) for k, v in stats.items()}
@@ -738,3 +590,21 @@ class GrassmannPAlignLoss(nn.Module):
             total = total + self.coeff_base * base
             self.last_scalar_state["grassmann_base_loss"] = base.detach() if torch.is_tensor(base) else torch.as_tensor(float(base))
         return total
+
+
+__all__ = [
+    "SkippableRecord",
+    "s_half_and_inv",
+    "occupied_projector",
+    "chordal_distance_sq",
+    "principal_angles",
+    "geodesic_distance",
+    "grassmann_exp",
+    "grassmann_log",
+    "mcweeny_purify",
+    "idempotency_error",
+    "GrassmannPResult",
+    "grassmann_p_loss_single",
+    "dense_grassmann_p_loss",
+    "GrassmannPAlignLoss",
+]
