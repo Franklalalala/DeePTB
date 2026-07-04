@@ -230,19 +230,34 @@ production eps is float32-noise-level.
 At `max_samples=8` the dual forward OOMs a 46GB L40S (fd peak 21.2 GB →
 dual needs >44 GB), consistent with the 2.2–2.9× activation-memory law.
 
-### What still separates jvp from the production SO2 CUDA line
+### What still separates jvp from the production SO2 CUDA line (empirically pinned)
 
-The production knobs (`streamed_m_major_fused_p0 + cublas_grouped`, used by
-998933/1027717/1027855) run custom `autograd.Function`s without `jvp`
-staticmethods — jvp currently lives only on the pure-torch ref knobs, which
-are ~1.6× slower than cueq at equal batch. Making jvp production-grade would
-take: `jvp` staticmethods for `_GroupedGemmFunction` /
-`_PersistentGroupedP1Function` (matmul-like, mechanical) and accepting the
+jvp runs live **only on the pure-torch ref knobs** (`streamed_m_major_ref +
+split_loop`). Both production-family CUDA backends block it at a specific
+custom op, now confirmed by measurement (not just static reasoning), natlan
+ms4:
+
+- **cueq line** (`streamed_m_major_cueq + cueq_indexed_linear`): fd works
+  (2.48 s / 15.1 GB at ms4); jvp dies at
+  `cuequivariance_ops_torch/indexed_linear.py:287`,
+  `torch.ops.cuequivariance.indexed_linear_B` →
+  `NotImplementedError: Cannot access storage of TensorWrapper`. The
+  cuEquivariance CUDA kernel has no forward-mode rule and reads tensor storage
+  directly, which functorch dual tensors don't have.
+- **fused_p0 line** (`streamed_m_major_fused_p0 + cublas_grouped`, the actual
+  998933/1027717/1027855 production knobs): same category
+  (`_GroupedGemmFunction` / `_PersistentGroupedP1Function`, custom
+  `autograd.Function`s without `jvp` staticmethods); not directly testable on
+  natlan because that CUDA extension does not compile there.
+
+The ref knobs are ~1.6× slower than cueq at equal batch, so jvp today is a
+*working exactness oracle* on the crystal stack (ref knobs, small batch), not
+a production path. Making jvp production-grade needs forward-mode support on
+those custom ops (`jvp` staticmethods for the grouped-GEMM Functions;
+upstream forward-AD for `cuequivariance.indexed_linear_B`) plus accepting the
 ~2.2× dual-forward memory (≈ halving max_samples). Until a concrete accuracy
 need appears (e.g. high-frequency time embeddings where fd's phase-step
-pathology returns), finite_difference remains the production default; jvp is
-now a *working* exactness oracle on the crystal stack rather than a
-theoretical one.
+pathology returns), finite_difference stays the production default.
 
 Memory-cap note: with `max_samples=32` the same batch (32 graphs / 48.2k
 edges) OOMs a 46GB L40S under pMF's 3-forward step — consistent with hanhai
