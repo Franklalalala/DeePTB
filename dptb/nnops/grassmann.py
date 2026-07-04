@@ -573,7 +573,11 @@ class GrassmannPAlignLoss(nn.Module):
                 out_field=AtomicDataDict.HAMILTONIAN_KEY,
                 dtype=dtype, device=device,
             )
-            if self.overlap:
+            # Build the S(k) assembler whenever an overlap is wanted. `self.overlap`
+            # reflects whether the *model* predicts overlap; the reference S we need
+            # for the Grassmann projector comes from the dataset (get_overlap) and is
+            # gated by require_overlap -- so decouple from the model-overlap flag.
+            if self.overlap or self.require_overlap:
                 self.s2k = HR2HK(
                     idp=idp, overlap=True,
                     edge_field=AtomicDataDict.EDGE_OVERLAP_KEY,
@@ -589,6 +593,31 @@ class GrassmannPAlignLoss(nn.Module):
         except Exception:
             return default
 
+    def _atomic_numbers(self, data, ref_data):
+        """Return per-atom Z as a list[int], or None.
+
+        Prefers an explicit ``atomic_numbers`` field; a processed AtomicData batch
+        usually carries only ``atom_types`` (basis indices), so fall back to mapping
+        those through the idp's ``type_names`` (element symbols) -> Z.
+        """
+        akey = AtomicDataDict.ATOMIC_NUMBERS_KEY if hasattr(AtomicDataDict, "ATOMIC_NUMBERS_KEY") else "atomic_numbers"
+        for src in (ref_data, data):
+            z = self._get(src, akey, None)
+            if z is not None:
+                return [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
+        tkey = AtomicDataDict.ATOM_TYPE_KEY if hasattr(AtomicDataDict, "ATOM_TYPE_KEY") else "atom_types"
+        type_names = getattr(self.idp, "type_names", None)
+        if type_names is not None:
+            try:
+                from ase.data import atomic_numbers as _AN
+                for src in (ref_data, data):
+                    t = self._get(src, tkey, None)
+                    if t is not None:
+                        return [int(_AN[type_names[int(ti)]]) for ti in torch.as_tensor(t).reshape(-1).tolist()]
+            except Exception:
+                return None
+        return None
+
     def _resolve_n_occ(self, data, ref_data):
         for src in (ref_data, data):
             v = self._get(src, self.n_occ_key, None)
@@ -596,17 +625,15 @@ class GrassmannPAlignLoss(nn.Module):
                 return int(v.reshape(-1)[0].item()) if torch.is_tensor(v) else int(v)
         if self.n_occ is not None:
             return self.n_occ
-        z = self._get(data, AtomicDataDict.ATOMIC_NUMBERS_KEY if hasattr(AtomicDataDict, "ATOMIC_NUMBERS_KEY") else "atomic_numbers", None)
-        if self.all_electron and z is not None:
+        zs = self._atomic_numbers(data, ref_data)
+        if self.all_electron and zs:
             # All-electron, neutral, closed-shell: n_occ = (sum of Z) / 2 exactly.
             # Correct for all-electron GTO/def2 data where core states are occupied
             # (the pseudopotential-valence table below would undercount).
-            zs = [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
             nel = sum(zs)
             if nel > 0 and nel % 2 == 0:
                 return nel // 2
-        if self.valence_fallback and z is not None:
-            zs = [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
+        if self.valence_fallback and zs:
             if any(zi not in self._vtab for zi in zs):
                 return None  # unknown species -> force explicit n_occ, never a silent guess
             nel = sum(self._vtab[zi] for zi in zs)
@@ -668,7 +695,7 @@ class GrassmannPAlignLoss(nn.Module):
                 h_pred = self._build_hk(data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
                 h_ref = self._build_hk(ref_data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
             s = None
-            if self.overlap and self.s2k is not None:
+            if self.s2k is not None and self._get(ref_data, AtomicDataDict.EDGE_OVERLAP_KEY) is not None:
                 s = self._build_hk(ref_data, self.s2k, AtomicDataDict.OVERLAP_KEY)
             if self.require_overlap and s is None:
                 raise KeyError("grassmann_p_align: require_overlap is set but no overlap was assembled "
