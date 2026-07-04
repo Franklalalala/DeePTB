@@ -177,15 +177,28 @@ memory. Fewer model calls ≠ less work here.
 | pure-torch ref | finite_difference | 7.29 | 26 292 | — |
 | pure-torch ref | jvp | (= fd after fallback) | — | **no — falls back** |
 
-**On the real crystal stack the jvp backend cannot run at all**: the first
-blocker is a TorchScript-scripted module (`RuntimeError: ... TorchScript
+**On the real crystal stack the jvp backend cannot run at all.** Fail-fast
+(`jvp_fallback=false`) pins the first blocker to
+`e3nn/o3/_spherical_harmonics.py:98` (entered from `lem_moe_v3_h0.py:99`):
+e3nn's SphericalHarmonics is TorchScript-compiled, and under `torch.func.jvp`
+*every* tensor in the transformed region is a storageless functorch wrapper —
+even ones that carry no tangent, like the edge direction vectors — so the JIT
+graph executor dies on `data_ptr()` (`RuntimeError: ... TorchScript
 interpreter ... Cannot access data pointer of Tensor that doesn't have
-storage` — forward-mode dual tensors are storageless and JIT rejects them),
-hit before torch_scatter or the custom Functions. The sticky fallback behaves
-exactly as designed: one warning, `*_flow_du_dt_backend_jvp = 0`, and the run
-proceeds at finite_difference speed — a 5-minute real `dptb train` pair on the
-same configs confirmed a misconfigured `du_dt_backend=jvp` production job
-degrades gracefully to fd-equivalent throughput instead of crashing.
+storage`). This is knob-independent (cueq and pure-torch ref fail
+identically) and sits *before* the torch_scatter / custom-Function walls; the
+production `streamed_m_major_fused_p0 + cublas_grouped` line adds those on
+top. Enabling jvp for real would therefore require, in order: disabling
+TorchScript across the model (e3nn `jit_script_fx=False` plus dptb's own
+`@torch.jit.script` helpers), replacing `scatter_max`-style torch_scatter
+calls, and adding `jvp` staticmethods to the SO2/grouped-GEMM Functions — none
+of it justified by the measured wall-clock/memory numbers.
+
+The sticky fallback behaves exactly as designed: one warning,
+`*_flow_du_dt_backend_jvp = 0`, and the run proceeds at finite_difference
+speed — a 5-minute real `dptb train` pair on the same configs confirmed a
+misconfigured `du_dt_backend=jvp` production job degrades gracefully to
+fd-equivalent throughput instead of crashing.
 
 Memory-cap note: with `max_samples=32` the same batch (32 graphs / 48.2k
 edges) OOMs a 46GB L40S under pMF's 3-forward step — consistent with hanhai
