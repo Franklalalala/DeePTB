@@ -112,6 +112,20 @@ Tensor = torch.Tensor
 # ============================================================================
 # Orthogonalization (S-metric handling)
 # ============================================================================
+def _stable_eigh(a: Tensor) -> Tuple[Tensor, Tensor]:
+    """Hermitian eigendecomposition done in double precision, cast back.
+
+    float32 ``torch.linalg.eigh`` frequently fails to converge on ill-conditioned
+    inputs (near-linearly-dependent NAO overlaps, random-init predicted H on crystals).
+    Solving in float64/complex128 is far more robust; the dtype casts are autograd-
+    transparent so gradients still flow to the float32 model.
+    """
+    hi = torch.complex128 if a.is_complex() else torch.float64
+    w, v = torch.linalg.eigh(a if a.dtype == hi else a.to(hi))
+    w_dtype = torch.float64 if a.dtype in (torch.float64, torch.complex128) else torch.float32
+    return w.to(w_dtype), v.to(a.dtype)
+
+
 def s_half_and_inv(s: Tensor, eig_floor: float = 1.0e-10) -> Tuple[Tensor, Tensor]:
     """Return ``(S^{1/2}, S^{-1/2})`` for a (regularized) overlap matrix.
 
@@ -119,7 +133,7 @@ def s_half_and_inv(s: Tensor, eig_floor: float = 1.0e-10) -> Tuple[Tensor, Tenso
     ordinary one and makes the standard Grassmann formulas apply.
     """
     s_h = hermitian_part(s)
-    evals, evecs = torch.linalg.eigh(s_h)
+    evals, evecs = _stable_eigh(s_h)
     evals = evals.clamp_min(float(eig_floor))
     root = evals.sqrt()
     x = (evecs * root.unsqueeze(-2)) @ evecs.mH
@@ -158,7 +172,7 @@ def occupied_projector(
         raise ValueError(f"n_occ must be in [1, N-1], got {n_occ} for N={n}")
     h_h = hermitian_part(h)
     if s is None:
-        eps, q = torch.linalg.eigh(h_h)
+        eps, q = _stable_eigh(h_h)
     else:
         x, x_inv = s_half_and_inv(s, eig_floor=eig_floor)
         # Hamiltonians transform as X^{-1} H X^{-1}.  An AO density kernel D obeys
@@ -166,7 +180,7 @@ def occupied_projector(
         # X^{-1} for a density selects the WRONG subspace in a non-orthogonal basis.
         transport = x if from_density else x_inv
         h_orth = hermitian_part(transport @ h_h @ transport)
-        eps, q = torch.linalg.eigh(h_orth)
+        eps, q = _stable_eigh(h_orth)
     u = q[:, -n_occ:] if from_density else q[:, :n_occ]  # top occupations vs lowest energies
     p = u @ u.mH
     if return_frame:
@@ -322,10 +336,10 @@ def grassmann_p_loss_single(
             transport = x if from_density else x_inv  # X D X for density, X^{-1} H X^{-1} for H
             h_orth = hermitian_part(transport @ h_h @ transport)
         if grad:
-            eps, q = torch.linalg.eigh(h_orth)
+            eps, q = _stable_eigh(h_orth)
         else:
             with torch.no_grad():
-                eps, q = torch.linalg.eigh(h_orth)
+                eps, q = _stable_eigh(h_orth)
         u = q[:, sel]
         return u @ u.mH, u, eps
 
