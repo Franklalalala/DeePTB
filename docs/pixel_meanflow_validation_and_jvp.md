@@ -163,6 +163,37 @@ live dual buffers — hence ≈3 forward-equivalents of compute (same as fd's
 3 calls) with extra per-op dispatch overhead, and ~2.4–2.9× peak activation
 memory. Fewer model calls ≠ less work here.
 
+### Production-like crystal measurement (natlan, 2×L40S 46GB, torch 2.8.0+cu128)
+
+`~/codex/0704_jvp_crystal_bench` on natlan: real `lem_moe_v3_h0` crystal stack
+(0516_2range nextham dataset, full-periodic-table basis, `batch_size=32`,
+`dynamic_batch.max_samples=16` = the hanhai production cap; first packed batch
+16 graphs / 244 nodes / 27.7k edges). Module-level loss_with_model+backward:
+
+| knobs | backend | s/step (median) | peak MB | jvp live? |
+|---|---|---:|---:|---|
+| cueq (production) | finite_difference | 4.45 | 28 787 | — |
+| cueq (production) | jvp | 4.32 (= fd after fallback) | 28 787 | **no — falls back** |
+| pure-torch ref | finite_difference | 7.29 | 26 292 | — |
+| pure-torch ref | jvp | (= fd after fallback) | — | **no — falls back** |
+
+**On the real crystal stack the jvp backend cannot run at all**: the first
+blocker is a TorchScript-scripted module (`RuntimeError: ... TorchScript
+interpreter ... Cannot access data pointer of Tensor that doesn't have
+storage` — forward-mode dual tensors are storageless and JIT rejects them),
+hit before torch_scatter or the custom Functions. The sticky fallback behaves
+exactly as designed: one warning, `*_flow_du_dt_backend_jvp = 0`, and the run
+proceeds at finite_difference speed — a 5-minute real `dptb train` pair on the
+same configs confirmed a misconfigured `du_dt_backend=jvp` production job
+degrades gracefully to fd-equivalent throughput instead of crashing.
+
+Memory-cap note: with `max_samples=32` the same batch (32 graphs / 48.2k
+edges) OOMs a 46GB L40S under pMF's 3-forward step — consistent with hanhai
+history (bs32/ms16 needed 43–44GB on A100 *pre* no-grad patch; post-patch
+bs96/ms48 fits 80GB). pMF peak = grad-forward graph + no-grad forward
+transients stacked on top, so per-sample headroom must be sized ~1.3–1.5× a
+supervised step, not 1×.
+
 ### Production stack blockers (real LEM/SO2 models)
 
 Static scan of the production model path finds forward-AD-incompatible ops —

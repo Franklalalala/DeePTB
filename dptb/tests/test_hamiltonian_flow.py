@@ -1580,6 +1580,9 @@ def test_resolve_flow_log_fields_pixel_meanflow_drops_never_computed_fields():
     # endpoint compatible fields stay on by default and legacy keys are expected
     assert "validation_compatible_euler_1_loss" in fields
     assert "validation_compatible_euler_3_hopping_loss" in fields
+    # canary scalars so silent jvp fallbacks are visible in production logs
+    assert "train_flow_du_dt_backend_jvp" in fields
+    assert "train_flow_explicit_model_calls" in fields
     assert register_legacy is True
 
 
@@ -1594,6 +1597,7 @@ def test_resolve_flow_log_fields_cfm_keeps_existing_fields():
     assert "validation_flow_euler_1_loss" in fields
     assert "validation_compatible_euler_1_loss" in fields
     assert "validation_flow_one_step_loss" not in fields
+    assert "train_flow_du_dt_backend_jvp" not in fields
     assert register_legacy is True
 
 

@@ -2019,7 +2019,16 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
         "train_flow_weight",
     ]
     if model_in_loss:
-        fields.extend(["train_flow_r", "train_flow_h"])
+        fields.extend(
+            [
+                "train_flow_r",
+                "train_flow_h",
+                # canary scalars: a silent jvp->finite_difference fallback is
+                # invisible in production without these in the terminal/TB log.
+                "train_flow_du_dt_backend_jvp",
+                "train_flow_explicit_model_calls",
+            ]
+        )
     if getattr(flow, "log_validation_random_t_loss", True):
         fields.append("validation_flow_random_t_loss")
     if getattr(flow, "log_validation_t0_loss", True):
