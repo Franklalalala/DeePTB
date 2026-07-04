@@ -33,8 +33,14 @@ def _fast_tf32_enabled() -> bool:
 
 
 class _GroupedGemmFunction(torch.autograd.Function):
+    # setup_context style (forward without ctx) so this Function composes with
+    # torch.func transforms, in particular torch.func.jvp used by the pixel
+    # meanflow du/dt=jvp backend. The op out[g] = x[g] @ weight[g].T is linear
+    # in x and in weight, so its forward-mode rule is just the same grouped GEMM
+    # applied to the input tangents (dweight is usually zero: weights are model
+    # params, not jvp primals).
     @staticmethod
-    def forward(ctx, x: torch.Tensor, ptr: torch.Tensor, weight: torch.Tensor, fast_tf32: bool):
+    def forward(x: torch.Tensor, ptr: torch.Tensor, weight: torch.Tensor, fast_tf32: bool):
         if x.dtype != torch.float32 or weight.dtype != torch.float32:
             raise RuntimeError(f"cublas_grouped_gemm currently requires float32, got x={x.dtype}, weight={weight.dtype}")
         if not x.is_cuda or not weight.is_cuda:
@@ -48,9 +54,18 @@ class _GroupedGemmFunction(torch.autograd.Function):
             weight_contig,
             bool(fast_tf32),
         )
-        ctx.save_for_backward(x_contig, ptr_cpu, weight_contig)
-        ctx.fast_tf32 = bool(fast_tf32)
         return out
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, ptr, weight, fast_tf32 = inputs
+        ptr_cpu = ptr.detach().to(device="cpu", dtype=torch.long).contiguous()
+        x_contig = x.contiguous()
+        weight_contig = weight.contiguous()
+        ctx.save_for_backward(x_contig, ptr_cpu, weight_contig)
+        # save_for_forward makes these available to jvp() via ctx.saved_tensors.
+        ctx.save_for_forward(x_contig, ptr_cpu, weight_contig)
+        ctx.fast_tf32 = bool(fast_tf32)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
@@ -71,6 +86,23 @@ class _GroupedGemmFunction(torch.autograd.Function):
             ctx.fast_tf32,
         )
         return grad_x, None, grad_weight, None
+
+    @staticmethod
+    def jvp(ctx, x_t, ptr_t, weight_t, fast_tf32_t):
+        # d_out = grouped_gemm(dx, weight) + grouped_gemm(x, dweight)
+        x, ptr_cpu, weight = ctx.saved_tensors
+        ext = _load_extension()
+        out_t = None
+        if x_t is not None:
+            out_t = ext.grouped_gemm_forward_fp32(
+                x_t.contiguous(), ptr_cpu, weight, ctx.fast_tf32
+            )
+        if weight_t is not None:
+            term = ext.grouped_gemm_forward_fp32(
+                x, ptr_cpu, weight_t.contiguous(), ctx.fast_tf32
+            )
+            out_t = term if out_t is None else out_t + term
+        return out_t
 
 
 def grouped_gemm(x: torch.Tensor, ptr: torch.Tensor, weight: torch.Tensor, *, fast_tf32: Optional[bool] = None) -> torch.Tensor:
