@@ -1624,61 +1624,78 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
 
         This is the paper's ``jvp(u_fn, (z, r, t), (v, 0, 1))`` (pMF Alg. 1) up
         to the u = (z - x)/t re-parameterization, which
-        _component_meanflow_loss applies analytically. The primal output keeps
-        the reverse-mode graph, so it replaces both the main grad forward and
-        the fd_eps forward of the finite_difference backend.
+        _component_meanflow_loss applies analytically.
+
+        Implemented with native ``torch.autograd.forward_ad`` dual tensors
+        rather than ``torch.func.jvp``. functorch wraps every tensor in
+        storageless interpreter wrappers, so a custom-Function ``jvp``
+        staticmethod cannot call a CUDA kernel that reads ``data_ptr()`` (the
+        production SO2/cublas grouped-GEMM kernels). Native dual tensors carry
+        real storage, so the kernels run; forward-mode tangents also propagate
+        layer-by-layer and can be freed as the pass advances, keeping the
+        memory overhead well below functorch's. The primal output keeps its
+        reverse-mode graph (forward-over-reverse composition), so it replaces
+        both the main grad forward and the fd_eps forward of the
+        finite_difference backend.
         """
+        import torch.autograd.forward_ad as fwAD
+
         has_node = ctx.node_state is not None
         has_edge = ctx.edge_state is not None
-        primals = []
-        tangents = []
-        if has_node:
-            primals.append(ctx.node_state)
-            tangents.append(node_tangent.detach())
-        if has_edge:
-            primals.append(ctx.edge_state)
-            tangents.append(edge_tangent.detach())
-        primals.append(ctx.t)
-        tangents.append(torch.ones_like(ctx.t))
 
-        def _x_prediction(*args):
-            idx = 0
-            node_state = args[idx] if has_node else None
-            idx += int(has_node)
-            edge_state = args[idx] if has_edge else None
-            t = args[-1]
-            _, node_x, edge_x = self._predict_clean(
+        with fwAD.dual_level():
+            node_dual = (
+                fwAD.make_dual(ctx.node_state, node_tangent.detach())
+                if has_node
+                else None
+            )
+            edge_dual = (
+                fwAD.make_dual(ctx.edge_state, edge_tangent.detach())
+                if has_edge
+                else None
+            )
+            # (dz/dt, dr/dt, dt/dt) = (tangent, 0, 1): only t carries a unit
+            # tangent; r stays primal.
+            t_dual = fwAD.make_dual(ctx.t, torch.ones_like(ctx.t))
+            _, node_x_dual, edge_x_dual = self._predict_clean(
                 model,
                 data,
                 ctx,
-                node_state,
-                edge_state,
+                node_dual,
+                edge_dual,
                 r=ctx.r,
-                t=t,
+                t=t_dual,
                 detach_times=False,
             )
-            outs = []
+
+            node_x = edge_x = node_x_dot = edge_x_dot = None
             if has_node:
-                if node_x is None:
+                if node_x_dual is None:
                     raise RuntimeError(
                         "pixel meanflow jvp backend requires the model to emit "
                         f"`{self.node_target_key}` for the node component."
                     )
-                outs.append(node_x)
+                node_x, node_dot = fwAD.unpack_dual(node_x_dual)
+                node_x_dot = (
+                    node_dot.detach()
+                    if node_dot is not None
+                    else torch.zeros_like(node_x)
+                )
             if has_edge:
-                if edge_x is None:
+                if edge_x_dual is None:
                     raise RuntimeError(
                         "pixel meanflow jvp backend requires the model to emit "
                         f"`{self.edge_target_key}` for the edge component."
                     )
-                outs.append(edge_x)
-            return tuple(outs)
+                edge_x, edge_dot = fwAD.unpack_dual(edge_x_dual)
+                edge_x_dot = (
+                    edge_dot.detach()
+                    if edge_dot is not None
+                    else torch.zeros_like(edge_x)
+                )
 
-        outs, douts = torch.func.jvp(_x_prediction, tuple(primals), tuple(tangents))
-        node_x = outs[0] if has_node else None
-        edge_x = outs[-1] if has_edge else None
-        node_x_dot = douts[0].detach() if has_node else None
-        edge_x_dot = douts[-1].detach() if has_edge else None
+        # unpack_dual's primal keeps the reverse-mode grad_fn built inside the
+        # dual level, so node_x/edge_x remain valid training signals here.
         return node_x, edge_x, node_x_dot, edge_x_dot
 
     def loss_with_model(

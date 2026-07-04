@@ -1861,6 +1861,8 @@ def test_pixel_meanflow_jvp_falls_back_to_finite_difference_with_warning(
 ):
     import logging
 
+    import torch.autograd.forward_ad as fwAD
+
     flow = HamiltonianPixelMeanFlow(_jvp_flow_options(), dtype=torch.float64)
     calls = {"jvp": 0}
 
@@ -1868,7 +1870,8 @@ def test_pixel_meanflow_jvp_falls_back_to_finite_difference_with_warning(
         calls["jvp"] += 1
         raise RuntimeError("forward AD not implemented for fake op")
 
-    monkeypatch.setattr(torch.func, "jvp", boom)
+    # the jvp backend now uses native torch.autograd.forward_ad, not functorch
+    monkeypatch.setattr(fwAD, "make_dual", boom)
 
     model = _TimeConditionedModel()
     with caplog.at_level(logging.WARNING, logger="dptb.nnops.flow"):
