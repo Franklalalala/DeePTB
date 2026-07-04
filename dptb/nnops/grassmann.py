@@ -134,18 +134,25 @@ def occupied_projector(
     *,
     eig_floor: float = 1.0e-10,
     return_frame: bool = False,
+    from_density: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
     """Occupied projector ``P`` (orthonormal, symmetric idempotent, rank ``n_occ``).
 
-    The generalized eigenproblem ``H C = S C eps`` is solved in the ``S^{1/2}``
-    basis; ``P = U Uᴴ`` with ``U`` the ``n_occ`` lowest orthonormal eigenvectors.
-    ``P`` is smooth in ``H`` whenever the HOMO-LUMO gap is open.
+    The generalized eigenproblem ``M C = S C eps`` is solved in the ``S^{1/2}``
+    basis; ``P = U Uᴴ`` with ``U`` an orthonormal frame for the occupied subspace.
 
-    With ``return_frame``: also returns the orthonormal frame ``U`` (N x n_occ)
-    and the full eigenvalue vector ``eps`` (band energies).
+    * ``from_density=False`` (Hamiltonian source): occupied = the ``n_occ`` **lowest**
+      eigenvectors of ``H``.  ``P`` is smooth in ``H`` when the HOMO-LUMO gap is open.
+    * ``from_density=True`` (density-matrix source): ``M`` is a predicted/label
+      **density matrix** whose eigenvalues are occupations; occupied = the ``n_occ``
+      **highest**-occupation eigenvectors.  This is the retraction of a regressed
+      density onto the Grassmann manifold -- the DM-regression route (get_DM).
+
+    With ``return_frame``: also returns the frame ``U`` (N x n_occ) and the full
+    eigenvalue/occupation vector ``eps`` (ascending).
     """
     if h.ndim != 2 or h.shape[-1] != h.shape[-2]:
-        raise ValueError(f"expected a single square dense H, got {tuple(h.shape)}")
+        raise ValueError(f"expected a single square dense matrix, got {tuple(h.shape)}")
     n = h.shape[-1]
     if n_occ <= 0 or n_occ >= n:
         raise ValueError(f"n_occ must be in [1, N-1], got {n_occ} for N={n}")
@@ -156,7 +163,7 @@ def occupied_projector(
         x, x_inv = s_half_and_inv(s, eig_floor=eig_floor)
         h_orth = hermitian_part(x_inv @ h_h @ x_inv)
         eps, q = torch.linalg.eigh(h_orth)
-    u = q[:, :n_occ]
+    u = q[:, -n_occ:] if from_density else q[:, :n_occ]  # top occupations vs lowest energies
     p = u @ u.mH
     if return_frame:
         return p, u, eps
@@ -281,6 +288,7 @@ def grassmann_p_loss_single(
     eps_window: Optional[int] = None,
     gauge_mu: bool = True,
     eig_floor: float = 1.0e-10,
+    from_density: bool = False,
 ) -> GrassmannPResult:
     """Single-k Grassmann P-regression loss.
 
@@ -289,11 +297,15 @@ def grassmann_p_loss_single(
     * ``lambda_eps``: optional weight on occupied (+ small virtual window)
       eigenvalue matching, which supplies band *energies* that the pure subspace
       distance does not carry.  A scalar gauge ``mu`` (Fermi shift) is removed.
+      Not meaningful when ``from_density=True`` (occupations, not energies).
+    * ``from_density``: treat ``h_pred``/``h_ref`` as density matrices and take the
+      ``n_occ`` highest-occupation eigenvectors (DM-regression retraction).
     """
     x_inv = None
     if s is not None:
         with torch.no_grad():
             _x, x_inv = s_half_and_inv(s.detach(), eig_floor=eig_floor)
+    sel = slice(-n_occ, None) if from_density else slice(0, n_occ)
 
     def _project(h, grad: bool):
         h_h = hermitian_part(h)
@@ -306,7 +318,7 @@ def grassmann_p_loss_single(
         else:
             with torch.no_grad():
                 eps, q = torch.linalg.eigh(h_orth)
-        u = q[:, :n_occ]
+        u = q[:, sel]
         return u @ u.mH, u, eps
 
     with torch.no_grad():
@@ -316,7 +328,7 @@ def grassmann_p_loss_single(
     loss_chordal = chordal_distance_sq(p_pred, p_ref)
 
     loss_eps = h_pred.real.new_zeros(())
-    if lambda_eps != 0.0:
+    if lambda_eps != 0.0 and not from_density:
         n = eps_ref.shape[-1]
         if eps_window is None:
             hi = n
@@ -331,7 +343,8 @@ def grassmann_p_loss_single(
     loss = lambda_chordal * loss_chordal + lambda_eps * loss_eps
     with torch.no_grad():
         geo = geodesic_distance(u_pred, u_ref)
-        gap = (eps_ref[n_occ] - eps_ref[n_occ - 1]).detach()
+        b = eps_ref.shape[-1] - n_occ if from_density else n_occ  # occ/vir boundary index
+        gap = (eps_ref[b] - eps_ref[b - 1]).detach()
     return GrassmannPResult(
         loss=loss,
         loss_chordal=loss_chordal.detach(),
@@ -364,6 +377,7 @@ def dense_grassmann_p_loss(
     eig_floor: float = 1.0e-10,
     max_kpoints: Optional[int] = None,
     random_kpoints: bool = False,
+    from_density: bool = False,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Batched (over k / matrices) Grassmann P-regression loss."""
     if h_pred.shape != h_ref.shape:
@@ -403,6 +417,7 @@ def dense_grassmann_p_loss(
                 eps_window=eps_window,
                 gauge_mu=gauge_mu,
                 eig_floor=eig_floor,
+                from_density=from_density,
             )
         )
     if not results:
@@ -476,11 +491,13 @@ class GrassmannPAlignLoss(nn.Module):
         base_loss_options: Optional[Mapping[str, Any]] = None,
         valence_fallback: bool = True,
         skip_on_error: bool = True,
+        from_density: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
+        self.from_density = bool(from_density)
         self.dtype = dtype
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.idp = idp
@@ -586,6 +603,7 @@ class GrassmannPAlignLoss(nn.Module):
                 gauge_mu=self.gauge_mu,
                 eig_floor=self.eig_floor,
                 max_kpoints=self.max_kpoints,
+                from_density=self.from_density,
             )
         except Exception:
             if self.skip_on_error:

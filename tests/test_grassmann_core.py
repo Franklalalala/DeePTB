@@ -92,8 +92,10 @@ def test_chordal_equals_sum_sin2():
 
 
 def test_geodesic_zero_for_same():
+    # geodesic uses arccos(singular values), which has an O(sqrt(clamp_eps)) floor
+    # at zero distance (the very reason chordal, not geodesic, is the loss).
     u = _rand_frame(5, 2)
-    assert float(geodesic_distance(u, u)) < 1e-6
+    assert float(geodesic_distance(u, u)) < 2e-3
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +176,27 @@ def test_p_loss_smetric_gradient():
     res.loss.backward()
     assert torch.isfinite(h_pred.grad).all()
     assert float(res.gap) != 0.0
+
+
+def test_from_density_picks_top_occupation():
+    # A density D = 2 P has occupations {2 (x k), 0 (x n-k)}; from_density must
+    # recover exactly the projector's subspace from the top-k occupations.
+    u = _rand_frame(8, 3)
+    p = u @ u.mH
+    d = 2.0 * p
+    p_from_d = occupied_projector(d, None, n_occ=3, from_density=True)
+    assert float(chordal_distance_sq(p_from_d, p)) < 1e-16
+
+
+def test_from_density_loss_gradient():
+    # Regress a density: pred/ref are density matrices, retract via from_density.
+    u = _rand_frame(8, 3)
+    d_ref = 2.0 * (u @ u.mH)
+    d_pred = (d_ref + 0.05 * _rand_herm(8)).clone().requires_grad_(True)
+    res = grassmann_p_loss_single(d_pred, d_ref, None, n_occ=3, lambda_chordal=1.0, from_density=True)
+    res.loss.backward()
+    assert torch.isfinite(d_pred.grad).all()
+    assert float(d_pred.grad.abs().max()) > 0.0
 
 
 def test_dense_batched_over_k():

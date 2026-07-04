@@ -37,3 +37,12 @@ train_options:
       overlap: true
       eig_floor: 1.0e-10
       skip_on_error: true                  # safe for first merge; set false once verified
+
+      # Source of the occupied subspace:
+      #   from_density: false -> assemble H(k); occupied = n_occ LOWEST eigenvectors
+      #                          (predict-H, supervise-P; keeps band energies via lambda_eps)
+      #   from_density: true  -> set dataset get_DM: true so the regressed field is the
+      #                          density_matrix; occupied = n_occ HIGHEST-occupation
+      #                          eigenvectors (retraction onto Grassmann). Pure subspace;
+      #                          lambda_eps is ignored.
+      from_density: false
