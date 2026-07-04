@@ -1940,6 +1940,55 @@ def loss_options():
         Argument("eps", float, optional=True, default=1e-12),
     ]
 
+    # Grassmann occupied-projector (P) regression loss (non-SOC band prediction).
+    # Predicts H, supervises the occupied subspace via a chordal Grassmann distance
+    # (see dptb/nnops/grassmann.py). `from_density: true` switches to the DM route.
+    grassmann_p = [
+        Argument("coeff_align", float, optional=True, default=1.0,
+                 doc="Overall weight of the Grassmann (subspace) objective. Default: 1.0"),
+        Argument("coeff_base", float, optional=True, default=0.0,
+                 doc="Weight of an optional element-wise base loss (0 => pure P). Default: 0.0"),
+        Argument("base_loss_options", [dict, None], optional=True, default=None,
+                 doc="Options for the anchor base loss; only used when coeff_base != 0."),
+        Argument("lambda_chordal", float, optional=True, default=1.0,
+                 doc="Weight of the occupied-subspace chordal (Frobenius) distance. Default: 1.0"),
+        Argument("lambda_eps", float, optional=True, default=0.1,
+                 doc="Weight of the occupied(+window) eigenvalue term (band energies). Default: 0.1"),
+        Argument("eps_window", [int, None], optional=True, default=8,
+                 doc="Number of virtual bands above HOMO included in the eps term. Default: 8"),
+        Argument("gauge_mu", bool, optional=True, default=True,
+                 doc="Remove a scalar Fermi shift (VBM-alignment analogue) in the eps term. Default: True"),
+        Argument("kpoints", [list, None], optional=True, default=[[0.0, 0.0, 0.0]],
+                 doc="Fractional k-points where P is defined. Default: Gamma-only."),
+        Argument("max_kpoints", [int, None], optional=True, default=None,
+                 doc="Subsample this many k-points if the k-list is large. Default: None."),
+        Argument("n_occ", [int, None], optional=True, default=None,
+                 doc="Explicit number of occupied orbitals. Overrides the dataset key/valence fallback."),
+        Argument("n_occ_key", str, optional=True, default="n_occ",
+                 doc="Dataset field carrying n_occ (checked before the explicit value). Default: n_occ"),
+        Argument("valence_fallback", bool, optional=True, default=True,
+                 doc="If n_occ is unresolved, use a closed-shell pseudopotential-valence estimate. "
+                     "Set False for all-electron data (where core states are occupied). Default: True"),
+        Argument("overlap", bool, optional=True, default=True,
+                 doc="Whether an overlap S(k) is assembled and used (non-orthogonal AO basis)."),
+        Argument("require_overlap", [bool, None], optional=True, default=None,
+                 doc="Fail rather than silently assume an orthonormal basis when no S is available. "
+                     "Defaults to the value of `overlap`."),
+        Argument("from_density", bool, optional=True, default=False,
+                 doc="DM route: regress the density (get_DM) and retract onto Grassmann via X D X. "
+                     "Default: False (H route)."),
+        Argument("density_key", str, optional=True, default="density_matrix",
+                 doc="Dense density field used by the DM route if present (else assembled via HR2HK)."),
+        Argument("min_gap", float, optional=True, default=0.0,
+                 doc="Reject metallic/near-degenerate records with HOMO-LUMO gap below this (0 disables)."),
+        Argument("check_pred_gap", bool, optional=True, default=False,
+                 doc="Also enforce min_gap on the predicted spectrum (can reject early training). Default: False"),
+        Argument("eig_floor", float, optional=True, default=1.0e-10,
+                 doc="Eigenvalue floor for the S^{1/2} regularization. Default: 1e-10"),
+        Argument("skip_on_error", bool, optional=True, default=False,
+                 doc="Return a zero loss (fail open) instead of raising on a bad record. Default: False (fail closed)."),
+    ]
+
     loss_args = Variant("method", [
         # Argument("hamil", dict, sub_fields=hamil),
         Argument("eigvals", dict, sub_fields=eigvals),
@@ -1956,6 +2005,8 @@ def loss_options():
         Argument("eig_ham", dict, sub_fields=hamil+eigvals+eig_ham),
         Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
         Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
+        Argument("grassmann_p_align", dict, sub_fields=grassmann_p),
+        Argument("p_regression", dict, sub_fields=grassmann_p),
     ], optional=False, doc=doc_method)
 
 
