@@ -1171,11 +1171,21 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_fd_eps = float(mf.get("fd_eps", 1.0e-3))
         self.meanflow_du_dt_backend = str(
             mf.get("du_dt_backend", mf.get("jvp_backend", "finite_difference"))
-        ).lower()
-        if self.meanflow_du_dt_backend != "finite_difference":
-            raise NotImplementedError(
-                "DeePTB pixel MeanFlow currently supports finite_difference du/dt only."
+        ).lower().replace("-", "_")
+        if self.meanflow_du_dt_backend in {"fd", "finite_diff"}:
+            self.meanflow_du_dt_backend = "finite_difference"
+        if self.meanflow_du_dt_backend not in {"finite_difference", "jvp"}:
+            raise ValueError(
+                "pixel_meanflow.du_dt_backend must be 'finite_difference' or 'jvp', "
+                f"got {self.meanflow_du_dt_backend!r}."
             )
+        # jvp failures (forward-mode-unsupported ops, DDP wrappers, custom
+        # kernels) fall back to finite_difference for the rest of the run
+        # unless the user makes them fatal.
+        self.meanflow_jvp_fallback = bool(
+            mf.get("jvp_fallback", mf.get("jvp_fallback_to_finite_difference", True))
+        )
+        self._meanflow_jvp_disabled = False
         self.meanflow_norm_eps = float(mf.get("norm_eps", 0.01))
         self.meanflow_norm_p = float(mf.get("norm_p", 1.0 if aggressive else 0.0))
         self.meanflow_aux_endpoint_weight = float(mf.get("aux_endpoint_weight", 0.05))
@@ -1190,9 +1200,28 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.flow_time_r_key = str(options.get("flow_time_r_key", "flow_time_r"))
         self.flow_time_t_key = str(options.get("flow_time_t_key", "flow_time_t"))
         self.flow_time_h_key = str(options.get("flow_time_h_key", "flow_time_h"))
-        self.log_train_compatible_loss = bool(mf.get("log_train_compatible_loss", False))
+        # model-in-loss pMF has no raw-batch train_compatible code path; a True
+        # request would only register logger fields that never update and print
+        # as constant zeros, so force it off loudly instead of silently lying.
+        if bool(mf.get("log_train_compatible_loss", False)) and self.enabled:
+            log.warning(
+                "pixel_meanflow.log_train_compatible_loss=true is not supported: "
+                "the model-in-loss pMF objective never computes train_compatible_* "
+                "metrics; forcing it off. Use train_flow_*_endpoint_loss for "
+                "train-side endpoint error."
+            )
+        self.log_train_compatible_loss = False
+        # Validation stays aligned with no-CFM/CFM by default: sample/euler to
+        # the endpoint and report the blockwise compatible loss under the
+        # legacy validation_loss/validation_onsite_loss/validation_hopping_loss
+        # keys (the parent already forces this on when enabled); explicit
+        # meanflow.log_validation_compatible_loss=false /
+        # meanflow.compatible_loss_to_legacy_keys=false opt-outs are honored.
         self.log_validation_compatible_loss = bool(
             mf.get("log_validation_compatible_loss", self.log_validation_compatible_loss)
+        )
+        self.compatible_loss_to_legacy_keys = bool(
+            mf.get("compatible_loss_to_legacy_keys", self.compatible_loss_to_legacy_keys)
         )
 
         # A completely disabled validation path returns literal zero from
@@ -1275,10 +1304,20 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         r = torch.where(fm_mask, t, r)
         return r, t, fm_mask
 
-    def _write_times(self, data: AtomicDataDict.Type, r: torch.Tensor, t: torch.Tensor) -> None:
-        tt = t.detach()
-        rr = r.detach()
-        hh = (t - r).detach()
+    def _write_times(
+        self,
+        data: AtomicDataDict.Type,
+        r: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        detach: bool = True,
+    ) -> None:
+        # detach=False is required by the jvp du/dt backend: forward-mode
+        # tangents on t must reach the model's time conditioning, and
+        # .detach() strips the dual part.
+        tt = t.detach() if detach else t
+        rr = r.detach() if detach else r
+        hh = tt - rr
         data[self.flow_time_key] = tt
         data[self.flow_time_t_key] = tt
         data[self.flow_time_r_key] = rr
@@ -1398,6 +1437,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         *,
         r: torch.Tensor,
         t: torch.Tensor,
+        detach_times: bool = True,
     ) -> Tuple[AtomicDataDict.Type, Optional[torch.Tensor], Optional[torch.Tensor]]:
         model_data = data.copy()
         if node_state is not None:
@@ -1410,7 +1450,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             model_data[self.edge_h0_key] = edge_current
             if self.overwrite_feature_keys:
                 model_data[self.edge_target_key] = edge_current
-        self._write_times(model_data, r, t)
+        self._write_times(model_data, r, t, detach=detach_times)
         pred = model(model_data)
         node_x = None
         if ctx.node_clean is not None and self.node_target_key in pred:
@@ -1459,9 +1499,10 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         state_z: torch.Tensor,
         comp_r: torch.Tensor,
         comp_t: torch.Tensor,
-        pred_x_eps: torch.Tensor,
         mask: torch.Tensor,
         weight: float,
+        pred_x_eps: Optional[torch.Tensor] = None,
+        pred_x_dot: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         t_view = self._view_time(comp_t, state_z)
         h_view = (comp_t - comp_r).reshape((-1,) + (1,) * (state_z.ndim - 1))
@@ -1471,18 +1512,32 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             tangent = (state_z - boundary_x) / t_view
         else:
             tangent = target_v
-        signed_dt = torch.where(
-            comp_t <= 1.0 - self.meanflow_fd_eps,
-            comp_t.new_full(comp_t.shape, self.meanflow_fd_eps),
-            comp_t.new_full(comp_t.shape, -self.meanflow_fd_eps),
-        )
-        t_eps = (comp_t + signed_dt).clamp(min=self.meanflow_min_t, max=1.0)
-        signed_dt = t_eps - comp_t
-        dt_view = self._view_time(signed_dt, state_z)
-        u_eps = (state_z + dt_view * tangent.detach() - pred_x_eps) / self._view_time(
-            t_eps, state_z
-        )
-        du_dt = ((u_eps - u.detach()) / dt_view).detach()
+        if pred_x_dot is not None:
+            # Exact forward-mode derivative along (dz/dt, dr/dt, dt/dt) =
+            # (tangent, 0, 1) with u = (z - x)/t:
+            #   du/dt = (tangent - dx/dt)/t - u/t.
+            u_detached = (state_z - pred_x.detach()) / t_view
+            du_dt = (
+                (tangent.detach() - pred_x_dot) / t_view - u_detached / t_view
+            ).detach()
+        elif pred_x_eps is not None:
+            signed_dt = torch.where(
+                comp_t <= 1.0 - self.meanflow_fd_eps,
+                comp_t.new_full(comp_t.shape, self.meanflow_fd_eps),
+                comp_t.new_full(comp_t.shape, -self.meanflow_fd_eps),
+            )
+            t_eps = (comp_t + signed_dt).clamp(min=self.meanflow_min_t, max=1.0)
+            signed_dt = t_eps - comp_t
+            dt_view = self._view_time(signed_dt, state_z)
+            u_eps = (state_z + dt_view * tangent.detach() - pred_x_eps) / self._view_time(
+                t_eps, state_z
+            )
+            du_dt = ((u_eps - u.detach()) / dt_view).detach()
+        else:
+            raise ValueError(
+                "pixel meanflow component loss needs either pred_x_eps "
+                "(finite_difference) or pred_x_dot (jvp)."
+            )
         compound_v = u + h_view * du_dt
 
         velocity_loss, velocity_mse, velocity_mae = self._adaptive_metric_stats(
@@ -1527,6 +1582,105 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         }
         return total, state
 
+    def _component_tangent(
+        self,
+        state: torch.Tensor,
+        boundary_x: Optional[torch.Tensor],
+        comp_t: torch.Tensor,
+        prior: torch.Tensor,
+        clean: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.meanflow_jvp_tangent == "boundary" and boundary_x is not None:
+            return (state - boundary_x) / self._view_time(comp_t, state)
+        return prior - clean
+
+    def _meanflow_use_jvp(self) -> bool:
+        return self.meanflow_du_dt_backend == "jvp" and not self._meanflow_jvp_disabled
+
+    def _disable_meanflow_jvp(self, exc: Exception) -> None:
+        self._meanflow_jvp_disabled = True
+        log.warning(
+            "Pixel MeanFlow jvp du/dt backend failed (%s: %s); falling back to "
+            "finite_difference for the rest of this run. Set "
+            "pixel_meanflow.jvp_fallback=false to make this fatal.",
+            type(exc).__name__,
+            exc,
+        )
+
+    def _jvp_du_dt(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        ctx: PixelMFContext,
+        node_tangent: Optional[torch.Tensor],
+        edge_tangent: Optional[torch.Tensor],
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        """One forward-mode call returning x-prediction and dx/dt together.
+
+        This is the paper's ``jvp(u_fn, (z, r, t), (v, 0, 1))`` (pMF Alg. 1) up
+        to the u = (z - x)/t re-parameterization, which
+        _component_meanflow_loss applies analytically. The primal output keeps
+        the reverse-mode graph, so it replaces both the main grad forward and
+        the fd_eps forward of the finite_difference backend.
+        """
+        has_node = ctx.node_state is not None
+        has_edge = ctx.edge_state is not None
+        primals = []
+        tangents = []
+        if has_node:
+            primals.append(ctx.node_state)
+            tangents.append(node_tangent.detach())
+        if has_edge:
+            primals.append(ctx.edge_state)
+            tangents.append(edge_tangent.detach())
+        primals.append(ctx.t)
+        tangents.append(torch.ones_like(ctx.t))
+
+        def _x_prediction(*args):
+            idx = 0
+            node_state = args[idx] if has_node else None
+            idx += int(has_node)
+            edge_state = args[idx] if has_edge else None
+            t = args[-1]
+            _, node_x, edge_x = self._predict_clean(
+                model,
+                data,
+                ctx,
+                node_state,
+                edge_state,
+                r=ctx.r,
+                t=t,
+                detach_times=False,
+            )
+            outs = []
+            if has_node:
+                if node_x is None:
+                    raise RuntimeError(
+                        "pixel meanflow jvp backend requires the model to emit "
+                        f"`{self.node_target_key}` for the node component."
+                    )
+                outs.append(node_x)
+            if has_edge:
+                if edge_x is None:
+                    raise RuntimeError(
+                        "pixel meanflow jvp backend requires the model to emit "
+                        f"`{self.edge_target_key}` for the edge component."
+                    )
+                outs.append(edge_x)
+            return tuple(outs)
+
+        outs, douts = torch.func.jvp(_x_prediction, tuple(primals), tuple(tangents))
+        node_x = outs[0] if has_node else None
+        edge_x = outs[-1] if has_edge else None
+        node_x_dot = douts[0].detach() if has_node else None
+        edge_x_dot = douts[-1].detach() if has_edge else None
+        return node_x, edge_x, node_x_dot, edge_x_dot
+
     def loss_with_model(
         self,
         model: torch.nn.Module,
@@ -1538,9 +1692,16 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         data, ref_data, ctx = self.prepare_batch(data, ref_data, r=r, t=t)
-        _, node_x, edge_x = self._predict_clean(
-            model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.r, t=ctx.t
-        )
+        use_jvp = self._meanflow_use_jvp()
+        explicit_model_calls = 0
+        node_x = edge_x = None
+        if not use_jvp:
+            # finite_difference keeps its historical call order:
+            # main grad forward -> boundary -> fd_eps forward.
+            _, node_x, edge_x = self._predict_clean(
+                model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.r, t=ctx.t
+            )
+            explicit_model_calls += 1
         need_boundary = (
             self.meanflow_jvp_tangent == "boundary"
             or self.meanflow_aux_boundary_v_weight > 0.0
@@ -1556,48 +1717,71 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 _, node_x_boundary, edge_x_boundary = self._predict_clean(
                     model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.t, t=ctx.t
                 )
+            explicit_model_calls += 1
 
-        node_state_eps = edge_state_eps = None
+        node_tangent = edge_tangent = None
         if ctx.node_state is not None:
-            if self.meanflow_jvp_tangent == "boundary" and node_x_boundary is not None:
-                tangent = (ctx.node_state - node_x_boundary) / self._view_time(ctx.node_t, ctx.node_state)
-            else:
-                tangent = ctx.node_prior - ctx.node_clean
-            node_dt = torch.where(
-                ctx.node_t <= 1.0 - self.meanflow_fd_eps,
-                ctx.node_t.new_full(ctx.node_t.shape, self.meanflow_fd_eps),
-                ctx.node_t.new_full(ctx.node_t.shape, -self.meanflow_fd_eps),
+            node_tangent = self._component_tangent(
+                ctx.node_state, node_x_boundary, ctx.node_t, ctx.node_prior, ctx.node_clean
             )
-            node_dt = (ctx.node_t + node_dt).clamp(min=self.meanflow_min_t, max=1.0) - ctx.node_t
-            node_state_eps = ctx.node_state + self._view_time(node_dt, ctx.node_state) * tangent.detach()
         if ctx.edge_state is not None:
-            if self.meanflow_jvp_tangent == "boundary" and edge_x_boundary is not None:
-                tangent = (ctx.edge_state - edge_x_boundary) / self._view_time(ctx.edge_t, ctx.edge_state)
-            else:
-                tangent = ctx.edge_prior - ctx.edge_clean
-            edge_dt = torch.where(
-                ctx.edge_t <= 1.0 - self.meanflow_fd_eps,
-                ctx.edge_t.new_full(ctx.edge_t.shape, self.meanflow_fd_eps),
-                ctx.edge_t.new_full(ctx.edge_t.shape, -self.meanflow_fd_eps),
+            edge_tangent = self._component_tangent(
+                ctx.edge_state, edge_x_boundary, ctx.edge_t, ctx.edge_prior, ctx.edge_clean
             )
-            edge_dt = (ctx.edge_t + edge_dt).clamp(min=self.meanflow_min_t, max=1.0) - ctx.edge_t
-            edge_state_eps = ctx.edge_state + self._view_time(edge_dt, ctx.edge_state) * tangent.detach()
-        graph_dt = torch.where(
-            ctx.t <= 1.0 - self.meanflow_fd_eps,
-            ctx.t.new_full(ctx.t.shape, self.meanflow_fd_eps),
-            ctx.t.new_full(ctx.t.shape, -self.meanflow_fd_eps),
-        )
-        t_eps = (ctx.t + graph_dt).clamp(min=self.meanflow_min_t, max=1.0)
-        with torch.no_grad():
-            _, node_x_eps, edge_x_eps = self._predict_clean(
-                model,
-                data,
-                ctx,
-                node_state_eps if node_state_eps is not None else ctx.node_state,
-                edge_state_eps if edge_state_eps is not None else ctx.edge_state,
-                r=ctx.r,
-                t=t_eps,
+
+        node_x_dot = edge_x_dot = None
+        if use_jvp:
+            try:
+                node_x, edge_x, node_x_dot, edge_x_dot = self._jvp_du_dt(
+                    model, data, ctx, node_tangent, edge_tangent
+                )
+                explicit_model_calls += 1
+            except Exception as exc:
+                if not self.meanflow_jvp_fallback:
+                    raise
+                self._disable_meanflow_jvp(exc)
+                use_jvp = False
+                _, node_x, edge_x = self._predict_clean(
+                    model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.r, t=ctx.t
+                )
+                explicit_model_calls += 1
+
+        node_x_eps = edge_x_eps = None
+        if not use_jvp:
+            node_state_eps = edge_state_eps = None
+            if ctx.node_state is not None:
+                node_dt = torch.where(
+                    ctx.node_t <= 1.0 - self.meanflow_fd_eps,
+                    ctx.node_t.new_full(ctx.node_t.shape, self.meanflow_fd_eps),
+                    ctx.node_t.new_full(ctx.node_t.shape, -self.meanflow_fd_eps),
+                )
+                node_dt = (ctx.node_t + node_dt).clamp(min=self.meanflow_min_t, max=1.0) - ctx.node_t
+                node_state_eps = ctx.node_state + self._view_time(node_dt, ctx.node_state) * node_tangent.detach()
+            if ctx.edge_state is not None:
+                edge_dt = torch.where(
+                    ctx.edge_t <= 1.0 - self.meanflow_fd_eps,
+                    ctx.edge_t.new_full(ctx.edge_t.shape, self.meanflow_fd_eps),
+                    ctx.edge_t.new_full(ctx.edge_t.shape, -self.meanflow_fd_eps),
+                )
+                edge_dt = (ctx.edge_t + edge_dt).clamp(min=self.meanflow_min_t, max=1.0) - ctx.edge_t
+                edge_state_eps = ctx.edge_state + self._view_time(edge_dt, ctx.edge_state) * edge_tangent.detach()
+            graph_dt = torch.where(
+                ctx.t <= 1.0 - self.meanflow_fd_eps,
+                ctx.t.new_full(ctx.t.shape, self.meanflow_fd_eps),
+                ctx.t.new_full(ctx.t.shape, -self.meanflow_fd_eps),
             )
+            t_eps = (ctx.t + graph_dt).clamp(min=self.meanflow_min_t, max=1.0)
+            with torch.no_grad():
+                _, node_x_eps, edge_x_eps = self._predict_clean(
+                    model,
+                    data,
+                    ctx,
+                    node_state_eps if node_state_eps is not None else ctx.node_state,
+                    edge_state_eps if edge_state_eps is not None else ctx.edge_state,
+                    r=ctx.r,
+                    t=t_eps,
+                )
+            explicit_model_calls += 1
 
         total = None
         state: Dict[str, torch.Tensor] = {
@@ -1606,6 +1790,14 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
             f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
             f"{prefix}_flow_weight": ctx.t.new_tensor(1.0),
+            # canary scalars: catch silent jvp fallbacks and count the explicit
+            # model calls per step (boundary + main/jvp [+ fd_eps]).
+            f"{prefix}_flow_du_dt_backend_jvp": ctx.t.new_tensor(
+                1.0 if use_jvp else 0.0
+            ),
+            f"{prefix}_flow_explicit_model_calls": ctx.t.new_tensor(
+                float(explicit_model_calls)
+            ),
         }
         if ctx.node_clean is not None and node_x is not None:
             comp_total, comp_state = self._component_meanflow_loss(
@@ -1618,6 +1810,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 comp_r=ctx.node_r,
                 comp_t=ctx.node_t,
                 pred_x_eps=node_x_eps,
+                pred_x_dot=node_x_dot,
                 mask=self._node_mask(data, node_x),
                 weight=self.node_weight,
             )
@@ -1641,6 +1834,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 comp_r=ctx.edge_r,
                 comp_t=ctx.edge_t,
                 pred_x_eps=edge_x_eps,
+                pred_x_dot=edge_x_dot,
                 mask=self._edge_mask(data, edge_x),
                 weight=self.edge_weight,
             )
@@ -1793,3 +1987,71 @@ def build_hamiltonian_flow(
     if objective in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
         return HamiltonianPixelMeanFlow(options, idp=idp, dtype=dtype, device=device)
     return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)
+
+
+def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]:
+    """Scalar log fields implied by the *effective* flow flags.
+
+    Entry points used to re-derive the field list from raw top-level
+    flow_options keys, which drifts from the resolved flow object: pixel
+    meanflow reads ``meanflow.*`` overrides, never computes the raw-batch
+    train_compatible loss, and emits ``validation_flow_one_step_loss`` instead
+    of CFM's ``validation_flow_t0_loss``/``validation_flow_euler_N_loss``. A
+    registered field the run never updates is seeded as 0.0 and the terminal
+    Logger then prints a constant zero that reads like a perfect model.
+
+    Returns ``(flow_log_fields, register_legacy_validation)``. The second
+    element says whether the legacy ``validation_onsite_loss`` /
+    ``validation_hopping_loss`` keys will actually be produced: for flow runs
+    that is the endpoint-compatible euler-1 pass; with flow disabled the plain
+    validation criterion fills them.
+    """
+    if flow is None or not getattr(flow, "enabled", False):
+        return [], True
+
+    model_in_loss = bool(getattr(flow, "model_in_loss", False))
+    ode_steps = [int(n) for n in getattr(flow, "validation_ode_steps", ()) or ()]
+    fields = [
+        "train_flow_loss",
+        "train_flow_onsite_loss",
+        "train_flow_hopping_loss",
+        "train_flow_t",
+        "train_flow_weight",
+    ]
+    if model_in_loss:
+        fields.extend(["train_flow_r", "train_flow_h"])
+    if getattr(flow, "log_validation_random_t_loss", True):
+        fields.append("validation_flow_random_t_loss")
+    if getattr(flow, "log_validation_t0_loss", True):
+        fields.append(
+            "validation_flow_one_step_loss" if model_in_loss else "validation_flow_t0_loss"
+        )
+    if not model_in_loss and getattr(flow, "log_validation_flow_euler_loss", True):
+        for num_steps in ode_steps:
+            fields.append(f"validation_flow_euler_{num_steps}_loss")
+    if getattr(flow, "log_train_compatible_loss", False) and not model_in_loss:
+        fields.extend(
+            [
+                "train_compatible_loss",
+                "train_compatible_onsite_loss",
+                "train_compatible_hopping_loss",
+            ]
+        )
+    log_validation_compatible = bool(
+        getattr(flow, "log_validation_compatible_loss", False)
+    )
+    if log_validation_compatible:
+        for num_steps in ode_steps:
+            fields.extend(
+                [
+                    f"validation_compatible_euler_{num_steps}_loss",
+                    f"validation_compatible_euler_{num_steps}_onsite_loss",
+                    f"validation_compatible_euler_{num_steps}_hopping_loss",
+                ]
+            )
+    register_legacy = bool(
+        log_validation_compatible
+        and getattr(flow, "compatible_loss_to_legacy_keys", True)
+        and 1 in ode_steps
+    )
+    return fields, register_legacy

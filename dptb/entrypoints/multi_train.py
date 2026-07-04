@@ -23,6 +23,7 @@ from pathlib import Path
 
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
+from dptb.nnops.flow import resolve_flow_log_fields
 from dptb.nnops.ddp_utils import (
     configure_debug_env,
     configure_runtime_perf,
@@ -533,6 +534,13 @@ def _multi_train_impl(
     with entry_tagger.tag("trainer/register_plugins"):
         train_options = jdata["train_options"]
         log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]
+        # Legacy validation_onsite/hopping keys are only produced when the
+        # resolved flow object maps the endpoint-compatible euler-1 loss to
+        # legacy keys (or when flow is disabled and the plain criterion fills
+        # them); registering them otherwise prints misleading constant zeros.
+        _, register_legacy_validation = resolve_flow_log_fields(
+            getattr(trainer, "flow_cfm", None)
+        )
 
         if validation_datasets:
             validation_intervals = []
@@ -548,11 +556,12 @@ def _multi_train_impl(
                     fast_mode=jdata["train_options"]["valid_fast"]
                 )
             )
-            log_field.extend([
-                "validation_loss",
-                "validation_onsite_loss",
-                "validation_hopping_loss",
-            ])
+            log_field.append("validation_loss")
+            if register_legacy_validation:
+                log_field.extend([
+                    "validation_onsite_loss",
+                    "validation_hopping_loss",
+                ])
 
         avg_per_iter = chk_avg_per_iter(jdata)
 
@@ -570,7 +579,7 @@ def _multi_train_impl(
         trainer.register_plugin(ExpertLoadCVMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ScalarFieldMonitor(stat_name="train_loss_opt", interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
-        if validation_datasets:
+        if validation_datasets and register_legacy_validation:
             trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_onsite_loss", interval=[(1, 'iteration'), (1, 'epoch')]))
             trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_hopping_loss", interval=[(1, 'iteration'), (1, 'epoch')]))
 

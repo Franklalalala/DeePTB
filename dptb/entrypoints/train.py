@@ -1,4 +1,5 @@
 from dptb.nnops.trainer import Trainer
+from dptb.nnops.flow import resolve_flow_log_fields
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
 from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
@@ -538,44 +539,16 @@ def train(
     # register the plugin in trainer, to tract training info
     train_options = jdata["train_options"]
     log_field = ["train_loss", "lr", "total_grad_norm"]
-    flow_enabled = bool(train_options.get("flow_options", {}).get("enabled", False))
-    flow_log_fields = []
-    flow_scalar_fields = []
-    if flow_enabled:
-        flow_options = train_options.get("flow_options", {})
-        flow_log_fields.extend([
-            "train_flow_loss",
-            "train_flow_onsite_loss",
-            "train_flow_hopping_loss",
-            "train_flow_t",
-            "train_flow_weight",
-        ])
-        if flow_options.get("log_validation_random_t_loss", True):
-            flow_log_fields.append("validation_flow_random_t_loss")
-        if flow_options.get("log_validation_t0_loss", True):
-            flow_log_fields.append("validation_flow_t0_loss")
-        if flow_options.get("log_validation_flow_euler_loss", True):
-            for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
-                flow_log_fields.append(f"validation_flow_euler_{int(num_steps)}_loss")
-        if flow_options.get("log_train_compatible_loss", flow_options.get("log_compatible_loss", True)):
-            flow_log_fields.extend([
-                "train_compatible_loss",
-                "train_compatible_onsite_loss",
-                "train_compatible_hopping_loss",
-            ])
-        if flow_options.get("log_validation_compatible_loss", flow_options.get("log_compatible_loss", True)):
-            flow_log_fields.extend([
-                "validation_onsite_loss",
-                "validation_hopping_loss",
-            ])
-            for num_steps in flow_options.get("validation_ode_steps", [1, 3]):
-                flow_log_fields.extend([
-                    f"validation_compatible_euler_{int(num_steps)}_loss",
-                    f"validation_compatible_euler_{int(num_steps)}_onsite_loss",
-                    f"validation_compatible_euler_{int(num_steps)}_hopping_loss",
-                ])
-        log_field.extend(flow_log_fields)
-        flow_scalar_fields = list(flow_log_fields)
+    # Register scalar fields from the *effective* flow flags on the resolved
+    # flow object. Re-deriving them from raw flow_options keys drifts for
+    # pixel meanflow (meanflow.* overrides, no raw-batch train_compatible
+    # path, one_step instead of t0/euler flow keys), and every
+    # registered-but-never-updated field prints a misleading constant 0.
+    flow_log_fields, register_legacy_validation = resolve_flow_log_fields(
+        getattr(trainer, "flow_cfm", None)
+    )
+    log_field.extend(flow_log_fields)
+    flow_scalar_fields = list(flow_log_fields)
     if validation_datasets:
         validation_intervals = []
         validation_freq = int(jdata["train_options"].get("validation_freq", 10) or 0)
@@ -586,26 +559,27 @@ def train(
             validation_intervals.append((validation_epoch_freq, 'epoch'))
         trainer.register_plugin(Validationer(interval=validation_intervals, fast_mode=jdata["train_options"]["valid_fast"]))
 
-        for validation_field in (
-            "validation_loss",
-            "validation_onsite_loss",
-            "validation_hopping_loss",
-        ):
-            if validation_field not in log_field:
-                log_field.append(validation_field)
+        if "validation_loss" not in log_field:
+            log_field.append("validation_loss")
+        if register_legacy_validation:
+            for validation_field in (
+                "validation_onsite_loss",
+                "validation_hopping_loss",
+            ):
+                if validation_field not in log_field:
+                    log_field.append(validation_field)
     avg_per_iter = chk_avg_per_iter(jdata)
     trainer.register_plugin(TrainLossMonitor(sliding_win_size=jdata["train_options"]["sliding_win_size"], avg_per_iter=avg_per_iter)) # by default, avg_per_iter is false, will not be activated.
     trainer.register_plugin(LearningRateMonitor())
     trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
-    if flow_enabled:
-        for flow_stat_name in flow_scalar_fields:
-            trainer.register_plugin(
-                ScalarFieldMonitor(
-                    stat_name=flow_stat_name,
-                    interval=[(1, 'iteration'), (1, 'epoch')],
-                )
+    for flow_stat_name in flow_scalar_fields:
+        trainer.register_plugin(
+            ScalarFieldMonitor(
+                stat_name=flow_stat_name,
+                interval=[(1, 'iteration'), (1, 'epoch')],
             )
-    if validation_datasets:
+        )
+    if validation_datasets and register_legacy_validation:
         for validation_stat_name in ("validation_onsite_loss", "validation_hopping_loss"):
             if validation_stat_name not in flow_scalar_fields:
                 trainer.register_plugin(

@@ -469,7 +469,7 @@ def test_pixel_meanflow_conservative_defaults_to_paper_boundary_tangent():
     assert flow.meanflow_aux_boundary_v_weight == pytest.approx(0.0)
 
 
-def test_pixel_meanflow_du_dt_backend_is_explicit_finite_difference():
+def test_pixel_meanflow_du_dt_backend_accepts_finite_difference_and_jvp():
     flow = HamiltonianPixelMeanFlow(
         {
             "enabled": True,
@@ -480,12 +480,27 @@ def test_pixel_meanflow_du_dt_backend_is_explicit_finite_difference():
 
     assert flow.meanflow_du_dt_backend == "finite_difference"
 
-    with pytest.raises(NotImplementedError, match="finite_difference"):
+    jvp_flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"du_dt_backend": "jvp"},
+        }
+    )
+    assert jvp_flow.meanflow_du_dt_backend == "jvp"
+
+    # default stays the opt-in-free finite difference
+    default_flow = HamiltonianPixelMeanFlow(
+        {"enabled": True, "objective": "pixel_meanflow"}
+    )
+    assert default_flow.meanflow_du_dt_backend == "finite_difference"
+
+    with pytest.raises(ValueError, match="du_dt_backend"):
         HamiltonianPixelMeanFlow(
             {
                 "enabled": True,
                 "objective": "pixel_meanflow",
-                "meanflow": {"du_dt_backend": "jvp"},
+                "meanflow": {"du_dt_backend": "spectral"},
             }
         )
 
@@ -745,7 +760,9 @@ def test_validation_euler_only_compatible_maps_to_legacy_loss(monkeypatch):
 
     loss = trainer.validation(fast=True)
 
-    assert loss.item() == pytest.approx(0.0)
+    # validation() now returns the compatible legacy loss when it exists, so
+    # direct callers see the same aligned scalar Validationer reports.
+    assert loss.item() == pytest.approx(1.5)
     assert trainer.flow_cfm.sample_calls == 1
     assert "validation_flow_random_t_loss" not in trainer._last_flow_validation_state
     assert "validation_flow_t0_loss" not in trainer._last_flow_validation_state
@@ -1170,6 +1187,11 @@ def test_tensorboard_monitor_writes_epoch_validation_on_iteration_axis():
                 "last": 0.3,
                 "epoch_last_updated": 4,
             },
+            "validation_flow_one_step_loss": {
+                "epoch_mean": 0.9,
+                "last": 0.9,
+                "epoch_last_updated": 4,
+            },
         },
     )
 
@@ -1181,6 +1203,7 @@ def test_tensorboard_monitor_writes_epoch_validation_on_iteration_axis():
     assert ("validation_compatible_euler_1_loss_iter/iteration", 0.5, 4321) in writes
     assert ("validation_compatible_euler_1_onsite_loss_iter/iteration", 0.2, 4321) in writes
     assert ("validation_compatible_euler_1_hopping_loss_iter/iteration", 0.3, 4321) in writes
+    assert ("validation_flow_one_step_loss_iter/iteration", 0.9, 4321) in writes
 
 
 def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
@@ -1372,3 +1395,461 @@ def test_pixel_meanflow_sample_final_forward_opt_out():
     sampled = flow.sample(_ConstantEndpointWithBlocks(), _two_graph_batch(), num_steps=1)
     assert "node_hamil_blocks" not in sampled
     assert torch.allclose(sampled["node_features"], torch.full((3, 1), 2.0))
+
+
+# ---------------------------------------------------------------------------
+# Pixel MeanFlow validation-semantics alignment with no-CFM/CFM legacy keys
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("objective", ["pixel_meanflow", "meanflow"])
+def test_meanflow_objectives_default_validation_compatible_alignment(objective):
+    flow = build_hamiltonian_flow({"enabled": True, "objective": objective})
+
+    assert isinstance(flow, HamiltonianPixelMeanFlow)
+    assert flow.log_validation_compatible_loss is True
+    assert flow.compatible_loss_to_legacy_keys is True
+    assert 1 in {int(n) for n in flow.validation_ode_steps}
+
+
+def test_pixel_meanflow_validation_compatible_explicit_opt_out_respected():
+    flow = build_hamiltonian_flow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"log_validation_compatible_loss": False},
+        }
+    )
+
+    assert flow.log_validation_compatible_loss is False
+
+
+def test_pixel_meanflow_forces_off_unsupported_train_compatible_request(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="dptb.nnops.flow"):
+        flow = HamiltonianPixelMeanFlow(
+            {
+                "enabled": True,
+                "objective": "pixel_meanflow",
+                "meanflow": {"log_train_compatible_loss": True},
+            }
+        )
+
+    # model_in_loss pMF has no train-compatible code path; a True request must
+    # not silently register fields that would print misleading constant zeros.
+    assert flow.log_train_compatible_loss is False
+    assert any("train_compatible" in rec.message for rec in caplog.records)
+
+
+class _ValidationConstantModel:
+    """Constant x-prediction surrogate for end-to-end pMF validation."""
+
+    def eval(self):
+        return None
+
+    def __call__(self, batch):
+        out = batch.copy()
+        out["node_features"] = torch.ones_like(batch["node_h0"])
+        out["edge_features"] = torch.full_like(batch["edge_h0"], 2.0)
+        return out
+
+
+def _pixel_meanflow_validation_trainer(monkeypatch, flow_overrides=None):
+    options = {
+        "enabled": True,
+        "objective": "pixel_meanflow",
+        "mode": "residual",
+        "prior": "zero",
+        "strict_h0": True,
+        "meanflow": {"fd_eps": 1.0e-4},
+    }
+    if flow_overrides:
+        options["meanflow"].update(flow_overrides.pop("meanflow", {}))
+        options.update(flow_overrides)
+
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.dtype = torch.float32
+    trainer.model = _ValidationConstantModel()
+    trainer.flow_cfm = build_hamiltonian_flow(options)
+    trainer.validation_loader = [_FakeBatch()]
+    trainer.validation_lossfunc = _ComponentLoss()
+    trainer.iter = 5
+
+    monkeypatch.setattr(
+        trainer_module.AtomicData,
+        "to_AtomicDataDict",
+        lambda batch: _two_graph_batch(),
+    )
+    return trainer
+
+
+def test_pixel_meanflow_validation_writes_legacy_endpoint_compatible_keys(monkeypatch):
+    trainer = _pixel_meanflow_validation_trainer(monkeypatch)
+
+    loss = trainer.validation(fast=True)
+    st = trainer._last_flow_validation_state
+
+    # Legacy keys must carry the euler/endpoint blockwise compatible loss so
+    # pMF curves line up with no-CFM/CFM validation semantics, and validation()
+    # itself must return that aligned scalar rather than the flow objective.
+    assert loss.item() == pytest.approx(1.5)
+    assert st["validation_loss"].item() == pytest.approx(1.5)
+    assert st["validation_onsite_loss"].item() == pytest.approx(1.0)
+    assert st["validation_hopping_loss"].item() == pytest.approx(2.0)
+    assert st["validation_compatible_euler_1_loss"].item() == pytest.approx(1.5)
+    assert st["validation_compatible_euler_3_loss"].item() == pytest.approx(1.5)
+
+    # The meanflow objective stays observable under validation_flow_* keys and
+    # must not be what the legacy validation_loss reports.
+    assert "validation_flow_random_t_loss" in st
+    assert "validation_flow_one_step_loss" in st
+    assert st["validation_flow_random_t_loss"].item() != pytest.approx(
+        st["validation_loss"].item()
+    )
+    # one_step flow objective scalars are renamespaced under validation_flow_*
+    # so the TensorBoard prefix scan picks them up.
+    assert "validation_flow_one_step_onsite_velocity_loss" in st
+    assert not any(key.startswith("validation_one_step_flow_") for key in st)
+
+
+class _ScalarOnlyLoss(torch.nn.Module):
+    def forward(self, pred, ref):
+        return (pred["node_features"] - ref["node_features"]).abs().mean()
+
+
+def test_pixel_meanflow_validation_does_not_fabricate_missing_legacy_components(
+    monkeypatch,
+):
+    trainer = _pixel_meanflow_validation_trainer(monkeypatch)
+    trainer.validation_lossfunc = _ScalarOnlyLoss()
+
+    trainer.validation(fast=True)
+    st = trainer._last_flow_validation_state
+
+    # A scalar-only criterion has no onsite/hopping side effects: legacy
+    # component keys must stay absent instead of printing fabricated zeros.
+    assert "validation_loss" in st
+    assert "validation_onsite_loss" not in st
+    assert "validation_hopping_loss" not in st
+
+
+def test_pixel_meanflow_validation_skips_sampling_when_compatible_disabled(monkeypatch):
+    trainer = _pixel_meanflow_validation_trainer(
+        monkeypatch,
+        flow_overrides={"meanflow": {"log_validation_compatible_loss": False}},
+    )
+    sample_calls = []
+    original_sample = trainer.flow_cfm.sample
+
+    def counting_sample(model, batch, *, num_steps):
+        sample_calls.append(int(num_steps))
+        return original_sample(model, batch, num_steps=num_steps)
+
+    monkeypatch.setattr(trainer.flow_cfm, "sample", counting_sample)
+
+    trainer.validation(fast=True)
+    st = trainer._last_flow_validation_state
+
+    assert sample_calls == []
+    assert "validation_loss" not in st
+    assert "validation_onsite_loss" not in st
+    assert "validation_hopping_loss" not in st
+    assert "validation_flow_random_t_loss" in st
+
+
+def test_resolve_flow_log_fields_pixel_meanflow_drops_never_computed_fields():
+    from dptb.nnops.flow import resolve_flow_log_fields
+
+    flow = build_hamiltonian_flow({"enabled": True, "objective": "pixel_meanflow"})
+    fields, register_legacy = resolve_flow_log_fields(flow)
+
+    # pMF never computes the raw-batch train compatible loss; registering the
+    # fields would print misleading constant zeros in the terminal logger.
+    assert "train_compatible_loss" not in fields
+    assert "train_compatible_onsite_loss" not in fields
+    assert "train_compatible_hopping_loss" not in fields
+    # pMF's validation branch never emits CFM's euler flow objective or the
+    # CFM t0 key; it emits validation_flow_one_step_loss instead.
+    assert "validation_flow_t0_loss" not in fields
+    assert "validation_flow_euler_1_loss" not in fields
+    assert "validation_flow_euler_3_loss" not in fields
+    assert "validation_flow_one_step_loss" in fields
+    assert "validation_flow_random_t_loss" in fields
+    # endpoint compatible fields stay on by default and legacy keys are expected
+    assert "validation_compatible_euler_1_loss" in fields
+    assert "validation_compatible_euler_3_hopping_loss" in fields
+    assert register_legacy is True
+
+
+def test_resolve_flow_log_fields_cfm_keeps_existing_fields():
+    from dptb.nnops.flow import resolve_flow_log_fields
+
+    flow = build_hamiltonian_flow({"enabled": True, "objective": "cfm"})
+    fields, register_legacy = resolve_flow_log_fields(flow)
+
+    assert "train_compatible_loss" in fields
+    assert "validation_flow_t0_loss" in fields
+    assert "validation_flow_euler_1_loss" in fields
+    assert "validation_compatible_euler_1_loss" in fields
+    assert "validation_flow_one_step_loss" not in fields
+    assert register_legacy is True
+
+
+def test_resolve_flow_log_fields_respects_validation_compatible_opt_out():
+    from dptb.nnops.flow import resolve_flow_log_fields
+
+    flow = build_hamiltonian_flow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"log_validation_compatible_loss": False},
+        }
+    )
+    fields, register_legacy = resolve_flow_log_fields(flow)
+
+    assert not any(field.startswith("validation_compatible_") for field in fields)
+    assert register_legacy is False
+
+
+def test_resolve_flow_log_fields_disabled_flow_keeps_legacy_registration():
+    from dptb.nnops.flow import resolve_flow_log_fields
+
+    flow = build_hamiltonian_flow({"enabled": False})
+    fields, register_legacy = resolve_flow_log_fields(flow)
+
+    assert fields == []
+    assert register_legacy is True
+
+
+def test_train_entrypoint_registers_flow_fields_from_effective_flags():
+    text = Path(train_entrypoint.__file__).read_text(encoding="utf-8")
+
+    assert "resolve_flow_log_fields" in text
+
+
+# ---------------------------------------------------------------------------
+# Pixel MeanFlow JVP du/dt backend
+# ---------------------------------------------------------------------------
+
+
+def _jvp_flow_options(meanflow_overrides=None):
+    meanflow = {
+        "du_dt_backend": "jvp",
+        "aux_endpoint_weight": 0.0,
+    }
+    if meanflow_overrides:
+        meanflow.update(meanflow_overrides)
+    return {
+        "enabled": True,
+        "objective": "pixel_meanflow",
+        "mode": "residual",
+        "prior": "zero",
+        "strict_h0": True,
+        "meanflow": meanflow,
+    }
+
+
+class _TimeConditionedModel(torch.nn.Module):
+    """x-prediction surrogate that is genuinely nonlinear in state and time.
+
+    du/dt therefore has both a state-transport term (through node_h0/edge_h0)
+    and an explicit time-conditioning term (through flow_time_t/flow_time_h),
+    which is exactly what the JVP backend must reproduce against finite
+    differences.
+    """
+
+    def __init__(self, dtype=torch.float64):
+        super().__init__()
+        self.w_node = torch.nn.Parameter(torch.tensor(0.7, dtype=dtype))
+        self.w_edge = torch.nn.Parameter(torch.tensor(-0.4, dtype=dtype))
+        self.a_node = torch.nn.Parameter(torch.tensor(0.5, dtype=dtype))
+        self.a_edge = torch.nn.Parameter(torch.tensor(0.3, dtype=dtype))
+        self.grad_modes = []
+
+    def forward(self, data):
+        self.grad_modes.append(torch.is_grad_enabled())
+        data = data.copy()
+        batch = data["batch"]
+        node_t = data["flow_time_t"].index_select(0, batch).unsqueeze(-1)
+        node_h = data["flow_time_h"].index_select(0, batch).unsqueeze(-1)
+        edge_graph = batch.index_select(0, data["edge_index"][0])
+        edge_t = data["flow_time_t"].index_select(0, edge_graph).unsqueeze(-1)
+        edge_h = data["flow_time_h"].index_select(0, edge_graph).unsqueeze(-1)
+
+        node_z = data["node_h0"]
+        edge_z = data["edge_h0"]
+        data["node_features"] = (
+            self.w_node * node_z
+            + self.a_node * torch.sin(node_z) * (node_t + 0.5 * node_t.square())
+            + 0.2 * node_h * node_z.square()
+        )
+        data["edge_features"] = (
+            self.w_edge * edge_z
+            + self.a_edge * torch.cos(edge_z) * edge_t
+            + 0.1 * edge_h * edge_z
+        )
+        return data
+
+
+def _double_batch():
+    return {
+        "batch": torch.tensor([0, 0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0, 2], [1, 2]], dtype=torch.long),
+        "node_h0": torch.tensor([[0.1], [-0.2], [0.3]], dtype=torch.float64),
+        "edge_h0": torch.tensor([[0.4], [-0.1]], dtype=torch.float64),
+        "node_features": torch.zeros(3, 1, dtype=torch.float64),
+        "edge_features": torch.zeros(2, 1, dtype=torch.float64),
+    }
+
+
+def _double_ref():
+    return {
+        "batch": torch.tensor([0, 0, 1], dtype=torch.long),
+        "edge_index": torch.tensor([[0, 2], [1, 2]], dtype=torch.long),
+        "node_features": torch.tensor([[1.1], [0.6], [-0.7]], dtype=torch.float64),
+        "edge_features": torch.tensor([[0.9], [-1.3]], dtype=torch.float64),
+    }
+
+
+@pytest.mark.parametrize("jvp_tangent", ["boundary", "path"])
+def test_pixel_meanflow_jvp_matches_finite_difference_numerically(jvp_tangent):
+    torch.manual_seed(0)
+    r = torch.tensor([0.2, 0.3], dtype=torch.float64)
+    t = torch.tensor([0.55, 0.8], dtype=torch.float64)
+
+    losses = {}
+    states = {}
+    for backend, fd_eps in (("finite_difference", 1.0e-6), ("jvp", 1.0e-6)):
+        flow = HamiltonianPixelMeanFlow(
+            _jvp_flow_options({"du_dt_backend": backend, "fd_eps": fd_eps,
+                               "jvp_tangent": jvp_tangent}),
+            dtype=torch.float64,
+        )
+        model = _TimeConditionedModel()
+        loss, state = flow.loss_with_model(
+            model, _double_batch(), _double_ref(), r=r.clone(), t=t.clone()
+        )
+        losses[backend] = float(loss.item())
+        states[backend] = state
+
+    assert losses["jvp"] == pytest.approx(losses["finite_difference"], rel=1.0e-4, abs=1.0e-8)
+    for key in (
+        "train_flow_onsite_velocity_mse",
+        "train_flow_hopping_velocity_mse",
+    ):
+        assert states["jvp"][key].item() == pytest.approx(
+            states["finite_difference"][key].item(), rel=1.0e-4, abs=1.0e-8
+        )
+
+
+def test_pixel_meanflow_jvp_oracle_endpoint_has_zero_velocity_loss():
+    flow = HamiltonianPixelMeanFlow(_jvp_flow_options())
+    r = torch.tensor([0.2, 0.3])
+    t = torch.tensor([0.5, 0.7])
+
+    loss, state = flow.loss_with_model(
+        _ConstantEndpoint(), _two_graph_batch(), _two_graph_ref(), r=r, t=t
+    )
+
+    assert loss.item() == pytest.approx(0.0, abs=1.0e-6)
+    assert state["train_flow_onsite_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+    assert state["train_flow_hopping_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+@pytest.mark.parametrize(
+    ("aux_boundary_v_weight", "expected_grad_modes"),
+    [
+        (0.0, [False, True]),
+        (0.2, [True, True]),
+    ],
+)
+def test_pixel_meanflow_jvp_uses_two_model_calls_with_boundary_tangent(
+    aux_boundary_v_weight, expected_grad_modes
+):
+    flow = HamiltonianPixelMeanFlow(
+        _jvp_flow_options(
+            {"jvp_tangent": "boundary", "aux_boundary_v_weight": aux_boundary_v_weight}
+        ),
+        dtype=torch.float64,
+    )
+    model = _TimeConditionedModel()
+
+    loss, state = flow.loss_with_model(
+        model,
+        _double_batch(),
+        _double_ref(),
+        r=torch.tensor([0.2, 0.3], dtype=torch.float64),
+        t=torch.tensor([0.55, 0.8], dtype=torch.float64),
+    )
+
+    # boundary forward (no_grad iff aux weight is zero) + one jvp forward; the
+    # finite-difference third forward is gone.
+    assert model.grad_modes == expected_grad_modes
+    assert state["train_flow_du_dt_backend_jvp"].item() == pytest.approx(1.0)
+    assert state["train_flow_explicit_model_calls"].item() == pytest.approx(2.0)
+
+    loss.backward()
+    assert model.w_node.grad is not None
+    assert torch.isfinite(model.w_node.grad)
+    assert model.a_node.grad is not None
+
+
+def test_pixel_meanflow_jvp_path_tangent_uses_single_model_call():
+    flow = HamiltonianPixelMeanFlow(
+        _jvp_flow_options({"jvp_tangent": "path", "aux_boundary_v_weight": 0.0}),
+        dtype=torch.float64,
+    )
+    model = _TimeConditionedModel()
+
+    _, state = flow.loss_with_model(
+        model,
+        _double_batch(),
+        _double_ref(),
+        r=torch.tensor([0.2, 0.3], dtype=torch.float64),
+        t=torch.tensor([0.55, 0.8], dtype=torch.float64),
+    )
+
+    assert model.grad_modes == [True]
+    assert state["train_flow_explicit_model_calls"].item() == pytest.approx(1.0)
+
+
+def test_pixel_meanflow_jvp_falls_back_to_finite_difference_with_warning(
+    monkeypatch, caplog
+):
+    import logging
+
+    flow = HamiltonianPixelMeanFlow(_jvp_flow_options(), dtype=torch.float64)
+    calls = {"jvp": 0}
+
+    def boom(*args, **kwargs):
+        calls["jvp"] += 1
+        raise RuntimeError("forward AD not implemented for fake op")
+
+    monkeypatch.setattr(torch.func, "jvp", boom)
+
+    model = _TimeConditionedModel()
+    with caplog.at_level(logging.WARNING, logger="dptb.nnops.flow"):
+        loss, state = flow.loss_with_model(
+            model,
+            _double_batch(),
+            _double_ref(),
+            r=torch.tensor([0.2, 0.3], dtype=torch.float64),
+            t=torch.tensor([0.55, 0.8], dtype=torch.float64),
+        )
+
+    assert torch.isfinite(loss)
+    assert calls["jvp"] == 1
+    assert any("finite_difference" in rec.message for rec in caplog.records)
+    assert state["train_flow_du_dt_backend_jvp"].item() == pytest.approx(0.0)
+
+    # sticky fallback: the second step must not retry the broken jvp path
+    flow.loss_with_model(
+        _TimeConditionedModel(),
+        _double_batch(),
+        _double_ref(),
+        r=torch.tensor([0.2, 0.3], dtype=torch.float64),
+        t=torch.tensor([0.55, 0.8], dtype=torch.float64),
+    )
+    assert calls["jvp"] == 1

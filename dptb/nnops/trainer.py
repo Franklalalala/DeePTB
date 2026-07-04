@@ -422,6 +422,23 @@ class Trainer(BaseTrainer):
         return state
 
     @staticmethod
+    def _renamespace_flow_objective_state(flow_state, *, old_prefix, new_prefix):
+        """Re-key model-in-loss flow objective scalars under a flow namespace.
+
+        loss_with_model(prefix="validation_one_step") emits
+        validation_one_step_flow_* keys, which match neither the TensorBoard
+        prefix scan (validation_flow_*/validation_compatible_*) nor the legacy
+        namespace -- they would be accumulated but never plotted. Rename them
+        to validation_flow_one_step_* so the flow objective stays observable.
+        """
+        old = f"{old_prefix}_flow_"
+        out = {}
+        for key, value in flow_state.items():
+            if key.startswith(old):
+                out[f"{new_prefix}_{key[len(old):]}"] = value
+        return out
+
+    @staticmethod
     def _accumulate_metric_state(metric_sums, state):
         for key, value in state.items():
             if torch.is_tensor(value):
@@ -605,17 +622,25 @@ class Trainer(BaseTrainer):
                                 r=zero_t,
                                 t=one_t,
                             )
-                            flow_metric_sums["validation_flow_one_step_loss"] = (
-                                flow_metric_sums.get("validation_flow_one_step_loss", 0.0)
-                                + one_step_loss.detach()
+                            self._accumulate_metric_state(
+                                flow_metric_sums,
+                                self._renamespace_flow_objective_state(
+                                    one_step_state,
+                                    old_prefix="validation_one_step",
+                                    new_prefix="validation_flow_one_step",
+                                ),
                             )
-                            self._accumulate_metric_state(flow_metric_sums, one_step_state)
-                        for num_steps in self.flow_cfm.validation_ode_steps:
-                            sampled = self.flow_cfm.sample(
-                                self.model, original_batch, num_steps=num_steps
-                            )
-                            sampled.update(batch_info)
-                            if self.flow_cfm.log_validation_compatible_loss:
+                        # Endpoint-compatible validation: euler-sample to t=0
+                        # and score the blockwise criterion so pMF's legacy
+                        # validation_* keys stay comparable with no-CFM/CFM.
+                        # Skip the sampling entirely when compatible logging is
+                        # explicitly off -- its result has no other consumer.
+                        if self.flow_cfm.log_validation_compatible_loss:
+                            for num_steps in self.flow_cfm.validation_ode_steps:
+                                sampled = self.flow_cfm.sample(
+                                    self.model, original_batch, num_steps=num_steps
+                                )
+                                sampled.update(batch_info)
                                 legacy_prefix = (
                                     "validation"
                                     if int(num_steps) == 1
@@ -742,5 +767,12 @@ class Trainer(BaseTrainer):
         self._last_flow_validation_state = {
             key: value / divisor for key, value in flow_metric_sums.items()
         }
+        # When the endpoint-compatible pass produced a legacy validation_loss,
+        # return it: direct callers and scheduler metrics then see the same
+        # no-CFM/CFM-comparable scalar that Validationer reports, matching
+        # MultiTrainer.validation semantics. The flow objective stays under
+        # validation_flow_* keys.
+        if "validation_loss" in self._last_flow_validation_state:
+            return self._last_flow_validation_state["validation_loss"]
         return loss
 
