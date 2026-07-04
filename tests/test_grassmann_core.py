@@ -199,6 +199,20 @@ def test_from_density_loss_gradient():
     assert float(d_pred.grad.abs().max()) > 0.0
 
 
+def test_from_density_smetric_uses_ao_density_kernel():
+    # For an AO density kernel D in a non-orthogonal basis, D S D = D and the
+    # orthonormal Grassmann projector is X D X (X = S^{1/2}), NOT X^{-1} D X^{-1}.
+    # from_density must transport with X so it recovers the same subspace as H.
+    n, k = 7, 3
+    h = _rand_herm(n)
+    s = _rand_spd(n)
+    p_orth = occupied_projector(h, s, n_occ=k)          # H-route projector (orthonormal basis)
+    _x, x_inv = s_half_and_inv(s)
+    d_ao = x_inv @ p_orth @ x_inv                        # AO density kernel D = X^{-1} P X^{-1}
+    p_from_d = occupied_projector(d_ao, s, n_occ=k, from_density=True)
+    assert float(chordal_distance_sq(p_from_d, p_orth)) < 1e-8
+
+
 def test_dense_batched_over_k():
     hp = torch.stack([_rand_herm(6, complex_=True) for _ in range(4)])
     hr = hp + 0.05 * torch.stack([_rand_herm(6, complex_=True) for _ in range(4)])

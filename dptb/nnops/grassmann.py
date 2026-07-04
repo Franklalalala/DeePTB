@@ -161,7 +161,11 @@ def occupied_projector(
         eps, q = torch.linalg.eigh(h_h)
     else:
         x, x_inv = s_half_and_inv(s, eig_floor=eig_floor)
-        h_orth = hermitian_part(x_inv @ h_h @ x_inv)
+        # Hamiltonians transform as X^{-1} H X^{-1}.  An AO density kernel D obeys
+        # D S D = D and its orthonormal projector is X D X (X = S^{1/2}); using
+        # X^{-1} for a density selects the WRONG subspace in a non-orthogonal basis.
+        transport = x if from_density else x_inv
+        h_orth = hermitian_part(transport @ h_h @ transport)
         eps, q = torch.linalg.eigh(h_orth)
     u = q[:, -n_occ:] if from_density else q[:, :n_occ]  # top occupations vs lowest energies
     p = u @ u.mH
@@ -275,6 +279,7 @@ class GrassmannPResult:
     n_occ: int
     n_bands: int
     gap: Tensor
+    pred_gap: Tensor
 
 
 def grassmann_p_loss_single(
@@ -289,6 +294,8 @@ def grassmann_p_loss_single(
     gauge_mu: bool = True,
     eig_floor: float = 1.0e-10,
     from_density: bool = False,
+    min_gap: float = 0.0,
+    check_pred_gap: bool = False,
 ) -> GrassmannPResult:
     """Single-k Grassmann P-regression loss.
 
@@ -301,10 +308,10 @@ def grassmann_p_loss_single(
     * ``from_density``: treat ``h_pred``/``h_ref`` as density matrices and take the
       ``n_occ`` highest-occupation eigenvectors (DM-regression retraction).
     """
-    x_inv = None
+    x = x_inv = None
     if s is not None:
         with torch.no_grad():
-            _x, x_inv = s_half_and_inv(s.detach(), eig_floor=eig_floor)
+            x, x_inv = s_half_and_inv(s.detach(), eig_floor=eig_floor)
     sel = slice(-n_occ, None) if from_density else slice(0, n_occ)
 
     def _project(h, grad: bool):
@@ -312,7 +319,8 @@ def grassmann_p_loss_single(
         if x_inv is None:
             h_orth = h_h
         else:
-            h_orth = hermitian_part(x_inv @ h_h @ x_inv)
+            transport = x if from_density else x_inv  # X D X for density, X^{-1} H X^{-1} for H
+            h_orth = hermitian_part(transport @ h_h @ transport)
         if grad:
             eps, q = torch.linalg.eigh(h_orth)
         else:
@@ -320,6 +328,10 @@ def grassmann_p_loss_single(
                 eps, q = torch.linalg.eigh(h_orth)
         u = q[:, sel]
         return u @ u.mH, u, eps
+
+    def _boundary_gap(e: Tensor) -> Tensor:
+        b = e.shape[-1] - n_occ if from_density else n_occ  # occ/vir boundary index
+        return e[b] - e[b - 1]
 
     with torch.no_grad():
         p_ref, u_ref, eps_ref = _project(h_ref.detach(), grad=False)
@@ -343,8 +355,17 @@ def grassmann_p_loss_single(
     loss = lambda_chordal * loss_chordal + lambda_eps * loss_eps
     with torch.no_grad():
         geo = geodesic_distance(u_pred, u_ref)
-        b = eps_ref.shape[-1] - n_occ if from_density else n_occ  # occ/vir boundary index
-        gap = (eps_ref[b] - eps_ref[b - 1]).detach()
+        gap = _boundary_gap(eps_ref).detach()
+        pred_gap = _boundary_gap(eps_pred).detach()
+
+    if min_gap and float(min_gap) > 0.0:
+        kind = "occupation" if from_density else "HOMO-LUMO"
+        if (not torch.isfinite(gap)) or float(gap.abs()) < float(min_gap):
+            raise ValueError(f"reference {kind} gap {float(gap):.3g} < min_gap {float(min_gap):.3g} "
+                             "(metallic/near-degenerate: projector is ill-conditioned)")
+        if check_pred_gap and ((not torch.isfinite(pred_gap)) or float(pred_gap.abs()) < float(min_gap)):
+            raise ValueError(f"predicted {kind} gap {float(pred_gap):.3g} < min_gap {float(min_gap):.3g}")
+
     return GrassmannPResult(
         loss=loss,
         loss_chordal=loss_chordal.detach(),
@@ -353,6 +374,7 @@ def grassmann_p_loss_single(
         n_occ=int(n_occ),
         n_bands=int(eps_ref.shape[-1]),
         gap=gap,
+        pred_gap=pred_gap,
     )
 
 
@@ -378,6 +400,8 @@ def dense_grassmann_p_loss(
     max_kpoints: Optional[int] = None,
     random_kpoints: bool = False,
     from_density: bool = False,
+    min_gap: float = 0.0,
+    check_pred_gap: bool = False,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Batched (over k / matrices) Grassmann P-regression loss."""
     if h_pred.shape != h_ref.shape:
@@ -387,6 +411,8 @@ def dense_grassmann_p_loss(
     fs = None
     if s is not None:
         fs = _flatten_mats(s) if s.ndim > 2 else s.reshape((1,) + tuple(s.shape)).expand(fp.shape)
+        if fs.shape != fp.shape:
+            raise ValueError(f"S shape mismatch after flatten: {tuple(fs.shape)} vs {tuple(fp.shape)}")
 
     n_mats = fp.shape[0]
     if max_kpoints is not None and 0 < int(max_kpoints) < n_mats:
@@ -418,6 +444,8 @@ def dense_grassmann_p_loss(
                 gauge_mu=gauge_mu,
                 eig_floor=eig_floor,
                 from_density=from_density,
+                min_gap=min_gap,
+                check_pred_gap=check_pred_gap,
             )
         )
     if not results:
@@ -429,6 +457,7 @@ def dense_grassmann_p_loss(
         "grassmann_loss": loss.detach(),
         "grassmann_chordal": torch.stack([r.loss_chordal for r in results]).mean(),
         "grassmann_eps": torch.stack([torch.as_tensor(r.loss_eps) for r in results]).mean(),
+        "grassmann_pred_gap": torch.stack([r.pred_gap for r in results]).mean(),
         "grassmann_geo_dist": torch.stack([r.geo_dist for r in results]).mean(),
         "grassmann_gap": torch.stack([r.gap for r in results]).mean(),
         "grassmann_rank": fp.real.new_tensor(float(sum(r.n_occ for r in results) / len(results))),
@@ -490,14 +519,21 @@ class GrassmannPAlignLoss(nn.Module):
         coeff_base: float = 0.0,
         base_loss_options: Optional[Mapping[str, Any]] = None,
         valence_fallback: bool = True,
-        skip_on_error: bool = True,
+        skip_on_error: bool = False,
         from_density: bool = False,
+        density_key: str = "density_matrix",
+        min_gap: float = 0.0,
+        check_pred_gap: bool = False,
+        require_overlap: Optional[bool] = None,
         **kwargs,
     ) -> None:
         super().__init__()
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
         self.from_density = bool(from_density)
+        self.density_key = str(density_key)
+        self.min_gap = float(min_gap)
+        self.check_pred_gap = bool(check_pred_gap)
         self.dtype = dtype
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.idp = idp
@@ -515,6 +551,7 @@ class GrassmannPAlignLoss(nn.Module):
         self.coeff_base = float(coeff_base)
         self.valence_fallback = bool(valence_fallback)
         self.skip_on_error = bool(skip_on_error)
+        self.require_overlap = bool(self.overlap if require_overlap is None else require_overlap)
         self.last_scalar_state: Dict[str, Tensor] = {}
         self._vtab = _valence_electron_table()
 
@@ -561,10 +598,21 @@ class GrassmannPAlignLoss(nn.Module):
             z = self._get(data, AtomicDataDict.ATOMIC_NUMBERS_KEY if hasattr(AtomicDataDict, "ATOMIC_NUMBERS_KEY") else "atomic_numbers", None)
             if z is not None:
                 zs = [int(v) for v in torch.as_tensor(z).reshape(-1).tolist()]
-                nel = sum(self._vtab.get(zi, 0) for zi in zs)
+                if any(zi not in self._vtab for zi in zs):
+                    return None  # unknown species -> force explicit n_occ, never a silent guess
+                nel = sum(self._vtab[zi] for zi in zs)
                 if nel > 0 and nel % 2 == 0:
                     return nel // 2
         return None
+
+    def _num_structures(self, data: Mapping[str, Any]) -> int:
+        ptr = self._get(data, AtomicDataDict.BATCH_PTR_KEY if hasattr(AtomicDataDict, "BATCH_PTR_KEY") else "ptr", None)
+        if torch.is_tensor(ptr) and ptr.numel() >= 2:
+            return int(ptr.numel() - 1)
+        batch = self._get(data, AtomicDataDict.BATCH_KEY if hasattr(AtomicDataDict, "BATCH_KEY") else "batch", None)
+        if torch.is_tensor(batch) and batch.numel() > 0:
+            return int(batch.detach().max().item()) + 1
+        return 1
 
     def _build_hk(self, data, module, out_key) -> Tensor:
         kpts = torch.as_tensor(self.kpoints, device=self.device, dtype=self.dtype)
@@ -583,17 +631,39 @@ class GrassmannPAlignLoss(nn.Module):
             ref_data = data
         if self.h2k is None:
             raise RuntimeError("GrassmannPAlignLoss requires HR2HK and an idp.")
+        h_pred = h_ref = None
         try:
+            # This dense, single-structure path assumes one system per loss call.
+            # Reject PyG batches until per-structure HR2HK/n_occ handling exists.
+            if self._num_structures(data) != 1 or self._num_structures(ref_data) != 1:
+                raise NotImplementedError(
+                    "grassmann_p_align currently assumes one structure per loss call; use "
+                    "batch_size=1 (or implement per-structure HR2HK/n_occ before batch>1).")
             n_occ = self._resolve_n_occ(data, ref_data)
             if n_occ is None:
                 if self.skip_on_error:
                     return self._zero(None)
-                raise KeyError(f"grassmann_p_align needs `{self.n_occ_key}`, an explicit n_occ, or a valence fallback")
-            h_pred = self._build_hk(data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
-            h_ref = self._build_hk(ref_data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
+                raise KeyError(f"grassmann_p_align needs `{self.n_occ_key}`, an explicit n_occ, or a known-species valence fallback")
+            if self.from_density:
+                # DM route (dataset get_DM). Prefer an explicit dense density field;
+                # otherwise the node/edge feature slots hold density blocks under
+                # get_DM and HR2HK assembles the density the same way it assembles H.
+                dp, dr = self._get(data, self.density_key), self._get(ref_data, self.density_key)
+                if torch.is_tensor(dp) and torch.is_tensor(dr):
+                    h_pred = dp.to(device=self.device)
+                    h_ref = dr.to(device=self.device, dtype=h_pred.dtype)
+                else:
+                    h_pred = self._build_hk(data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
+                    h_ref = self._build_hk(ref_data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
+            else:
+                h_pred = self._build_hk(data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
+                h_ref = self._build_hk(ref_data, self.h2k, AtomicDataDict.HAMILTONIAN_KEY)
             s = None
             if self.overlap and self.s2k is not None:
                 s = self._build_hk(ref_data, self.s2k, AtomicDataDict.OVERLAP_KEY)
+            if self.require_overlap and s is None:
+                raise KeyError("grassmann_p_align: require_overlap is set but no overlap was assembled "
+                               "(a non-orthogonal NAO basis must not be treated as orthonormal)")
             loss, stats = dense_grassmann_p_loss(
                 h_pred, h_ref, s,
                 n_occ=n_occ,
@@ -604,10 +674,12 @@ class GrassmannPAlignLoss(nn.Module):
                 eig_floor=self.eig_floor,
                 max_kpoints=self.max_kpoints,
                 from_density=self.from_density,
+                min_gap=self.min_gap,
+                check_pred_gap=self.check_pred_gap,
             )
         except Exception:
             if self.skip_on_error:
-                return self._zero(None)
+                return self._zero(h_pred if torch.is_tensor(h_pred) else h_ref)
             raise
         self.last_scalar_state = {k: (v.detach() if torch.is_tensor(v) else torch.as_tensor(float(v))) for k, v in stats.items()}
         total = self.coeff_align * loss

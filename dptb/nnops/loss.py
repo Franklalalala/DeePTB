@@ -28,10 +28,22 @@ takes AtomicData class as input, and give AtomicData class as output.
 class Loss:
     _register = Register()
 
+    # losses whose registration lives in a side module the trainer does not import
+    # by default -> import on demand so `Loss(method=...)` can find them.
+    _LAZY_MODULES = {
+        "grassmann_p_align": "dptb.nnops.grassmann",
+        "p_regression": "dptb.nnops.grassmann",
+        "riemannian_align": "dptb.nnops.riemannian_alignment",
+        "fermi_projector_align": "dptb.nnops.riemannian_alignment",
+    }
+
     def register(target):
         return Loss._register.register(target)
-    
+
     def __new__(cls, method: str, **kwargs):
+        if method not in Loss._register.keys() and method in Loss._LAZY_MODULES:
+            import importlib
+            importlib.import_module(Loss._LAZY_MODULES[method])
         if method in Loss._register.keys():
             return Loss._register[method](**kwargs)
         else:

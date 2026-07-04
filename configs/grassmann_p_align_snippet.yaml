@@ -35,14 +35,20 @@ train_options:
       valence_fallback: true               # closed-shell: n_occ = sum(valence)/2
 
       overlap: true
+      require_overlap: true                # fail rather than silently assume an orthonormal AO basis
       eig_floor: 1.0e-10
-      skip_on_error: true                  # safe for first merge; set false once verified
+      min_gap: 1.0e-6                      # reject metallic/near-degenerate records (0 disables)
+      check_pred_gap: false                # stricter, but can reject early-training predictions
+      skip_on_error: false                 # fail closed; set true only for audited debugging
 
       # Source of the occupied subspace:
       #   from_density: false -> assemble H(k); occupied = n_occ LOWEST eigenvectors
       #                          (predict-H, supervise-P; keeps band energies via lambda_eps)
-      #   from_density: true  -> set dataset get_DM: true so the regressed field is the
-      #                          density_matrix; occupied = n_occ HIGHEST-occupation
-      #                          eigenvectors (retraction onto Grassmann). Pure subspace;
-      #                          lambda_eps is ignored.
+      #   from_density: true  -> DM route. Set dataset get_DM: true so the regressed field is
+      #                          the density; occupied = n_occ HIGHEST-occupation eigenvectors
+      #                          (retraction onto Grassmann, S-metric X D X transform). An
+      #                          explicit dense `density_key` field is used if present, else the
+      #                          density is assembled from node/edge feature blocks via HR2HK.
+      #                          Pure subspace; lambda_eps ignored.
+      density_key: density_matrix
       from_density: false
