@@ -68,6 +68,15 @@ from dptb.nnops._manifold_math import (
     regularize_overlap,
     generalized_eigh,
 )
+# Shared batched-loss book-keeping (flatten / k-selection / n_occ remap).
+from dptb.nnops._manifold_loss_base import (
+    flatten_dense_mats as _flatten_dense_mats,
+    flatten_optional_overlap as _flatten_optional_overlap,
+    select_matrix_indices as _select_matrix_indices,
+    n_occ_for_flat_index as _n_occ_for_flat_index,
+    dict_get,
+    ManifoldLossModule,
+)
 
 
 def _as_tuple_of_ints(value: Union[str, int, Iterable[int], None], default: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -270,47 +279,6 @@ def riemannian_alignment_loss_single(
     )
 
 
-def _flatten_dense_mats(x: Tensor) -> Tensor:
-    if x.ndim == 2:
-        return x.reshape((1,) + tuple(x.shape))
-    if x.ndim < 2 or x.shape[-1] != x.shape[-2]:
-        raise ValueError(f"expected dense matrices [..., n, n], got {tuple(x.shape)}")
-    return x.reshape((-1,) + tuple(x.shape[-2:]))
-
-
-def _flatten_optional_overlap(s: Optional[Tensor], like: Tensor) -> Optional[Tensor]:
-    if s is None:
-        return None
-    if s.ndim == 2:
-        return s.reshape((1,) + tuple(s.shape)).expand(like.shape)
-    return s.reshape((-1,) + tuple(s.shape[-2:]))
-
-
-def _select_matrix_indices(n_mats: int, max_kpoints: Optional[int], random_kpoints: bool, device: torch.device) -> Tensor:
-    if max_kpoints is None or int(max_kpoints) <= 0 or n_mats <= int(max_kpoints):
-        return torch.arange(n_mats, device=device, dtype=torch.long)
-    k = int(max_kpoints)
-    if random_kpoints:
-        return torch.randperm(n_mats, device=device)[:k]
-    return torch.linspace(0, n_mats - 1, steps=k, device=device).round().to(torch.long).unique()
-
-
-def _n_occ_for_flat_index(n_occ: Union[int, Tensor], i: int, n_items: int) -> int:
-    if torch.is_tensor(n_occ):
-        flat = n_occ.detach().reshape(-1).to(device="cpu", dtype=torch.long)
-        if flat.numel() == 0:
-            raise ValueError("empty n_occ tensor")
-        if flat.numel() == 1:
-            return int(flat[0].item())
-        # If one n_occ per structure rather than per k point, fall back to the
-        # nearest valid entry by proportional indexing.
-        j = min(int(i), int(flat.numel()) - 1)
-        if flat.numel() != n_items and n_items > 0:
-            j = min(int(i * flat.numel() / n_items), int(flat.numel()) - 1)
-        return int(flat[j].item())
-    return int(n_occ)
-
-
 def dense_riemannian_alignment_loss(
     h_pred: Tensor,
     h_ref: Tensor,
@@ -383,7 +351,7 @@ def dense_riemannian_alignment_loss(
 
 @Loss.register("riemannian_align")
 @Loss.register("fermi_projector_align")
-class RiemannianAlignmentLoss(nn.Module):
+class RiemannianAlignmentLoss(ManifoldLossModule, nn.Module):
     """Registered DeePTB loss for near-Fermi subspace alignment.
 
     Recommended use with CFM is as ``train_options.flow_options.auxiliary_loss``
@@ -451,12 +419,9 @@ class RiemannianAlignmentLoss(nn.Module):
         self.coeff_base = float(coeff_base)
         self.last_scalar_state: Dict[str, Tensor] = {}
 
-        self.base_loss = None
-        if base_loss_options:
-            opts = dict(base_loss_options)
-            opts.pop("enabled", None)
-            if "method" in opts:
-                self.base_loss = Loss(**opts, idp=idp, basis=basis, dtype=dtype, device=device, overlap=overlap, **kwargs)
+        self.base_loss = self._build_base_loss(
+            base_loss_options, Loss,
+            idp=idp, basis=basis, dtype=dtype, device=device, overlap=overlap, **kwargs)
 
         self.eigenvalue = None
         if use_eigenvalue_builder and Eigenvalues is not None and idp is not None:
@@ -473,12 +438,7 @@ class RiemannianAlignmentLoss(nn.Module):
                 device=device,
             )
 
-    @staticmethod
-    def _dict_get(data: Mapping[str, Any], key: str, default=None):
-        try:
-            return data[key]
-        except Exception:
-            return default
+    _dict_get = staticmethod(dict_get)  # shared, tolerant AtomicData getter
 
     def _with_dense(self, data: Mapping[str, Any]) -> Mapping[str, Any]:
         if self._dict_get(data, self.h_pred_key if self.h_pred_key != _keys.HAMILTONIAN_KEY else _keys.HAMILTONIAN_KEY) is not None:
@@ -495,10 +455,7 @@ class RiemannianAlignmentLoss(nn.Module):
         return self.n_occ
 
     def _zero_with_state(self, like: Optional[Tensor], skipped: float = 1.0) -> Tensor:
-        if like is None:
-            zero = torch.zeros((), device=self.device, dtype=self.dtype)
-        else:
-            zero = like.real.new_zeros(())
+        zero = self._zero_scalar(like)
         self.last_scalar_state = {
             "riem_align_loss": zero.detach(),
             "riem_pp_loss": zero.detach(),

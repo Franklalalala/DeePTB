@@ -64,6 +64,14 @@ from dptb.nnops._manifold_math import (
     grassmann_log,
     mcweeny_purify,
 )
+from dptb.nnops._manifold_loss_base import (
+    flatten_dense_mats,
+    flatten_optional_overlap,
+    select_matrix_indices,
+    n_occ_for_flat_index,
+    dict_get,
+    ManifoldLossModule,
+)
 
 try:
     from dptb.nnops.loss import Loss
@@ -234,14 +242,6 @@ def grassmann_p_loss_single(
     )
 
 
-def _flatten_mats(x: Tensor) -> Tensor:
-    if x.ndim == 2:
-        return x.reshape((1,) + tuple(x.shape))
-    if x.ndim < 2 or x.shape[-1] != x.shape[-2]:
-        raise ValueError(f"expected dense matrices [..., n, n], got {tuple(x.shape)}")
-    return x.reshape((-1,) + tuple(x.shape[-2:]))
-
-
 def dense_grassmann_p_loss(
     h_pred: Tensor,
     h_ref: Tensor,
@@ -263,30 +263,14 @@ def dense_grassmann_p_loss(
     """Batched (over k / matrices) Grassmann P-regression loss."""
     if h_pred.shape != h_ref.shape:
         raise ValueError(f"h_pred/h_ref shape mismatch: {tuple(h_pred.shape)} vs {tuple(h_ref.shape)}")
-    fp = _flatten_mats(h_pred)
-    fr = _flatten_mats(h_ref)
-    fs = None
-    if s is not None:
-        fs = _flatten_mats(s) if s.ndim > 2 else s.reshape((1,) + tuple(s.shape)).expand(fp.shape)
-        if fs.shape != fp.shape:
-            raise ValueError(f"S shape mismatch after flatten: {tuple(fs.shape)} vs {tuple(fp.shape)}")
+    fp = flatten_dense_mats(h_pred)
+    fr = flatten_dense_mats(h_ref)
+    fs = flatten_optional_overlap(s, fp)
+    if fs is not None and fs.shape != fp.shape:
+        raise ValueError(f"S shape mismatch after flatten: {tuple(fs.shape)} vs {tuple(fp.shape)}")
 
     n_mats = fp.shape[0]
-    if max_kpoints is not None and 0 < int(max_kpoints) < n_mats:
-        if random_kpoints:
-            idx = torch.randperm(n_mats, device=fp.device)[: int(max_kpoints)]
-        else:
-            idx = torch.linspace(0, n_mats - 1, steps=int(max_kpoints), device=fp.device).round().long().unique()
-    else:
-        idx = torch.arange(n_mats, device=fp.device)
-
-    def _n_occ_at(i: int) -> int:
-        if torch.is_tensor(n_occ):
-            fl = n_occ.reshape(-1)
-            return int(fl[min(i, fl.numel() - 1)].item())
-        if isinstance(n_occ, (list, tuple)):
-            return int(n_occ[min(i, len(n_occ) - 1)])
-        return int(n_occ)
+    idx = select_matrix_indices(n_mats, max_kpoints, random_kpoints, fp.device)
 
     results = []
     for j in idx.tolist():
@@ -294,7 +278,7 @@ def dense_grassmann_p_loss(
         results.append(
             grassmann_p_loss_single(
                 fp[int(j)], fr[int(j)], ss,
-                n_occ=_n_occ_at(int(j)),
+                n_occ=n_occ_for_flat_index(n_occ, int(j), n_mats),
                 lambda_chordal=lambda_chordal,
                 lambda_eps=lambda_eps,
                 eps_window=eps_window,
@@ -339,7 +323,7 @@ def _valence_electron_table() -> Dict[int, int]:
 
 @Loss.register("grassmann_p_align")
 @Loss.register("p_regression")
-class GrassmannPAlignLoss(nn.Module):
+class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
     """Occupied-projector (Grassmann) regression loss for non-SOC band prediction.
 
     Assembles dense ``H(k)``/``S(k)`` from predicted vs. reference features via
@@ -417,12 +401,9 @@ class GrassmannPAlignLoss(nn.Module):
         self.last_scalar_state: Dict[str, Tensor] = {}
         self._vtab = _valence_electron_table()
 
-        self.base_loss = None
-        if base_loss_options:
-            opts = dict(base_loss_options)
-            opts.pop("enabled", None)
-            if "method" in opts:
-                self.base_loss = Loss(**opts, idp=idp, basis=basis, dtype=dtype, device=device, overlap=overlap, **kwargs)
+        self.base_loss = self._build_base_loss(
+            base_loss_options, Loss,
+            idp=idp, basis=basis, dtype=dtype, device=device, overlap=overlap, **kwargs)
 
         self.h2k = self.s2k = None
         if HR2HK is not None and idp is not None:
@@ -446,12 +427,7 @@ class GrassmannPAlignLoss(nn.Module):
                     dtype=dtype, device=device,
                 )
 
-    @staticmethod
-    def _get(data: Mapping[str, Any], key: str, default=None):
-        try:
-            return data[key]
-        except Exception:
-            return default
+    _get = staticmethod(dict_get)  # shared, tolerant AtomicData getter
 
     def _atomic_numbers(self, data, ref_data):
         """Return per-atom Z as a list[int], or None.
@@ -518,7 +494,7 @@ class GrassmannPAlignLoss(nn.Module):
         return d[out_key]
 
     def _zero(self, like, skipped=1.0):
-        z = (like.real.new_zeros(()) if torch.is_tensor(like) else torch.zeros((), device=self.device, dtype=self.dtype))
+        z = self._zero_scalar(like if torch.is_tensor(like) else None)
         self.last_scalar_state = {"grassmann_loss": z.detach(), "grassmann_skipped": z.detach() + float(skipped)}
         return z
 
