@@ -284,11 +284,14 @@ truncation error at the production `fd_eps=5e-4` is at that same float-noise
 level.
 
 Key results:
-- **split keeps jvp at fd-level memory (1.08×) across all batch sizes**, so it
-  fits wherever fd fits. fused OOMs a 46 GB card by `max_samples=8`.
-  Extrapolating the fd curve (~1 GB/sample) to production bs96/ms48: fd ≈ 57 GB,
-  split ≈ 61 GB (fits an 80 GB A100), fused ≈ 125 GB (OOM). **split is what
-  makes jvp usable at production batch.**
+- **split keeps jvp at fd-level memory (1.08×) on the measured `max_samples=
+  {4,8,16}` points**, so it fits wherever fd fits there. fused OOMs a 46 GB card
+  by `max_samples=8` (measured). Extrapolating the fd curve (~1 GB/sample) to
+  production bs96/ms48 gives fd ≈ 57 GB, split ≈ 61 GB, fused ≈ 125 GB — these
+  ms48 numbers are **extrapolated, not measured** (ms48 OOMs the 46 GB L40S; it
+  needs an 80 GB A100 to measure). Treat "split fits 80 GB" as a hypothesis to
+  validate, not a benchmark. **split is what plausibly makes jvp usable at
+  production batch; confirm on a real A100 job.**
 - Time is the forward-mode tax: split +74–77%, fused +49% over fd. Optional
   `jvp_tangent="path"` drops the boundary forward (split ms4: 10.18 → 8.61 s,
   memory unchanged, still exact) but changes the tangent from the paper's
@@ -347,22 +350,45 @@ memory numbers.
 
 ## Recommendation for Hanhai bs96 pMF
 
-**Do not enable jvp for the bs96 production task.** Three independent reasons:
+This section supersedes an earlier draft that said jvp could not run on the
+production stack — the "SO2/grouped-GEMM custom ops don't support forward AD"
+blocker has since been removed (native forward_ad + the two forward-AD rules +
+the so2_cuda_ops patcher; see the production-line section above).
 
-1. Peak memory ×2.4–2.9 on the grad-carrying step — bs96 already runs with
-   strict OOM-fallback submission on A100s; the jvp backend would burn the
-   headroom that motivated the recent boundary no-grad optimization.
-2. Wall-clock is 30–40% *worse* per step on plain PyTorch ops despite one
-   fewer model call.
-3. The real stack (torch_scatter + SO2/grouped-GEMM custom ops) does not
-   support forward-mode AD today, so production jvp would silently run as
-   finite_difference anyway (correct, but pointless).
+Current state and recommendation:
 
-Where jvp *is* useful now: an accuracy oracle/canary on small batches (verify
-fd du/dt against the exact derivative when changing time-embedding
-frequencies, fd_eps, or tangent mode), and CI-side exactness tests. Keep
-`finite_difference` as the deployed backend; the validation-semantics fix in
-Part A is the production-relevant half of this change.
+- **`finite_difference` stays the default backend.** jvp is opt-in
+  (`du_dt_backend=jvp`). fd's truncation error at the production `fd_eps=5e-4`
+  is float-noise-level (~1e-7 vs the exact jvp), so fd is a fine production
+  default; jvp buys exactness, not accuracy you can currently measure a
+  training difference from.
+- **jvp no longer forces a batch reduction.** With the split mode (default)
+  its peak memory is ~1.08× fd on the measured L40S `max_samples={4,8,16}`
+  points, so it fits where fd fits. The bs96/`max_samples=48` A100 figures
+  (fd ≈ 57 GB, split ≈ 61 GB, fused ≈ 125 GB) are **extrapolated from a
+  ~1 GB/sample fit, not measured** — validate on a real A100 job before
+  relying on "fits 80 GB". The fused mode's ~2.2× memory does OOM a 46 GB card
+  by `max_samples=8` (measured).
+- **Cost of enabling jvp:** +74–77% wall clock (measured on the real
+  fused_p0+cublas kernels). Whether that's worth exactness is a training-quality
+  call, not a hard blocker.
+- **If you do a first production jvp canary run, set `jvp_fallback=false`** so a
+  fallback is a hard crash rather than a silent degrade to fd (see the
+  observability caveat below), and confirm `train_flow_du_dt_backend_jvp==1`.
+
+Observability caveat (review finding 3): a jvp→fd fallback always emits a
+one-time `WARNING ... falling back to finite_difference` on every trainer,
+including the distributed `MultiTrainer`. The per-step canary *scalar*
+(`train_flow_du_dt_backend_jvp`) is surfaced to TensorBoard by the single-GPU
+`Trainer` but **not yet threaded through `MultiTrainer`'s packed
+all-reduce/display path** — so on hanhai bs96 the live-vs-fallback signal is the
+warning log, not a TB scalar. `jvp_fallback=false` makes this moot for a canary
+run. Threading the canary through the distributed reducer is deferred (it
+touches two reduction paths and is not worth the regression risk on the
+production trainer for a diagnostic).
+
+The validation-semantics fix in Part A remains the production-relevant half of
+this change regardless of backend choice.
 
 ## Verification
 

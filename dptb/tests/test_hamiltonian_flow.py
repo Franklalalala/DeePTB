@@ -1749,7 +1749,12 @@ def test_pixel_meanflow_jvp_matches_finite_difference_numerically(jvp_tangent):
 
 
 def test_pixel_meanflow_jvp_oracle_endpoint_has_zero_velocity_loss():
-    flow = HamiltonianPixelMeanFlow(_jvp_flow_options())
+    # _ConstantEndpoint's output has no dependence on the state, so its forward
+    # tangent is legitimately None -> opt out of the require-tangents guard
+    # (that guard exists to catch real models that accidentally drop the dual).
+    flow = HamiltonianPixelMeanFlow(
+        _jvp_flow_options({"jvp_require_tangents": False})
+    )
     r = torch.tensor([0.2, 0.3])
     t = torch.tensor([0.5, 0.7])
 
@@ -1760,6 +1765,26 @@ def test_pixel_meanflow_jvp_oracle_endpoint_has_zero_velocity_loss():
     assert loss.item() == pytest.approx(0.0, abs=1.0e-6)
     assert state["train_flow_onsite_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
     assert state["train_flow_hopping_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_pixel_meanflow_jvp_require_tangents_falls_back_not_silent_zero(caplog):
+    import logging
+
+    # A dropped dual (None tangent) under the default guard must NOT be silently
+    # treated as du/dt=0; it raises inside jvp and the run falls back to fd.
+    flow = HamiltonianPixelMeanFlow(_jvp_flow_options({"jvp_require_tangents": True}))
+    with caplog.at_level(logging.WARNING, logger="dptb.nnops.flow"):
+        loss, state = flow.loss_with_model(
+            _ConstantEndpoint(),
+            _two_graph_batch(),
+            _two_graph_ref(),
+            r=torch.tensor([0.2, 0.3]),
+            t=torch.tensor([0.5, 0.7]),
+        )
+
+    assert torch.isfinite(loss)
+    assert state["train_flow_du_dt_backend_jvp"].item() == pytest.approx(0.0)
+    assert any("finite_difference" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.parametrize(

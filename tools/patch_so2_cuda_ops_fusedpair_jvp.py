@@ -51,15 +51,35 @@ def main() -> int:
         sys.stderr.write(f"not found: {src}\n")
         return 2
 
+    marker = "# DeePTB-pMF-jvp-patch:"
+    class_header = "class _FusedPairFunction(torch.autograd.Function):"
+
+    def _class_block(text):
+        # the _FusedPairFunction class body only, so idempotence/collision
+        # checks don't trip on hooks belonging to a *different* Function.
+        start = text.find(class_header)
+        if start < 0:
+            return ""
+        nxt = text.find("\nclass ", start + 1)
+        return text[start:] if nxt < 0 else text[start:nxt]
+
     txt = src.read_text()
-    if (
-        "def setup_context(ctx, inputs, output):" in txt
-        and "def jvp(ctx, *tangents):" in txt
-    ):
+    block = _class_block(txt)
+    if not block:
+        sys.stderr.write("_FusedPairFunction class not found (source drifted)\n")
+        return 3
+    if marker in block:
         print("ALREADY PATCHED")
         return 0
-
-    shutil.copy(src, str(src) + ".bak_jvp")
+    if (
+        "def setup_context(" in block
+        or "def jvp(" in block
+    ):
+        sys.stderr.write(
+            "_FusedPairFunction already has forward-AD hooks but not the DeePTB "
+            "marker; refusing an ambiguous patch (source drifted upstream)\n"
+        )
+        return 3
 
     sig_old = (
         "class _FusedPairFunction(torch.autograd.Function):\n"
@@ -79,7 +99,6 @@ def main() -> int:
     if sig_old not in txt:
         sys.stderr.write("forward-signature anchor not found (source drifted)\n")
         return 3
-    txt = txt.replace(sig_old, sig_new, 1)
 
     save_old = '''        ctx.save_for_backward(
             x,
@@ -110,6 +129,7 @@ def main() -> int:
 
     save_new = '''        return out
 
+    # DeePTB-pMF-jvp-patch: forward-AD hooks for the pixel-meanflow jvp backend
     @staticmethod
     def setup_context(ctx, inputs, output):
         (
@@ -168,10 +188,26 @@ def main() -> int:
     if save_old not in txt:
         sys.stderr.write("save/backward anchor not found (source drifted)\n")
         return 3
-    txt = txt.replace(save_old, save_new, 1)
 
-    src.write_text(txt)
-    py_compile.compile(str(src), doraise=True)
+    # Verify all anchors, build in memory, confirm the marker landed in the
+    # target class, then compile a temp file and atomically replace -- so a bad
+    # replacement or compile failure never leaves a broken editable package.
+    patched = txt.replace(sig_old, sig_new, 1).replace(save_old, save_new, 1)
+    if marker not in _class_block(patched):
+        sys.stderr.write("internal error: marker not inserted into _FusedPairFunction\n")
+        return 3
+
+    backup = Path(str(src) + ".bak_jvp")
+    if not backup.exists():
+        shutil.copy(src, backup)
+    tmp = Path(str(src) + ".jvp_tmp.py")
+    try:
+        tmp.write_text(patched)
+        py_compile.compile(str(tmp), doraise=True)
+        os.replace(str(tmp), str(src))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     print(f"PATCHED {src}")
     return 0
 

@@ -395,6 +395,10 @@ def _multi_train_impl(
         jdata["train_options"]["ddp_world_size"] = world_size
         jdata["train_options"]["ddp_rank"] = rank
 
+    # jvp du/dt backend needs eager e3nn before ANY dataset/model-side module is
+    # imported or constructed (review finding 6). Do it here, before
+    # collect_cutoffs / dataset / model build, not after the monitor config.
+    configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
     cutoff_options = collect_cutoffs(jdata)
     build_common_options = copy.deepcopy(jdata["common_options"])
     if distributed_expert:
@@ -465,8 +469,6 @@ def _multi_train_impl(
         event_enabled=jdata["train_options"].get("monitor_cuda_cache_events", None),
         event_summary_interval=jdata["train_options"].get("monitor_cuda_cache_event_summary_interval", 0),
     )
-    # jvp du/dt backend needs eager e3nn before any module is instantiated.
-    configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
 
     log.info(f"[MultiTrainer][rank={rank}] distributed_expert = {distributed_expert}")
     log.info(f"[MultiTrainer][rank={rank}] parallel_multi = {parallel_multi}")

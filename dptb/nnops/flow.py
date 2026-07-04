@@ -1196,6 +1196,25 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_jvp_memory_efficient = bool(
             mf.get("jvp_memory_efficient", True)
         )
+        # Safety switches for the jvp path (review findings 1 & 2).
+        # A None forward tangent for an active component is almost never a valid
+        # du/dt: it means a detach / no_grad island / forward-AD-unsupported op
+        # swallowed the dual. Zeroing it would silently bias the MeanFlow
+        # objective while the canary still reports jvp live, so by default we
+        # raise (the loss_with_model try/except then degrades to
+        # finite_difference if jvp_fallback=true). Synthetic constant-output
+        # test models legitimately have no tangent -> opt out there.
+        self.meanflow_jvp_require_tangents = bool(mf.get("jvp_require_tangents", True))
+        # In split mode the training primal and the du/dt tangent come from two
+        # separate forwards; if they disagree (nondeterministic routing, stateful
+        # cache) dx/dt is evaluated at the wrong point. Cheap allclose on the
+        # endpoint guards it; loose tol tolerates GPU-atomic scatter noise. A
+        # mismatch raises -> finite_difference fallback rather than silent-wrong.
+        self.meanflow_jvp_split_check_primal = bool(
+            mf.get("jvp_split_check_primal", True)
+        )
+        self.meanflow_jvp_split_check_rtol = float(mf.get("jvp_split_check_rtol", 5.0e-4))
+        self.meanflow_jvp_split_check_atol = float(mf.get("jvp_split_check_atol", 5.0e-5))
         self._meanflow_jvp_disabled = False
         self.meanflow_norm_eps = float(mf.get("norm_eps", 0.01))
         self.meanflow_norm_p = float(mf.get("norm_p", 1.0 if aggressive else 0.0))
@@ -1673,6 +1692,20 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 r=ctx.r, t=t_dual, detach_times=False,
             )
 
+        def _require_tangent(dot, primal, label: str):
+            if dot is not None:
+                return dot.detach()
+            if self.meanflow_jvp_require_tangents:
+                raise RuntimeError(
+                    "pixel meanflow jvp backend produced no forward tangent for "
+                    f"`{label}`; a module/custom autograd.Function likely dropped "
+                    "the dual tensor. Falling back to finite_difference is safer "
+                    "than treating du/dt as zero (set "
+                    "meanflow.jvp_require_tangents=false only for synthetic "
+                    "constant-output tests)."
+                )
+            return torch.zeros_like(primal)
+
         def _unpack(node_x_dual, edge_x_dual):
             n_x = n_dot = e_x = e_dot = None
             if has_node:
@@ -1682,7 +1715,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                         f"`{self.node_target_key}` for the node component."
                     )
                 n_x, n_dot = fwAD.unpack_dual(node_x_dual)
-                n_dot = n_dot.detach() if n_dot is not None else torch.zeros_like(n_x)
+                n_dot = _require_tangent(n_dot, n_x, self.node_target_key)
             if has_edge:
                 if edge_x_dual is None:
                     raise RuntimeError(
@@ -1690,8 +1723,27 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                         f"`{self.edge_target_key}` for the edge component."
                     )
                 e_x, e_dot = fwAD.unpack_dual(edge_x_dual)
-                e_dot = e_dot.detach() if e_dot is not None else torch.zeros_like(e_x)
+                e_dot = _require_tangent(e_dot, e_x, self.edge_target_key)
             return n_x, n_dot, e_x, e_dot
+
+        def _check_split_primal(label, grad_primal, dual_primal):
+            if not self.meanflow_jvp_split_check_primal:
+                return
+            if grad_primal is None or dual_primal is None:
+                return
+            if not torch.allclose(
+                dual_primal.detach(), grad_primal.detach(),
+                rtol=self.meanflow_jvp_split_check_rtol,
+                atol=self.meanflow_jvp_split_check_atol,
+            ):
+                diff = (dual_primal.detach() - grad_primal.detach()).abs()
+                max_abs = float(diff.max().item()) if diff.numel() else 0.0
+                raise RuntimeError(
+                    f"pixel meanflow split jvp primal mismatch for `{label}` "
+                    f"(max_abs={max_abs:.3g}): the no_grad dual forward did not "
+                    "match the grad-tracked primal forward, so dx/dt would be "
+                    "evaluated at the wrong point (nondeterministic routing?)."
+                )
 
         if self.meanflow_jvp_memory_efficient:
             # Split pass: primal (with reverse graph, the training signal) in a
@@ -1703,9 +1755,14 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 r=ctx.r, t=ctx.t, detach_times=True,
             )
             with torch.no_grad(), fwAD.dual_level():
-                node_xd, edge_xd = None, None
                 _, node_xd, edge_xd = _run_dual(ctx.node_state, ctx.edge_state)
-                _, node_x_dot, _, edge_x_dot = _unpack(node_xd, edge_xd)
+                node_xd_primal, node_x_dot, edge_xd_primal, edge_x_dot = _unpack(
+                    node_xd, edge_xd
+                )
+            # The dual forward's primal must equal the grad-tracked primal, else
+            # dx/dt is evaluated at a different point than the training signal.
+            _check_split_primal(self.node_target_key, node_x, node_xd_primal)
+            _check_split_primal(self.edge_target_key, edge_x, edge_xd_primal)
             return node_x, edge_x, node_x_dot, edge_x_dot
 
         # Fused pass: one grad-tracking dual forward yields primal + tangent
