@@ -230,34 +230,93 @@ production eps is float32-noise-level.
 At `max_samples=8` the dual forward OOMs a 46GB L40S (fd peak 21.2 GB →
 dual needs >44 GB), consistent with the 2.2–2.9× activation-memory law.
 
-### What still separates jvp from the production SO2 CUDA line (empirically pinned)
+### jvp now runs on the production SO2 CUDA fast line (fused_p0 + cublas_grouped)
 
-jvp runs live **only on the pure-torch ref knobs** (`streamed_m_major_ref +
-split_loop`). Both production-family CUDA backends block it at a specific
-custom op, now confirmed by measurement (not just static reasoning), natlan
-ms4:
+The production line (`so2_fusion_mode=streamed_m_major_fused_p0` +
+`mole_linear_mode=cublas_grouped`, the 998933/1027855 knobs) now runs the jvp
+backend end-to-end. What it took, in order:
 
-- **cueq line** (`streamed_m_major_cueq + cueq_indexed_linear`): fd works
-  (2.48 s / 15.1 GB at ms4); jvp dies at
-  `cuequivariance_ops_torch/indexed_linear.py:287`,
-  `torch.ops.cuequivariance.indexed_linear_B` →
-  `NotImplementedError: Cannot access storage of TensorWrapper`. The
-  cuEquivariance CUDA kernel has no forward-mode rule and reads tensor storage
-  directly, which functorch dual tensors don't have.
-- **fused_p0 line** (`streamed_m_major_fused_p0 + cublas_grouped`, the actual
-  998933/1027717/1027855 production knobs): same category
-  (`_GroupedGemmFunction` / `_PersistentGroupedP1Function`, custom
-  `autograd.Function`s without `jvp` staticmethods); not directly testable on
-  natlan because that CUDA extension does not compile there.
+1. **e3nn eager** (as above) — `configure_jvp_friendly_backends`.
+2. **native `torch.autograd.forward_ad`, not `torch.func.jvp`.** functorch
+   wraps every tensor in a storageless interpreter wrapper, so a custom
+   Function's `jvp` staticmethod cannot call a CUDA kernel that reads
+   `data_ptr()`. Native dual tensors carry real storage, so the fused-pair and
+   grouped-GEMM kernels run inside their jvp rules. (`_jvp_du_dt` in
+   `dptb/nnops/flow.py`.)
+3. **forward-AD rules on the two custom autograd.Functions**, both linear in
+   the feature input so `jvp = same op applied to the tangent`:
+   - `_GroupedGemmFunction` (`dptb/nn/cublas_grouped_gemm.py`) — bilinear in
+     (x, weight); `setup_context` + `jvp`, in-repo.
+   - `_FusedPairFunction` (external `so2_cuda_ops`, SO2 tensor product) —
+     trilinear in (x, mixed_weight, radial). Applied by
+     `tools/patch_so2_cuda_ops_fusedpair_jvp.py` (idempotent, anchored,
+     backs up the original). The so2_cuda_ops source is editable-installed;
+     re-run the patcher after any so2_cuda_ops update.
+4. **build fix** for the natlan dev box (nvcc 12.2 rejects gcc 12.3):
+   `CUDAHOSTCXX=/usr/bin/g++-11 CUDA_HOME=/usr/local/cuda-12.2`. Production
+   (hanhai) already has a working so2_cuda_ops build.
 
-The ref knobs are ~1.6× slower than cueq at equal batch, so jvp today is a
-*working exactness oracle* on the crystal stack (ref knobs, small batch), not
-a production path. Making jvp production-grade needs forward-mode support on
-those custom ops (`jvp` staticmethods for the grouped-GEMM Functions;
-upstream forward-AD for `cuequivariance.indexed_linear_B`) plus accepting the
-~2.2× dual-forward memory (≈ halving max_samples). Until a concrete accuracy
-need appears (e.g. high-frequency time embeddings where fd's phase-step
-pathology returns), finite_difference stays the production default.
+### Memory-efficient split vs fused, and the production measurement
+
+Two jvp execution modes (`meanflow.jvp_memory_efficient`, default **true**):
+
+- **split (default)**: primal in a normal grad forward + detached du/dt tangent
+  in a *separate no_grad* forward-mode pass. Forward-mode tangents free
+  layer-by-layer under no_grad, so peak memory stays ~1× (like fd). One extra
+  model call.
+- **fused**: one grad-tracking dual forward yields primal + tangent together
+  (one fewer call), but every stored activation is a primal+tangent dual → ~2.2×
+  peak.
+
+natlan L40S 46GB, real production `fused_p0 + cublas_grouped` kernels
+(`my_oeq` env), boundary tangent, per step forward+backward, median of 3 after
+warmup. `max_samples` = dynamic-batch cap (production is bs96/`max_samples=48`):
+
+| max_samples | fd s/step · peak | jvp **split** s/step · peak | jvp fused s/step · peak |
+|---:|---|---|---|
+| 4  | 5.85 · 13.3 GB | 10.18 (+74%) · **14.4 GB (1.08×)** | 8.74 (+49%) · 29.5 GB (2.21×) |
+| 8  | 9.03 · 20.3 GB | 15.96 (+77%) · **21.9 GB (1.08×)** | OOM |
+| 16 | 11.24 · 25.2 GB | 19.85 (+77%) · **27.2 GB (1.08×)** | OOM |
+
+Numeric parity vs fd (fixed r,t,seed): velocity-loss rel. diff **1.2–2.4e-7**
+at every batch size — the jvp is exact on the production kernels, and fd's
+truncation error at the production `fd_eps=5e-4` is at that same float-noise
+level.
+
+Key results:
+- **split keeps jvp at fd-level memory (1.08×) across all batch sizes**, so it
+  fits wherever fd fits. fused OOMs a 46 GB card by `max_samples=8`.
+  Extrapolating the fd curve (~1 GB/sample) to production bs96/ms48: fd ≈ 57 GB,
+  split ≈ 61 GB (fits an 80 GB A100), fused ≈ 125 GB (OOM). **split is what
+  makes jvp usable at production batch.**
+- Time is the forward-mode tax: split +74–77%, fused +49% over fd. Optional
+  `jvp_tangent="path"` drops the boundary forward (split ms4: 10.18 → 8.61 s,
+  memory unchanged, still exact) but changes the tangent from the paper's
+  instantaneous velocity to the straight-line velocity.
+
+### Backend coverage summary
+
+- **fused_p0 + cublas_grouped** (production, 998933/1027855): **jvp works** with
+  the split mode at fd-level memory (this section). Requires the two
+  forward-AD rules above + the so2_cuda_ops patcher.
+- **ref** (`streamed_m_major_ref + split_loop`, pure torch): jvp works
+  natively (no custom-op rules needed); ~1.6× slower than the fused kernels.
+- **cueq** (`streamed_m_major_cueq + cueq_indexed_linear`): **still blocked** —
+  jvp dies at `torch.ops.cuequivariance.indexed_linear_B`
+  (`Cannot access storage of TensorWrapper`); that CUDA kernel is third-party
+  (cuEquivariance) with no forward-AD rule and can't be patched from DeePTB.
+  This is not the production path, so it doesn't gate the goal; a DeePTB-side
+  autograd.Function wrapper around the cueq call (jvp = same call on the
+  tangent) would fix it if ever needed.
+
+finite_difference remains the *default* backend (`du_dt_backend` default
+`finite_difference`): jvp is opt-in. jvp's value is exactness — it removes fd's
+`O(fd_eps)` truncation / float32-cancellation error and matches the paper's
+`jvp(u_fn, (z,r,t), (v,0,1))` definition — at the cost of +74–77% wall clock.
+With the split mode its memory is now essentially free (1.08×), so enabling it
+on the production line no longer forces a batch reduction. Whether to pay the
+time for the exactness is a training-quality call; the capability is now there
+and verified on the real kernels.
 
 Memory-cap note: with `max_samples=32` the same batch (32 graphs / 48.2k
 edges) OOMs a 46GB L40S under pMF's 3-forward step — consistent with hanhai
