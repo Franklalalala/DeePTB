@@ -1763,18 +1763,27 @@ def test_pixel_meanflow_jvp_oracle_endpoint_has_zero_velocity_loss():
 
 
 @pytest.mark.parametrize(
-    ("aux_boundary_v_weight", "expected_grad_modes"),
+    ("memory_efficient", "aux_boundary_v_weight", "expected_grad_modes", "expected_calls"),
     [
-        (0.0, [False, True]),
-        (0.2, [True, True]),
+        # fused: boundary + one grad dual forward (primal+tangent together)
+        (False, 0.0, [False, True], 2.0),
+        (False, 0.2, [True, True], 2.0),
+        # split (default): boundary + grad primal + no_grad tangent forward.
+        # The extra no_grad forward keeps peak memory ~1x instead of ~2.2x.
+        (True, 0.0, [False, True, False], 3.0),
+        (True, 0.2, [True, True, False], 3.0),
     ],
 )
-def test_pixel_meanflow_jvp_uses_two_model_calls_with_boundary_tangent(
-    aux_boundary_v_weight, expected_grad_modes
+def test_pixel_meanflow_jvp_model_call_pattern_with_boundary_tangent(
+    memory_efficient, aux_boundary_v_weight, expected_grad_modes, expected_calls
 ):
     flow = HamiltonianPixelMeanFlow(
         _jvp_flow_options(
-            {"jvp_tangent": "boundary", "aux_boundary_v_weight": aux_boundary_v_weight}
+            {
+                "jvp_tangent": "boundary",
+                "aux_boundary_v_weight": aux_boundary_v_weight,
+                "jvp_memory_efficient": memory_efficient,
+            }
         ),
         dtype=torch.float64,
     )
@@ -1788,11 +1797,9 @@ def test_pixel_meanflow_jvp_uses_two_model_calls_with_boundary_tangent(
         t=torch.tensor([0.55, 0.8], dtype=torch.float64),
     )
 
-    # boundary forward (no_grad iff aux weight is zero) + one jvp forward; the
-    # finite-difference third forward is gone.
     assert model.grad_modes == expected_grad_modes
     assert state["train_flow_du_dt_backend_jvp"].item() == pytest.approx(1.0)
-    assert state["train_flow_explicit_model_calls"].item() == pytest.approx(2.0)
+    assert state["train_flow_explicit_model_calls"].item() == pytest.approx(expected_calls)
 
     loss.backward()
     assert model.w_node.grad is not None
@@ -1800,9 +1807,24 @@ def test_pixel_meanflow_jvp_uses_two_model_calls_with_boundary_tangent(
     assert model.a_node.grad is not None
 
 
-def test_pixel_meanflow_jvp_path_tangent_uses_single_model_call():
+@pytest.mark.parametrize(
+    ("memory_efficient", "expected_grad_modes", "expected_calls"),
+    [
+        (False, [True], 1.0),
+        (True, [True, False], 2.0),
+    ],
+)
+def test_pixel_meanflow_jvp_path_tangent_call_pattern(
+    memory_efficient, expected_grad_modes, expected_calls
+):
     flow = HamiltonianPixelMeanFlow(
-        _jvp_flow_options({"jvp_tangent": "path", "aux_boundary_v_weight": 0.0}),
+        _jvp_flow_options(
+            {
+                "jvp_tangent": "path",
+                "aux_boundary_v_weight": 0.0,
+                "jvp_memory_efficient": memory_efficient,
+            }
+        ),
         dtype=torch.float64,
     )
     model = _TimeConditionedModel()
@@ -1815,8 +1837,8 @@ def test_pixel_meanflow_jvp_path_tangent_uses_single_model_call():
         t=torch.tensor([0.55, 0.8], dtype=torch.float64),
     )
 
-    assert model.grad_modes == [True]
-    assert state["train_flow_explicit_model_calls"].item() == pytest.approx(1.0)
+    assert model.grad_modes == expected_grad_modes
+    assert state["train_flow_explicit_model_calls"].item() == pytest.approx(expected_calls)
 
 
 @pytest.mark.parametrize(

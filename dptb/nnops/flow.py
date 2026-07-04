@@ -1185,6 +1185,17 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_jvp_fallback = bool(
             mf.get("jvp_fallback", mf.get("jvp_fallback_to_finite_difference", True))
         )
+        # Memory-efficient jvp: compute the primal (training signal) in a normal
+        # grad forward and the detached du/dt tangent in a separate no_grad
+        # forward-mode pass, instead of one fused dual forward. The fused pass
+        # stores every activation as a primal+tangent dual (~2.2x peak); the
+        # split pass keeps only the primal reverse graph (~1x, like
+        # finite_difference) because forward-mode tangents free layer-by-layer
+        # under no_grad. Costs one extra model call. Default on: production is
+        # memory-bound (bs96 must fit the card).
+        self.meanflow_jvp_memory_efficient = bool(
+            mf.get("jvp_memory_efficient", True)
+        )
         self._meanflow_jvp_disabled = False
         self.meanflow_norm_eps = float(mf.get("norm_eps", 0.01))
         self.meanflow_norm_p = float(mf.get("norm_p", 1.0 if aggressive else 0.0))
@@ -1643,57 +1654,66 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         has_node = ctx.node_state is not None
         has_edge = ctx.edge_state is not None
 
-        with fwAD.dual_level():
+        def _run_dual(node_state, edge_state):
             node_dual = (
-                fwAD.make_dual(ctx.node_state, node_tangent.detach())
+                fwAD.make_dual(node_state, node_tangent.detach())
                 if has_node
                 else None
             )
             edge_dual = (
-                fwAD.make_dual(ctx.edge_state, edge_tangent.detach())
+                fwAD.make_dual(edge_state, edge_tangent.detach())
                 if has_edge
                 else None
             )
             # (dz/dt, dr/dt, dt/dt) = (tangent, 0, 1): only t carries a unit
             # tangent; r stays primal.
             t_dual = fwAD.make_dual(ctx.t, torch.ones_like(ctx.t))
-            _, node_x_dual, edge_x_dual = self._predict_clean(
-                model,
-                data,
-                ctx,
-                node_dual,
-                edge_dual,
-                r=ctx.r,
-                t=t_dual,
-                detach_times=False,
+            return self._predict_clean(
+                model, data, ctx, node_dual, edge_dual,
+                r=ctx.r, t=t_dual, detach_times=False,
             )
 
-            node_x = edge_x = node_x_dot = edge_x_dot = None
+        def _unpack(node_x_dual, edge_x_dual):
+            n_x = n_dot = e_x = e_dot = None
             if has_node:
                 if node_x_dual is None:
                     raise RuntimeError(
                         "pixel meanflow jvp backend requires the model to emit "
                         f"`{self.node_target_key}` for the node component."
                     )
-                node_x, node_dot = fwAD.unpack_dual(node_x_dual)
-                node_x_dot = (
-                    node_dot.detach()
-                    if node_dot is not None
-                    else torch.zeros_like(node_x)
-                )
+                n_x, n_dot = fwAD.unpack_dual(node_x_dual)
+                n_dot = n_dot.detach() if n_dot is not None else torch.zeros_like(n_x)
             if has_edge:
                 if edge_x_dual is None:
                     raise RuntimeError(
                         "pixel meanflow jvp backend requires the model to emit "
                         f"`{self.edge_target_key}` for the edge component."
                     )
-                edge_x, edge_dot = fwAD.unpack_dual(edge_x_dual)
-                edge_x_dot = (
-                    edge_dot.detach()
-                    if edge_dot is not None
-                    else torch.zeros_like(edge_x)
-                )
+                e_x, e_dot = fwAD.unpack_dual(edge_x_dual)
+                e_dot = e_dot.detach() if e_dot is not None else torch.zeros_like(e_x)
+            return n_x, n_dot, e_x, e_dot
 
+        if self.meanflow_jvp_memory_efficient:
+            # Split pass: primal (with reverse graph, the training signal) in a
+            # normal forward, then the detached du/dt tangent in a no_grad
+            # forward-mode pass whose activations free layer-by-layer. Peak
+            # memory stays ~1x (like finite_difference) instead of ~2.2x.
+            _, node_x, edge_x = self._predict_clean(
+                model, data, ctx, ctx.node_state, ctx.edge_state,
+                r=ctx.r, t=ctx.t, detach_times=True,
+            )
+            with torch.no_grad(), fwAD.dual_level():
+                node_xd, edge_xd = None, None
+                _, node_xd, edge_xd = _run_dual(ctx.node_state, ctx.edge_state)
+                _, node_x_dot, _, edge_x_dot = _unpack(node_xd, edge_xd)
+            return node_x, edge_x, node_x_dot, edge_x_dot
+
+        # Fused pass: one grad-tracking dual forward yields primal + tangent
+        # together (one fewer model call, but every stored activation is a
+        # primal+tangent dual -> ~2.2x peak memory).
+        with fwAD.dual_level():
+            _, node_x_dual, edge_x_dual = _run_dual(ctx.node_state, ctx.edge_state)
+            node_x, node_x_dot, edge_x, edge_x_dot = _unpack(node_x_dual, edge_x_dual)
         # unpack_dual's primal keeps the reverse-mode grad_fn built inside the
         # dual level, so node_x/edge_x remain valid training signals here.
         return node_x, edge_x, node_x_dot, edge_x_dot
@@ -1752,7 +1772,9 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 node_x, edge_x, node_x_dot, edge_x_dot = self._jvp_du_dt(
                     model, data, ctx, node_tangent, edge_tangent
                 )
-                explicit_model_calls += 1
+                # split (memory-efficient) does primal + tangent forwards;
+                # fused does one combined dual forward.
+                explicit_model_calls += 2 if self.meanflow_jvp_memory_efficient else 1
             except Exception as exc:
                 if not self.meanflow_jvp_fallback:
                     raise
