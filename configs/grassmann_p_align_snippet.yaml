@@ -1,0 +1,39 @@
+# Grassmann occupied-projector (P) regression loss for non-SOC band prediction.
+#
+# This is a NORMAL train loss (no CFM): the standard train_lossfunc path picks it
+# up directly, so no flow-auxiliary wiring is needed.  The model still predicts
+# Hamiltonian matrix elements; the training signal is the Grassmann distance of
+# the occupied subspace (plus an optional occupied-eigenvalue term for band
+# energies).  Merge this into the `loss_options` block of a non-SOC config.
+train_options:
+  loss_options:
+    train:
+      method: grassmann_p_align          # alias: p_regression
+
+      # Overall scaling and an optional element-wise base loss to keep the
+      # matrix-element trunk anchored (coeff_base > 0 => hybrid; 0 => pure P).
+      coeff_align: 1.0
+      coeff_base: 0.0
+      base_loss_options:
+        method: hamil_abs                 # anchor; only used if coeff_base > 0
+
+      # Grassmann objective.
+      lambda_chordal: 1.0                  # occupied-subspace chordal distance (smooth loss)
+      lambda_eps: 0.1                      # occupied(+window) eigenvalue match -> band energies
+      eps_window: 8                        # virtual bands above HOMO included in the eps term
+      gauge_mu: true                       # remove a scalar Fermi shift (VBM-alignment analogue)
+
+      # k-points where P is defined (fractional coords).  Gamma-only to start;
+      # widen to a small set for band-path-aware supervision.
+      kpoints:
+        - [0.0, 0.0, 0.0]
+      max_kpoints: null                    # subsample if the k-list is large
+
+      # n_occ resolution: dataset key -> explicit scalar -> valence-electron table.
+      n_occ_key: n_occ
+      n_occ: null
+      valence_fallback: true               # closed-shell: n_occ = sum(valence)/2
+
+      overlap: true
+      eig_floor: 1.0e-10
+      skip_on_error: true                  # safe for first merge; set false once verified
