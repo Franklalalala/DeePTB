@@ -367,6 +367,11 @@ class HamiltonianProductSplitFlow(HamiltonianCFM):
             f"{prefix}_flow_du_dt_backend_jvp": ctx.t.new_tensor(0.0),  # this objective uses no jvp
             f"{prefix}_flow_explicit_model_calls": ctx.t.new_tensor(1.0),
         })
+        # super().loss() stashes a nested dict `_compatible_clean_stats` (for the
+        # model_in_loss=False compatible-loss path); the model_in_loss validation metric
+        # accumulator (trainer._accumulate_metric_state) sums values, so drop any
+        # non-tensor entry -- pMF's loss_with_model likewise emits only tensor scalars.
+        state = {k: v for k, v in state.items() if torch.is_tensor(v)}
         self.last_state = state
         return total, state
 
