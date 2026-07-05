@@ -665,6 +665,11 @@ class LMDBDataset(AtomicDataset):
             and blocks is not False
             and blocks is not None
             and AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY not in atomicdata
+            # SOC uses the SOC-aware RME feature path (block_to_feature above); the AO
+            # block-wise side channel (block_dict_to_ordered_tensors) is a non-SOC-only
+            # loss helper, so skip it for SOC rather than tripping its has_soc guard and
+            # aborting the whole load.
+            and not bool(getattr(self.type_mapper, "has_soc", False))
         ):
             from dptb.data.interfaces.blockwise_tensor import attach_block_tensors, block_dict_to_ordered_tensors
 
@@ -683,6 +688,8 @@ class LMDBDataset(AtomicDataset):
             self.get_H0
             and h0_blocks is not None
             and AtomicDataDict.NODE_H0_BLOCKS_KEY not in atomicdata
+            # See note above: skip the non-SOC block-wise side channel for SOC data.
+            and not bool(getattr(self.type_mapper, "has_soc", False))
         ):
             from dptb.data.interfaces.blockwise_tensor import attach_block_tensors, block_dict_to_ordered_tensors
 
