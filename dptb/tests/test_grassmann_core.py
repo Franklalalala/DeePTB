@@ -230,6 +230,42 @@ def test_from_density_smetric_uses_ao_density_kernel():
     assert float(chordal_distance_sq(p_from_d, p_orth)) < 1e-8
 
 
+def _gapped_H(gap, n=8, n_occ=3, seed=0):
+    # occupied block near -1..-2, virtual block starting `gap` above the HOMO
+    g = torch.Generator().manual_seed(seed)
+    w = torch.cat([torch.linspace(-2.0, -1.0, n_occ), torch.linspace(-1.0 + gap, 1.0, n - n_occ)])
+    q, _ = torch.linalg.qr(torch.randn(n, n, generator=g, dtype=torch.float64))
+    return (q * w) @ q.mT
+
+
+def test_soft_pred_gap_bounds_gradient_without_dropping():
+    # A transiently metallic PREDICTED spectrum makes the eigh eigenvector gradient blow
+    # up like 1/gap. soft_pred_gap (default) must keep the record but bound the gradient;
+    # a healthy gap must be untouched (weight == 1).
+    h_ref = _gapped_H(1.0, seed=1)
+    def grad_and_weight(pred_gap, soft):
+        hp = _gapped_H(pred_gap, seed=2).clone().requires_grad_(True)
+        res = grassmann_p_loss_single(hp, h_ref, None, n_occ=3, lambda_chordal=1.0, lambda_eps=0.0,
+                                      min_gap=0.05, check_pred_gap=False, soft_pred_gap=soft)
+        res.loss.backward()
+        return float(hp.grad.abs().max()), float(res.gap_weight)
+    g_off, _ = grad_and_weight(0.001, soft=False)
+    g_soft, w_soft = grad_and_weight(0.001, soft=True)
+    assert g_off > 10.0                       # unprotected: genuinely spikes
+    assert g_soft < 1.0                        # soft: bounded (weight ~ (gap/min_gap)^2)
+    assert w_soft < 0.01
+    _, w_healthy = grad_and_weight(1.0, soft=True)
+    assert abs(w_healthy - 1.0) < 1e-12        # healthy gap: no down-weighting
+
+
+def test_soft_pred_gap_off_for_healthy_and_reported():
+    h_ref = _gapped_H(1.0, seed=3)
+    h_pred = (_gapped_H(1.0, seed=4)).clone().requires_grad_(True)
+    _, stats = dense_grassmann_p_loss(h_pred, h_ref, None, n_occ=3, lambda_chordal=1.0,
+                                      min_gap=0.05)
+    assert abs(float(stats["grassmann_gap_weight"]) - 1.0) < 1e-9
+
+
 def test_dense_batched_over_k():
     hp = torch.stack([_rand_herm(6, complex_=True) for _ in range(4)])
     hr = hp + 0.05 * torch.stack([_rand_herm(6, complex_=True) for _ in range(4)])

@@ -1985,7 +1985,12 @@ def loss_options():
         Argument("min_gap", float, optional=True, default=0.0,
                  doc="Reject metallic/near-degenerate records with HOMO-LUMO gap below this (0 disables)."),
         Argument("check_pred_gap", bool, optional=True, default=False,
-                 doc="Also enforce min_gap on the predicted spectrum (can reject early training). Default: False"),
+                 doc="Hard-skip a record whose PREDICTED occ/vir gap is below min_gap (strict; can reject "
+                     "early training). Default: False -- prefer the smooth soft_pred_gap instead."),
+        Argument("soft_pred_gap", bool, optional=True, default=True,
+                 doc="Smoothly down-weight the chordal term by (pred_gap/min_gap)^2 when the predicted gap "
+                     "falls below min_gap, so the 1/gap eigh gradient stays bounded without dropping the "
+                     "record (needs min_gap>0; ignored if check_pred_gap is set). Default: True"),
         Argument("chordal_normalize", bool, optional=True, default=False,
                  doc="Divide the chordal term by n_occ so its magnitude is size-invariant across systems. Default: False"),
         Argument("eig_floor", float, optional=True, default=1.0e-10,

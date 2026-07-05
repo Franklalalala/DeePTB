@@ -771,6 +771,16 @@ class Trainer(BaseTrainer):
                     batch_for_loss.update(batch_info)
                     batch_loss = self.validation_lossfunc(batch, batch_for_loss)
                     loss += batch_loss
+                    # Publish a bare `validation_loss` symmetric to the top-level
+                    # `train_loss` (mirroring the CFM path's legacy_prefix key), so the
+                    # train/validation loss curves pair up and validation() returns this
+                    # explicit scalar. For a non-flow loss the model prediction already IS
+                    # the endpoint, so this equals the train-side quantity (no random-t /
+                    # ODE gap to reconcile the way the CFM objective needs).
+                    self._accumulate_metric_state(
+                        flow_metric_sums,
+                        {"validation_loss": batch_loss.detach()},
+                    )
                     self._accumulate_metric_state(
                         flow_metric_sums,
                         self._loss_component_state(

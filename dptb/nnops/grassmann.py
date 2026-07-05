@@ -138,6 +138,7 @@ class GrassmannPResult:
     n_bands: int
     gap: Tensor
     pred_gap: Tensor
+    gap_weight: Tensor
 
 
 def grassmann_p_loss_single(
@@ -154,6 +155,7 @@ def grassmann_p_loss_single(
     from_density: bool = False,
     min_gap: float = 0.0,
     check_pred_gap: bool = False,
+    soft_pred_gap: bool = True,
     chordal_normalize: bool = False,
 ) -> GrassmannPResult:
     """Single-k Grassmann P-regression loss.
@@ -166,6 +168,14 @@ def grassmann_p_loss_single(
       Not meaningful when ``from_density=True`` (occupations, not energies).
     * ``from_density``: treat ``h_pred``/``h_ref`` as density matrices and take the
       ``n_occ`` highest-occupation eigenvectors (DM-regression retraction).
+    * ``soft_pred_gap`` (default): when a scale ``min_gap`` is set and the *predicted*
+      occ/vir gap falls below it, multiply the chordal term by a detached weight
+      ``(gap/min_gap)^2 in [0,1)`` so the ``eigh`` eigenvector gradient (which scales
+      like ``1/gap``) stays bounded (``~ gap -> 0``) instead of spiking on an early,
+      transiently metallic prediction.  The record is kept, not dropped; the eigenvalue
+      term (gradient-safe, and what actually drives the gap open) keeps full weight.
+      This is the smooth alternative to ``check_pred_gap`` (which hard-skips).  Ignored
+      when ``check_pred_gap`` is set (strict wins) or ``min_gap == 0``.
     """
     x = x_inv = None
     if s is not None:
@@ -196,12 +206,41 @@ def grassmann_p_loss_single(
         p_ref, u_ref, eps_ref = _project(h_ref.detach(), grad=False)
     p_pred, u_pred, eps_pred = _project(h_pred, grad=True)
 
+    with torch.no_grad():
+        gap = _boundary_gap(eps_ref).detach()
+        pred_gap = _boundary_gap(eps_pred).detach()
+
+    # Guards keyed to the occ/vir boundary gap (where the eigh eigenvector gradient
+    # ~1/gap lives).  A metallic *reference* target is always unusable (skip); a
+    # metallic *predicted* spectrum is either hard-skipped (check_pred_gap) or, by
+    # default, softly down-weighted below (soft_pred_gap) so the record is kept.
+    if min_gap and float(min_gap) > 0.0:
+        kind = "occupation" if from_density else "HOMO-LUMO"
+        if (not torch.isfinite(gap)) or float(gap.abs()) < float(min_gap):
+            raise SkippableRecord(f"reference {kind} gap {float(gap):.3g} < min_gap {float(min_gap):.3g} "
+                                  "(metallic/near-degenerate: projector is ill-conditioned)")
+        if check_pred_gap and ((not torch.isfinite(pred_gap)) or float(pred_gap.abs()) < float(min_gap)):
+            raise SkippableRecord(f"predicted {kind} gap {float(pred_gap):.3g} < min_gap {float(min_gap):.3g}")
+
     loss_chordal = chordal_distance_sq(p_pred, p_ref)
     # Raw chordal = sum_i sin^2(theta_i) in [0, n_occ]; its magnitude therefore grows
     # with n_occ / system size, which distorts the effective LR when mixing systems of
     # different size (or against a fixed-coeff base loss).  Optionally normalize per
     # occupied state so the term is O(1) regardless of size.
     chordal_term = loss_chordal / max(int(n_occ), 1) if chordal_normalize else loss_chordal
+
+    # Soft predicted-gap floor: bound the 1/gap eigenvector gradient of the chordal term
+    # without dropping a transiently-metallic prediction.  w = (gap/min_gap)^2 clamped to
+    # [0,1] is detached, so it scales the chordal gradient by ~gap^2 -> the effective
+    # gradient magnitude ~ gap stays finite as the predicted gap closes; w=1 (no effect)
+    # once the gap is healthy.
+    gap_weight = h_pred.real.new_ones(())
+    if soft_pred_gap and not check_pred_gap and min_gap and float(min_gap) > 0.0:
+        if torch.isfinite(pred_gap):
+            gap_weight = (pred_gap.abs() / float(min_gap)).clamp(max=1.0).to(gap_weight.dtype) ** 2
+        else:
+            gap_weight = h_pred.real.new_zeros(())
+    chordal_term = chordal_term * gap_weight.detach()
 
     loss_eps = h_pred.real.new_zeros(())
     if lambda_eps != 0.0 and not from_density:
@@ -219,16 +258,6 @@ def grassmann_p_loss_single(
     loss = lambda_chordal * chordal_term + lambda_eps * loss_eps
     with torch.no_grad():
         geo = geodesic_distance(u_pred, u_ref)
-        gap = _boundary_gap(eps_ref).detach()
-        pred_gap = _boundary_gap(eps_pred).detach()
-
-    if min_gap and float(min_gap) > 0.0:
-        kind = "occupation" if from_density else "HOMO-LUMO"
-        if (not torch.isfinite(gap)) or float(gap.abs()) < float(min_gap):
-            raise SkippableRecord(f"reference {kind} gap {float(gap):.3g} < min_gap {float(min_gap):.3g} "
-                                  "(metallic/near-degenerate: projector is ill-conditioned)")
-        if check_pred_gap and ((not torch.isfinite(pred_gap)) or float(pred_gap.abs()) < float(min_gap)):
-            raise SkippableRecord(f"predicted {kind} gap {float(pred_gap):.3g} < min_gap {float(min_gap):.3g}")
 
     return GrassmannPResult(
         loss=loss,
@@ -239,6 +268,7 @@ def grassmann_p_loss_single(
         n_bands=int(eps_ref.shape[-1]),
         gap=gap,
         pred_gap=pred_gap,
+        gap_weight=gap_weight.detach(),
     )
 
 
@@ -258,6 +288,7 @@ def dense_grassmann_p_loss(
     from_density: bool = False,
     min_gap: float = 0.0,
     check_pred_gap: bool = False,
+    soft_pred_gap: bool = True,
     chordal_normalize: bool = False,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Batched (over k / matrices) Grassmann P-regression loss."""
@@ -287,6 +318,7 @@ def dense_grassmann_p_loss(
                 from_density=from_density,
                 min_gap=min_gap,
                 check_pred_gap=check_pred_gap,
+                soft_pred_gap=soft_pred_gap,
                 chordal_normalize=chordal_normalize,
             )
         )
@@ -300,6 +332,7 @@ def dense_grassmann_p_loss(
         "grassmann_chordal": torch.stack([r.loss_chordal for r in results]).mean(),
         "grassmann_eps": torch.stack([torch.as_tensor(r.loss_eps) for r in results]).mean(),
         "grassmann_pred_gap": torch.stack([r.pred_gap for r in results]).mean(),
+        "grassmann_gap_weight": torch.stack([r.gap_weight for r in results]).mean(),
         "grassmann_geo_dist": torch.stack([r.geo_dist for r in results]).mean(),
         "grassmann_gap": torch.stack([r.gap for r in results]).mean(),
         "grassmann_rank": fp.real.new_tensor(float(sum(r.n_occ for r in results) / len(results))),
@@ -367,6 +400,7 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
         density_key: str = "density_matrix",
         min_gap: float = 0.0,
         check_pred_gap: bool = False,
+        soft_pred_gap: bool = True,
         chordal_normalize: bool = False,
         require_overlap: Optional[bool] = None,
         **kwargs,
@@ -378,6 +412,7 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
         self.density_key = str(density_key)
         self.min_gap = float(min_gap)
         self.check_pred_gap = bool(check_pred_gap)
+        self.soft_pred_gap = bool(soft_pred_gap)
         self.chordal_normalize = bool(chordal_normalize)
         self.dtype = dtype
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
@@ -549,6 +584,7 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
                 from_density=self.from_density,
                 min_gap=self.min_gap,
                 check_pred_gap=self.check_pred_gap,
+                soft_pred_gap=self.soft_pred_gap,
             )
         except SkippableRecord as exc:
             # Expected physical/data skip (metallic gap, missing overlap, unresolved
