@@ -19,7 +19,7 @@ for the product-manifold flow story.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,16 +68,41 @@ class Manifold(ABC):
     def parallel_transport(self, x: Tensor, y: Tensor, v: Tensor) -> Tensor:
         """Parallel-transport tangent ``v`` at ``x`` along the geodesic to ``y``."""
 
+    # --- tangent / point algebra (tensor defaults; ProductManifold overrides) --- #
+    # These route the raw arithmetic the flow losses used to do inline (``c * v``,
+    # ``a - b``, ``x.detach()``) through the manifold, so a ``ProductManifold`` whose
+    # points/tangents are *tuples* can dispatch component-wise while the single-tensor
+    # manifolds keep byte-for-byte identical behavior.
+    def scale_tangent(self, v: Tensor, c: "float | Tensor") -> Tensor:
+        """Scalar (or leading-batch time) times a tangent, broadcast-safe."""
+        return scale_like(c, v) * v
+
+    def tangent_sub(self, a: Tensor, b: Tensor) -> Tensor:
+        """Tangent difference ``a - b`` (same base point)."""
+        return a - b
+
+    def detach_point(self, x: Tensor) -> Tensor:
+        return x.detach()
+
+    def detach_tangent(self, v: Tensor) -> Tensor:
+        return v.detach()
+
+    def distance_sq(self, x: Tensor, y: Tensor) -> Tensor:
+        """Squared distance used as a *loss* (smooth default: geodesic^2; overridden)."""
+        return self.geodesic_distance(x, y) ** 2
+
     # --- provided for free -------------------------------------------------- #
     def geodesic_interpolant(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tensor:
         """Point on the geodesic from ``x0`` to ``x1`` at time ``t`` in [0, 1].
 
         ``t`` may be a scalar or a leading-batch ``[B]`` tensor; it is reshaped to
         broadcast over the tangent (a bare ``[B]`` cannot multiply a ``[B, N, K]``
-        tangent otherwise).
+        tangent otherwise).  Uses ``scale_tangent`` so a product manifold dispatches
+        the scaling component-wise (identical to ``scale_like(t, delta) * delta`` for a
+        single-tensor manifold).
         """
         delta = self.log_map(x0, x1)
-        return self.projx(self.exp_map(x0, scale_like(t, delta) * delta))
+        return self.projx(self.exp_map(x0, self.scale_tangent(delta, t)))
 
     def geodesic_with_tangent(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
         """Return ``(x_t, dx_t/dt)`` in one forward pass via ``torch.func.jvp``.
@@ -135,6 +160,10 @@ class GrassmannManifold(Manifold):
     def chordal_distance_sq(self, x: Tensor, y: Tensor) -> Tensor:
         """Chordal distance on the derived projectors -- the smooth training distance."""
         return chordal_distance_sq(self.to_projector(x), self.to_projector(y))
+
+    def distance_sq(self, x: Tensor, y: Tensor) -> Tensor:
+        """The Grassmann *loss* distance is chordal (smooth at the optimum)."""
+        return self.chordal_distance_sq(x, y)
 
     def geodesic_with_tangent(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
         """Closed-form ``(x_t, dx_t/dt)`` along the Grassmann geodesic (NaN-safe at t=0/1).
@@ -194,6 +223,142 @@ class GrassmannManifold(Manifold):
         return u @ u.mH
 
 
+class EuclideanManifold(Manifold):
+    """Flat ``R^d`` (or a block of Hamiltonian RMEs) -- the delta-H factor of the product.
+
+    Straight-line geodesics, trivial transport, identity projections.  ``event_ndim``
+    is the number of trailing axes that form one point (1 for a feature vector, 2 for a
+    dense ``[N, N]`` block); everything to the left is a preserved batch axis, matching
+    the Grassmann convention (distances/metrics reduce only the event axes).
+    """
+
+    def __init__(self, event_ndim: int = 1):
+        self.event_ndim = int(event_ndim)
+
+    def _event_dims(self) -> Tuple[int, ...]:
+        return tuple(range(-self.event_ndim, 0))
+
+    def exp_map(self, x: Tensor, u: Tensor) -> Tensor:
+        return x + u
+
+    def log_map(self, x: Tensor, y: Tensor) -> Tensor:
+        return y - x
+
+    def projx(self, x: Tensor) -> Tensor:
+        return x
+
+    def proju(self, x: Tensor, v: Tensor) -> Tensor:
+        return v
+
+    def metric(self, x: Tensor, u: Tensor, v: Tensor) -> Tensor:
+        return (u.conj() * v).real.sum(dim=self._event_dims())
+
+    def geodesic_distance(self, x: Tensor, y: Tensor) -> Tensor:
+        return self.distance_sq(x, y).clamp_min(0.0).sqrt()
+
+    def distance_sq(self, x: Tensor, y: Tensor) -> Tensor:
+        return ((x - y).abs() ** 2).sum(dim=self._event_dims())
+
+    def parallel_transport(self, x: Tensor, y: Tensor, v: Tensor) -> Tensor:
+        return v  # flat space: transport is the identity
+
+    def geodesic_with_tangent(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
+        delta = x1 - x0
+        x_t = x0 + scale_like(t, delta) * delta
+        # velocity of a straight line is constant (= delta); broadcast to x_t's shape so a
+        # batched time still returns a per-item velocity.
+        return x_t, delta.expand_as(x_t) if delta.shape != x_t.shape else delta
+
+
+class ProductManifold(Manifold):
+    """Cartesian product ``M_1 x ... x M_k`` -- e.g. Euclidean(delta-H) (+) Grassmann(P).
+
+    A point (and a tangent) is a **tuple** aligned with ``manifolds``; every primitive
+    dispatches component-wise.  The Riemannian metric is the **sum** of the component
+    metrics (so ``square_norm_at`` and the geodesic distance combine in quadrature), and
+    the loss distance is the sum of component ``distance_sq`` (Euclidean L2 on delta-H +
+    chordal on P).  ``torch.func.jvp`` treats the tuple as a pytree, so the MeanFlow du/dt
+    machinery in :mod:`manifold_flow` works unchanged once the velocity head emits a tuple.
+    """
+
+    def __init__(self, manifolds: Sequence[Manifold]):
+        self.manifolds = tuple(manifolds)
+        if not self.manifolds:
+            raise ValueError("ProductManifold needs at least one factor")
+
+    def _check(self, x) -> None:
+        if not isinstance(x, (tuple, list)) or len(x) != len(self.manifolds):
+            raise ValueError(
+                f"product point/tangent must be a {len(self.manifolds)}-tuple, got {type(x).__name__}")
+
+    def exp_map(self, x, u):
+        self._check(x); self._check(u)
+        return tuple(m.exp_map(xi, ui) for m, xi, ui in zip(self.manifolds, x, u))
+
+    def log_map(self, x, y):
+        self._check(x); self._check(y)
+        return tuple(m.log_map(xi, yi) for m, xi, yi in zip(self.manifolds, x, y))
+
+    def projx(self, x):
+        self._check(x)
+        return tuple(m.projx(xi) for m, xi in zip(self.manifolds, x))
+
+    def proju(self, x, v):
+        self._check(x); self._check(v)
+        return tuple(m.proju(xi, vi) for m, xi, vi in zip(self.manifolds, x, v))
+
+    def metric(self, x, u, v):
+        self._check(x)
+        parts = [m.metric(xi, ui, vi) for m, xi, ui, vi in zip(self.manifolds, x, u, v)]
+        out = parts[0]
+        for p in parts[1:]:
+            out = out + p
+        return out
+
+    def geodesic_distance(self, x, y):
+        self._check(x); self._check(y)
+        d2 = [m.geodesic_distance(xi, yi) ** 2 for m, xi, yi in zip(self.manifolds, x, y)]
+        out = d2[0]
+        for p in d2[1:]:
+            out = out + p
+        return out.clamp_min(0.0).sqrt()
+
+    def distance_sq(self, x, y):
+        self._check(x); self._check(y)
+        parts = [m.distance_sq(xi, yi) for m, xi, yi in zip(self.manifolds, x, y)]
+        out = parts[0]
+        for p in parts[1:]:
+            out = out + p
+        return out
+
+    def parallel_transport(self, x, y, v):
+        self._check(x); self._check(y); self._check(v)
+        return tuple(m.parallel_transport(xi, yi, vi)
+                     for m, xi, yi, vi in zip(self.manifolds, x, y, v))
+
+    def geodesic_with_tangent(self, x0, x1, t):
+        self._check(x0); self._check(x1)
+        pts, tans = [], []
+        for m, a, b in zip(self.manifolds, x0, x1):
+            p, d = m.geodesic_with_tangent(a, b, t)
+            pts.append(p)
+            tans.append(d)
+        return tuple(pts), tuple(tans)
+
+    # tuple-aware tangent/point algebra (used by the manifold-generic flow losses)
+    def scale_tangent(self, v, c):
+        return tuple(m.scale_tangent(vi, c) for m, vi in zip(self.manifolds, v))
+
+    def tangent_sub(self, a, b):
+        return tuple(m.tangent_sub(ai, bi) for m, ai, bi in zip(self.manifolds, a, b))
+
+    def detach_point(self, x):
+        return tuple(m.detach_point(xi) for m, xi in zip(self.manifolds, x))
+
+    def detach_tangent(self, v):
+        return tuple(m.detach_tangent(vi) for m, vi in zip(self.manifolds, v))
+
+
 class GrassmannTangentWrapper(nn.Module):
     """Wrap a flow head so its raw output is a *horizontal* Grassmann tangent at ``U``.
 
@@ -219,4 +384,5 @@ class GrassmannTangentWrapper(nn.Module):
         return delta
 
 
-__all__ = ["Manifold", "GrassmannManifold", "GrassmannTangentWrapper"]
+__all__ = ["Manifold", "GrassmannManifold", "EuclideanManifold", "ProductManifold",
+           "GrassmannTangentWrapper"]

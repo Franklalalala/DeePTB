@@ -40,7 +40,7 @@ Grassmann layer on top of them.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -139,6 +139,30 @@ class GrassmannPResult:
     gap: Tensor
     pred_gap: Tensor
     gap_weight: Tensor
+
+
+@dataclass(frozen=True)
+class GrassmannPConfig:
+    """The dense P-regression numerical knobs, grouped so they thread through
+    :func:`dense_grassmann_p_loss` as one object instead of ~11 hand-mirrored kwargs.
+
+    The field names are a 1:1 match with ``dense_grassmann_p_loss``'s keyword-only
+    parameters, so a call is just ``dense_grassmann_p_loss(..., **asdict(cfg))`` and
+    adding a knob touches the argcheck schema + this dataclass only (not three call
+    sites).  ``GrassmannPAlignLoss.__init__`` still takes the flat kwargs (the argcheck
+    mirror the config JSON needs) and builds one of these internally.
+    """
+    lambda_chordal: float = 1.0
+    lambda_eps: float = 0.1
+    eps_window: Optional[int] = 8
+    gauge_mu: bool = True
+    eig_floor: float = 1.0e-10
+    max_kpoints: Optional[int] = None
+    from_density: bool = False
+    min_gap: float = 0.0
+    check_pred_gap: bool = False
+    soft_pred_gap: bool = True
+    chordal_normalize: bool = False
 
 
 def grassmann_p_loss_single(
@@ -272,6 +296,149 @@ def grassmann_p_loss_single(
     )
 
 
+def _stats_from_results(fp: Tensor, results: "list") -> Tuple[Tensor, Dict[str, Tensor]]:
+    """Aggregate a list of per-k :class:`GrassmannPResult` into ``(loss, stats)``.
+
+    Kept as the single source of the stats-dict layout so the loop path and the
+    batched fast-path emit byte-identical keys/reductions (``torch.stack(...).mean()``).
+    """
+    loss = torch.stack([r.loss for r in results]).mean()
+    stats = {
+        "grassmann_loss": loss.detach(),
+        "grassmann_chordal": torch.stack([r.loss_chordal for r in results]).mean(),
+        "grassmann_eps": torch.stack([torch.as_tensor(r.loss_eps) for r in results]).mean(),
+        "grassmann_pred_gap": torch.stack([r.pred_gap for r in results]).mean(),
+        "grassmann_gap_weight": torch.stack([r.gap_weight for r in results]).mean(),
+        "grassmann_geo_dist": torch.stack([r.geo_dist for r in results]).mean(),
+        "grassmann_gap": torch.stack([r.gap for r in results]).mean(),
+        "grassmann_rank": fp.real.new_tensor(float(sum(r.n_occ for r in results) / len(results))),
+        "grassmann_skipped": fp.real.new_zeros(()),
+    }
+    return loss, stats
+
+
+def _batched_grassmann_p_loss(
+    fp: Tensor,
+    fr: Tensor,
+    fs: Optional[Tensor],
+    idx: Tensor,
+    *,
+    n_occ: int,
+    lambda_chordal: float,
+    lambda_eps: float,
+    eps_window: Optional[int],
+    gauge_mu: bool,
+    eig_floor: float,
+    from_density: bool,
+    min_gap: float,
+    check_pred_gap: bool,
+    soft_pred_gap: bool,
+    chordal_normalize: bool,
+) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """Vectorized (single ``[K,N,N]`` eigh) equivalent of the per-k loop.
+
+    Precondition (enforced by the caller): ``n_occ`` is constant across the selected
+    indices and ``len(idx) > 1``.  Every intermediate (``s_half_and_inv``, ``stable_eigh``,
+    ``hermitian_part``, ``chordal_distance_sq``, ``geodesic_distance``) is torch-batched and
+    dispatches per-matrix identically to its ``[N, N]`` call, so the aggregated ``(loss,
+    stats)`` is bit-equivalent to :func:`grassmann_p_loss_single` run in the loop.  This
+    mirrors ``grassmann_p_loss_single`` line for line; keep the two in lock-step.
+    """
+    hp = fp.index_select(0, idx)            # [K, N, N] predicted (grad)
+    hr = fr.index_select(0, idx)            # [K, N, N] reference
+    ss = None if fs is None else fs.index_select(0, idx)  # [K, N, N] overlap
+    n = hp.shape[-1]
+
+    x = x_inv = None
+    if ss is not None:
+        with torch.no_grad():
+            x, x_inv = s_half_and_inv(ss.detach(), eig_floor=eig_floor)
+    sel = slice(-n_occ, None) if from_density else slice(0, n_occ)
+
+    def _project(h, grad: bool):
+        h_h = hermitian_part(h)
+        if x_inv is None:
+            h_orth = h_h
+        else:
+            transport = x if from_density else x_inv  # X D X for density, X^{-1} H X^{-1} for H
+            h_orth = hermitian_part(transport @ h_h @ transport)
+        if grad:
+            eps, q = _stable_eigh(h_orth)
+        else:
+            with torch.no_grad():
+                eps, q = _stable_eigh(h_orth)
+        u = q[..., :, sel]
+        return u @ u.mH, u, eps
+
+    # occ/vir boundary index (per matrix; n_occ is constant so it is a scalar column)
+    b = n - n_occ if from_density else n_occ
+
+    with torch.no_grad():
+        p_ref, u_ref, eps_ref = _project(hr.detach(), grad=False)
+    p_pred, u_pred, eps_pred = _project(hp, grad=True)
+
+    with torch.no_grad():
+        gap = (eps_ref[..., b] - eps_ref[..., b - 1]).detach()      # [K]
+        pred_gap = (eps_pred[..., b] - eps_pred[..., b - 1]).detach()  # [K]
+
+    # Reference-gap guard: identical to the loop, where the FIRST bad k raises and
+    # skips the whole record.  Here we check every selected k at once; if any is bad
+    # we raise (mentioning the first offender), which drops the record just the same.
+    if min_gap and float(min_gap) > 0.0:
+        kind = "occupation" if from_density else "HOMO-LUMO"
+        bad_ref = (~torch.isfinite(gap)) | (gap.abs() < float(min_gap))
+        if bool(bad_ref.any()):
+            j = int(torch.nonzero(bad_ref, as_tuple=False)[0].item())
+            raise SkippableRecord(f"reference {kind} gap {float(gap[j]):.3g} < min_gap {float(min_gap):.3g} "
+                                  "(metallic/near-degenerate: projector is ill-conditioned)")
+        if check_pred_gap:
+            bad_pred = (~torch.isfinite(pred_gap)) | (pred_gap.abs() < float(min_gap))
+            if bool(bad_pred.any()):
+                j = int(torch.nonzero(bad_pred, as_tuple=False)[0].item())
+                raise SkippableRecord(f"predicted {kind} gap {float(pred_gap[j]):.3g} < min_gap {float(min_gap):.3g}")
+
+    loss_chordal = chordal_distance_sq(p_pred, p_ref)   # [K]
+    chordal_term = loss_chordal / max(int(n_occ), 1) if chordal_normalize else loss_chordal
+
+    # Per-k soft predicted-gap weight, detached; identical formula to the single path.
+    gap_weight = hp.real.new_ones(gap.shape)            # [K]
+    if soft_pred_gap and not check_pred_gap and min_gap and float(min_gap) > 0.0:
+        finite = torch.isfinite(pred_gap)
+        w = (pred_gap.abs() / float(min_gap)).clamp(max=1.0).to(gap_weight.dtype) ** 2
+        gap_weight = torch.where(finite, w, hp.real.new_zeros(gap.shape))
+    chordal_term = chordal_term * gap_weight.detach()
+
+    loss_eps = hp.real.new_zeros(gap.shape)             # [K]
+    if lambda_eps != 0.0 and not from_density:
+        if eps_window is None:
+            hi = n
+        else:
+            hi = min(n, n_occ + int(eps_window))
+        lo = 0
+        de = eps_pred[..., lo:hi] - eps_ref[..., lo:hi].detach()   # [K, hi]
+        if gauge_mu:
+            de = de - de.mean(dim=-1, keepdim=True)
+        loss_eps = (de ** 2).mean(dim=-1)
+
+    loss_k = lambda_chordal * chordal_term + lambda_eps * loss_eps  # [K]
+    with torch.no_grad():
+        geo = geodesic_distance(u_pred, u_ref)          # [K]
+
+    loss = loss_k.mean()
+    stats = {
+        "grassmann_loss": loss.detach(),
+        "grassmann_chordal": loss_chordal.detach().mean(),
+        "grassmann_eps": loss_eps.detach().mean(),
+        "grassmann_pred_gap": pred_gap.mean(),
+        "grassmann_gap_weight": gap_weight.detach().mean(),
+        "grassmann_geo_dist": geo.mean(),
+        "grassmann_gap": gap.mean(),
+        "grassmann_rank": fp.real.new_tensor(float(n_occ)),
+        "grassmann_skipped": fp.real.new_zeros(()),
+    }
+    return loss, stats
+
+
 def dense_grassmann_p_loss(
     h_pred: Tensor,
     h_ref: Tensor,
@@ -290,8 +457,17 @@ def dense_grassmann_p_loss(
     check_pred_gap: bool = False,
     soft_pred_gap: bool = True,
     chordal_normalize: bool = False,
+    _force_loop: bool = False,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
-    """Batched (over k / matrices) Grassmann P-regression loss."""
+    """Batched (over k / matrices) Grassmann P-regression loss.
+
+    When ``n_occ`` is constant across the selected k-indices and more than one matrix is
+    selected, the two float64 eighs (reference + predicted) are batched into a single
+    ``[K, N, N]`` :func:`stable_eigh` each and every downstream quantity is computed
+    vectorized -- bit-equivalent to, but faster than, the per-k Python loop.  Otherwise
+    (per-k varying ``n_occ``, a single matrix, or ``_force_loop`` for tests) the loop is
+    used.  ``_force_loop`` is an internal test hook, not part of the public contract.
+    """
     if h_pred.shape != h_ref.shape:
         raise ValueError(f"h_pred/h_ref shape mismatch: {tuple(h_pred.shape)} vs {tuple(h_ref.shape)}")
     fp = flatten_dense_mats(h_pred)
@@ -303,13 +479,37 @@ def dense_grassmann_p_loss(
     n_mats = fp.shape[0]
     idx = select_matrix_indices(n_mats, max_kpoints, random_kpoints, fp.device)
 
+    if idx.numel() == 0:
+        z = fp.real.new_zeros(())
+        return z, {"grassmann_skipped": fp.real.new_ones(())}
+
+    # Per-k n_occ for the selected matrices; the batched fast-path needs it constant.
+    n_occ_sel = [n_occ_for_flat_index(n_occ, int(j), n_mats) for j in idx.tolist()]
+    constant_n_occ = all(v == n_occ_sel[0] for v in n_occ_sel)
+
+    if (not _force_loop) and constant_n_occ and idx.numel() > 1:
+        return _batched_grassmann_p_loss(
+            fp, fr, fs, idx,
+            n_occ=int(n_occ_sel[0]),
+            lambda_chordal=lambda_chordal,
+            lambda_eps=lambda_eps,
+            eps_window=eps_window,
+            gauge_mu=gauge_mu,
+            eig_floor=eig_floor,
+            from_density=from_density,
+            min_gap=min_gap,
+            check_pred_gap=check_pred_gap,
+            soft_pred_gap=soft_pred_gap,
+            chordal_normalize=chordal_normalize,
+        )
+
     results = []
-    for j in idx.tolist():
+    for pos, j in enumerate(idx.tolist()):
         ss = None if fs is None else fs[int(j)]
         results.append(
             grassmann_p_loss_single(
                 fp[int(j)], fr[int(j)], ss,
-                n_occ=n_occ_for_flat_index(n_occ, int(j), n_mats),
+                n_occ=n_occ_sel[pos],
                 lambda_chordal=lambda_chordal,
                 lambda_eps=lambda_eps,
                 eps_window=eps_window,
@@ -326,19 +526,7 @@ def dense_grassmann_p_loss(
         z = fp.real.new_zeros(())
         return z, {"grassmann_skipped": fp.real.new_ones(())}
 
-    loss = torch.stack([r.loss for r in results]).mean()
-    stats = {
-        "grassmann_loss": loss.detach(),
-        "grassmann_chordal": torch.stack([r.loss_chordal for r in results]).mean(),
-        "grassmann_eps": torch.stack([torch.as_tensor(r.loss_eps) for r in results]).mean(),
-        "grassmann_pred_gap": torch.stack([r.pred_gap for r in results]).mean(),
-        "grassmann_gap_weight": torch.stack([r.gap_weight for r in results]).mean(),
-        "grassmann_geo_dist": torch.stack([r.geo_dist for r in results]).mean(),
-        "grassmann_gap": torch.stack([r.gap for r in results]).mean(),
-        "grassmann_rank": fp.real.new_tensor(float(sum(r.n_occ for r in results) / len(results))),
-        "grassmann_skipped": fp.real.new_zeros(()),
-    }
-    return loss, stats
+    return _stats_from_results(fp, results)
 
 
 # ============================================================================
@@ -408,12 +596,23 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
         super().__init__()
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
-        self.from_density = bool(from_density)
+        # The dense P-regression numerical knobs live in one grouped config (field names
+        # == dense_grassmann_p_loss kwargs), so forward() threads them via **asdict(pcfg)
+        # instead of hand-mirroring ~11 kwargs at the call site.
+        self.pcfg = GrassmannPConfig(
+            lambda_chordal=float(lambda_chordal),
+            lambda_eps=float(lambda_eps),
+            eps_window=None if eps_window is None else int(eps_window),
+            gauge_mu=bool(gauge_mu),
+            eig_floor=float(eig_floor),
+            max_kpoints=None if max_kpoints is None else int(max_kpoints),
+            from_density=bool(from_density),
+            min_gap=float(min_gap),
+            check_pred_gap=bool(check_pred_gap),
+            soft_pred_gap=bool(soft_pred_gap),
+            chordal_normalize=bool(chordal_normalize),
+        )
         self.density_key = str(density_key)
-        self.min_gap = float(min_gap)
-        self.check_pred_gap = bool(check_pred_gap)
-        self.soft_pred_gap = bool(soft_pred_gap)
-        self.chordal_normalize = bool(chordal_normalize)
         self.dtype = dtype
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.idp = idp
@@ -421,12 +620,6 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
         self.n_occ = None if n_occ is None else int(n_occ)
         self.n_occ_key = str(n_occ_key)
         self.kpoints = [[0.0, 0.0, 0.0]] if kpoints is None else [list(map(float, k)) for k in kpoints]
-        self.lambda_chordal = float(lambda_chordal)
-        self.lambda_eps = float(lambda_eps)
-        self.eps_window = None if eps_window is None else int(eps_window)
-        self.gauge_mu = bool(gauge_mu)
-        self.eig_floor = float(eig_floor)
-        self.max_kpoints = None if max_kpoints is None else int(max_kpoints)
         self.coeff_align = float(coeff_align)
         self.coeff_base = float(coeff_base)
         self.valence_fallback = bool(valence_fallback)
@@ -551,7 +744,7 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
                 raise SkippableRecord(
                     f"grassmann_p_align needs `{self.n_occ_key}`, an explicit n_occ, "
                     "all_electron, or a known-species valence fallback")
-            if self.from_density:
+            if self.pcfg.from_density:
                 # DM route (dataset get_DM). Prefer an explicit dense density field;
                 # otherwise the node/edge feature slots hold density blocks under
                 # get_DM and HR2HK assembles the density the same way it assembles H.
@@ -572,20 +765,7 @@ class GrassmannPAlignLoss(ManifoldLossModule, nn.Module):
                 raise SkippableRecord("grassmann_p_align: require_overlap is set but no overlap was assembled "
                                       "(a non-orthogonal NAO basis must not be treated as orthonormal)")
             loss, stats = dense_grassmann_p_loss(
-                h_pred, h_ref, s,
-                n_occ=n_occ,
-                lambda_chordal=self.lambda_chordal,
-                lambda_eps=self.lambda_eps,
-                eps_window=self.eps_window,
-                gauge_mu=self.gauge_mu,
-                eig_floor=self.eig_floor,
-                max_kpoints=self.max_kpoints,
-                chordal_normalize=self.chordal_normalize,
-                from_density=self.from_density,
-                min_gap=self.min_gap,
-                check_pred_gap=self.check_pred_gap,
-                soft_pred_gap=self.soft_pred_gap,
-            )
+                h_pred, h_ref, s, n_occ=n_occ, **asdict(self.pcfg))
         except SkippableRecord as exc:
             # Expected physical/data skip (metallic gap, missing overlap, unresolved
             # n_occ).  Only these are swallowed under skip_on_error; a genuine bug
@@ -616,6 +796,7 @@ __all__ = [
     "mcweeny_purify",
     "idempotency_error",
     "GrassmannPResult",
+    "GrassmannPConfig",
     "grassmann_p_loss_single",
     "dense_grassmann_p_loss",
     "GrassmannPAlignLoss",

@@ -60,26 +60,117 @@ def geodesic_conditional(manifold: Manifold, x0: Tensor, x1: Tensor, t: Tensor) 
 AvgVel = Callable[[Tensor, Tensor, Tensor], Tensor]  # (x, t, s) -> horizontal tangent at x
 
 
-def forward_flow(manifold: GrassmannManifold, avg_vel: AvgVel, x: Tensor,
-                 t: Tensor, s: Tensor) -> Tensor:
-    """Step from ``x`` at time ``t`` to time ``s`` with the average velocity: ``exp(x, (s-t) v)``."""
+def forward_flow(manifold: Manifold, avg_vel: AvgVel, x, t: Tensor, s: Tensor):
+    """Step from ``x`` at time ``t`` to time ``s`` with the average velocity: ``exp(x, (s-t) v)``.
+
+    Routed through ``manifold.scale_tangent`` / ``exp_map`` so a ``ProductManifold`` (whose
+    point/tangent are tuples) dispatches component-wise; identical to
+    ``scale_like(s-t, v) * v`` for a single-tensor manifold.
+    """
     v = manifold.proju(x, avg_vel(x, t, s))
-    return manifold.exp_map(x, scale_like(s - t, v) * v)
+    return manifold.exp_map(x, manifold.scale_tangent(v, s - t))
 
 
-def split_flow_loss(manifold: GrassmannManifold, avg_vel: AvgVel,
-                    x0: Tensor, x1: Tensor, t: Tensor, r: Tensor) -> Tensor:
-    """Integration-free semigroup consistency (Grassmann split-flow).
+def split_flow_loss(manifold: Manifold, avg_vel: AvgVel, x0, x1, t: Tensor, r: Tensor) -> Tensor:
+    """Integration-free semigroup consistency (split-flow), any manifold.
 
     Stepping ``x_t -> r`` in one shot with the learned average velocity must land on the
-    geodesic point ``x_r``.  Uses only ``exp`` + a (squared chordal) distance -- no
-    forward-mode autodiff, no eigh-in-jvp.  Recommended as the first flow milestone.
-    The chordal distance keeps its batch axis, so the per-sample residuals are averaged.
+    geodesic point ``x_r``.  Uses only ``exp`` + a squared distance -- no forward-mode
+    autodiff, no eigh-in-jvp.  Recommended as the first flow milestone.  The distance
+    keeps its batch axis, so the per-sample residuals are averaged; on a product manifold
+    it is the sum of the Euclidean (delta-H) and chordal (P) squared distances.
     """
     x_t, _ = manifold.geodesic_with_tangent(x0, x1, t)
     x_r, _ = manifold.geodesic_with_tangent(x0, x1, r)
     stepped = forward_flow(manifold, avg_vel, x_t, t, r)
-    return manifold.chordal_distance_sq(stepped, x_r.detach()).mean()
+    return manifold.distance_sq(stepped, manifold.detach_point(x_r)).mean()
+
+
+class ThreePointSampler:
+    """Sample an ordered triple ``t <= s <= r`` in ``[0, 1]`` for a *true* semigroup check.
+
+    Unlike :class:`OrderedIntervalSampler` (two times), this draws three and sorts them, so
+    the middle time ``s`` is a genuine interior split of ``[t, r]``.  With probability
+    ``boundary_ratio`` the split collapses (``s = t``), degenerating to the two-point
+    consistency of :func:`split_flow_loss`.
+    """
+
+    def __init__(self, boundary_ratio: float = 0.0):
+        self.boundary_ratio = float(boundary_ratio)
+
+    def sample(self, n: int, *, device=None, dtype=torch.float64,
+               generator: Optional[torch.Generator] = None) -> Tuple[Tensor, Tensor, Tensor]:
+        u = torch.rand(n, 3, device=device, dtype=dtype, generator=generator)
+        srt, _ = torch.sort(u, dim=-1)
+        t, s, r = srt[:, 0], srt[:, 1], srt[:, 2]
+        if self.boundary_ratio > 0.0:
+            collapse = torch.rand(n, device=device, dtype=dtype, generator=generator) < self.boundary_ratio
+            s = torch.where(collapse, t, s)
+        return t, s, r
+
+
+def semigroup_consistency_loss(manifold: Manifold, avg_vel: AvgVel, x0, x1,
+                               t: Tensor, s: Tensor, r: Tensor) -> Tensor:
+    """True multi-step semigroup residual: ``step(t->r) == step(s->r) . step(t->s)``.
+
+    The average-velocity flow must be *path-composable*: one big jump ``t->r`` has to equal
+    stepping ``t->s`` then ``s->r``.  This is a stronger, integration-free constraint than
+    :func:`split_flow_loss` (which only checks a one-shot jump against the geodesic point)
+    and does not reference the geodesic target of the middle time at all -- it is a pure
+    self-consistency of the learned field.  For the exact geodesic average velocity both
+    routes land on ``x_r`` and the residual is ~0.
+    """
+    x_t, _ = manifold.geodesic_with_tangent(x0, x1, t)
+    direct = forward_flow(manifold, avg_vel, x_t, t, r)
+    x_s = forward_flow(manifold, avg_vel, x_t, t, s)
+    composed = forward_flow(manifold, avg_vel, x_s, s, r)
+    return manifold.distance_sq(direct, manifold.detach_point(composed)).mean()
+
+
+def _leaf_tensor(x):
+    """First tensor leaf of a point (tensor, or tuple/list of them) -- for dtype/device."""
+    if isinstance(x, (tuple, list)):
+        for xi in x:
+            t = _leaf_tensor(xi)
+            if t is not None:
+                return t
+        return None
+    return x if torch.is_tensor(x) else None
+
+
+def euler_sample(manifold: Manifold, avg_vel: AvgVel, x0, num_steps: int,
+                 *, t0: float = 0.0, t1: float = 1.0):
+    """Integrate the average-velocity field from ``x0`` (at ``t0``) to ``t1`` in Euler steps.
+
+    Each sub-step advances with the average velocity over its own sub-interval
+    (``x <- forward_flow(x, t_i, t_{i+1})``).  ``num_steps=1`` is the one-shot endpoint jump
+    used for endpoint-aligned validation (the euler-1 sample of 0703-Flow's CFM).  Works on
+    any manifold, including the product tuple.
+    """
+    ref = _leaf_tensor(x0)
+    ts = torch.linspace(float(t0), float(t1), int(num_steps) + 1,
+                        dtype=ref.real.dtype, device=ref.device)
+    x = x0
+    for i in range(int(num_steps)):
+        x = forward_flow(manifold, avg_vel, x, ts[i], ts[i + 1])
+    return x
+
+
+def validation_endpoint_loss(manifold: Manifold, avg_vel: AvgVel, x0, x1,
+                             *, num_steps: int = 1) -> Tensor:
+    """Endpoint-aligned validation score -- the euler-1 fix of commits 58eb6b6 / a2b7b7b.
+
+    A MeanFlow head trains on a *random-t* average-velocity regression, so its train loss is
+    not on the same scale as a data-space endpoint error and train/val curves are otherwise
+    incomparable.  For a comparable validation number, euler-integrate the learned field from
+    ``x0`` to the ``t=1`` endpoint (``num_steps`` steps; 1 = one-shot jump) and score it against
+    the data endpoint ``x1`` with the **same** distance the training loss uses.  For the exact
+    average velocity the field is path-consistent, so this is ~0 for any ``num_steps``.  When the
+    Grassmann-P flow is wired into ``flow_cfm``, this is what the CFM validation branch
+    (``trainer.py:657``) must call, mapped to the legacy ``validation_*`` keys.
+    """
+    reached = euler_sample(manifold, avg_vel, x0, num_steps, t0=0.0, t1=1.0)
+    return manifold.distance_sq(reached, manifold.detach_point(x1)).mean()
 
 
 def meanflow_time_derivative(
@@ -119,6 +210,7 @@ def meanflow_average_velocity_target(
     *,
     path_velocity: Optional[Tensor] = None,
     instantaneous_velocity: Optional[Tensor] = None,
+    manifold: Optional[Manifold] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Full MeanFlow target ``u_tgt = v - (t - s) * D_t u`` (stop-grad label).
 
@@ -128,6 +220,10 @@ def meanflow_average_velocity_target(
     target otherwise.  ``instantaneous_velocity`` is the ground-truth ``v`` in the
     identity; on a geodesic conditional path it equals ``dx_t/dt`` and so defaults to
     ``path_velocity``.  The label is detached, so no EMA teacher network is needed.
+
+    ``manifold`` (optional) routes the ``v - (t-s) D_t u`` combination through tuple-aware
+    tangent algebra so a ``ProductManifold`` works; for a single-tensor manifold (or
+    ``None``) it is byte-identical to the plain ``(v - scale_like(t-s, u) * dudt).detach()``.
     """
     if path_velocity is None:
         raise ValueError(
@@ -135,28 +231,41 @@ def meanflow_average_velocity_target(
             "path_velocity=dx_t/dt (use meanflow_time_derivative for the partial-only diagnostic)")
     u, dudt = meanflow_time_derivative(vel_fn, x_t, t, s, path_velocity=path_velocity)
     v = path_velocity if instantaneous_velocity is None else instantaneous_velocity
-    return u, (v - scale_like(t - s, u) * dudt).detach()
+    if manifold is None:
+        return u, (v - scale_like(t - s, u) * dudt).detach()
+    u_tgt = manifold.detach_tangent(
+        manifold.tangent_sub(v, manifold.scale_tangent(dudt, t - s)))
+    return u, u_tgt
 
 
-def meanflow_loss(manifold: GrassmannManifold, vel_fn: AvgVel, x_t: Tensor,
+def meanflow_loss(manifold: Manifold, vel_fn: AvgVel, x_t,
                   t: Tensor, s: Tensor, *,
-                  path_velocity: Optional[Tensor] = None,
-                  instantaneous_velocity: Optional[Tensor] = None) -> Tensor:
-    """Squared tangent-metric residual between the predicted and target average velocity."""
+                  path_velocity=None,
+                  instantaneous_velocity=None) -> Tensor:
+    """Squared tangent-metric residual between the predicted and target average velocity.
+
+    Works on any :class:`Manifold`; on a :class:`ProductManifold` the residual is measured
+    in the product metric (sum of the component tangent norms).
+    """
     u, u_tgt = meanflow_average_velocity_target(
         vel_fn, x_t, t, s,
         path_velocity=path_velocity,
         instantaneous_velocity=instantaneous_velocity,
+        manifold=manifold,
     )
-    diff = manifold.proju(x_t, u - u_tgt)
+    diff = manifold.proju(x_t, manifold.tangent_sub(u, u_tgt))
     return manifold.square_norm_at(x_t, diff).mean()
 
 
 __all__ = [
     "OrderedIntervalSampler",
+    "ThreePointSampler",
     "geodesic_conditional",
     "forward_flow",
     "split_flow_loss",
+    "semigroup_consistency_loss",
+    "euler_sample",
+    "validation_endpoint_loss",
     "meanflow_time_derivative",
     "meanflow_average_velocity_target",
     "meanflow_loss",
