@@ -89,6 +89,67 @@ def test_h_consistency_scales_like_extrapolation_factor():
     assert abs(float(loss) - float(expected)) < 1e-12
 
 
+def test_spinor_lift_overlap_is_noop_when_dims_agree():
+    # non-SOC (or already-lifted) S: N==N -> returned unchanged (identity object).
+    s = torch.randn(2, 4, 4, dtype=torch.complex128)
+    h = torch.randn(2, 4, 4, dtype=torch.complex128)
+    out = HamiltonianProductSplitFlow._spinor_lift_overlap(s, h)
+    assert out is s
+
+
+def test_spinor_lift_overlap_block_diag_matches_kron_I2():
+    # SOC: H is 2N x 2N, S is N x N -> lift to block_diag(S,S) == I_2 (x) S, matching
+    # HR2HK's block-diagonal spin-major layout (up block, then down block).
+    n = 3
+    s = torch.randn(2, n, n, dtype=torch.complex128)
+    h = torch.zeros(2, 2 * n, 2 * n, dtype=torch.complex128)
+    out = HamiltonianProductSplitFlow._spinor_lift_overlap(s, h)
+    assert out.shape == (2, 2 * n, 2 * n)
+    eye2 = torch.eye(2, dtype=torch.complex128)
+    expected = torch.stack([torch.kron(eye2, s[k]) for k in range(2)], dim=0)
+    assert torch.allclose(out, expected)
+    # explicit block structure: top-left = bottom-right = S, off-diagonal spin blocks = 0.
+    assert torch.allclose(out[:, :n, :n], s) and torch.allclose(out[:, n:, n:], s)
+    assert torch.allclose(out[:, :n, n:], torch.zeros_like(s))
+    assert torch.allclose(out[:, n:, :n], torch.zeros_like(s))
+
+
+def test_spinor_lift_overlap_rejects_incompatible_dim():
+    from dptb.nnops.grassmann import SkippableRecord
+    s = torch.randn(5, 5, dtype=torch.complex128)          # 5 is neither == nor 2x of 7
+    h = torch.zeros(7, 7, dtype=torch.complex128)
+    try:
+        HamiltonianProductSplitFlow._spinor_lift_overlap(s, h)
+        raise AssertionError("expected SkippableRecord for incompatible S/H dims")
+    except SkippableRecord:
+        pass
+
+
+def test_soc_lifted_overlap_gives_valid_occupied_projector():
+    # The end-to-end point of the lift: occupied_projector(H_2N, S_2N, n_occ) must be
+    # well-posed and S-orthonormal once S is lifted -- with a NON-orthogonal S and a
+    # spin-coupled H (off-diagonal spin blocks) so the metric genuinely matters.
+    from dptb.nnops._manifold_math import occupied_projector
+    torch.manual_seed(1)
+    n, n_occ = 4, 3
+    a = torch.randn(n, n, dtype=torch.complex128)
+    s_n = a @ a.mH + n * torch.eye(n, dtype=torch.complex128)     # HPD spatial overlap
+    b = torch.randn(2 * n, 2 * n, dtype=torch.complex128)
+    h_2n = b + b.mH                                                # Hermitian SOC H (spin-coupled)
+    s_2n = HamiltonianProductSplitFlow._spinor_lift_overlap(s_n, h_2n)
+    p, u, eps = occupied_projector(h_2n, s_2n, n_occ, return_frame=True)
+    assert p.shape == (2 * n, 2 * n)
+    assert torch.allclose(p, p.mH, atol=1e-9)                      # symmetric
+    assert torch.allclose(p @ p, p, atol=1e-7)                     # idempotent
+    # rank == n_occ (trace of an orthonormal projector counts occupied states)
+    assert abs(float(p.diagonal(dim1=-2, dim2=-1).sum().real) - n_occ) < 1e-6
+    # S-orthonormal occupied frame in the ORIGINAL metric: (S^{1/2} basis) C^H C == I.
+    assert torch.allclose(u.mH @ u, torch.eye(n_occ, dtype=torch.complex128), atol=1e-7)
+    # chordal self-distance is exactly zero (the loss floor).
+    from dptb.nnops._manifold_math import chordal_distance_sq
+    assert float(chordal_distance_sq(p, p)) < 1e-20
+
+
 def test_prepare_batch_canonicalises_validation_times():
     # The trainer's model-in-loss validation passes (r=0, t=1); prepare_batch must
     # canonicalise to t_cur=0 <= r_next=1 and stamp the product time keys.

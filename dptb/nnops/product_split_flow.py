@@ -246,6 +246,32 @@ class HamiltonianProductSplitFlow(HamiltonianCFM):
         d = module(d)
         return d[out_key]
 
+    @staticmethod
+    def _spinor_lift_overlap(s: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Lift an ``N x N`` spatial overlap to the ``2N x 2N`` SOC spinor basis.
+
+        ``HR2HK._forward_full_soc`` assembles the SOC Hamiltonian **block-diagonal spin-major**
+        (``get_spin_slices``: rows ``[0:N)`` = up-spin spatial orbitals, ``[N:2N)`` = down-spin),
+        while the overlap assembler (``overlap=True`` -> ``is_full_soc=False`` -> scalar path)
+        returns only the ``N x N`` spatial ``S``.  The spin-diagonal overlap in the spinor basis
+        is therefore ``S_2N = I_2 (x) S_N = block_diag(S_N, S_N)``.  A no-op when the dims already
+        agree (non-SOC, or an already-lifted ``S``), so it is always safe to call.  A dim that is
+        neither equal nor exactly ``2x`` is a real inconsistency -> :class:`SkippableRecord`.
+        """
+        if s is None:
+            return s
+        n_h, n_s = int(h.shape[-1]), int(s.shape[-1])
+        if n_h == n_s:
+            return s  # non-SOC, or S already lifted -- dims already match H
+        if n_h != 2 * n_s:
+            raise SkippableRecord(
+                f"overlap dim {n_s} incompatible with Hamiltonian dim {n_h} "
+                "(expected equal for non-SOC or exactly 2x for spinor-doubled SOC)")
+        z = torch.zeros_like(s)
+        top = torch.cat((s, z), dim=-1)          # [..., N, 2N]  = (S | 0)
+        bot = torch.cat((z, s), dim=-1)          # [..., N, 2N]  = (0 | S)
+        return torch.cat((top, bot), dim=-2)     # [..., 2N, 2N] = block_diag(S, S) = I_2 (x) S
+
     def _resolve_p_n_occ(self, ref_data, data) -> Optional[int]:
         for src in (ref_data, data):
             v = src.get(self.p_n_occ_key, None)
@@ -298,6 +324,11 @@ class HamiltonianProductSplitFlow(HamiltonianCFM):
             s = None
             if self.s2k is not None:
                 s = self._build_hk({}, ref_data, self.s2k, AtomicDataDict.OVERLAP_KEY)
+                # SOC: h_pred is the 2N x 2N spinor Hamiltonian but the overlap assembler
+                # (overlap=True -> is_full_soc=False -> scalar path) returns only the N x N
+                # spatial S; lift it to S_2N = I_2 (x) S_N so the generalized eigenproblem
+                # H_2N C = S_2N C eps is well-posed (occupied_projector needs s.shape==h.shape).
+                s = self._spinor_lift_overlap(s, h_pred)
             elif self.p_require_overlap:
                 raise SkippableRecord("product_split_flow.require_overlap set but no overlap assembler")
 
