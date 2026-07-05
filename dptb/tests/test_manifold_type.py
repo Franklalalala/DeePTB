@@ -1,4 +1,6 @@
 """Tests for the GrassmannManifold interface (exp/log/proju/transport/jvp)."""
+import math
+
 import torch
 
 from dptb.nnops.manifold_type import GrassmannManifold, GrassmannTangentWrapper
@@ -66,6 +68,60 @@ def test_geodesic_with_tangent_matches_finite_difference():
     dP_ad = dx_t @ x_t.mH + x_t @ dx_t.mH
     dP_fd = (P(x_p) - P(x_m)) / (2 * h)
     assert float((dP_ad - dP_fd).abs().max()) < 1e-5
+
+
+def test_log_is_pi_over_2_safe():
+    # A principal angle of exactly pi/2 (an occupied direction going orthogonal) must
+    # NOT crash the log (old solve(m) raised LinAlgError); the tangent stays finite and
+    # the geodesic still round-trips onto the target subspace.
+    e = torch.eye(4, dtype=torch.float64)
+    u0 = e[:, :2]
+    u1 = torch.stack([e[:, 1], e[:, 2]], dim=1)        # shares e1, e2 ⟂ span(u0) -> angle pi/2
+    delta = M.log_map(u0, u1)
+    assert torch.isfinite(delta).all()
+    assert float((u0.mH @ delta).abs().max()) < 1e-12          # horizontal
+    assert float(torch.linalg.svdvals(delta).amax()) <= math.pi / 2 + 1e-9
+    assert float(M.chordal_distance_sq(M.exp_map(u0, delta), u1)) < 1e-12
+    # fully orthogonal subspaces (m = 0) also must not raise
+    u1o = e[:, 2:]
+    assert torch.isfinite(M.log_map(u0, u1o)).all()
+
+
+def test_geodesic_with_tangent_finite_at_endpoints():
+    # Closed-form velocity must be finite at t=0 and t=1 (the generic jvp route hits
+    # svd of the zero tangent there and returns NaN), and dx_t(0) == the tangent delta.
+    u0 = _frame(8, 2); u1 = _nearby(u0, 2)
+    delta = M.proju(u0, M.log_map(u0, u1))
+    for tv in (0.0, 1.0):
+        x_t, dx_t = M.geodesic_with_tangent(u0, u1, torch.tensor(tv, dtype=torch.float64))
+        assert torch.isfinite(x_t).all() and torch.isfinite(dx_t).all()
+        assert float((x_t.mH @ dx_t).abs().max()) < 1e-10       # horizontal velocity
+    _, dx0 = M.geodesic_with_tangent(u0, u1, torch.tensor(0.0, dtype=torch.float64))
+    assert float((dx0 - delta).abs().max()) < 1e-10             # velocity at t=0 is delta
+
+
+def test_geodesic_with_tangent_accepts_batched_times():
+    # A [B] time tensor must broadcast over a [B, N, K] batch of geodesics.
+    xs = torch.stack([_frame(8, 2) for _ in range(4)])
+    ys = torch.stack([_nearby(xs[i], 2) for i in range(4)])
+    t = torch.linspace(0.1, 0.9, 4, dtype=torch.float64)
+    x_t, dx_t = M.geodesic_with_tangent(xs, ys, t)
+    assert x_t.shape == xs.shape
+    assert dx_t.shape == xs.shape
+    assert float((x_t.mH @ dx_t).abs().max()) < 1e-8            # velocity horizontal per batch item
+
+
+def test_chordal_and_geodesic_preserve_batch():
+    # Distances must reduce only the matrix / angle axes, not the batch axis.
+    xs = torch.stack([_frame(8, 2) for _ in range(5)])
+    ys = torch.stack([_nearby(xs[i], 2) for i in range(5)])
+    cd = M.chordal_distance_sq(xs, ys)
+    gd = M.geodesic_distance(xs, ys)
+    assert cd.shape == (5,)
+    assert gd.shape == (5,)
+    # a single pair still collapses to a 0-d scalar (backward compatible)
+    assert M.chordal_distance_sq(xs[0], ys[0]).ndim == 0
+    assert M.geodesic_distance(xs[0], ys[0]).ndim == 0
 
 
 def test_parallel_transport_is_isometry():

@@ -6,6 +6,7 @@ from dptb.nnops.manifold_flow import (
     OrderedIntervalSampler,
     split_flow_loss,
     forward_flow,
+    meanflow_time_derivative,
     meanflow_average_velocity_target,
     meanflow_loss,
 )
@@ -21,6 +22,19 @@ def _frame(n, k):
 
 def _nearby(u0, k):
     u1 = _frame(u0.shape[0], k)
+    if float(torch.linalg.svdvals(u0.mH @ u1).min()) < 0.3:
+        u1, _ = torch.linalg.qr(u0 + 0.3 * u1)
+        u1 = u1[:, :k]
+    return u1
+
+
+def _cframe(n, k):
+    q, _ = torch.linalg.qr(torch.randn(n, k, dtype=torch.complex128))
+    return q[:, :k]
+
+
+def _cnearby(u0, k):
+    u1 = _cframe(u0.shape[0], k)
     if float(torch.linalg.svdvals(u0.mH @ u1).min()) < 0.3:
         u1, _ = torch.linalg.qr(u0 + 0.3 * u1)
         u1 = u1[:, :k]
@@ -78,7 +92,7 @@ def test_forward_flow_reaches_endpoint():
 # MeanFlow average-velocity identity via jvp
 # --------------------------------------------------------------------------- #
 def test_meanflow_target_constant_velocity():
-    # u independent of t => du/dt = 0 => u_tgt == u
+    # u independent of t and x => D_t u = 0 => u_tgt == v == u
     x_t = _frame(8, 3)
     V0 = M.proju(x_t, torch.randn(8, 3, dtype=torch.float64))
 
@@ -87,14 +101,14 @@ def test_meanflow_target_constant_velocity():
 
     t = torch.tensor(0.4, dtype=torch.float64)
     s = torch.tensor(0.9, dtype=torch.float64)
-    u, u_tgt = meanflow_average_velocity_target(vel, x_t, t, s)
+    u, u_tgt = meanflow_average_velocity_target(vel, x_t, t, s, path_velocity=V0, instantaneous_velocity=V0)
     assert float((u - V0).abs().max()) < 1e-12
     assert float((u_tgt - V0).abs().max()) < 1e-10
-    assert float(meanflow_loss(M, vel, x_t, t, s)) < 1e-12
+    assert float(meanflow_loss(M, vel, x_t, t, s, path_velocity=V0, instantaneous_velocity=V0)) < 1e-12
 
 
 def test_meanflow_target_linear_velocity():
-    # u = t * V0 => du/dt = V0 => u_tgt = t V0 - (t-s) V0 = s V0
+    # u = t * V0 => D_t u = V0 => u_tgt = v - (t-s) V0 = t V0 - (t-s) V0 = s V0
     x_t = _frame(8, 2)
     V0 = M.proju(x_t, torch.randn(8, 2, dtype=torch.float64))
 
@@ -103,9 +117,57 @@ def test_meanflow_target_linear_velocity():
 
     t = torch.tensor(0.4, dtype=torch.float64)
     s = torch.tensor(0.9, dtype=torch.float64)
-    u, u_tgt = meanflow_average_velocity_target(vel, x_t, t, s)
+    u, u_tgt = meanflow_average_velocity_target(
+        vel, x_t, t, s, path_velocity=V0, instantaneous_velocity=t * V0)
     assert float((u - t * V0).abs().max()) < 1e-12
     assert float((u_tgt - s * V0).abs().max()) < 1e-9
+
+
+def test_meanflow_requires_path_velocity():
+    # The state term is mandatory: omitting path_velocity must fail loudly, not bias silently.
+    x_t = _frame(6, 2)
+    import pytest
+    with pytest.raises(ValueError):
+        meanflow_average_velocity_target(lambda x, t, s: x, x_t,
+                                         torch.tensor(0.3, dtype=torch.float64),
+                                         torch.tensor(0.8, dtype=torch.float64))
+
+
+def test_meanflow_identity_zero_for_true_geodesic_average_velocity():
+    # The strongest check: for the exact average velocity of a geodesic, the MeanFlow
+    # identity u = v - (t-s) D_t u holds, so the residual is ~0 (real AND complex).
+    for complex_ in (False, True):
+        x0 = _cframe(8, 2) if complex_ else _frame(8, 2)
+        x1 = _cnearby(x0, 2) if complex_ else _nearby(x0, 2)
+        t = torch.tensor(0.35, dtype=torch.float64)
+        s = torch.tensor(0.80, dtype=torch.float64)
+        x_t, dx_t = M.geodesic_with_tangent(x0, x1, t)      # point + trajectory velocity
+
+        def true_avg(x, tt, ss):
+            x_s = M.geodesic_interpolant(x0, x1, ss)
+            return M.log_map(x, x_s) / (ss - tt)
+
+        loss = meanflow_loss(M, true_avg, x_t, t, s, path_velocity=dx_t, instantaneous_velocity=dx_t)
+        assert float(loss) < 1e-18, (complex_, float(loss))
+
+
+def test_meanflow_total_derivative_includes_state_jvp():
+    # For an x-dependent field the total derivative must add (du/dx).(dx/dt); the
+    # partial-only mode misses exactly x_dot @ A.
+    x_t = _frame(7, 2)
+    x_dot = M.proju(x_t, torch.randn(7, 2, dtype=torch.float64))
+    A = torch.randn(2, 2, dtype=torch.float64)
+    B = M.proju(x_t, torch.randn(7, 2, dtype=torch.float64))
+
+    def vel(x, t, s):
+        return x @ A + t * B
+
+    t = torch.tensor(0.25, dtype=torch.float64)
+    s = torch.tensor(0.75, dtype=torch.float64)
+    _, partial = meanflow_time_derivative(vel, x_t, t, s)
+    _, total = meanflow_time_derivative(vel, x_t, t, s, path_velocity=x_dot)
+    assert float((total - partial - x_dot @ A).abs().max()) < 1e-10
+    assert float((total - partial).norm()) > 1e-8
 
 
 if __name__ == "__main__":

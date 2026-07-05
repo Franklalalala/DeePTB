@@ -38,6 +38,26 @@ def angle_eps(dtype: torch.dtype) -> float:
     return _EPS_BY_DTYPE.get(dtype, 1.0e-7)
 
 
+def scale_like(scale: "float | Tensor", like: Tensor) -> Tensor:
+    """Reshape a scalar / leading-batch time (or interval) so it broadcasts over ``like``.
+
+    A time tensor of shape ``[B]`` cannot directly multiply a tangent of shape
+    ``[B, N, K]`` (``[B]`` broadcasts against the *trailing* axis).  This appends the
+    missing singleton axes so ``scale_like(t, delta) * delta`` works whether ``t`` is a
+    python float, a 0-d tensor, or a ``[B]`` batch.  ``scale`` is cast to ``like``'s real
+    dtype (time is real; a real * complex tangent stays complex).
+    """
+    if not torch.is_tensor(scale):
+        return like.real.new_tensor(float(scale))
+    scale = scale.to(device=like.device, dtype=like.real.dtype)
+    if scale.ndim == 0:
+        return scale
+    if scale.ndim > like.ndim:
+        raise ValueError(
+            f"time tensor rank {scale.ndim} cannot broadcast over tangent rank {like.ndim}")
+    return scale.reshape(tuple(scale.shape) + (1,) * (like.ndim - scale.ndim))
+
+
 # --------------------------------------------------------------------------- #
 # Hermitian helpers + eigensolvers
 # --------------------------------------------------------------------------- #
@@ -160,10 +180,12 @@ def chordal_distance_sq(p1: Tensor, p2: Tensor) -> Tensor:
     """Squared chordal (projector Frobenius) distance ``||P1 - P2||_F^2 / 2``.
 
     Equal to ``sum_i sin^2(theta_i)`` over principal angles.  Smooth everywhere,
-    including at ``P1 == P2`` -- this is the recommended *loss*.
+    including at ``P1 == P2`` -- this is the recommended *loss*.  Only the matrix axes
+    are reduced, so leading batch dimensions are preserved (a bare ``[N, N]`` pair still
+    returns a 0-d scalar).
     """
     diff = p1 - p2
-    return 0.5 * (diff.abs() ** 2).sum()
+    return 0.5 * (diff.abs() ** 2).sum(dim=(-2, -1))
 
 
 def acos_linear_extrapolation(x: Tensor, bound: float = 1.0 - 1.0e-4) -> Tensor:
@@ -194,10 +216,11 @@ def geodesic_distance(u1: Tensor, u2: Tensor) -> Tensor:
     """Grassmann geodesic distance ``||theta||_2`` (diagnostic only).
 
     Gradient is singular as the distance -> 0, so prefer :func:`chordal_distance_sq`
-    as a training objective.
+    as a training objective.  Reduces only the principal-angle axis, so leading batch
+    dimensions are preserved (a single frame pair still returns a 0-d scalar).
     """
     theta = principal_angles(u1, u2)
-    return (theta ** 2).sum().clamp_min(0.0).sqrt()
+    return (theta ** 2).sum(-1).clamp_min(0.0).sqrt()
 
 
 # --------------------------------------------------------------------------- #
@@ -223,35 +246,60 @@ def grassmann_exp(u0: Tensor, delta: Tensor) -> Tensor:
 def grassmann_log(u0: Tensor, u1: Tensor) -> Tensor:
     """Grassmann logarithm: horizontal tangent at ``u0`` pointing to ``u1``.
 
-    Requires principal angles ``< pi/2`` (``u0ᴴ u1`` invertible), which holds for
-    nearby subspaces such as ``P(H0) -> P(H_ref)``.  Uses ``solve`` (``u1_perp @ m^{-1}``
-    via ``(mᴴ \\ u1_perpᴴ)ᴴ``) rather than forming an explicit inverse.
+    Well-defined for principal angles ``<= pi/2``.  Computed from the SVD of the
+    overlap ``m = u0ᴴ u1 = A cos(Θ) Bᴴ`` and the perpendicular component
+    ``u1_perp = u1 - u0 m = Ξ sin(Θ) Bᴴ``, giving the tangent ``delta = Ξ Θ Aᴴ`` with
+    ``Θ = atan2(sin Θ, cos Θ)``.  Unlike the earlier ``u1_perp @ m^{-1}`` form, this
+    never inverts a singular overlap, so a principal angle of exactly ``pi/2`` (an
+    occupied direction going orthogonal, e.g. symmetry-forced or an avoided crossing)
+    yields ``Θ = pi/2`` instead of raising ``LinAlgError`` / returning a silent NaN.
+    The gradient is still singular exactly at ``pi/2`` (the injectivity-radius boundary,
+    where the geodesic is genuinely non-unique).
     """
+    tiny = angle_eps(u0.dtype)
     m = u0.mH @ u1
     u1_perp = u1 - u0 @ m
-    # b = u1_perp @ inv(m)  ==  solve(m^H, u1_perp^H)^H
-    b = torch.linalg.solve(m.mH, u1_perp.mH).mH
-    q, sv, vh = torch.linalg.svd(b, full_matrices=False)
-    theta = torch.arctan(sv)
-    return (q * theta.to(q.dtype).unsqueeze(-2)) @ vh
+    a, cos_theta, bh = torch.linalg.svd(m)               # m = a diag(cos_theta) bh
+    cos_theta = cos_theta.clamp(0.0, 1.0)
+    perp_aligned = u1_perp @ bh.mH                        # columns: sin(Θ_i) · Ξ_i
+    sin_theta = perp_aligned.norm(dim=-2)                 # real, per principal direction
+    xi = perp_aligned / sin_theta.clamp_min(tiny).unsqueeze(-2)   # Ξ (zero-angle cols -> 0·Θ)
+    theta = torch.atan2(sin_theta, cos_theta)            # pi/2-safe principal angles
+    return (xi * theta.to(xi.dtype).unsqueeze(-2)) @ a.mH
 
 
 # --------------------------------------------------------------------------- #
 # McWeeny purification (differentiable retraction to the manifold)
 # --------------------------------------------------------------------------- #
 def mcweeny_purify(p: Tensor, n_iter: int = 30, tol: float = 1.0e-10,
-                   clamp_spectrum: bool = True) -> Tensor:
+                   clamp_spectrum: bool = True, n_occ: Optional[int] = None) -> Tensor:
     """Grand-canonical McWeeny purification ``P <- 3P^2 - 2P^3``.
 
-    Retracts an approximate projector (eigenvalues in ``(0,1)`` with the correct count
-    above ``0.5``) onto the nearest idempotent.  The cubic map only converges from a
-    spectrum already inside ``(0,1)``: eigenvalues outside ``[0,1]`` diverge and a wrong
-    count across ``0.5`` converges to the wrong-rank idempotent.  With ``clamp_spectrum``
-    (default) the input spectrum is first clamped to ``[0, 1]`` by one eigendecomposition,
-    guaranteeing a well-posed retraction; set it False for the pure matmul-only path when
-    the input is already known to be in band.
+    The cubic map drives eigenvalues toward ``{0, 1}`` but its fixed point is fixed by
+    the eigenvalue **count above 0.5**, not by any target rank -- eigenvalues outside
+    ``[0,1]`` diverge, and a spectrum whose count above 0.5 differs from the intended
+    occupation converges to the *wrong-rank* idempotent.
+
+    * ``n_occ`` given: the exact, rank-correct retraction.  One eigendecomposition sets
+      the top-``n_occ`` occupations to 1 and the rest to 0, returning the nearest rank-
+      ``n_occ`` idempotent regardless of where the eigenvalues sit relative to 0.5.
+      Prefer this (or :func:`occupied_projector` with ``from_density=True``) for density
+      retraction.
+    * ``n_occ=None``, ``clamp_spectrum=True`` (default): clamp the spectrum to ``[0,1]``
+      then iterate.  This guarantees convergence to *an* idempotent, namely the one whose
+      rank equals ``#{eig > 0.5}`` -- the caller must ensure that count is the intended
+      occupation; clamping does **not** enforce it.
+    * ``n_occ=None``, ``clamp_spectrum=False``: the pure matmul-only path, valid only when
+      the input spectrum is already in band with the correct count above 0.5.
     """
     p = hermitian_part(p)
+    if n_occ is not None:
+        if not 0 < int(n_occ) < p.shape[-1]:
+            raise ValueError(f"n_occ must be in [1, N-1], got {n_occ} for N={p.shape[-1]}")
+        w, v = stable_eigh(p)  # ascending; top-n_occ occupations are the highest
+        w_new = torch.zeros_like(w)
+        w_new[..., -int(n_occ):] = 1.0
+        return hermitian_part((v * w_new.to(v.dtype).unsqueeze(-2)) @ v.mH)
     if clamp_spectrum:
         w, v = stable_eigh(p)
         w = w.clamp(0.0, 1.0).to(v.dtype)
@@ -269,6 +317,7 @@ def mcweeny_purify(p: Tensor, n_iter: int = 30, tol: float = 1.0e-10,
 __all__ = [
     "Tensor",
     "angle_eps",
+    "scale_like",
     "hermitian_part",
     "stable_eigh",
     "regularize_overlap",

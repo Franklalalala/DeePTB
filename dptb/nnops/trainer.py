@@ -187,6 +187,9 @@ class Trainer(BaseTrainer):
         "last_hopping_l1_sum",
         "last_hopping_mse_sum",
         "last_hopping_count",
+        # manifold/subspace losses publish diagnostics here; save+restore it too so a
+        # compatible/reference loss run does not clobber the primary loss's dict.
+        "last_scalar_state",
     )
 
     @staticmethod

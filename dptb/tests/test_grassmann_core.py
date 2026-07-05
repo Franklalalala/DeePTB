@@ -132,6 +132,20 @@ def test_exp_from_zero_tangent_is_identity_subspace():
 # --------------------------------------------------------------------------- #
 # McWeeny purification
 # --------------------------------------------------------------------------- #
+def test_mcweeny_n_occ_enforces_rank_across_half():
+    # A spectrum straddling 0.5 with the WRONG count above threshold: plain McWeeny
+    # (fixed point = count above 0.5) converges to rank 4, but n_occ=3 must give an
+    # exact rank-3 idempotent regardless of where the eigenvalues sit.
+    q, _ = torch.linalg.qr(torch.randn(6, 6, dtype=torch.float64))
+    w = torch.tensor([0.9, 0.8, 0.6, 0.55, 0.3, 0.1], dtype=torch.float64)  # 4 eigenvalues > 0.5
+    p = (q * w) @ q.mT
+    p_wrong = mcweeny_purify(p, n_iter=40)                 # count-above-0.5 -> rank 4
+    assert abs(float(torch.trace(p_wrong).real) - 4.0) < 1e-6
+    p_right = mcweeny_purify(p, n_occ=3)                   # exact rank-3 retraction
+    assert float(idempotency_error(p_right)) < 1e-10
+    assert abs(float(torch.trace(p_right).real) - 3.0) < 1e-9
+
+
 def test_mcweeny_purifies_noisy_projector():
     n, k = 8, 3
     u = _rand_frame(n, k)

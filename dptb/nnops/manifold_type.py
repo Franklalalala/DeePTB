@@ -26,6 +26,8 @@ import torch.nn as nn
 
 from dptb.nnops._manifold_math import (
     Tensor,
+    angle_eps,
+    scale_like,
     grassmann_exp,
     grassmann_log,
     geodesic_distance,
@@ -36,14 +38,6 @@ from dptb.nnops._manifold_math import (
 
 class Manifold(ABC):
     """Minimal Riemannian manifold interface (exp/log/proj/metric/transport)."""
-
-    # dtype-keyed tolerance (real + complex), shared convention with _manifold_math
-    EPS = {
-        torch.float32: 1.0e-4,
-        torch.float64: 1.0e-7,
-        torch.complex64: 1.0e-4,
-        torch.complex128: 1.0e-7,
-    }
 
     # --- abstract primitives ------------------------------------------------ #
     @abstractmethod
@@ -76,25 +70,34 @@ class Manifold(ABC):
 
     # --- provided for free -------------------------------------------------- #
     def geodesic_interpolant(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tensor:
-        """Point on the geodesic from ``x0`` to ``x1`` at time ``t`` in [0, 1]."""
-        return self.projx(self.exp_map(x0, t * self.log_map(x0, x1)))
+        """Point on the geodesic from ``x0`` to ``x1`` at time ``t`` in [0, 1].
+
+        ``t`` may be a scalar or a leading-batch ``[B]`` tensor; it is reshaped to
+        broadcast over the tangent (a bare ``[B]`` cannot multiply a ``[B, N, K]``
+        tangent otherwise).
+        """
+        delta = self.log_map(x0, x1)
+        return self.projx(self.exp_map(x0, scale_like(t, delta) * delta))
 
     def geodesic_with_tangent(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
         """Return ``(x_t, dx_t/dt)`` in one forward pass via ``torch.func.jvp``.
 
         This is the du/dt mechanism the Riemannian-MeanFlow objective consumes: the
-        forward-mode derivative of the geodesic interpolant w.r.t. time.
+        forward-mode derivative of the geodesic interpolant w.r.t. time.  The velocity is
+        projected onto the tangent at ``x_t`` so differentiating through the ``projx`` QR
+        cannot leak a non-horizontal (gauge) component.
         """
         def gamma(_t: Tensor) -> Tensor:
             return self.geodesic_interpolant(x0, x1, _t)
 
-        return torch.func.jvp(gamma, (t,), (torch.ones_like(t),))
+        x_t, dx_t = torch.func.jvp(gamma, (t,), (torch.ones_like(t),))
+        return x_t, self.proju(x_t, dx_t)
 
     def square_norm_at(self, x: Tensor, v: Tensor) -> Tensor:
         return self.metric(x, v, v)
 
     def eps(self, dtype: torch.dtype) -> float:
-        return self.EPS.get(dtype, 1.0e-7)
+        return angle_eps(dtype)
 
 
 class GrassmannManifold(Manifold):
@@ -133,6 +136,29 @@ class GrassmannManifold(Manifold):
         """Chordal distance on the derived projectors -- the smooth training distance."""
         return chordal_distance_sq(self.to_projector(x), self.to_projector(y))
 
+    def geodesic_with_tangent(self, x0: Tensor, x1: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
+        """Closed-form ``(x_t, dx_t/dt)`` along the Grassmann geodesic (NaN-safe at t=0/1).
+
+        Overrides the ABC's generic ``torch.func.jvp`` route, which differentiates
+        through ``svd`` of the *zero* tangent at the endpoints (``t in {0, 1}``) and
+        yields a NaN velocity.  Here ``svd(delta)`` is taken once (t-independent) and
+        both the point and its exact time-derivative are assembled analytically:
+        ``x_t = (x0 V cos(tΣ) + Q sin(tΣ)) Vᴴ`` with ``delta = Q Σ Vᴴ``, and
+        ``dx_t = (-x0 V Σ sin(tΣ) + Q Σ cos(tΣ)) Vᴴ`` -- finite for every ``t`` (at
+        ``t=0`` it reduces to ``delta`` itself).  Also cheaper (no forward-AD trace).
+        """
+        delta = self.log_map(x0, x1)
+        q, sv, vh = torch.linalg.svd(delta, full_matrices=False)
+        v = vh.mH
+        angle = scale_like(t, sv) * sv                      # t * Σ (per principal mode)
+        x0v = x0 @ v
+        cos_a = torch.cos(angle); sin_a = torch.sin(angle)
+        x_t = (x0v * cos_a.to(v.dtype).unsqueeze(-2)) @ vh + (q * sin_a.to(q.dtype).unsqueeze(-2)) @ vh
+        d_cos = (-sv * sin_a).to(v.dtype)                   # d/dt cos(tΣ)
+        d_sin = (sv * cos_a).to(q.dtype)                    # d/dt sin(tΣ)
+        dx_t = (x0v * d_cos.unsqueeze(-2)) @ vh + (q * d_sin.unsqueeze(-2)) @ vh
+        return x_t, self.proju(x_t, dx_t)
+
     def parallel_transport(self, x: Tensor, y: Tensor, v: Tensor) -> Tensor:
         """Parallel transport ``v`` (tangent at ``x``) to ``y`` (Edelman-Arias-Smith eq. 2.4).
 
@@ -140,6 +166,7 @@ class GrassmannManifold(Manifold):
         transport to ``t = 1`` acts by
         ``tau = (-x W sin(S) Qᴴ + Q cos(S) Qᴴ + (I - Q Qᴴ))`` applied to ``v``.
         """
+        v = self.proju(x, v)                         # accept only the horizontal part of v
         delta = self.log_map(x, y)
         q, s, wh = torch.linalg.svd(delta, full_matrices=False)
         w = wh.mH
@@ -149,7 +176,8 @@ class GrassmannManifold(Manifold):
         qhv = q.mH @ v
         term_rot = (x @ w) @ (-sin_s.unsqueeze(-1) * qhv) + q @ (cos_s.unsqueeze(-1) * qhv)
         term_perp = v - q @ qhv                      # component orthogonal to both frames
-        return term_rot + term_perp
+        # exact arithmetic already lands horizontal at y; re-project to clear fp/QR drift.
+        return self.proju(y, term_rot + term_perp)
 
     # --- constructors / conversions ---------------------------------------- #
     @classmethod
