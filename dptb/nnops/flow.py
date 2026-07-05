@@ -2025,6 +2025,11 @@ def build_hamiltonian_flow(
     objective = str(options.get("objective", options.get("type", "cfm"))).lower()
     if objective in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
         return HamiltonianPixelMeanFlow(options, idp=idp, dtype=dtype, device=device)
+    if objective in {"product_split_flow", "product_split", "product_flow", "psf", "mb_split_flow"}:
+        # Lazy import: product_split_flow imports flow.py at top level, so importing it here
+        # (after flow.py is fully defined) keeps the dependency one-directional (no cycle).
+        from dptb.nnops.product_split_flow import HamiltonianProductSplitFlow
+        return HamiltonianProductSplitFlow(options, idp=idp, dtype=dtype, device=device)
     return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)
 
 

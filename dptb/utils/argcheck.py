@@ -184,6 +184,7 @@ def flow_options():
         Argument("flow_time_t_key", str, optional=True, default="flow_time_t"),
         Argument("flow_time_h_key", str, optional=True, default="flow_time_h"),
         Argument("meanflow", dict, optional=True, default={}),
+        Argument("product_manifold", dict, optional=True, default={}),
         Argument("time_sampling", str, optional=True, default="uniform"),
         Argument("t_min", (int, float), optional=True, default=0.0),
         Argument("t_max", (int, float), optional=True, default=0.999),
