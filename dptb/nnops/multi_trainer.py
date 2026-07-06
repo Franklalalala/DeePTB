@@ -2130,6 +2130,29 @@ class MultiTrainer(Trainer):
                         batch_for_loss,
                     )
                 flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
+                flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
+                compatible_enabled = (
+                    getattr(self.flow_cfm, "log_train_compatible_loss", False)
+                    if flow_prefix == "train"
+                    else getattr(self.flow_cfm, "log_validation_compatible_loss", False)
+                )
+                if compatible_enabled:
+                    compatible_prefix = f"{flow_prefix}_compatible"
+                    legacy_prefix = (
+                        flow_prefix
+                        if getattr(self.flow_cfm, "compatible_loss_to_legacy_keys", True)
+                        else None
+                    )
+                    compatible_state = Trainer._compatible_loss_state_from_flow_stats(
+                        criterion,
+                        flow_state,
+                        source_prefix=flow_prefix,
+                        prefix=compatible_prefix,
+                        legacy_prefix=legacy_prefix,
+                        global_step=self.iter,
+                    )
+                    if compatible_state is not None:
+                        flow_state.update(compatible_state)
             else:
                 with self._tagger.tag("expert/flow_prepare_batch", it=self.iter, expert=expert_idx):
                     flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
@@ -2156,6 +2179,7 @@ class MultiTrainer(Trainer):
                     loss, flow_state = self.flow_cfm.loss(pred_batch, flow_ref, flow_ctx)
 
                 flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
+                flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
                 compatible_enabled = (
                     getattr(self.flow_cfm, "log_train_compatible_loss", False)
                     if flow_prefix == "train"

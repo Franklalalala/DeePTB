@@ -248,6 +248,7 @@ class Trainer(BaseTrainer):
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
         if use_flow and self.flow_cfm.enabled:
+            model_in_loss = getattr(self.flow_cfm, "model_in_loss", False)
             if getattr(self.flow_cfm, "model_in_loss", False):
                 loss, flow_state = self.flow_cfm.loss_with_model(self.model, batch, batch_for_loss)
             else:
@@ -256,9 +257,8 @@ class Trainer(BaseTrainer):
                 batch.update(batch_info)
                 batch_for_loss.update(batch_info)
                 loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
-            if self.flow_cfm.log_train_compatible_loss and not getattr(
-                self.flow_cfm, "model_in_loss", False
-            ):
+            flow_state.setdefault("train_loss_opt", loss.detach())
+            if self.flow_cfm.log_train_compatible_loss:
                 compatible_state = self._compatible_loss_state_from_flow_stats(
                     lossfunc,
                     flow_state,
@@ -269,7 +269,7 @@ class Trainer(BaseTrainer):
                     ),
                     global_step=getattr(self, "iter", None),
                 )
-                if compatible_state is None:
+                if compatible_state is None and not model_in_loss:
                     compatible_state = self._compatible_loss_state(
                         lossfunc,
                         batch,
@@ -279,7 +279,8 @@ class Trainer(BaseTrainer):
                             "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
                         ),
                     )
-                flow_state.update(compatible_state)
+                if compatible_state is not None:
+                    flow_state.update(compatible_state)
             flow_state.pop("_compatible_clean_stats", None)
             self._last_flow_state = flow_state
             return loss

@@ -521,6 +521,39 @@ def test_pixel_meanflow_du_dt_backend_accepts_finite_difference_and_jvp():
         )
 
 
+def test_pixel_meanflow_semigroup_objective_is_configurable():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"objective": "semigroup"},
+        }
+    )
+
+    assert flow.meanflow_objective == "semigroup"
+    assert flow.meanflow_semigroup_weight == pytest.approx(1.0)
+    assert flow.meanflow_semigroup_endpoint_weight == pytest.approx(1.0)
+
+    hybrid_flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"objective": "hybrid", "semigroup_weight": 0.25},
+        }
+    )
+    assert hybrid_flow.meanflow_objective == "hybrid"
+    assert hybrid_flow.meanflow_semigroup_weight == pytest.approx(0.25)
+
+    with pytest.raises(ValueError, match="meanflow.objective"):
+        HamiltonianPixelMeanFlow(
+            {
+                "enabled": True,
+                "objective": "pixel_meanflow",
+                "meanflow": {"objective": "bad"},
+            }
+        )
+
+
 def test_pixel_meanflow_aggressive_profile_sets_opt_in_knobs():
     flow = HamiltonianPixelMeanFlow(
         {
@@ -561,6 +594,13 @@ class _ModelInLossFlow:
         assert model is _UNUSED_MODEL
         assert batch is not batch_for_loss
         return torch.tensor(7.0, requires_grad=True), {"train_flow_loss": torch.tensor(7.0)}
+
+
+class _ModelInLossFlowWithStats(_ModelInLossFlow):
+    def loss_with_model(self, model, batch, batch_for_loss):
+        loss, state = super().loss_with_model(model, batch, batch_for_loss)
+        state.update(_compatible_clean_stats())
+        return loss, state
 
 
 class _FakeBatch:
@@ -1031,6 +1071,7 @@ def test_pixel_meanflow_train_endpoint_stats_feed_compatible_reducer():
         range_dis=(0.0, 1.0),
     )
     pack = trainer._make_step_pack(payload)
+    stats_calls_before_reduce = lossfunc.stats_calls
     state = trainer._compute_compatible_state_from_pack(
         pack,
         criterion=lossfunc,
@@ -1050,7 +1091,43 @@ def test_pixel_meanflow_train_endpoint_stats_feed_compatible_reducer():
     assert state["train_hopping_loss"].item() == pytest.approx(hopping)
     assert state["train_loss"].item() == pytest.approx(total)
     assert lossfunc.forward_calls == 0
+    assert stats_calls_before_reduce == 1
+    assert lossfunc.stats_calls == stats_calls_before_reduce + 1
+
+
+def test_multitrainer_model_in_loss_uses_flow_stats_for_compatible_metrics():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 2
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer._tagger = _NoopTagger()
+    trainer.flow_cfm = _ModelInLossFlowWithStats()
+    trainer.model = _UNUSED_MODEL
+    trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
+        torch.ones(batch["edge_h0"].shape[0], dtype=torch.bool),
+        torch.ones(batch["node_h0"].shape[0], dtype=torch.bool),
+    )
+    lossfunc = _StatsCompatibleLoss()
+
+    result = trainer._run_one_expert_loss(
+        _two_graph_batch(),
+        batch_info={},
+        criterion=lossfunc,
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+        capture_metrics=True,
+    )
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+
+    assert result["loss"].item() == pytest.approx(7.0)
+    assert lossfunc.forward_calls == 0
     assert lossfunc.stats_calls == 1
+    assert result["onsite"].item() == pytest.approx(onsite)
+    assert result["hopping"].item() == pytest.approx(hopping)
+    assert result["last_onsite_count"].item() == pytest.approx(2.0)
+    assert result["last_hopping_count"].item() == pytest.approx(3.0)
 
 
 def _trainer_for_compatible_pack(lossfunc):
@@ -1300,6 +1377,40 @@ def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
 
     assert loss.item() == pytest.approx(7.0)
     assert trainer._last_flow_state["train_flow_loss"].item() == pytest.approx(7.0)
+    assert trainer._last_flow_state["train_loss_opt"].item() == pytest.approx(7.0)
+    assert "train_loss" not in trainer._last_flow_state
+
+
+def test_model_in_loss_train_loss_aligns_from_endpoint_stats(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.flow_cfm = _ModelInLossFlowWithStats()
+    trainer.model = _UNUSED_MODEL
+    lossfunc = _StatsCompatibleLoss()
+
+    def fake_to_dict(batch):
+        return {"raw_batch": True}
+
+    def fail_compatible(*args, **kwargs):
+        raise AssertionError("model-in-loss pMF must use flow stats, not raw-batch criterion")
+
+    monkeypatch.setattr(trainer_module.AtomicData, "to_AtomicDataDict", fake_to_dict)
+    monkeypatch.setattr(Trainer, "_compatible_loss_state", staticmethod(fail_compatible))
+
+    loss = trainer._loss_on_batch(_FakeBatch(), lossfunc)
+    state = trainer._last_flow_state
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+    aligned_total = 0.5 * (onsite + hopping)
+
+    assert loss.item() == pytest.approx(7.0)
+    assert lossfunc.forward_calls == 0
+    assert lossfunc.stats_calls == 1
+    assert state["train_loss_opt"].item() == pytest.approx(7.0)
+    assert state["train_loss"].item() == pytest.approx(aligned_total)
+    assert state["train_onsite_loss"].item() == pytest.approx(onsite)
+    assert state["train_hopping_loss"].item() == pytest.approx(hopping)
 
 
 def test_loss_on_batch_can_skip_flow_for_reference_batch(monkeypatch):
@@ -1363,6 +1474,31 @@ def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():
     assert state["train_flow_h"].item() == pytest.approx(float((t - r).mean()), abs=1.0e-6)
     assert state["train_flow_onsite_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
     assert state["train_flow_hopping_velocity_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_pixel_meanflow_semigroup_oracle_endpoint_has_zero_state_loss():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "mode": "residual",
+            "prior": "zero",
+            "strict_h0": True,
+            "meanflow": {
+                "objective": "semigroup",
+                "semigroup_endpoint_weight": 0.0,
+            },
+        }
+    )
+    r = torch.tensor([0.2, 0.3])
+    t = torch.tensor([0.5, 0.7])
+
+    loss, state = flow.loss_with_model(_ConstantEndpoint(), _two_graph_batch(), _two_graph_ref(), r=r, t=t)
+
+    assert loss.item() == pytest.approx(0.0, abs=1.0e-6)
+    assert state["train_flow_objective_semigroup"].item() == pytest.approx(1.0)
+    assert state["train_flow_onsite_semigroup_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
+    assert state["train_flow_hopping_semigroup_mse"].item() == pytest.approx(0.0, abs=1.0e-6)
 
 
 @pytest.mark.parametrize(
@@ -1499,22 +1635,23 @@ def test_pixel_meanflow_validation_compatible_explicit_opt_out_respected():
     assert flow.log_validation_compatible_loss is False
 
 
-def test_pixel_meanflow_forces_off_unsupported_train_compatible_request(caplog):
-    import logging
+def test_pixel_meanflow_train_compatible_alignment_defaults_on_and_can_opt_out():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+        }
+    )
+    opt_out = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"log_train_compatible_loss": False},
+        }
+    )
 
-    with caplog.at_level(logging.WARNING, logger="dptb.nnops.flow"):
-        flow = HamiltonianPixelMeanFlow(
-            {
-                "enabled": True,
-                "objective": "pixel_meanflow",
-                "meanflow": {"log_train_compatible_loss": True},
-            }
-        )
-
-    # model_in_loss pMF has no train-compatible code path; a True request must
-    # not silently register fields that would print misleading constant zeros.
-    assert flow.log_train_compatible_loss is False
-    assert any("train_compatible" in rec.message for rec in caplog.records)
+    assert flow.log_train_compatible_loss is True
+    assert opt_out.log_train_compatible_loss is False
 
 
 class _ValidationConstantModel:
@@ -1658,6 +1795,25 @@ def test_resolve_flow_log_fields_pixel_meanflow_drops_never_computed_fields():
     # canary scalars so silent jvp fallbacks are visible in production logs
     assert "train_flow_du_dt_backend_jvp" in fields
     assert "train_flow_explicit_model_calls" in fields
+    assert register_legacy is True
+
+
+def test_resolve_flow_log_fields_includes_semigroup_meanflow_fields():
+    from dptb.nnops.flow import resolve_flow_log_fields
+
+    flow = build_hamiltonian_flow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "meanflow": {"objective": "semigroup"},
+        }
+    )
+    fields, register_legacy = resolve_flow_log_fields(flow)
+
+    assert "train_flow_objective_semigroup" in fields
+    assert "train_flow_semigroup_split_t" in fields
+    assert "train_flow_onsite_semigroup_loss" in fields
+    assert "train_flow_hopping_semigroup_loss" in fields
     assert register_legacy is True
 
 

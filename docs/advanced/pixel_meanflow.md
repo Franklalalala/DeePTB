@@ -1,8 +1,9 @@
 # Pixel MeanFlow smoke configuration
 
 Pixel MeanFlow is an opt-in Hamiltonian endpoint objective. The DeePTB path
-uses endpoint prediction with a finite-difference `du/dt` backend; exact JVP is
-not implemented in this repo yet.
+uses endpoint prediction and supports the original local MeanFlow objective
+with either finite-difference or JVP `du/dt`. It also exposes a KAIST-style
+semigroup consistency objective for ablations.
 
 Minimal paper-conservative flow fragment:
 
@@ -18,6 +19,7 @@ Minimal paper-conservative flow fragment:
     "apply_to_reference": false,
     "meanflow": {
       "profile": "conservative",
+      "objective": "finite_difference",
       "jvp_tangent": "boundary",
       "time_sampling": "logit_normal",
       "p_mean": -0.4,
@@ -33,6 +35,36 @@ Minimal paper-conservative flow fragment:
   }
 }
 ```
+
+KAIST semigroup ablation:
+
+```json
+{
+  "flow_options": {
+    "enabled": true,
+    "objective": "pixel_meanflow",
+    "mode": "residual",
+    "prior": "zero",
+    "overwrite_feature_keys": true,
+    "validation_ode_steps": [1, 3],
+    "meanflow": {
+      "profile": "conservative",
+      "objective": "semigroup",
+      "semigroup_weight": 1.0,
+      "semigroup_endpoint_weight": 1.0,
+      "time_sampling": "logit_normal",
+      "p_mean": -0.4,
+      "p_std": 1.0,
+      "data_proportion": 0.5,
+      "tr_uniform_prob": 0.1,
+      "min_t": 0.05
+    }
+  }
+}
+```
+
+`meanflow.objective: "hybrid"` keeps the original local MeanFlow loss and adds
+the semigroup term as an auxiliary loss.
 
 The model must receive the two-time conditioning keys:
 
@@ -53,6 +85,56 @@ residual priors should be separate ablations.
 Use the aggressive profile only as a separate ablation. It enables extra
 stabilizers such as adaptive normalization and boundary-velocity auxiliary
 loss; those are not required for the paper-conservative path.
+
+## Physical prior and jitter
+
+For no-H0 or weak-H0 PMF experiments, prefer a low-cost physical prior over a
+plain dense Gaussian. The current non-NN on-the-fly path uses DeePTB's DFTB-SK
+module with Slater-Koster parameters:
+
+```json
+{
+  "flow_options": {
+    "enabled": true,
+    "objective": "pixel_meanflow",
+    "mode": "residual",
+    "prior": "dftbsk",
+    "prior_skdata": "/path/to/slater_koster_files_or_skparams.pth",
+    "dftb_prior_overlap": false,
+    "dftb_prior_require_geometry": true,
+    "strict_h0": false,
+    "physical_prior_jitter_sigma": 0.02,
+    "physical_prior_jitter_reference_scale": true,
+    "physical_prior_jitter_edge_decay": 3.0
+  }
+}
+```
+
+This path runs `DFTBSK(..., transform=True)` under `torch.no_grad()`, aligns the
+result to the active node/edge feature layout, converts the absolute guess to a
+residual prior, and then writes the interpolated state back to `node_h0` /
+`edge_h0` before the model initial layer sees the batch. It does not use NNSK.
+
+For user-facing reports, describe the endpoint metric as
+`label_delta_H - pred_delta_H`. The code still contains internal
+MeanFlow-derived correction keys, but the model output remains the clean
+Hamiltonian endpoint/residual endpoint.
+
+`physical_prior_jitter_sigma` adds perturbations around the physical prior. With
+`physical_prior_jitter_reference_scale=true`, the perturbation is scaled by the
+row RMS of the active target/residual blocks. With
+`physical_prior_jitter_edge_decay > 0`, edge jitter is multiplied by
+`exp(-edge_length / physical_prior_jitter_edge_decay)`, so long-range hopping
+entries receive smaller perturbations.
+
+## Comparable loss keys
+
+For CFM and Pixel MeanFlow runs, `train_loss`, `train_onsite_loss`,
+`train_hopping_loss`, `validation_loss`, `validation_onsite_loss`, and
+`validation_hopping_loss` are reserved for endpoint-compatible metrics, so they
+can be plotted against non-CFM runs. The actual flow/semigroup optimization
+objective remains visible under `train_loss_opt`, `train_flow_loss`, and
+`train_flow_*` / `validation_flow_*` keys.
 
 ## Time-embedding vs finite-difference scale
 

@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.data.transforms_upper_triangle import OrbitalMapper
+from dptb.nn.sktb.onsiteDB import onsite_energy_database
 from dptb.nnops.flow import (
     CFMContext,
     HamiltonianCFM,
@@ -760,6 +762,148 @@ def test_te_prior_passes_num_graphs_to_radius_once_per_batch():
     assert all(value == 2 for value in seen_num_graphs)
 
 
+def _basis_onsite_case(device: torch.device, dtype: torch.dtype):
+    idp = OrbitalMapper(
+        {"H": ["1s"], "C": ["2s", "2p"]},
+        method="e3tb",
+        device=device,
+    )
+    node = torch.zeros(2, idp.reduced_matrix_element, device=device, dtype=dtype)
+    edge = torch.zeros(2, idp.reduced_matrix_element, device=device, dtype=dtype)
+    data = {
+        _keys.EDGE_INDEX_KEY: torch.tensor([[0, 1], [1, 0]], device=device, dtype=torch.long),
+        _keys.BATCH_KEY: torch.zeros(2, device=device, dtype=torch.long),
+        AtomicDataDict.ATOM_TYPE_KEY: torch.tensor(
+            [idp.chemical_symbol_to_type["H"], idp.chemical_symbol_to_type["C"]],
+            device=device,
+            dtype=torch.long,
+        ),
+        AtomicDataDict.EDGE_TYPE_KEY: torch.tensor(
+            [idp.bond_to_type["H-C"], idp.bond_to_type["C-H"]],
+            device=device,
+            dtype=torch.long,
+        ),
+        _keys.NODE_FEATURES_KEY: node.clone(),
+        _keys.EDGE_FEATURES_KEY: edge.clone(),
+    }
+    ref = {
+        _keys.NODE_FEATURES_KEY: node.clone(),
+        _keys.EDGE_FEATURES_KEY: edge.clone(),
+    }
+    return idp, data, ref
+
+
+def _onsite_diag_indices(idp: OrbitalMapper, symbol: str, orbital: str, device: torch.device):
+    full = idp.basis_to_full_basis[symbol][orbital]
+    block = idp.orbpair_maps[f"{full}-{full}"]
+    degree = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}[full[-1]]
+    width = 2 * degree + 1
+    diag = torch.arange(width, device=device, dtype=torch.long)
+    return int(block.start) + diag * width + diag
+
+
+def test_basis_onsite_prior_initializes_without_h0():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "basis_onsite",
+            "strict_h0": False,
+            "warn_missing_h0": False,
+            "detach_interpolated_h0": False,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+
+    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+
+    expected = torch.zeros_like(ref[_keys.NODE_FEATURES_KEY])
+    expected[0, _onsite_diag_indices(idp, "H", "1s", device)] = onsite_energy_database["H"]["1s"]
+    expected[1, _onsite_diag_indices(idp, "C", "2s", device)] = onsite_energy_database["C"]["2s"]
+    expected[1, _onsite_diag_indices(idp, "C", "2p", device)] = onsite_energy_database["C"]["2p"]
+
+    torch.testing.assert_close(out[_keys.NODE_H0_KEY], expected)
+    torch.testing.assert_close(ctx.node_prior, expected)
+    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], torch.zeros_like(ref[_keys.EDGE_FEATURES_KEY]))
+
+
+def test_basis_onsite_prior_is_residualized_against_existing_h0():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    node_base = torch.full_like(ref[_keys.NODE_FEATURES_KEY], 0.25)
+    edge_base = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.5)
+    data[_keys.NODE_H0_KEY] = node_base
+    data[_keys.EDGE_H0_KEY] = edge_base
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "basis_onsite",
+            "detach_interpolated_h0": False,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+
+    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+
+    expected_abs = torch.zeros_like(ref[_keys.NODE_FEATURES_KEY])
+    expected_abs[0, _onsite_diag_indices(idp, "H", "1s", device)] = onsite_energy_database["H"]["1s"]
+    expected_abs[1, _onsite_diag_indices(idp, "C", "2s", device)] = onsite_energy_database["C"]["2s"]
+    expected_abs[1, _onsite_diag_indices(idp, "C", "2p", device)] = onsite_energy_database["C"]["2p"]
+
+    torch.testing.assert_close(out[_keys.NODE_H0_KEY], expected_abs)
+    torch.testing.assert_close(ctx.node_prior, expected_abs - node_base)
+    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], torch.zeros_like(edge_base))
+    torch.testing.assert_close(ctx.edge_prior, -edge_base)
+
+
+def test_dftb_prior_uses_external_absolute_hamiltonian_keys():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    dftb_node = data[_keys.NODE_H0_KEY] + 3.0
+    dftb_edge = data[_keys.EDGE_H0_KEY] - 2.0
+    data["dftb_node_h0"] = dftb_node
+    data["dftb_edge_h0"] = dftb_edge
+    flow = _flow("dftb", device=device, dtype=dtype)
+
+    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    torch.testing.assert_close(out[_keys.NODE_H0_KEY], dftb_node)
+    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], dftb_edge)
+    torch.testing.assert_close(ctx.node_prior, dftb_node - data[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(ctx.edge_prior, dftb_edge - data[_keys.EDGE_H0_KEY])
+
+
+def test_dftbsk_prior_uses_on_the_fly_absolute_initial_guess():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    node_guess = data[_keys.NODE_H0_KEY] + 0.75
+    edge_guess = data[_keys.EDGE_H0_KEY] - 0.25
+    flow = _flow("dftbsk", device=device, dtype=dtype)
+
+    def fake_dftbsk(like, *, data, label):
+        return node_guess if label == "node" else edge_guess
+
+    flow._dftbsk_absolute_prior_like = fake_dftbsk
+
+    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    torch.testing.assert_close(out[_keys.NODE_H0_KEY], node_guess)
+    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], edge_guess)
+    torch.testing.assert_close(ctx.node_prior, node_guess - data[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(ctx.edge_prior, edge_guess - data[_keys.EDGE_H0_KEY])
+
+
 def test_flow_options_argcheck_accepts_te_prior_config_keys():
     schema = flow_options()
 
@@ -779,6 +923,37 @@ def test_flow_options_argcheck_accepts_te_prior_config_keys():
     assert value["te_prior_sigma"] == pytest.approx(0.5)
     assert value["te_prior_mode"] == "typewise"
     assert value["te_prior_per_graph"] is False
+
+
+def test_flow_options_argcheck_accepts_physical_prior_config_keys():
+    schema = flow_options()
+
+    value = schema.normalize_value(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "dftbsk",
+            "prior_node_key": "dftb_node_h0",
+            "prior_edge_key": "dftb_edge_h0",
+            "prior_key_prefixes": ["dftb", "xtb"],
+            "prior_skdata": "/tmp/skfiles",
+            "dftb_prior_overlap": True,
+            "physical_prior_fallback": "basis_onsite",
+            "basis_onsite_scale": 0.5,
+            "physical_prior_jitter_sigma": 0.01,
+            "physical_prior_jitter_reference_scale": True,
+            "physical_prior_jitter_edge_decay": 2.0,
+        }
+    )
+    schema.check_value(value, strict=True)
+
+    assert value["prior"] == "dftbsk"
+    assert value["prior_node_key"] == "dftb_node_h0"
+    assert value["prior_key_prefixes"] == ["dftb", "xtb"]
+    assert value["prior_skdata"] == "/tmp/skfiles"
+    assert value["dftb_prior_overlap"] is True
+    assert value["basis_onsite_scale"] == pytest.approx(0.5)
+    assert value["physical_prior_jitter_edge_decay"] == pytest.approx(2.0)
 
 
 def test_common_options_argcheck_accepts_nextham_uureal_mask():

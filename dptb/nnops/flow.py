@@ -13,11 +13,13 @@ features.
 from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.nn.sktb.onsiteDB import onsite_energy_database
 from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 
 log = logging.getLogger(__name__)
@@ -117,11 +119,38 @@ class HamiltonianCFM:
         # dense TE/CG priors.
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
-        allowed_priors = {"zero", "gaussian", "residual_gaussian", *self._te_prior_names}
+        self._basis_prior_names = {"basis_onsite", "fixed_onsite", "atomic_onsite"}
+        self._external_prior_names = {
+            "external",
+            "dftb",
+            "dftb_xtb",
+            "xtb",
+            "physical",
+            "sk",
+            "nnsk",
+        }
+        self._dftbsk_prior_names = {
+            "dftbsk",
+            "dftb_sk",
+            "dftb_scf0",
+            "dftb_on_the_fly",
+            "skf",
+            "skfile",
+        }
+        allowed_priors = {
+            "zero",
+            "gaussian",
+            "residual_gaussian",
+            *self._te_prior_names,
+            *self._basis_prior_names,
+            *self._external_prior_names,
+            *self._dftbsk_prior_names,
+        }
         if self.prior not in allowed_priors:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
-                "use 'zero', 'gaussian', 'residual_gaussian', or 'te'."
+                "use 'zero', 'gaussian', 'residual_gaussian', 'te', "
+                "'basis_onsite', 'dftbsk', 'external', 'dftb', 'xtb', or 'physical'."
             )
 
         self.node_sigma = float(options.get("node_sigma", 1.0))
@@ -135,6 +164,50 @@ class HamiltonianCFM:
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
             raise ValueError("flow_options.te_prior_mode must be 'irrep', 'block', or 'typewise'.")
         self.te_prior_per_graph = bool(options.get("te_prior_per_graph", True))
+        self.prior_node_key = str(options.get("prior_node_key", "") or "")
+        self.prior_edge_key = str(options.get("prior_edge_key", "") or "")
+        raw_prefixes = options.get("prior_key_prefixes", ())
+        if isinstance(raw_prefixes, str):
+            raw_prefixes = [raw_prefixes]
+        self.prior_key_prefixes = tuple(
+            str(prefix).strip() for prefix in raw_prefixes if str(prefix).strip()
+        )
+        self.external_prior_strict = bool(options.get("external_prior_strict", True))
+        self.prior_skdata = str(
+            options.get("prior_skdata", options.get("dftb_skdata", options.get("skdata", ""))) or ""
+        )
+        self.dftb_prior_overlap = bool(options.get("dftb_prior_overlap", False))
+        self.dftb_prior_strict = bool(options.get("dftb_prior_strict", True))
+        self.dftb_prior_require_geometry = bool(
+            options.get("dftb_prior_require_geometry", True)
+        )
+        self._dftbsk_prior_cache: Dict[Tuple[str, torch.dtype], Any] = {}
+        self._dftbsk_prior_last: Optional[
+            Tuple[
+                Tuple[int, int, int, str, torch.dtype],
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+            ]
+        ] = None
+        self.physical_prior_fallback = str(
+            options.get("physical_prior_fallback", "basis_onsite")
+        ).lower().replace("-", "_")
+        if self.physical_prior_fallback not in {"basis_onsite", "zero", "error"}:
+            raise ValueError(
+                "flow_options.physical_prior_fallback must be 'basis_onsite', 'zero', or 'error'."
+            )
+        self.basis_onsite_scale = float(options.get("basis_onsite_scale", 1.0))
+        self.basis_onsite_missing_value = float(options.get("basis_onsite_missing_value", 0.0))
+        self.basis_onsite_edge_value = float(options.get("basis_onsite_edge_value", 0.0))
+        self.physical_prior_jitter_sigma = float(
+            options.get("physical_prior_jitter_sigma", options.get("prior_jitter_sigma", 0.0))
+        )
+        self.physical_prior_jitter_reference_scale = bool(
+            options.get("physical_prior_jitter_reference_scale", True)
+        )
+        self.physical_prior_jitter_edge_decay = float(
+            options.get("physical_prior_jitter_edge_decay", 0.0)
+        )
 
         # Time sampling.  QHFlow uses U(0,1); we expose a t0 mass so the network
         # explicitly sees the physical-H0 one-step inference point.
@@ -368,6 +441,480 @@ class HamiltonianCFM:
         like = table.new_empty((table.shape[0], int(feature_dim)))
         table, _raw_mask = project_uureal_to_like(self.idp, table, like)
         return table
+
+    def _external_prior_prefixes(self) -> Tuple[str, ...]:
+        if self.prior_key_prefixes:
+            return self.prior_key_prefixes
+        if self.prior == "dftb":
+            return ("dftb", "dftbsk", "sk", "nnsk")
+        if self.prior == "xtb":
+            return ("xtb", "gfn", "gfn1", "gfn2")
+        if self.prior == "sk":
+            return ("sk", "dftbsk", "nnsk")
+        if self.prior == "nnsk":
+            return ("nnsk", "sk")
+        if self.prior in {"dftb_xtb", "physical"}:
+            return ("dftb", "xtb", "dftbsk", "sk", "nnsk", "gfn", "gfn1", "gfn2")
+        return ("prior", "external")
+
+    def _external_prior_candidate_keys(self, label: Optional[str]) -> Tuple[str, ...]:
+        if label == "node":
+            explicit = self.prior_node_key
+            h0_key = self.node_h0_key
+            target_key = self.node_target_key
+            physical_name = "onsite"
+        elif label == "edge":
+            explicit = self.prior_edge_key
+            h0_key = self.edge_h0_key
+            target_key = self.edge_target_key
+            physical_name = "hopping"
+        else:
+            explicit = ""
+            h0_key = ""
+            target_key = ""
+            physical_name = str(label or "state")
+
+        keys = []
+        if explicit:
+            keys.append(explicit)
+        for prefix in self._external_prior_prefixes():
+            keys.extend(
+                [
+                    f"{prefix}_{label}_h0",
+                    f"{label}_{prefix}_h0",
+                    f"{label}_h0_{prefix}",
+                    f"{prefix}_{h0_key}" if h0_key else "",
+                    f"{h0_key}_{prefix}" if h0_key else "",
+                    f"{prefix}_{target_key}" if target_key else "",
+                    f"{target_key}_{prefix}" if target_key else "",
+                    f"{prefix}_{label}_features",
+                    f"{label}_{prefix}_features",
+                    f"{prefix}_{label}_hamiltonian",
+                    f"{label}_{prefix}_hamiltonian",
+                    f"{prefix}_{physical_name}",
+                    f"{physical_name}_{prefix}",
+                ]
+            )
+        out = []
+        seen = set()
+        for key in keys:
+            key = str(key or "")
+            if key and key not in seen:
+                out.append(key)
+                seen.add(key)
+        return tuple(out)
+
+    def _coerce_prior_source(
+        self,
+        source: torch.Tensor,
+        like: torch.Tensor,
+        *,
+        key: str,
+        label: Optional[str],
+    ) -> torch.Tensor:
+        if not torch.is_tensor(source):
+            source = torch.as_tensor(source, device=like.device)
+        if torch.is_complex(source):
+            log.warning("External %s prior `%s` is complex; only the real part is used.", label, key)
+            source = source.real
+        source = source.to(device=like.device, dtype=like.dtype)
+        if source.ndim == 1 and like.ndim >= 2:
+            source = source.unsqueeze(0)
+        source, _raw_mask = project_uureal_to_like(self.idp, source, like)
+        if source.shape == like.shape:
+            return source
+        if source.numel() == like.numel():
+            return source.reshape_as(like)
+        raise ValueError(
+            f"External {label or 'state'} prior `{key}` shape {tuple(source.shape)} "
+            f"does not match target shape {tuple(like.shape)}."
+        )
+
+    def _external_absolute_prior_like(
+        self,
+        like: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        if data is None:
+            return None
+        for key in self._external_prior_candidate_keys(label):
+            source = data.get(key, None)
+            if source is None:
+                continue
+            return self._coerce_prior_source(source, like, key=key, label=label)
+        return None
+
+    def _should_try_dftbsk_prior(self) -> bool:
+        if self.prior in self._dftbsk_prior_names:
+            return True
+        return bool(self.prior_skdata) and self.prior in {
+            "dftb",
+            "dftb_xtb",
+            "physical",
+            "sk",
+        }
+
+    def _dftbsk_prior_basis(self) -> Optional[Dict[str, Any]]:
+        basis = getattr(self.idp, "basis", None)
+        if isinstance(basis, dict):
+            return basis
+        return None
+
+    def _dftbsk_prior_model(self, *, device: torch.device, dtype: torch.dtype) -> Any:
+        if not self.prior_skdata:
+            raise ValueError(
+                "On-the-fly DFTB-SK prior requires flow_options.prior_skdata "
+                "or flow_options.dftb_skdata."
+            )
+        basis = self._dftbsk_prior_basis()
+        if basis is None:
+            raise ValueError(
+                "On-the-fly DFTB-SK prior requires an idp with a basis dictionary."
+            )
+        key = (str(device), dtype)
+        model = self._dftbsk_prior_cache.get(key)
+        if model is None:
+            from dptb.nn.dftbsk import DFTBSK
+
+            model = DFTBSK(
+                basis=basis,
+                skdata=self.prior_skdata,
+                overlap=self.dftb_prior_overlap,
+                dtype=dtype,
+                device=device,
+                transform=True,
+            )
+            model.eval()
+            self._dftbsk_prior_cache[key] = model
+        return model
+
+    def _dftbsk_prior_outputs(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if data is None:
+            return None, None
+        cache_key = (
+            id(data),
+            id(data.get(AtomicDataDict.ATOM_TYPE_KEY, None)),
+            id(data.get(_keys.EDGE_INDEX_KEY, None)),
+            str(device),
+            dtype,
+        )
+        if self._dftbsk_prior_last is not None:
+            last_key, last_node, last_edge = self._dftbsk_prior_last
+            if last_key == cache_key:
+                return last_node, last_edge
+
+        runtime_data = data.copy()
+        if self.dftb_prior_require_geometry and (
+            _keys.EDGE_VECTORS_KEY not in runtime_data
+            and (
+                _keys.POSITIONS_KEY not in runtime_data
+                or _keys.EDGE_INDEX_KEY not in runtime_data
+            )
+        ):
+            raise KeyError(
+                "On-the-fly DFTB-SK prior requires edge_vectors or pos+edge_index "
+                "so hopping features can be rotated into the DeePTB RME layout."
+            )
+        if _keys.PBC_KEY not in runtime_data:
+            num_graphs = self._num_graphs(runtime_data)
+            runtime_data[_keys.PBC_KEY] = torch.zeros(
+                num_graphs,
+                3,
+                device=device,
+                dtype=torch.bool,
+            )
+        model = self._dftbsk_prior_model(device=device, dtype=dtype)
+        with torch.no_grad():
+            out = model(runtime_data)
+        node = out.get(_keys.NODE_FEATURES_KEY, None)
+        edge = out.get(_keys.EDGE_FEATURES_KEY, None)
+        self._dftbsk_prior_last = (cache_key, node, edge)
+        return node, edge
+
+    def _dftbsk_absolute_prior_like(
+        self,
+        like: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        if not self._should_try_dftbsk_prior():
+            return None
+        if not self.prior_skdata:
+            if self.prior in self._dftbsk_prior_names:
+                raise ValueError(
+                    "flow_options.prior='dftbsk' requires prior_skdata/dftb_skdata."
+                )
+            return None
+        try:
+            node, edge = self._dftbsk_prior_outputs(
+                data,
+                device=like.device,
+                dtype=like.dtype,
+            )
+            source = node if label == "node" else edge if label == "edge" else None
+            if source is None:
+                return None
+            return self._coerce_prior_source(
+                source,
+                like,
+                key=f"on_the_fly_dftbsk:{label}",
+                label=label,
+            )
+        except Exception as exc:
+            if self.prior in self._dftbsk_prior_names or self.dftb_prior_strict:
+                raise RuntimeError(
+                    "On-the-fly DFTB-SK prior failed. Check prior_skdata, basis, "
+                    "edge geometry, and target feature layout."
+                ) from exc
+            log.warning("On-the-fly DFTB-SK prior failed; falling back: %s", exc)
+            return None
+
+    def _basis_onsite_energy(self, symbol: str, orbital: str) -> float:
+        db = onsite_energy_database.get(str(symbol), {})
+        orbital = str(orbital)
+        if orbital in db:
+            return float(db[orbital])
+
+        letters = re.findall(r"[A-Za-z]", orbital)
+        if not letters:
+            return self.basis_onsite_missing_value
+        angular = letters[-1].lower()
+        if "*" in orbital:
+            starred = f"{angular}*"
+            if starred in db:
+                return float(db[starred])
+
+        candidates = []
+        for key, value in db.items():
+            if "*" in key:
+                continue
+            match = re.fullmatch(r"(\d+)([A-Za-z])", str(key))
+            if match is not None and match.group(2).lower() == angular:
+                candidates.append((int(match.group(1)), float(value)))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+        return self.basis_onsite_missing_value
+
+    @staticmethod
+    def _orbital_l(orbital: str) -> int:
+        letters = re.findall(r"[A-Za-z]", str(orbital))
+        if not letters:
+            return 0
+        return {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}.get(
+            letters[-1].lower(),
+            0,
+        )
+
+    def _basis_onsite_table(self, like: torch.Tensor) -> Optional[torch.Tensor]:
+        idp = self.idp
+        if idp is None:
+            return None
+        basis = getattr(idp, "basis", None)
+        type_names = getattr(idp, "type_names", None)
+        chemical_symbol_to_type = getattr(idp, "chemical_symbol_to_type", None)
+        basis_to_full_basis = getattr(idp, "basis_to_full_basis", None)
+        orbpair_maps = getattr(idp, "orbpair_maps", None)
+        if callable(getattr(idp, "get_orbpair_maps", None)) and orbpair_maps is None:
+            orbpair_maps = idp.get_orbpair_maps()
+        if (
+            not isinstance(basis, dict)
+            or not isinstance(basis_to_full_basis, dict)
+            or not isinstance(orbpair_maps, dict)
+        ):
+            return None
+        if chemical_symbol_to_type is None:
+            if type_names is None:
+                return None
+            chemical_symbol_to_type = {str(symbol): idx for idx, symbol in enumerate(type_names)}
+
+        raw_dim = int(getattr(idp, "reduced_matrix_element", like.shape[-1]))
+        for slc in orbpair_maps.values():
+            raw_dim = max(raw_dim, int(getattr(slc, "stop", 0)))
+        num_types = 0
+        for type_idx in chemical_symbol_to_type.values():
+            num_types = max(num_types, int(type_idx) + 1)
+        table = torch.zeros(
+            num_types,
+            raw_dim,
+            device=like.device,
+            dtype=like.dtype,
+        )
+        for symbol, type_idx in chemical_symbol_to_type.items():
+            orbitals = basis.get(symbol, ())
+            full_map = basis_to_full_basis.get(symbol, {})
+            if not isinstance(full_map, dict):
+                continue
+            for orbital in orbitals:
+                full_orbital = full_map.get(orbital)
+                if full_orbital is None:
+                    continue
+                block = orbpair_maps.get(f"{full_orbital}-{full_orbital}")
+                if block is None:
+                    continue
+                width = 2 * self._orbital_l(full_orbital) + 1
+                diag = torch.arange(width, device=like.device, dtype=torch.long)
+                diag = int(block.start) + diag * width + diag
+                diag = diag[diag < int(block.stop)]
+                if diag.numel() == 0:
+                    continue
+                energy = self._basis_onsite_energy(str(symbol), str(orbital))
+                table[int(type_idx), diag] = float(self.basis_onsite_scale) * energy
+
+        table, _raw_mask = project_uureal_to_like(self.idp, table, like)
+        if table.ndim < 2 or table.shape[-1] != like.shape[-1]:
+            return None
+        return table
+
+    def _basis_onsite_absolute_prior_like(
+        self,
+        like: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        if label == "edge":
+            prior = torch.full_like(like, float(self.basis_onsite_edge_value))
+            return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
+        if label != "node":
+            return torch.zeros_like(like)
+        if data is None or AtomicDataDict.ATOM_TYPE_KEY not in data:
+            return None
+        table = self._basis_onsite_table(like)
+        if table is None:
+            return None
+        atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].to(
+            device=like.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        prior = torch.zeros_like(like)
+        take = min(int(atom_types.numel()), int(like.shape[0]))
+        if take > 0 and table.shape[0] > 0:
+            raw_types = atom_types[:take]
+            valid = (raw_types >= 0) & (raw_types < table.shape[0])
+            rows = torch.arange(take, device=like.device, dtype=torch.long)[valid]
+            if rows.numel() > 0:
+                prior[rows] = table.index_select(0, raw_types[valid])
+        return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
+
+    def _absolute_to_flow_prior(
+        self,
+        absolute_prior: torch.Tensor,
+        like: torch.Tensor,
+        *,
+        base: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        absolute_prior = absolute_prior.to(device=like.device, dtype=like.dtype)
+        if self.mode != "residual":
+            return absolute_prior
+        if base is None:
+            base = torch.zeros_like(like)
+        return absolute_prior - base.to(device=like.device, dtype=like.dtype)
+
+    def _physical_prior_jitter_like(
+        self,
+        like: torch.Tensor,
+        sigma: float,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> torch.Tensor:
+        if self.physical_prior_jitter_sigma <= 0.0:
+            return torch.zeros_like(like)
+        mask = self._prior_mask(data, like, label).to(dtype=like.dtype)
+        noise = torch.randn_like(like) * mask
+        if self.physical_prior_jitter_reference_scale and like.ndim >= 2:
+            denom = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            row_rms = ((like.detach().square() * mask).sum(dim=-1, keepdim=True) / denom).sqrt()
+            noise = noise * row_rms.clamp_min(float(self.residual_sigma_floor))
+        if (
+            label == "edge"
+            and self.physical_prior_jitter_edge_decay > 0.0
+            and data is not None
+            and _keys.EDGE_LENGTH_KEY in data
+        ):
+            edge_lengths = data[_keys.EDGE_LENGTH_KEY].to(device=like.device, dtype=like.dtype)
+            edge_lengths = edge_lengths.reshape(-1)
+            if int(edge_lengths.shape[0]) == int(like.shape[0]):
+                view_shape = (edge_lengths.shape[0],) + (1,) * (like.ndim - 1)
+                noise = noise * torch.exp(
+                    -edge_lengths.reshape(view_shape) / self.physical_prior_jitter_edge_decay
+                )
+        return noise * (float(sigma) * self.physical_prior_jitter_sigma)
+
+    def _physical_prior_like(
+        self,
+        residual: torch.Tensor,
+        sigma: float,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+        base: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        absolute_prior = None
+        if self.prior in self._external_prior_names:
+            absolute_prior = self._external_absolute_prior_like(residual, data=data, label=label)
+
+        if absolute_prior is None:
+            absolute_prior = self._dftbsk_absolute_prior_like(
+                residual,
+                data=data,
+                label=label,
+            )
+
+        allow_basis_fallback = (
+            self.prior in self._basis_prior_names
+            or (
+                self.prior not in {"external", *self._dftbsk_prior_names}
+                and self.physical_prior_fallback == "basis_onsite"
+            )
+        )
+        if absolute_prior is None and allow_basis_fallback:
+            absolute_prior = self._basis_onsite_absolute_prior_like(
+                residual,
+                data=data,
+                label=label,
+            )
+
+        if absolute_prior is None:
+            if self.prior in self._basis_prior_names:
+                raise ValueError(
+                    "flow_options.prior='basis_onsite' requires an OrbitalMapper-like idp "
+                    "with basis_to_full_basis/orbpair_maps and node atom_types."
+                )
+            if self.prior in self._dftbsk_prior_names:
+                raise ValueError(
+                    "flow_options.prior='dftbsk' requires a successful on-the-fly "
+                    "DFTB-SK initialization; set prior_skdata/dftb_skdata to a "
+                    "Slater-Koster directory or formatted .pth."
+                )
+            if (
+                self.physical_prior_fallback == "zero"
+                or (self.prior == "external" and not self.external_prior_strict)
+            ):
+                absolute_prior = torch.zeros_like(residual)
+            else:
+                keys = ", ".join(self._external_prior_candidate_keys(label)[:8])
+                raise KeyError(
+                    f"flow_options.prior={self.prior!r} did not find an external "
+                    f"{label or 'state'} prior. Tried keys: {keys}."
+                )
+
+        prior = self._absolute_to_flow_prior(absolute_prior, residual, base=base)
+        return prior + self._physical_prior_jitter_like(
+            residual,
+            sigma,
+            data=data,
+            label=label,
+        )
 
     def _prior_mask(
         self,
@@ -742,6 +1289,7 @@ class HamiltonianCFM:
         *,
         data: Optional[AtomicDataDict.Type] = None,
         label: Optional[str] = None,
+        base: Optional[torch.Tensor] = None,
         reference_scale: bool = True,
         num_graphs: Optional[int] = None,
     ) -> torch.Tensor:
@@ -757,6 +1305,18 @@ class HamiltonianCFM:
                 label=label,
                 reference_scale=reference_scale,
                 num_graphs=num_graphs,
+            )
+        if (
+            self.prior in self._basis_prior_names
+            or self.prior in self._external_prior_names
+            or self.prior in self._dftbsk_prior_names
+        ):
+            return self._physical_prior_like(
+                residual,
+                sigma,
+                data=data,
+                label=label,
+                base=base,
             )
         # residual_gaussian: match global residual scale, useful as a rough TE/GOE proxy.
         scale = residual.detach().std().clamp_min(self.residual_sigma_floor)
@@ -811,6 +1371,7 @@ class HamiltonianCFM:
                 self.node_sigma,
                 data=data,
                 label="node",
+                base=node_base,
                 num_graphs=num_graphs,
             )
             node_t_view = node_t.reshape((-1,) + (1,) * (node_target.ndim - 1))
@@ -830,6 +1391,7 @@ class HamiltonianCFM:
                 self.edge_sigma,
                 data=data,
                 label="edge",
+                base=edge_base,
                 num_graphs=num_graphs,
             )
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_target.ndim - 1))
@@ -1077,6 +1639,7 @@ class HamiltonianCFM:
                     self.node_sigma,
                     data=state,
                     label="node",
+                    base=node_current,
                     reference_scale=False,
                 )
             if edge_current is not None:
@@ -1085,6 +1648,7 @@ class HamiltonianCFM:
                     self.edge_sigma,
                     data=state,
                     label="edge",
+                    base=edge_current,
                     reference_scale=False,
                 )
 
@@ -1222,6 +1786,31 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_aux_boundary_v_weight = float(
             mf.get("aux_boundary_v_weight", 0.10 if aggressive else 0.0)
         )
+        self.meanflow_objective = str(
+            mf.get("objective", mf.get("loss_objective", "finite_difference"))
+        ).lower().replace("-", "_")
+        if self.meanflow_objective in {"fd", "finite_diff", "jvp"}:
+            self.meanflow_objective = "finite_difference"
+        if self.meanflow_objective in {"kaist", "semigroup_meanflow", "semigroup_mf"}:
+            self.meanflow_objective = "semigroup"
+        if self.meanflow_objective not in {"finite_difference", "semigroup", "hybrid"}:
+            raise ValueError(
+                "pixel_meanflow.meanflow.objective must be 'finite_difference', "
+                "'semigroup', or 'hybrid', "
+                f"got {self.meanflow_objective!r}."
+            )
+        self.meanflow_semigroup_weight = float(
+            mf.get(
+                "semigroup_weight",
+                1.0 if self.meanflow_objective in {"semigroup", "hybrid"} else 0.0,
+            )
+        )
+        self.meanflow_semigroup_endpoint_weight = float(
+            mf.get(
+                "semigroup_endpoint_weight",
+                1.0 if self.meanflow_objective == "semigroup" else self.meanflow_aux_endpoint_weight,
+            )
+        )
         self.meanflow_jvp_tangent = str(mf.get("jvp_tangent", "boundary")).lower()
         if self.meanflow_jvp_tangent not in {"path", "boundary"}:
             raise ValueError("pixel_meanflow.jvp_tangent must be 'path' or 'boundary'.")
@@ -1230,20 +1819,13 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.flow_time_r_key = str(options.get("flow_time_r_key", "flow_time_r"))
         self.flow_time_t_key = str(options.get("flow_time_t_key", "flow_time_t"))
         self.flow_time_h_key = str(options.get("flow_time_h_key", "flow_time_h"))
-        # model-in-loss pMF has no raw-batch train_compatible scalar-field path;
-        # the endpoint-compatible train stats are collected directly from
-        # pred_x-clean below and feed the legacy train_loss reducer. A True
-        # request here would only register separate train_compatible_* logger
-        # fields that never update and print as constant zeros, so force it off
-        # loudly instead of silently lying.
-        if bool(mf.get("log_train_compatible_loss", False)) and self.enabled:
-            log.warning(
-                "pixel_meanflow.log_train_compatible_loss=true is not supported: "
-                "the model-in-loss pMF objective does not emit separate "
-                "train_compatible_* scalar fields; forcing it off. Endpoint "
-                "stats still feed legacy train_loss/train_*_loss."
-            )
-        self.log_train_compatible_loss = False
+        # pMF computes its optimization loss inside loss_with_model, but it
+        # also has the endpoint prediction in hand. Keep train_loss aligned to
+        # no-CFM/CFM by reducing endpoint stats, while train_loss_opt remains
+        # the actual flow/semigroup objective used for backward.
+        self.log_train_compatible_loss = bool(
+            mf.get("log_train_compatible_loss", self.log_train_compatible_loss)
+        )
         # Validation stays aligned with no-CFM/CFM by default: sample/euler to
         # the endpoint and report the blockwise compatible loss under the
         # legacy validation_loss/validation_onsite_loss/validation_hopping_loss
@@ -1290,9 +1872,11 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
 
         if self.enabled:
             log.info(
-                "Pixel MeanFlow enabled: profile=%s sampling=%s min_t=%.3g "
-                "data_prop=%.3g du_dt=%s jvp_tangent=%s norm_p=%.3g aux_x=%.3g aux_v=%.3g",
+                "Pixel MeanFlow enabled: profile=%s objective=%s sampling=%s min_t=%.3g "
+                "data_prop=%.3g du_dt=%s jvp_tangent=%s norm_p=%.3g "
+                "aux_x=%.3g aux_v=%.3g semigroup_w=%.3g semigroup_x=%.3g",
                 self.meanflow_profile,
+                self.meanflow_objective,
                 self.meanflow_time_sampling,
                 self.meanflow_min_t,
                 self.meanflow_data_proportion,
@@ -1301,6 +1885,8 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 self.meanflow_norm_p,
                 self.meanflow_aux_endpoint_weight,
                 self.meanflow_aux_boundary_v_weight,
+                self.meanflow_semigroup_weight,
+                self.meanflow_semigroup_endpoint_weight,
             )
 
     def _sample_time_base(
@@ -1417,7 +2003,13 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             node_target = node_target.to(device=device, dtype=dtype)
             node_base = self._base_like(data, node_target, self.node_h0_key, "node")
             node_clean = node_target - node_base if self.mode == "residual" else node_target
-            node_prior = self._prior_like(node_clean, self.node_sigma, data=data, label="node")
+            node_prior = self._prior_like(
+                node_clean,
+                self.node_sigma,
+                data=data,
+                label="node",
+                base=node_base,
+            )
             node_t_view = node_t.reshape((-1,) + (1,) * (node_clean.ndim - 1))
             node_state = (1.0 - node_t_view) * node_clean + node_t_view * node_prior
             current = node_base + node_state if self.mode == "residual" else node_state
@@ -1430,7 +2022,13 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             edge_target = edge_target.to(device=device, dtype=dtype)
             edge_base = self._base_like(data, edge_target, self.edge_h0_key, "edge")
             edge_clean = edge_target - edge_base if self.mode == "residual" else edge_target
-            edge_prior = self._prior_like(edge_clean, self.edge_sigma, data=data, label="edge")
+            edge_prior = self._prior_like(
+                edge_clean,
+                self.edge_sigma,
+                data=data,
+                label="edge",
+                base=edge_base,
+            )
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_clean.ndim - 1))
             edge_state = (1.0 - edge_t_view) * edge_clean + edge_t_view * edge_prior
             current = edge_base + edge_state if self.mode == "residual" else edge_state
@@ -1520,6 +2118,222 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         if norm_p != 0.0:
             per_item = per_item / (per_item.detach() + norm_eps).pow(norm_p)
         return per_item.mean(), sq.mean(), ab.mean()
+
+    def _reverse_meanflow_step(
+        self,
+        state_z: torch.Tensor,
+        pred_x: torch.Tensor,
+        start_time: torch.Tensor,
+        end_time: torch.Tensor,
+    ) -> torch.Tensor:
+        h_view = (start_time - end_time).reshape((-1,) + (1,) * (state_z.ndim - 1))
+        u = (state_z - pred_x) / self._view_time(start_time, state_z)
+        return state_z - h_view * u
+
+    def _component_semigroup_loss(
+        self,
+        *,
+        diff_prefix: str,
+        pred_x: torch.Tensor,
+        clean: torch.Tensor,
+        state_z: torch.Tensor,
+        state_two_step: torch.Tensor,
+        comp_r: torch.Tensor,
+        comp_t: torch.Tensor,
+        mask: torch.Tensor,
+        weight: float,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        state_one_step = self._reverse_meanflow_step(state_z, pred_x, comp_t, comp_r)
+        semigroup_loss, semigroup_mse, semigroup_mae = self._adaptive_metric_stats(
+            state_one_step - state_two_step.detach(),
+            mask,
+            self.loss_type,
+            norm_p=self.meanflow_norm_p,
+            norm_eps=self.meanflow_norm_eps,
+        )
+        endpoint_loss, endpoint_mse, endpoint_mae = self._adaptive_metric_stats(
+            pred_x - clean,
+            mask,
+            self.loss_type,
+        )
+        total = weight * (
+            self.meanflow_semigroup_weight * semigroup_loss
+            + self.meanflow_semigroup_endpoint_weight * endpoint_loss
+        )
+        state = {
+            f"{diff_prefix}_semigroup_loss": semigroup_loss.detach(),
+            f"{diff_prefix}_semigroup_mse": semigroup_mse.detach(),
+            f"{diff_prefix}_semigroup_mae": semigroup_mae.detach(),
+            f"{diff_prefix}_endpoint_loss": endpoint_loss.detach(),
+            f"{diff_prefix}_endpoint_mse": endpoint_mse.detach(),
+            f"{diff_prefix}_endpoint_mae": endpoint_mae.detach(),
+        }
+        return total, state
+
+    def _semigroup_loss_with_model(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        ctx: PixelMFContext,
+        *,
+        prefix: str,
+        node_x: Optional[torch.Tensor] = None,
+        edge_x: Optional[torch.Tensor] = None,
+        primary_aliases: bool = True,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], int]:
+        explicit_model_calls = 0
+        needs_main = (
+            (ctx.node_clean is not None and node_x is None)
+            or (ctx.edge_clean is not None and edge_x is None)
+        )
+        if needs_main:
+            _, fetched_node_x, fetched_edge_x = self._predict_clean(
+                model, data, ctx, ctx.node_state, ctx.edge_state, r=ctx.r, t=ctx.t
+            )
+            explicit_model_calls += 1
+            if node_x is None:
+                node_x = fetched_node_x
+            if edge_x is None:
+                edge_x = fetched_edge_x
+
+        split_t = 0.5 * (ctx.r + ctx.t)
+        split_t = torch.minimum(
+            torch.maximum(split_t, ctx.t.new_full(ctx.t.shape, self.meanflow_min_t)),
+            ctx.t,
+        )
+        node_split_t, edge_split_t = self._expand_graph_times(
+            data,
+            split_t,
+            node_count=None if ctx.node_state is None else ctx.node_state.shape[0],
+            edge_count=None if ctx.edge_state is None else ctx.edge_state.shape[0],
+        )
+
+        with torch.no_grad():
+            _, node_x_to_split, edge_x_to_split = self._predict_clean(
+                model,
+                data,
+                ctx,
+                ctx.node_state,
+                ctx.edge_state,
+                r=split_t,
+                t=ctx.t,
+            )
+            explicit_model_calls += 1
+
+            node_state_split = edge_state_split = None
+            if ctx.node_state is not None and node_x_to_split is not None:
+                node_state_split = self._reverse_meanflow_step(
+                    ctx.node_state,
+                    node_x_to_split,
+                    ctx.node_t,
+                    node_split_t,
+                )
+            if ctx.edge_state is not None and edge_x_to_split is not None:
+                edge_state_split = self._reverse_meanflow_step(
+                    ctx.edge_state,
+                    edge_x_to_split,
+                    ctx.edge_t,
+                    edge_split_t,
+                )
+
+            _, node_x_to_r, edge_x_to_r = self._predict_clean(
+                model,
+                data,
+                ctx,
+                node_state_split,
+                edge_state_split,
+                r=ctx.r,
+                t=split_t,
+            )
+            explicit_model_calls += 1
+
+            node_state_two_step = edge_state_two_step = None
+            if node_state_split is not None and node_x_to_r is not None:
+                node_state_two_step = self._reverse_meanflow_step(
+                    node_state_split,
+                    node_x_to_r,
+                    node_split_t,
+                    ctx.node_r,
+                )
+            if edge_state_split is not None and edge_x_to_r is not None:
+                edge_state_two_step = self._reverse_meanflow_step(
+                    edge_state_split,
+                    edge_x_to_r,
+                    edge_split_t,
+                    ctx.edge_r,
+                )
+
+        total = None
+        state: Dict[str, torch.Tensor] = {
+            f"{prefix}_flow_objective_semigroup": ctx.t.new_tensor(1.0),
+            f"{prefix}_flow_semigroup_split_t": split_t.detach().mean(),
+            f"{prefix}_flow_semigroup_weight": ctx.t.new_tensor(
+                float(self.meanflow_semigroup_weight)
+            ),
+            f"{prefix}_flow_semigroup_endpoint_weight": ctx.t.new_tensor(
+                float(self.meanflow_semigroup_endpoint_weight)
+            ),
+            f"{prefix}_flow_semigroup_explicit_model_calls": ctx.t.new_tensor(
+                float(explicit_model_calls)
+            ),
+        }
+        if ctx.node_clean is not None and node_x is not None and node_state_two_step is not None:
+            node_mask = self._node_mask(data, node_x)
+            comp_total, comp_state = self._component_semigroup_loss(
+                diff_prefix=f"{prefix}_flow_onsite",
+                pred_x=node_x,
+                clean=ctx.node_clean,
+                state_z=ctx.node_state,
+                state_two_step=node_state_two_step,
+                comp_r=ctx.node_r,
+                comp_t=ctx.node_t,
+                mask=node_mask,
+                weight=self.node_weight,
+            )
+            total = comp_total if total is None else total + comp_total
+            state.update(comp_state)
+            if prefix == "train" and self.log_train_compatible_loss:
+                state.setdefault("_compatible_clean_stats", {}).update(
+                    self._compatible_clean_stats(node_x - ctx.node_clean, node_mask, "onsite")
+                )
+            if primary_aliases:
+                state[f"{prefix}_flow_onsite_loss"] = comp_state[
+                    f"{prefix}_flow_onsite_semigroup_loss"
+                ]
+                if prefix == "train":
+                    state["train_onsite_loss"] = comp_state[
+                        f"{prefix}_flow_onsite_endpoint_loss"
+                    ]
+        if ctx.edge_clean is not None and edge_x is not None and edge_state_two_step is not None:
+            edge_mask = self._edge_mask(data, edge_x)
+            comp_total, comp_state = self._component_semigroup_loss(
+                diff_prefix=f"{prefix}_flow_hopping",
+                pred_x=edge_x,
+                clean=ctx.edge_clean,
+                state_z=ctx.edge_state,
+                state_two_step=edge_state_two_step,
+                comp_r=ctx.edge_r,
+                comp_t=ctx.edge_t,
+                mask=edge_mask,
+                weight=self.edge_weight,
+            )
+            total = comp_total if total is None else total + comp_total
+            state.update(comp_state)
+            if prefix == "train" and self.log_train_compatible_loss:
+                state.setdefault("_compatible_clean_stats", {}).update(
+                    self._compatible_clean_stats(edge_x - ctx.edge_clean, edge_mask, "hopping")
+                )
+            if primary_aliases:
+                state[f"{prefix}_flow_hopping_loss"] = comp_state[
+                    f"{prefix}_flow_hopping_semigroup_loss"
+                ]
+                if prefix == "train":
+                    state["train_hopping_loss"] = comp_state[
+                        f"{prefix}_flow_hopping_endpoint_loss"
+                    ]
+        if total is None:
+            raise KeyError("Pixel MeanFlow semigroup objective could not compute a loss.")
+        return total, state, explicit_model_calls
 
     def _component_meanflow_loss(
         self,
@@ -1789,6 +2603,27 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         data, ref_data, ctx = self.prepare_batch(data, ref_data, r=r, t=t)
+        if self.meanflow_objective == "semigroup":
+            total, state, explicit_model_calls = self._semigroup_loss_with_model(
+                model, data, ctx, prefix=prefix, primary_aliases=True
+            )
+            common_state: Dict[str, torch.Tensor] = {
+                f"{prefix}_flow_r": ctx.r.detach().mean(),
+                f"{prefix}_flow_t": ctx.t.detach().mean(),
+                f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
+                f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
+                f"{prefix}_flow_weight": ctx.t.new_tensor(1.0),
+                f"{prefix}_flow_objective_finite_difference": ctx.t.new_tensor(0.0),
+                f"{prefix}_flow_du_dt_backend_jvp": ctx.t.new_tensor(0.0),
+                f"{prefix}_flow_explicit_model_calls": ctx.t.new_tensor(
+                    float(explicit_model_calls)
+                ),
+            }
+            common_state.update(state)
+            common_state[f"{prefix}_flow_loss"] = total.detach()
+            self.last_state = common_state
+            return total, common_state
+
         use_jvp = self._meanflow_use_jvp()
         explicit_model_calls = 0
         node_x = edge_x = None
@@ -1889,6 +2724,10 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             f"{prefix}_flow_h": (ctx.t - ctx.r).detach().mean(),
             f"{prefix}_flow_fm_frac": ctx.fm_mask.detach().float().mean(),
             f"{prefix}_flow_weight": ctx.t.new_tensor(1.0),
+            f"{prefix}_flow_objective_finite_difference": ctx.t.new_tensor(1.0),
+            f"{prefix}_flow_objective_semigroup": ctx.t.new_tensor(
+                1.0 if self.meanflow_objective == "hybrid" else 0.0
+            ),
             # canary scalars: catch silent jvp fallbacks and count the explicit
             # model calls per step (boundary + main/jvp [+ fd_eps]).
             f"{prefix}_flow_du_dt_backend_jvp": ctx.t.new_tensor(
@@ -1916,13 +2755,9 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
-            if prefix == "train":
+            if prefix == "train" and self.log_train_compatible_loss:
                 state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(
-                        node_x - ctx.node_clean,
-                        node_mask,
-                        "onsite",
-                    )
+                    self._compatible_clean_stats(node_x - ctx.node_clean, node_mask, "onsite")
                 )
             # Legacy aliases so pMF logs line up with CFM/supervised curves:
             # *_flow_onsite_loss mirrors the velocity objective; the train_*
@@ -1949,19 +2784,37 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             )
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
-            if prefix == "train":
+            if prefix == "train" and self.log_train_compatible_loss:
                 state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(
-                        edge_x - ctx.edge_clean,
-                        edge_mask,
-                        "hopping",
-                    )
+                    self._compatible_clean_stats(edge_x - ctx.edge_clean, edge_mask, "hopping")
                 )
             state[f"{prefix}_flow_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_velocity_loss"]
             if prefix == "train":
                 state["train_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_endpoint_loss"]
         if total is None:
             raise KeyError("Pixel MeanFlow could not compute a loss from configured node/edge targets.")
+        if (
+            self.meanflow_objective == "hybrid"
+            and (
+                self.meanflow_semigroup_weight != 0.0
+                or self.meanflow_semigroup_endpoint_weight != 0.0
+            )
+        ):
+            semigroup_total, semigroup_state, semigroup_calls = self._semigroup_loss_with_model(
+                model,
+                data,
+                ctx,
+                prefix=prefix,
+                node_x=node_x,
+                edge_x=edge_x,
+                primary_aliases=False,
+            )
+            total = total + semigroup_total
+            state.update(semigroup_state)
+            state[f"{prefix}_flow_explicit_model_calls"] = (
+                state[f"{prefix}_flow_explicit_model_calls"]
+                + ctx.t.new_tensor(float(semigroup_calls))
+            )
         if self.router_z_loss_coef > 0.0:
             # The main prediction is intentionally not retained; keep router regularization
             # out of pMF unless a future model-level integration returns it explicitly.
@@ -1992,6 +2845,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             self.node_sigma,
             data=state,
             label="node",
+            base=node_base,
             reference_scale=False,
         )
         edge_z = None if edge_base is None else self._prior_like(
@@ -1999,6 +2853,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             self.edge_sigma,
             data=state,
             label="edge",
+            base=edge_base,
             reference_scale=False,
         )
         like = node_z if node_z is not None else edge_z
@@ -2182,12 +3037,25 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
             [
                 "train_flow_r",
                 "train_flow_h",
+                "train_flow_objective_finite_difference",
+                "train_flow_objective_semigroup",
                 # canary scalars: a silent jvp->finite_difference fallback is
                 # invisible in production without these in the terminal/TB log.
                 "train_flow_du_dt_backend_jvp",
                 "train_flow_explicit_model_calls",
             ]
         )
+        if getattr(flow, "meanflow_objective", "finite_difference") in {"semigroup", "hybrid"}:
+            fields.extend(
+                [
+                    "train_flow_semigroup_split_t",
+                    "train_flow_semigroup_weight",
+                    "train_flow_semigroup_endpoint_weight",
+                    "train_flow_semigroup_explicit_model_calls",
+                    "train_flow_onsite_semigroup_loss",
+                    "train_flow_hopping_semigroup_loss",
+                ]
+            )
     if getattr(flow, "log_validation_random_t_loss", True):
         fields.append("validation_flow_random_t_loss")
     if getattr(flow, "log_validation_t0_loss", True):
