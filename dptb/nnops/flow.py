@@ -245,6 +245,7 @@ class HamiltonianCFM:
         if self.enabled:
             self.log_train_compatible_loss = True
             self.log_validation_compatible_loss = True
+            self.compatible_loss_to_legacy_keys = True
         # Loss and regularization.
         self.loss_type = str(options.get("loss_type", "mse")).lower()
         if self.loss_type not in {"mse", "l1_rmse"}:
@@ -1819,25 +1820,12 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.flow_time_r_key = str(options.get("flow_time_r_key", "flow_time_r"))
         self.flow_time_t_key = str(options.get("flow_time_t_key", "flow_time_t"))
         self.flow_time_h_key = str(options.get("flow_time_h_key", "flow_time_h"))
-        # pMF computes its optimization loss inside loss_with_model, but it
-        # also has the endpoint prediction in hand. Keep train_loss aligned to
-        # no-CFM/CFM by reducing endpoint stats, while train_loss_opt remains
-        # the actual flow/semigroup objective used for backward.
-        self.log_train_compatible_loss = bool(
-            mf.get("log_train_compatible_loss", self.log_train_compatible_loss)
-        )
-        # Validation stays aligned with no-CFM/CFM by default: sample/euler to
-        # the endpoint and report the blockwise compatible loss under the
-        # legacy validation_loss/validation_onsite_loss/validation_hopping_loss
-        # keys (the parent already forces this on when enabled); explicit
-        # meanflow.log_validation_compatible_loss=false /
-        # meanflow.compatible_loss_to_legacy_keys=false opt-outs are honored.
-        self.log_validation_compatible_loss = bool(
-            mf.get("log_validation_compatible_loss", self.log_validation_compatible_loss)
-        )
-        self.compatible_loss_to_legacy_keys = bool(
-            mf.get("compatible_loss_to_legacy_keys", self.compatible_loss_to_legacy_keys)
-        )
+        # pMF computes its optimization loss inside loss_with_model, but legacy
+        # train/validation loss keys are a cross-route endpoint contract. Keep
+        # compatible endpoint logging forced on; user flags may not opt out.
+        self.log_train_compatible_loss = True
+        self.log_validation_compatible_loss = True
+        self.compatible_loss_to_legacy_keys = True
 
         # A completely disabled validation path returns literal zero from
         # Trainer.validation(), which is indistinguishable from a perfect model
@@ -3073,9 +3061,7 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
                 "train_compatible_hopping_loss",
             ]
         )
-    log_validation_compatible = bool(
-        getattr(flow, "log_validation_compatible_loss", False)
-    )
+    log_validation_compatible = True
     if log_validation_compatible:
         for num_steps in ode_steps:
             fields.extend(

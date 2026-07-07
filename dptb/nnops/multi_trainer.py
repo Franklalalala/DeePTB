@@ -2019,14 +2019,12 @@ class MultiTrainer(Trainer):
                 state,
                 f"{prefix}_compatible_onsite_loss",
                 f"{prefix}_onsite_loss",
-                f"{prefix}_flow_onsite_loss",
                 default=0.0,
             ),
             "hopping": self._flow_state_scalar(
                 state,
                 f"{prefix}_compatible_hopping_loss",
                 f"{prefix}_hopping_loss",
-                f"{prefix}_flow_hopping_loss",
                 default=0.0,
             ),
             "z_loss": self._flow_state_scalar(
@@ -2131,28 +2129,17 @@ class MultiTrainer(Trainer):
                     )
                 flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
                 flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
-                compatible_enabled = (
-                    getattr(self.flow_cfm, "log_train_compatible_loss", False)
-                    if flow_prefix == "train"
-                    else getattr(self.flow_cfm, "log_validation_compatible_loss", False)
+                compatible_prefix = f"{flow_prefix}_compatible"
+                compatible_state = Trainer._compatible_loss_state_from_flow_stats(
+                    criterion,
+                    flow_state,
+                    source_prefix=flow_prefix,
+                    prefix=compatible_prefix,
+                    legacy_prefix=flow_prefix,
+                    global_step=self.iter,
                 )
-                if compatible_enabled:
-                    compatible_prefix = f"{flow_prefix}_compatible"
-                    legacy_prefix = (
-                        flow_prefix
-                        if getattr(self.flow_cfm, "compatible_loss_to_legacy_keys", True)
-                        else None
-                    )
-                    compatible_state = Trainer._compatible_loss_state_from_flow_stats(
-                        criterion,
-                        flow_state,
-                        source_prefix=flow_prefix,
-                        prefix=compatible_prefix,
-                        legacy_prefix=legacy_prefix,
-                        global_step=self.iter,
-                    )
-                    if compatible_state is not None:
-                        flow_state.update(compatible_state)
+                if compatible_state is not None:
+                    flow_state.update(compatible_state)
             else:
                 with self._tagger.tag("expert/flow_prepare_batch", it=self.iter, expert=expert_idx):
                     flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
@@ -2180,34 +2167,24 @@ class MultiTrainer(Trainer):
 
                 flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
                 flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
-                compatible_enabled = (
-                    getattr(self.flow_cfm, "log_train_compatible_loss", False)
-                    if flow_prefix == "train"
-                    else getattr(self.flow_cfm, "log_validation_compatible_loss", False)
+                compatible_prefix = f"{flow_prefix}_compatible"
+                compatible_state = Trainer._compatible_loss_state_from_flow_stats(
+                    criterion,
+                    flow_state,
+                    source_prefix=flow_prefix,
+                    prefix=compatible_prefix,
+                    legacy_prefix=flow_prefix,
+                    global_step=self.iter,
                 )
-                if compatible_enabled:
-                    compatible_prefix = f"{flow_prefix}_compatible"
-                    legacy_prefix = (
-                        flow_prefix
-                        if getattr(self.flow_cfm, "compatible_loss_to_legacy_keys", True)
-                        else None
-                    )
-                    compatible_state = Trainer._compatible_loss_state_from_flow_stats(
+                if compatible_state is None:
+                    compatible_state = Trainer._compatible_loss_state(
                         criterion,
-                        flow_state,
-                        source_prefix=flow_prefix,
+                        pred_batch,
+                        flow_ref,
                         prefix=compatible_prefix,
-                        legacy_prefix=legacy_prefix,
-                        global_step=self.iter,
+                        legacy_prefix=flow_prefix,
                     )
-                    if compatible_state is None:
-                        compatible_state = Trainer._compatible_loss_state(
-                            criterion,
-                            pred_batch,
-                            flow_ref,
-                            prefix=compatible_prefix,
-                            legacy_prefix=legacy_prefix,
-                        )
+                if compatible_state is not None:
                     flow_state.update(compatible_state)
 
             out = {
@@ -2458,9 +2435,6 @@ class MultiTrainer(Trainer):
     ):
         if criterion is None:
             criterion = self.train_lossfunc
-
-        if (not self.log_single_model_compatible_loss) or (self.log_single_model_compatible_loss_mode != "reduce"):
-            return None
 
         onsite_cnt = pack[self._P_ONSITE_CNT_SUM]
         hopping_cnt = pack[self._P_HOPPING_CNT_SUM]
@@ -3649,9 +3623,7 @@ class MultiTrainer(Trainer):
         if compatible_state is not None:
             state.update(compatible_state)
 
-        if int(num_steps) == 1 and getattr(
-            self.flow_cfm, "compatible_loss_to_legacy_keys", True
-        ):
+        if int(num_steps) == 1:
             legacy_state = self._compute_compatible_state_from_pack(
                 pack,
                 criterion=criterion,
@@ -3674,10 +3646,7 @@ class MultiTrainer(Trainer):
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
-                flow_euler_validation = bool(
-                    getattr(getattr(self, "flow_cfm", None), "enabled", False)
-                    and getattr(self.flow_cfm, "log_validation_compatible_loss", False)
-                )
+                flow_euler_validation = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
 
                 if self.distributed_expert:
                     local_idx = self.local_expert_idx

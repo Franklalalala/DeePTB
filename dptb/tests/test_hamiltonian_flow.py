@@ -755,7 +755,7 @@ class _StatsForwardLoss(torch.nn.Module):
         return 0.5 * (onsite + hopping)
 
 
-def test_validation_compatible_loss_respects_legacy_key_flag(monkeypatch):
+def test_validation_compatible_loss_forces_legacy_keys(monkeypatch):
     trainer = object.__new__(Trainer)
     trainer.device = torch.device("cpu")
     trainer.dtype = torch.float32
@@ -780,8 +780,11 @@ def test_validation_compatible_loss_respects_legacy_key_flag(monkeypatch):
         legacy_prefix=None,
         global_step=None,
     ):
-        assert legacy_prefix is None
-        return {f"{prefix}_loss": torch.tensor(9.0)}
+        assert legacy_prefix == "validation"
+        return {
+            f"{prefix}_loss": torch.tensor(9.0),
+            "validation_loss": torch.tensor(9.0),
+        }
 
     monkeypatch.setattr(
         Trainer,
@@ -791,8 +794,8 @@ def test_validation_compatible_loss_respects_legacy_key_flag(monkeypatch):
 
     loss = trainer.validation(fast=True)
 
-    assert loss.item() == pytest.approx(3.0)
-    assert "validation_loss" not in trainer._last_flow_validation_state
+    assert loss.item() == pytest.approx(9.0)
+    assert trainer._last_flow_validation_state["validation_loss"].item() == pytest.approx(9.0)
     assert trainer._last_flow_validation_state[
         "validation_compatible_euler_1_loss"
     ].item() == pytest.approx(9.0)
@@ -999,8 +1002,8 @@ def test_multitrainer_expert_payload_applies_flow_before_model():
     assert torch.equal(trainer.model.seen["node_h0"], batch["node_h0"] + 10.0)
     assert torch.equal(trainer.model.seen["edge_h0"], batch["edge_h0"] + 20.0)
     assert result["loss"].item() == pytest.approx(5.0)
-    assert result["onsite"].item() == pytest.approx(2.0)
-    assert result["hopping"].item() == pytest.approx(3.0)
+    assert result["onsite"].item() == pytest.approx(10.0)
+    assert result["hopping"].item() == pytest.approx(20.0)
 
 
 def test_multitrainer_non_display_step_does_not_run_full_compatible_loss():
@@ -1172,8 +1175,55 @@ def test_compatible_pack_component_tags_use_same_stats_semantics_as_total():
     assert state["validation_hopping_loss"].item() == pytest.approx(hopping)
 
 
+def test_compatible_pack_component_tags_ignore_legacy_reduce_flag():
+    trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
+    trainer.log_single_model_compatible_loss = False
+    state = trainer._pack_component_state(
+        _pack_with_conflicting_active_component_means(),
+        prefix="validation",
+        criterion=trainer.train_lossfunc,
+    )
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+    assert state["validation_onsite_loss"].item() == pytest.approx(onsite)
+    assert state["validation_hopping_loss"].item() == pytest.approx(hopping)
+
+
 def test_display_window_component_tags_use_compatible_stats_semantics():
     trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
+    trainer.distributed_expert = False
+    trainer.num_experts = 1
+    trainer.world_size = 1
+    trainer._tagger = _NoopTagger()
+    trainer.display_sync_freq = 1
+    trainer._display_window_pack_local = _pack_with_conflicting_active_component_means()
+    trainer._display_window_dynamic_batch_pack_local = torch.zeros(
+        MultiTrainer._DB_PACK_LEN, dtype=torch.float32
+    )
+    trainer._gather_cuda_memory_metrics = lambda: {}
+    trainer._all_reduce_ = lambda tensor, name=None: tensor
+    trainer._gather_display_window_expert_metrics = lambda: [
+        torch.tensor([99.0, 77.0, 0.0, 0.1, 1.0, 1.0])
+    ]
+    trainer._rank_to_expert_idx = lambda rank_idx: 0
+    trainer._add_optimizer_diagnostics_to_state = lambda state: None
+    trainer._add_cuda_memory_state = lambda state, metrics: None
+    trainer._reset_display_window_buffers = lambda: None
+
+    state = trainer._flush_display_window(time_idx=2)
+
+    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
+    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
+    total = 0.5 * (onsite + hopping)
+    assert _scalar(state["train_loss"]) == pytest.approx(total)
+    assert _scalar(state["train_onsite_loss"]) == pytest.approx(onsite)
+    assert _scalar(state["train_hopping_loss"]) == pytest.approx(hopping)
+
+
+def test_display_window_component_tags_ignore_legacy_reduce_flag():
+    trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
+    trainer.log_single_model_compatible_loss = False
     trainer.distributed_expert = False
     trainer.num_experts = 1
     trainer.world_size = 1
@@ -1623,7 +1673,7 @@ def test_meanflow_objectives_default_validation_compatible_alignment(objective):
     assert 1 in {int(n) for n in flow.validation_ode_steps}
 
 
-def test_pixel_meanflow_validation_compatible_explicit_opt_out_respected():
+def test_pixel_meanflow_validation_compatible_cannot_opt_out():
     flow = build_hamiltonian_flow(
         {
             "enabled": True,
@@ -1632,10 +1682,11 @@ def test_pixel_meanflow_validation_compatible_explicit_opt_out_respected():
         }
     )
 
-    assert flow.log_validation_compatible_loss is False
+    assert flow.log_validation_compatible_loss is True
+    assert flow.compatible_loss_to_legacy_keys is True
 
 
-def test_pixel_meanflow_train_compatible_alignment_defaults_on_and_can_opt_out():
+def test_pixel_meanflow_train_compatible_alignment_is_forced_on():
     flow = HamiltonianPixelMeanFlow(
         {
             "enabled": True,
@@ -1651,7 +1702,8 @@ def test_pixel_meanflow_train_compatible_alignment_defaults_on_and_can_opt_out()
     )
 
     assert flow.log_train_compatible_loss is True
-    assert opt_out.log_train_compatible_loss is False
+    assert opt_out.log_train_compatible_loss is True
+    assert opt_out.compatible_loss_to_legacy_keys is True
 
 
 class _ValidationConstantModel:
@@ -1747,7 +1799,7 @@ def test_pixel_meanflow_validation_does_not_fabricate_missing_legacy_components(
     assert "validation_hopping_loss" not in st
 
 
-def test_pixel_meanflow_validation_skips_sampling_when_compatible_disabled(monkeypatch):
+def test_pixel_meanflow_validation_compatible_sampling_is_forced(monkeypatch):
     trainer = _pixel_meanflow_validation_trainer(
         monkeypatch,
         flow_overrides={"meanflow": {"log_validation_compatible_loss": False}},
@@ -1764,11 +1816,10 @@ def test_pixel_meanflow_validation_skips_sampling_when_compatible_disabled(monke
     trainer.validation(fast=True)
     st = trainer._last_flow_validation_state
 
-    assert sample_calls == []
-    assert "validation_loss" not in st
-    assert "validation_onsite_loss" not in st
-    assert "validation_hopping_loss" not in st
-    assert "validation_flow_random_t_loss" in st
+    assert sample_calls == [1, 3]
+    assert "validation_loss" in st
+    assert "validation_onsite_loss" in st
+    assert "validation_hopping_loss" in st
 
 
 def test_resolve_flow_log_fields_pixel_meanflow_drops_never_computed_fields():
@@ -1832,7 +1883,7 @@ def test_resolve_flow_log_fields_cfm_keeps_existing_fields():
     assert register_legacy is True
 
 
-def test_resolve_flow_log_fields_respects_validation_compatible_opt_out():
+def test_resolve_flow_log_fields_forces_validation_compatible_fields():
     from dptb.nnops.flow import resolve_flow_log_fields
 
     flow = build_hamiltonian_flow(
@@ -1844,8 +1895,10 @@ def test_resolve_flow_log_fields_respects_validation_compatible_opt_out():
     )
     fields, register_legacy = resolve_flow_log_fields(flow)
 
-    assert not any(field.startswith("validation_compatible_") for field in fields)
-    assert register_legacy is False
+    assert "validation_compatible_euler_1_loss" in fields
+    assert "validation_compatible_euler_1_onsite_loss" in fields
+    assert "validation_compatible_euler_1_hopping_loss" in fields
+    assert register_legacy is True
 
 
 def test_resolve_flow_log_fields_disabled_flow_keeps_legacy_registration():

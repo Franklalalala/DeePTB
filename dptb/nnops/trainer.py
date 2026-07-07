@@ -258,29 +258,24 @@ class Trainer(BaseTrainer):
                 batch_for_loss.update(batch_info)
                 loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
             flow_state.setdefault("train_loss_opt", loss.detach())
-            if self.flow_cfm.log_train_compatible_loss:
-                compatible_state = self._compatible_loss_state_from_flow_stats(
+            compatible_state = self._compatible_loss_state_from_flow_stats(
+                lossfunc,
+                flow_state,
+                source_prefix="train",
+                prefix="train_compatible",
+                legacy_prefix="train",
+                global_step=getattr(self, "iter", None),
+            )
+            if compatible_state is None and not model_in_loss:
+                compatible_state = self._compatible_loss_state(
                     lossfunc,
-                    flow_state,
-                    source_prefix="train",
+                    batch,
+                    batch_for_loss,
                     prefix="train_compatible",
-                    legacy_prefix=(
-                        "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
-                    ),
-                    global_step=getattr(self, "iter", None),
+                    legacy_prefix="train",
                 )
-                if compatible_state is None and not model_in_loss:
-                    compatible_state = self._compatible_loss_state(
-                        lossfunc,
-                        batch,
-                        batch_for_loss,
-                        prefix="train_compatible",
-                        legacy_prefix=(
-                            "train" if self.flow_cfm.compatible_loss_to_legacy_keys else None
-                        ),
-                    )
-                if compatible_state is not None:
-                    flow_state.update(compatible_state)
+            if compatible_state is not None:
+                flow_state.update(compatible_state)
             flow_state.pop("_compatible_clean_stats", None)
             self._last_flow_state = flow_state
             return loss
@@ -634,34 +629,22 @@ class Trainer(BaseTrainer):
                         # Endpoint-compatible validation: euler-sample to t=0
                         # and score the blockwise criterion so pMF's legacy
                         # validation_* keys stay comparable with no-CFM/CFM.
-                        # Skip the sampling entirely when compatible logging is
-                        # explicitly off -- its result has no other consumer.
-                        if self.flow_cfm.log_validation_compatible_loss:
-                            for num_steps in self.flow_cfm.validation_ode_steps:
-                                sampled = self.flow_cfm.sample(
-                                    self.model, original_batch, num_steps=num_steps
-                                )
-                                sampled.update(batch_info)
-                                legacy_prefix = (
-                                    "validation"
-                                    if int(num_steps) == 1
-                                    and getattr(
-                                        self.flow_cfm,
-                                        "compatible_loss_to_legacy_keys",
-                                        True,
-                                    )
-                                    else None
-                                )
-                                self._accumulate_metric_state(
-                                    flow_metric_sums,
-                                    self._compatible_loss_state(
-                                        self.validation_lossfunc,
-                                        sampled,
-                                        batch_for_loss,
-                                        prefix=f"validation_compatible_euler_{num_steps}",
-                                        legacy_prefix=legacy_prefix,
-                                    ),
-                                )
+                        for num_steps in self.flow_cfm.validation_ode_steps:
+                            sampled = self.flow_cfm.sample(
+                                self.model, original_batch, num_steps=num_steps
+                            )
+                            sampled.update(batch_info)
+                            legacy_prefix = "validation" if int(num_steps) == 1 else None
+                            self._accumulate_metric_state(
+                                flow_metric_sums,
+                                self._compatible_loss_state(
+                                    self.validation_lossfunc,
+                                    sampled,
+                                    batch_for_loss,
+                                    prefix=f"validation_compatible_euler_{num_steps}",
+                                    legacy_prefix=legacy_prefix,
+                                ),
+                            )
                         num_batches += 1
                         continue
                     if log_random_t:
@@ -712,41 +695,31 @@ class Trainer(BaseTrainer):
                             flow_metric_sums[key] = (
                                 flow_metric_sums.get(key, 0.0) + sample_loss.detach()
                             )
-                        if self.flow_cfm.log_validation_compatible_loss:
-                            legacy_prefix = (
-                                "validation"
-                                if int(num_steps) == 1
-                                and getattr(
-                                    self.flow_cfm,
-                                    "compatible_loss_to_legacy_keys",
-                                    True,
-                                )
-                                else None
+                        legacy_prefix = "validation" if int(num_steps) == 1 else None
+                        compatible_state = None
+                        if sample_state is not None:
+                            compatible_state = self._compatible_loss_state_from_flow_stats(
+                                self.validation_lossfunc,
+                                sample_state,
+                                source_prefix=f"validation_compatible_euler_{num_steps}",
+                                prefix=f"validation_compatible_euler_{num_steps}",
+                                legacy_prefix=legacy_prefix,
+                                global_step=getattr(self, "iter", None),
                             )
-                            compatible_state = None
-                            if sample_state is not None:
-                                compatible_state = self._compatible_loss_state_from_flow_stats(
-                                    self.validation_lossfunc,
-                                    sample_state,
-                                    source_prefix=f"validation_compatible_euler_{num_steps}",
-                                    prefix=f"validation_compatible_euler_{num_steps}",
-                                    legacy_prefix=legacy_prefix,
-                                    global_step=getattr(self, "iter", None),
-                                )
-                            if compatible_state is None:
-                                compatible_ref = t0_ref if t0_ref is not None else batch_for_loss.copy()
-                                compatible_ref.update(batch_info)
-                                compatible_state = self._compatible_loss_state(
-                                    self.validation_lossfunc,
-                                    sampled,
-                                    compatible_ref,
-                                    prefix=f"validation_compatible_euler_{num_steps}",
-                                    legacy_prefix=legacy_prefix,
-                                )
-                            self._accumulate_metric_state(
-                                flow_metric_sums,
-                                compatible_state,
+                        if compatible_state is None:
+                            compatible_ref = t0_ref if t0_ref is not None else batch_for_loss.copy()
+                            compatible_ref.update(batch_info)
+                            compatible_state = self._compatible_loss_state(
+                                self.validation_lossfunc,
+                                sampled,
+                                compatible_ref,
+                                prefix=f"validation_compatible_euler_{num_steps}",
+                                legacy_prefix=legacy_prefix,
                             )
+                        self._accumulate_metric_state(
+                            flow_metric_sums,
+                            compatible_state,
+                        )
                 else:
                     batch = self.model(batch)
                     batch.update(batch_info)

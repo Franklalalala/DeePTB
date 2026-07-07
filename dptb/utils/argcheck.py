@@ -228,6 +228,8 @@ def flow_options():
         Argument("log_validation_random_t_loss", bool, optional=True, default=True),
         Argument("log_validation_t0_loss", bool, optional=True, default=True),
         Argument("log_validation_flow_euler_loss", bool, optional=True, default=True),
+        # Backward-compatible accepted keys. Flow logging always maps endpoint-compatible
+        # metrics to legacy train/validation loss keys when flow is enabled.
         Argument("log_train_compatible_loss", bool, optional=True, default=True),
         Argument("log_validation_compatible_loss", bool, optional=True, default=True),
         Argument("compatible_loss_to_legacy_keys", bool, optional=True, default=True),
@@ -421,7 +423,8 @@ def train_options():
 
     # ================= stitched / compatible loss & scheduler =================
     doc_log_single_model_compatible_loss = (
-        "Set true to reconstruct and log a stitched loss compatible with the single-model baseline. "
+        "Deprecated compatibility switch. Split/flow trainers now always reconstruct and log "
+        "endpoint-compatible legacy loss keys when the required packed stats are available. "
         "This is mainly for fair metric comparison between the split-expert model and the unsplit single model. "
         "Default: `True`"
     )
