@@ -114,7 +114,8 @@ _DEFAULT_GRAPH_FIELDS: Set[str] = {
     AtomicDataDict.EIGENVECTOR_KEY, # new # should be nested
     AtomicDataDict.ENERGY_WINDOWS_KEY, # new,
     AtomicDataDict.BAND_WINDOW_KEY, # new,
-    AtomicDataDict.NODE_SOC_SWITCH_KEY # new
+    AtomicDataDict.NODE_SOC_SWITCH_KEY, # new
+    AtomicDataDict.HAAR_U0_KEY,
 }
 
 _NODE_FIELDS: Set[str] = set(_DEFAULT_NODE_FIELDS)
