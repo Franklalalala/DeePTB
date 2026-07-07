@@ -1,0 +1,74 @@
+# Group D: ordinary CFM with a precomputed pure Haar density-matrix prior.
+# x0 is RME(D_haar), not hidden InitLayer features and not TE noise.
+
+data_options:
+  train:
+    root: /home/mingkang_nt/data/1118/cluster_1123_charge/updated_lmdb_overlap_huckel_haar_k8_dm_rme_k1/train
+    type: LMDBDataset
+    prefix: data
+    separator: "."
+    get_DM: true
+    get_overlap: true
+    get_Hamiltonian: false
+    get_H0: false
+  validation:
+    root: /home/mingkang_nt/data/1118/cluster_1123_charge/updated_lmdb_overlap_huckel_haar_k8_dm_rme_k1/valid
+    type: LMDBDataset
+    prefix: data
+    separator: "."
+    get_DM: true
+    get_overlap: true
+    get_Hamiltonian: false
+    get_H0: false
+
+train_options:
+  batch_size: 1
+  val_batch_size: 1
+  optimizer:
+    type: AdamW
+    lr: 0.01
+    weight_decay: 0.01
+    betas: [0.98, 0.999]
+    eps: 1.0e-8
+    amsgrad: false
+  loss_options:
+    train: &endpoint_report_loss
+      method: hamil_abs
+      z_loss_coef: 0
+      onsite_shift: false
+      onsite_boost: false
+      debug_flag: false
+    validation: *endpoint_report_loss
+  flow_options:
+    enabled: true
+    objective: cfm
+    mode: full
+    prior: haar_dm
+    haar_node_key: haar_node_features
+    haar_edge_key: haar_edge_features
+    haar_candidate_index: -1
+    haar_dm_strict: true
+    strict_h0: false
+    node_target_key: node_features
+    edge_target_key: edge_features
+    node_h0_key: node_h0
+    edge_h0_key: edge_h0
+    overwrite_feature_keys: true
+    detach_interpolated_h0: true
+    loss_type: mse
+    component_reduction: global_elements
+    time_sampling: uniform
+    t_min: 0.0
+    t_max: 0.999
+    t0_probability: 0.0
+    omit_time_scaling: true
+    endpoint_weight_power: 0.0
+    endpoint_weight_cap: 100.0
+    validation_ode_steps: [1]
+    log_compatible_loss: true
+    log_validation_random_t_loss: true
+    log_validation_t0_loss: true
+    log_validation_flow_euler_loss: true
+    log_train_compatible_loss: true
+    log_validation_compatible_loss: true
+    compatible_loss_to_legacy_keys: true

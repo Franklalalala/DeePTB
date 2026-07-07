@@ -1164,6 +1164,64 @@ def test_flow_options_argcheck_accepts_overlap_huckel_config_keys():
     assert value["huckel_edge_length_decay"] == pytest.approx(3.0)
 
 
+def test_haar_dm_prior_selects_precomputed_candidate():
+    device = torch.device("cpu")
+    dtype = torch.float64
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "full",
+            "prior": "haar_dm",
+            "haar_candidate_index": 1,
+        },
+        idp=_FakeIDP(device=device),
+        device=device,
+        dtype=dtype,
+    )
+    residual = torch.zeros(2, 4, dtype=dtype)
+    node_candidates = torch.stack(
+        [torch.full_like(residual, 3.0), torch.full_like(residual, 7.0)],
+        dim=1,
+    )
+    data = {_keys.HAAR_NODE_FEATURES_KEY: node_candidates}
+
+    prior = flow._prior_like(residual, 1.0, data=data, label="node")
+
+    torch.testing.assert_close(prior, torch.full_like(residual, 7.0))
+    assert flow.last_haar_candidate_index == 1
+
+
+def test_haar_dm_prior_requires_precomputed_fields():
+    flow = HamiltonianCFM(
+        {"enabled": True, "mode": "full", "prior": "haar_dm"},
+        idp=_FakeIDP(device=torch.device("cpu")),
+    )
+
+    with pytest.raises(KeyError, match="haar_dm"):
+        flow._prior_like(torch.zeros(2, 4), 1.0, data={}, label="node")
+
+
+def test_flow_options_argcheck_accepts_haar_dm_config_keys():
+    schema = flow_options()
+    value = schema.normalize_value(
+        {
+            "enabled": True,
+            "prior": "haar_dm",
+            "haar_node_key": "haar_node_features",
+            "haar_edge_key": "haar_edge_features",
+            "haar_candidate_index": 0,
+            "haar_dm_strict": True,
+        }
+    )
+    schema.check_value(value, strict=True)
+
+    assert value["prior"] == "haar_dm"
+    assert value["haar_node_key"] == "haar_node_features"
+    assert value["haar_edge_key"] == "haar_edge_features"
+    assert value["haar_candidate_index"] == 0
+    assert value["haar_dm_strict"] is True
+
+
 def test_common_options_argcheck_accepts_nextham_uureal_mask():
     schema = common_options()
 

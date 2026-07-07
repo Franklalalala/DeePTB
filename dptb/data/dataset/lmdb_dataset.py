@@ -447,6 +447,8 @@ class LMDBDataset(AtomicDataset):
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
         haar_u0 = data_dict.get(AtomicDataDict.HAAR_U0_KEY, None)
+        haar_node_features = data_dict.get(AtomicDataDict.HAAR_NODE_FEATURES_KEY, None)
+        haar_edge_features = data_dict.get(AtomicDataDict.HAAR_EDGE_FEATURES_KEY, None)
         soc_uureal_keep_mask = getattr(self.type_mapper, "mask_uureal", None)
 
         if self.info_files[self.file_map[idx]]['train_dip'] == True:
@@ -650,6 +652,34 @@ class LMDBDataset(AtomicDataset):
                 haar_u0,
                 dtype=torch.get_default_dtype(),
             )
+        if haar_node_features is not None:
+            haar_node_features = _expand_soc_uureal_compact(
+                haar_node_features,
+                data_dict,
+                field_name=AtomicDataDict.HAAR_NODE_FEATURES_KEY,
+                keep_mask=soc_uureal_keep_mask,
+            )
+            if haar_node_features.shape[0] != num_nodes:
+                raise ValueError(
+                    "Precomputed LMDB Haar node feature rows do not match the active graph: "
+                    f"haar_node_features={tuple(haar_node_features.shape)}, "
+                    f"num_nodes={num_nodes}."
+                )
+            atomicdata[AtomicDataDict.HAAR_NODE_FEATURES_KEY] = haar_node_features
+        if haar_edge_features is not None:
+            haar_edge_features = _expand_soc_uureal_compact(
+                haar_edge_features,
+                data_dict,
+                field_name=AtomicDataDict.HAAR_EDGE_FEATURES_KEY,
+                keep_mask=soc_uureal_keep_mask,
+            )
+            if haar_edge_features.shape[0] != num_edges:
+                raise ValueError(
+                    "Precomputed LMDB Haar edge feature rows do not match the active graph: "
+                    f"haar_edge_features={tuple(haar_edge_features.shape)}, "
+                    f"num_edges={num_edges}."
+                )
+            atomicdata[AtomicDataDict.HAAR_EDGE_FEATURES_KEY] = haar_edge_features
 
         # Optional AO-block targets/H0 produced by the blockwise NexTHAM
         # conversion path. Keep this side channel independent of the feature

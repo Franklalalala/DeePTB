@@ -126,6 +126,11 @@ class HamiltonianCFM:
             "extended_huckel",
             "eht",
         }
+        self._haar_dm_prior_names = {
+            "haar_dm",
+            "haar_density",
+            "haar_projector",
+        }
         self._external_prior_names = {
             "external",
             "dftb",
@@ -150,6 +155,7 @@ class HamiltonianCFM:
             *self._te_prior_names,
             *self._basis_prior_names,
             *self._overlap_huckel_prior_names,
+            *self._haar_dm_prior_names,
             *self._external_prior_names,
             *self._dftbsk_prior_names,
         }
@@ -157,7 +163,7 @@ class HamiltonianCFM:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
                 "use 'zero', 'gaussian', 'residual_gaussian', 'te', "
-                "'basis_onsite', 'overlap_huckel', 'dftbsk', 'external', "
+                "'basis_onsite', 'overlap_huckel', 'haar_dm', 'dftbsk', 'external', "
                 "'dftb', 'xtb', or 'physical'."
             )
 
@@ -220,6 +226,15 @@ class HamiltonianCFM:
             options.get("huckel_edge_energy_fallback", self.basis_onsite_edge_value)
         )
         self.huckel_edge_length_decay = float(options.get("huckel_edge_length_decay", 0.0))
+        self.haar_node_key = str(
+            options.get("haar_node_key", _keys.HAAR_NODE_FEATURES_KEY)
+        )
+        self.haar_edge_key = str(
+            options.get("haar_edge_key", _keys.HAAR_EDGE_FEATURES_KEY)
+        )
+        self.haar_candidate_index = int(options.get("haar_candidate_index", -1))
+        self.haar_dm_strict = bool(options.get("haar_dm_strict", True))
+        self.last_haar_candidate_index = -1
         self._basis_onsite_table_cache: Dict[
             Tuple[str, torch.dtype, int], Optional[torch.Tensor]
         ] = {}
@@ -996,6 +1011,81 @@ class HamiltonianCFM:
             base = torch.zeros_like(like)
         return absolute_prior - base.to(device=like.device, dtype=like.dtype)
 
+    def _select_haar_candidate(
+        self,
+        source: torch.Tensor,
+        like: torch.Tensor,
+        *,
+        key: str,
+        label: Optional[str],
+    ) -> torch.Tensor:
+        source = torch.as_tensor(source, device=like.device, dtype=like.dtype)
+        self.last_haar_candidate_index = -1
+        if source.shape == like.shape:
+            return source
+        if source.ndim != like.ndim + 1:
+            raise ValueError(
+                f"Haar-DM {label or 'state'} prior `{key}` shape {tuple(source.shape)} "
+                f"must match target shape {tuple(like.shape)} or include one candidate axis."
+            )
+
+        if source.shape[0] == like.shape[0] and source.shape[-1] == like.shape[-1]:
+            candidate_count = int(source.shape[1])
+            candidate_axis = 1
+        elif source.shape[1] == like.shape[0] and source.shape[-1] == like.shape[-1]:
+            candidate_count = int(source.shape[0])
+            candidate_axis = 0
+        else:
+            raise ValueError(
+                f"Haar-DM {label or 'state'} prior `{key}` shape {tuple(source.shape)} "
+                f"is incompatible with target shape {tuple(like.shape)}."
+            )
+        if candidate_count <= 0:
+            raise ValueError(f"Haar-DM prior `{key}` has zero candidates.")
+        if self.haar_candidate_index >= 0:
+            if self.haar_candidate_index >= candidate_count:
+                raise ValueError(
+                    f"flow_options.haar_candidate_index={self.haar_candidate_index} "
+                    f"is outside `{key}` candidate count {candidate_count}."
+                )
+            idx = self.haar_candidate_index
+        else:
+            idx = int(torch.randint(candidate_count, (), device=like.device).item())
+        self.last_haar_candidate_index = idx
+        return source[:, idx, ...] if candidate_axis == 1 else source[idx, ...]
+
+    def _haar_dm_absolute_prior_like(
+        self,
+        like: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        if label == "node":
+            key = self.haar_node_key
+        elif label == "edge":
+            key = self.haar_edge_key
+        else:
+            return torch.zeros_like(like)
+        source = None if data is None else data.get(key, None)
+        if source is None:
+            if self.haar_dm_strict:
+                raise KeyError(
+                    f"flow_options.prior='haar_dm' requires precomputed `{key}` "
+                    f"for the {label} prior. Precompute RME(D_haar) offline or "
+                    "change the experiment label; no nonphysical random-matrix fallback is used."
+                )
+            return None
+        prior = self._select_haar_candidate(source, like, key=key, label=label)
+        if prior.shape != like.shape:
+            raise ValueError(
+                f"Haar-DM {label} prior `{key}` selected shape {tuple(prior.shape)} "
+                f"does not match target shape {tuple(like.shape)}."
+            )
+        if not torch.isfinite(prior).all():
+            raise ValueError(f"Haar-DM {label} prior `{key}` contains non-finite values.")
+        return prior
+
     def _physical_prior_jitter_like(
         self,
         like: torch.Tensor,
@@ -1495,6 +1585,15 @@ class HamiltonianCFM:
                 reference_scale=reference_scale,
                 num_graphs=num_graphs,
             )
+        if self.prior in self._haar_dm_prior_names:
+            absolute_prior = self._haar_dm_absolute_prior_like(
+                residual,
+                data=data,
+                label=label,
+            )
+            if absolute_prior is None:
+                return torch.zeros_like(residual)
+            return self._absolute_to_flow_prior(absolute_prior, residual, base=base)
         if (
             self.prior in self._basis_prior_names
             or self.prior in self._external_prior_names
