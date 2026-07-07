@@ -120,6 +120,12 @@ class HamiltonianCFM:
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
         self._basis_prior_names = {"basis_onsite", "fixed_onsite", "atomic_onsite"}
+        self._overlap_huckel_prior_names = {
+            "overlap_huckel",
+            "huckel_overlap",
+            "extended_huckel",
+            "eht",
+        }
         self._external_prior_names = {
             "external",
             "dftb",
@@ -143,6 +149,7 @@ class HamiltonianCFM:
             "residual_gaussian",
             *self._te_prior_names,
             *self._basis_prior_names,
+            *self._overlap_huckel_prior_names,
             *self._external_prior_names,
             *self._dftbsk_prior_names,
         }
@@ -150,7 +157,8 @@ class HamiltonianCFM:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
                 "use 'zero', 'gaussian', 'residual_gaussian', 'te', "
-                "'basis_onsite', 'dftbsk', 'external', 'dftb', 'xtb', or 'physical'."
+                "'basis_onsite', 'overlap_huckel', 'dftbsk', 'external', "
+                "'dftb', 'xtb', or 'physical'."
             )
 
         self.node_sigma = float(options.get("node_sigma", 1.0))
@@ -199,6 +207,25 @@ class HamiltonianCFM:
         self.basis_onsite_scale = float(options.get("basis_onsite_scale", 1.0))
         self.basis_onsite_missing_value = float(options.get("basis_onsite_missing_value", 0.0))
         self.basis_onsite_edge_value = float(options.get("basis_onsite_edge_value", 0.0))
+        self.huckel_k = float(options.get("huckel_k", options.get("overlap_huckel_k", 1.75)))
+        self.huckel_node_overlap_key = str(
+            options.get("huckel_node_overlap_key", _keys.NODE_OVERLAP_KEY)
+        )
+        self.huckel_edge_overlap_key = str(
+            options.get("huckel_edge_overlap_key", _keys.EDGE_OVERLAP_KEY)
+        )
+        self.huckel_strict_overlap = bool(options.get("huckel_strict_overlap", True))
+        self.huckel_strict_basis = bool(options.get("huckel_strict_basis", True))
+        self.huckel_edge_energy_fallback = float(
+            options.get("huckel_edge_energy_fallback", self.basis_onsite_edge_value)
+        )
+        self.huckel_edge_length_decay = float(options.get("huckel_edge_length_decay", 0.0))
+        self._basis_onsite_table_cache: Dict[
+            Tuple[str, torch.dtype, int], Optional[torch.Tensor]
+        ] = {}
+        self._basis_onsite_type_mean_cache: Dict[
+            Tuple[str, torch.dtype, int], Optional[torch.Tensor]
+        ] = {}
         self.physical_prior_jitter_sigma = float(
             options.get("physical_prior_jitter_sigma", options.get("prior_jitter_sigma", 0.0))
         )
@@ -716,8 +743,13 @@ class HamiltonianCFM:
         )
 
     def _basis_onsite_table(self, like: torch.Tensor) -> Optional[torch.Tensor]:
+        cache_key = (str(like.device), like.dtype, int(like.shape[-1]))
+        if cache_key in self._basis_onsite_table_cache:
+            return self._basis_onsite_table_cache[cache_key]
+
         idp = self.idp
         if idp is None:
+            self._basis_onsite_table_cache[cache_key] = None
             return None
         basis = getattr(idp, "basis", None)
         type_names = getattr(idp, "type_names", None)
@@ -731,9 +763,11 @@ class HamiltonianCFM:
             or not isinstance(basis_to_full_basis, dict)
             or not isinstance(orbpair_maps, dict)
         ):
+            self._basis_onsite_table_cache[cache_key] = None
             return None
         if chemical_symbol_to_type is None:
             if type_names is None:
+                self._basis_onsite_table_cache[cache_key] = None
                 return None
             chemical_symbol_to_type = {str(symbol): idx for idx, symbol in enumerate(type_names)}
 
@@ -772,7 +806,9 @@ class HamiltonianCFM:
 
         table, _raw_mask = project_uureal_to_like(self.idp, table, like)
         if table.ndim < 2 or table.shape[-1] != like.shape[-1]:
+            self._basis_onsite_table_cache[cache_key] = None
             return None
+        self._basis_onsite_table_cache[cache_key] = table
         return table
 
     def _basis_onsite_absolute_prior_like(
@@ -804,6 +840,146 @@ class HamiltonianCFM:
             rows = torch.arange(take, device=like.device, dtype=torch.long)[valid]
             if rows.numel() > 0:
                 prior[rows] = table.index_select(0, raw_types[valid])
+        return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
+
+    def _basis_onsite_type_mean(self, like: torch.Tensor) -> Optional[torch.Tensor]:
+        cache_key = (str(like.device), like.dtype, int(like.shape[-1]))
+        if cache_key in self._basis_onsite_type_mean_cache:
+            return self._basis_onsite_type_mean_cache[cache_key]
+
+        table = self._basis_onsite_table(like)
+        if table is None:
+            self._basis_onsite_type_mean_cache[cache_key] = None
+            return None
+        active = table.abs() > 0
+        count = active.sum(dim=-1).clamp_min(1)
+        mean = (table * active.to(dtype=table.dtype)).sum(dim=-1) / count.to(dtype=table.dtype)
+        fallback = torch.full_like(mean, float(self.huckel_edge_energy_fallback))
+        mean = torch.where(active.any(dim=-1), mean, fallback)
+        self._basis_onsite_type_mean_cache[cache_key] = mean
+        return mean
+
+    def _huckel_edge_energy_like(
+        self,
+        like: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+    ) -> torch.Tensor:
+        fallback = torch.full(
+            (like.shape[0],),
+            float(self.huckel_edge_energy_fallback),
+            device=like.device,
+            dtype=like.dtype,
+        )
+        type_mean = self._basis_onsite_type_mean(like)
+        if type_mean is None:
+            if self.huckel_strict_basis:
+                raise ValueError(
+                    "flow_options.prior='overlap_huckel' requires an OrbitalMapper-like idp "
+                    "with basis_to_full_basis/orbpair_maps so edge energies can use basis onsite levels."
+                )
+            return fallback
+        type_mean = type_mean.to(device=like.device, dtype=like.dtype)
+
+        if data is None or _keys.EDGE_INDEX_KEY not in data or AtomicDataDict.ATOM_TYPE_KEY not in data:
+            if self.huckel_strict_basis:
+                raise KeyError(
+                    "flow_options.prior='overlap_huckel' requires edge_index and atom_types "
+                    "to map overlap rows to basis-derived endpoint energies."
+                )
+            valid = type_mean.abs() > 0
+            if bool(valid.any().item()):
+                fallback.fill_(float(type_mean[valid].mean().detach().item()))
+            return fallback
+
+        edge_index = data[_keys.EDGE_INDEX_KEY].to(device=like.device, dtype=torch.long)
+        atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].to(device=like.device, dtype=torch.long).reshape(-1)
+        if edge_index.ndim != 2 or edge_index.shape[0] < 2 or atom_types.numel() == 0:
+            if self.huckel_strict_basis:
+                raise ValueError(
+                    "flow_options.prior='overlap_huckel' expects edge_index with shape [2, n_edge] "
+                    "and non-empty atom_types."
+                )
+            return fallback
+
+        count = int(like.shape[0])
+        src = edge_index[0].reshape(-1)
+        dst = edge_index[1].reshape(-1)
+        if src.numel() < count:
+            pad = src.new_zeros(count - src.numel())
+            src = torch.cat([src, pad], dim=0)
+            dst = torch.cat([dst, pad], dim=0)
+        src = src[:count].clamp(min=0, max=max(int(atom_types.numel()) - 1, 0))
+        dst = dst[:count].clamp(min=0, max=max(int(atom_types.numel()) - 1, 0))
+        src_type = atom_types.index_select(0, src)
+        dst_type = atom_types.index_select(0, dst)
+        valid = (
+            (src_type >= 0)
+            & (src_type < type_mean.shape[0])
+            & (dst_type >= 0)
+            & (dst_type < type_mean.shape[0])
+        )
+        energy = fallback
+        if valid.any():
+            rows = torch.arange(count, device=like.device, dtype=torch.long)[valid]
+            energy[rows] = 0.5 * (
+                type_mean.index_select(0, src_type[valid])
+                + type_mean.index_select(0, dst_type[valid])
+            )
+        return energy.reshape((count,) + (1,) * (like.ndim - 1))
+
+    def _overlap_huckel_absolute_prior_like(
+        self,
+        like: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        if label == "node":
+            prior = self._basis_onsite_absolute_prior_like(like, data=data, label=label)
+            if prior is None and self.huckel_strict_basis:
+                raise ValueError(
+                    "flow_options.prior='overlap_huckel' requires an OrbitalMapper-like idp "
+                    "with basis_to_full_basis/orbpair_maps for node onsite initialization."
+                )
+            return prior
+        if label != "edge":
+            return torch.zeros_like(like)
+        if data is None:
+            if self.huckel_strict_overlap:
+                raise KeyError(
+                    f"flow_options.prior='overlap_huckel' requires `{self.huckel_edge_overlap_key}` "
+                    "in the batch."
+                )
+            return None
+        overlap_source = data.get(self.huckel_edge_overlap_key, None)
+        if overlap_source is None:
+            if self.huckel_strict_overlap:
+                raise KeyError(
+                    f"flow_options.prior='overlap_huckel' requires `{self.huckel_edge_overlap_key}` "
+                    "in the batch. Precompute ABACUS/get_s overlap or enable dataset get_overlap."
+                )
+            return None
+        overlap = self._coerce_prior_source(
+            overlap_source,
+            like,
+            key=self.huckel_edge_overlap_key,
+            label=label,
+        )
+        edge_energy = self._huckel_edge_energy_like(like, data=data)
+        prior = float(self.huckel_k) * overlap * edge_energy
+        if (
+            self.huckel_edge_length_decay > 0.0
+            and data is not None
+            and _keys.EDGE_LENGTH_KEY in data
+        ):
+            edge_lengths = data[_keys.EDGE_LENGTH_KEY].to(device=like.device, dtype=like.dtype)
+            edge_lengths = edge_lengths.reshape(-1)
+            if int(edge_lengths.shape[0]) == int(like.shape[0]):
+                view_shape = (edge_lengths.shape[0],) + (1,) * (like.ndim - 1)
+                prior = prior * torch.exp(
+                    -edge_lengths.reshape(view_shape) / self.huckel_edge_length_decay
+                )
         return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
 
     def _absolute_to_flow_prior(
@@ -861,7 +1037,14 @@ class HamiltonianCFM:
         base: Optional[torch.Tensor],
     ) -> torch.Tensor:
         absolute_prior = None
-        if self.prior in self._external_prior_names:
+        if self.prior in self._overlap_huckel_prior_names:
+            absolute_prior = self._overlap_huckel_absolute_prior_like(
+                residual,
+                data=data,
+                label=label,
+            )
+
+        if absolute_prior is None and self.prior in self._external_prior_names:
             absolute_prior = self._external_absolute_prior_like(residual, data=data, label=label)
 
         if absolute_prior is None:
@@ -874,7 +1057,7 @@ class HamiltonianCFM:
         allow_basis_fallback = (
             self.prior in self._basis_prior_names
             or (
-                self.prior not in {"external", *self._dftbsk_prior_names}
+                self.prior not in {"external", *self._overlap_huckel_prior_names, *self._dftbsk_prior_names}
                 and self.physical_prior_fallback == "basis_onsite"
             )
         )
@@ -896,6 +1079,11 @@ class HamiltonianCFM:
                     "flow_options.prior='dftbsk' requires a successful on-the-fly "
                     "DFTB-SK initialization; set prior_skdata/dftb_skdata to a "
                     "Slater-Koster directory or formatted .pth."
+                )
+            if self.prior in self._overlap_huckel_prior_names:
+                raise ValueError(
+                    "flow_options.prior='overlap_huckel' requires basis onsite levels "
+                    "and edge overlap features; set huckel_edge_overlap_key or precompute overlap."
                 )
             if (
                 self.physical_prior_fallback == "zero"
@@ -1310,6 +1498,7 @@ class HamiltonianCFM:
         if (
             self.prior in self._basis_prior_names
             or self.prior in self._external_prior_names
+            or self.prior in self._overlap_huckel_prior_names
             or self.prior in self._dftbsk_prior_names
         ):
             return self._physical_prior_like(

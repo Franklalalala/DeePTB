@@ -3705,12 +3705,9 @@ class MultiTrainer(Trainer):
                             reduced_pack = self._make_step_pack(payload)
                             self._all_reduce_(reduced_pack, name="dist/all_reduce(validation_metrics_packed)")
 
-                        if self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
-                            with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
-                                loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
-                            if loss_i is None:
-                                loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
-                        else:
+                        with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
+                            loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
+                        if loss_i is None:
                             loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
 
                         self._accumulate_metric_state(

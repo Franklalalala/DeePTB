@@ -32,6 +32,67 @@ def _uureal_mask_cache(idp: Any):
     return cache
 
 
+def _nextham_full_soc_uureal_mask(
+    idp: Any,
+    *,
+    raw_width: int,
+    target_width: int,
+    device: Optional[torch.device] = None,
+) -> Optional[torch.Tensor]:
+    if (
+        idp is None
+        or not bool(getattr(idp, "nextham_uureal_mask", False))
+        or not bool(getattr(idp, "has_soc", False))
+        or int(target_width) <= 0
+        or int(raw_width) <= int(target_width)
+        or int(raw_width) % int(target_width) != 0
+    ):
+        return None
+
+    factor = int(raw_width) // int(target_width)
+    expected = 4 * (2 if bool(getattr(idp, "soc_complex_doubling", True)) else 1)
+    if factor != expected:
+        return None
+
+    orbpair_maps = getattr(idp, "orbpair_maps", None)
+    if orbpair_maps is None and callable(getattr(idp, "get_orbpair_maps", None)):
+        try:
+            orbpair_maps = idp.get_orbpair_maps()
+        except Exception:
+            return None
+    if not isinstance(orbpair_maps, dict):
+        return None
+
+    slices = []
+    for slc in orbpair_maps.values():
+        start = int(getattr(slc, "start", 0))
+        stop = int(getattr(slc, "stop", 0))
+        if stop > start:
+            slices.append((start, stop))
+    if not slices:
+        return None
+    slices.sort()
+
+    mask_cpu = torch.zeros(int(raw_width), dtype=torch.bool, device="cpu")
+    raw_offset = 0
+    compact_width = 0
+    for _start, stop in slices:
+        width = int(stop) - int(_start)
+        if width <= 0:
+            continue
+        if raw_offset + width > int(raw_width):
+            return None
+        mask_cpu[raw_offset: raw_offset + width] = True
+        raw_offset += width * factor
+        compact_width += width
+
+    if raw_offset != int(raw_width) or compact_width != int(target_width):
+        return None
+    if device is None:
+        device = torch.device("cpu")
+    return mask_cpu.to(device=torch.device(device))
+
+
 def uureal_projection_mask(
     idp: Any,
     *,
@@ -43,12 +104,22 @@ def uureal_projection_mask(
         return None
     raw_mask = getattr(idp, "mask_uureal", None)
     if raw_mask is None:
-        return None
+        return _nextham_full_soc_uureal_mask(
+            idp,
+            raw_width=int(raw_width),
+            target_width=int(target_width),
+            device=device,
+        )
     cache = _uureal_mask_cache(idp)
     if cache is None:
         return None
     if cache["numel"] != int(raw_width) or cache["count"] != int(target_width):
-        return None
+        return _nextham_full_soc_uureal_mask(
+            idp,
+            raw_width=int(raw_width),
+            target_width=int(target_width),
+            device=device,
+        )
 
     if device is None:
         device = raw_mask.device if torch.is_tensor(raw_mask) else torch.device("cpu")

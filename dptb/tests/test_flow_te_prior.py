@@ -13,6 +13,7 @@ from dptb.nnops.flow import (
     HamiltonianCFM,
     HamiltonianPixelMeanFlow,
 )
+from dptb.nnops.layout import project_uureal_to_like
 from dptb.nnops.loss import HamilLossAbs
 from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
@@ -87,6 +88,28 @@ class _LazyIrrepIDP(_FakeIDP):
         self.get_irreps_calls += 1
         self.orbpair_irreps = _FakeIrreps()
         return self.orbpair_irreps
+
+
+class _CompactUuRealIDP:
+    nextham_uureal_mask = True
+    has_soc = True
+    soc_complex_doubling = True
+
+    def __init__(self):
+        self.mask_uureal = torch.ones(5, dtype=torch.bool)
+        self.orbpair_maps = {
+            "1s-1s": slice(0, 2),
+            "1s-2p": slice(2, 5),
+        }
+
+    def get_orbpair_maps(self):
+        return self.orbpair_maps
+
+
+class _CompactUuRealNoMaskIDP(_CompactUuRealIDP):
+    def __init__(self):
+        super().__init__()
+        del self.mask_uureal
 
 
 class _FakeCompatibleLoss:
@@ -165,6 +188,42 @@ def test_te_irrep_slices_preserve_raw_feature_order():
     flow = HamiltonianCFM(opts, idp=_UnsortedIrrepIDP(device=device), device=device, dtype=dtype)
 
     assert flow._te_irrep_slices(4) == ((0, 3, 1), (3, 4, 0))
+
+
+def test_project_uureal_to_like_handles_full_soc_overlap_for_compact_idp():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    idp = _CompactUuRealIDP()
+    like = torch.zeros(2, 5, device=device, dtype=dtype)
+    raw = torch.zeros(2, 40, device=device, dtype=dtype)
+    raw[:, 0:2] = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=device, dtype=dtype)
+    raw[:, 16:19] = torch.tensor([[5.0, 6.0, 7.0], [8.0, 9.0, 10.0]], device=device, dtype=dtype)
+    raw[:, 2:16] = 100.0
+    raw[:, 19:] = 200.0
+
+    projected, mask = project_uureal_to_like(idp, raw, like)
+
+    expected = torch.cat([raw[:, 0:2], raw[:, 16:19]], dim=-1)
+    torch.testing.assert_close(projected, expected)
+    assert mask is not None
+    assert int(mask.sum().item()) == 5
+
+
+def test_project_uureal_to_like_infers_full_soc_overlap_without_mask_uureal():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    idp = _CompactUuRealNoMaskIDP()
+    like = torch.zeros(2, 5, device=device, dtype=dtype)
+    raw = torch.zeros(2, 40, device=device, dtype=dtype)
+    raw[:, 0:2] = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=device, dtype=dtype)
+    raw[:, 16:19] = torch.tensor([[5.0, 6.0, 7.0], [8.0, 9.0, 10.0]], device=device, dtype=dtype)
+
+    projected, mask = project_uureal_to_like(idp, raw, like)
+
+    expected = torch.cat([raw[:, 0:2], raw[:, 16:19]], dim=-1)
+    torch.testing.assert_close(projected, expected)
+    assert mask is not None
+    assert int(mask.sum().item()) == 5
 
 
 @pytest.mark.parametrize("mode", ["irrep", "typewise"])
@@ -865,6 +924,130 @@ def test_basis_onsite_prior_is_residualized_against_existing_h0():
     torch.testing.assert_close(ctx.edge_prior, -edge_base)
 
 
+def test_overlap_huckel_prior_uses_overlap_and_basis_without_h0():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    edge_overlap = torch.linspace(
+        -0.3,
+        0.4,
+        steps=ref[_keys.EDGE_FEATURES_KEY].numel(),
+        device=device,
+        dtype=dtype,
+    ).reshape_as(ref[_keys.EDGE_FEATURES_KEY])
+    data[_keys.EDGE_OVERLAP_KEY] = edge_overlap
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "overlap_huckel",
+            "strict_h0": False,
+            "warn_missing_h0": False,
+            "detach_interpolated_h0": False,
+            "huckel_k": 2.0,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+
+    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+    out_again, _ref_again, ctx_again = flow.prepare_batch(
+        data,
+        ref,
+        t=torch.zeros(1, device=device, dtype=dtype),
+    )
+
+    expected_node = torch.zeros_like(ref[_keys.NODE_FEATURES_KEY])
+    expected_node[0, _onsite_diag_indices(idp, "H", "1s", device)] = onsite_energy_database["H"]["1s"]
+    expected_node[1, _onsite_diag_indices(idp, "C", "2s", device)] = onsite_energy_database["C"]["2s"]
+    expected_node[1, _onsite_diag_indices(idp, "C", "2p", device)] = onsite_energy_database["C"]["2p"]
+    h_mean = torch.tensor(onsite_energy_database["H"]["1s"], device=device, dtype=dtype)
+    c_mean = torch.tensor(
+        (onsite_energy_database["C"]["2s"] + 3.0 * onsite_energy_database["C"]["2p"]) / 4.0,
+        device=device,
+        dtype=dtype,
+    )
+    edge_energy = 0.5 * (h_mean + c_mean)
+    expected_edge = 2.0 * edge_energy * edge_overlap
+    expected_edge = expected_edge * flow._prior_mask(data, expected_edge, "edge").to(dtype=dtype)
+
+    torch.testing.assert_close(out[_keys.NODE_H0_KEY], expected_node)
+    torch.testing.assert_close(ctx.node_prior, expected_node)
+    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], expected_edge)
+    torch.testing.assert_close(ctx.edge_prior, expected_edge)
+    torch.testing.assert_close(out_again[_keys.NODE_H0_KEY], out[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(ctx_again.node_prior, ctx.node_prior)
+    torch.testing.assert_close(out_again[_keys.EDGE_H0_KEY], out[_keys.EDGE_H0_KEY])
+    torch.testing.assert_close(ctx_again.edge_prior, ctx.edge_prior)
+
+
+def test_overlap_huckel_prior_is_residualized_against_existing_h0():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    edge_overlap = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
+    data[_keys.EDGE_OVERLAP_KEY] = edge_overlap
+    node_base = torch.full_like(ref[_keys.NODE_FEATURES_KEY], 0.25)
+    edge_base = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], -0.5)
+    data[_keys.NODE_H0_KEY] = node_base
+    data[_keys.EDGE_H0_KEY] = edge_base
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "overlap_huckel",
+            "detach_interpolated_h0": False,
+            "huckel_k": 1.5,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+
+    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+
+    expected_node = torch.zeros_like(ref[_keys.NODE_FEATURES_KEY])
+    expected_node[0, _onsite_diag_indices(idp, "H", "1s", device)] = onsite_energy_database["H"]["1s"]
+    expected_node[1, _onsite_diag_indices(idp, "C", "2s", device)] = onsite_energy_database["C"]["2s"]
+    expected_node[1, _onsite_diag_indices(idp, "C", "2p", device)] = onsite_energy_database["C"]["2p"]
+    h_mean = torch.tensor(onsite_energy_database["H"]["1s"], device=device, dtype=dtype)
+    c_mean = torch.tensor(
+        (onsite_energy_database["C"]["2s"] + 3.0 * onsite_energy_database["C"]["2p"]) / 4.0,
+        device=device,
+        dtype=dtype,
+    )
+    expected_edge = 1.5 * 0.5 * (h_mean + c_mean) * edge_overlap
+    expected_edge = expected_edge * flow._prior_mask(data, expected_edge, "edge").to(dtype=dtype)
+
+    torch.testing.assert_close(out[_keys.NODE_H0_KEY], expected_node)
+    torch.testing.assert_close(ctx.node_prior, expected_node - node_base)
+    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], expected_edge)
+    torch.testing.assert_close(ctx.edge_prior, expected_edge - edge_base)
+
+
+def test_overlap_huckel_prior_requires_edge_overlap_by_default():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "overlap_huckel",
+            "strict_h0": False,
+            "warn_missing_h0": False,
+            "detach_interpolated_h0": False,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+
+    with pytest.raises(KeyError, match="edge_overlap"):
+        flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+
+
 def test_dftb_prior_uses_external_absolute_hamiltonian_keys():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -954,6 +1137,31 @@ def test_flow_options_argcheck_accepts_physical_prior_config_keys():
     assert value["dftb_prior_overlap"] is True
     assert value["basis_onsite_scale"] == pytest.approx(0.5)
     assert value["physical_prior_jitter_edge_decay"] == pytest.approx(2.0)
+
+
+def test_flow_options_argcheck_accepts_overlap_huckel_config_keys():
+    schema = flow_options()
+
+    value = schema.normalize_value(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "overlap_huckel",
+            "huckel_k": 1.75,
+            "huckel_node_overlap_key": "node_overlap",
+            "huckel_edge_overlap_key": "edge_overlap",
+            "huckel_strict_overlap": True,
+            "huckel_edge_energy_fallback": -2.0,
+            "huckel_edge_length_decay": 3.0,
+        }
+    )
+    schema.check_value(value, strict=True)
+
+    assert value["prior"] == "overlap_huckel"
+    assert value["huckel_k"] == pytest.approx(1.75)
+    assert value["huckel_edge_overlap_key"] == "edge_overlap"
+    assert value["huckel_strict_overlap"] is True
+    assert value["huckel_edge_length_decay"] == pytest.approx(3.0)
 
 
 def test_common_options_argcheck_accepts_nextham_uureal_mask():
