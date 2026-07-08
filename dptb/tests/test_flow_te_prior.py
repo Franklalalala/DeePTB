@@ -8,6 +8,7 @@ import torch
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.transforms_upper_triangle import OrbitalMapper
 from dptb.nn.sktb.onsiteDB import onsite_energy_database
+from dptb.nnops import prior_physical
 from dptb.nnops.flow import (
     CFMContext,
     HamiltonianCFM,
@@ -1048,6 +1049,148 @@ def test_overlap_huckel_prior_requires_edge_overlap_by_default():
         flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
 
 
+def test_overlap_huckel_prior_rejects_edge_index_overlap_row_mismatch():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    # edge_index carries 3 columns while the edge overlap/feature tensor has 2 rows.
+    # Under the default strict basis mode this must fail loud instead of being
+    # silently padded/truncated/clamped into a plausible-but-wrong prior.
+    data[_keys.EDGE_INDEX_KEY] = torch.tensor(
+        [[0, 1, 0], [1, 0, 1]], device=device, dtype=torch.long
+    )
+    data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "overlap_huckel",
+            "strict_h0": False,
+            "warn_missing_h0": False,
+            "detach_interpolated_h0": False,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+
+    with pytest.raises(ValueError, match="edge_index"):
+        flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+
+
+def test_prior_physical_basis_onsite_table_matches_cfm_method():
+    # The shared dptb.nnops.prior_physical.basis_onsite_table must reproduce, value
+    # for value, the table the HamiltonianCFM method builds (the online prior and
+    # the offline EMolFlow preprocess tool now share this one implementation).
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    idp, _data, ref = _basis_onsite_case(device, dtype)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "basis_onsite",
+            "strict_h0": False,
+            "warn_missing_h0": False,
+            "basis_onsite_scale": 0.5,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+    like = ref[_keys.NODE_FEATURES_KEY]
+
+    method_table = flow._basis_onsite_table(like)
+    shared_table = prior_physical.basis_onsite_table(
+        idp,
+        device=like.device,
+        dtype=like.dtype,
+        scale=flow.basis_onsite_scale,
+        missing=flow.basis_onsite_missing_value,
+    )
+
+    assert method_table is not None
+    assert shared_table is not None
+    # The non-SOC test idp uses an identity uureal->like projection, so the raw
+    # shared table equals the projected table returned by the CFM method.
+    torch.testing.assert_close(shared_table, method_table)
+    # basis_onsite_scale must be threaded identically through both paths.
+    h_diag = _onsite_diag_indices(idp, "H", "1s", device)
+    assert method_table[idp.chemical_symbol_to_type["H"], h_diag[0]].item() == pytest.approx(
+        0.5 * onsite_energy_database["H"]["1s"]
+    )
+
+    # The derived per-type mean must also match (same active-entry averaging).
+    method_mean = flow._basis_onsite_type_mean(like)
+    shared_mean = prior_physical.basis_onsite_type_mean(
+        shared_table, fallback=flow.huckel_edge_energy_fallback
+    )
+    assert method_mean is not None
+    torch.testing.assert_close(shared_mean, method_mean)
+
+
+def test_prior_physical_huckel_edge_energy_reproduces_prior_edge_energies():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    idp, data, ref = _basis_onsite_case(device, dtype)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "overlap_huckel",
+            "strict_h0": False,
+            "warn_missing_h0": False,
+        },
+        idp=idp,
+        device=device,
+        dtype=dtype,
+    )
+    edge_like = ref[_keys.EDGE_FEATURES_KEY]
+    type_mean = flow._basis_onsite_type_mean(edge_like)
+    assert type_mean is not None
+
+    shared_energy = prior_physical.huckel_edge_energy(
+        type_mean,
+        data[_keys.EDGE_INDEX_KEY],
+        data[AtomicDataDict.ATOM_TYPE_KEY],
+        edge_like.shape[0],
+        fallback=flow.huckel_edge_energy_fallback,
+        strict=flow.huckel_strict_basis,
+    )
+    method_energy = flow._huckel_edge_energy_like(edge_like, data=data)
+
+    # The shared helper reproduces the CFM method's per-edge energy exactly.
+    torch.testing.assert_close(shared_energy, method_energy.reshape(-1))
+
+    # edge_index = [[0, 1], [1, 0]] over atom_types [H, C], so both edges take the
+    # H<->C endpoint average 0.5*(mean_H + mean_C).
+    h_mean = type_mean[idp.chemical_symbol_to_type["H"]]
+    c_mean = type_mean[idp.chemical_symbol_to_type["C"]]
+    expected = torch.stack([0.5 * (h_mean + c_mean), 0.5 * (c_mean + h_mean)])
+    torch.testing.assert_close(shared_energy, expected)
+
+
+def test_prior_physical_huckel_edge_energy_strict_rejects_column_mismatch():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    type_mean = torch.tensor([1.0, 2.0], device=device, dtype=dtype)
+    atom_types = torch.tensor([0, 1], device=device, dtype=torch.long)
+    # 3 edge_index columns but only 2 edge rows: strict mode must fail loud rather
+    # than pad/truncate (the strict-basis behavior guarded by the CFM prior).
+    edge_index = torch.tensor([[0, 1, 0], [1, 0, 1]], device=device, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="edge_index"):
+        prior_physical.huckel_edge_energy(
+            type_mean, edge_index, atom_types, 2, fallback=0.0, strict=True
+        )
+
+    # The same mismatch is tolerated (pad/truncate) when strict=False.
+    out = prior_physical.huckel_edge_energy(
+        type_mean, edge_index, atom_types, 2, fallback=0.0, strict=False
+    )
+    assert out.shape == (2,)
+
+
 def test_dftb_prior_uses_external_absolute_hamiltonian_keys():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -1066,6 +1209,63 @@ def test_dftb_prior_uses_external_absolute_hamiltonian_keys():
     torch.testing.assert_close(ctx.edge_prior, dftb_edge - data[_keys.EDGE_H0_KEY])
 
 
+def test_external_candidate_keys_are_the_short_documented_list():
+    # Behavior change: the external family consults only the explicit key plus the
+    # short documented per-prefix set {prefix}_{label}_h0, {label}_{prefix}_h0,
+    # {prefix}_{label}_features -- the ~10 other legacy permutations are dropped.
+    device = torch.device("cpu")
+    dtype = torch.float32
+    flow = _flow("dftb", device=device, dtype=dtype, prior_node_key="my_node_prior")
+    fam = flow.prior_family
+
+    expected = ["my_node_prior"]
+    for prefix in fam._prefixes():
+        expected += [f"{prefix}_node_h0", f"node_{prefix}_h0", f"{prefix}_node_features"]
+    assert list(fam.candidate_keys("node")) == expected
+
+    edge_keys = set(fam.candidate_keys("edge"))
+    for prefix in fam._prefixes():
+        assert f"{prefix}_edge_h0" in edge_keys
+        assert f"edge_{prefix}_h0" in edge_keys
+        assert f"{prefix}_edge_features" in edge_keys
+    # Dropped legacy permutations must no longer appear.
+    for dropped in (
+        "edge_h0_dftb",
+        "dftb_edge_hamiltonian",
+        "edge_dftb_hamiltonian",
+        "dftb_hopping",
+        "hopping_dftb",
+    ):
+        assert dropped not in edge_keys
+
+
+def test_dftb_prior_fails_closed_without_matching_keys_or_skdata():
+    # Behavior change: prior=dftb/xtb/sk/nnsk with no matching keys and no skdata
+    # must fail closed (KeyError), no longer silently falling back to basis_onsite.
+    device = torch.device("cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    # A dropped legacy permutation is present but is no longer consulted.
+    data["node_h0_dftb"] = data[_keys.NODE_H0_KEY] + 1.0
+    flow = _flow("dftb", device=device, dtype=dtype)
+
+    with pytest.raises(KeyError, match="Tried keys"):
+        flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
+
+    # external_prior_strict=False still degrades the whole external family to a
+    # zero absolute prior (H_t at t=0 equals the zero Hamiltonian).
+    flow_lax = _flow("dftb", device=device, dtype=dtype, external_prior_strict=False)
+    out, _ref_out, _ctx = flow_lax.prepare_batch(
+        data, ref, t=torch.zeros(2, device=device, dtype=dtype)
+    )
+    torch.testing.assert_close(
+        out[_keys.NODE_H0_KEY], torch.zeros_like(out[_keys.NODE_H0_KEY])
+    )
+    torch.testing.assert_close(
+        out[_keys.EDGE_H0_KEY], torch.zeros_like(out[_keys.EDGE_H0_KEY])
+    )
+
+
 def test_dftbsk_prior_uses_on_the_fly_absolute_initial_guess():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -1074,10 +1274,11 @@ def test_dftbsk_prior_uses_on_the_fly_absolute_initial_guess():
     edge_guess = data[_keys.EDGE_H0_KEY] - 0.25
     flow = _flow("dftbsk", device=device, dtype=dtype)
 
-    def fake_dftbsk(like, *, data, label):
+    def fake_dftbsk(like, *, data, label, ctx):
         return node_guess if label == "node" else edge_guess
 
-    flow._dftbsk_absolute_prior_like = fake_dftbsk
+    # The DFTB-SK builder now lives on the resolved prior family instance.
+    flow.prior_family.absolute_prior_like = fake_dftbsk
 
     out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
 
@@ -1199,6 +1400,84 @@ def test_haar_dm_prior_requires_precomputed_fields():
 
     with pytest.raises(KeyError, match="haar_dm"):
         flow._prior_like(torch.zeros(2, 4), 1.0, data={}, label="node")
+
+
+def test_haar_dm_prior_uses_same_candidate_for_node_and_edge():
+    device = torch.device("cpu")
+    dtype = torch.float64
+    data, ref = _make_batch(device=device, dtype=dtype)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "full",
+            "prior": "haar_dm",
+            "detach_interpolated_h0": False,
+        },
+        idp=_FakeIDP(device=device),
+        device=device,
+        dtype=dtype,
+    )
+
+    node_target = ref[_keys.NODE_FEATURES_KEY]
+    edge_target = ref[_keys.EDGE_FEATURES_KEY]
+    # K=2 candidate axis on both node and edge. Candidate 0 vs 1 are far apart,
+    # and index i of the node tensor is coherent with index i of the edge tensor
+    # (both encode the same Haar density matrix in production), so the node and
+    # edge priors must always select the same candidate.
+    node_candidates = torch.stack(
+        [torch.full_like(node_target, 3.0), torch.full_like(node_target, 7.0)],
+        dim=1,
+    )
+    edge_candidates = torch.stack(
+        [torch.full_like(edge_target, 30.0), torch.full_like(edge_target, 70.0)],
+        dim=1,
+    )
+    data[_keys.HAAR_NODE_FEATURES_KEY] = node_candidates
+    data[_keys.HAAR_EDGE_FEATURES_KEY] = edge_candidates
+
+    t = torch.zeros(2, device=device, dtype=dtype)
+    seen = set()
+    torch.manual_seed(0)
+    for _ in range(40):
+        _out, _ref_out, ctx = flow.prepare_batch(data, ref, t=t)
+        node_c0 = bool(torch.all(ctx.node_prior == 3.0))
+        node_c1 = bool(torch.all(ctx.node_prior == 7.0))
+        edge_c0 = bool(torch.all(ctx.edge_prior == 30.0))
+        edge_c1 = bool(torch.all(ctx.edge_prior == 70.0))
+        # Each prior is exactly one candidate, fully (no cross-candidate mixing).
+        assert node_c0 != node_c1
+        assert edge_c0 != edge_c1
+        node_idx = 0 if node_c0 else 1
+        edge_idx = 0 if edge_c0 else 1
+        assert node_idx == edge_idx
+        seen.add(node_idx)
+    # The shared draw is genuinely random, not pinned to a single candidate.
+    assert seen == {0, 1}
+
+
+def test_haar_dm_prior_rejects_mismatched_node_edge_candidate_counts():
+    device = torch.device("cpu")
+    dtype = torch.float64
+    data, ref = _make_batch(device=device, dtype=dtype)
+    flow = HamiltonianCFM(
+        {"enabled": True, "mode": "full", "prior": "haar_dm"},
+        idp=_FakeIDP(device=device),
+        device=device,
+        dtype=dtype,
+    )
+    node_target = ref[_keys.NODE_FEATURES_KEY]
+    edge_target = ref[_keys.EDGE_FEATURES_KEY]
+    # Node exposes K=2 candidates, edge exposes K=3: the coherent-pairing
+    # assumption is violated and prepare_batch must refuse to draw an index.
+    data[_keys.HAAR_NODE_FEATURES_KEY] = torch.stack(
+        [torch.full_like(node_target, float(i)) for i in range(2)], dim=1
+    )
+    data[_keys.HAAR_EDGE_FEATURES_KEY] = torch.stack(
+        [torch.full_like(edge_target, float(i)) for i in range(3)], dim=1
+    )
+
+    with pytest.raises(ValueError, match="candidate"):
+        flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
 
 
 def test_flow_options_argcheck_accepts_haar_dm_config_keys():

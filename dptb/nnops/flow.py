@@ -13,13 +13,26 @@ features.
 from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
-import re
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from dptb.data import AtomicDataDict, _keys
-from dptb.nn.sktb.onsiteDB import onsite_energy_database
+from dptb.nnops import prior_physical
+from dptb.nnops.flow_priors import (
+    BasisOnsiteFamily,
+    DFTBSKFamily,
+    ExternalFamily,
+    HaarDMFamily,
+    OverlapHuckelFamily,
+    PriorContext,
+    build_prior_families,
+    BASIS_ONSITE_NAMES,
+    DFTBSK_NAMES,
+    EXTERNAL_NAMES,
+    HAAR_DM_NAMES,
+    OVERLAP_HUCKEL_NAMES,
+)
 from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 
 log = logging.getLogger(__name__)
@@ -119,35 +132,11 @@ class HamiltonianCFM:
         # dense TE/CG priors.
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
-        self._basis_prior_names = {"basis_onsite", "fixed_onsite", "atomic_onsite"}
-        self._overlap_huckel_prior_names = {
-            "overlap_huckel",
-            "huckel_overlap",
-            "extended_huckel",
-            "eht",
-        }
-        self._haar_dm_prior_names = {
-            "haar_dm",
-            "haar_density",
-            "haar_projector",
-        }
-        self._external_prior_names = {
-            "external",
-            "dftb",
-            "dftb_xtb",
-            "xtb",
-            "physical",
-            "sk",
-            "nnsk",
-        }
-        self._dftbsk_prior_names = {
-            "dftbsk",
-            "dftb_sk",
-            "dftb_scf0",
-            "dftb_on_the_fly",
-            "skf",
-            "skfile",
-        }
+        self._basis_prior_names = BASIS_ONSITE_NAMES
+        self._overlap_huckel_prior_names = OVERLAP_HUCKEL_NAMES
+        self._haar_dm_prior_names = HAAR_DM_NAMES
+        self._external_prior_names = EXTERNAL_NAMES
+        self._dftbsk_prior_names = DFTBSK_NAMES
         allowed_priors = {
             "zero",
             "gaussian",
@@ -178,31 +167,26 @@ class HamiltonianCFM:
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
             raise ValueError("flow_options.te_prior_mode must be 'irrep', 'block', or 'typewise'.")
         self.te_prior_per_graph = bool(options.get("te_prior_per_graph", True))
-        self.prior_node_key = str(options.get("prior_node_key", "") or "")
-        self.prior_edge_key = str(options.get("prior_edge_key", "") or "")
-        raw_prefixes = options.get("prior_key_prefixes", ())
-        if isinstance(raw_prefixes, str):
-            raw_prefixes = [raw_prefixes]
-        self.prior_key_prefixes = tuple(
-            str(prefix).strip() for prefix in raw_prefixes if str(prefix).strip()
-        )
-        self.external_prior_strict = bool(options.get("external_prior_strict", True))
-        self.prior_skdata = str(
-            options.get("prior_skdata", options.get("dftb_skdata", options.get("skdata", ""))) or ""
-        )
-        self.dftb_prior_overlap = bool(options.get("dftb_prior_overlap", False))
-        self.dftb_prior_strict = bool(options.get("dftb_prior_strict", True))
-        self.dftb_prior_require_geometry = bool(
-            options.get("dftb_prior_require_geometry", True)
-        )
-        self._dftbsk_prior_cache: Dict[Tuple[str, torch.dtype], Any] = {}
-        self._dftbsk_prior_last: Optional[
-            Tuple[
-                Tuple[int, int, int, str, torch.dtype],
-                Optional[torch.Tensor],
-                Optional[torch.Tensor],
-            ]
-        ] = None
+
+        # Physical prior families each own their option keys (parsed in
+        # from_options).  Every family is built once so the external family can
+        # fall back to the on-the-fly DFTB-SK guess without re-parsing options.
+        self._families = build_prior_families(options, idp)
+        self.prior_family = None
+        for _cls in (
+            BasisOnsiteFamily,
+            OverlapHuckelFamily,
+            HaarDMFamily,
+            ExternalFamily,
+            DFTBSKFamily,
+        ):
+            if self.prior in _cls.NAMES:
+                self.prior_family = self._families[_cls]
+                break
+        self._prior_ctx = PriorContext(self)
+
+        # physical_prior_fallback is cross-cutting (it governs which family the
+        # 'physical' prior degrades to), so it stays on the trainer.
         self.physical_prior_fallback = str(
             options.get("physical_prior_fallback", "basis_onsite")
         ).lower().replace("-", "_")
@@ -210,30 +194,6 @@ class HamiltonianCFM:
             raise ValueError(
                 "flow_options.physical_prior_fallback must be 'basis_onsite', 'zero', or 'error'."
             )
-        self.basis_onsite_scale = float(options.get("basis_onsite_scale", 1.0))
-        self.basis_onsite_missing_value = float(options.get("basis_onsite_missing_value", 0.0))
-        self.basis_onsite_edge_value = float(options.get("basis_onsite_edge_value", 0.0))
-        self.huckel_k = float(options.get("huckel_k", options.get("overlap_huckel_k", 1.75)))
-        self.huckel_node_overlap_key = str(
-            options.get("huckel_node_overlap_key", _keys.NODE_OVERLAP_KEY)
-        )
-        self.huckel_edge_overlap_key = str(
-            options.get("huckel_edge_overlap_key", _keys.EDGE_OVERLAP_KEY)
-        )
-        self.huckel_strict_overlap = bool(options.get("huckel_strict_overlap", True))
-        self.huckel_strict_basis = bool(options.get("huckel_strict_basis", True))
-        self.huckel_edge_energy_fallback = float(
-            options.get("huckel_edge_energy_fallback", self.basis_onsite_edge_value)
-        )
-        self.huckel_edge_length_decay = float(options.get("huckel_edge_length_decay", 0.0))
-        self.haar_node_key = str(
-            options.get("haar_node_key", _keys.HAAR_NODE_FEATURES_KEY)
-        )
-        self.haar_edge_key = str(
-            options.get("haar_edge_key", _keys.HAAR_EDGE_FEATURES_KEY)
-        )
-        self.haar_candidate_index = int(options.get("haar_candidate_index", -1))
-        self.haar_dm_strict = bool(options.get("haar_dm_strict", True))
         self.last_haar_candidate_index = -1
         self._basis_onsite_table_cache: Dict[
             Tuple[str, torch.dtype, int], Optional[torch.Tensor]
@@ -319,6 +279,48 @@ class HamiltonianCFM:
                 self.t0_probability,
                 self.loss_type,
             )
+
+    # ------------------------------------------------------------------
+    # Family-owned option accessors
+    # ------------------------------------------------------------------
+    # These options now live on the prior-family instances (single source of
+    # truth).  The shared basis-onsite/Huckel/Haar helpers below and existing
+    # callers still read them off the trainer, so expose read-only views.
+    @property
+    def basis_onsite_scale(self) -> float:
+        return self._families[BasisOnsiteFamily].basis_onsite_scale
+
+    @property
+    def basis_onsite_missing_value(self) -> float:
+        return self._families[BasisOnsiteFamily].basis_onsite_missing_value
+
+    @property
+    def basis_onsite_edge_value(self) -> float:
+        return self._families[BasisOnsiteFamily].basis_onsite_edge_value
+
+    @property
+    def huckel_edge_energy_fallback(self) -> float:
+        return self._families[OverlapHuckelFamily].huckel_edge_energy_fallback
+
+    @property
+    def huckel_strict_basis(self) -> bool:
+        return self._families[OverlapHuckelFamily].huckel_strict_basis
+
+    @property
+    def haar_node_key(self) -> str:
+        return self._families[HaarDMFamily].haar_node_key
+
+    @property
+    def haar_edge_key(self) -> str:
+        return self._families[HaarDMFamily].haar_edge_key
+
+    @property
+    def haar_candidate_index(self) -> int:
+        return self._families[HaarDMFamily].haar_candidate_index
+
+    @property
+    def haar_dm_strict(self) -> bool:
+        return self._families[HaarDMFamily].haar_dm_strict
 
     # ------------------------------------------------------------------
     # Sampling / interpolation
@@ -485,68 +487,6 @@ class HamiltonianCFM:
         table, _raw_mask = project_uureal_to_like(self.idp, table, like)
         return table
 
-    def _external_prior_prefixes(self) -> Tuple[str, ...]:
-        if self.prior_key_prefixes:
-            return self.prior_key_prefixes
-        if self.prior == "dftb":
-            return ("dftb", "dftbsk", "sk", "nnsk")
-        if self.prior == "xtb":
-            return ("xtb", "gfn", "gfn1", "gfn2")
-        if self.prior == "sk":
-            return ("sk", "dftbsk", "nnsk")
-        if self.prior == "nnsk":
-            return ("nnsk", "sk")
-        if self.prior in {"dftb_xtb", "physical"}:
-            return ("dftb", "xtb", "dftbsk", "sk", "nnsk", "gfn", "gfn1", "gfn2")
-        return ("prior", "external")
-
-    def _external_prior_candidate_keys(self, label: Optional[str]) -> Tuple[str, ...]:
-        if label == "node":
-            explicit = self.prior_node_key
-            h0_key = self.node_h0_key
-            target_key = self.node_target_key
-            physical_name = "onsite"
-        elif label == "edge":
-            explicit = self.prior_edge_key
-            h0_key = self.edge_h0_key
-            target_key = self.edge_target_key
-            physical_name = "hopping"
-        else:
-            explicit = ""
-            h0_key = ""
-            target_key = ""
-            physical_name = str(label or "state")
-
-        keys = []
-        if explicit:
-            keys.append(explicit)
-        for prefix in self._external_prior_prefixes():
-            keys.extend(
-                [
-                    f"{prefix}_{label}_h0",
-                    f"{label}_{prefix}_h0",
-                    f"{label}_h0_{prefix}",
-                    f"{prefix}_{h0_key}" if h0_key else "",
-                    f"{h0_key}_{prefix}" if h0_key else "",
-                    f"{prefix}_{target_key}" if target_key else "",
-                    f"{target_key}_{prefix}" if target_key else "",
-                    f"{prefix}_{label}_features",
-                    f"{label}_{prefix}_features",
-                    f"{prefix}_{label}_hamiltonian",
-                    f"{label}_{prefix}_hamiltonian",
-                    f"{prefix}_{physical_name}",
-                    f"{physical_name}_{prefix}",
-                ]
-            )
-        out = []
-        seen = set()
-        for key in keys:
-            key = str(key or "")
-            if key and key not in seen:
-                out.append(key)
-                seen.add(key)
-        return tuple(out)
-
     def _coerce_prior_source(
         self,
         source: torch.Tensor,
@@ -573,189 +513,14 @@ class HamiltonianCFM:
             f"does not match target shape {tuple(like.shape)}."
         )
 
-    def _external_absolute_prior_like(
-        self,
-        like: torch.Tensor,
-        *,
-        data: Optional[AtomicDataDict.Type],
-        label: Optional[str],
-    ) -> Optional[torch.Tensor]:
-        if data is None:
-            return None
-        for key in self._external_prior_candidate_keys(label):
-            source = data.get(key, None)
-            if source is None:
-                continue
-            return self._coerce_prior_source(source, like, key=key, label=label)
-        return None
-
-    def _should_try_dftbsk_prior(self) -> bool:
-        if self.prior in self._dftbsk_prior_names:
-            return True
-        return bool(self.prior_skdata) and self.prior in {
-            "dftb",
-            "dftb_xtb",
-            "physical",
-            "sk",
-        }
-
-    def _dftbsk_prior_basis(self) -> Optional[Dict[str, Any]]:
-        basis = getattr(self.idp, "basis", None)
-        if isinstance(basis, dict):
-            return basis
-        return None
-
-    def _dftbsk_prior_model(self, *, device: torch.device, dtype: torch.dtype) -> Any:
-        if not self.prior_skdata:
-            raise ValueError(
-                "On-the-fly DFTB-SK prior requires flow_options.prior_skdata "
-                "or flow_options.dftb_skdata."
-            )
-        basis = self._dftbsk_prior_basis()
-        if basis is None:
-            raise ValueError(
-                "On-the-fly DFTB-SK prior requires an idp with a basis dictionary."
-            )
-        key = (str(device), dtype)
-        model = self._dftbsk_prior_cache.get(key)
-        if model is None:
-            from dptb.nn.dftbsk import DFTBSK
-
-            model = DFTBSK(
-                basis=basis,
-                skdata=self.prior_skdata,
-                overlap=self.dftb_prior_overlap,
-                dtype=dtype,
-                device=device,
-                transform=True,
-            )
-            model.eval()
-            self._dftbsk_prior_cache[key] = model
-        return model
-
-    def _dftbsk_prior_outputs(
-        self,
-        data: Optional[AtomicDataDict.Type],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if data is None:
-            return None, None
-        cache_key = (
-            id(data),
-            id(data.get(AtomicDataDict.ATOM_TYPE_KEY, None)),
-            id(data.get(_keys.EDGE_INDEX_KEY, None)),
-            str(device),
-            dtype,
-        )
-        if self._dftbsk_prior_last is not None:
-            last_key, last_node, last_edge = self._dftbsk_prior_last
-            if last_key == cache_key:
-                return last_node, last_edge
-
-        runtime_data = data.copy()
-        if self.dftb_prior_require_geometry and (
-            _keys.EDGE_VECTORS_KEY not in runtime_data
-            and (
-                _keys.POSITIONS_KEY not in runtime_data
-                or _keys.EDGE_INDEX_KEY not in runtime_data
-            )
-        ):
-            raise KeyError(
-                "On-the-fly DFTB-SK prior requires edge_vectors or pos+edge_index "
-                "so hopping features can be rotated into the DeePTB RME layout."
-            )
-        if _keys.PBC_KEY not in runtime_data:
-            num_graphs = self._num_graphs(runtime_data)
-            runtime_data[_keys.PBC_KEY] = torch.zeros(
-                num_graphs,
-                3,
-                device=device,
-                dtype=torch.bool,
-            )
-        model = self._dftbsk_prior_model(device=device, dtype=dtype)
-        with torch.no_grad():
-            out = model(runtime_data)
-        node = out.get(_keys.NODE_FEATURES_KEY, None)
-        edge = out.get(_keys.EDGE_FEATURES_KEY, None)
-        self._dftbsk_prior_last = (cache_key, node, edge)
-        return node, edge
-
-    def _dftbsk_absolute_prior_like(
-        self,
-        like: torch.Tensor,
-        *,
-        data: Optional[AtomicDataDict.Type],
-        label: Optional[str],
-    ) -> Optional[torch.Tensor]:
-        if not self._should_try_dftbsk_prior():
-            return None
-        if not self.prior_skdata:
-            if self.prior in self._dftbsk_prior_names:
-                raise ValueError(
-                    "flow_options.prior='dftbsk' requires prior_skdata/dftb_skdata."
-                )
-            return None
-        try:
-            node, edge = self._dftbsk_prior_outputs(
-                data,
-                device=like.device,
-                dtype=like.dtype,
-            )
-            source = node if label == "node" else edge if label == "edge" else None
-            if source is None:
-                return None
-            return self._coerce_prior_source(
-                source,
-                like,
-                key=f"on_the_fly_dftbsk:{label}",
-                label=label,
-            )
-        except Exception as exc:
-            if self.prior in self._dftbsk_prior_names or self.dftb_prior_strict:
-                raise RuntimeError(
-                    "On-the-fly DFTB-SK prior failed. Check prior_skdata, basis, "
-                    "edge geometry, and target feature layout."
-                ) from exc
-            log.warning("On-the-fly DFTB-SK prior failed; falling back: %s", exc)
-            return None
-
     def _basis_onsite_energy(self, symbol: str, orbital: str) -> float:
-        db = onsite_energy_database.get(str(symbol), {})
-        orbital = str(orbital)
-        if orbital in db:
-            return float(db[orbital])
-
-        letters = re.findall(r"[A-Za-z]", orbital)
-        if not letters:
-            return self.basis_onsite_missing_value
-        angular = letters[-1].lower()
-        if "*" in orbital:
-            starred = f"{angular}*"
-            if starred in db:
-                return float(db[starred])
-
-        candidates = []
-        for key, value in db.items():
-            if "*" in key:
-                continue
-            match = re.fullmatch(r"(\d+)([A-Za-z])", str(key))
-            if match is not None and match.group(2).lower() == angular:
-                candidates.append((int(match.group(1)), float(value)))
-        if candidates:
-            return max(candidates, key=lambda item: item[0])[1]
-        return self.basis_onsite_missing_value
+        return prior_physical.basis_onsite_energy(
+            symbol, orbital, missing=self.basis_onsite_missing_value
+        )
 
     @staticmethod
     def _orbital_l(orbital: str) -> int:
-        letters = re.findall(r"[A-Za-z]", str(orbital))
-        if not letters:
-            return 0
-        return {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}.get(
-            letters[-1].lower(),
-            0,
-        )
+        return prior_physical.orbital_l(orbital)
 
     def _basis_onsite_table(self, like: torch.Tensor) -> Optional[torch.Tensor]:
         cache_key = (str(like.device), like.dtype, int(like.shape[-1]))
@@ -766,58 +531,16 @@ class HamiltonianCFM:
         if idp is None:
             self._basis_onsite_table_cache[cache_key] = None
             return None
-        basis = getattr(idp, "basis", None)
-        type_names = getattr(idp, "type_names", None)
-        chemical_symbol_to_type = getattr(idp, "chemical_symbol_to_type", None)
-        basis_to_full_basis = getattr(idp, "basis_to_full_basis", None)
-        orbpair_maps = getattr(idp, "orbpair_maps", None)
-        if callable(getattr(idp, "get_orbpair_maps", None)) and orbpair_maps is None:
-            orbpair_maps = idp.get_orbpair_maps()
-        if (
-            not isinstance(basis, dict)
-            or not isinstance(basis_to_full_basis, dict)
-            or not isinstance(orbpair_maps, dict)
-        ):
-            self._basis_onsite_table_cache[cache_key] = None
-            return None
-        if chemical_symbol_to_type is None:
-            if type_names is None:
-                self._basis_onsite_table_cache[cache_key] = None
-                return None
-            chemical_symbol_to_type = {str(symbol): idx for idx, symbol in enumerate(type_names)}
-
-        raw_dim = int(getattr(idp, "reduced_matrix_element", like.shape[-1]))
-        for slc in orbpair_maps.values():
-            raw_dim = max(raw_dim, int(getattr(slc, "stop", 0)))
-        num_types = 0
-        for type_idx in chemical_symbol_to_type.values():
-            num_types = max(num_types, int(type_idx) + 1)
-        table = torch.zeros(
-            num_types,
-            raw_dim,
+        table = prior_physical.basis_onsite_table(
+            idp,
             device=like.device,
             dtype=like.dtype,
+            scale=self.basis_onsite_scale,
+            missing=self.basis_onsite_missing_value,
         )
-        for symbol, type_idx in chemical_symbol_to_type.items():
-            orbitals = basis.get(symbol, ())
-            full_map = basis_to_full_basis.get(symbol, {})
-            if not isinstance(full_map, dict):
-                continue
-            for orbital in orbitals:
-                full_orbital = full_map.get(orbital)
-                if full_orbital is None:
-                    continue
-                block = orbpair_maps.get(f"{full_orbital}-{full_orbital}")
-                if block is None:
-                    continue
-                width = 2 * self._orbital_l(full_orbital) + 1
-                diag = torch.arange(width, device=like.device, dtype=torch.long)
-                diag = int(block.start) + diag * width + diag
-                diag = diag[diag < int(block.stop)]
-                if diag.numel() == 0:
-                    continue
-                energy = self._basis_onsite_energy(str(symbol), str(orbital))
-                table[int(type_idx), diag] = float(self.basis_onsite_scale) * energy
+        if table is None:
+            self._basis_onsite_table_cache[cache_key] = None
+            return None
 
         table, _raw_mask = project_uureal_to_like(self.idp, table, like)
         if table.ndim < 2 or table.shape[-1] != like.shape[-1]:
@@ -825,37 +548,6 @@ class HamiltonianCFM:
             return None
         self._basis_onsite_table_cache[cache_key] = table
         return table
-
-    def _basis_onsite_absolute_prior_like(
-        self,
-        like: torch.Tensor,
-        *,
-        data: Optional[AtomicDataDict.Type],
-        label: Optional[str],
-    ) -> Optional[torch.Tensor]:
-        if label == "edge":
-            prior = torch.full_like(like, float(self.basis_onsite_edge_value))
-            return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
-        if label != "node":
-            return torch.zeros_like(like)
-        if data is None or AtomicDataDict.ATOM_TYPE_KEY not in data:
-            return None
-        table = self._basis_onsite_table(like)
-        if table is None:
-            return None
-        atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].to(
-            device=like.device,
-            dtype=torch.long,
-        ).reshape(-1)
-        prior = torch.zeros_like(like)
-        take = min(int(atom_types.numel()), int(like.shape[0]))
-        if take > 0 and table.shape[0] > 0:
-            raw_types = atom_types[:take]
-            valid = (raw_types >= 0) & (raw_types < table.shape[0])
-            rows = torch.arange(take, device=like.device, dtype=torch.long)[valid]
-            if rows.numel() > 0:
-                prior[rows] = table.index_select(0, raw_types[valid])
-        return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
 
     def _basis_onsite_type_mean(self, like: torch.Tensor) -> Optional[torch.Tensor]:
         cache_key = (str(like.device), like.dtype, int(like.shape[-1]))
@@ -866,11 +558,9 @@ class HamiltonianCFM:
         if table is None:
             self._basis_onsite_type_mean_cache[cache_key] = None
             return None
-        active = table.abs() > 0
-        count = active.sum(dim=-1).clamp_min(1)
-        mean = (table * active.to(dtype=table.dtype)).sum(dim=-1) / count.to(dtype=table.dtype)
-        fallback = torch.full_like(mean, float(self.huckel_edge_energy_fallback))
-        mean = torch.where(active.any(dim=-1), mean, fallback)
+        mean = prior_physical.basis_onsite_type_mean(
+            table, fallback=self.huckel_edge_energy_fallback
+        )
         self._basis_onsite_type_mean_cache[cache_key] = mean
         return mean
 
@@ -918,84 +608,15 @@ class HamiltonianCFM:
             return fallback
 
         count = int(like.shape[0])
-        src = edge_index[0].reshape(-1)
-        dst = edge_index[1].reshape(-1)
-        if src.numel() < count:
-            pad = src.new_zeros(count - src.numel())
-            src = torch.cat([src, pad], dim=0)
-            dst = torch.cat([dst, pad], dim=0)
-        src = src[:count].clamp(min=0, max=max(int(atom_types.numel()) - 1, 0))
-        dst = dst[:count].clamp(min=0, max=max(int(atom_types.numel()) - 1, 0))
-        src_type = atom_types.index_select(0, src)
-        dst_type = atom_types.index_select(0, dst)
-        valid = (
-            (src_type >= 0)
-            & (src_type < type_mean.shape[0])
-            & (dst_type >= 0)
-            & (dst_type < type_mean.shape[0])
+        energy = prior_physical.huckel_edge_energy(
+            type_mean,
+            edge_index,
+            atom_types,
+            count,
+            fallback=float(self.huckel_edge_energy_fallback),
+            strict=self.huckel_strict_basis,
         )
-        energy = fallback
-        if valid.any():
-            rows = torch.arange(count, device=like.device, dtype=torch.long)[valid]
-            energy[rows] = 0.5 * (
-                type_mean.index_select(0, src_type[valid])
-                + type_mean.index_select(0, dst_type[valid])
-            )
         return energy.reshape((count,) + (1,) * (like.ndim - 1))
-
-    def _overlap_huckel_absolute_prior_like(
-        self,
-        like: torch.Tensor,
-        *,
-        data: Optional[AtomicDataDict.Type],
-        label: Optional[str],
-    ) -> Optional[torch.Tensor]:
-        if label == "node":
-            prior = self._basis_onsite_absolute_prior_like(like, data=data, label=label)
-            if prior is None and self.huckel_strict_basis:
-                raise ValueError(
-                    "flow_options.prior='overlap_huckel' requires an OrbitalMapper-like idp "
-                    "with basis_to_full_basis/orbpair_maps for node onsite initialization."
-                )
-            return prior
-        if label != "edge":
-            return torch.zeros_like(like)
-        if data is None:
-            if self.huckel_strict_overlap:
-                raise KeyError(
-                    f"flow_options.prior='overlap_huckel' requires `{self.huckel_edge_overlap_key}` "
-                    "in the batch."
-                )
-            return None
-        overlap_source = data.get(self.huckel_edge_overlap_key, None)
-        if overlap_source is None:
-            if self.huckel_strict_overlap:
-                raise KeyError(
-                    f"flow_options.prior='overlap_huckel' requires `{self.huckel_edge_overlap_key}` "
-                    "in the batch. Precompute ABACUS/get_s overlap or enable dataset get_overlap."
-                )
-            return None
-        overlap = self._coerce_prior_source(
-            overlap_source,
-            like,
-            key=self.huckel_edge_overlap_key,
-            label=label,
-        )
-        edge_energy = self._huckel_edge_energy_like(like, data=data)
-        prior = float(self.huckel_k) * overlap * edge_energy
-        if (
-            self.huckel_edge_length_decay > 0.0
-            and data is not None
-            and _keys.EDGE_LENGTH_KEY in data
-        ):
-            edge_lengths = data[_keys.EDGE_LENGTH_KEY].to(device=like.device, dtype=like.dtype)
-            edge_lengths = edge_lengths.reshape(-1)
-            if int(edge_lengths.shape[0]) == int(like.shape[0]):
-                view_shape = (edge_lengths.shape[0],) + (1,) * (like.ndim - 1)
-                prior = prior * torch.exp(
-                    -edge_lengths.reshape(view_shape) / self.huckel_edge_length_decay
-                )
-        return prior * self._prior_mask(data, like, label).to(dtype=like.dtype)
 
     def _absolute_to_flow_prior(
         self,
@@ -1011,30 +632,32 @@ class HamiltonianCFM:
             base = torch.zeros_like(like)
         return absolute_prior - base.to(device=like.device, dtype=like.dtype)
 
-    def _select_haar_candidate(
+    def _haar_candidate_axis(
         self,
         source: torch.Tensor,
         like: torch.Tensor,
         *,
         key: str,
         label: Optional[str],
-    ) -> torch.Tensor:
-        source = torch.as_tensor(source, device=like.device, dtype=like.dtype)
-        self.last_haar_candidate_index = -1
+    ) -> Optional[Tuple[int, int]]:
+        """Resolve ``(candidate_axis, candidate_count)`` for a Haar-DM source.
+
+        Returns ``None`` when ``source`` already matches ``like`` (no candidate
+        axis). Raises ValueError for any rank/shape that is neither the target
+        shape nor a single-candidate-axis expansion of it. Only shapes are read,
+        so ``source`` need not be on ``like``'s device/dtype.
+        """
         if source.shape == like.shape:
-            return source
+            return None
         if source.ndim != like.ndim + 1:
             raise ValueError(
                 f"Haar-DM {label or 'state'} prior `{key}` shape {tuple(source.shape)} "
                 f"must match target shape {tuple(like.shape)} or include one candidate axis."
             )
-
         if source.shape[0] == like.shape[0] and source.shape[-1] == like.shape[-1]:
-            candidate_count = int(source.shape[1])
-            candidate_axis = 1
+            candidate_axis, candidate_count = 1, int(source.shape[1])
         elif source.shape[1] == like.shape[0] and source.shape[-1] == like.shape[-1]:
-            candidate_count = int(source.shape[0])
-            candidate_axis = 0
+            candidate_axis, candidate_count = 0, int(source.shape[0])
         else:
             raise ValueError(
                 f"Haar-DM {label or 'state'} prior `{key}` shape {tuple(source.shape)} "
@@ -1042,7 +665,114 @@ class HamiltonianCFM:
             )
         if candidate_count <= 0:
             raise ValueError(f"Haar-DM prior `{key}` has zero candidates.")
+        return candidate_axis, candidate_count
+
+    def _haar_candidate_count(
+        self,
+        source: Optional[torch.Tensor],
+        like: Optional[torch.Tensor],
+        *,
+        key: str,
+        label: Optional[str],
+    ) -> Optional[int]:
+        """Candidate-axis size for ``source`` against ``like`` (``None`` if absent)."""
+        if source is None or like is None:
+            return None
+        if not torch.is_tensor(source):
+            source = torch.as_tensor(source)
+        axis_info = self._haar_candidate_axis(source, like, key=key, label=label)
+        return None if axis_info is None else axis_info[1]
+
+    def _resolve_haar_candidate_idx(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        *,
+        node_like: Optional[torch.Tensor],
+        edge_like: Optional[torch.Tensor],
+    ) -> Optional[int]:
+        """Draw one Haar-DM candidate index shared by the node and edge priors.
+
+        The precomputed node/edge candidates are per-candidate coherent -- index
+        ``i`` of ``haar_node_key`` and index ``i`` of ``haar_edge_key`` encode the
+        same Haar density matrix ``D_haar`` (so ``DSD=spin*D`` and ``Tr(DS)=nelec``
+        hold per candidate). Node and edge must therefore select the *same*
+        candidate; drawing independently in the node and edge calls would break
+        the density-matrix semantics whenever the candidate axis K>1. The index is
+        threaded explicitly to both ``_prior_like`` calls rather than stashed on an
+        instance attribute so concurrent node/edge preparation cannot desync.
+
+        Returns ``None`` when the active prior is not Haar-DM or when neither
+        source carries a candidate axis (2D sources are selected as-is
+        downstream). ``haar_candidate_index >= 0`` is honored as a fixed override.
+        """
+        if self.prior not in self._haar_dm_prior_names or data is None:
+            return None
+        node_count = self._haar_candidate_count(
+            data.get(self.haar_node_key, None),
+            node_like,
+            key=self.haar_node_key,
+            label="node",
+        )
+        edge_count = self._haar_candidate_count(
+            data.get(self.haar_edge_key, None),
+            edge_like,
+            key=self.haar_edge_key,
+            label="edge",
+        )
+        if (
+            node_count is not None
+            and edge_count is not None
+            and node_count != edge_count
+        ):
+            raise ValueError(
+                f"Haar-DM node prior `{self.haar_node_key}` has {node_count} candidates "
+                f"but edge prior `{self.haar_edge_key}` has {edge_count}; the node and "
+                "edge candidate axes must match so the same Haar density matrix is "
+                "selected for both."
+            )
+        count = node_count if node_count is not None else edge_count
+        if count is None:
+            return None
         if self.haar_candidate_index >= 0:
+            if self.haar_candidate_index >= count:
+                raise ValueError(
+                    f"flow_options.haar_candidate_index={self.haar_candidate_index} "
+                    f"is outside the Haar-DM candidate count {count}."
+                )
+            return int(self.haar_candidate_index)
+        device = (
+            node_like.device
+            if node_like is not None
+            else edge_like.device
+            if edge_like is not None
+            else torch.device("cpu")
+        )
+        return int(torch.randint(count, (), device=device).item())
+
+    def _select_haar_candidate(
+        self,
+        source: torch.Tensor,
+        like: torch.Tensor,
+        *,
+        key: str,
+        label: Optional[str],
+        candidate_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        source = torch.as_tensor(source, device=like.device, dtype=like.dtype)
+        self.last_haar_candidate_index = -1
+        axis_info = self._haar_candidate_axis(source, like, key=key, label=label)
+        if axis_info is None:
+            return source
+        candidate_axis, candidate_count = axis_info
+        if candidate_idx is not None:
+            # Batch-resolved shared index (see _resolve_haar_candidate_idx).
+            idx = int(candidate_idx)
+            if idx < 0 or idx >= candidate_count:
+                raise ValueError(
+                    f"Haar-DM {label or 'state'} prior `{key}` candidate index {idx} "
+                    f"is outside candidate count {candidate_count}."
+                )
+        elif self.haar_candidate_index >= 0:
             if self.haar_candidate_index >= candidate_count:
                 raise ValueError(
                     f"flow_options.haar_candidate_index={self.haar_candidate_index} "
@@ -1053,38 +783,6 @@ class HamiltonianCFM:
             idx = int(torch.randint(candidate_count, (), device=like.device).item())
         self.last_haar_candidate_index = idx
         return source[:, idx, ...] if candidate_axis == 1 else source[idx, ...]
-
-    def _haar_dm_absolute_prior_like(
-        self,
-        like: torch.Tensor,
-        *,
-        data: Optional[AtomicDataDict.Type],
-        label: Optional[str],
-    ) -> Optional[torch.Tensor]:
-        if label == "node":
-            key = self.haar_node_key
-        elif label == "edge":
-            key = self.haar_edge_key
-        else:
-            return torch.zeros_like(like)
-        source = None if data is None else data.get(key, None)
-        if source is None:
-            if self.haar_dm_strict:
-                raise KeyError(
-                    f"flow_options.prior='haar_dm' requires precomputed `{key}` "
-                    f"for the {label} prior. Precompute RME(D_haar) offline or "
-                    "change the experiment label; no nonphysical random-matrix fallback is used."
-                )
-            return None
-        prior = self._select_haar_candidate(source, like, key=key, label=label)
-        if prior.shape != like.shape:
-            raise ValueError(
-                f"Haar-DM {label} prior `{key}` selected shape {tuple(prior.shape)} "
-                f"does not match target shape {tuple(like.shape)}."
-            )
-        if not torch.isfinite(prior).all():
-            raise ValueError(f"Haar-DM {label} prior `{key}` contains non-finite values.")
-        return prior
 
     def _physical_prior_jitter_like(
         self,
@@ -1126,66 +824,33 @@ class HamiltonianCFM:
         label: Optional[str],
         base: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        absolute_prior = None
-        if self.prior in self._overlap_huckel_prior_names:
-            absolute_prior = self._overlap_huckel_absolute_prior_like(
-                residual,
-                data=data,
-                label=label,
-            )
-
-        if absolute_prior is None and self.prior in self._external_prior_names:
-            absolute_prior = self._external_absolute_prior_like(residual, data=data, label=label)
-
-        if absolute_prior is None:
-            absolute_prior = self._dftbsk_absolute_prior_like(
-                residual,
-                data=data,
-                label=label,
-            )
-
-        allow_basis_fallback = (
-            self.prior in self._basis_prior_names
-            or (
-                self.prior not in {"external", *self._overlap_huckel_prior_names, *self._dftbsk_prior_names}
-                and self.physical_prior_fallback == "basis_onsite"
-            )
+        # basis_onsite / overlap_huckel / external / dftbsk all resolve through a
+        # family instance; only the cross-family fallback chain and the
+        # fail-closed errors stay here.
+        ctx = self._prior_ctx
+        absolute_prior = self.prior_family.absolute_prior_like(
+            residual, data=data, label=label, ctx=ctx
         )
-        if absolute_prior is None and allow_basis_fallback:
-            absolute_prior = self._basis_onsite_absolute_prior_like(
-                residual,
-                data=data,
-                label=label,
+
+        # The external family may additionally try an on-the-fly DFTB-SK guess.
+        if absolute_prior is None and self.prior in self._external_prior_names:
+            absolute_prior = self._families[DFTBSKFamily].absolute_prior_like(
+                residual, data=data, label=label, ctx=ctx
+            )
+
+        # Silent basis_onsite fallback is now reserved for prior='physical'
+        # (governed by physical_prior_fallback); dftb/xtb/sk/nnsk fail closed.
+        if (
+            absolute_prior is None
+            and self.prior == "physical"
+            and self.physical_prior_fallback == "basis_onsite"
+        ):
+            absolute_prior = self._families[BasisOnsiteFamily].absolute_prior_like(
+                residual, data=data, label=label, ctx=ctx
             )
 
         if absolute_prior is None:
-            if self.prior in self._basis_prior_names:
-                raise ValueError(
-                    "flow_options.prior='basis_onsite' requires an OrbitalMapper-like idp "
-                    "with basis_to_full_basis/orbpair_maps and node atom_types."
-                )
-            if self.prior in self._dftbsk_prior_names:
-                raise ValueError(
-                    "flow_options.prior='dftbsk' requires a successful on-the-fly "
-                    "DFTB-SK initialization; set prior_skdata/dftb_skdata to a "
-                    "Slater-Koster directory or formatted .pth."
-                )
-            if self.prior in self._overlap_huckel_prior_names:
-                raise ValueError(
-                    "flow_options.prior='overlap_huckel' requires basis onsite levels "
-                    "and edge overlap features; set huckel_edge_overlap_key or precompute overlap."
-                )
-            if (
-                self.physical_prior_fallback == "zero"
-                or (self.prior == "external" and not self.external_prior_strict)
-            ):
-                absolute_prior = torch.zeros_like(residual)
-            else:
-                keys = ", ".join(self._external_prior_candidate_keys(label)[:8])
-                raise KeyError(
-                    f"flow_options.prior={self.prior!r} did not find an external "
-                    f"{label or 'state'} prior. Tried keys: {keys}."
-                )
+            absolute_prior = self._physical_prior_absent(residual, data=data, label=label)
 
         prior = self._absolute_to_flow_prior(absolute_prior, residual, base=base)
         return prior + self._physical_prior_jitter_like(
@@ -1193,6 +858,40 @@ class HamiltonianCFM:
             sigma,
             data=data,
             label=label,
+        )
+
+    def _physical_prior_absent(
+        self,
+        residual: torch.Tensor,
+        *,
+        data: Optional[AtomicDataDict.Type],
+        label: Optional[str],
+    ) -> torch.Tensor:
+        """No family produced an absolute prior: fail closed or degrade to zeros."""
+        if self.prior in self._basis_prior_names:
+            raise ValueError(
+                "flow_options.prior='basis_onsite' requires an OrbitalMapper-like idp "
+                "with basis_to_full_basis/orbpair_maps and node atom_types."
+            )
+        if self.prior in self._dftbsk_prior_names:
+            raise ValueError(
+                "flow_options.prior='dftbsk' requires a successful on-the-fly "
+                "DFTB-SK initialization; set prior_skdata/dftb_skdata to a "
+                "Slater-Koster directory or formatted .pth."
+            )
+        if self.prior in self._overlap_huckel_prior_names:
+            raise ValueError(
+                "flow_options.prior='overlap_huckel' requires basis onsite levels "
+                "and edge overlap features; set huckel_edge_overlap_key or precompute overlap."
+            )
+        # External family (external/dftb/xtb/physical/sk/nnsk/dftb_xtb).
+        external = self._families[ExternalFamily]
+        if self.physical_prior_fallback == "zero" or not external.external_prior_strict:
+            return torch.zeros_like(residual)
+        keys = ", ".join(external.candidate_keys(label)[:8])
+        raise KeyError(
+            f"flow_options.prior={self.prior!r} did not find an external "
+            f"{label or 'state'} prior. Tried keys: {keys}."
         )
 
     def _prior_mask(
@@ -1571,6 +1270,7 @@ class HamiltonianCFM:
         base: Optional[torch.Tensor] = None,
         reference_scale: bool = True,
         num_graphs: Optional[int] = None,
+        candidate_idx: Optional[int] = None,
     ) -> torch.Tensor:
         if self.prior == "zero":
             return torch.zeros_like(residual)
@@ -1586,20 +1286,17 @@ class HamiltonianCFM:
                 num_graphs=num_graphs,
             )
         if self.prior in self._haar_dm_prior_names:
-            absolute_prior = self._haar_dm_absolute_prior_like(
+            absolute_prior = self.prior_family.absolute_prior_like(
                 residual,
                 data=data,
                 label=label,
+                ctx=self._prior_ctx,
+                candidate_idx=candidate_idx,
             )
             if absolute_prior is None:
                 return torch.zeros_like(residual)
             return self._absolute_to_flow_prior(absolute_prior, residual, base=base)
-        if (
-            self.prior in self._basis_prior_names
-            or self.prior in self._external_prior_names
-            or self.prior in self._overlap_huckel_prior_names
-            or self.prior in self._dftbsk_prior_names
-        ):
+        if self.prior_family is not None:
             return self._physical_prior_like(
                 residual,
                 sigma,
@@ -1650,6 +1347,10 @@ class HamiltonianCFM:
 
         node_base = edge_base = node_current = edge_current = None
         node_prior = edge_prior = None
+        # One shared Haar-DM candidate for node+edge; None for every other prior.
+        haar_candidate_idx = self._resolve_haar_candidate_idx(
+            data, node_like=node_target, edge_like=edge_target
+        )
 
         if node_target is not None:
             node_target = node_target.to(device=device, dtype=dtype)
@@ -1662,6 +1363,7 @@ class HamiltonianCFM:
                 label="node",
                 base=node_base,
                 num_graphs=num_graphs,
+                candidate_idx=haar_candidate_idx,
             )
             node_t_view = node_t.reshape((-1,) + (1,) * (node_target.ndim - 1))
             node_current = node_base + (1.0 - node_t_view) * node_prior + node_t_view * node_res
@@ -1682,6 +1384,7 @@ class HamiltonianCFM:
                 label="edge",
                 base=edge_base,
                 num_graphs=num_graphs,
+                candidate_idx=haar_candidate_idx,
             )
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_target.ndim - 1))
             edge_current = edge_base + (1.0 - edge_t_view) * edge_prior + edge_t_view * edge_res
@@ -1922,6 +1625,10 @@ class HamiltonianCFM:
             raise KeyError("Flow sampling requires node and/or edge Hamiltonian start features.")
 
         if self.prior != "zero":
+            # One shared Haar-DM candidate for node+edge; None for every other prior.
+            haar_candidate_idx = self._resolve_haar_candidate_idx(
+                state, node_like=node_current, edge_like=edge_current
+            )
             if node_current is not None:
                 node_current = node_current + self._prior_like(
                     node_current,
@@ -1930,6 +1637,7 @@ class HamiltonianCFM:
                     label="node",
                     base=node_current,
                     reference_scale=False,
+                    candidate_idx=haar_candidate_idx,
                 )
             if edge_current is not None:
                 edge_current = edge_current + self._prior_like(
@@ -1939,6 +1647,7 @@ class HamiltonianCFM:
                     label="edge",
                     base=edge_current,
                     reference_scale=False,
+                    candidate_idx=haar_candidate_idx,
                 )
 
         like = node_current if node_current is not None else edge_current
@@ -2275,6 +1984,10 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
 
         node_base = edge_base = node_clean = edge_clean = None
         node_state = edge_state = node_prior = edge_prior = None
+        # One shared Haar-DM candidate for node+edge; None for every other prior.
+        haar_candidate_idx = self._resolve_haar_candidate_idx(
+            data, node_like=node_target, edge_like=edge_target
+        )
         if node_target is not None:
             node_target = node_target.to(device=device, dtype=dtype)
             node_base = self._base_like(data, node_target, self.node_h0_key, "node")
@@ -2285,6 +1998,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 data=data,
                 label="node",
                 base=node_base,
+                candidate_idx=haar_candidate_idx,
             )
             node_t_view = node_t.reshape((-1,) + (1,) * (node_clean.ndim - 1))
             node_state = (1.0 - node_t_view) * node_clean + node_t_view * node_prior
@@ -2304,6 +2018,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
                 data=data,
                 label="edge",
                 base=edge_base,
+                candidate_idx=haar_candidate_idx,
             )
             edge_t_view = edge_t.reshape((-1,) + (1,) * (edge_clean.ndim - 1))
             edge_state = (1.0 - edge_t_view) * edge_clean + edge_t_view * edge_prior
@@ -3116,6 +2831,10 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         edge_base = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_base is None and edge_base is None:
             raise KeyError("Pixel MeanFlow sampling requires node and/or edge Hamiltonian start features.")
+        # One shared Haar-DM candidate for node+edge; None for every other prior.
+        haar_candidate_idx = self._resolve_haar_candidate_idx(
+            state, node_like=node_base, edge_like=edge_base
+        )
         node_z = None if node_base is None else self._prior_like(
             torch.zeros_like(node_base),
             self.node_sigma,
@@ -3123,6 +2842,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             label="node",
             base=node_base,
             reference_scale=False,
+            candidate_idx=haar_candidate_idx,
         )
         edge_z = None if edge_base is None else self._prior_like(
             torch.zeros_like(edge_base),
@@ -3131,6 +2851,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             label="edge",
             base=edge_base,
             reference_scale=False,
+            candidate_idx=haar_candidate_idx,
         )
         like = node_z if node_z is not None else edge_z
         num_graphs = self._num_graphs(state)
