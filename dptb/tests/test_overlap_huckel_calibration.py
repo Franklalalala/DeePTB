@@ -64,6 +64,15 @@ def _flow(idp, device, dtype, **extra):
     return HamiltonianCFM(opts, idp=idp, device=device, dtype=dtype)
 
 
+def _slice_constant_scale(idp, *, device, dtype):
+    scale = torch.ones(int(idp.reduced_matrix_element), device=device, dtype=dtype)
+    for idx, slc in enumerate(
+        sorted(idp.orbpair_maps.values(), key=lambda value: int(value.start))
+    ):
+        scale[int(slc.start):int(slc.stop)] = 0.5 + 0.25 * idx
+    return scale
+
+
 def _write_artifact(tmp_path, idp, *, edge_scale=None, node_table=None, fingerprint=None):
     rme = int(idp.reduced_matrix_element)
     signature = prior_calibration.make_signature(idp, rme_dim=rme)
@@ -169,10 +178,7 @@ def test_edge_channel_scale_multiplies_hopping_prior():
     dtype = torch.float64
     idp, data, ref = _case(device, dtype)
     data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
-    scale = torch.linspace(
-        0.5, 1.5, steps=ref[_keys.EDGE_FEATURES_KEY].shape[-1],
-        device=device, dtype=dtype,
-    )
+    scale = _slice_constant_scale(idp, device=device, dtype=dtype)
     base = _flow(idp, device, dtype)
     scaled = _flow(idp, device, dtype, huckel_edge_channel_scale=scale.cpu().tolist())
 
@@ -182,6 +188,34 @@ def test_edge_channel_scale_multiplies_hopping_prior():
     torch.testing.assert_close(ctx_scaled.edge_prior, ctx_base.edge_prior * scale.reshape(1, -1))
     assert ctx_scaled.edge_prior.dtype == dtype
     assert ctx_scaled.edge_prior.device == ref[_keys.EDGE_FEATURES_KEY].device
+
+
+def test_edge_channel_scale_rejects_non_slice_constant_vector():
+    device = torch.device("cpu")
+    dtype = torch.float64
+    idp, data, ref = _case(device, dtype)
+    data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
+    scale = _slice_constant_scale(idp, device=device, dtype=dtype)
+    block = next(
+        slc for slc in idp.orbpair_maps.values() if int(slc.stop) - int(slc.start) > 1
+    )
+    scale[int(block.start)] = 0.5
+    scale[int(block.start) + 1] = 0.75
+    flow = _flow(idp, device, dtype, huckel_edge_channel_scale=scale.cpu().tolist())
+
+    with pytest.raises(ValueError, match="slice-constant|orbpair"):
+        flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+
+
+def test_edge_channel_scale_rejects_nested_values_even_if_width_matches():
+    device = torch.device("cpu")
+    dtype = torch.float64
+    idp, data, ref = _case(device, dtype)
+    data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
+    nested = [[1.0] * int(idp.reduced_matrix_element)]
+
+    with pytest.raises(ValueError, match="1-D|one-dimensional"):
+        _flow(idp, device, dtype, huckel_edge_channel_scale=nested)
 
 
 def test_edge_channel_scale_width_mismatch_raises():
@@ -348,6 +382,8 @@ def test_argcheck_accepts_new_keys_and_defaults_are_inert():
             "huckel_energy_mode": "orbital_pair",
             "huckel_scale_mode": "pair_block",
             "huckel_scale_global": 0.5,
+            "huckel_edge_channel_scale": "1.0",
+            "overlap_huckel_edge_channel_scale": [1.0],
             "prior_calibration": "/tmp/calib.pt",
             "basis_onsite_mode": "calibrated",
             "prior_node": "basis_onsite",
@@ -356,6 +392,8 @@ def test_argcheck_accepts_new_keys_and_defaults_are_inert():
     )
     schema.check_value(value, strict=True)
     assert value["huckel_energy_mode"] == "orbital_pair"
+    assert value["huckel_edge_channel_scale"] == "1.0"
+    assert value["overlap_huckel_edge_channel_scale"] == [1.0]
     assert value["prior_edge"] == "external"
 
     defaults = schema.normalize_value({"enabled": False})

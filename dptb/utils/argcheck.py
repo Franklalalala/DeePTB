@@ -227,6 +227,15 @@ def flow_options():
                  doc="'none' | 'global' (multiply huckel_scale_global) | 'pair_block' "
                      "(per bond-type x orbpair-slice signed scales from prior_calibration)."),
         Argument("huckel_scale_global", (int, float), optional=True, default=1.0),
+        Argument("huckel_edge_channel_scale", (str, list, int, float, type(None)),
+                 optional=True, default=None,
+                 doc="Manual scalar or per-edge-channel overlap-Hueckel scale. "
+                     "Non-scalar vectors must be constant within each orbpair slice; "
+                     "prefer huckel_scale_mode='pair_block' with prior_calibration for "
+                     "fingerprinted train-fit calibration."),
+        Argument("overlap_huckel_edge_channel_scale", (str, list, int, float, type(None)),
+                 optional=True, default=None,
+                 doc="Alias for huckel_edge_channel_scale."),
         Argument("prior_calibration", str, optional=True, default="",
                  doc="Path to a calibration artifact from tools/calibrate_huckel_scales.py "
                      "(edge_scale + node_table). Verified fail-closed against the idp basis."),

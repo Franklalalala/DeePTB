@@ -186,6 +186,7 @@ class OverlapHuckelFamily(PriorFamily):
         edge_energy_fallback: float,
         edge_length_decay: float,
         basis: BasisOnsiteFamily,
+        idp: Any = None,
         energy_mode: str = "type_mean",
         scale_mode: str = "none",
         scale_global: float = 1.0,
@@ -203,6 +204,7 @@ class OverlapHuckelFamily(PriorFamily):
         self.huckel_scale_global = scale_global
         self.huckel_edge_channel_scale = channel_scale
         self._basis = basis
+        self._idp = idp
 
     @classmethod
     def from_options(cls, options: Dict[str, Any], idp: Any) -> "OverlapHuckelFamily":
@@ -236,6 +238,7 @@ class OverlapHuckelFamily(PriorFamily):
             ),
             edge_length_decay=float(options.get("huckel_edge_length_decay", 0.0)),
             basis=BasisOnsiteFamily.from_options(options, idp),
+            idp=idp,
             energy_mode=energy_mode,
             scale_mode=scale_mode,
             scale_global=float(options.get("huckel_scale_global", 1.0)),
@@ -259,11 +262,85 @@ class OverlapHuckelFamily(PriorFamily):
                 raise ValueError("flow_options.huckel_edge_channel_scale must not be empty.")
             return [float(part) for part in parts]
         if torch.is_tensor(value):
+            if value.ndim > 1:
+                raise ValueError(
+                    "flow_options.huckel_edge_channel_scale must be a 1-D sequence or scalar."
+                )
             flat = value.detach().cpu().reshape(-1).tolist()
-            if not flat:
-                raise ValueError("flow_options.huckel_edge_channel_scale must not be empty.")
-            return flat
-        return value
+        else:
+            try:
+                raw = torch.as_tensor(value)
+            except Exception as exc:
+                raise ValueError(
+                    "flow_options.huckel_edge_channel_scale must be numeric."
+                ) from exc
+            if raw.ndim > 1:
+                raise ValueError(
+                    "flow_options.huckel_edge_channel_scale must be a 1-D sequence or scalar."
+                )
+            flat = raw.reshape(-1).tolist()
+        if not flat:
+            raise ValueError("flow_options.huckel_edge_channel_scale must not be empty.")
+        return [float(item) for item in flat]
+
+    def _channel_scale_block_slices(self, width: int) -> Optional[Tuple[Tuple[int, int], ...]]:
+        idp = self._idp
+        if idp is None:
+            return None
+        orbpair_maps = getattr(idp, "orbpair_maps", None)
+        if orbpair_maps is None and callable(getattr(idp, "get_orbpair_maps", None)):
+            try:
+                orbpair_maps = idp.get_orbpair_maps()
+            except Exception:
+                return None
+        if not isinstance(orbpair_maps, dict):
+            return None
+        raw_slices = []
+        for slc in orbpair_maps.values():
+            start = int(getattr(slc, "start", 0))
+            stop = int(getattr(slc, "stop", 0))
+            if stop > start:
+                raw_slices.append((start, stop))
+        if not raw_slices:
+            return None
+        raw_slices.sort()
+        raw_width = max(stop for _start, stop in raw_slices)
+        if int(width) == raw_width:
+            return tuple(raw_slices)
+
+        raw_mask = getattr(idp, "mask_uureal", None)
+        if raw_mask is None:
+            return None
+        raw_mask = torch.as_tensor(raw_mask, device="cpu", dtype=torch.bool).reshape(-1)
+        if int(raw_mask.numel()) != raw_width or int(raw_mask.sum().item()) != int(width):
+            return None
+        projected = []
+        offset = 0
+        for start, stop in raw_slices:
+            kept = int(raw_mask[start:stop].sum().item())
+            if kept > 0:
+                projected.append((offset, offset + kept))
+                offset += kept
+        if offset != int(width):
+            return None
+        return tuple(projected)
+
+    def _validate_channel_scale_blocks(self, scale: torch.Tensor) -> None:
+        block_slices = self._channel_scale_block_slices(int(scale.numel()))
+        if block_slices is None:
+            raise ValueError(
+                "flow_options.huckel_edge_channel_scale vectors require an "
+                "OrbitalMapper with orbpair_maps so slice-constant scaling can be verified."
+            )
+        for start, stop in block_slices:
+            if stop - start <= 1:
+                continue
+            block = scale[start:stop]
+            if not torch.allclose(block, block[0].expand_as(block), rtol=1.0e-6, atol=1.0e-8):
+                raise ValueError(
+                    "flow_options.huckel_edge_channel_scale must be slice-constant "
+                    "within each orbpair block to preserve rotational equivariance."
+                )
 
     def _channel_scale_like(self, like: torch.Tensor) -> Optional[torch.Tensor]:
         values = self.huckel_edge_channel_scale
@@ -280,6 +357,7 @@ class OverlapHuckelFamily(PriorFamily):
                 f"value per edge feature channel ({int(like.shape[-1])}), got "
                 f"{int(scale.numel())}."
             )
+        self._validate_channel_scale_blocks(scale)
         return scale.reshape((1,) * (like.ndim - 1) + (int(scale.numel()),))
 
     def _edge_types(self, data, like, *, purpose: str) -> Optional[torch.Tensor]:
