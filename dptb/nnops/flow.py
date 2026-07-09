@@ -843,7 +843,10 @@ class HamiltonianCFM:
             )
         # External family (external/dftb/xtb/physical/sk/nnsk/dftb_xtb).
         external = self._families[ExternalFamily]
-        if self.physical_prior_fallback == "zero" or not external.external_prior_strict:
+        if (
+            (self.prior == "physical" and self.physical_prior_fallback == "zero")
+            or not external.external_prior_strict
+        ):
             return torch.zeros_like(residual)
         keys = ", ".join(external.candidate_keys(label)[:8])
         raise KeyError(
@@ -1554,10 +1557,13 @@ class HamiltonianCFM:
         feature_key: str,
         label: str,
     ) -> Optional[torch.Tensor]:
+        if self.mode == "full":
+            template = data.get(h0_key, None)
+            if template is None:
+                template = data.get(feature_key, None)
+            return None if template is None else torch.zeros_like(template)
+
         base = data.get(h0_key, None)
-        if base is None and self.mode == "full":
-            feature = data.get(feature_key, None)
-            return None if feature is None else torch.zeros_like(feature)
         if base is None:
             if self.strict_h0:
                 raise KeyError(f"Flow sampling requires `{h0_key}` for the {label} start state.")

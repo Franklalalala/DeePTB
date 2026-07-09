@@ -788,6 +788,48 @@ def test_te_prior_sampling_interface_keeps_existing_keys():
     assert torch.allclose(sampled[flow.flow_time_key], torch.ones(2, device=device, dtype=dtype))
 
 
+def test_full_mode_external_sampling_uses_absolute_prior_once():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, _ref = _make_batch(device=device, dtype=dtype)
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "full",
+            "prior": "external",
+            "prior_node_key": _keys.NODE_H0_KEY,
+            "prior_edge_key": _keys.EDGE_H0_KEY,
+        },
+        idp=_FakeIDP(device=device),
+        device=device,
+        dtype=dtype,
+    )
+
+    class _EchoCurrentH0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first_node_h0 = None
+            self.first_edge_h0 = None
+
+        def forward(self, batch):
+            if self.first_node_h0 is None:
+                self.first_node_h0 = batch[_keys.NODE_H0_KEY].detach().clone()
+                self.first_edge_h0 = batch[_keys.EDGE_H0_KEY].detach().clone()
+            out = batch.copy()
+            out[_keys.NODE_FEATURES_KEY] = batch[_keys.NODE_H0_KEY]
+            out[_keys.EDGE_FEATURES_KEY] = batch[_keys.EDGE_H0_KEY]
+            return out
+
+    model = _EchoCurrentH0()
+
+    sampled = flow.sample(model, data, num_steps=1)
+
+    torch.testing.assert_close(model.first_node_h0, data[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(model.first_edge_h0, data[_keys.EDGE_H0_KEY])
+    torch.testing.assert_close(sampled[_keys.NODE_FEATURES_KEY], data[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(sampled[_keys.EDGE_FEATURES_KEY], data[_keys.EDGE_H0_KEY])
+
+
 def test_validation_t0_call_with_te_prior_keeps_prepare_batch_signature():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -1264,6 +1306,16 @@ def test_dftb_prior_fails_closed_without_matching_keys_or_skdata():
     torch.testing.assert_close(
         out[_keys.EDGE_H0_KEY], torch.zeros_like(out[_keys.EDGE_H0_KEY])
     )
+
+
+def test_named_external_prior_alias_ignores_physical_zero_fallback():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    flow = _flow("dftb", device=device, dtype=dtype, physical_prior_fallback="zero")
+
+    with pytest.raises(KeyError, match="flow_options.prior='dftb'"):
+        flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
 
 
 def test_dftbsk_prior_uses_on_the_fly_absolute_initial_guess():
