@@ -159,6 +159,76 @@ def basis_onsite_type_mean(table: torch.Tensor, fallback: float = 0.0) -> torch.
     return torch.where(active.any(dim=-1), mean, fallback_t)
 
 
+def huckel_pair_energy_table(
+    idp: Any,
+    *,
+    device: Any,
+    dtype: torch.dtype,
+    missing: float = 0.0,
+) -> Optional[torch.Tensor]:
+    """Per-bond-type, per-orbital-pair Wolfsberg-Helmholz endpoint energy table.
+
+    Returns ``[num_bond_types, raw_dim]`` where the columns of orbpair block
+    ``fo1-fo2`` of bond type ``"Src-Dst"`` hold ``0.5*(eps_Src(fo1)+eps_Dst(fo2))``
+    -- the orbital-resolved analogue of :func:`huckel_edge_energy`'s per-type
+    mean (classic extended-Hueckel uses the orbital energies; the per-type mean
+    collapses every radial/angular channel of an edge onto one scalar).  Blocks
+    whose orbitals are absent from the respective species' basis stay 0 (those
+    columns are masked by ``mask_to_erme`` downstream).  Layout-agnostic raw
+    orbpair convention, like :func:`basis_onsite_table`; callers project to
+    compressed/SOC layouts.  Returns ``None`` when ``idp`` lacks the required
+    attributes.
+    """
+    basis = getattr(idp, "basis", None)
+    bond_to_type = getattr(idp, "bond_to_type", None)
+    basis_to_full_basis = getattr(idp, "basis_to_full_basis", None)
+    orbpair_maps = getattr(idp, "orbpair_maps", None)
+    if callable(getattr(idp, "get_orbpair_maps", None)) and orbpair_maps is None:
+        orbpair_maps = idp.get_orbpair_maps()
+    if (
+        not isinstance(basis, dict)
+        or not isinstance(bond_to_type, dict)
+        or not isinstance(basis_to_full_basis, dict)
+        or not isinstance(orbpair_maps, dict)
+    ):
+        return None
+
+    raw_dim = int(getattr(idp, "reduced_matrix_element", 0))
+    for slc in orbpair_maps.values():
+        raw_dim = max(raw_dim, int(getattr(slc, "stop", 0)))
+    num_bond = 0
+    for btype in bond_to_type.values():
+        num_bond = max(num_bond, int(btype) + 1)
+    if num_bond == 0 or raw_dim == 0:
+        return None
+    table = torch.zeros(num_bond, raw_dim, device=device, dtype=dtype)
+    full2orb = {
+        sym: {fo: orb for orb, fo in (basis_to_full_basis.get(sym) or {}).items()}
+        for sym in basis
+    }
+    for bond, btype in bond_to_type.items():
+        parts = str(bond).split("-")
+        if len(parts) != 2:
+            continue
+        sym_i, sym_j = parts
+        fi = full2orb.get(sym_i, {})
+        fj = full2orb.get(sym_j, {})
+        for name, slc in orbpair_maps.items():
+            pair = str(name).split("-")
+            if len(pair) != 2:
+                continue
+            orb_i = fi.get(pair[0])
+            orb_j = fj.get(pair[1])
+            if orb_i is None or orb_j is None:
+                continue
+            energy = 0.5 * (
+                basis_onsite_energy(sym_i, orb_i, missing=missing)
+                + basis_onsite_energy(sym_j, orb_j, missing=missing)
+            )
+            table[int(btype), int(slc.start):int(slc.stop)] = energy
+    return table
+
+
 def huckel_edge_energy(
     type_mean: torch.Tensor,
     edge_index: torch.Tensor,

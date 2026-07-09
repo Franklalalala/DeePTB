@@ -18,6 +18,7 @@ import torch
 from dptb.data import AtomicDataDict, _keys
 from dptb.nnops import prior_physical
 from dptb.nnops.flow_context import CFMContext, PixelMFContext, _to_torch_dtype
+from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
     BasisOnsiteFamily,
     DFTBSKFamily,
@@ -25,6 +26,7 @@ from dptb.nnops.flow_priors import (
     HaarDMFamily,
     OverlapHuckelFamily,
     PriorContext,
+    SplitPriorFamily,
     build_prior_families,
     BASIS_ONSITE_NAMES,
     DFTBSK_NAMES,
@@ -140,7 +142,40 @@ class HamiltonianCFM:
             if self.prior in _cls.NAMES:
                 self.prior_family = self._families[_cls]
                 break
+
+        # Optional per-label split: prior_node/prior_edge compose two absolute
+        # families (e.g. the hybrid oracle basis_onsite + external-H0 hoppings).
+        self.prior_node = str(options.get("prior_node", "") or "").lower().replace("-", "_")
+        self.prior_edge = str(options.get("prior_edge", "") or "").lower().replace("-", "_")
+        if bool(self.prior_node) != bool(self.prior_edge):
+            raise ValueError(
+                "flow_options.prior_node and prior_edge must be set together "
+                "(one family per label); got "
+                f"prior_node={self.prior_node!r}, prior_edge={self.prior_edge!r}."
+            )
+        if self.prior_node and self.prior_edge:
+            if self.prior_family is None or self.prior in self._haar_dm_prior_names:
+                raise ValueError(
+                    "flow_options.prior_node/prior_edge require flow_options.prior to "
+                    "be one of the physical absolute families (e.g. 'external' or "
+                    "'overlap_huckel') so the split prior rides the physical prior "
+                    f"path; got prior={self.prior!r}."
+                )
+            self.prior_family = SplitPriorFamily(
+                node_family=SplitPriorFamily.resolve_side(self.prior_node, self._families),
+                edge_family=SplitPriorFamily.resolve_side(self.prior_edge, self._families),
+                node_name=self.prior_node,
+                edge_name=self.prior_edge,
+            )
         self._prior_ctx = PriorContext(self)
+        self.prior_calibration_path = str(options.get("prior_calibration", "") or "")
+        self._prior_calibration_artifact: Optional[Dict[str, Any]] = None
+        self._prior_calibration_cache: Dict[
+            Tuple[str, str, torch.dtype, int], Optional[torch.Tensor]
+        ] = {}
+        self._huckel_pair_energy_table_cache: Dict[
+            Tuple[str, torch.dtype, int], Optional[torch.Tensor]
+        ] = {}
 
         # physical_prior_fallback is cross-cutting (it governs which family the
         # 'physical' prior degrades to), so it stays on the trainer.
@@ -520,6 +555,63 @@ class HamiltonianCFM:
         )
         self._basis_onsite_type_mean_cache[cache_key] = mean
         return mean
+
+    def _huckel_pair_energy_table(self, like: torch.Tensor) -> Optional[torch.Tensor]:
+        """[num_bond_types, like_width] per-orbital-pair WH energies (cached)."""
+        cache_key = (str(like.device), like.dtype, int(like.shape[-1]))
+        if cache_key in self._huckel_pair_energy_table_cache:
+            return self._huckel_pair_energy_table_cache[cache_key]
+        table = None
+        if self.idp is not None:
+            table = prior_physical.huckel_pair_energy_table(
+                self.idp,
+                device=like.device,
+                dtype=like.dtype,
+                missing=self.basis_onsite_missing_value,
+            )
+            if table is not None:
+                table, _raw_mask = project_uureal_to_like(self.idp, table, like)
+                if table.ndim < 2 or table.shape[-1] != like.shape[-1]:
+                    table = None
+        self._huckel_pair_energy_table_cache[cache_key] = table
+        return table
+
+    def _calibration_table(self, like: torch.Tensor, name: str) -> Optional[torch.Tensor]:
+        """A named table from the prior_calibration artifact, on like's device/dtype.
+
+        Loads the artifact lazily (fail-closed: version/basis mismatch raises in
+        :mod:`dptb.nnops.prior_calibration`), then projects the stored layout to
+        ``like``'s width -- equal widths pass through; a wider raw/SOC layout is
+        compressed via ``project_uureal_to_like``; anything else raises.
+        """
+        cache_key = (name, str(like.device), like.dtype, int(like.shape[-1]))
+        if cache_key in self._prior_calibration_cache:
+            return self._prior_calibration_cache[cache_key]
+        table: Optional[torch.Tensor] = None
+        if self.prior_calibration_path:
+            if self._prior_calibration_artifact is None:
+                self._prior_calibration_artifact = prior_calibration.load_calibration(
+                    self.prior_calibration_path, idp=self.idp, strict=True
+                )
+            raw = self._prior_calibration_artifact.get(name)
+            if raw is not None:
+                table = raw.to(device=like.device, dtype=like.dtype)
+                if table.ndim != 2:
+                    raise ValueError(
+                        f"prior_calibration `{name}` must be 2-D [num_types, rme_dim]; "
+                        f"got shape {tuple(table.shape)}."
+                    )
+                if table.shape[-1] != like.shape[-1]:
+                    projected, _raw_mask = project_uureal_to_like(self.idp, table, like)
+                    if projected.ndim < 2 or projected.shape[-1] != like.shape[-1]:
+                        raise ValueError(
+                            f"prior_calibration `{name}` width {int(table.shape[-1])} does "
+                            f"not match the feature width {int(like.shape[-1])} and cannot "
+                            "be projected; regenerate the calibration in this layout."
+                        )
+                    table = projected
+        self._prior_calibration_cache[cache_key] = table
+        return table
 
     def _huckel_edge_energy_like(
         self,

@@ -218,6 +218,27 @@ def flow_options():
         Argument("huckel_strict_basis", bool, optional=True, default=True),
         Argument("huckel_edge_energy_fallback", (int, float), optional=True, default=0.0),
         Argument("huckel_edge_length_decay", (int, float), optional=True, default=0.0),
+        # Hueckel v2: orbital-pair endpoint energies and offline scale calibration.
+        Argument("huckel_energy_mode", str, optional=True, default="type_mean",
+                 doc="'type_mean' (legacy: one scalar per edge) or 'orbital_pair' "
+                     "(Wolfsberg-Helmholz 0.5*(eps_mu+eps_nu) per orbpair slice, "
+                     "indexed by edge_type)."),
+        Argument("huckel_scale_mode", str, optional=True, default="none",
+                 doc="'none' | 'global' (multiply huckel_scale_global) | 'pair_block' "
+                     "(per bond-type x orbpair-slice signed scales from prior_calibration)."),
+        Argument("huckel_scale_global", (int, float), optional=True, default=1.0),
+        Argument("prior_calibration", str, optional=True, default="",
+                 doc="Path to a calibration artifact from tools/calibrate_huckel_scales.py "
+                     "(edge_scale + node_table). Verified fail-closed against the idp basis."),
+        Argument("basis_onsite_mode", str, optional=True, default="table",
+                 doc="'table' (free-atom onsite DB diagonal) or 'calibrated' "
+                     "(per-type onsite rows from prior_calibration's node_table)."),
+        Argument("prior_node", str, optional=True, default="",
+                 doc="Split prior: family for the node/onsite prior (basis_onsite / "
+                     "overlap_huckel / external / dftbsk). Must be set together with prior_edge."),
+        Argument("prior_edge", str, optional=True, default="",
+                 doc="Split prior: family for the edge/hopping prior (e.g. 'external' with "
+                     "prior_edge_key=edge_h0 for the hybrid H0-hopping oracle)."),
         Argument("haar_node_key", str, optional=True, default="haar_node_features"),
         Argument("haar_edge_key", str, optional=True, default="haar_edge_features"),
         Argument("haar_candidate_index", int, optional=True, default=-1),
@@ -1579,6 +1600,11 @@ def slem_h0():
         Argument("h0_fallback_to_hamiltonian", bool, optional=True, default=True, doc=doc_fallback_to_hamiltonian),
         Argument("fallback_node_key", str, optional=True, default="node_features", doc=doc_fallback_node_key),
         Argument("fallback_edge_key", str, optional=True, default="edge_features", doc=doc_fallback_edge_key),
+        Argument("allow_target_fallback_in_training", bool, optional=True, default=False,
+                 doc="Permit the H0 input fallback to resolve to the target Hamiltonian/"
+                     "features while the module is in training mode. Off by default: "
+                     "that fallback is a label leak during training (it is a deliberate "
+                     "surrogate only at inference)."),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),

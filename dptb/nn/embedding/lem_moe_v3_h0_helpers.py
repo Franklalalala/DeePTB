@@ -76,6 +76,26 @@ def _get_feature_source(
     device: Union[str, torch.device],
     label: str,
 ) -> Optional[torch.Tensor]:
+    tensor, _key = _get_feature_source_with_key(
+        data,
+        candidate_keys,
+        expected_dim=expected_dim,
+        dtype=dtype,
+        device=device,
+        label=label,
+    )
+    return tensor
+
+
+def _get_feature_source_with_key(
+    data: AtomicDataDict.Type,
+    candidate_keys: Sequence[str],
+    expected_dim: int,
+    dtype: Union[str, torch.dtype],
+    device: Union[str, torch.device],
+    label: str,
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Like :func:`_get_feature_source`, but also reports which key resolved."""
     for key in candidate_keys:
         tensor = _prepare_source_tensor(
             data.get(key, None),
@@ -86,8 +106,8 @@ def _get_feature_source(
             label=label,
         )
         if tensor is not None:
-            return tensor
-    return None
+            return tensor, key
+    return None, None
 
 
 class H0InitLayer(torch.nn.Module):
@@ -100,6 +120,7 @@ class H0InitLayer(torch.nn.Module):
         fallback_to_hamiltonian: bool = True,
         fallback_node_key: str = _keys.NODE_FEATURES_KEY,
         fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
+        allow_target_fallback_in_training: bool = False,
         merge_mode: str = "replace",
         self_edge_tol: float = 1e-8,
         dtype: Union[str, torch.dtype] = torch.float32,
@@ -122,6 +143,7 @@ class H0InitLayer(torch.nn.Module):
         self.fallback_to_hamiltonian = fallback_to_hamiltonian
         self.fallback_node_key = fallback_node_key
         self.fallback_edge_key = fallback_edge_key
+        self.allow_target_fallback_in_training = allow_target_fallback_in_training
         self.merge_mode = merge_mode
         self.self_edge_tol = self_edge_tol
         self.dtype = dtype
@@ -236,13 +258,38 @@ class H0InitLayer(torch.nn.Module):
         )
         return node_features, self_mask.any()
 
+    def _guard_target_fallback(self, resolved_key: Optional[str], primary_key: str, label: str) -> None:
+        """Refuse to train on the target Hamiltonian dressed up as an H0 input.
+
+        The candidate chain falls back to ``node_features``/``edge_features`` /
+        the ``*_hamiltonian`` blocks when the H0 keys are absent.  At inference
+        that is a deliberate surrogate; during training it silently feeds the
+        label to the model.  Fail closed unless explicitly opted in.
+        """
+        if (
+            resolved_key is None
+            or resolved_key == primary_key
+            or not self.training
+            or self.allow_target_fallback_in_training
+        ):
+            return
+        raise RuntimeError(
+            f"H0InitLayer resolved `{resolved_key}` as the {label} input because "
+            f"`{primary_key}` is missing from the batch. Feeding the target "
+            "Hamiltonian/features as a model input during training is a label "
+            "leak. Provide the H0 keys (or point h0_node_key/h0_edge_key at, "
+            "e.g., node_overlap/edge_overlap for an overlap-feature run), or set "
+            "embedding option allow_target_fallback_in_training=true to opt in "
+            "explicitly."
+        )
+
     def _fallback_node_features(
         self,
         data: AtomicDataDict.Type,
         atom_type: torch.Tensor,
         base_node_features: torch.Tensor,
     ) -> torch.Tensor:
-        node_source = _get_feature_source(
+        node_source, node_source_key = _get_feature_source_with_key(
             data=data,
             candidate_keys=self._candidate_keys(
                 self.h0_node_key,
@@ -254,6 +301,7 @@ class H0InitLayer(torch.nn.Module):
             device=self.device,
             label="node H0",
         )
+        self._guard_target_fallback(node_source_key, self.h0_node_key, "node H0")
         if node_source is None:
             log.warning(
                 "No usable node H0 source found; falling back to the original node init."
@@ -286,7 +334,7 @@ class H0InitLayer(torch.nn.Module):
             cutoff_coeffs,
         )
 
-        edge_source = _get_feature_source(
+        edge_source, edge_source_key = _get_feature_source_with_key(
             data=data,
             candidate_keys=self._candidate_keys(
                 self.h0_edge_key,
@@ -298,6 +346,7 @@ class H0InitLayer(torch.nn.Module):
             device=self.device,
             label="edge H0",
         )
+        self._guard_target_fallback(edge_source_key, self.h0_edge_key, "edge H0")
         if edge_source is None:
             log.warning(
                 "No usable edge H0 source found; falling back to the original InitLayer output."

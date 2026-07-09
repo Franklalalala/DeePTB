@@ -65,6 +65,15 @@ class PriorContext:
     def huckel_edge_energy_like(self, like, *, data):
         return self._owner._huckel_edge_energy_like(like, data=data)
 
+    def huckel_pair_energy_table(self, like):
+        return self._owner._huckel_pair_energy_table(like)
+
+    def calibration_edge_scale(self, like):
+        return self._owner._calibration_table(like, "edge_scale")
+
+    def calibration_node_table(self, like):
+        return self._owner._calibration_table(like, "node_table")
+
     def select_haar_candidate(self, source, like, *, key, label, candidate_idx=None):
         return self._owner._select_haar_candidate(
             source, like, key=key, label=label, candidate_idx=candidate_idx
@@ -97,17 +106,32 @@ class PriorFamily:
 class BasisOnsiteFamily(PriorFamily):
     NAMES = BASIS_ONSITE_NAMES
 
-    def __init__(self, *, scale: float, missing_value: float, edge_value: float) -> None:
+    def __init__(
+        self,
+        *,
+        scale: float,
+        missing_value: float,
+        edge_value: float,
+        mode: str = "table",
+    ) -> None:
         self.basis_onsite_scale = scale
         self.basis_onsite_missing_value = missing_value
         self.basis_onsite_edge_value = edge_value
+        self.basis_onsite_mode = mode
 
     @classmethod
     def from_options(cls, options: Dict[str, Any], idp: Any) -> "BasisOnsiteFamily":
+        mode = str(options.get("basis_onsite_mode", "table")).lower().replace("-", "_")
+        if mode not in {"table", "calibrated"}:
+            raise ValueError(
+                "flow_options.basis_onsite_mode must be 'table' (free-atom onsite DB) "
+                "or 'calibrated' (per-type onsite rows from a prior_calibration artifact)."
+            )
         return cls(
             scale=float(options.get("basis_onsite_scale", 1.0)),
             missing_value=float(options.get("basis_onsite_missing_value", 0.0)),
             edge_value=float(options.get("basis_onsite_edge_value", 0.0)),
+            mode=mode,
         )
 
     def absolute_prior_like(self, like, *, data, label, ctx):
@@ -118,7 +142,16 @@ class BasisOnsiteFamily(PriorFamily):
             return torch.zeros_like(like)
         if data is None or AtomicDataDict.ATOM_TYPE_KEY not in data:
             return None
-        table = ctx.basis_onsite_table(like)
+        if self.basis_onsite_mode == "calibrated":
+            table = ctx.calibration_node_table(like)
+            if table is None:
+                raise ValueError(
+                    "flow_options.basis_onsite_mode='calibrated' requires "
+                    "flow_options.prior_calibration pointing to an artifact with a "
+                    "`node_table` (tools/calibrate_huckel_scales.py)."
+                )
+        else:
+            table = ctx.basis_onsite_table(like)
         if table is None:
             return None
         atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].to(
@@ -139,6 +172,9 @@ class BasisOnsiteFamily(PriorFamily):
 class OverlapHuckelFamily(PriorFamily):
     NAMES = OVERLAP_HUCKEL_NAMES
 
+    ENERGY_MODES = frozenset({"type_mean", "orbital_pair"})
+    SCALE_MODES = frozenset({"none", "global", "pair_block"})
+
     def __init__(
         self,
         *,
@@ -150,6 +186,10 @@ class OverlapHuckelFamily(PriorFamily):
         edge_energy_fallback: float,
         edge_length_decay: float,
         basis: BasisOnsiteFamily,
+        energy_mode: str = "type_mean",
+        scale_mode: str = "none",
+        scale_global: float = 1.0,
+        channel_scale: Optional[Any] = None,
     ) -> None:
         self.huckel_k = huckel_k
         self.huckel_node_overlap_key = node_overlap_key
@@ -158,11 +198,29 @@ class OverlapHuckelFamily(PriorFamily):
         self.huckel_strict_basis = strict_basis
         self.huckel_edge_energy_fallback = edge_energy_fallback
         self.huckel_edge_length_decay = edge_length_decay
+        self.huckel_energy_mode = energy_mode
+        self.huckel_scale_mode = scale_mode
+        self.huckel_scale_global = scale_global
+        self.huckel_edge_channel_scale = channel_scale
         self._basis = basis
 
     @classmethod
     def from_options(cls, options: Dict[str, Any], idp: Any) -> "OverlapHuckelFamily":
         edge_value = float(options.get("basis_onsite_edge_value", 0.0))
+        energy_mode = str(options.get("huckel_energy_mode", "type_mean")).lower().replace("-", "_")
+        if energy_mode not in cls.ENERGY_MODES:
+            raise ValueError(
+                "flow_options.huckel_energy_mode must be 'type_mean' (legacy: one "
+                "scalar per edge) or 'orbital_pair' (Wolfsberg-Helmholz "
+                "0.5*(eps_mu+eps_nu) per orbpair slice)."
+            )
+        scale_mode = str(options.get("huckel_scale_mode", "none")).lower().replace("-", "_")
+        if scale_mode not in cls.SCALE_MODES:
+            raise ValueError(
+                "flow_options.huckel_scale_mode must be 'none', 'global' "
+                "(huckel_scale_global scalar), or 'pair_block' (per bond-type x "
+                "orbpair-slice table from flow_options.prior_calibration)."
+            )
         return cls(
             huckel_k=float(options.get("huckel_k", options.get("overlap_huckel_k", 1.75))),
             node_overlap_key=str(
@@ -178,7 +236,71 @@ class OverlapHuckelFamily(PriorFamily):
             ),
             edge_length_decay=float(options.get("huckel_edge_length_decay", 0.0)),
             basis=BasisOnsiteFamily.from_options(options, idp),
+            energy_mode=energy_mode,
+            scale_mode=scale_mode,
+            scale_global=float(options.get("huckel_scale_global", 1.0)),
+            channel_scale=cls._parse_channel_scale(
+                options.get(
+                    "huckel_edge_channel_scale",
+                    options.get("overlap_huckel_edge_channel_scale", None),
+                )
+            ),
         )
+
+    @staticmethod
+    def _parse_channel_scale(value: Optional[Any]) -> Optional[Any]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if not value.strip():
+                return None
+            parts = [part.strip() for part in value.split(",") if part.strip()]
+            if not parts:
+                raise ValueError("flow_options.huckel_edge_channel_scale must not be empty.")
+            return [float(part) for part in parts]
+        if torch.is_tensor(value):
+            flat = value.detach().cpu().reshape(-1).tolist()
+            if not flat:
+                raise ValueError("flow_options.huckel_edge_channel_scale must not be empty.")
+            return flat
+        return value
+
+    def _channel_scale_like(self, like: torch.Tensor) -> Optional[torch.Tensor]:
+        values = self.huckel_edge_channel_scale
+        if values is None:
+            return None
+        scale = torch.as_tensor(values, device=like.device, dtype=like.dtype).reshape(-1)
+        if int(scale.numel()) == 0:
+            raise ValueError("flow_options.huckel_edge_channel_scale must not be empty.")
+        if int(scale.numel()) == 1:
+            return scale.reshape(())
+        if like.ndim < 1 or int(scale.numel()) != int(like.shape[-1]):
+            raise ValueError(
+                "flow_options.huckel_edge_channel_scale must be a scalar or have one "
+                f"value per edge feature channel ({int(like.shape[-1])}), got "
+                f"{int(scale.numel())}."
+            )
+        return scale.reshape((1,) * (like.ndim - 1) + (int(scale.numel()),))
+
+    def _edge_types(self, data, like, *, purpose: str) -> Optional[torch.Tensor]:
+        edge_types = None if data is None else data.get(AtomicDataDict.EDGE_TYPE_KEY, None)
+        if edge_types is None:
+            if self.huckel_strict_basis:
+                raise KeyError(
+                    f"flow_options.prior='overlap_huckel' with {purpose} requires "
+                    "`edge_type` in the batch to index per-bond-type tables."
+                )
+            return None
+        edge_types = edge_types.to(device=like.device, dtype=torch.long).reshape(-1)
+        if int(edge_types.numel()) != int(like.shape[0]):
+            if self.huckel_strict_basis:
+                raise ValueError(
+                    f"flow_options.prior='overlap_huckel' with {purpose}: edge_type has "
+                    f"{int(edge_types.numel())} rows but the edge overlap tensor has "
+                    f"{int(like.shape[0])} rows."
+                )
+            return None
+        return edge_types
 
     def absolute_prior_like(self, like, *, data, label, ctx):
         if label == "node":
@@ -212,8 +334,42 @@ class OverlapHuckelFamily(PriorFamily):
             key=self.huckel_edge_overlap_key,
             label=label,
         )
-        edge_energy = ctx.huckel_edge_energy_like(like, data=data)
-        prior = float(self.huckel_k) * overlap * edge_energy
+        energy = None
+        if self.huckel_energy_mode == "orbital_pair":
+            pair_table = ctx.huckel_pair_energy_table(like)
+            edge_types = self._edge_types(data, like, purpose="huckel_energy_mode='orbital_pair'")
+            if pair_table is None:
+                if self.huckel_strict_basis:
+                    raise ValueError(
+                        "flow_options.huckel_energy_mode='orbital_pair' requires an "
+                        "OrbitalMapper-like idp with bond_to_type/basis_to_full_basis/"
+                        "orbpair_maps to build the per-orbital-pair energy table."
+                    )
+            elif edge_types is not None:
+                energy = pair_table.index_select(0, edge_types)
+        if energy is None:
+            energy = ctx.huckel_edge_energy_like(like, data=data)
+        prior = float(self.huckel_k) * overlap * energy
+        if self.huckel_scale_mode == "global":
+            prior = prior * float(self.huckel_scale_global)
+        elif self.huckel_scale_mode == "pair_block":
+            scale_table = ctx.calibration_edge_scale(like)
+            if scale_table is None:
+                raise ValueError(
+                    "flow_options.huckel_scale_mode='pair_block' requires "
+                    "flow_options.prior_calibration pointing to an artifact with an "
+                    "`edge_scale` table (tools/calibrate_huckel_scales.py)."
+                )
+            edge_types = self._edge_types(data, like, purpose="huckel_scale_mode='pair_block'")
+            if edge_types is None:
+                raise KeyError(
+                    "flow_options.huckel_scale_mode='pair_block' requires `edge_type` "
+                    "rows aligned with the edge overlap tensor."
+                )
+            prior = prior * scale_table.index_select(0, edge_types)
+        channel_scale = self._channel_scale_like(prior)
+        if channel_scale is not None:
+            prior = prior * channel_scale
         if (
             self.huckel_edge_length_decay > 0.0
             and data is not None
@@ -541,6 +697,59 @@ class DFTBSKFamily(PriorFamily):
                 ) from exc
             log.warning("On-the-fly DFTB-SK prior failed; falling back: %s", exc)
             return None
+
+
+class SplitPriorFamily(PriorFamily):
+    """Compose one family for the node (onsite) prior and another for the edge
+    (hopping) prior -- e.g. the hybrid oracle ``prior_node='basis_onsite'`` +
+    ``prior_edge='external'`` (real H0 hoppings), or an overlap-only stack with
+    different node/edge mechanisms.
+
+    Only absolute physical families are composable (basis_onsite /
+    overlap_huckel / external / dftbsk).  Haar-DM is excluded: its node and edge
+    candidates must share one coherent draw, which a per-label split would break.
+    Fail-closed: a side whose family produces no prior raises instead of
+    degrading to zeros.
+    """
+
+    SPLIT_ALLOWED = (BasisOnsiteFamily, OverlapHuckelFamily, ExternalFamily, DFTBSKFamily)
+
+    def __init__(self, *, node_family: PriorFamily, edge_family: PriorFamily,
+                 node_name: str, edge_name: str) -> None:
+        self.node_family = node_family
+        self.edge_family = edge_family
+        self.node_name = node_name
+        self.edge_name = edge_name
+
+    @classmethod
+    def resolve_side(cls, name: str, families: Dict[type, PriorFamily]) -> PriorFamily:
+        name = str(name).lower().replace("-", "_")
+        for fam_cls in cls.SPLIT_ALLOWED:
+            if name in fam_cls.NAMES:
+                return families[fam_cls]
+        allowed = sorted(set().union(*(f.NAMES for f in cls.SPLIT_ALLOWED)))
+        raise ValueError(
+            f"flow_options.prior_node/prior_edge={name!r} is not a splittable "
+            f"physical prior family; use one of {allowed}. 'haar_dm' and the "
+            "noise priors (te/gaussian/zero) cannot be split per label."
+        )
+
+    def absolute_prior_like(self, like, *, data, label, ctx):
+        if label == "node":
+            family, name = self.node_family, self.node_name
+        elif label == "edge":
+            family, name = self.edge_family, self.edge_name
+        else:
+            return torch.zeros_like(like)
+        prior = family.absolute_prior_like(like, data=data, label=label, ctx=ctx)
+        if prior is None:
+            raise KeyError(
+                f"Split prior: the {label} family {name!r} produced no absolute "
+                f"prior (missing fields or idp support). The split prior is "
+                "fail-closed; provide the required dataset fields or choose a "
+                "different prior_node/prior_edge."
+            )
+        return prior
 
 
 # prior-name -> family class.  Instantiated once per HamiltonianCFM.
