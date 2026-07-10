@@ -17,6 +17,7 @@ from dptb.nnops.self_consistency import (
     SelfConsistencyScheduler,
     SelfConsistencySchedulerConfig,
     compute_self_consistency_loss,
+    compute_self_consistency_payload_loss,
 )
 
 
@@ -57,6 +58,29 @@ def test_loss_coerces_numpy_repair_to_pred_device_dtype():
     assert h_pred.grad is not None
 
 
+def test_payload_loss_averages_configured_feature_tensors():
+    h_pred = {
+        "node_features": torch.tensor([1.0, 3.0], requires_grad=True),
+        "edge_features": torch.tensor([2.0], requires_grad=True),
+        "metadata": "kept out of loss",
+    }
+    h_repaired = {
+        "node_features": torch.tensor([2.0, 1.0]),
+        "edge_features": torch.tensor([4.0]),
+    }
+
+    loss = compute_self_consistency_payload_loss(
+        h_pred,
+        h_repaired,
+        tensor_keys=("node_features", "edge_features"),
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(((1.0 + 4.0) / 2.0 + 4.0) / 2.0)
+    assert h_pred["node_features"].grad is not None
+    assert h_pred["edge_features"].grad is not None
+
+
 def test_loss_mask_broadcasts_with_per_element_denominator():
     """A per-sample mask (leading dims) must broadcast against per-element
     diffs, and the denominator must count active ELEMENTS after broadcast so
@@ -78,6 +102,33 @@ def _fake_repair_fn_success(sample_id, h_pred_snapshot):
 
 def _fake_repair_fn_refuses(sample_id, h_pred_snapshot):
     return None  # e.g. gap-threshold guard refused
+
+
+def test_scheduler_round_trips_mapping_payloads():
+    def repair_payload(_sample_id, snapshot):
+        return {
+            "node_features": snapshot["node_features"] + 1.0,
+            "edge_features": snapshot["edge_features"] + 2.0,
+        }
+
+    cfg = SelfConsistencySchedulerConfig(every_n_steps=1, sample_frac=1.0, staleness_steps=1, warmup_epochs=0)
+    sched = SelfConsistencyScheduler(repair_fn=repair_payload, config=cfg)
+    try:
+        sample = {
+            "node_features": torch.tensor([1.0, 2.0]),
+            "edge_features": torch.tensor([3.0]),
+            "meta": "not a tensor",
+        }
+        assert sched.maybe_submit(step=0, epoch=0, samples=[("batch", sample)])
+        pairs = sched.maybe_consume(step=1, current_samples={"batch": sample}, timeout=1.0)
+    finally:
+        sched.shutdown()
+
+    assert len(pairs) == 1
+    current, repaired = pairs[0]
+    assert current is sample
+    assert torch.allclose(repaired["node_features"], torch.tensor([2.0, 3.0]))
+    assert torch.allclose(repaired["edge_features"], torch.tensor([5.0]))
 
 
 def test_submit_consume_cadence_and_staleness():
@@ -193,11 +244,10 @@ def test_retry_unfinished_false_restores_drop_behavior():
         sched.shutdown()
 
 
-def test_trainer_fails_fast_on_unwired_self_consistency():
-    """train_options.self_consistency is in the schema but not wired into the
-    Trainer loss assembly; enabling it must raise instead of silently training
-    without L_sc. The check runs before any model/optimizer construction, so
-    placeholder arguments never get touched."""
+def test_trainer_requires_explicit_self_consistency_repair_fn_for_now():
+    """Until ABACUS block serialization is wired into Trainer, enabling the
+    hook from JSON-only config must still fail fast instead of pretending to
+    run a real SCF repair path."""
     from dptb.nnops.trainer import Trainer
 
     with pytest.raises(NotImplementedError, match="self_consistency"):
@@ -207,3 +257,123 @@ def test_trainer_fails_fast_on_unwired_self_consistency():
             model=None,
             train_datasets=None,
         )
+
+
+def test_self_consistency_argcheck_accepts_payload_hook_options():
+    from dptb.utils.argcheck import self_consistency_options
+
+    arg = self_consistency_options()
+    normalized = arg.normalize_value(
+        {
+            "enabled": True,
+            "sample_mode": "payload",
+            "tensor_keys": ["node_features", "edge_features"],
+            "consume_timeout": 0.25,
+            "max_workers": 1,
+            "retry_unfinished": False,
+        }
+    )
+    arg.check_value(normalized, strict=True)
+
+    assert normalized["sample_mode"] == "payload"
+    assert normalized["tensor_keys"] == ["node_features", "edge_features"]
+    assert normalized["consume_timeout"] == pytest.approx(0.25)
+    assert normalized["max_workers"] == 1
+    assert normalized["retry_unfinished"] is False
+
+
+class _FakeSelfConsistencyScheduler:
+    def __init__(self):
+        self.submitted = None
+
+    def maybe_consume(self, step, current_samples, timeout=0.0):
+        node = current_samples["node_features"]
+        return [(node, node.detach() + 1.0)]
+
+    def maybe_submit(self, step, epoch, samples):
+        self.submitted = (step, epoch, [(key, value.detach().clone()) for key, value in samples])
+        return True
+
+
+class _FakePayloadSelfConsistencyScheduler:
+    def __init__(self):
+        self.submitted = None
+
+    def maybe_consume(self, step, current_samples, timeout=0.0):
+        payload = current_samples["batch"]
+        repaired = {
+            "node_features": payload["node_features"].detach() + 1.0,
+            "edge_features": payload["edge_features"].detach() + 2.0,
+        }
+        return [(payload, repaired)]
+
+    def maybe_submit(self, step, epoch, samples):
+        self.submitted = (step, epoch, samples)
+        return True
+
+
+def test_trainer_self_consistency_hook_adds_weighted_consumed_loss_and_resubmits():
+    from dptb.nnops.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.self_consistency_enabled = True
+    trainer.self_consistency_weight = 0.25
+    trainer.self_consistency_tensor_keys = ("node_features", "edge_features")
+    trainer.self_consistency_consume_timeout = 0.0
+    trainer.self_consistency_scheduler = _FakeSelfConsistencyScheduler()
+    trainer.iter = 11
+    trainer.ep = 3
+    trainer._last_self_consistency_state = {}
+
+    base_loss = torch.tensor(2.0, requires_grad=True)
+    pred = {
+        "node_features": torch.tensor([[1.0, 2.0]], requires_grad=True),
+        "edge_features": torch.tensor([[3.0]], requires_grad=True),
+    }
+
+    got = trainer._apply_self_consistency_loss(base_loss, pred)
+    got.backward()
+
+    assert got.item() == pytest.approx(2.25)
+    assert pred["node_features"].grad is not None
+    assert trainer._last_self_consistency_state["train_self_consistency_loss"].item() == pytest.approx(1.0)
+    assert trainer._last_self_consistency_state["train_self_consistency_weighted_loss"].item() == pytest.approx(0.25)
+    assert trainer._last_self_consistency_state["train_self_consistency_pairs"].item() == pytest.approx(1.0)
+    assert trainer._last_self_consistency_state["train_self_consistency_submitted"].item() == pytest.approx(1.0)
+    step, epoch, submitted = trainer.self_consistency_scheduler.submitted
+    assert (step, epoch) == (11, 3)
+    assert [key for key, _value in submitted] == ["node_features", "edge_features"]
+
+
+def test_trainer_self_consistency_hook_can_submit_whole_feature_payloads():
+    from dptb.nnops.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.self_consistency_enabled = True
+    trainer.self_consistency_weight = 0.5
+    trainer.self_consistency_tensor_keys = ("node_features", "edge_features")
+    trainer.self_consistency_sample_mode = "payload"
+    trainer.self_consistency_consume_timeout = 0.0
+    trainer.self_consistency_scheduler = _FakePayloadSelfConsistencyScheduler()
+    trainer.iter = 12
+    trainer.ep = 4
+    trainer._last_self_consistency_state = {}
+
+    base_loss = torch.tensor(2.0, requires_grad=True)
+    pred = {
+        "node_features": torch.tensor([1.0, 3.0], requires_grad=True),
+        "edge_features": torch.tensor([2.0], requires_grad=True),
+        "atomic_numbers": torch.tensor([6]),
+    }
+
+    got = trainer._apply_self_consistency_loss(base_loss, pred)
+    got.backward()
+
+    assert got.item() == pytest.approx(3.25)
+    assert pred["node_features"].grad is not None
+    assert pred["edge_features"].grad is not None
+    assert trainer._last_self_consistency_state["train_self_consistency_loss"].item() == pytest.approx(2.5)
+    step, epoch, submitted = trainer.self_consistency_scheduler.submitted
+    assert (step, epoch) == (12, 4)
+    assert submitted[0][0] == "batch"
+    assert submitted[0][1] is pred

@@ -29,11 +29,12 @@ to the total loss.
 from __future__ import annotations
 
 import logging
+import copy
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -71,12 +72,59 @@ def compute_self_consistency_loss(
     return sq.mean()
 
 
+def compute_self_consistency_payload_loss(
+    h_pred: Any,
+    h_repaired: Any,
+    *,
+    tensor_keys: Optional[Tuple[str, ...]] = None,
+) -> torch.Tensor:
+    """Apply :func:`compute_self_consistency_loss` to one tensor or to a
+    mapping payload such as a post-forward ``AtomicDataDict``.
+
+    Mapping mode is the training hook needed for real hrebuild repairs: the
+    repair endpoint sees the whole structure, then returns repaired
+    ``node_features``/``edge_features`` together. The scalar is the mean of
+    the configured per-feature losses; non-tensor metadata is ignored.
+    """
+    if torch.is_tensor(h_pred) or not isinstance(h_pred, Mapping):
+        return compute_self_consistency_loss(h_pred, h_repaired)
+    if not isinstance(h_repaired, Mapping):
+        raise ValueError("mapping prediction requires mapping repaired target")
+
+    if tensor_keys is None:
+        keys = tuple(
+            key for key in h_pred.keys()
+            if key in h_repaired and torch.is_tensor(h_pred[key])
+        )
+    else:
+        keys = tuple(tensor_keys)
+
+    losses = []
+    for key in keys:
+        if key not in h_pred or key not in h_repaired:
+            continue
+        if not torch.is_tensor(h_pred[key]):
+            continue
+        losses.append(compute_self_consistency_loss(h_pred[key], h_repaired[key]))
+    if not losses:
+        raise ValueError("no tensor payload entries available for self-consistency loss")
+    return torch.stack(losses).mean()
+
+
+def _detach_clone_sample(sample: Any) -> Any:
+    if torch.is_tensor(sample):
+        return sample.detach().clone()
+    if isinstance(sample, Mapping):
+        return {key: _detach_clone_sample(value) for key, value in sample.items()}
+    return copy.deepcopy(sample)
+
+
 @dataclass
 class _PendingRequest:
     submitted_step: int
     sample_id: Any
     future: Future
-    h_pred_snapshot: torch.Tensor  # detached copy, kept for the loss target-shape check at consume time
+    h_pred_snapshot: Any  # detached copy, kept for diagnostics and repair payload isolation
 
 
 @dataclass
@@ -139,7 +187,7 @@ class SelfConsistencyScheduler:
         pending = []
         for idx in indices:
             sample_id, h_pred = samples[idx]
-            snapshot = h_pred.detach().clone()
+            snapshot = _detach_clone_sample(h_pred)
             future = self._pool.submit(self.repair_fn, sample_id, snapshot)
             pending.append(_PendingRequest(submitted_step=step, sample_id=sample_id, future=future, h_pred_snapshot=snapshot))
 

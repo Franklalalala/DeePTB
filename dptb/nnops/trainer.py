@@ -19,6 +19,11 @@ from dptb.nn import build_model
 from dptb.nn.activation_recompute import configure_activation_recompute
 from dptb.nnops.flow import build_hamiltonian_flow
 from dptb.nnops.loss import Loss
+from dptb.nnops.self_consistency import (
+    SelfConsistencyScheduler,
+    SelfConsistencySchedulerConfig,
+    compute_self_consistency_payload_loss,
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,18 +40,7 @@ class Trainer(BaseTrainer):
             reference_datasets: Union[AtomicDataset, None] = None,
             validation_datasets: Union[AtomicDataset, None] = None,
     ) -> None:
-        # train_options.self_consistency is exposed in the schema (argcheck ::
-        # self_consistency_options) but the SelfConsistencyScheduler is not
-        # wired into Trainer/MultiTrainer loss assembly yet (WS4-C pending).
-        # Fail fast -- before building the model/optimizer -- instead of
-        # silently training without the requested L_sc term.
-        self.self_consistency_options = dict(train_options.get("self_consistency", {}) or {})
-        if bool(self.self_consistency_options.get("enabled", False)):
-            raise NotImplementedError(
-                "train_options.self_consistency.enabled=true, but the self-consistency loss is not "
-                "wired into the Trainer yet -- it would silently train without L_sc. Leave it "
-                "disabled until the submit/consume hook (dptb/nnops/self_consistency.py) lands."
-            )
+        self._configure_self_consistency(train_options.get("self_consistency", {}) or {})
 
         super(Trainer, self).__init__(dtype=common_options["dtype"], device=common_options["device"])
 
@@ -138,6 +132,7 @@ class Trainer(BaseTrainer):
         )
         self._last_flow_state = {}
         self._last_flow_validation_state = {}
+        self._last_self_consistency_state = {}
 
         if train_options["loss_options"]["train"]["method"] == "skints":
             assert self.model.name == 'nnsk', "The model should be nnsk for the skints loss function."
@@ -209,6 +204,99 @@ class Trainer(BaseTrainer):
                 state[key] = getattr(batch, attr)
         return state
 
+    def _configure_self_consistency(self, options):
+        self.self_consistency_options = dict(options or {})
+        self.self_consistency_enabled = bool(self.self_consistency_options.get("enabled", False))
+        self.self_consistency_scheduler = None
+        self.self_consistency_weight = float(self.self_consistency_options.get("weight", 0.1))
+        self.self_consistency_tensor_keys = tuple(
+            self.self_consistency_options.get("tensor_keys", ("node_features", "edge_features"))
+        )
+        self.self_consistency_sample_mode = str(
+            self.self_consistency_options.get("sample_mode", "feature_tensors")
+        )
+        self.self_consistency_consume_timeout = float(
+            self.self_consistency_options.get("consume_timeout", 0.0)
+        )
+        self._last_self_consistency_state = {}
+        if not self.self_consistency_enabled:
+            return
+
+        repair_fn = self.self_consistency_options.get("repair_fn")
+        if not callable(repair_fn):
+            raise NotImplementedError(
+                "train_options.self_consistency.enabled=true requires an explicit repair_fn "
+                "until the ABACUS hrebuild block serializer is wired into Trainer. This avoids "
+                "silently training without a real self-consistency target."
+            )
+        config = SelfConsistencySchedulerConfig(
+            every_n_steps=int(self.self_consistency_options.get("every_n_steps", 100)),
+            sample_frac=float(self.self_consistency_options.get("sample_frac", 0.1)),
+            staleness_steps=int(self.self_consistency_options.get("staleness_steps", 1)),
+            warmup_epochs=int(self.self_consistency_options.get("warmup_epochs", 0)),
+            max_workers=int(self.self_consistency_options.get("max_workers", 2)),
+            retry_unfinished=bool(self.self_consistency_options.get("retry_unfinished", True)),
+        )
+        self.self_consistency_scheduler = SelfConsistencyScheduler(repair_fn, config)
+
+    def _self_consistency_current_samples(self, pred_data):
+        if not self.self_consistency_enabled or not isinstance(pred_data, dict):
+            return {}
+        sample_mode = getattr(self, "self_consistency_sample_mode", "feature_tensors")
+        if sample_mode in {"payload", "atomic_data", "batch"}:
+            return {"batch": pred_data}
+        samples = {}
+        for key in self.self_consistency_tensor_keys:
+            value = pred_data.get(key)
+            if torch.is_tensor(value):
+                samples[str(key)] = value
+        return samples
+
+    def _apply_self_consistency_loss(self, loss, pred_data):
+        self._last_self_consistency_state = {}
+        if not self.self_consistency_enabled or self.self_consistency_scheduler is None:
+            return loss
+
+        current_samples = self._self_consistency_current_samples(pred_data)
+        like = loss if torch.is_tensor(loss) else torch.as_tensor(loss, device=self.device)
+        raw_loss = like.new_zeros(())
+        weighted_loss = like.new_zeros(())
+        pairs = []
+        submitted = False
+
+        if current_samples:
+            pairs = self.self_consistency_scheduler.maybe_consume(
+                int(getattr(self, "iter", 0)),
+                current_samples,
+                timeout=self.self_consistency_consume_timeout,
+            )
+            if pairs:
+                raw_loss = torch.stack(
+                    [
+                        compute_self_consistency_payload_loss(
+                            h_pred_now,
+                            h_repaired,
+                            tensor_keys=self.self_consistency_tensor_keys,
+                        )
+                        for h_pred_now, h_repaired in pairs
+                    ]
+                ).mean()
+                weighted_loss = raw_loss * self.self_consistency_weight
+                loss = loss + weighted_loss
+            submitted = self.self_consistency_scheduler.maybe_submit(
+                int(getattr(self, "iter", 0)),
+                int(getattr(self, "ep", 0)),
+                list(current_samples.items()),
+            )
+
+        self._last_self_consistency_state = {
+            "train_self_consistency_loss": raw_loss.detach(),
+            "train_self_consistency_weighted_loss": weighted_loss.detach(),
+            "train_self_consistency_pairs": like.new_tensor(float(len(pairs))),
+            "train_self_consistency_submitted": like.new_tensor(1.0 if submitted else 0.0),
+        }
+        return loss
+
     @staticmethod
     def _add_effective_expert_lr_state(state, *, optimizer, num_experts):
         num_experts = int(num_experts or 0)
@@ -242,7 +330,7 @@ class Trainer(BaseTrainer):
         frequency = max(int(getattr(self, "optimizer_diagnostics_freq", 1)), 1)
         return self.iter == 1 or self.iter % frequency == 0
 
-    def _loss_on_batch(self, batch, lossfunc, *, use_flow=True):
+    def _loss_on_batch(self, batch, lossfunc, *, use_flow=True, allow_self_consistency=True):
         batch = batch.to(self.device)
         batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
@@ -251,12 +339,15 @@ class Trainer(BaseTrainer):
             model_in_loss = getattr(self.flow_cfm, "model_in_loss", False)
             if getattr(self.flow_cfm, "model_in_loss", False):
                 loss, flow_state = self.flow_cfm.loss_with_model(self.model, batch, batch_for_loss)
+                self._last_self_consistency_state = {}
             else:
                 batch, batch_for_loss, flow_ctx = self.flow_cfm.prepare_batch(batch, batch_for_loss)
                 batch = self.model(batch)
                 batch.update(batch_info)
                 batch_for_loss.update(batch_info)
                 loss, flow_state = self.flow_cfm.loss(batch, batch_for_loss, flow_ctx)
+                if allow_self_consistency:
+                    loss = self._apply_self_consistency_loss(loss, batch)
             flow_state.setdefault("train_loss_opt", loss.detach())
             compatible_state = self._compatible_loss_state_from_flow_stats(
                 lossfunc,
@@ -283,7 +374,10 @@ class Trainer(BaseTrainer):
         batch = self.model(batch)
         batch.update(batch_info)
         batch_for_loss.update(batch_info)
-        return lossfunc(batch, batch_for_loss)
+        loss = lossfunc(batch, batch_for_loss)
+        if allow_self_consistency:
+            loss = self._apply_self_consistency_loss(loss, batch)
+        return loss
 
     @staticmethod
     def _loss_component_state(lossfunc, *, prefix="train"):
@@ -462,6 +556,7 @@ class Trainer(BaseTrainer):
                 ref_batch,
                 reference_lossfunc,
                 use_flow=self.flow_cfm.apply_to_reference,
+                allow_self_consistency=False,
             )
             loss_for_log = loss_for_log + ref_loss.detach()
             ref_loss.backward()
@@ -500,6 +595,7 @@ class Trainer(BaseTrainer):
             state.update(self._loss_component_state(self.train_lossfunc))
         state.update(ref_component_state)
         state.update(getattr(self, "_last_flow_state", {}))
+        state.update(getattr(self, "_last_self_consistency_state", {}))
         if self._optimizer_diagnostics_due():
             state.update(self._optimizer_diagnostics(self.optimizer))
 
