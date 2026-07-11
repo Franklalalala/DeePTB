@@ -17,7 +17,7 @@ from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
 from dptb.nn.activation_recompute import configure_activation_recompute
-from dptb.nnops.flow import build_hamiltonian_flow
+from dptb.nnops.flow import assert_flow_h0_keys_reach_model, build_hamiltonian_flow
 from dptb.nnops.loss import Loss
 from dptb.nnops.self_consistency import (
     SelfConsistencyScheduler,
@@ -130,6 +130,10 @@ class Trainer(BaseTrainer):
             dtype=self.dtype,
             device=self.device,
         )
+        # Fail closed when an enabled flow writes its interpolated H0 state to
+        # keys the model's H0-init embedding never reads (silent prior
+        # deactivation P0: flow.node_h0_key != embedding.h0_node_key).
+        assert_flow_h0_keys_reach_model(self.flow_cfm, self.model)
         self._last_flow_state = {}
         self._last_flow_validation_state = {}
         self._last_self_consistency_state = {}

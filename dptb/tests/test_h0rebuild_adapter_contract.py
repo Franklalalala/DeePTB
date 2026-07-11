@@ -70,3 +70,13 @@ def test_physical_h0_overlay_uses_train_options_schema():
     assert flow["edge_h0_key"] == "edge_physical_h0"
     normalized = flow_options().normalize_value(flow)
     flow_options().check_value(normalized, strict=True)
+
+    # P0 wiring fix: the H0-init embedding must read exactly the keys the flow
+    # overwrites with the interpolated state x_t.  If the embedding is left at
+    # the stored-h0 defaults (node_h0/edge_h0) while the flow points at the
+    # physical keys, x_t never reaches the network and the prior is silently
+    # deactivated.  The overlay must therefore repoint the embedding keys too,
+    # and they must stay aligned with the flow keys.
+    embedding = overlay["model_options"]["embedding"]
+    assert embedding["h0_node_key"] == flow["node_h0_key"] == "node_physical_h0"
+    assert embedding["h0_edge_key"] == flow["edge_h0_key"] == "edge_physical_h0"

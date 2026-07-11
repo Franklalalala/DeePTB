@@ -13,6 +13,8 @@ from dptb.nnops.flow import (
     CFMContext,
     HamiltonianCFM,
     HamiltonianPixelMeanFlow,
+    assert_flow_h0_keys_reach_model,
+    build_hamiltonian_flow,
 )
 from dptb.nnops.layout import project_uureal_to_like
 from dptb.nnops.loss import HamilLossAbs
@@ -1679,3 +1681,85 @@ def test_compatible_pack_loss_falls_back_to_weighted_clean_components():
     loss = trainer._compute_compatible_loss_from_pack(pack, _FakeCompatibleLoss())
 
     assert loss.item() == pytest.approx(1.25)
+
+
+# ---------------------------------------------------------------------------
+# P0 regression: flow prior must not be silently deactivated by a key mismatch
+# between train_options.flow_options.{node,edge}_h0_key (what the flow writes)
+# and model_options.embedding.h0_{node,edge}_key (what the H0-init reads).
+# ---------------------------------------------------------------------------
+
+
+def _h0_init_consumer_stub(h0_node_key, h0_edge_key):
+    """Minimal stand-in for the H0InitLayer consumer.
+
+    The build-time guard keys purely on a submodule that exposes string
+    ``h0_node_key`` / ``h0_edge_key`` attributes (which is exactly what
+    ``H0InitLayer`` registers), so a bare Module carrying those attributes
+    reproduces the model side without building a full embedding.
+    """
+    layer = torch.nn.Module()
+    layer.h0_node_key = h0_node_key
+    layer.h0_edge_key = h0_edge_key
+    model = torch.nn.Module()
+    model.init_layer = layer  # registered as a child -> visible via model.modules()
+    return model
+
+
+def _physical_h0_flow(enabled=True):
+    return build_hamiltonian_flow(
+        {
+            "enabled": enabled,
+            "mode": "residual",
+            "prior": "zero",
+            "node_h0_key": "node_physical_h0",
+            "edge_h0_key": "edge_physical_h0",
+        }
+    )
+
+
+def test_flow_h0_key_guard_raises_when_embedding_keys_not_repointed():
+    # The P0: overlay set flow_options -> node/edge_physical_h0 but left the
+    # embedding at the stored-h0 defaults; the interpolated state never reaches
+    # the network and every mode collapses to a plain stored-H0 run.
+    flow = _physical_h0_flow(enabled=True)
+    model = _h0_init_consumer_stub("node_h0", "edge_h0")
+    with pytest.raises(ValueError, match="silently deactivated"):
+        assert_flow_h0_keys_reach_model(flow, model)
+
+
+def test_flow_h0_key_guard_message_names_both_offending_sides():
+    flow = _physical_h0_flow(enabled=True)
+    model = _h0_init_consumer_stub("node_h0", "edge_h0")
+    with pytest.raises(ValueError) as excinfo:
+        assert_flow_h0_keys_reach_model(flow, model)
+    message = str(excinfo.value)
+    assert "node_physical_h0" in message and "edge_physical_h0" in message
+    assert "h0_node_key" in message and "h0_edge_key" in message
+
+
+def test_flow_h0_key_guard_passes_when_embedding_keys_are_aligned():
+    flow = _physical_h0_flow(enabled=True)
+    model = _h0_init_consumer_stub("node_physical_h0", "edge_physical_h0")
+    # aligned keys -> the fixed configuration must build without error
+    assert assert_flow_h0_keys_reach_model(flow, model) is None
+
+
+def test_flow_h0_key_guard_is_noop_when_flow_disabled():
+    flow = _physical_h0_flow(enabled=False)
+    model = _h0_init_consumer_stub("node_h0", "edge_h0")
+    assert assert_flow_h0_keys_reach_model(flow, model) is None
+
+
+def test_flow_h0_key_guard_is_noop_without_h0_init_consumer():
+    flow = _physical_h0_flow(enabled=True)
+    model = torch.nn.Linear(2, 2)  # no module exposes h0_node_key/h0_edge_key
+    assert assert_flow_h0_keys_reach_model(flow, model) is None
+
+
+def test_flow_h0_key_guard_accepts_default_stored_h0_config():
+    # Legacy stored-h0 flow: flow and embedding share the node_h0/edge_h0
+    # defaults, so the guard must stay silent (no false positive).
+    flow = build_hamiltonian_flow({"enabled": True, "mode": "residual", "prior": "zero"})
+    model = _h0_init_consumer_stub("node_h0", "edge_h0")
+    assert assert_flow_h0_keys_reach_model(flow, model) is None

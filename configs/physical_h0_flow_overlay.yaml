@@ -17,3 +17,16 @@ train_options:
     # Never enable this for the physical SOC prior.  AO blocks must be converted
     # through block_to_feature so imaginary SOC channels become explicit Re/Im RME.
     allow_complex_prior_real_projection: false
+
+model_options:
+  embedding:
+    # REQUIRED: point the H0-init embedding at the same keys the flow writes.
+    # The flow overwrites data[node_physical_h0]/data[edge_physical_h0] with the
+    # interpolated state x_t so the model consumes it, but the H0-init embedding
+    # reads its own h0_node_key/h0_edge_key slots.  If these are left at the
+    # stored-h0 defaults (node_h0/edge_h0) while flow_options points at the
+    # physical keys, x_t never reaches the network: the prior is silently dropped
+    # and every flow mode collapses to a plain stored-H0 run.  The Trainer now
+    # fails closed on this mismatch, but the two keys must be kept in sync here.
+    h0_node_key: node_physical_h0
+    h0_edge_key: edge_physical_h0

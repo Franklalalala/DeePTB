@@ -1779,6 +1779,68 @@ def build_hamiltonian_flow(
     return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)
 
 
+def assert_flow_h0_keys_reach_model(flow: Any, model: Any) -> None:
+    """Fail closed when an enabled flow's H0 write-keys never reach the model.
+
+    An enabled flow overwrites ``data[flow_options.node_h0_key]`` /
+    ``data[flow_options.edge_h0_key]`` with the interpolated flow state ``x_t``
+    precisely so the model's H0-init embedding consumes it.  The embedding reads
+    its own ``embedding.h0_node_key`` / ``embedding.h0_edge_key`` slots, though.
+    When the two disagree (e.g. the flow writes ``node_physical_h0`` but the
+    embedding still reads the stored ``node_h0``), ``x_t`` never reaches the
+    network: the base/prior difference is silently dropped, training looks
+    healthy, and every flow ``mode`` collapses to the same stored-H0 run.  This
+    guard turns that silent P0 deactivation into a build-time error.
+
+    The check is a no-op unless the flow is enabled and the model actually
+    exposes an H0-init consumer (a module carrying string ``h0_node_key`` /
+    ``h0_edge_key`` attributes, i.e. ``H0InitLayer``).  Standard configs where
+    the flow and embedding keys already agree (the shared ``node_h0`` /
+    ``edge_h0`` defaults) pass untouched.
+    """
+    if flow is None or not getattr(flow, "enabled", False):
+        return
+    flow_node_key = getattr(flow, "node_h0_key", None)
+    flow_edge_key = getattr(flow, "edge_h0_key", None)
+    if flow_node_key is None and flow_edge_key is None:
+        return
+
+    modules_iter = getattr(model, "modules", None)
+    if not callable(modules_iter):
+        return
+
+    saw_h0_init = False
+    mismatches = set()
+    for module in modules_iter():
+        emb_node_key = getattr(module, "h0_node_key", None)
+        emb_edge_key = getattr(module, "h0_edge_key", None)
+        if not (isinstance(emb_node_key, str) and isinstance(emb_edge_key, str)):
+            continue
+        saw_h0_init = True
+        if flow_node_key is not None and emb_node_key != flow_node_key:
+            mismatches.add(("node", flow_node_key, emb_node_key))
+        if flow_edge_key is not None and emb_edge_key != flow_edge_key:
+            mismatches.add(("edge", flow_edge_key, emb_edge_key))
+
+    if not (saw_h0_init and mismatches):
+        return
+
+    detail = "; ".join(
+        f"{side}: train_options.flow_options.{side}_h0_key={fk!r} but "
+        f"model_options.embedding.h0_{side}_key={ek!r}"
+        for side, fk, ek in sorted(mismatches)
+    )
+    raise ValueError(
+        "Flow prior is silently deactivated: the interpolated H0 state is "
+        "written to keys the model's H0-init embedding never reads, so the flow "
+        "base/prior difference cannot reach the network. "
+        f"{detail}. Point model_options.embedding.h0_node_key/h0_edge_key at the "
+        "same keys as train_options.flow_options.node_h0_key/edge_h0_key "
+        "(e.g. node_physical_h0 / edge_physical_h0), or align the flow keys to "
+        "the embedding keys. See configs/physical_h0_flow_overlay.yaml."
+    )
+
+
 def configure_jvp_friendly_backends(flow_options: Optional[Dict[str, Any]]) -> bool:
     """Best-effort process-level prep for the pixel-meanflow jvp backend.
 
