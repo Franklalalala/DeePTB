@@ -10,6 +10,7 @@ and 10,000-iteration budget.
 | D CFM | CFM | retained | none | A: `edge_h0` |
 | C non-CFM | direct `hamil_abs` | replaced | B: `node_overlap` | A: `edge_h0` |
 | D non-CFM | direct `hamil_abs` | retained | none | A: `edge_h0` |
+| E baseline | direct `hamil_abs` | retained | none | none |
 
 For C CFM, `prior_node=external` and `prior_edge=external` select different
 absolute fields through `prior_node_key` and `prior_edge_key`. Since the edge
@@ -21,3 +22,6 @@ NN InitLayer node output while `use_h0_edge_init=true` retains H0 edge
 initialization. The non-CFM variants keep the same static initialization but
 set `train_options.flow_options.enabled=false`; they therefore remain distinct
 instead of collapsing to one ordinary baseline.
+
+The E baseline additionally sets `use_h0_init=false`, so neither node nor edge
+receives H0 conditioning; both are produced by the native NN InitLayer.
