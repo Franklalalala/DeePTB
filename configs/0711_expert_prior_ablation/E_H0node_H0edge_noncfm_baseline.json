@@ -236,12 +236,12 @@
       "tp_radial_emb": true,
       "universal": true,
       "use_angle": false,
-      "use_h0_init": false,
+      "use_h0_init": true,
       "use_interpolation_out": true,
       "use_layer_onehot_tp": true,
       "use_out_onehot_tp": true,
-      "use_h0_node_init": false,
-      "use_h0_edge_init": false
+      "use_h0_node_init": true,
+      "use_h0_edge_init": true
     },
     "prediction": {
       "activation": "tanh",
