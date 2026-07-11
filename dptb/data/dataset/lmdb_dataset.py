@@ -446,6 +446,14 @@ class LMDBDataset(AtomicDataset):
         h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
+        node_physical_h0 = data_dict.get(AtomicDataDict.NODE_PHYSICAL_H0_KEY, None)
+        edge_physical_h0 = data_dict.get(AtomicDataDict.EDGE_PHYSICAL_H0_KEY, None)
+        physical_h0_present = (node_physical_h0 is not None, edge_physical_h0 is not None)
+        if any(physical_h0_present) and not all(physical_h0_present):
+            raise ValueError(
+                "Offline physical H0 must provide both node_physical_h0 and "
+                "edge_physical_h0; refusing a partial prior."
+            )
         haar_u0 = data_dict.get(AtomicDataDict.HAAR_U0_KEY, None)
         haar_node_features = data_dict.get(AtomicDataDict.HAAR_NODE_FEATURES_KEY, None)
         haar_edge_features = data_dict.get(AtomicDataDict.HAAR_EDGE_FEATURES_KEY, None)
@@ -489,6 +497,7 @@ class LMDBDataset(AtomicDataset):
         )
 
         uses_pre_main = bool(has_pre_main and has_pre_overlap)
+        uses_pre_physical_h0 = bool(all(physical_h0_present))
         uses_pre_h0 = bool(
             self.get_H0
             and self.prefer_precomputed_h0
@@ -509,7 +518,7 @@ class LMDBDataset(AtomicDataset):
         )
         use_stored_edge_graph = bool(
             has_stored_edge_graph
-            and (uses_pre_main or uses_pre_h0)
+            and (uses_pre_main or uses_pre_h0 or uses_pre_physical_h0)
             and not needs_missing_env_graph
             and not needs_missing_onsitenv_graph
         )
@@ -646,6 +655,39 @@ class LMDBDataset(AtomicDataset):
                     field_name=AtomicDataDict.EDGE_H0_KEY,
                     keep_mask=soc_uureal_keep_mask,
                 )
+
+        if uses_pre_physical_h0:
+            node_physical_h0 = _expand_soc_uureal_compact(
+                node_physical_h0,
+                data_dict,
+                field_name=AtomicDataDict.NODE_PHYSICAL_H0_KEY,
+                keep_mask=soc_uureal_keep_mask,
+            )
+            edge_physical_h0 = _expand_soc_uureal_compact(
+                edge_physical_h0,
+                data_dict,
+                field_name=AtomicDataDict.EDGE_PHYSICAL_H0_KEY,
+                keep_mask=soc_uureal_keep_mask,
+            )
+            if (
+                node_physical_h0.shape[0] != num_nodes
+                or edge_physical_h0.shape[0] != num_edges
+            ):
+                raise ValueError(
+                    "Precomputed offline physical H0 rows do not match the active graph: "
+                    f"node_physical_h0={tuple(node_physical_h0.shape)}, "
+                    f"edge_physical_h0={tuple(edge_physical_h0.shape)}, "
+                    f"num_nodes={num_nodes}, num_edges={num_edges}."
+                )
+            if torch.is_complex(node_physical_h0) or torch.is_complex(edge_physical_h0):
+                raise TypeError(
+                    "node_physical_h0/edge_physical_h0 must already be DeePTB real "
+                    "RME features; raw complex SOC AO blocks are not accepted here."
+                )
+            if not torch.isfinite(node_physical_h0).all() or not torch.isfinite(edge_physical_h0).all():
+                raise ValueError("Offline physical H0 contains NaN or infinity.")
+            atomicdata[AtomicDataDict.NODE_PHYSICAL_H0_KEY] = node_physical_h0
+            atomicdata[AtomicDataDict.EDGE_PHYSICAL_H0_KEY] = edge_physical_h0
 
         if haar_u0 is not None:
             atomicdata[AtomicDataDict.HAAR_U0_KEY] = torch.as_tensor(

@@ -102,6 +102,10 @@ EDGE_HAMILTONIAN_KEY: Final[str] = "edge_hamiltonian"
 NODE_HAMILTONIAN_KEY: Final[str] = "node_hamiltonian"
 EDGE_H0_KEY: Final[str] = "edge_h0"
 NODE_H0_KEY: Final[str] = "node_h0"
+# Dedicated offline DFT H[rho0] features.  Keep these separate from legacy
+# H0/Hueckel fields so provenance and fallback semantics cannot mix.
+EDGE_PHYSICAL_H0_KEY: Final[str] = "edge_physical_h0"
+NODE_PHYSICAL_H0_KEY: Final[str] = "node_physical_h0"
 EDGE_DELTA_HAMIL_BLOCKS_KEY: Final[str] = "edge_delta_hamil_blocks"
 NODE_DELTA_HAMIL_BLOCKS_KEY: Final[str] = "node_delta_hamil_blocks"
 EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY: Final[str] = "edge_delta_hamil_block_shape"

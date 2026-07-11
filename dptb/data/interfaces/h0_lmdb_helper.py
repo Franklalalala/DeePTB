@@ -238,6 +238,7 @@ def materialize_h0_features(
                     dataset.orthogonal,
                     node_field=_keys.NODE_H0_KEY,
                     edge_field=_keys.EDGE_H0_KEY,
+                    missing_block_policy="error",
                 )
 
                 record[_keys.NODE_H0_KEY] = atomicdata[_keys.NODE_H0_KEY].cpu().numpy()

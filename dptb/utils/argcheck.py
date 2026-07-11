@@ -201,6 +201,7 @@ def flow_options():
         Argument("prior_edge_key", str, optional=True, default=""),
         Argument("prior_key_prefixes", list, optional=True, default=[]),
         Argument("external_prior_strict", bool, optional=True, default=True),
+        Argument("allow_complex_prior_real_projection", bool, optional=True, default=False),
         Argument("prior_skdata", str, optional=True, default=""),
         Argument("dftb_skdata", str, optional=True, default=""),
         Argument("dftb_prior_overlap", bool, optional=True, default=False),

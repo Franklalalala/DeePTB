@@ -27,6 +27,8 @@ def block_to_feature(
     edge_field: str = _keys.EDGE_FEATURES_KEY,
     node_overlap_field: str = _keys.NODE_OVERLAP_KEY,
     edge_overlap_field: str = _keys.EDGE_OVERLAP_KEY,
+    missing_block_policy: str = "zero",
+    output_dtype=None,
 ):
     """
     将 Hamiltonian/Overlap blocks 转换为模型可训练的 features。
@@ -37,6 +39,12 @@ def block_to_feature(
     has_ham = (blocks is not False) and (blocks is not None)
     has_ovp = (overlap_blocks is not False) and (overlap_blocks is not None)
     assert has_ham or has_ovp, "Feature blocks (Hamiltonian) and Overlap blocks are both missing."
+    missing_block_policy = str(missing_block_policy).lower()
+    if missing_block_policy not in {"zero", "error"}:
+        raise ValueError(
+            "missing_block_policy must be 'zero' (legacy) or 'error' (fail closed), "
+            f"got {missing_block_policy!r}."
+        )
 
     # 确保 map 已构建
     idp.get_orbital_maps()
@@ -54,6 +62,25 @@ def block_to_feature(
     else:
         # 如果不开 doubling，保留复数类型
         feature_dtype = torch.complex64 if has_soc else torch.get_default_dtype()
+    if output_dtype is not None:
+        if output_dtype not in {
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        }:
+            raise TypeError(f"Unsupported block_to_feature output_dtype={output_dtype!r}")
+        if has_soc:
+            if soc_complex_doubling and output_dtype.is_complex:
+                raise TypeError(
+                    "SOC complex doubling requires a real output_dtype (float32 or float64)."
+                )
+            if not soc_complex_doubling and not output_dtype.is_complex:
+                raise TypeError(
+                    "SOC without complex doubling requires a complex output_dtype "
+                    "(complex64 or complex128)."
+                )
+        feature_dtype = output_dtype
 
     # 确定设备 (CPU/GPU)
     device = None
@@ -74,11 +101,25 @@ def block_to_feature(
         else:
             raise TypeError(f"Block data must be Tensor or ndarray, got {type(x)}")
 
-        # 统一转为 Complex64 (如果包含复数) 或 Float32，避免 Double 精度不必要的显存占用
+        if output_dtype is None:
+            # Legacy behavior for existing callers.
+            complex_dtype = torch.complex64
+            real_dtype = torch.float32
+        else:
+            if output_dtype not in {
+                torch.float32,
+                torch.float64,
+                torch.complex64,
+                torch.complex128,
+            }:
+                raise TypeError(f"Unsupported block_to_feature output_dtype={output_dtype!r}")
+            use_double = output_dtype in {torch.float64, torch.complex128}
+            complex_dtype = torch.complex128 if use_double else torch.complex64
+            real_dtype = torch.float64 if use_double else torch.float32
         if t.is_complex():
-            t = t.to(torch.complex64)
+            t = t.to(complex_dtype)
         elif t.is_floating_point():
-            t = t.to(torch.float32)
+            t = t.to(real_dtype)
 
         return t.to(device=device) if device is not None else t
 
@@ -319,7 +360,12 @@ def block_to_feature(
                     if np.iscomplexobj(val): val = val.conj()
                     batch_list.append(val)
                 else:
-                    # 缺失补零
+                    if missing_block_policy == "error":
+                        raise KeyError(
+                            f"Missing Hamiltonian edge block: neither {k!r} nor "
+                            f"Hermitian counterpart {rk!r} exists."
+                        )
+                    # Legacy compatibility: missing edges become zero only when requested.
                     shape = (2 * norb_i, 2 * norb_j) if has_soc else (norb_i, norb_j)
                     dtype = np.complex64 if has_soc else np.float32
                     batch_list.append(np.zeros(shape, dtype=dtype))
@@ -338,6 +384,11 @@ def block_to_feature(
                     if np.iscomplexobj(val): val = val.conj()
                     batch_list.append(val)
                 else:
+                    if missing_block_policy == "error":
+                        raise KeyError(
+                            f"Missing overlap edge block: neither {k!r} nor "
+                            f"Hermitian counterpart {rk!r} exists."
+                        )
                     # Overlap 缺省时可能是 Spinless 的 Shape，先用 norb_i
                     # 后续 _pack_soc_tensor 会处理
                     # 安全起见，如果 reduced, shape=(N,N), 如果 full, shape=(2N,2N)

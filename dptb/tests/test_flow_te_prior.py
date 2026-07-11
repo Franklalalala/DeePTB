@@ -1251,6 +1251,41 @@ def test_dftb_prior_uses_external_absolute_hamiltonian_keys():
     torch.testing.assert_close(ctx.edge_prior, dftb_edge - data[_keys.EDGE_H0_KEY])
 
 
+def test_external_prior_rejects_complex_features_by_default():
+    device = torch.device("cpu")
+    flow = _flow("external", device=device, dtype=torch.float32)
+    source = torch.tensor([[1.0 + 2.0j]], dtype=torch.complex64)
+
+    with pytest.raises(TypeError, match="complex"):
+        flow._coerce_prior_source(
+            source,
+            torch.zeros((1, 1), dtype=torch.float32),
+            key="node_physical_h0",
+            label="node",
+        )
+
+
+def test_external_prior_real_projection_requires_explicit_ablation(caplog):
+    device = torch.device("cpu")
+    flow = _flow(
+        "external",
+        device=device,
+        dtype=torch.float32,
+        allow_complex_prior_real_projection=True,
+    )
+    source = torch.tensor([[1.0 + 2.0j]], dtype=torch.complex64)
+
+    projected = flow._coerce_prior_source(
+        source,
+        torch.zeros((1, 1), dtype=torch.float32),
+        key="node_physical_h0",
+        label="node",
+    )
+
+    torch.testing.assert_close(projected, torch.tensor([[1.0]]))
+    assert "discarding imaginary channels" in caplog.text
+
+
 def test_external_candidate_keys_are_the_short_documented_list():
     # Behavior change: the external family consults only the explicit key plus the
     # short documented per-prefix set {prefix}_{label}_h0, {label}_{prefix}_h0,
@@ -1372,6 +1407,7 @@ def test_flow_options_argcheck_accepts_physical_prior_config_keys():
             "prior_node_key": "dftb_node_h0",
             "prior_edge_key": "dftb_edge_h0",
             "prior_key_prefixes": ["dftb", "xtb"],
+            "allow_complex_prior_real_projection": True,
             "prior_skdata": "/tmp/skfiles",
             "dftb_prior_overlap": True,
             "physical_prior_fallback": "basis_onsite",
@@ -1386,6 +1422,7 @@ def test_flow_options_argcheck_accepts_physical_prior_config_keys():
     assert value["prior"] == "dftbsk"
     assert value["prior_node_key"] == "dftb_node_h0"
     assert value["prior_key_prefixes"] == ["dftb", "xtb"]
+    assert value["allow_complex_prior_real_projection"] is True
     assert value["prior_skdata"] == "/tmp/skfiles"
     assert value["dftb_prior_overlap"] is True
     assert value["basis_onsite_scale"] == pytest.approx(0.5)

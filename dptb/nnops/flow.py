@@ -70,6 +70,9 @@ class HamiltonianCFM:
         self.idp = idp
         self.dtype = _to_torch_dtype(dtype)
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.allow_complex_prior_real_projection = bool(
+            options.get("allow_complex_prior_real_projection", False)
+        )
 
         # Keys.  The defaults match DeePTB's NextHAM/H0 branch.
         self.node_h0_key = str(options.get("node_h0_key", _keys.NODE_H0_KEY))
@@ -490,7 +493,20 @@ class HamiltonianCFM:
         if not torch.is_tensor(source):
             source = torch.as_tensor(source, device=like.device)
         if torch.is_complex(source):
-            log.warning("External %s prior `%s` is complex; only the real part is used.", label, key)
+            if not self.allow_complex_prior_real_projection:
+                raise TypeError(
+                    f"External {label or 'state'} prior `{key}` is complex. "
+                    "For SOC, convert AO blocks through block_to_feature into the "
+                    "real Re/Im RME layout. Setting "
+                    "flow_options.allow_complex_prior_real_projection=true restores "
+                    "the legacy, lossy .real projection only for an explicit ablation."
+                )
+            log.warning(
+                "External %s prior `%s` is complex; applying the explicitly enabled "
+                "legacy real-part projection and discarding imaginary channels.",
+                label,
+                key,
+            )
             source = source.real
         source = source.to(device=like.device, dtype=like.dtype)
         if source.ndim == 1 and like.ndim >= 2:
