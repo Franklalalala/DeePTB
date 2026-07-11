@@ -177,6 +177,33 @@ def _flow(prior: str, *, device: torch.device, dtype: torch.dtype, **extra) -> H
     return HamiltonianCFM(opts, idp=_FakeIDP(device=device), device=device, dtype=dtype)
 
 
+def test_split_external_prior_can_mix_node_overlap_with_edge_h0():
+    device = torch.device("cpu")
+    dtype = torch.float32
+    data, ref = _make_batch(device=device, dtype=dtype)
+    node_overlap = data[_keys.NODE_H0_KEY] + 0.25
+    data["node_overlap"] = node_overlap
+    flow = _flow(
+        "external",
+        device=device,
+        dtype=dtype,
+        prior_node="external",
+        prior_edge="external",
+        prior_node_key="node_overlap",
+        prior_edge_key=_keys.EDGE_H0_KEY,
+        external_prior_strict=True,
+    )
+
+    model_data, _ref, ctx = flow.prepare_batch(
+        data, ref, t=torch.zeros(2, device=device, dtype=dtype)
+    )
+
+    torch.testing.assert_close(ctx.node_current, node_overlap)
+    torch.testing.assert_close(ctx.edge_current, data[_keys.EDGE_H0_KEY])
+    torch.testing.assert_close(model_data[_keys.NODE_H0_KEY], node_overlap)
+    torch.testing.assert_close(model_data[_keys.EDGE_H0_KEY], data[_keys.EDGE_H0_KEY])
+
+
 def test_te_irrep_slices_preserve_raw_feature_order():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32

@@ -1596,6 +1596,8 @@ def slem_h0():
     doc_use_h0_init = "Whether to replace the geometry init layer with the H0 init plugin. Default: `True`."
     doc_h0_node_key = "Node-wise H0 key. Defaults to `node_h0`. When absent and fallback is enabled, the plugin checks `node_hamiltonian` first and then the configured fallback feature key."
     doc_h0_edge_key = "Edge-wise H0 key. Defaults to `edge_h0`. When absent and fallback is enabled, the plugin checks `edge_hamiltonian` first and then the configured fallback feature key."
+    doc_use_h0_node_init = "Whether H0 replaces/adds to the native node InitLayer output. Default: `True`."
+    doc_use_h0_edge_init = "Whether H0 replaces/adds to the native edge InitLayer output. Default: `True`."
     doc_h0_node_mode = "How to build node init from H0. Supported: `direct`, `self_edge`. Default: `direct`."
     doc_fallback_to_hamiltonian = "Whether to fall back to the LMDB Hamiltonian-derived node/edge features when explicit H0 keys are absent. Default: `True`."
     doc_fallback_node_key = "Fallback node key used when explicit H0 is absent. Default: `node_features`."
@@ -1613,6 +1615,8 @@ def slem_h0():
         Argument("use_h0_init", bool, optional=True, default=True, doc=doc_use_h0_init),
         Argument("h0_node_key", str, optional=True, default="node_h0", doc=doc_h0_node_key),
         Argument("h0_edge_key", str, optional=True, default="edge_h0", doc=doc_h0_edge_key),
+        Argument("use_h0_node_init", bool, optional=True, default=True, doc=doc_use_h0_node_init),
+        Argument("use_h0_edge_init", bool, optional=True, default=True, doc=doc_use_h0_edge_init),
         Argument("h0_node_mode", str, optional=True, default="direct", doc=doc_h0_node_mode),
         Argument("fallback_to_hamiltonian", bool, optional=True, default=True, doc=doc_fallback_to_hamiltonian),
         Argument("h0_fallback_to_hamiltonian", bool, optional=True, default=True, doc=doc_fallback_to_hamiltonian),

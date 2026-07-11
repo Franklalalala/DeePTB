@@ -116,6 +116,8 @@ class H0InitLayer(torch.nn.Module):
         base_init: torch.nn.Module,
         h0_node_key: str = _keys.NODE_H0_KEY,
         h0_edge_key: str = _keys.EDGE_H0_KEY,
+        use_h0_node_init: bool = True,
+        use_h0_edge_init: bool = True,
         h0_node_mode: str = "direct",
         fallback_to_hamiltonian: bool = True,
         fallback_node_key: str = _keys.NODE_FEATURES_KEY,
@@ -139,6 +141,8 @@ class H0InitLayer(torch.nn.Module):
         self.h0_dim = self.h0_irreps.dim
         self.h0_node_key = h0_node_key
         self.h0_edge_key = h0_edge_key
+        self.use_h0_node_init = bool(use_h0_node_init)
+        self.use_h0_edge_init = bool(use_h0_edge_init)
         self.h0_node_mode = h0_node_mode
         self.fallback_to_hamiltonian = fallback_to_hamiltonian
         self.fallback_node_key = fallback_node_key
@@ -334,30 +338,39 @@ class H0InitLayer(torch.nn.Module):
             cutoff_coeffs,
         )
 
-        edge_source, edge_source_key = _get_feature_source_with_key(
-            data=data,
-            candidate_keys=self._candidate_keys(
-                self.h0_edge_key,
-                self.fallback_edge_key,
-                _keys.EDGE_HAMILTONIAN_KEY,
-            ),
-            expected_dim=self.h0_dim,
-            dtype=self.dtype,
-            device=self.device,
-            label="edge H0",
-        )
-        self._guard_target_fallback(edge_source_key, self.h0_edge_key, "edge H0")
-        if edge_source is None:
-            log.warning(
-                "No usable edge H0 source found; falling back to the original InitLayer output."
+        edge_features_h0 = None
+        edge_features = base_edge_features
+        if self.use_h0_edge_init:
+            edge_source, edge_source_key = _get_feature_source_with_key(
+                data=data,
+                candidate_keys=self._candidate_keys(
+                    self.h0_edge_key,
+                    self.fallback_edge_key,
+                    _keys.EDGE_HAMILTONIAN_KEY,
+                ),
+                expected_dim=self.h0_dim,
+                dtype=self.dtype,
+                device=self.device,
+                label="edge H0",
             )
-            return latents, base_node_features, base_edge_features, cutoff_coeffs, active_edges
+            self._guard_target_fallback(edge_source_key, self.h0_edge_key, "edge H0")
+            if edge_source is None:
+                log.warning(
+                    "No usable edge H0 source found; falling back to the original InitLayer output."
+                )
+                return latents, base_node_features, base_edge_features, cutoff_coeffs, active_edges
+            edge_source = self._mask_edge_source(edge_source, bond_type)
+            edge_features_h0 = self.edge_projector(edge_source[active_edges])
+            edge_features = self._merge_features(base_edge_features, edge_features_h0)
 
-        edge_source = self._mask_edge_source(edge_source, bond_type)
-        edge_features_h0 = self.edge_projector(edge_source[active_edges])
-        edge_features = self._merge_features(base_edge_features, edge_features_h0)
+        if not self.use_h0_node_init:
+            return latents, base_node_features, edge_features, cutoff_coeffs, active_edges
 
         if self.h0_node_mode == "self_edge":
+            if edge_features_h0 is None:
+                raise ValueError(
+                    "h0_node_mode='self_edge' requires use_h0_edge_init=true."
+                )
             self_node_features_h0, has_self_edge = self._node_from_self_edge(
                 edge_features=edge_features_h0,
                 data=data,

@@ -556,3 +556,59 @@ def test_h0init_training_target_fallback_fails_loud():
         edge_one_hot=torch.zeros(2, 4),
     )
     assert len(out2) == 5
+
+
+def test_h0init_can_keep_native_node_init_while_replacing_edges():
+    from dptb.nn.embedding.lem_moe_v3_h0_helpers import H0InitLayer
+
+    class _BaseInit(torch.nn.Module):
+        def __init__(self, idp):
+            super().__init__()
+            self.idp = idp
+            if getattr(idp, "orbpair_irreps", None) is None:
+                idp.get_irreps()
+            self.irreps_out = idp.orbpair_irreps.sort()[0].simplify()
+
+        def forward(self, edge_index, atom_type, bond_type, edge_sh, edge_length,
+                    edge_one_hot, active_edges=None, cutoff_coeffs=None):
+            n_edge = edge_index.shape[1]
+            dim = self.irreps_out.dim
+            active = torch.arange(n_edge) if active_edges is None else active_edges
+            return (
+                torch.zeros(n_edge, 8),
+                torch.zeros(atom_type.numel(), dim),
+                torch.zeros(active.numel(), dim),
+                torch.ones(n_edge) if cutoff_coeffs is None else cutoff_coeffs,
+                active,
+            )
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+    idp, data, _ref = _case(device, dtype)
+    layer = H0InitLayer(
+        base_init=_BaseInit(idp),
+        use_h0_node_init=False,
+        use_h0_edge_init=True,
+        fallback_to_hamiltonian=False,
+        dtype=dtype,
+        device=device,
+    )
+    layer.eval()
+    edge_index = data[_keys.EDGE_INDEX_KEY]
+    atom_type = data[AtomicDataDict.ATOM_TYPE_KEY]
+    bond_type = data[AtomicDataDict.EDGE_TYPE_KEY]
+    batch = {
+        _keys.NODE_H0_KEY: torch.randn(atom_type.numel(), idp.reduced_matrix_element),
+        _keys.EDGE_H0_KEY: torch.randn(edge_index.shape[1], idp.reduced_matrix_element),
+    }
+    _latents, node_features, edge_features, _cutoff, _active = layer(
+        batch,
+        edge_index,
+        atom_type,
+        bond_type,
+        edge_sh=torch.zeros(edge_index.shape[1], 1),
+        edge_length=torch.ones(edge_index.shape[1]),
+        edge_one_hot=torch.zeros(edge_index.shape[1], 4),
+    )
+    torch.testing.assert_close(node_features, torch.zeros_like(node_features))
+    assert edge_features.shape[0] == edge_index.shape[1]
