@@ -240,7 +240,7 @@ class Trainer(BaseTrainer):
         self.self_consistency_scheduler = SelfConsistencyScheduler(repair_fn, config)
 
     def _self_consistency_current_samples(self, pred_data):
-        if not self.self_consistency_enabled or not isinstance(pred_data, dict):
+        if not getattr(self, "self_consistency_enabled", False) or not isinstance(pred_data, dict):
             return {}
         sample_mode = getattr(self, "self_consistency_sample_mode", "feature_tensors")
         if sample_mode in {"payload", "atomic_data", "batch"}:
@@ -254,7 +254,10 @@ class Trainer(BaseTrainer):
 
     def _apply_self_consistency_loss(self, loss, pred_data):
         self._last_self_consistency_state = {}
-        if not self.self_consistency_enabled or self.self_consistency_scheduler is None:
+        if (
+            not getattr(self, "self_consistency_enabled", False)
+            or getattr(self, "self_consistency_scheduler", None) is None
+        ):
             return loss
 
         current_samples = self._self_consistency_current_samples(pred_data)
