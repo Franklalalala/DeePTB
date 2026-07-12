@@ -2010,7 +2010,7 @@ def loss_options():
         Argument("target_edge_block_key", str, optional=True, default="edge_delta_hamil_blocks"),
         Argument("target_node_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
         Argument("target_edge_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
-        Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, feature_compatible."),
+        Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, block_mae_mse, feature_compatible."),
         Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
         Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
         Argument("log_feature_compatible", bool, optional=True, default=True),

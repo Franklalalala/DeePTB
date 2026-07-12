@@ -29,3 +29,45 @@ def test_hamil_blockwise_nextham_argcheck_accepts_rop_config():
     normalized = train_options().normalize_value(cfg)
     train_options().check_value(normalized, strict=True)
     assert normalized["loss_options"]["train"]["method"] == "hamil_blockwise_nextham"
+
+
+def test_hamil_blockwise_mae_mse_optimization_mode():
+    import torch
+
+    from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
+
+    basis = {"H": "1s", "O": "1s1p"}
+    loss_fn = HamilBlockwiseNexTHamLoss(
+        basis=basis,
+        optimization="block_mae_mse",
+        block_reduction="global",
+        log_feature_compatible=False,
+    )
+    max_norb = 4  # 1s1p union
+    pred_node = torch.zeros(2, max_norb, max_norb)
+    target_node = torch.zeros(2, max_norb, max_norb)
+    target_node[0, 0, 0] = 0.5  # H onsite 1x1
+    target_node[1, :4, :4] = 0.25  # O onsite 4x4
+    pred_edge = torch.zeros(2, max_norb, max_norb)
+    target_edge = torch.zeros(2, max_norb, max_norb)
+    target_edge[0, :1, :4] = 1.0  # H->O 1x4
+    target_edge[1, :4, :1] = -1.0  # O->H 4x1
+
+    data = {
+        "node_hamil_blocks": pred_node,
+        "edge_hamil_blocks": pred_edge,
+        "atom_types": torch.tensor([[0], [1]]),
+        "atomic_numbers": torch.tensor([1, 8]),
+        "edge_index": torch.tensor([[0, 1], [1, 0]]),
+        "node_delta_hamil_blocks": target_node,
+        "edge_delta_hamil_blocks": target_edge,
+        "node_delta_hamil_block_shape": torch.tensor([[1, 1], [4, 4]]),
+        "edge_delta_hamil_block_shape": torch.tensor([[1, 4], [4, 1]]),
+    }
+    out = loss_fn(data, data)
+    # Active entries: node 1 + 16, edge 4 + 4 = 25 total.
+    abs_sum = 0.5 + 16 * 0.25 + 4 * 1.0 + 4 * 1.0
+    sq_sum = 0.25 + 16 * 0.0625 + 4 * 1.0 + 4 * 1.0
+    expected = abs_sum / 25.0 + sq_sum / 25.0
+    assert torch.isfinite(out)
+    assert abs(out.item() - expected) < 1e-6

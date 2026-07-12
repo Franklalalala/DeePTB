@@ -180,6 +180,17 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
                     + l1_rmse_from_components(edge_comp, eps=self.eps)
                 )
             return l1_rmse_from_components(total_comp, eps=self.eps)
+        if self.optimization in {"block_mae_mse", "mae_mse"}:
+            # QHFlow2 dense objective form: mean|diff| + mean(diff^2) over
+            # active AO entries (its global x10 weight is an LR scale, not
+            # reproduced here).
+            def _mae_mse(comp: ComponentSums):
+                count = comp.count.clamp_min(1.0)
+                return comp.abs_sum / count + comp.square_sum / count
+
+            if self.block_reduction in {"equal", "equal_onsite_hopping", "legacy"}:
+                return 0.5 * (_mae_mse(node_comp) + _mae_mse(edge_comp))
+            return _mae_mse(total_comp)
         if self.optimization in {"feature", "feature_compatible", "compat"}:
             return None
         raise ValueError(f"Unknown optimization mode: {self.optimization}")
