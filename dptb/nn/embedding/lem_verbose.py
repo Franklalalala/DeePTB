@@ -26,7 +26,8 @@ from .edge_angle_tools.edge_angle_utils import compute_cos_angle
 from .edge_angle_tools.transformer import ComformerConv_edge
 from .edge_angle_tools.utils import RBFExpansion
 
-torch.set_default_dtype(torch.float32)
+# NOTE: never set the process-wide default dtype at import time; it would
+# silently revert a float64 run configured by the train entrypoint.
 
 from math import ceil
 

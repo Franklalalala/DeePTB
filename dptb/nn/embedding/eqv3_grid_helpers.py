@@ -204,7 +204,10 @@ def _get_grid_mats(
     normalization: str,
     resolution: tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (lmax, mmax, normalization, resolution)
+    # Grid matrices are generated under the ambient default dtype; keying the
+    # cache on it prevents a float32 build from leaking float32 constants into
+    # a later float64 build in the same process.
+    key = (lmax, mmax, normalization, resolution, torch.get_default_dtype())
     mats = _GRID_MAT_CACHE.get(key)
     if mats is not None:
         return mats
@@ -380,7 +383,14 @@ class EquivariantMergedRMSNormFlat(nn.Module):
             raise ValueError(f"Expected dim={self.dim}, got {x.shape[-1]}")
 
         orig_dtype = x.dtype
-        y = x.to(torch.float32)
+        # Upcast only low-precision inputs; float64 must stay float64 or the
+        # norm silently truncates activations/gradients to float32 accuracy.
+        compute_dtype = (
+            torch.float32
+            if orig_dtype in (torch.float16, torch.bfloat16)
+            else orig_dtype
+        )
+        y = x.to(compute_dtype)
         # identity check instead of data_ptr(): storageless wrapper tensors
         # (torch.func transforms, fake tensors) reject data_ptr access, and
         # .to() returns the same object exactly when no conversion happened.
