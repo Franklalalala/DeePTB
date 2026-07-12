@@ -95,3 +95,58 @@ def apply_ao_basis_mask(
         col_mask = row_mask
     mask = row_mask.to(dtype=torch.bool).unsqueeze(-1) & col_mask.to(dtype=torch.bool).unsqueeze(-2)
     return blocks * mask.to(dtype=blocks.dtype, device=blocks.device)
+
+
+def species_compact_index(mask_to_basis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Union-slot -> species-contiguous gather maps for padded AO canvases.
+
+    Block heads lay out ``[max_norb, max_norb]`` canvases by full/union-basis
+    shell offsets, while blockwise targets, H0 blocks, and the blockwise loss
+    masks pack each species' orbitals contiguously from the top-left (the
+    ``orbital_maps``/``feature_tensors_to_block_tensors`` convention).  The two
+    layouts only coincide when a species' basis is a prefix of the union basis;
+    any skipped shell (e.g. H ``2s1p`` inside an O ``3s2p1d`` union) misaligns
+    every affected row/column.
+
+    Returns ``(index, norb)`` where ``index[s, :norb[s]]`` lists species ``s``'s
+    union-slot positions in ascending order (tail padded with 0) and ``norb[s]``
+    is its orbital count.
+    """
+    mask = mask_to_basis.to(dtype=torch.bool)
+    n_species, max_norb = mask.shape
+    index = torch.zeros((n_species, max_norb), dtype=torch.long, device=mask.device)
+    norb = mask.sum(dim=-1).to(dtype=torch.long)
+    for s in range(n_species):
+        pos = torch.nonzero(mask[s], as_tuple=False).flatten()
+        index[s, : pos.numel()] = pos
+    return index, norb
+
+
+def compact_blocks_to_species_layout(
+    blocks: torch.Tensor,
+    row_index: torch.Tensor,
+    row_norb: torch.Tensor,
+    col_index: torch.Tensor | None = None,
+    col_norb: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather union-slot AO blocks into the species-contiguous data layout.
+
+    ``blocks`` is ``[N, max_norb, max_norb]`` in union full-basis slot layout;
+    ``row_index``/``col_index`` are per-block ``[N, max_norb]`` gather positions
+    and ``row_norb``/``col_norb`` the per-block valid counts (both typically
+    ``species_compact_index`` outputs indexed by atom type).  Entries beyond the
+    valid ``(row_norb, col_norb)`` rectangle are zeroed so the result matches
+    ``block_mask_from_shapes`` semantics exactly.
+    """
+    if col_index is None:
+        col_index = row_index
+    if col_norb is None:
+        col_norb = row_norb
+    max_norb = blocks.shape[-1]
+    rows = blocks.gather(-2, row_index.unsqueeze(-1).expand(-1, -1, max_norb))
+    compact = rows.gather(-1, col_index.unsqueeze(-2).expand(-1, max_norb, -1))
+    ar = torch.arange(max_norb, device=blocks.device)
+    valid = (ar.view(1, -1, 1) < row_norb.view(-1, 1, 1)) & (
+        ar.view(1, 1, -1) < col_norb.view(-1, 1, 1)
+    )
+    return compact * valid.to(dtype=blocks.dtype)

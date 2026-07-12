@@ -13,6 +13,8 @@ from dptb.data.interfaces.blockwise_tensor import (
     NODE_DELTA_HAMIL_BLOCKS_KEY,
     NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
     NODE_PRED_HAMIL_BLOCKS_KEY,
+    block_mask_from_shapes,
+    infer_block_shapes,
 )
 from dptb.nn.build import build_model
 from dptb.nn.embedding.cartesian_ict_bank import (
@@ -192,24 +194,71 @@ def test_block_routes_respect_shell_slices_and_species_masks(tmp_path):
         node = output[_keys.NODE_HAMILTONIAN_KEY]
         edge = output[_keys.EDGE_HAMILTONIAN_KEY]
         layout = ao_shell_layout(model.idp.full_basis)
-        for row_start, row_stop, row_l in layout:
-            for col_start, col_stop, col_l in layout:
-                assert node[:, row_start:row_stop, col_start:col_stop].shape[-2:] == (
-                    2 * row_l + 1,
-                    2 * col_l + 1,
-                )
+        full_norb = layout[-1][1]
+        assert node.shape[-2:] == (full_norb, full_norb)
 
-        atom_type = output[_keys.ATOM_TYPE_KEY].flatten()
-        basis_mask = model.idp.mask_to_basis[atom_type]
-        expected_node = basis_mask.unsqueeze(-1) & basis_mask.unsqueeze(-2)
-        assert torch.count_nonzero(node.masked_select(~expected_node)) == 0
+        # Predictions must live in the species-contiguous layout used by the
+        # blockwise targets/loss: zero outside the top-left (n_i, n_j) box.
+        node_shapes, edge_shapes = infer_block_shapes(output, model.idp)
+        node_valid = block_mask_from_shapes(node_shapes, tuple(node.shape[-2:]))
+        assert torch.count_nonzero(node.masked_select(~node_valid)) == 0
+        edge_valid = block_mask_from_shapes(edge_shapes, tuple(edge.shape[-2:]))
+        assert torch.count_nonzero(edge.masked_select(~edge_valid)) == 0
 
-        edge_index = output[_keys.EDGE_INDEX_KEY]
-        expected_edge = (
-            basis_mask[edge_index[0]].unsqueeze(-1)
-            & basis_mask[edge_index[1]].unsqueeze(-2)
-        )
-        assert torch.count_nonzero(edge.masked_select(~expected_edge)) == 0
+
+def test_block_native_layout_matches_blockwise_target_contract(tmp_path):
+    """Water-basis regression: H (2s1p) skips the union 3s slot.
+
+    Before the species-compaction fix, block heads emitted union-slot canvases
+    (H rows {0,1,3,4,5}) while the blockwise targets/loss expect contiguous
+    packing (H rows 0..4): row 2 of every H block was hard-zero in the
+    prediction yet nonzero in the target, pinning all block-native routes at
+    the zero-predictor plateau on multi-species data.
+    """
+    basis = {"H": "2s1p", "O": "3s2p1d"}
+    hidden = "4x0e+4x1o+4x1e+4x2e+4x2o+4x3o+4x3e+4x4e"
+    embedding = _embedding_options("h_b0", tmp_path)
+    embedding["irreps_hidden"] = hidden
+    model = build_model(
+        common_options={
+            "basis": basis,
+            "overlap": False,
+            "dtype": "float32",
+            "device": "cpu",
+        },
+        model_options={
+            "embedding": embedding,
+            "prediction": {
+                "method": "block_native",
+                "scale_type": "no_scale",
+                "block_decoder": "expansion_cg",
+                "blockwise_hamiltonian": True,
+            },
+        },
+        train_options={},
+        no_check=False,
+    )
+    output = model(_data(model))
+    node = output[NODE_PRED_HAMIL_BLOCKS_KEY]
+    edge = output[EDGE_PRED_HAMIL_BLOCKS_KEY]
+    atom_type = output[_keys.ATOM_TYPE_KEY].flatten()
+    h_type = model.idp.chemical_symbol_to_type["H"]
+    h_nodes = torch.nonzero(atom_type == h_type, as_tuple=False).flatten()
+    assert h_nodes.numel() > 0
+
+    node_shapes, edge_shapes = infer_block_shapes(output, model.idp)
+    node_valid = block_mask_from_shapes(node_shapes, tuple(node.shape[-2:]))
+    assert torch.count_nonzero(node.masked_select(~node_valid)) == 0
+    edge_valid = block_mask_from_shapes(edge_shapes, tuple(edge.shape[-2:]))
+    assert torch.count_nonzero(edge.masked_select(~edge_valid)) == 0
+
+    # H onsite is 5x5 contiguous; rows 2:5 are its p shell and must carry
+    # signal (union-slot layout left row 2 identically zero).
+    h_block = node[h_nodes[0]]
+    assert torch.count_nonzero(h_block[:5, :5]) > 0
+    assert torch.count_nonzero(h_block[2:5, :5]) > 0
+    assert torch.count_nonzero(h_block[5:, :]) == 0
+    assert torch.count_nonzero(h_block[:, 5:]) == 0
 
 
 def test_route_specific_runtime_semantics_on_real_models(tmp_path):

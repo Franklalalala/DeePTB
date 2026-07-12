@@ -41,7 +41,10 @@ from .output_routes import (
     resolve_output_route,
     select_final_irreps,
 )
-from .block_native_head import apply_ao_basis_mask
+from .block_native_head import (
+    compact_blocks_to_species_layout,
+    species_compact_index,
+)
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
@@ -1359,6 +1362,14 @@ class LemMoEV3(torch.nn.Module):
             )
         return out_node_features, out_edge_features
 
+    def _species_compact_maps(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        cached = getattr(self, "_species_compact_cache", None)
+        if cached is not None and cached[0].device == device:
+            return cached[0], cached[1]
+        index, norb = species_compact_index(self.idp.mask_to_basis.to(device=device))
+        self._species_compact_cache = (index, norb)
+        return index, norb
+
     def _apply_block_native_output_heads(
         self,
         node_features: torch.Tensor,
@@ -1370,16 +1381,25 @@ class LemMoEV3(torch.nn.Module):
         out_node_blocks = self.out_node(node_features)
         out_edge_blocks = self.out_edge(edge_features)
 
-        basis_mask = self.idp.mask_to_basis.to(device=node_features.device)
+        # Heads emit union full-basis slot canvases; blockwise targets/loss use
+        # the species-contiguous layout, so translate at this boundary.
+        compact_index, compact_norb = self._species_compact_maps(node_features.device)
         atom_type = atom_type.to(device=node_features.device, dtype=torch.long).flatten()
-        node_masks = basis_mask[atom_type]
-        out_node_blocks = apply_ao_basis_mask(out_node_blocks, node_masks)
+        out_node_blocks = compact_blocks_to_species_layout(
+            out_node_blocks, compact_index[atom_type], compact_norb[atom_type]
+        )
 
         edge_index = edge_index.to(device=node_features.device)
         active_edges = active_edges.to(device=node_features.device, dtype=torch.long).reshape(-1)
-        row_masks = basis_mask[atom_type[edge_index[0, active_edges]]]
-        col_masks = basis_mask[atom_type[edge_index[1, active_edges]]]
-        out_edge_blocks = apply_ao_basis_mask(out_edge_blocks, row_masks, col_masks)
+        src_type = atom_type[edge_index[0, active_edges]]
+        dst_type = atom_type[edge_index[1, active_edges]]
+        out_edge_blocks = compact_blocks_to_species_layout(
+            out_edge_blocks,
+            compact_index[src_type],
+            compact_norb[src_type],
+            compact_index[dst_type],
+            compact_norb[dst_type],
+        )
         return out_node_blocks, out_edge_blocks
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
