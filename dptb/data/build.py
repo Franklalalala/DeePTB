@@ -284,6 +284,7 @@ class DatasetBuilder:
                 orthogonal=orthogonal,
                 get_Hamiltonian=get_Hamiltonian,
                 get_H0=kwargs.get("get_H0", False),
+                residual_hamiltonian=kwargs.get("residual_hamiltonian", False),
                 get_overlap=get_overlap,
                 get_DM=get_DM,
                 get_eigenvalues=get_eigenvalues,
