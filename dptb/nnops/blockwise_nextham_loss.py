@@ -9,6 +9,7 @@ can reconstruct epoch/DDP metrics without averaging already-sqrt'ed batch losses
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
@@ -82,6 +83,7 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         feature_log_no_grad: bool = True,
         distributed_log_reduce: bool = True,
         expose_component_sums: bool = True,
+        loss_weight: float = 1.0,
         eps: float = 1e-12,
         **kwargs,
     ) -> None:
@@ -115,6 +117,9 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         self.feature_log_no_grad = bool(feature_log_no_grad)
         self.distributed_log_reduce = bool(distributed_log_reduce)
         self.expose_component_sums = bool(expose_component_sums)
+        self.loss_weight = float(loss_weight)
+        if not math.isfinite(self.loss_weight) or self.loss_weight < 0.0:
+            raise ValueError(f"loss_weight must be finite and non-negative, got {loss_weight}.")
         self.eps = float(eps)
         self._clear_last_state()
 
@@ -182,8 +187,9 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
             return l1_rmse_from_components(total_comp, eps=self.eps)
         if self.optimization in {"block_mae_mse", "mae_mse"}:
             # QHFlow2 dense objective form: mean|diff| + mean(diff^2) over
-            # active AO entries (its global x10 weight is an LR scale, not
-            # reproduced here).
+            # active AO entries. Use loss_weight=10 to reproduce its global
+            # Hamiltonian weight; this matters independently of LR when
+            # gradient clipping is enabled.
             def _mae_mse(comp: ComponentSums):
                 count = comp.count.clamp_min(1.0)
                 return comp.abs_sum / count + comp.square_sum / count
@@ -278,8 +284,9 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         opt_loss = feature_total if self.optimization in {"feature", "feature_compatible", "compat"} else block_loss
         if opt_loss is None:
             raise RuntimeError("Could not determine optimization loss.")
+        weighted_opt_loss = self.loss_weight * opt_loss
 
-        self.last_opt_loss = opt_loss.detach()
+        self.last_opt_loss = weighted_opt_loss.detach()
         self.last_block_loss = block_loss.detach() if block_loss is not None else None
         self.last_block_element_mae = block_global_mae.detach()
         self.last_block_onsite_loss = block_onsite.detach()
@@ -304,4 +311,4 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
             feature_edge=component_to_detached(feature_edge_comp) if feature_edge_comp is not None else None,
             feature_total=component_to_detached(feature_total_comp) if feature_total_comp is not None else None,
         )
-        return opt_loss
+        return weighted_opt_loss

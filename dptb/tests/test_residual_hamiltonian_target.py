@@ -109,6 +109,43 @@ def test_residual_guard_rejects_zero_or_garbage_h0():
         assert_residual_target_shrinks(blocks, delta)
 
 
+def test_residual_guard_keeps_complex_magnitude():
+    """Imaginary components must participate in the shrink decision."""
+    from dptb.data.dataset.lmdb_dataset import assert_residual_target_shrinks
+
+    blocks = {"1_1_0_0_0": np.array([[1.0 + 10.0j]])}
+    delta = {"1_1_0_0_0": np.array([[0.1 + 9.0j]])}
+    # Real-only magnitudes would incorrectly see a 10x shrink and pass. The
+    # complex magnitude shrinks by only ~1.12x and must fail the 1.2x guard.
+    with pytest.raises(RuntimeError, match="does not shrink"):
+        assert_residual_target_shrinks(blocks, delta)
+
+
+def test_residual_builder_rejects_prepacked_target_provenance():
+    from dptb.data.dataset.lmdb_dataset import build_residual_hamiltonian_target_blocks
+
+    data = {
+        "hamiltonian_0": {"1_1_0_0_0": np.zeros((1, 1))},
+        "node_delta_hamil_blocks": np.zeros((1, 1, 1)),
+    }
+    blocks = {"1_1_0_0_0": np.ones((1, 1))}
+    with pytest.raises(ValueError, match="already contains prepacked"):
+        build_residual_hamiltonian_target_blocks(data, blocks)
+
+
+def test_residual_builder_validates_every_call_and_block_shape():
+    from dptb.data.dataset.lmdb_dataset import build_residual_hamiltonian_target_blocks
+
+    good_blocks = {"1_1_0_0_0": np.ones((2, 2))}
+    good_data = {"hamiltonian_0": {"1_1_0_0_0": np.full((2, 2), 0.95)}}
+    delta = build_residual_hamiltonian_target_blocks(good_data, good_blocks)
+    assert np.allclose(delta["1_1_0_0_0"], 0.05)
+
+    bad_data = {"hamiltonian_0": {"1_1_0_0_0": np.zeros((1, 2))}}
+    with pytest.raises(ValueError, match="mismatched Hamiltonian/H0 shapes"):
+        build_residual_hamiltonian_target_blocks(bad_data, good_blocks)
+
+
 if __name__ == "__main__":
     off = _masked_mean_abs(_build(False).get(0))
     on = _masked_mean_abs(_build(True).get(0))

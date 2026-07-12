@@ -22,6 +22,7 @@ def test_hamil_blockwise_nextham_argcheck_accepts_rop_config():
                 "log_feature_compatible": True,
                 "feature_log_no_grad": True,
                 "distributed_log_reduce": True,
+                "loss_weight": 10.0,
             },
         },
     }
@@ -29,6 +30,7 @@ def test_hamil_blockwise_nextham_argcheck_accepts_rop_config():
     normalized = train_options().normalize_value(cfg)
     train_options().check_value(normalized, strict=True)
     assert normalized["loss_options"]["train"]["method"] == "hamil_blockwise_nextham"
+    assert normalized["loss_options"]["train"]["loss_weight"] == 10.0
 
 
 def test_hamil_blockwise_mae_mse_optimization_mode():
@@ -71,3 +73,15 @@ def test_hamil_blockwise_mae_mse_optimization_mode():
     expected = abs_sum / 25.0 + sq_sum / 25.0
     assert torch.isfinite(out)
     assert abs(out.item() - expected) < 1e-6
+
+    weighted_loss_fn = HamilBlockwiseNexTHamLoss(
+        basis=basis,
+        optimization="block_mae_mse",
+        block_reduction="global",
+        log_feature_compatible=False,
+        loss_weight=10.0,
+    )
+    weighted = weighted_loss_fn(data, data)
+    assert abs(weighted.item() - 10.0 * expected) < 1e-6
+    assert abs(weighted_loss_fn.last_block_loss.item() - expected) < 1e-6
+    assert abs(weighted_loss_fn.last_opt_loss.item() - 10.0 * expected) < 1e-6

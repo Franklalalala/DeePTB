@@ -6,7 +6,10 @@ from dptb.nn.embedding import Embedding
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
-from dptb.nn.blockwise_hamiltonian import BlockwiseE3Hamiltonian
+from dptb.nn.blockwise_hamiltonian import (
+    BlockwiseE3Hamiltonian,
+    attach_full_hamiltonian_from_h0,
+)
 from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian
 from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
@@ -144,6 +147,13 @@ class NNENV(nn.Module):
         scale_type = prediction_copy.get("scale_type")
         self.scale_type = scale_type
         self.blockwise_hamiltonian = bool(prediction_copy.get("blockwise_hamiltonian", False))
+        self.block_native_add_h0 = bool(prediction_copy.get("add_h0", False))
+        self.block_native_full_output_node_field = prediction_copy.get(
+            "full_output_node_field", "node_full_hamil_blocks"
+        )
+        self.block_native_full_output_edge_field = prediction_copy.get(
+            "full_output_edge_field", "edge_full_hamil_blocks"
+        )
 
         self.has_soc = has_soc
         self.full_soc_prediction = bool(
@@ -400,6 +410,12 @@ class NNENV(nn.Module):
 
         data = self.embedding(data)
         if self.method == "block_native":
+            if self.block_native_add_h0:
+                attach_full_hamiltonian_from_h0(
+                    data,
+                    full_output_node_field=self.block_native_full_output_node_field,
+                    full_output_edge_field=self.block_native_full_output_edge_field,
+                )
             return data
         if hasattr(self, "overlap") and self.method == "sktb":
             data[AtomicDataDict.EDGE_OVERLAP_KEY] = data[AtomicDataDict.EDGE_FEATURES_KEY]

@@ -1738,6 +1738,9 @@ def block_native_prediction():
         Argument("scale_type", str, optional=True, default="no_scale", doc=doc_scale_type),
         Argument("block_decoder", str, optional=True, default="linear", doc=doc_block_decoder),
         Argument("blockwise_hamiltonian", bool, optional=True, default=True, doc=doc_blockwise_hamiltonian),
+        Argument("add_h0", bool, optional=True, default=False, doc="Also expose full-H AO blocks as H0 plus residual block-native predictions. Requires get_H0=true for every dataset split."),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for full node Hamiltonian blocks when add_h0 is true."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for full edge Hamiltonian blocks when add_h0 is true."),
     ]
 
 
@@ -2021,6 +2024,7 @@ def loss_options():
         Argument("feature_log_no_grad", bool, optional=True, default=True),
         Argument("distributed_log_reduce", bool, optional=True, default=True),
         Argument("expose_component_sums", bool, optional=True, default=True),
+        Argument("loss_weight", [int, float], optional=True, default=1.0, doc="Global multiplier applied only to the optimization loss. Set 10.0 for the QHFlow2 Hamiltonian objective; unlike LR scaling, this also changes gradient-clipping behavior."),
         Argument("eps", float, optional=True, default=1e-12),
     ]
 

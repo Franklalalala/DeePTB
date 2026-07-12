@@ -54,20 +54,19 @@ def assert_residual_target_shrinks(
     shrinks ~16x on the water QHFlow2 data). Magnitudes are compared over
     all stored block entries.
     """
-    h_mag = float(
-        np.mean(
-            np.concatenate(
-                [np.abs(np.asarray(v, dtype=np.float64)).ravel() for v in blocks.values()]
-            )
-        )
-    )
-    d_mag = float(
-        np.mean(
-            np.concatenate(
-                [np.abs(np.asarray(v, dtype=np.float64)).ravel() for v in delta_blocks.values()]
-            )
-        )
-    )
+    def _mean_abs(values) -> float:
+        flattened = [
+            np.abs(np.asarray(value)).astype(np.float64, copy=False).ravel()
+            for value in values
+        ]
+        if not flattened:
+            raise ValueError("Cannot validate an empty Hamiltonian block dictionary.")
+        return float(np.mean(np.concatenate(flattened)))
+
+    # Take abs before converting to float so complex/SOC blocks retain their
+    # imaginary contribution in the safety check.
+    h_mag = _mean_abs(blocks.values())
+    d_mag = _mean_abs(delta_blocks.values())
     if not d_mag * min_shrink < h_mag:
         raise RuntimeError(
             "residual_hamiltonian=True, but subtracting H0 does not shrink the "
@@ -77,6 +76,66 @@ def assert_residual_target_shrinks(
             f"convention), or '{h0_key}' is not a valid H0 for it. Refusing to "
             "double-subtract; disable residual_hamiltonian for this dataset."
         )
+
+
+_PREPACKED_HAMILTONIAN_TARGET_KEYS = (
+    AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
+    AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
+    AtomicDataDict.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    AtomicDataDict.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+)
+
+
+def assert_residual_target_source_is_raw(data_dict: Dict[str, Any]) -> None:
+    """Reject ambiguous prepacked targets before the loader can bypass raw H-H0."""
+    prepacked = [key for key in _PREPACKED_HAMILTONIAN_TARGET_KEYS if key in data_dict]
+    if prepacked:
+        raise ValueError(
+            "residual_hamiltonian=True is ambiguous for an LMDB record that "
+            f"already contains prepacked block targets {prepacked}. Their "
+            "absolute-H versus delta-H provenance cannot be inferred safely; "
+            "disable residual_hamiltonian for an already-residual dataset or "
+            "rebuild the block targets from raw Hamiltonian/H0 dictionaries."
+        )
+
+
+def build_residual_hamiltonian_target_blocks(
+    data_dict: Dict[str, Any],
+    blocks: Dict[Any, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+) -> Dict[Any, np.ndarray]:
+    """Build H-H0 targets with fail-closed source and shape validation."""
+    assert_residual_target_source_is_raw(data_dict)
+
+    h0_blocks = data_dict.get(h0_key, None)
+    if h0_blocks is None:
+        raise ValueError(
+            f"residual_hamiltonian=True requires '{h0_key}' blocks in the LMDB record."
+        )
+    missing = [key for key in blocks if key not in h0_blocks]
+    if missing:
+        raise ValueError(
+            f"residual_hamiltonian=True: '{h0_key}' is missing {len(missing)} "
+            f"block key(s) present in the Hamiltonian (first: {missing[:3]}); "
+            "cannot form H-H0."
+        )
+
+    delta_blocks: Dict[Any, np.ndarray] = {}
+    for key, value in blocks.items():
+        h_value = np.asarray(value)
+        h0_value = np.asarray(h0_blocks[key])
+        if h_value.shape != h0_value.shape:
+            raise ValueError(
+                f"residual_hamiltonian=True: block {key!r} has mismatched "
+                f"Hamiltonian/H0 shapes {h_value.shape} vs {h0_value.shape}."
+            )
+        delta_blocks[key] = h_value - h0_value
+
+    # Validate every accessed record. Residual datasets are opt-in, and the
+    # small extra reduction is preferable to silently accepting a mixed shard.
+    assert_residual_target_shrinks(blocks, delta_blocks, h0_key=h0_key)
+    return delta_blocks
 
 
 def _count_offsite_lmdb_blocks(blocks: Any) -> int:
@@ -284,6 +343,11 @@ class LMDBDataset(AtomicDataset):
         self.get_Hamiltonian = get_Hamiltonian
         self.get_H0 = get_H0
         self.residual_hamiltonian = residual_hamiltonian
+        if self.residual_hamiltonian and not self.get_Hamiltonian:
+            raise ValueError(
+                "residual_hamiltonian=True requires get_Hamiltonian=True; "
+                "otherwise the target switch would be a silent no-op."
+            )
         self.get_overlap = get_overlap
         self.get_DM = get_DM
         self.get_eigenvalues = get_eigenvalues
@@ -769,6 +833,8 @@ class LMDBDataset(AtomicDataset):
         # Optional AO-block targets/H0 produced by the blockwise NexTHAM
         # conversion path. Keep this side channel independent of the feature
         # path so existing RME training remains unchanged.
+        if self.get_Hamiltonian and getattr(self, "residual_hamiltonian", False):
+            assert_residual_target_source_is_raw(data_dict)
         for blockwise_key in (
             AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
             AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
@@ -793,27 +859,9 @@ class LMDBDataset(AtomicDataset):
             start_id = 0 if "0_0_0_0_0" in blocks else 1
             block_target_source = blocks
             if getattr(self, "residual_hamiltonian", False):
-                h0_for_delta = data_dict.get(self.h0_key, None)
-                if h0_for_delta is None:
-                    raise ValueError(
-                        f"residual_hamiltonian=True requires '{self.h0_key}' blocks in the LMDB record."
-                    )
-                missing = [k for k in blocks if k not in h0_for_delta]
-                if missing:
-                    raise ValueError(
-                        f"residual_hamiltonian=True: '{self.h0_key}' is missing "
-                        f"{len(missing)} block key(s) present in the Hamiltonian "
-                        f"(first: {missing[:3]}); cannot form H-H0."
-                    )
-                block_target_source = {
-                    k: np.asarray(blocks[k]) - np.asarray(h0_for_delta[k])
-                    for k in blocks
-                }
-                if not getattr(self, "_residual_guard_done", False):
-                    assert_residual_target_shrinks(
-                        blocks, block_target_source, h0_key=self.h0_key
-                    )
-                    self._residual_guard_done = True
+                block_target_source = build_residual_hamiltonian_target_blocks(
+                    data_dict, blocks, h0_key=self.h0_key
+                )
             target_blocks = block_dict_to_ordered_tensors(
                 atomicdata,
                 self.type_mapper,

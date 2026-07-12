@@ -9,9 +9,11 @@ from dptb.data import _keys
 from dptb.data.interfaces.blockwise_tensor import (
     EDGE_DELTA_HAMIL_BLOCKS_KEY,
     EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    EDGE_H0_BLOCKS_KEY,
     EDGE_PRED_HAMIL_BLOCKS_KEY,
     NODE_DELTA_HAMIL_BLOCKS_KEY,
     NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+    NODE_H0_BLOCKS_KEY,
     NODE_PRED_HAMIL_BLOCKS_KEY,
     block_mask_from_shapes,
     infer_block_shapes,
@@ -70,7 +72,7 @@ def _embedding_options(route: str, tmp_path: Path) -> dict:
     return options
 
 
-def _build(route: str, tmp_path: Path):
+def _build(route: str, tmp_path: Path, prediction_overrides: dict | None = None):
     spec = get_output_route_spec(route)
     prediction = {
         "method": spec.prediction_method,
@@ -83,6 +85,8 @@ def _build(route: str, tmp_path: Path):
                 "blockwise_hamiltonian": True,
             }
         )
+    if prediction_overrides:
+        prediction.update(prediction_overrides)
     return build_model(
         common_options={
             "basis": BASIS,
@@ -97,6 +101,30 @@ def _build(route: str, tmp_path: Path):
         train_options={},
         no_check=False,
     )
+
+
+def test_block_native_add_h0_exposes_full_h_without_changing_residual(tmp_path):
+    model = _build("h_b0", tmp_path, {"add_h0": True})
+    data = _data(model)
+    max_norb = model.idp.full_basis_norb
+    data[NODE_H0_BLOCKS_KEY] = torch.randn(2, max_norb, max_norb)
+    data[EDGE_H0_BLOCKS_KEY] = torch.randn(2, max_norb, max_norb)
+    h0_node = data[NODE_H0_BLOCKS_KEY].clone()
+    h0_edge = data[EDGE_H0_BLOCKS_KEY].clone()
+
+    output = model(data)
+    residual_node = output[NODE_PRED_HAMIL_BLOCKS_KEY]
+    residual_edge = output[EDGE_PRED_HAMIL_BLOCKS_KEY]
+    assert torch.equal(output["node_full_hamil_blocks"], h0_node + residual_node)
+    assert torch.equal(output["edge_full_hamil_blocks"], h0_edge + residual_edge)
+    assert torch.equal(output[NODE_PRED_HAMIL_BLOCKS_KEY], residual_node)
+    assert torch.equal(output[EDGE_PRED_HAMIL_BLOCKS_KEY], residual_edge)
+
+
+def test_block_native_add_h0_fails_closed_without_converted_h0(tmp_path):
+    model = _build("h_b0", tmp_path, {"add_h0": True})
+    with pytest.raises(KeyError, match="Enable get_H0"):
+        model(_data(model))
 
 
 def _data(model):

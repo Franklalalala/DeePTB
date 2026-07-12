@@ -32,6 +32,58 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.nn.hamiltonian import E3Hamiltonian
 
 
+def attach_full_hamiltonian_from_h0(
+    data: Dict[str, Any],
+    *,
+    pred_node_field: str = NODE_PRED_HAMIL_BLOCKS_KEY,
+    pred_edge_field: str = EDGE_PRED_HAMIL_BLOCKS_KEY,
+    full_output_node_field: str = "node_full_hamil_blocks",
+    full_output_edge_field: str = "edge_full_hamil_blocks",
+) -> Dict[str, Any]:
+    """Expose full-H blocks while preserving residual predictions for loss.
+
+    Residual training keeps ``pred_*`` fields as delta-H so the blockwise loss
+    can compare them with residual targets.  Downstream Hamiltonian consumers
+    must use the explicit ``full_output_*`` fields produced here.
+    """
+    required = (
+        pred_node_field,
+        pred_edge_field,
+        NODE_H0_BLOCKS_KEY,
+        EDGE_H0_BLOCKS_KEY,
+    )
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise KeyError(
+            "add_h0=True requires residual node/edge predictions and converted "
+            f"node/edge H0 blocks; missing {missing}. Enable get_H0 for every "
+            "dataset split used with this model."
+        )
+
+    pred_node = data[pred_node_field]
+    pred_edge = data[pred_edge_field]
+    h0_node = data[NODE_H0_BLOCKS_KEY].to(
+        device=pred_node.device, dtype=pred_node.dtype
+    )
+    h0_edge = data[EDGE_H0_BLOCKS_KEY].to(
+        device=pred_edge.device, dtype=pred_edge.dtype
+    )
+    if tuple(h0_node.shape) != tuple(pred_node.shape):
+        raise ValueError(
+            "Node H0/prediction block shapes differ: "
+            f"h0={tuple(h0_node.shape)}, pred={tuple(pred_node.shape)}."
+        )
+    if tuple(h0_edge.shape) != tuple(pred_edge.shape):
+        raise ValueError(
+            "Edge H0/prediction block shapes differ: "
+            f"h0={tuple(h0_edge.shape)}, pred={tuple(pred_edge.shape)}."
+        )
+
+    data[full_output_node_field] = h0_node + pred_node
+    data[full_output_edge_field] = h0_edge + pred_edge
+    return data
+
+
 class BlockwiseE3Hamiltonian(nn.Module):
     """Decode equivariant Hamiltonian features and expose AO-block predictions.
 
@@ -110,14 +162,11 @@ class BlockwiseE3Hamiltonian(nn.Module):
             edge_shape_key=self.output_edge_shape_field,
         )
         if self.add_h0:
-            if packed.node_blocks is not None and NODE_H0_BLOCKS_KEY in data:
-                data[self.full_output_node_field] = data[NODE_H0_BLOCKS_KEY].to(
-                    device=packed.node_blocks.device,
-                    dtype=packed.node_blocks.dtype,
-                ) + packed.node_blocks
-            if packed.edge_blocks is not None and EDGE_H0_BLOCKS_KEY in data:
-                data[self.full_output_edge_field] = data[EDGE_H0_BLOCKS_KEY].to(
-                    device=packed.edge_blocks.device,
-                    dtype=packed.edge_blocks.dtype,
-                ) + packed.edge_blocks
+            attach_full_hamiltonian_from_h0(
+                data,
+                pred_node_field=self.output_node_field,
+                pred_edge_field=self.output_edge_field,
+                full_output_node_field=self.full_output_node_field,
+                full_output_edge_field=self.full_output_edge_field,
+            )
         return data
