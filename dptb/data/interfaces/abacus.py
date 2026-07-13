@@ -57,6 +57,7 @@ def recursive_parse(input_path,
                     output_mode="conv",
                     data_name="OUT.ABACUS",
                     parse_Hamiltonian=False, 
+                    parse_H0=False,
                     parse_overlap=False,
                     parse_DM=False, 
                     parse_eigenvalues=False,
@@ -71,6 +72,8 @@ def recursive_parse(input_path,
     `only_overlap`: usually `False`. 
                     set to `True` if the calculation job is getting overlap matrix ONLY.
     `parse_Hamiltonian`: determine whether parsing the Hamiltonian `.csr` file or not.
+    `parse_H0`: parse `data-HR0_SPIN0.csr` into the raw `hamiltonian_0`
+                field. This keeps the absolute Hamiltonian in `hamiltonian`.
     `add_overlap`: determine whether parsing the overlap `.csr` file or not.
                    `parse_Hamiltonian` must be true to add overlap.
     `parse_eigenvalues`: determine whether parsing `kpoints.dat` and `BAND_1.dat` or not.
@@ -110,11 +113,16 @@ def recursive_parse(input_path,
                                     lmdb_env=lmdb_env,
                                     idx=index,
                                     get_Ham=parse_Hamiltonian,
+                                    get_H0=parse_H0,
                                     get_DM=parse_DM,
                                     get_overlap=parse_overlap, 
                                     get_eigenvalues=parse_eigenvalues)
                     #h5file_names.append(os.path.join(file, "AtomicData.h5"))
                     if os.path.exists(os.path.join(folder, data_name, "running_md.log")):
+                        if parse_H0:
+                            raise NotImplementedError(
+                                "parse_H0 is currently supported for single-point ABACUS data only."
+                            )
                         if output_mode == "lmdb":
                             raise NotImplementedError("LMDB mode is not supported for molecular dynamics.")
                         tasktype = tasktype + "molecular_dynamics"
@@ -148,6 +156,7 @@ def _abacus_parse(input_path,
                   lmdb_env=None,
                   only_S=False, 
                   get_Ham=False,
+                  get_H0=False,
                   get_DM=False,
                   get_overlap=False, 
                   get_eigenvalues=False):
@@ -383,6 +392,23 @@ def _abacus_parse(input_path,
             # hamiltonian_dict = pickle.dumps(dict(zip(kk, vv)))
             # hamiltonian_dict = pickle.dumps(hamiltonian_dict)
             data_dict["hamiltonian"] = hamiltonian_dict
+        else:
+            raise NotImplementedError(f"output_mode {output_mode} is not supported.")
+
+    if get_H0:
+        h0_dict, tmp = parse_matrix(
+            os.path.join(input_path, data_name, "data-HR0_SPIN0.csr"),
+            13.605698,  # Ryd2eV
+            spinful=spinful,
+        )
+        assert tmp == norbits * (1 + spinful)
+        if output_mode == "conv":
+            with h5py.File(os.path.join(output_path, "hamiltonians_0.h5"), "w") as fid:
+                default_group = fid.create_group("0")
+                for key_str, value in h0_dict.items():
+                    default_group[key_str] = value
+        elif output_mode == "lmdb":
+            data_dict["hamiltonian_0"] = h0_dict
         else:
             raise NotImplementedError(f"output_mode {output_mode} is not supported.")
 

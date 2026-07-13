@@ -102,6 +102,12 @@ EDGE_HAMILTONIAN_KEY: Final[str] = "edge_hamiltonian"
 NODE_HAMILTONIAN_KEY: Final[str] = "node_hamiltonian"
 EDGE_H0_KEY: Final[str] = "edge_h0"
 NODE_H0_KEY: Final[str] = "node_h0"
+# P2 physical Hamiltonian prior.  Keep this contract independent from the
+# historical stored-H0 path: P2 is assembled from transferable two-centre
+# tables plus factorized non-local projector contributions and is available at
+# inference without a per-structure H0 calculation.
+EDGE_P2_KEY: Final[str] = "edge_p2"
+NODE_P2_KEY: Final[str] = "node_p2"
 # Dedicated offline DFT H[rho0] features.  Keep these separate from legacy
 # H0/Hueckel fields so provenance and fallback semantics cannot mix.
 EDGE_PHYSICAL_H0_KEY: Final[str] = "edge_physical_h0"
@@ -114,6 +120,16 @@ EDGE_H0_BLOCKS_KEY: Final[str] = "edge_h0_blocks"
 NODE_H0_BLOCKS_KEY: Final[str] = "node_h0_blocks"
 EDGE_H0_BLOCK_SHAPE_KEY: Final[str] = "edge_h0_block_shape"
 NODE_H0_BLOCK_SHAPE_KEY: Final[str] = "node_h0_block_shape"
+EDGE_P2_BLOCKS_KEY: Final[str] = "edge_p2_blocks"
+NODE_P2_BLOCKS_KEY: Final[str] = "node_p2_blocks"
+EDGE_P2_BLOCK_SHAPE_KEY: Final[str] = "edge_p2_block_shape"
+NODE_P2_BLOCK_SHAPE_KEY: Final[str] = "node_p2_block_shape"
+# Absolute Full-H supervision has dedicated names.  Historical ``delta`` names
+# remain available for H0->dH training, but must never be reinterpreted as Full H.
+EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY: Final[str] = "edge_full_hamil_target_blocks"
+NODE_FULL_HAMIL_TARGET_BLOCKS_KEY: Final[str] = "node_full_hamil_target_blocks"
+EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY: Final[str] = "edge_full_hamil_target_block_shape"
+NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY: Final[str] = "node_full_hamil_target_block_shape"
 HAAR_U0_KEY: Final[str] = "haar_u0"
 HAAR_NODE_FEATURES_KEY: Final[str] = "haar_node_features"
 HAAR_EDGE_FEATURES_KEY: Final[str] = "haar_edge_features"

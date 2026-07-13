@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple, Union
 
+import torch
 import torch.nn as nn
 
 try:
@@ -23,13 +24,96 @@ except Exception:  # pragma: no cover
 
 from dptb.data.interfaces.blockwise_tensor import (
     EDGE_H0_BLOCKS_KEY,
+    EDGE_P2_BLOCKS_KEY,
     EDGE_PRED_HAMIL_BLOCKS_KEY,
     NODE_H0_BLOCKS_KEY,
+    NODE_P2_BLOCKS_KEY,
     NODE_PRED_HAMIL_BLOCKS_KEY,
     attach_prediction_block_tensors,
     feature_tensors_to_block_tensors,
 )
 from dptb.nn.hamiltonian import E3Hamiltonian
+
+
+def attach_full_hamiltonian_from_prior(
+    data: Dict[str, Any],
+    *,
+    pred_node_field: str = NODE_PRED_HAMIL_BLOCKS_KEY,
+    pred_edge_field: str = EDGE_PRED_HAMIL_BLOCKS_KEY,
+    prior_node_field: str,
+    prior_edge_field: str,
+    full_output_node_field: str = "node_full_hamil_blocks",
+    full_output_edge_field: str = "edge_full_hamil_blocks",
+    prior_label: str = "physical prior",
+    non_soc_only: bool = False,
+    validate_prior_blocks: bool = False,
+    missing_hint: str = "",
+) -> Dict[str, Any]:
+    """Expose Full-H blocks while preserving correction predictions.
+
+    The model head is parameterized as a correction, but the physical task can
+    remain absolute Full-H supervision by pointing the blockwise loss at the
+    explicit ``full_output_*`` fields produced here.
+    """
+    required = (
+        pred_node_field,
+        pred_edge_field,
+        prior_node_field,
+        prior_edge_field,
+    )
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise KeyError(
+            f"Full-H reconstruction from {prior_label} requires correction "
+            f"predictions and converted node/edge prior blocks; missing {missing}."
+            f"{missing_hint}"
+        )
+
+    pred_node = data[pred_node_field]
+    pred_edge = data[pred_edge_field]
+    if not isinstance(pred_node, torch.Tensor) or not isinstance(pred_edge, torch.Tensor):
+        raise TypeError("Hamiltonian correction block fields must be torch.Tensor values.")
+    raw_prior_node = data[prior_node_field]
+    raw_prior_edge = data[prior_edge_field]
+    if not isinstance(raw_prior_node, torch.Tensor) or not isinstance(
+        raw_prior_edge, torch.Tensor
+    ):
+        raise TypeError(f"{prior_label} block fields must be torch.Tensor values.")
+    if non_soc_only and (
+        torch.is_complex(raw_prior_node)
+        or torch.is_complex(raw_prior_edge)
+        or torch.is_complex(pred_node)
+        or torch.is_complex(pred_edge)
+    ):
+        raise TypeError(
+            f"{prior_label} Full-H reconstruction is non-SOC only in this path; "
+            "complex prior blocks are not supported."
+        )
+    prior_node = raw_prior_node.to(
+        device=pred_node.device, dtype=pred_node.dtype
+    )
+    prior_edge = raw_prior_edge.to(
+        device=pred_edge.device, dtype=pred_edge.dtype
+    )
+    if tuple(prior_node.shape) != tuple(pred_node.shape):
+        raise ValueError(
+            f"Node {prior_label}/prediction block shapes differ: "
+            f"prior={tuple(prior_node.shape)}, pred={tuple(pred_node.shape)}."
+        )
+    if tuple(prior_edge.shape) != tuple(pred_edge.shape):
+        raise ValueError(
+            f"Edge {prior_label}/prediction block shapes differ: "
+            f"prior={tuple(prior_edge.shape)}, pred={tuple(pred_edge.shape)}."
+        )
+    if validate_prior_blocks and (
+        not torch.isfinite(prior_node).all()
+        or not torch.isfinite(prior_edge).all()
+    ):
+        raise ValueError(f"{prior_label} blocks contain NaN or infinity.")
+
+    data[full_output_node_field] = prior_node + pred_node
+    data[full_output_edge_field] = prior_edge + pred_edge
+    return data
 
 
 def attach_full_hamiltonian_from_h0(
@@ -39,49 +123,22 @@ def attach_full_hamiltonian_from_h0(
     pred_edge_field: str = EDGE_PRED_HAMIL_BLOCKS_KEY,
     full_output_node_field: str = "node_full_hamil_blocks",
     full_output_edge_field: str = "edge_full_hamil_blocks",
+    validate_prior_blocks: bool = False,
 ) -> Dict[str, Any]:
-    """Expose full-H blocks while preserving residual predictions for loss.
-
-    Residual training keeps ``pred_*`` fields as delta-H so the blockwise loss
-    can compare them with residual targets.  Downstream Hamiltonian consumers
-    must use the explicit ``full_output_*`` fields produced here.
-    """
-    required = (
-        pred_node_field,
-        pred_edge_field,
-        NODE_H0_BLOCKS_KEY,
-        EDGE_H0_BLOCKS_KEY,
+    """Backward-compatible H0 wrapper around generic prior reconstruction."""
+    return attach_full_hamiltonian_from_prior(
+        data,
+        pred_node_field=pred_node_field,
+        pred_edge_field=pred_edge_field,
+        prior_node_field=NODE_H0_BLOCKS_KEY,
+        prior_edge_field=EDGE_H0_BLOCKS_KEY,
+        full_output_node_field=full_output_node_field,
+        full_output_edge_field=full_output_edge_field,
+        prior_label="H0",
+        non_soc_only=False,
+        validate_prior_blocks=validate_prior_blocks,
+        missing_hint=" Enable get_H0 for every dataset split used with this model.",
     )
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise KeyError(
-            "add_h0=True requires residual node/edge predictions and converted "
-            f"node/edge H0 blocks; missing {missing}. Enable get_H0 for every "
-            "dataset split used with this model."
-        )
-
-    pred_node = data[pred_node_field]
-    pred_edge = data[pred_edge_field]
-    h0_node = data[NODE_H0_BLOCKS_KEY].to(
-        device=pred_node.device, dtype=pred_node.dtype
-    )
-    h0_edge = data[EDGE_H0_BLOCKS_KEY].to(
-        device=pred_edge.device, dtype=pred_edge.dtype
-    )
-    if tuple(h0_node.shape) != tuple(pred_node.shape):
-        raise ValueError(
-            "Node H0/prediction block shapes differ: "
-            f"h0={tuple(h0_node.shape)}, pred={tuple(pred_node.shape)}."
-        )
-    if tuple(h0_edge.shape) != tuple(pred_edge.shape):
-        raise ValueError(
-            "Edge H0/prediction block shapes differ: "
-            f"h0={tuple(h0_edge.shape)}, pred={tuple(pred_edge.shape)}."
-        )
-
-    data[full_output_node_field] = h0_node + pred_node
-    data[full_output_edge_field] = h0_edge + pred_edge
-    return data
 
 
 class BlockwiseE3Hamiltonian(nn.Module):
@@ -111,6 +168,11 @@ class BlockwiseE3Hamiltonian(nn.Module):
         complete_edges: bool = True,
         strict_complete_edges: bool = False,
         add_h0: bool = False,
+        add_prior: bool = False,
+        prior_node_block_field: str = NODE_P2_BLOCKS_KEY,
+        prior_edge_block_field: str = EDGE_P2_BLOCKS_KEY,
+        prior_label: str = "P2",
+        validate_prior_blocks: bool = False,
         full_output_node_field: str = "node_full_hamil_blocks",
         full_output_edge_field: str = "edge_full_hamil_blocks",
         **kwargs,
@@ -137,6 +199,13 @@ class BlockwiseE3Hamiltonian(nn.Module):
         self.complete_edges = bool(complete_edges)
         self.strict_complete_edges = bool(strict_complete_edges)
         self.add_h0 = bool(add_h0)
+        self.add_prior = bool(add_prior)
+        if self.add_h0 and self.add_prior:
+            raise ValueError("add_h0 and add_prior are mutually exclusive.")
+        self.prior_node_block_field = str(prior_node_block_field)
+        self.prior_edge_block_field = str(prior_edge_block_field)
+        self.prior_label = str(prior_label)
+        self.validate_prior_blocks = bool(validate_prior_blocks)
         self.full_output_node_field = full_output_node_field
         self.full_output_edge_field = full_output_edge_field
 
@@ -168,5 +237,19 @@ class BlockwiseE3Hamiltonian(nn.Module):
                 pred_edge_field=self.output_edge_field,
                 full_output_node_field=self.full_output_node_field,
                 full_output_edge_field=self.full_output_edge_field,
+                validate_prior_blocks=self.validate_prior_blocks,
+            )
+        elif self.add_prior:
+            attach_full_hamiltonian_from_prior(
+                data,
+                pred_node_field=self.output_node_field,
+                pred_edge_field=self.output_edge_field,
+                prior_node_field=self.prior_node_block_field,
+                prior_edge_field=self.prior_edge_block_field,
+                full_output_node_field=self.full_output_node_field,
+                full_output_edge_field=self.full_output_edge_field,
+                prior_label=self.prior_label,
+                non_soc_only=True,
+                validate_prior_blocks=self.validate_prior_blocks,
             )
         return data

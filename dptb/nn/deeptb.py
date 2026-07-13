@@ -9,6 +9,7 @@ from dptb.data import AtomicDataDict
 from dptb.nn.blockwise_hamiltonian import (
     BlockwiseE3Hamiltonian,
     attach_full_hamiltonian_from_h0,
+    attach_full_hamiltonian_from_prior,
 )
 from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian
 from dptb.nn.nnsk import NNSK
@@ -148,6 +149,19 @@ class NNENV(nn.Module):
         self.scale_type = scale_type
         self.blockwise_hamiltonian = bool(prediction_copy.get("blockwise_hamiltonian", False))
         self.block_native_add_h0 = bool(prediction_copy.get("add_h0", False))
+        self.block_native_add_prior = bool(prediction_copy.get("add_prior", False))
+        if self.block_native_add_h0 and self.block_native_add_prior:
+            raise ValueError("prediction.add_h0 and prediction.add_prior are mutually exclusive.")
+        self.block_native_prior_node_field = prediction_copy.get(
+            "prior_node_block_field", AtomicDataDict.NODE_P2_BLOCKS_KEY
+        )
+        self.block_native_prior_edge_field = prediction_copy.get(
+            "prior_edge_block_field", AtomicDataDict.EDGE_P2_BLOCKS_KEY
+        )
+        self.block_native_prior_label = prediction_copy.get("prior_label", "P2")
+        self.block_native_validate_prior_blocks = bool(
+            prediction_copy.get("validate_prior_blocks", False)
+        )
         self.block_native_full_output_node_field = prediction_copy.get(
             "full_output_node_field", "node_full_hamil_blocks"
         )
@@ -361,6 +375,11 @@ class NNENV(nn.Module):
                     "complete_edges",
                     "strict_complete_edges",
                     "add_h0",
+                    "add_prior",
+                    "prior_node_block_field",
+                    "prior_edge_block_field",
+                    "prior_label",
+                    "validate_prior_blocks",
                     "full_output_node_field",
                     "full_output_edge_field",
                 ):
@@ -415,6 +434,18 @@ class NNENV(nn.Module):
                     data,
                     full_output_node_field=self.block_native_full_output_node_field,
                     full_output_edge_field=self.block_native_full_output_edge_field,
+                    validate_prior_blocks=self.block_native_validate_prior_blocks,
+                )
+            elif self.block_native_add_prior:
+                attach_full_hamiltonian_from_prior(
+                    data,
+                    prior_node_field=self.block_native_prior_node_field,
+                    prior_edge_field=self.block_native_prior_edge_field,
+                    full_output_node_field=self.block_native_full_output_node_field,
+                    full_output_edge_field=self.block_native_full_output_edge_field,
+                    prior_label=self.block_native_prior_label,
+                    non_soc_only=True,
+                    validate_prior_blocks=self.block_native_validate_prior_blocks,
                 )
             return data
         if hasattr(self, "overlap") and self.method == "sktb":

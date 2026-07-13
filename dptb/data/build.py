@@ -284,12 +284,23 @@ class DatasetBuilder:
                 orthogonal=orthogonal,
                 get_Hamiltonian=get_Hamiltonian,
                 get_H0=kwargs.get("get_H0", False),
+                get_P2=kwargs.get("get_P2", False),
                 residual_hamiltonian=kwargs.get("residual_hamiltonian", False),
                 get_overlap=get_overlap,
                 get_DM=get_DM,
                 get_eigenvalues=get_eigenvalues,
                 h0_key=kwargs.get("h0_key", "hamiltonian_0"),
                 prefer_precomputed_h0=kwargs.get("prefer_precomputed_h0", True),
+                p2_key=kwargs.get("p2_key", "hamiltonian_p2"),
+                prefer_precomputed_p2=kwargs.get("prefer_precomputed_p2", True),
+                require_p2_blocks=kwargs.get("require_p2_blocks", False),
+                require_full_h_target=kwargs.get("require_full_h_target", False),
+                expected_p2_source_fingerprint=kwargs.get(
+                    "expected_p2_source_fingerprint", ""
+                ),
+                audit_p2_representations=kwargs.get(
+                    "audit_p2_representations", False
+                ),
                 info_files = info_files
             )
 

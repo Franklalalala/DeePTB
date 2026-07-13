@@ -65,6 +65,21 @@ EDGE_H0_BLOCKS_KEY = "edge_h0_blocks"
 NODE_H0_BLOCK_SHAPE_KEY = "node_h0_block_shape"
 EDGE_H0_BLOCK_SHAPE_KEY = "edge_h0_block_shape"
 
+# Converted P2 physical-prior tensors.  These must not alias the H0 fields:
+# P2 is a transferable table/factorized assembly available from structure,
+# basis and pseudopotential metadata alone.
+NODE_P2_BLOCKS_KEY = "node_p2_blocks"
+EDGE_P2_BLOCKS_KEY = "edge_p2_blocks"
+NODE_P2_BLOCK_SHAPE_KEY = "node_p2_block_shape"
+EDGE_P2_BLOCK_SHAPE_KEY = "edge_p2_block_shape"
+
+# Dedicated absolute Full-H target fields.  Do not alias the historical
+# ``*_delta_hamil_*`` fields: those remain the dH contract for H0 residual runs.
+NODE_FULL_HAMIL_TARGET_BLOCKS_KEY = "node_full_hamil_target_blocks"
+EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY = "edge_full_hamil_target_blocks"
+NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY = "node_full_hamil_target_block_shape"
+EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY = "edge_full_hamil_target_block_shape"
+
 # Model prediction keys used by the block loss.
 NODE_PRED_HAMIL_BLOCKS_KEY = "node_hamil_blocks"
 EDGE_PRED_HAMIL_BLOCKS_KEY = "edge_hamil_blocks"
@@ -201,9 +216,26 @@ def edge_shift_from_data(data: Mapping[str, Any], *, n_edges: Optional[int] = No
     if shift is None:
         n = int(n_edges if n_edges is not None else edge_index_from_data(data).shape[1])
         return torch.zeros((n, 3), dtype=torch.long, device=device)
-    # Some existing LMDBs store shifts as float32.  They are cell translations,
-    # so round before casting to long.
-    return as_tensor(shift, device=device).round().to(dtype=torch.long)
+    # Some existing LMDBs store shifts as float32.  They are exact lattice
+    # translations: validate once and never let separate paths choose between
+    # rounding and truncation.
+    value = as_tensor(shift, device=device)
+    if value.ndim != 2 or value.shape[-1] != 3:
+        raise ValueError(f"edge_cell_shift must have shape [E,3], got {tuple(value.shape)}.")
+    if n_edges is not None and value.shape[0] != int(n_edges):
+        raise ValueError(
+            f"edge_cell_shift rows {value.shape[0]} do not match n_edges={int(n_edges)}."
+        )
+    if not torch.isfinite(value).all():
+        raise ValueError("edge_cell_shift contains NaN or infinity.")
+    rounded = value.round()
+    max_error = float((value - rounded).abs().max().detach().cpu()) if value.numel() else 0.0
+    if max_error > 1.0e-6:
+        raise ValueError(
+            "edge_cell_shift must be integer-valued within 1e-6; "
+            f"max error is {max_error:.3e}."
+        )
+    return rounded.to(dtype=torch.long)
 
 
 def matrix_shape_for_symbol(idp: Any, symbol: str) -> Tuple[int, int]:
@@ -233,6 +265,119 @@ def block_mask_from_shapes(shapes: torch.Tensor, block_hw: Tuple[int, int]) -> t
     rows = torch.arange(h, device=shapes.device).view(1, h, 1)
     cols = torch.arange(w, device=shapes.device).view(1, 1, w)
     return (rows < shapes[:, 0].view(-1, 1, 1)) & (cols < shapes[:, 1].view(-1, 1, 1))
+
+
+def validate_packed_non_soc_blocks(
+    data: Mapping[str, Any],
+    idp: Any,
+    node_blocks: Any,
+    edge_blocks: Any,
+    node_shapes: Any,
+    edge_shapes: Any,
+    *,
+    label: str,
+    require_symmetric_edges: bool = True,
+    atol: float = 2.0e-5,
+    rtol: float = 2.0e-5,
+    padding_atol: float = 0.0,
+) -> None:
+    """Validate species shapes, zero padding, and real-Hermiticity.
+
+    This is intentionally an ingest/audit check rather than a model-forward
+    check.  Raw and prepacked P2/Full-H tensors therefore pass through the same
+    contract before they can become row-aligned model inputs or targets.
+    """
+
+    ensure_non_soc_mapper(idp)
+    node = as_tensor(node_blocks)
+    edge = as_tensor(edge_blocks)
+    nshape = as_tensor(node_shapes, dtype=torch.long, device=node.device)
+    eshape = as_tensor(edge_shapes, dtype=torch.long, device=edge.device)
+    if node.ndim != 3 or edge.ndim != 3:
+        raise ValueError(
+            f"{label} blocks must be rank-3 node/edge canvases; got "
+            f"{tuple(node.shape)} and {tuple(edge.shape)}."
+        )
+    if node.is_complex() or edge.is_complex():
+        raise NotImplementedError(f"{label} strict validator is non-SOC only.")
+    if not torch.is_floating_point(node) or not torch.is_floating_point(edge):
+        raise TypeError(f"{label} blocks must be floating point.")
+    if not torch.isfinite(node).all() or not torch.isfinite(edge).all():
+        raise ValueError(f"{label} blocks contain NaN or infinity.")
+    if tuple(nshape.shape) != (node.shape[0], 2):
+        raise ValueError(
+            f"{label} node shape metadata must be {(node.shape[0], 2)}, got {tuple(nshape.shape)}."
+        )
+    if tuple(eshape.shape) != (edge.shape[0], 2):
+        raise ValueError(
+            f"{label} edge shape metadata must be {(edge.shape[0], 2)}, got {tuple(eshape.shape)}."
+        )
+
+    expected_node, expected_edge = infer_block_shapes(data, idp)
+    expected_node = expected_node.to(device=nshape.device)
+    expected_edge = expected_edge.to(device=eshape.device)
+    if not torch.equal(nshape, expected_node):
+        bad = torch.nonzero((nshape != expected_node).any(dim=1), as_tuple=False).flatten()
+        preview = bad[:8].detach().cpu().tolist()
+        raise ValueError(
+            f"{label} node shapes do not match atom species at rows {preview}."
+        )
+    if not torch.equal(eshape, expected_edge):
+        bad = torch.nonzero((eshape != expected_edge).any(dim=1), as_tuple=False).flatten()
+        preview = bad[:8].detach().cpu().tolist()
+        raise ValueError(
+            f"{label} edge shapes do not match ordered bond species at rows {preview}."
+        )
+
+    for blocks, shapes, kind in ((node, nshape, "node"), (edge, eshape, "edge")):
+        limits = torch.as_tensor(blocks.shape[-2:], dtype=torch.long, device=shapes.device)
+        if bool((shapes > limits).any().detach().cpu()):
+            raise ValueError(
+                f"{label} {kind} shapes exceed canvas {tuple(blocks.shape[-2:])}."
+            )
+        valid = block_mask_from_shapes(shapes, tuple(blocks.shape[-2:]))
+        padding = blocks.masked_select(~valid)
+        max_padding = (
+            float(padding.abs().max().detach().cpu()) if padding.numel() else 0.0
+        )
+        if max_padding > float(padding_atol):
+            raise ValueError(
+                f"{label} {kind} canvas has non-zero padding; max abs {max_padding:.3e}."
+            )
+
+    for index, (rows, cols) in enumerate(nshape.detach().cpu().tolist()):
+        block = node[index, : int(rows), : int(cols)]
+        if not torch.allclose(block, block.transpose(-1, -2), atol=atol, rtol=rtol):
+            error = float((block - block.transpose(-1, -2)).abs().max().detach().cpu())
+            raise ValueError(
+                f"{label} onsite row {index} is not symmetric; max abs {error:.3e}."
+            )
+
+    reverse = reverse_edge_index(data, device=edge.device)
+    if require_symmetric_edges and bool((reverse < 0).any().detach().cpu()):
+        missing = torch.nonzero(reverse < 0, as_tuple=False).flatten()[:8].detach().cpu().tolist()
+        raise ValueError(
+            f"{label} requires a symmetric directed graph; missing reverse rows for {missing}."
+        )
+    for index, reverse_index in enumerate(reverse.detach().cpu().tolist()):
+        if reverse_index < 0 or index > int(reverse_index):
+            continue
+        rows, cols = [int(x) for x in eshape[index].detach().cpu().tolist()]
+        reverse_rows, reverse_cols = [
+            int(x) for x in eshape[int(reverse_index)].detach().cpu().tolist()
+        ]
+        if (rows, cols) != (reverse_cols, reverse_rows):
+            raise ValueError(
+                f"{label} reverse edge shapes disagree at rows {index}/{reverse_index}."
+            )
+        direct = edge[index, :rows, :cols]
+        opposite = edge[int(reverse_index), :reverse_rows, :reverse_cols].transpose(-1, -2)
+        if not torch.allclose(direct, opposite, atol=atol, rtol=rtol):
+            error = float((direct - opposite).abs().max().detach().cpu())
+            raise ValueError(
+                f"{label} reverse-edge Hermiticity mismatch at rows "
+                f"{index}/{reverse_index}; max abs {error:.3e}."
+            )
 
 
 def block_key(i: int, j: int, shift: Sequence[int], *, start_id: int = 0) -> str:
@@ -302,7 +447,13 @@ def reverse_edge_index(data: Mapping[str, Any], *, device=None) -> torch.Tensor:
     lookup: Dict[Tuple[int, int, int, int, int], int] = {}
     for e, (u, v) in enumerate(edge_index.T.tolist()):
         r0, r1, r2 = [int(x) for x in shift[e].tolist()]
-        lookup[(int(u), int(v), r0, r1, r2)] = int(e)
+        edge_key = (int(u), int(v), r0, r1, r2)
+        if edge_key in lookup:
+            raise ValueError(
+                f"edge graph contains duplicate directed edge {edge_key}; "
+                "row-aligned Hamiltonian data would be ambiguous."
+            )
+        lookup[edge_key] = int(e)
     rev = []
     for e, (u, v) in enumerate(edge_index.T.tolist()):
         r0, r1, r2 = [int(x) for x in shift[e].tolist()]
@@ -467,7 +618,12 @@ def _to_block_tensor(value: Any, *, dtype: Optional[torch.dtype] = None) -> torc
 
 def _put_padded(dst: torch.Tensor, index: int, block: torch.Tensor, shape: Tuple[int, int]) -> None:
     rows, cols = shape
-    dst[index, :rows, :cols] = block[:rows, :cols].to(device=dst.device, dtype=dst.dtype)
+    if tuple(block.shape) != (int(rows), int(cols)):
+        raise ValueError(
+            f"AO block shape {tuple(block.shape)} does not match expected species shape "
+            f"{(int(rows), int(cols))}; refusing silent truncation or padding."
+        )
+    dst[index, :rows, :cols] = block.to(device=dst.device, dtype=dst.dtype)
 
 
 def block_dict_to_ordered_tensors(
@@ -540,6 +696,18 @@ def attach_block_tensors(result: MutableMapping[str, Any], packed: BlockTensorRe
     elif p in {"h0", "h_0"}:
         node_key, edge_key = NODE_H0_BLOCKS_KEY, EDGE_H0_BLOCKS_KEY
         node_shape_key, edge_shape_key = NODE_H0_BLOCK_SHAPE_KEY, EDGE_H0_BLOCK_SHAPE_KEY
+    elif p in {"p2", "p_2", "physical_p2"}:
+        node_key, edge_key = NODE_P2_BLOCKS_KEY, EDGE_P2_BLOCKS_KEY
+        node_shape_key, edge_shape_key = NODE_P2_BLOCK_SHAPE_KEY, EDGE_P2_BLOCK_SHAPE_KEY
+    elif p in {"full_h_target", "full_target", "absolute_h", "absolute_full_h"}:
+        node_key, edge_key = (
+            NODE_FULL_HAMIL_TARGET_BLOCKS_KEY,
+            EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY,
+        )
+        node_shape_key, edge_shape_key = (
+            NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY,
+            EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY,
+        )
     else:
         node_key, edge_key = f"node_{prefix}_blocks", f"edge_{prefix}_blocks"
         node_shape_key, edge_shape_key = f"node_{prefix}_block_shape", f"edge_{prefix}_block_shape"
