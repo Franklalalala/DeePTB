@@ -147,7 +147,8 @@ class BlockwiseE3Hamiltonian(nn.Module):
     Parameters are forwarded to ``E3Hamiltonian`` except for the block-specific
     output controls below.  Gradients from block loss flow through the
     differentiable feature-to-block materialization back to the original
-    feature/RME head.
+    feature/RME head.  It supports both non-SOC spatial blocks and the reduced
+    SOC ``uu_real`` single-block contract; full spinor SOC remains out of scope.
     """
 
     def __init__(

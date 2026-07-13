@@ -46,6 +46,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     component_to_detached,
     feature_components_from_blocks,
     infer_block_shapes,
+    ensure_spatial_block_mapper,
     l1_rmse_from_components,
     mae_from_components,
     maybe_all_reduce_components,
@@ -69,6 +70,8 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         basis: Optional[dict] = None,
         idp: Any = None,
         has_soc: bool = False,
+        nextham_uureal_mask: bool = False,
+        full_soc_prediction: bool = False,
         device: Union[str, torch.device, None] = None,
         pred_node_block_key: str = NODE_PRED_HAMIL_BLOCKS_KEY,
         pred_edge_block_key: str = EDGE_PRED_HAMIL_BLOCKS_KEY,
@@ -94,11 +97,17 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
                 raise ValueError("Provide either idp or basis.")
             if OrbitalMapper is None:
                 raise ImportError("OrbitalMapper is required when idp is not provided.")
-            self.idp = OrbitalMapper(basis, method="e3tb", device=mapper_device, has_soc=has_soc)
+            self.idp = OrbitalMapper(
+                basis,
+                method="e3tb",
+                device=mapper_device,
+                has_soc=has_soc,
+                nextham_uureal_mask=nextham_uureal_mask,
+                full_soc_prediction=full_soc_prediction,
+            )
         else:
             self.idp = idp
-        if getattr(self.idp, "has_soc", False):
-            raise NotImplementedError("This loss package is intentionally non-SOC only.")
+        ensure_spatial_block_mapper(self.idp)
         if hasattr(self.idp, "get_orbital_maps"):
             self.idp.get_orbital_maps()
         if hasattr(self.idp, "get_orbpair_maps"):

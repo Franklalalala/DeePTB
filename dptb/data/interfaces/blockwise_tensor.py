@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Clean block-wise tensor utilities for non-SOC NexTHam-style DeePTB.
+"""Clean block-wise tensor utilities for spatial-real DeePTB targets.
 
 This module keeps one responsibility per function:
 
 1. derive atom/edge metadata from an ``AtomicData``-like mapping;
-2. convert DeePTB non-SOC feature tensors to padded AO blocks;
+2. convert non-SOC or SOC-uu_real feature tensors to padded AO blocks;
 3. pack official ``feature_to_block`` dictionaries into ordered tensors;
 4. Hermitian-complete hopping blocks from reverse edges;
 5. compute block-level and feature-compatible metric components.
 
 The feature-compatible metrics are computed by walking ``OrbitalMapper``'s
 canonical orbital-pair slices, not by storing feature masks in LMDB.
-SOC is intentionally disabled in this minimal package.
+Full spinor SOC is intentionally disabled in this package.  The reduced
+``has_soc=True`` + ``nextham_uureal_mask=True`` contract is supported because
+it is a single directed real spatial block per orbital pair.
 """
 
 from __future__ import annotations
@@ -130,12 +132,22 @@ def as_tensor(value: Any, *, device=None, dtype=None) -> torch.Tensor:
     return out
 
 
-def ensure_non_soc_mapper(idp: Any) -> Any:
-    """Initialize lazy ``OrbitalMapper`` maps and fail fast for SOC."""
-    if bool(getattr(idp, "has_soc", False)):
+def is_soc_uureal_mapper(idp: Any) -> bool:
+    """Return whether ``idp`` represents the reduced real ``uu`` SOC target."""
+    return bool(
+        getattr(idp, "has_soc", False)
+        and getattr(idp, "nextham_uureal_mask", False)
+        and not getattr(idp, "full_soc_prediction", False)
+    )
+
+
+def ensure_spatial_block_mapper(idp: Any) -> Any:
+    """Initialize mapper maps and reject only full spinor SOC contracts."""
+    if bool(getattr(idp, "has_soc", False)) and not is_soc_uureal_mapper(idp):
         raise NotImplementedError(
-            "This clean block-wise package is for the current non-SOC workflow. "
-            "SOC real/imag feature semantics need a separate validation pass."
+            "Block-wise spatial AO tensors support non-SOC and reduced "
+            "SOC uu_real targets only. Full spinor SOC real/imag channels "
+            "require a separate block contract."
         )
     if not getattr(idp, "norbs", None) and hasattr(idp, "get_orbital_maps"):
         idp.get_orbital_maps()
@@ -144,8 +156,18 @@ def ensure_non_soc_mapper(idp: Any) -> Any:
     return idp
 
 
+def ensure_non_soc_mapper(idp: Any) -> Any:
+    """Initialize mapper maps while preserving a strictly non-SOC contract."""
+    if bool(getattr(idp, "has_soc", False)):
+        raise NotImplementedError(
+            "This validator is strictly non-SOC; reduced SOC uu_real callers "
+            "must use ensure_spatial_block_mapper instead."
+        )
+    return ensure_spatial_block_mapper(idp)
+
+
 def mapper_max_norb(idp: Any) -> int:
-    ensure_non_soc_mapper(idp)
+    ensure_spatial_block_mapper(idp)
     return max(int(v) for v in idp.norbs.values())
 
 
@@ -247,7 +269,7 @@ def matrix_shape_for_bond(idp: Any, sym_i: str, sym_j: str) -> Tuple[int, int]:
 
 
 def infer_block_shapes(data: Mapping[str, Any], idp: Any, *, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
-    ensure_non_soc_mapper(idp)
+    ensure_spatial_block_mapper(idp)
     symbols = symbols_from_data(data, idp)
     node_shapes = torch.as_tensor([matrix_shape_for_symbol(idp, s) for s in symbols], dtype=torch.long, device=device)
     edge_index = edge_index_from_data(data).detach().cpu()
@@ -403,10 +425,11 @@ def _zero_component_like(tensor: Optional[torch.Tensor], *, device=None) -> Comp
 def onsite_feature_slices(idp: Any, symbol: str) -> Iterable[Tuple[slice, slice, slice]]:
     """Yield ``(row_slice, col_slice, feature_slice)`` for onsite features."""
     basis = idp.basis[symbol]
+    directed = is_soc_uureal_mapper(idp)
     for i, basis_i in enumerate(basis):
         row = idp.orbital_maps[symbol][basis_i]
         full_i = idp.basis_to_full_basis[symbol][basis_i]
-        for basis_j in basis[i:]:
+        for basis_j in (basis if directed else basis[i:]):
             col = idp.orbital_maps[symbol][basis_j]
             full_j = idp.basis_to_full_basis[symbol][basis_j]
             feat = idp.orbpair_maps.get(f"{full_i}-{full_j}")
@@ -415,15 +438,16 @@ def onsite_feature_slices(idp: Any, symbol: str) -> Iterable[Tuple[slice, slice,
 
 
 def edge_feature_slices(idp: Any, sym_i: str, sym_j: str) -> Iterable[Tuple[slice, slice, slice]]:
-    """Yield canonical non-SOC edge slices matching DeePTB feature packing."""
+    """Yield edge slices for triangular non-SOC or directed SOC-uu_real packing."""
     full_order = {b: i for i, b in enumerate(idp.full_basis)}
+    directed = is_soc_uureal_mapper(idp)
     for basis_i in idp.basis[sym_i]:
         row = idp.orbital_maps[sym_i][basis_i]
         full_i = idp.basis_to_full_basis[sym_i][basis_i]
         for basis_j in idp.basis[sym_j]:
             col = idp.orbital_maps[sym_j][basis_j]
             full_j = idp.basis_to_full_basis[sym_j][basis_j]
-            if full_order[full_i] > full_order[full_j]:
+            if not directed and full_order[full_i] > full_order[full_j]:
                 continue
             feat = idp.orbpair_maps.get(f"{full_i}-{full_j}")
             if feat is not None:
@@ -469,7 +493,7 @@ def edge_direct_feature_mask(
     device=None,
 ) -> torch.Tensor:
     """AO entries directly represented by each edge feature vector."""
-    ensure_non_soc_mapper(idp)
+    ensure_spatial_block_mapper(idp)
     symbols = symbols_from_data(data, idp)
     edge_index = edge_index_from_data(data).detach().cpu()
     h = w = mapper_max_norb(idp)
@@ -499,7 +523,7 @@ def complete_edge_blocks_from_reverse(
         return None, None, reverse_edge_index(data)
     if edge_blocks.numel() == 0:
         return edge_blocks, direct_mask, reverse_edge_index(data, device=edge_blocks.device)
-    ensure_non_soc_mapper(idp)
+    ensure_spatial_block_mapper(idp)
     if direct_mask is None:
         direct_mask = edge_direct_feature_mask(data, idp, pad_shape=tuple(edge_blocks.shape[-2:]), device=edge_blocks.device)
     else:
@@ -548,8 +572,9 @@ def feature_tensors_to_block_tensors(
     complete_edges: bool = True,
     strict_complete_edges: bool = False,
 ) -> BlockTensorResult:
-    """Differentiably materialize non-SOC feature tensors into AO blocks."""
-    ensure_non_soc_mapper(idp)
+    """Differentiably materialize spatial-real feature tensors into AO blocks."""
+    ensure_spatial_block_mapper(idp)
+    directed = is_soc_uureal_mapper(idp)
     symbols = symbols_from_data(data, idp)
     default_dim = mapper_max_norb(idp)
     node_pad_shape = tuple(node_pad_shape or (default_dim, default_dim))
@@ -575,7 +600,11 @@ def feature_tensors_to_block_tensors(
                 h, w = _slice_hw(row, col)
                 part = sub_feat[:, feat].reshape(idx.numel(), h, w)
                 sub_block[:, row, col] = part
-                if symmetrize_onsite and (row.start != col.start or row.stop != col.stop):
+                if (
+                    symmetrize_onsite
+                    and not directed
+                    and (row.start != col.start or row.stop != col.stop)
+                ):
                     sub_block[:, col, row] = part.transpose(-1, -2)
             node_blocks.index_copy_(0, idx, sub_block)
 
@@ -611,6 +640,73 @@ def feature_tensors_to_block_tensors(
     return BlockTensorResult(node_blocks, edge_blocks, node_shapes, edge_shapes)
 
 
+def block_tensors_to_feature_tensors(
+    data: Mapping[str, Any],
+    idp: Any,
+    *,
+    node_blocks: Optional[torch.Tensor] = None,
+    edge_blocks: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Pack padded spatial AO blocks back into canonical feature tensors.
+
+    This is the exact inverse of :func:`feature_tensors_to_block_tensors` on
+    valid mapper slots.  Invalid union-basis slots remain zero.
+    """
+    ensure_spatial_block_mapper(idp)
+    symbols = symbols_from_data(data, idp)
+
+    node_features = None
+    if node_blocks is not None:
+        node_blocks = as_tensor(node_blocks)
+        node_features = node_blocks.new_zeros(
+            (len(symbols), int(idp.reduced_matrix_element))
+        )
+        by_symbol: Dict[str, List[int]] = {}
+        for index, symbol in enumerate(symbols):
+            by_symbol.setdefault(symbol, []).append(index)
+        for symbol, positions in by_symbol.items():
+            index = torch.as_tensor(positions, dtype=torch.long, device=node_blocks.device)
+            sub_block = node_blocks.index_select(0, index)
+            for row, col, feat in onsite_feature_slices(idp, symbol):
+                part = sub_block[:, row, col].reshape(index.numel(), -1)
+                if part.shape[1] != int(feat.stop - feat.start):
+                    raise RuntimeError(
+                        f"Onsite block/feature width mismatch for {symbol}: "
+                        f"block={part.shape[1]} feature={feat.stop - feat.start}."
+                    )
+                columns = torch.arange(
+                    feat.start, feat.stop, device=node_blocks.device
+                )
+                node_features[index[:, None], columns[None, :]] = part
+
+    edge_features = None
+    if edge_blocks is not None:
+        edge_blocks = as_tensor(edge_blocks)
+        edge_index = edge_index_from_data(data).detach().cpu()
+        edge_features = edge_blocks.new_zeros(
+            (int(edge_index.shape[1]), int(idp.reduced_matrix_element))
+        )
+        by_pair: Dict[Tuple[str, str], List[int]] = {}
+        for edge, (source, target) in enumerate(edge_index.T.tolist()):
+            by_pair.setdefault((symbols[int(source)], symbols[int(target)]), []).append(edge)
+        for (sym_i, sym_j), positions in by_pair.items():
+            index = torch.as_tensor(positions, dtype=torch.long, device=edge_blocks.device)
+            sub_block = edge_blocks.index_select(0, index)
+            for row, col, feat in edge_feature_slices(idp, sym_i, sym_j):
+                part = sub_block[:, row, col].reshape(index.numel(), -1)
+                if part.shape[1] != int(feat.stop - feat.start):
+                    raise RuntimeError(
+                        f"Edge block/feature width mismatch for {sym_i}-{sym_j}: "
+                        f"block={part.shape[1]} feature={feat.stop - feat.start}."
+                    )
+                columns = torch.arange(
+                    feat.start, feat.stop, device=edge_blocks.device
+                )
+                edge_features[index[:, None], columns[None, :]] = part
+
+    return node_features, edge_features
+
+
 def _to_block_tensor(value: Any, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     out = value if torch.is_tensor(value) else torch.as_tensor(value)
     return out.to(dtype=dtype) if dtype is not None else out
@@ -640,7 +736,7 @@ def block_dict_to_ordered_tensors(
     strict_complete_edges: bool = False,
 ) -> BlockTensorResult:
     """Pack official ``feature_to_block`` dict output into LMDB-ready tensors."""
-    ensure_non_soc_mapper(idp)
+    ensure_spatial_block_mapper(idp)
     symbols = symbols_from_data(data, idp)
     default_dim = mapper_max_norb(idp)
     node_pad_shape = tuple(node_pad_shape or (default_dim, default_dim))
@@ -838,7 +934,7 @@ def feature_components_from_blocks(
     complex_reduction: str = "modulus",
 ) -> Tuple[ComponentSums, ComponentSums]:
     """Old hamil_abs-compatible components from AO-block diffs."""
-    ensure_non_soc_mapper(idp)
+    ensure_spatial_block_mapper(idp)
     symbols = symbols_from_data(data, idp)
     device = None
     if pred_node_blocks is not None:
