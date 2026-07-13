@@ -188,6 +188,139 @@ def _lmdb_scalar_bool(value: Any) -> bool:
     return bool(value)
 
 
+def validate_non_soc_p2_blocks(blocks: Any, *, key: str = "hamiltonian_p2") -> None:
+    """Fail closed on malformed or SOC P2 AO-block dictionaries."""
+    if not isinstance(blocks, dict) or not blocks:
+        raise ValueError(f"'{key}' must be a non-empty AO-block dictionary.")
+    for block_key, value in blocks.items():
+        if _parse_lmdb_block_key(block_key) is None:
+            raise ValueError(
+                f"'{key}' contains invalid AO-block key {block_key!r}; expected i_j_rx_ry_rz."
+            )
+        array = np.asarray(value)
+        if array.ndim != 2:
+            raise ValueError(
+                f"'{key}' block {block_key!r} must be rank-2, got shape {array.shape}."
+            )
+        if np.iscomplexobj(array):
+            raise NotImplementedError(
+                "The first P2 prior path is non-SOC only; complex P2 block "
+                f"{block_key!r} is not accepted."
+            )
+        if not np.issubdtype(array.dtype, np.floating):
+            raise TypeError(
+                f"'{key}' block {block_key!r} must be floating point, got {array.dtype}."
+            )
+        if 0 in array.shape:
+            raise ValueError(f"'{key}' block {block_key!r} must be non-empty.")
+        if not np.isfinite(array).all():
+            raise ValueError(f"'{key}' block {block_key!r} contains NaN or infinity.")
+
+
+def validate_p2_feature_pair(
+    node_p2: Any,
+    edge_p2: Any,
+    *,
+    num_nodes: Optional[int] = None,
+    num_edges: Optional[int] = None,
+    feature_dim: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Validate first-class real-RME P2 node/edge features."""
+    present = (node_p2 is not None, edge_p2 is not None)
+    if any(present) and not all(present):
+        raise ValueError(
+            "P2 prior must provide both node_p2 and edge_p2; refusing a partial prior."
+        )
+    if not all(present):
+        raise ValueError("P2 prior features are absent.")
+    node = torch.as_tensor(node_p2)
+    edge = torch.as_tensor(edge_p2)
+    if node.ndim != 2 or edge.ndim != 2:
+        raise ValueError(
+            "node_p2/edge_p2 must be rank-2 real-RME tensors; got "
+            f"{tuple(node.shape)} and {tuple(edge.shape)}."
+        )
+    if torch.is_complex(node) or torch.is_complex(edge):
+        raise NotImplementedError(
+            "The first P2 prior path is non-SOC only; complex P2 RME features are not accepted."
+        )
+    if not torch.is_floating_point(node) or not torch.is_floating_point(edge):
+        raise TypeError(
+            "node_p2/edge_p2 must be floating-point real-RME tensors; got "
+            f"{node.dtype} and {edge.dtype}."
+        )
+    if not torch.isfinite(node).all() or not torch.isfinite(edge).all():
+        raise ValueError("node_p2/edge_p2 contain NaN or infinity.")
+    if num_nodes is not None and node.shape[0] != int(num_nodes):
+        raise ValueError(
+            f"node_p2 rows {node.shape[0]} do not match num_nodes={int(num_nodes)}."
+        )
+    if num_edges is not None and edge.shape[0] != int(num_edges):
+        raise ValueError(
+            f"edge_p2 rows {edge.shape[0]} do not match num_edges={int(num_edges)}."
+        )
+    if feature_dim is not None and (
+        node.shape[1] != int(feature_dim) or edge.shape[1] != int(feature_dim)
+    ):
+        raise ValueError(
+            "node_p2/edge_p2 widths must match the mapper RME width "
+            f"{int(feature_dim)}; got {node.shape[1]} and {edge.shape[1]}."
+        )
+    return node, edge
+
+
+def validate_non_soc_p2_block_tensors(
+    node_blocks: Any,
+    edge_blocks: Any,
+    node_shapes: Any,
+    edge_shapes: Any,
+    *,
+    num_nodes: int,
+    num_edges: int,
+) -> None:
+    """Validate packed P2 AO canvases and their per-row valid extents."""
+    entries = (
+        ("node", torch.as_tensor(node_blocks), torch.as_tensor(node_shapes), num_nodes),
+        ("edge", torch.as_tensor(edge_blocks), torch.as_tensor(edge_shapes), num_edges),
+    )
+    for label, blocks, shapes, rows in entries:
+        if blocks.ndim != 3:
+            raise ValueError(
+                f"{label}_p2_blocks must be rank-3 [rows, ni, nj], got {tuple(blocks.shape)}."
+            )
+        if blocks.shape[0] != int(rows):
+            raise ValueError(
+                f"{label}_p2_blocks rows {blocks.shape[0]} do not match {label} count {int(rows)}."
+            )
+        if torch.is_complex(blocks):
+            raise NotImplementedError(
+                "The first P2 Full-H reconstruction path is non-SOC only."
+            )
+        if not torch.is_floating_point(blocks):
+            raise TypeError(f"{label}_p2_blocks must be floating point, got {blocks.dtype}.")
+        if not torch.isfinite(blocks).all():
+            raise ValueError(f"{label}_p2_blocks contain NaN or infinity.")
+        if shapes.ndim != 2 or tuple(shapes.shape) != (int(rows), 2):
+            raise ValueError(
+                f"{label}_p2_block_shape must have shape ({int(rows)}, 2), "
+                f"got {tuple(shapes.shape)}."
+            )
+        if torch.is_complex(shapes) or not torch.isfinite(shapes).all():
+            raise ValueError(f"{label}_p2_block_shape must contain finite real extents.")
+        long_shapes = shapes.to(dtype=torch.long)
+        if not torch.equal(shapes, long_shapes.to(dtype=shapes.dtype)):
+            raise ValueError(f"{label}_p2_block_shape extents must be integers.")
+        if (long_shapes < 0).any():
+            raise ValueError(f"{label}_p2_block_shape extents must be non-negative.")
+        limits = torch.tensor(
+            blocks.shape[-2:], dtype=torch.long, device=long_shapes.device
+        )
+        if (long_shapes > limits).any():
+            raise ValueError(
+                f"{label}_p2_block_shape exceeds packed canvas {tuple(blocks.shape[-2:])}."
+            )
+
+
 def _lmdb_scalar_int(value: Any) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.item())
@@ -302,6 +435,11 @@ _ATOMICDATA_CONSTRUCTOR_OPTIONS = {"r_max", "er_max", "oer_max", "self_interacti
 
 class LMDBDataset(AtomicDataset):
     prefer_loaded_dynamic_batch_cost_parts = True
+    # Class defaults keep lightweight ``__new__``-based tooling and historical
+    # tests backward compatible; normal construction always sets instances.
+    get_P2 = False
+    p2_key = "hamiltonian_p2"
+    prefer_precomputed_p2 = True
 
     def __init__(
             self,
@@ -313,12 +451,15 @@ class LMDBDataset(AtomicDataset):
             orthogonal: bool = False,
             get_Hamiltonian: bool = False,
             get_H0: bool = False,
+            get_P2: bool = False,
             residual_hamiltonian: bool = False,
             get_overlap: bool = False,
             get_DM: bool = False,
             get_eigenvalues: bool = False,
             h0_key: str = "hamiltonian_0",
             prefer_precomputed_h0: bool = True,
+            p2_key: str = "hamiltonian_p2",
+            prefer_precomputed_p2: bool = True,
     ):
         # TO DO, this may be simplified
         # See if a subclass defines some inputs
@@ -342,6 +483,9 @@ class LMDBDataset(AtomicDataset):
         super().__init__(root=root, type_mapper=type_mapper)  # the type_mapper will be called in getitem in PyG data class
         self.get_Hamiltonian = get_Hamiltonian
         self.get_H0 = get_H0
+        self.get_P2 = get_P2
+        if self.get_P2 and bool(getattr(type_mapper, "has_soc", False)):
+            raise NotImplementedError("get_P2=True is non-SOC only in the first implementation.")
         self.residual_hamiltonian = residual_hamiltonian
         if self.residual_hamiltonian and not self.get_Hamiltonian:
             raise ValueError(
@@ -354,6 +498,8 @@ class LMDBDataset(AtomicDataset):
         self.orthogonal = orthogonal
         self.h0_key = h0_key
         self.prefer_precomputed_h0 = prefer_precomputed_h0
+        self.p2_key = str(p2_key)
+        self.prefer_precomputed_p2 = bool(prefer_precomputed_p2)
         assert not get_Hamiltonian * get_DM, "Hamiltonian and Density Matrix can only loaded one at a time, for which will occupy the same attribute in the AtomicData."
 
         self.num_graphs = 0
@@ -476,6 +622,7 @@ class LMDBDataset(AtomicDataset):
         block_keys = [
             "hamiltonian",
             getattr(self, "h0_key", "hamiltonian_0"),
+            getattr(self, "p2_key", "hamiltonian_p2"),
             "hamiltonian_0",
             "density_matrix",
             "overlap",
@@ -553,6 +700,16 @@ class LMDBDataset(AtomicDataset):
         h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
+        p2_blocks = data_dict.get(self.p2_key, None) if self.get_P2 else None
+        node_p2 = data_dict.get(AtomicDataDict.NODE_P2_KEY, None) if self.get_P2 else None
+        edge_p2 = data_dict.get(AtomicDataDict.EDGE_P2_KEY, None) if self.get_P2 else None
+        p2_feature_present = (node_p2 is not None, edge_p2 is not None)
+        if any(p2_feature_present) and not all(p2_feature_present):
+            raise ValueError(
+                "P2 prior must provide both node_p2 and edge_p2; refusing a partial prior."
+            )
+        if p2_blocks is not None:
+            validate_non_soc_p2_blocks(p2_blocks, key=self.p2_key)
         node_physical_h0 = data_dict.get(AtomicDataDict.NODE_PHYSICAL_H0_KEY, None)
         edge_physical_h0 = data_dict.get(AtomicDataDict.EDGE_PHYSICAL_H0_KEY, None)
         physical_h0_present = (node_physical_h0 is not None, edge_physical_h0 is not None)
@@ -611,6 +768,10 @@ class LMDBDataset(AtomicDataset):
             and node_h0 is not None
             and edge_h0 is not None
         )
+        uses_p2 = bool(
+            self.get_P2
+            and (all(p2_feature_present) or p2_blocks is not None)
+        )
         stored_edge_index = data_dict.get(AtomicDataDict.EDGE_INDEX_KEY, None)
         stored_edge_shift = data_dict.get(AtomicDataDict.EDGE_CELL_SHIFT_KEY, None)
         has_stored_edge_graph = stored_edge_index is not None and stored_edge_shift is not None
@@ -625,7 +786,7 @@ class LMDBDataset(AtomicDataset):
         )
         use_stored_edge_graph = bool(
             has_stored_edge_graph
-            and (uses_pre_main or uses_pre_h0 or uses_pre_physical_h0)
+            and (uses_pre_main or uses_pre_h0 or uses_pre_physical_h0 or uses_p2)
             and not needs_missing_env_graph
             and not needs_missing_onsitenv_graph
         )
@@ -675,6 +836,10 @@ class LMDBDataset(AtomicDataset):
 
         num_edges = atomicdata[AtomicDataDict.EDGE_INDEX_KEY].shape[1]
         num_nodes = atomicdata.num_nodes
+        mapper_p2_irreps = getattr(
+            getattr(self, "type_mapper", None), "orbpair_irreps", None
+        )
+        mapper_p2_dim = getattr(mapper_p2_irreps, "dim", None)
 
         if has_pre_main and has_pre_overlap:
             pre_node_features = _expand_soc_uureal_compact(
@@ -763,6 +928,56 @@ class LMDBDataset(AtomicDataset):
                     keep_mask=soc_uureal_keep_mask,
                 )
 
+        if self.get_P2:
+            if self.prefer_precomputed_p2 and all(p2_feature_present):
+                node_p2, edge_p2 = validate_p2_feature_pair(
+                    node_p2,
+                    edge_p2,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                    feature_dim=mapper_p2_dim,
+                )
+                atomicdata[AtomicDataDict.NODE_P2_KEY] = node_p2
+                atomicdata[AtomicDataDict.EDGE_P2_KEY] = edge_p2
+            elif p2_blocks is not None:
+                block_to_feature(
+                    atomicdata,
+                    self.type_mapper,
+                    p2_blocks,
+                    False,
+                    self.orthogonal,
+                    node_field=AtomicDataDict.NODE_P2_KEY,
+                    edge_field=AtomicDataDict.EDGE_P2_KEY,
+                )
+                node_p2, edge_p2 = validate_p2_feature_pair(
+                    atomicdata[AtomicDataDict.NODE_P2_KEY]
+                    if AtomicDataDict.NODE_P2_KEY in atomicdata
+                    else None,
+                    atomicdata[AtomicDataDict.EDGE_P2_KEY]
+                    if AtomicDataDict.EDGE_P2_KEY in atomicdata
+                    else None,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                    feature_dim=mapper_p2_dim,
+                )
+                atomicdata[AtomicDataDict.NODE_P2_KEY] = node_p2
+                atomicdata[AtomicDataDict.EDGE_P2_KEY] = edge_p2
+            elif all(p2_feature_present):
+                node_p2, edge_p2 = validate_p2_feature_pair(
+                    node_p2,
+                    edge_p2,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                    feature_dim=mapper_p2_dim,
+                )
+                atomicdata[AtomicDataDict.NODE_P2_KEY] = node_p2
+                atomicdata[AtomicDataDict.EDGE_P2_KEY] = edge_p2
+            else:
+                raise ValueError(
+                    f"get_P2=True requires either raw '{self.p2_key}' AO blocks "
+                    "or precomputed node_p2/edge_p2 features."
+                )
+
         if uses_pre_physical_h0:
             node_physical_h0 = _expand_soc_uureal_compact(
                 node_physical_h0,
@@ -835,6 +1050,22 @@ class LMDBDataset(AtomicDataset):
         # path so existing RME training remains unchanged.
         if self.get_Hamiltonian and getattr(self, "residual_hamiltonian", False):
             assert_residual_target_source_is_raw(data_dict)
+        p2_blockwise_keys = (
+            AtomicDataDict.NODE_P2_BLOCKS_KEY,
+            AtomicDataDict.EDGE_P2_BLOCKS_KEY,
+            AtomicDataDict.NODE_P2_BLOCK_SHAPE_KEY,
+            AtomicDataDict.EDGE_P2_BLOCK_SHAPE_KEY,
+        )
+        p2_blockwise_present = [key in data_dict for key in p2_blockwise_keys]
+        if self.get_P2 and any(p2_blockwise_present) and not all(p2_blockwise_present):
+            missing = [
+                key for key, present in zip(p2_blockwise_keys, p2_blockwise_present)
+                if not present
+            ]
+            raise ValueError(
+                "Prepacked P2 prior is incomplete; missing block fields "
+                f"{missing}."
+            )
         for blockwise_key in (
             AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
             AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
@@ -847,6 +1078,10 @@ class LMDBDataset(AtomicDataset):
         ):
             if blockwise_key in data_dict:
                 atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
+        if self.get_P2:
+            for blockwise_key in p2_blockwise_keys:
+                if blockwise_key in data_dict:
+                    atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
 
         if (
             self.get_Hamiltonian
@@ -889,6 +1124,51 @@ class LMDBDataset(AtomicDataset):
                 strict_complete_edges=False,
             )
             attach_block_tensors(atomicdata, target_h0_blocks, prefix="h0")
+
+        if (
+            self.get_P2
+            and p2_blocks is not None
+            and AtomicDataDict.NODE_P2_BLOCKS_KEY not in atomicdata
+        ):
+            from dptb.data.interfaces.blockwise_tensor import attach_block_tensors, block_dict_to_ordered_tensors
+
+            start_id = 0 if "0_0_0_0_0" in p2_blocks else 1
+            target_p2_blocks = block_dict_to_ordered_tensors(
+                atomicdata,
+                self.type_mapper,
+                p2_blocks,
+                start_id=start_id,
+                complete_edges=True,
+                strict_complete_edges=True,
+            )
+            attach_block_tensors(atomicdata, target_p2_blocks, prefix="p2")
+
+        if self.get_P2:
+            required_p2_blocks = (
+                AtomicDataDict.NODE_P2_BLOCKS_KEY,
+                AtomicDataDict.EDGE_P2_BLOCKS_KEY,
+            )
+            available_p2_blocks = [key in atomicdata for key in required_p2_blocks]
+            if any(available_p2_blocks) and not all(available_p2_blocks):
+                raise ValueError(
+                    "P2 AO-block reconstruction requires both node_p2_blocks and "
+                    "edge_p2_blocks."
+                )
+            if all(available_p2_blocks):
+                p2_node_blocks = torch.as_tensor(
+                    atomicdata[AtomicDataDict.NODE_P2_BLOCKS_KEY]
+                )
+                p2_edge_blocks = torch.as_tensor(
+                    atomicdata[AtomicDataDict.EDGE_P2_BLOCKS_KEY]
+                )
+                validate_non_soc_p2_block_tensors(
+                    p2_node_blocks,
+                    p2_edge_blocks,
+                    atomicdata[AtomicDataDict.NODE_P2_BLOCK_SHAPE_KEY],
+                    atomicdata[AtomicDataDict.EDGE_P2_BLOCK_SHAPE_KEY],
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                )
 
         return atomicdata
 

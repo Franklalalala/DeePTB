@@ -65,6 +65,14 @@ EDGE_H0_BLOCKS_KEY = "edge_h0_blocks"
 NODE_H0_BLOCK_SHAPE_KEY = "node_h0_block_shape"
 EDGE_H0_BLOCK_SHAPE_KEY = "edge_h0_block_shape"
 
+# Converted P2 physical-prior tensors.  These must not alias the H0 fields:
+# P2 is a transferable table/factorized assembly available from structure,
+# basis and pseudopotential metadata alone.
+NODE_P2_BLOCKS_KEY = "node_p2_blocks"
+EDGE_P2_BLOCKS_KEY = "edge_p2_blocks"
+NODE_P2_BLOCK_SHAPE_KEY = "node_p2_block_shape"
+EDGE_P2_BLOCK_SHAPE_KEY = "edge_p2_block_shape"
+
 # Model prediction keys used by the block loss.
 NODE_PRED_HAMIL_BLOCKS_KEY = "node_hamil_blocks"
 EDGE_PRED_HAMIL_BLOCKS_KEY = "edge_hamil_blocks"
@@ -540,6 +548,9 @@ def attach_block_tensors(result: MutableMapping[str, Any], packed: BlockTensorRe
     elif p in {"h0", "h_0"}:
         node_key, edge_key = NODE_H0_BLOCKS_KEY, EDGE_H0_BLOCKS_KEY
         node_shape_key, edge_shape_key = NODE_H0_BLOCK_SHAPE_KEY, EDGE_H0_BLOCK_SHAPE_KEY
+    elif p in {"p2", "p_2", "physical_p2"}:
+        node_key, edge_key = NODE_P2_BLOCKS_KEY, EDGE_P2_BLOCKS_KEY
+        node_shape_key, edge_shape_key = NODE_P2_BLOCK_SHAPE_KEY, EDGE_P2_BLOCK_SHAPE_KEY
     else:
         node_key, edge_key = f"node_{prefix}_blocks", f"edge_{prefix}_blocks"
         node_shape_key, edge_shape_key = f"node_{prefix}_block_shape", f"edge_{prefix}_block_shape"

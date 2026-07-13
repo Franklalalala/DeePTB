@@ -1,0 +1,92 @@
+# Minimal P2-first, non-SOC, absolute Full-H training contract.
+# Replace only the root/prefix and basis/model capacity for a real dataset.
+common_options:
+  basis: {H: 1s, O: 1s1p}
+  overlap: false
+  has_soc: false
+  dtype: float32
+  device: cpu
+
+data_options:
+  train:
+    type: LMDBDataset
+    root: __REPLACE_WITH_P2_LMDB_ROOT__
+    prefix: data
+    separator: "."
+    get_Hamiltonian: true
+    get_H0: false
+    get_P2: true
+    p2_key: hamiltonian_p2
+    prefer_precomputed_p2: true
+    residual_hamiltonian: false
+    get_overlap: false
+
+model_options:
+  embedding:
+    method: lem_moe_v3_prior
+    prior_kind: p2
+    prior_node_key: node_p2
+    prior_edge_key: edge_p2
+    use_prior_init: true
+    prior_merge_mode: replace
+    use_soft_edge_memory: true
+    soft_edge_memory_num_slots: 64
+    soft_edge_memory_num_heads: 4
+    soft_edge_memory_head_dim: 16
+    soft_edge_memory_temperature: 1.0
+    soft_edge_memory_dropout: 0.0
+    soft_edge_memory_gate_mode: deepseek
+    soft_edge_memory_gate_bias: 0.0
+    soft_edge_memory_zero_init_output: true
+    output_route: h_b0
+    n_layers: 1
+    avg_num_neighbors: 2.0
+    r_max: 4.0
+    irreps_hidden: 4x0e+4x1o+4x1e+4x2e
+    env_embed_multiplicity: 4
+    latent_dim: 8
+    latent_channels: [8]
+    edge_one_hot_dim: 4
+    num_experts: 1
+    num_shared_experts: 1
+    top_k: 1
+    universal: true
+    use_layer_onehot_tp: false
+    use_out_onehot_tp: false
+    use_interpolation_out: false
+    tp_radial_emb: false
+    mole_linear_mode: indexed_ref
+    so2_fusion_mode: streamed_m_major_ref
+    rme_fusion_rank: 4
+    rme_fusion_init: 0.0
+  prediction:
+    method: block_native
+    scale_type: no_scale
+    block_decoder: expansion_cg
+    blockwise_hamiltonian: true
+    add_h0: false
+    add_prior: true
+    prior_node_block_field: node_p2_blocks
+    prior_edge_block_field: edge_p2_blocks
+    prior_label: P2
+    full_output_node_field: node_full_hamil_blocks
+    full_output_edge_field: edge_full_hamil_blocks
+
+train_options:
+  num_epoch: 1
+  batch_size: 1
+  optimizer: {type: AdamW, lr: 0.001}
+  lr_scheduler: {type: rop}
+  loss_options:
+    train:
+      method: hamil_blockwise_nextham
+      pred_node_block_key: node_full_hamil_blocks
+      pred_edge_block_key: edge_full_hamil_blocks
+      # These historical target names contain absolute H because
+      # residual_hamiltonian is false.
+      target_node_block_key: node_delta_hamil_blocks
+      target_edge_block_key: edge_delta_hamil_blocks
+      target_node_shape_key: node_delta_hamil_block_shape
+      target_edge_shape_key: edge_delta_hamil_block_shape
+      optimization: block_mae
+      block_reduction: global

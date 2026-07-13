@@ -1131,9 +1131,12 @@ def train_data_sub():
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
+        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
+        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
         Argument("get_DM", bool, optional=True, default=False, doc=doc_DM),
         Argument("get_eigenvalues", bool, optional=True, default=False, doc=doc_eig)
@@ -1162,9 +1165,12 @@ def validation_data_sub():
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
+        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
+        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
         Argument("get_DM", bool, optional=True, default=False, doc=doc_DM),
         Argument("get_eigenvalues", bool, optional=True, default=False, doc=doc_eig)
@@ -1193,9 +1199,12 @@ def reference_data_sub():
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
+        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
+        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
         Argument("get_DM", bool, optional=True, default=False, doc=doc_DM),
         Argument("get_eigenvalues", bool, optional=True, default=False, doc=doc_eig)
@@ -1223,9 +1232,12 @@ def test_data_sub():
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
+        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
+        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("get_eigenvalues", bool, optional=True, default=False, doc=doc_eig),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
         Argument("get_DM", bool, optional=True, default=False, doc=doc_DM),
@@ -1301,6 +1313,7 @@ def embedding():
             Argument("lem_moe_v3", dict, slem()),
             Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
+            Argument("lem_moe_v3_prior", dict, slem_prior()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_non_linear", dict, slem()),
             Argument("lem_non_linear_h0", dict, slem_h0()),
@@ -1722,8 +1735,12 @@ def e3tb_prediction():
         Argument("complete_edges", bool, optional=True, default=True, doc="Fill missing edge AO entries from reverse directed edges in blockwise output."),
         Argument("strict_complete_edges", bool, optional=True, default=False, doc="Fail if reverse-edge completion leaves unresolved valid AO entries."),
         Argument("add_h0", bool, optional=True, default=False, doc="Also expose full H block tensors by adding converted H0 blocks to delta predictions."),
-        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for full node Hamiltonian blocks when add_h0 is true."),
-        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for full edge Hamiltonian blocks when add_h0 is true."),
+        Argument("add_prior", bool, optional=True, default=False, doc="Expose Full-H blocks as a physical prior plus learned correction. Mutually exclusive with add_h0."),
+        Argument("prior_node_block_field", str, optional=True, default="node_p2_blocks", doc="Node AO-block field used for physical-prior Full-H reconstruction."),
+        Argument("prior_edge_block_field", str, optional=True, default="edge_p2_blocks", doc="Edge AO-block field used for physical-prior Full-H reconstruction."),
+        Argument("prior_label", str, optional=True, default="P2"),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks when add_h0 or add_prior is true."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks when add_h0 or add_prior is true."),
     ]
 
     return nn
@@ -1739,8 +1756,38 @@ def block_native_prediction():
         Argument("block_decoder", str, optional=True, default="linear", doc=doc_block_decoder),
         Argument("blockwise_hamiltonian", bool, optional=True, default=True, doc=doc_blockwise_hamiltonian),
         Argument("add_h0", bool, optional=True, default=False, doc="Also expose full-H AO blocks as H0 plus residual block-native predictions. Requires get_H0=true for every dataset split."),
-        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for full node Hamiltonian blocks when add_h0 is true."),
-        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for full edge Hamiltonian blocks when add_h0 is true."),
+        Argument("add_prior", bool, optional=True, default=False, doc="Expose Full-H AO blocks as a physical prior plus learned correction. Mutually exclusive with add_h0."),
+        Argument("prior_node_block_field", str, optional=True, default="node_p2_blocks"),
+        Argument("prior_edge_block_field", str, optional=True, default="edge_p2_blocks"),
+        Argument("prior_label", str, optional=True, default="P2"),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks when add_h0 or add_prior is true."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks when add_h0 or add_prior is true."),
+    ]
+
+
+def slem_prior():
+    """Strict first-class physical-prior schema (P2 in the first release)."""
+    return slem() + [
+        Argument("prior_kind", str, optional=True, default="p2", doc="Physical prior family. The first implementation accepts only p2."),
+        Argument("use_prior_init", bool, optional=True, default=True, doc="Project the P2 RME prior into the equivariant node/edge hidden state."),
+        Argument("prior_node_key", str, optional=True, default="node_p2", doc="Node-wise P2 RME field."),
+        Argument("prior_edge_key", str, optional=True, default="edge_p2", doc="Edge-wise P2 RME field."),
+        Argument("use_prior_node_init", bool, optional=True, default=True),
+        Argument("use_prior_edge_init", bool, optional=True, default=True),
+        Argument("prior_node_mode", str, optional=True, default="direct", doc="Supported: direct or self_edge."),
+        Argument("prior_merge_mode", str, optional=True, default="replace", doc="Supported: replace or add."),
+        Argument("prior_self_edge_tol", float, optional=True, default=1e-8),
+        Argument("use_soft_edge_memory", bool, optional=True, default=True, doc="Enable scalar-only multi-head external edge KV memory."),
+        Argument("soft_edge_memory_num_slots", int, optional=True, default=64),
+        Argument("soft_edge_memory_num_heads", int, optional=True, default=4),
+        Argument("soft_edge_memory_head_dim", int, optional=True, default=16),
+        Argument("soft_edge_memory_temperature", float, optional=True, default=1.0),
+        Argument("soft_edge_memory_dropout", float, optional=True, default=0.0),
+        Argument("soft_edge_memory_gate_mode", str, optional=True, default="deepseek", doc="Memory gate: deepseek normalized-similarity gate or linear scalar gate."),
+        Argument("soft_edge_memory_gate_bias", float, optional=True, default=0.0),
+        Argument("soft_edge_memory_gate_eps", float, optional=True, default=1e-6),
+        Argument("soft_edge_memory_zero_init_output", bool, optional=True, default=True),
+        Argument("soft_edge_memory_input_norm", bool, optional=True, default=True),
     ]
 
 
@@ -2059,6 +2106,82 @@ def loss_options():
     return Argument("loss_options", dict, sub_fields=args, sub_variants=[], optional=False, doc=doc_loss_options)
 
 
+def _validate_p2_prior_full_h_contract(data):
+    """Semantic checks that cannot be expressed by independent dargs fields."""
+    common = data.get("common_options", {})
+    model = data.get("model_options", {})
+    embedding_options = model.get("embedding", {})
+    prediction_options = model.get("prediction", {})
+    embedding_uses_p2 = embedding_options.get("method") == "lem_moe_v3_prior"
+    add_prior = bool(prediction_options.get("add_prior", False))
+    add_h0 = bool(prediction_options.get("add_h0", False))
+    if not embedding_uses_p2 and not add_prior:
+        return
+
+    if bool(common.get("has_soc", False)):
+        raise ValueError(
+            "lem_moe_v3_prior/add_prior is non-SOC only; set common_options.has_soc=false."
+        )
+    if add_prior and add_h0:
+        raise ValueError("prediction.add_prior and prediction.add_h0 are mutually exclusive.")
+
+    data_options_value = data.get("data_options", {})
+    configured_splits = {
+        split: data_options_value[split]
+        for split in ("train", "validation", "reference")
+        if isinstance(data_options_value.get(split), dict)
+    }
+    for split, split_options in configured_splits.items():
+        if str(split_options.get("type", "DefaultDataset")).lower() != "lmdbdataset":
+            raise ValueError(
+                f"data_options.{split}.type must be LMDBDataset for the current P2 loader."
+            )
+        if not bool(split_options.get("get_P2", False)):
+            raise ValueError(
+                f"data_options.{split}.get_P2 must be true for the P2 prior route."
+            )
+        if add_prior:
+            if not bool(split_options.get("get_Hamiltonian", False)):
+                raise ValueError(
+                    f"data_options.{split}.get_Hamiltonian must be true for Full-H supervision."
+                )
+            if bool(split_options.get("residual_hamiltonian", False)):
+                raise ValueError(
+                    f"data_options.{split}.residual_hamiltonian must be false: "
+                    "P2+dH is supervised against absolute Full H."
+                )
+
+    if not add_prior:
+        return
+
+    full_node_key = prediction_options.get(
+        "full_output_node_field", "node_full_hamil_blocks"
+    )
+    full_edge_key = prediction_options.get(
+        "full_output_edge_field", "edge_full_hamil_blocks"
+    )
+    loss_options_value = data.get("train_options", {}).get("loss_options", {})
+    for split, split_loss in loss_options_value.items():
+        if not isinstance(split_loss, dict):
+            continue
+        if split_loss.get("method") not in {
+            "hamil_blockwise_nextham",
+            "hamil_block_abs",
+        }:
+            raise ValueError(
+                f"train_options.loss_options.{split}.method must use a blockwise "
+                "Hamiltonian loss when prediction.add_prior=true."
+            )
+        pred_node_key = split_loss.get("pred_node_block_key", "node_hamil_blocks")
+        pred_edge_key = split_loss.get("pred_edge_block_key", "edge_hamil_blocks")
+        if pred_node_key != full_node_key or pred_edge_key != full_edge_key:
+            raise ValueError(
+                f"train_options.loss_options.{split} must read reconstructed Full-H "
+                f"fields {full_node_key!r}/{full_edge_key!r}, got "
+                f"{pred_node_key!r}/{pred_edge_key!r}."
+            )
+
+
 def normalize(data):
 
     co = common_options()
@@ -2070,6 +2193,7 @@ def normalize(data):
     data = base.normalize_value(data)
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
+    _validate_p2_prior_full_h_contract(data)
 
     # add check loss and use wannier:
 
@@ -2795,7 +2919,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_prior", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")
@@ -2903,6 +3027,7 @@ def normalize(data):
     data = base.normalize_value(data)
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
+    _validate_p2_prior_full_h_contract(data)
 
     # add check loss and use wannier:
 
