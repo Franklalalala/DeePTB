@@ -782,12 +782,64 @@ def _reuse_raw_split(
     )
     rows: list[dict[str, Any]] = []
     try:
-        with env.begin() as txn:
-            committed = int(txn.stat()["entries"])
-            if committed > len(cases):
+        with env.begin(write=True) as txn:
+            entry_count = int(txn.stat()["entries"])
+            if entry_count > len(cases):
                 raise ValueError(
-                    f"Cannot resume {split}: LMDB has {committed} entries, "
+                    f"Cannot resume {split}: LMDB has {entry_count} entries, "
                     f"more than requested {len(cases)}."
+                )
+            committed = 0
+            parser_placeholder = False
+            for index, case in enumerate(cases):
+                key = index.to_bytes(length=4, byteorder="big")
+                value = txn.get(key)
+                if value is None:
+                    if index < entry_count:
+                        raise KeyError(
+                            f"Cannot resume {split}: raw LMDB is missing row {index} "
+                            f"inside {entry_count} entries."
+                        )
+                    break
+                record = pickle.loads(value)
+                case_id = record.get("case_id")
+                if case_id is None and record.get(SAMPLE_SCHEMA_KEY) is None:
+                    # _abacus_parse commits H/H0 first.  A TERM between that
+                    # commit and P2 enrichment leaves one safe-to-rebuild tail
+                    # row that must not count as a completed cache record.
+                    parser_placeholder = True
+                    break
+                if case_id != case.name:
+                    raise ValueError(
+                        f"Cannot resume {split}[{index}]: case_id "
+                        f"{case_id!r} != {case.name!r}."
+                    )
+                if record.get(SAMPLE_SCHEMA_KEY) != P2_SAMPLE_SCHEMA:
+                    raise ValueError(f"Cannot resume {case.name}: schema mismatch.")
+                if record.get(P2_SOURCE_FINGERPRINT_KEY) != p2_source_fingerprint:
+                    raise ValueError(
+                        f"Cannot resume {case.name}: P2 source fingerprint mismatch."
+                    )
+                committed += 1
+
+            if entry_count != committed:
+                if not parser_placeholder or entry_count != committed + 1:
+                    raise ValueError(
+                        f"Cannot resume {split}: {entry_count} LMDB entries do not "
+                        f"form a complete prefix of {committed} plus one parser tail."
+                    )
+                tail_key = committed.to_bytes(length=4, byteorder="big")
+                if not txn.delete(tail_key):
+                    raise KeyError(
+                        f"Cannot resume {split}: failed to remove parser tail {committed}."
+                    )
+                _heartbeat(
+                    work_root,
+                    stage="truncate_raw_parser_tail",
+                    split=split,
+                    completed=committed,
+                    total=len(cases),
+                    discarded_index=committed,
                 )
         for index, case in enumerate(cases[:committed]):
             key = index.to_bytes(length=4, byteorder="big")
