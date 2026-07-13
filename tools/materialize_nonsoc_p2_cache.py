@@ -241,6 +241,83 @@ def _zero_completion_metadata(
     }
 
 
+def project_non_soc_blocks_hermitian(
+    blocks: dict[str, np.ndarray],
+    *,
+    required_keys: Iterable[tuple[int, int, int, int, int]],
+    label: str = "P2",
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Project graph-aligned real AO blocks onto exact Hermitian pairs.
+
+    Radial interpolation, frame rotation, and the final float32 cast can leave
+    tiny numerical differences between ``H_ij(R)`` and ``H_ji(-R)^T`` even
+    when the radial table itself satisfies reciprocity.  Cache that noise only
+    after an explicit pair projection, so later loaders see an exactly
+    Hermitian prior instead of relying on a relaxed validation tolerance.
+    """
+
+    output = {key: np.asarray(value) for key, value in blocks.items()}
+    required = sorted(set(required_keys))
+    required_set = set(required)
+    missing = [key for key in required if "_".join(map(str, key)) not in output]
+    if missing:
+        raise ValueError(f"{label} is missing required blocks {missing[:5]}.")
+
+    seen: set[tuple[int, int, int, int, int]] = set()
+    max_mismatch = 0.0
+    max_correction = 0.0
+    pair_count = 0
+    for key in required:
+        if key in seen:
+            continue
+        i, j, rx, ry, rz = key
+        reverse = (j, i, -rx, -ry, -rz)
+        if reverse not in required_set:
+            raise ValueError(f"{label} block {key} has no reverse graph block {reverse}.")
+        forward_name = "_".join(map(str, key))
+        reverse_name = "_".join(map(str, reverse))
+        forward = np.asarray(output[forward_name])
+        backward = np.asarray(output[reverse_name])
+        if forward.dtype != backward.dtype:
+            raise ValueError(
+                f"{label} Hermitian pair {key}/{reverse} has dtype mismatch "
+                f"{forward.dtype} != {backward.dtype}."
+            )
+        if forward.shape != backward.T.shape:
+            raise ValueError(
+                f"{label} Hermitian pair {key}/{reverse} has shape mismatch "
+                f"{forward.shape} != transpose({backward.shape})."
+            )
+        reverse_t = backward.T.conj()
+        mismatch = float(np.max(np.abs(forward - reverse_t), initial=0.0))
+        calculation_dtype = np.complex128 if np.iscomplexobj(forward) else np.float64
+        average = 0.5 * (
+            forward.astype(calculation_dtype, copy=False)
+            + reverse_t.astype(calculation_dtype, copy=False)
+        )
+        projected = np.asarray(average, dtype=forward.dtype)
+        correction = float(np.max(np.abs(projected - forward), initial=0.0))
+        reverse_correction = float(
+            np.max(np.abs(projected.T.conj() - backward), initial=0.0)
+        )
+        output[forward_name] = projected
+        # Derive reverse from the already-cast forward block.  This makes
+        # equality exact in storage, including for float32.
+        output[reverse_name] = projected.T.conj().copy()
+        max_mismatch = max(max_mismatch, mismatch)
+        max_correction = max(max_correction, correction, reverse_correction)
+        pair_count += 1
+        seen.add(key)
+        seen.add(reverse)
+
+    return output, {
+        "pair_count": pair_count,
+        "max_pre_projection_mismatch": max_mismatch,
+        "max_projection_correction": max_correction,
+        "method": "pair_average_exact_reverse",
+    }
+
+
 def _source_set_fingerprint(cases: list[Path], p2_root: Path) -> str:
     digest = hashlib.sha256()
     for case in sorted(cases, key=lambda item: item.name):
@@ -474,6 +551,8 @@ def _raw_split(
     input_json: Path,
     work_root: Path,
     split: str,
+    start_index: int = 0,
+    prefix_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     cutoff_options, _, _ = _dataset_args_from_input(
         input_json=str(input_json),
@@ -481,9 +560,14 @@ def _raw_split(
         get_h0=True,
     )
     env = _open_write(raw_split / "data.0000.lmdb")
-    rows: list[dict[str, Any]] = []
+    rows = list(prefix_rows or [])
+    if start_index != len(rows) or not 0 <= start_index <= len(cases):
+        raise ValueError(
+            f"Invalid raw resume prefix: start_index={start_index}, rows={len(rows)}, "
+            f"cases={len(cases)}."
+        )
     try:
-        for index, case in enumerate(cases):
+        for index, case in enumerate(cases[start_index:], start=start_index):
             _abacus_parse(
                 str(case),
                 str(raw_split),
@@ -592,7 +676,13 @@ def _raw_split(
                         f"{case.name}: main graph has P2 block keys absent from the "
                         f"source: {missing_required[:5]}"
                     )
+                p2_blocks, projection = project_non_soc_blocks_hermitian(
+                    p2_blocks,
+                    required_keys=required_keys,
+                    label=f"{case.name} P2",
+                )
                 record["hamiltonian_p2"] = p2_blocks
+                record["p2_hermitian_projection"] = projection
                 record["case_id"] = case.name
                 record["source"] = str(case)
                 record["p2_cache_source"] = source_metadata
@@ -633,6 +723,12 @@ def _raw_row(record: dict[str, Any], *, index: int) -> dict[str, Any]:
             source.get("npz_sha256") or source.get("table_manifest_sha256")
         ),
         "p2_blocks": len(record["hamiltonian_p2"]),
+        "p2_max_pre_projection_mismatch": record.get(
+            "p2_hermitian_projection", {}
+        ).get("max_pre_projection_mismatch", 0.0),
+        "p2_max_projection_correction": record.get(
+            "p2_hermitian_projection", {}
+        ).get("max_projection_correction", 0.0),
         "full_h_sparse_zero_filled": zero_completion.get("hamiltonian", {}).get(
             "filled_count", 0
         ),
@@ -646,28 +742,30 @@ def _reuse_raw_split(
     *,
     cases: list[Path],
     raw_split: Path,
+    p2_root: Path | None,
+    p2_assembler: P2TableAssembler | None,
+    gate1: Any | None,
     p2_source_fingerprint: str,
     input_json: Path,
     work_root: Path,
     split: str,
 ) -> list[dict[str, Any]]:
-    """Validate and reuse a completed raw staging split after interruption."""
+    """Validate a committed raw prefix and append any missing cases."""
 
     lmdb_path = raw_split / "data.0000.lmdb"
     paths_path = raw_split / "data.0000.paths.txt"
-    if not lmdb_path.is_dir() or not paths_path.is_file():
-        raise FileNotFoundError(
-            f"Cannot resume {split}: raw staging LMDB/path manifest is incomplete."
-        )
-    staged_paths = [
-        Path(line.strip())
-        for line in paths_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    if [path.name for path in staged_paths] != [case.name for case in cases]:
-        raise ValueError(
-            f"Cannot resume {split}: staged case order does not match requested split."
-        )
+    if not lmdb_path.is_dir():
+        raise FileNotFoundError(f"Cannot resume {split}: raw staging LMDB is missing.")
+    if paths_path.is_file():
+        staged_paths = [
+            Path(line.strip())
+            for line in paths_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if [path.name for path in staged_paths] != [case.name for case in cases]:
+            raise ValueError(
+                f"Cannot resume {split}: staged case order does not match requested split."
+            )
 
     cutoff_options, _, _ = _dataset_args_from_input(
         input_json=str(input_json),
@@ -685,12 +783,13 @@ def _reuse_raw_split(
     rows: list[dict[str, Any]] = []
     try:
         with env.begin() as txn:
-            if txn.stat()["entries"] != len(cases):
+            committed = int(txn.stat()["entries"])
+            if committed > len(cases):
                 raise ValueError(
-                    f"Cannot resume {split}: LMDB has {txn.stat()['entries']} "
-                    f"entries, expected {len(cases)}."
+                    f"Cannot resume {split}: LMDB has {committed} entries, "
+                    f"more than requested {len(cases)}."
                 )
-        for index, case in enumerate(cases):
+        for index, case in enumerate(cases[:committed]):
             key = index.to_bytes(length=4, byteorder="big")
             with env.begin(write=True) as txn:
                 value = txn.get(key)
@@ -747,6 +846,13 @@ def _reuse_raw_split(
                         f"Cannot resume {case.name}: P2 is missing exact graph "
                         f"blocks {missing_p2[:5]}."
                     )
+                projected, projection = project_non_soc_blocks_hermitian(
+                    record["hamiltonian_p2"],
+                    required_keys=required_keys,
+                    label=f"{case.name} P2",
+                )
+                record["hamiltonian_p2"] = projected
+                record["p2_hermitian_projection"] = projection
                 record["sparse_zero_completion"] = zero_completion
                 txn.put(key, pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL))
             row = _raw_row(record, index=index)
@@ -762,6 +868,24 @@ def _reuse_raw_split(
             print(json.dumps({"stage": "reuse_raw", "split": split, **row}), flush=True)
     finally:
         env.close()
+    if committed < len(cases):
+        return _raw_split(
+            cases=cases,
+            raw_split=raw_split,
+            p2_root=p2_root,
+            p2_assembler=p2_assembler,
+            gate1=gate1,
+            p2_source_fingerprint=p2_source_fingerprint,
+            input_json=input_json,
+            work_root=work_root,
+            split=split,
+            start_index=committed,
+            prefix_rows=rows,
+        )
+    if not paths_path.is_file():
+        paths_path.write_text(
+            "".join(f"{case}\n" for case in cases), encoding="utf-8"
+        )
     return rows
 
 
@@ -794,6 +918,7 @@ def _base_record(
             "case_id": raw["case_id"],
             "source": raw["source"],
             "p2_cache_source": raw["p2_cache_source"],
+            "p2_hermitian_projection": raw.get("p2_hermitian_projection", {}),
             "sparse_zero_completion": raw.get("sparse_zero_completion", {}),
             SAMPLE_SCHEMA_KEY: P2_SAMPLE_SCHEMA,
             BASIS_FINGERPRINT_KEY: basis_fingerprint,
@@ -1156,6 +1281,9 @@ def main(argv: list[str] | None = None) -> int:
             raw_rows = _reuse_raw_split(
                 cases=selected,
                 raw_split=raw_split,
+                p2_root=p2_root,
+                p2_assembler=p2_assembler,
+                gate1=gate1,
                 p2_source_fingerprint=p2_source_fingerprint,
                 input_json=input_json,
                 work_root=work_root,

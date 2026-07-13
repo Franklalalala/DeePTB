@@ -17,6 +17,7 @@ from tools.materialize_nonsoc_p2_cache import (
     complete_sparse_zero_blocks,
     dense_p2_to_deeptb_blocks,
     parse_basis_lines,
+    project_non_soc_blocks_hermitian,
 )
 
 
@@ -185,6 +186,40 @@ def test_abacus_sparse_zero_completion_is_explicit_and_shape_safe():
             basis_lines="1s\n1s1p\n",
             atom_count=2,
             label="hamiltonian",
+        )
+
+
+def test_p2_hermitian_projection_makes_reverse_edges_exact():
+    blocks = {
+        "0_0_0_0_0": np.asarray([[1.0, 2.0], [2.00002, 3.0]], dtype=np.float32),
+        "0_1_1_0_0": np.asarray([[4.0, 5.0]], dtype=np.float32),
+        "1_0_-1_0_0": np.asarray([[4.00002], [4.99998]], dtype=np.float32),
+        "1_1_0_0_0": np.asarray([[6.0]], dtype=np.float32),
+    }
+    projected, stats = project_non_soc_blocks_hermitian(
+        blocks,
+        required_keys=[
+            (0, 0, 0, 0, 0),
+            (0, 1, 1, 0, 0),
+            (1, 0, -1, 0, 0),
+            (1, 1, 0, 0, 0),
+        ],
+    )
+    np.testing.assert_array_equal(
+        projected["0_0_0_0_0"], projected["0_0_0_0_0"].T
+    )
+    np.testing.assert_array_equal(
+        projected["0_1_1_0_0"], projected["1_0_-1_0_0"].T
+    )
+    assert stats["max_pre_projection_mismatch"] > 1.0e-5
+    assert stats["max_projection_correction"] > 0.0
+
+
+def test_p2_hermitian_projection_rejects_missing_reverse_graph_block():
+    with pytest.raises(ValueError, match="no reverse graph block"):
+        project_non_soc_blocks_hermitian(
+            {"0_1_1_0_0": np.ones((1, 1), dtype=np.float32)},
+            required_keys=[(0, 1, 1, 0, 0)],
         )
 
 
