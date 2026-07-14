@@ -1,11 +1,11 @@
-"""Fail-closed metadata and fingerprint helpers for the non-SOC P2 route.
+"""Fail-closed metadata and fingerprint helpers for non-SOC physical priors.
 
 The compact training LMDB stores several row-aligned views of the same
-structure: a canonical directed edge graph, P2 RME features, packed P2 AO
-blocks, and (for Full-H training) packed absolute-H targets.  Row counts alone
-cannot prove that those views still refer to the same graph.  This module keeps
-the small, deterministic contract used both by the cache materializer and the
-LMDB loader.
+structure: a canonical directed edge graph, P2/P23 RME features, packed prior
+AO blocks, and (for Full-H training) packed absolute-H targets.  Row counts
+alone cannot prove that those views still refer to the same graph.  This module
+keeps the small, deterministic contract used both by cache materializers and
+the LMDB loader while retaining the historical P2-v2 API.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -20,6 +21,7 @@ import torch
 
 
 P2_SAMPLE_SCHEMA = "deeptb.p2_training_sample/v2"
+DUAL_PRIOR_SAMPLE_SCHEMA = "deeptb.physical_prior_training_sample/v3"
 ABSOLUTE_FULL_H_SEMANTICS = "absolute_full_h"
 H0_RESIDUAL_SEMANTICS = "h0_residual"
 
@@ -32,6 +34,11 @@ P2_SOURCE_FINGERPRINT_KEY = "p2_source_fingerprint"
 P2_RME_FINGERPRINT_KEY = "p2_rme_fingerprint"
 P2_BLOCK_FINGERPRINT_KEY = "p2_blocks_fingerprint"
 P2_BUNDLE_FINGERPRINT_KEY = "p2_bundle_fingerprint"
+P23_SOURCE_FINGERPRINT_KEY = "p23_source_fingerprint"
+P23_RME_FINGERPRINT_KEY = "p23_rme_fingerprint"
+P23_BLOCK_FINGERPRINT_KEY = "p23_blocks_fingerprint"
+P23_BUNDLE_FINGERPRINT_KEY = "p23_bundle_fingerprint"
+P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY = "p23_parent_p2_bundle_fingerprint"
 FULL_H_TARGET_FINGERPRINT_KEY = "full_h_target_fingerprint"
 ROW_ALIGNED_DATA_FINGERPRINT_KEY = "row_aligned_data_fingerprint"
 ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY = "row_aligned_bundle_fingerprint"
@@ -51,6 +58,8 @@ ROW_ALIGNED_FIELD_CANDIDATES = (
     "edge_physical_h0",
     "node_p2",
     "edge_p2",
+    "node_p23",
+    "edge_p23",
     "node_delta_hamil_blocks",
     "edge_delta_hamil_blocks",
     "node_delta_hamil_block_shape",
@@ -67,9 +76,102 @@ ROW_ALIGNED_FIELD_CANDIDATES = (
     "edge_p2_blocks",
     "node_p2_block_shape",
     "edge_p2_block_shape",
+    "node_p23_blocks",
+    "edge_p23_blocks",
+    "node_p23_block_shape",
+    "edge_p23_block_shape",
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class PriorFieldSpec:
+    """All record fields that must move together for one physical prior."""
+
+    kind: str
+    raw_key: str
+    node_rme_key: str
+    edge_rme_key: str
+    node_blocks_key: str
+    edge_blocks_key: str
+    node_shape_key: str
+    edge_shape_key: str
+    source_fingerprint_key: str
+    rme_fingerprint_key: str
+    block_fingerprint_key: str
+    bundle_fingerprint_key: str
+    allowed_sample_schemas: tuple[str, ...]
+    bundle_dependency_fields: tuple[str, ...] = ()
+
+    @property
+    def rme_fields(self) -> tuple[str, str]:
+        return self.node_rme_key, self.edge_rme_key
+
+    @property
+    def block_fields(self) -> tuple[str, str, str, str]:
+        return (
+            self.node_blocks_key,
+            self.edge_blocks_key,
+            self.node_shape_key,
+            self.edge_shape_key,
+        )
+
+
+PRIOR_FIELD_SPECS = {
+    "p2": PriorFieldSpec(
+        kind="p2",
+        raw_key="hamiltonian_p2",
+        node_rme_key="node_p2",
+        edge_rme_key="edge_p2",
+        node_blocks_key="node_p2_blocks",
+        edge_blocks_key="edge_p2_blocks",
+        node_shape_key="node_p2_block_shape",
+        edge_shape_key="edge_p2_block_shape",
+        source_fingerprint_key=P2_SOURCE_FINGERPRINT_KEY,
+        rme_fingerprint_key=P2_RME_FINGERPRINT_KEY,
+        block_fingerprint_key=P2_BLOCK_FINGERPRINT_KEY,
+        bundle_fingerprint_key=P2_BUNDLE_FINGERPRINT_KEY,
+        allowed_sample_schemas=(P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA),
+    ),
+    "p23": PriorFieldSpec(
+        kind="p23",
+        raw_key="hamiltonian_p23",
+        node_rme_key="node_p23",
+        edge_rme_key="edge_p23",
+        node_blocks_key="node_p23_blocks",
+        edge_blocks_key="edge_p23_blocks",
+        node_shape_key="node_p23_block_shape",
+        edge_shape_key="edge_p23_block_shape",
+        source_fingerprint_key=P23_SOURCE_FINGERPRINT_KEY,
+        rme_fingerprint_key=P23_RME_FINGERPRINT_KEY,
+        block_fingerprint_key=P23_BLOCK_FINGERPRINT_KEY,
+        bundle_fingerprint_key=P23_BUNDLE_FINGERPRINT_KEY,
+        allowed_sample_schemas=(DUAL_PRIOR_SAMPLE_SCHEMA,),
+        bundle_dependency_fields=(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,),
+    ),
+}
+
+
+def resolve_prior_field_spec(kind: Any) -> PriorFieldSpec:
+    normalized = str(kind).strip().lower()
+    try:
+        return PRIOR_FIELD_SPECS[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"prior kind must be one of {tuple(PRIOR_FIELD_SPECS)}, got {kind!r}."
+        ) from exc
+
+
+def resolve_prior_field_spec_from_raw_key(raw_key: Any) -> PriorFieldSpec:
+    normalized = str(raw_key).strip()
+    for spec in PRIOR_FIELD_SPECS.values():
+        if normalized == spec.raw_key:
+            return spec
+    raise ValueError(
+        "physical-prior raw key must select exactly 'hamiltonian_p2' or "
+        f"'hamiltonian_p23'; got {raw_key!r}."
+    )
 
 
 def require_sha256(value: Any, *, field: str) -> str:
@@ -282,6 +384,7 @@ def assert_record_fingerprint(
 __all__ = [
     "ABSOLUTE_FULL_H_SEMANTICS",
     "BASIS_FINGERPRINT_KEY",
+    "DUAL_PRIOR_SAMPLE_SCHEMA",
     "EDGE_GRAPH_FINGERPRINT_KEY",
     "FULL_H_TARGET_FINGERPRINT_KEY",
     "H0_RESIDUAL_SEMANTICS",
@@ -290,6 +393,13 @@ __all__ = [
     "P2_RME_FINGERPRINT_KEY",
     "P2_SAMPLE_SCHEMA",
     "P2_SOURCE_FINGERPRINT_KEY",
+    "P23_BLOCK_FINGERPRINT_KEY",
+    "P23_BUNDLE_FINGERPRINT_KEY",
+    "P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY",
+    "P23_RME_FINGERPRINT_KEY",
+    "P23_SOURCE_FINGERPRINT_KEY",
+    "PRIOR_FIELD_SPECS",
+    "PriorFieldSpec",
     "ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY",
     "ROW_ALIGNED_DATA_FINGERPRINT_KEY",
     "ROW_ALIGNED_FIELD_CANDIDATES",
@@ -304,4 +414,6 @@ __all__ = [
     "fingerprint_text_fields",
     "mapper_basis_fingerprint",
     "require_sha256",
+    "resolve_prior_field_spec",
+    "resolve_prior_field_spec_from_raw_key",
 ]

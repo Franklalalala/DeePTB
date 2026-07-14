@@ -108,6 +108,11 @@ NODE_H0_KEY: Final[str] = "node_h0"
 # inference without a per-structure H0 calculation.
 EDGE_P2_KEY: Final[str] = "edge_p2"
 NODE_P2_KEY: Final[str] = "node_p2"
+# P23 augments the transferable P2 Hamiltonian with the explicit factorized
+# third-centre neutral-atom-potential contribution.  Keep it first-class and
+# separate from P2 so one immutable LMDB record can expose both priors.
+EDGE_P23_KEY: Final[str] = "edge_p23"
+NODE_P23_KEY: Final[str] = "node_p23"
 # Dedicated offline DFT H[rho0] features.  Keep these separate from legacy
 # H0/Hueckel fields so provenance and fallback semantics cannot mix.
 EDGE_PHYSICAL_H0_KEY: Final[str] = "edge_physical_h0"
@@ -124,6 +129,10 @@ EDGE_P2_BLOCKS_KEY: Final[str] = "edge_p2_blocks"
 NODE_P2_BLOCKS_KEY: Final[str] = "node_p2_blocks"
 EDGE_P2_BLOCK_SHAPE_KEY: Final[str] = "edge_p2_block_shape"
 NODE_P2_BLOCK_SHAPE_KEY: Final[str] = "node_p2_block_shape"
+EDGE_P23_BLOCKS_KEY: Final[str] = "edge_p23_blocks"
+NODE_P23_BLOCKS_KEY: Final[str] = "node_p23_blocks"
+EDGE_P23_BLOCK_SHAPE_KEY: Final[str] = "edge_p23_block_shape"
+NODE_P23_BLOCK_SHAPE_KEY: Final[str] = "node_p23_block_shape"
 # Absolute Full-H supervision has dedicated names.  Historical ``delta`` names
 # remain available for H0->dH training, but must never be reinterpreted as Full H.
 EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY: Final[str] = "edge_full_hamil_target_blocks"

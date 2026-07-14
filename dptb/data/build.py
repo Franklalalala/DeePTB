@@ -291,6 +291,7 @@ class DatasetBuilder:
                 get_eigenvalues=get_eigenvalues,
                 h0_key=kwargs.get("h0_key", "hamiltonian_0"),
                 prefer_precomputed_h0=kwargs.get("prefer_precomputed_h0", True),
+                prior_kind=kwargs.get("prior_kind", "p2"),
                 p2_key=kwargs.get("p2_key", "hamiltonian_p2"),
                 prefer_precomputed_p2=kwargs.get("prefer_precomputed_p2", True),
                 require_p2_blocks=kwargs.get("require_p2_blocks", False),
