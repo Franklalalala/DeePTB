@@ -258,8 +258,12 @@ def _train_options(
             ),
         },
         "save_freq": 5000,
+        # TensorBoardMonitor is registered only when display_freq is not more
+        # frequent than validation_freq (train.py enforces display >= validation).
+        # Keep both at the intended 1k validation cadence so production configs
+        # pass the real training entrypoint without paying for extra validation.
         "validation_freq": 1000,
-        "display_freq": 100,
+        "display_freq": 1000,
         "sliding_win_size": 1000,
         "update_lr_per_iter": True,
         "valid_fast": False,

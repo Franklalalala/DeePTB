@@ -255,6 +255,7 @@ def test_four_ablation_configs_lock_hb0_and_comparable_loss(tmp_path):
         assert train["lr_scheduler"]["type"] == "wsd"
         assert train["lr_scheduler"]["total_steps"] == 50_000
         assert train["num_epoch"] == 278
+        assert train["display_freq"] >= train["validation_freq"] > 0
         assert loss["method"] == "hamil_blockwise_nextham"
         assert loss["optimization"] == "block_l1_rmse"
         assert loss["block_reduction"] == "equal_onsite_hopping"
