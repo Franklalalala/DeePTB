@@ -35,6 +35,10 @@ DEFAULT_REFERENCE = (
 )
 SCHEMA = "deeptb.nonsoc_dual_prior_ablation_configs/v1"
 MUON_CLIP_MODE = "auto"
+SAVE_FREQ = 1000
+VALIDATION_FREQ = 1000
+VALIDATION_EPOCH_FREQ = 0
+DISPLAY_FREQ = 1000
 MUON_CLIP_MODE_EVIDENCE = (
     "Hanhai production HybridMuon used automatic relative-step clipping; "
     "muon_clip_rms=0.2 is the requested hard update-RMS cap."
@@ -240,10 +244,10 @@ def _train_options(*, total_steps: int, train_count: int, head_mode: str) -> dic
             "train": copy.deepcopy(loss),
             "validation": copy.deepcopy(loss),
         },
-        "save_freq": 1000,
-        "validation_freq": 1000,
-        "validation_epoch_freq": 0,
-        "display_freq": 1000,
+        "save_freq": SAVE_FREQ,
+        "validation_freq": VALIDATION_FREQ,
+        "validation_epoch_freq": VALIDATION_EPOCH_FREQ,
+        "display_freq": DISPLAY_FREQ,
         "sliding_win_size": 1000,
         "update_lr_per_iter": True,
         "valid_fast": False,
@@ -446,7 +450,11 @@ def build_configs(
             "scheduled_epochs": int(math.ceil(total_steps / train_count)),
             "scheduled_data_steps": int(math.ceil(total_steps / train_count))
             * train_count,
-            "validation_epoch_freq": 0,
+            "save_freq": SAVE_FREQ,
+            "validation_freq": VALIDATION_FREQ,
+            "validation_epoch_freq": VALIDATION_EPOCH_FREQ,
+            "display_freq": DISPLAY_FREQ,
+            "expected_validation_points": total_steps // VALIDATION_FREQ,
             "note": (
                 "Trainer epochs are integer-ceiled, so the latest checkpoint/log "
                 "may reach scheduled_data_steps (for raw200: 50040) while formal "
