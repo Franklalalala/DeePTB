@@ -8,12 +8,17 @@ import json
 import os
 from pathlib import Path
 import random
+import sys
 import time
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from dptb.data.interfaces.p2_table import P2_TABLE_SCHEMA, P2TableStore
+from dptb.data.interfaces.p2_table import (
+    P2_TABLE_SCHEMA,
+    P2TableStore,
+    validate_p2_component_numerical_contract,
+)
 
 
 SCHEMA = "deeptb.p2_radial_table_audit/v1"
@@ -70,21 +75,37 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     if manifest.get("schema") != P2_TABLE_SCHEMA or manifest.get("complete") is not True:
         raise ValueError("P2 table manifest is not a completed v1 table.")
     rng = random.Random(int(args.seed))
-    store = P2TableStore(root, verify_checksums=True)
+    store = P2TableStore(
+        root,
+        verify_checksums=True,
+        require_explicit_source_identity=True,
+    )
     base_inventory = _metadata_inventory(root, manifest["base_tables"])
     projector_inventory = _metadata_inventory(root, manifest["projector_tables"])
 
     species_checks = []
     for symbol in sorted(store.species):
-        arrays = store.species_arrays(symbol)
+        onsite = store.onsite(symbol)
+        d_eff = store.d_eff(symbol)
+        onsite_components = {
+            component: float(
+                np.max(
+                    np.abs(store.onsite_component(symbol, component)),
+                    initial=0.0,
+                )
+            )
+            for component in store.onsite_component_arrays
+        }
         species_checks.append(
             {
                 "symbol": symbol,
                 "orbital_norb": int(store.species[symbol]["orbital_norb"]),
                 "projector_norb": int(store.species[symbol]["projector_norb"]),
                 "onsite_max_abs_ry": float(
-                    np.max(np.abs(arrays["onsite_base"]), initial=0.0)
+                    np.max(np.abs(onsite), initial=0.0)
                 ),
+                "d_eff_max_abs_ry": float(np.max(np.abs(d_eff), initial=0.0)),
+                "onsite_component_max_abs": onsite_components,
             }
         )
 
@@ -106,6 +127,19 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         displacement = direction * distance
         direct = table.evaluate(displacement)
         opposite = reverse.evaluate(-displacement).T
+        component_max_abs = {
+            component: float(
+                np.max(
+                    np.abs(
+                        store.base_component(left, right, component).evaluate(
+                            displacement
+                        )
+                    ),
+                    initial=0.0,
+                )
+            )
+            for component in store.base_component_arrays
+        }
         error = float(np.max(np.abs(direct - opposite), initial=0.0))
         worst_reciprocity = max(worst_reciprocity, error)
         base_checks.append(
@@ -114,6 +148,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
                 "shape": list(direct.shape),
                 "distance_bohr": distance,
                 "reciprocity_max_abs_ry": error,
+                "component_max_abs": component_max_abs,
             }
         )
 
@@ -139,18 +174,52 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
             f"Base-table reciprocity error {worst_reciprocity:.3e} exceeds "
             f"{float(args.reciprocity_tolerance):.3e}."
         )
+    component_gate = validate_p2_component_numerical_contract(
+        store,
+        reciprocity_tolerance=float(args.component_reciprocity_tolerance),
+        reconstruction_tolerance=float(args.component_reconstruction_tolerance),
+        distance_samples=int(args.component_gate_distance_samples),
+    )
+    if component_gate["status"] != "pass":
+        raise ValueError(
+            "P2 component numerical gate failed: "
+            + "; ".join(component_gate.get("failures", []))
+        )
+    full_base_scope = len(selected_base) == len(store.base_tables)
+    full_projector_scope = len(selected_projector) == len(store.projector_tables)
+    production_eligible = full_base_scope and full_projector_scope
+    audit_mode = "full_production" if production_eligible else "sampled_non_production"
+    expected_checksum_files = (
+        len(store.species) + len(store.base_tables) + len(store.projector_tables)
+    )
+    if production_eligible and store.verified_path_count != expected_checksum_files:
+        raise ValueError(
+            "Full P2 audit did not checksum one distinct file per species/base/"
+            "projector entry; cross-category duplicate paths or an unloaded shard "
+            f"exist (verified={store.verified_path_count}, "
+            f"expected={expected_checksum_files})."
+        )
     report = {
         "schema": SCHEMA,
         "table_root": str(root),
+        "audit_mode": audit_mode,
+        "production_eligible": production_eligible,
+        "requested_base_samples": int(args.base_samples),
+        "requested_projector_samples": int(args.projector_samples),
         "species": len(store.species),
+        "species_source_identity_sha256": store.species_source_identity_sha256,
+        "base_component_contract": store.base_component_contract,
+        "component_numerical_gate": component_gate,
         "base_inventory": base_inventory,
         "projector_inventory": projector_inventory,
         "species_checks": species_checks,
         "base_samples": base_checks,
         "projector_samples": projector_checks,
         "worst_base_reciprocity_max_abs_ry": worst_reciprocity,
+        "verified_file_checksums": store.verified_path_count,
+        "expected_full_file_checksums": expected_checksum_files,
         "elapsed_seconds": time.time() - started,
-        "status": "pass",
+        "status": "pass" if production_eligible else "pass_non_production",
     }
     _atomic_json(args.output.resolve(), report)
     return report
@@ -160,15 +229,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--table-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--base-samples", type=int, default=64)
-    parser.add_argument("--projector-samples", type=int, default=64)
+    parser.add_argument(
+        "--base-samples",
+        type=int,
+        default=0,
+        help=(
+            "explicit non-production sample count; 0 (default) loads and checks "
+            "every base shard"
+        ),
+    )
+    parser.add_argument(
+        "--projector-samples",
+        type=int,
+        default=0,
+        help=(
+            "explicit non-production sample count; 0 (default) loads and checks "
+            "every projector shard"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=713)
     parser.add_argument("--reciprocity-tolerance", type=float, default=2.0e-4)
+    parser.add_argument("--component-reciprocity-tolerance", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--component-reconstruction-tolerance", type=float, default=1.0e-6
+    )
+    parser.add_argument("--component-gate-distance-samples", type=int, default=33)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     result = audit(parse_args(argv))
+    if not result["production_eligible"]:
+        print(
+            "WARNING: sampled P2 audit is diagnostic only and is not a production gate.",
+            file=sys.stderr,
+        )
     print(
         json.dumps(
             {
@@ -178,6 +273,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "projector_samples": len(result["projector_samples"]),
                 "worst_base_reciprocity_max_abs_ry": result[
                     "worst_base_reciprocity_max_abs_ry"
+                ],
+                "component_numerical_gate": result["component_numerical_gate"][
+                    "status"
                 ],
                 "elapsed_seconds": result["elapsed_seconds"],
             },

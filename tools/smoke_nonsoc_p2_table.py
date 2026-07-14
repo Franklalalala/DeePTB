@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -19,6 +20,17 @@ from dptb.data.interfaces.p2_table import P2TableAssembler, P2TableStore
 
 
 SCHEMA = "deeptb.p2_table_oracle_smoke/v1"
+
+# Conservative catastrophe gates for the production-default profile.  A
+# campaign may tighten these from a validated oracle distribution, but it must
+# never silently remove every numerical acceptance condition.
+DEFAULT_MAX_ACTIVE_MAE_RY = 5.0e-3
+DEFAULT_MAX_ACTIVE_RMSE_RY = 1.0e-2
+DEFAULT_MAX_ACTIVE_P99_ABS_RY = 5.0e-2
+DEFAULT_MAX_ACTIVE_ABS_RY = 2.0e-1
+DEFAULT_MIN_ACTIVE_R2 = 0.99
+DEFAULT_MAX_TABLE_HERMITICITY_RY = 5.0e-4
+DEFAULT_MAX_ORACLE_HERMITICITY_RY = 5.0e-6
 
 
 def _sha256(path: Path) -> str:
@@ -133,6 +145,112 @@ def _hermiticity(array: np.ndarray, r_keys: np.ndarray) -> dict[str, Any]:
     return {"paired_r_keys": compared, "max_abs_ry": worst}
 
 
+def _numerical_gate(
+    metrics: dict[str, Any],
+    *,
+    enabled: bool,
+    thresholds: dict[str, float],
+) -> dict[str, Any]:
+    for name, value in thresholds.items():
+        if not math.isfinite(float(value)):
+            raise ValueError(f"numerical threshold {name} must be finite")
+        if name != "min_active_r2" and float(value) < 0.0:
+            raise ValueError(f"numerical threshold {name} must be non-negative")
+    active = metrics["blocks"].get("active_total")
+    if active is None:
+        raise ValueError("direct-oracle smoke has no active AO blocks to qualify")
+    checks = [
+        {
+            "metric": "active_total.mae_ry",
+            "value": float(active["mae_ry"]),
+            "operator": "<=",
+            "threshold": float(thresholds["max_active_mae_ry"]),
+            "pass": float(active["mae_ry"])
+            <= float(thresholds["max_active_mae_ry"]),
+        },
+        {
+            "metric": "active_total.rmse_ry",
+            "value": float(active["rmse_ry"]),
+            "operator": "<=",
+            "threshold": float(thresholds["max_active_rmse_ry"]),
+            "pass": float(active["rmse_ry"])
+            <= float(thresholds["max_active_rmse_ry"]),
+        },
+        {
+            "metric": "active_total.p99_abs_ry",
+            "value": float(active["p99_abs_ry"]),
+            "operator": "<=",
+            "threshold": float(thresholds["max_active_p99_abs_ry"]),
+            "pass": float(active["p99_abs_ry"])
+            <= float(thresholds["max_active_p99_abs_ry"]),
+        },
+        {
+            "metric": "active_total.max_abs_ry",
+            "value": float(active["max_abs_ry"]),
+            "operator": "<=",
+            "threshold": float(thresholds["max_active_abs_ry"]),
+            "pass": float(active["max_abs_ry"])
+            <= float(thresholds["max_active_abs_ry"]),
+        },
+        {
+            "metric": "active_total.r2",
+            "value": float(active["r2"]),
+            "operator": ">=",
+            "threshold": float(thresholds["min_active_r2"]),
+            "pass": math.isfinite(float(active["r2"]))
+            and float(active["r2"]) >= float(thresholds["min_active_r2"]),
+        },
+        {
+            "metric": "table_hermiticity.max_abs_ry",
+            "value": float(metrics["table_hermiticity"]["max_abs_ry"]),
+            "operator": "<=",
+            "threshold": float(thresholds["max_table_hermiticity_ry"]),
+            "pass": float(metrics["table_hermiticity"]["max_abs_ry"])
+            <= float(thresholds["max_table_hermiticity_ry"]),
+        },
+        {
+            "metric": "table_hermiticity.paired_r_keys",
+            "value": int(metrics["table_hermiticity"]["paired_r_keys"]),
+            "operator": ">=",
+            "threshold": 1,
+            "pass": int(metrics["table_hermiticity"]["paired_r_keys"]) >= 1,
+        },
+        {
+            "metric": "oracle_hermiticity.max_abs_ry",
+            "value": float(metrics["oracle_hermiticity"]["max_abs_ry"]),
+            "operator": "<=",
+            "threshold": float(thresholds["max_oracle_hermiticity_ry"]),
+            "pass": float(metrics["oracle_hermiticity"]["max_abs_ry"])
+            <= float(thresholds["max_oracle_hermiticity_ry"]),
+        },
+        {
+            "metric": "oracle_hermiticity.paired_r_keys",
+            "value": int(metrics["oracle_hermiticity"]["paired_r_keys"]),
+            "operator": ">=",
+            "threshold": 1,
+            "pass": int(metrics["oracle_hermiticity"]["paired_r_keys"]) >= 1,
+        },
+    ]
+    passed = all(bool(check["pass"]) for check in checks)
+    if not enabled:
+        return {
+            "profile": "disabled_explicit_non_production",
+            "enabled": False,
+            "production_eligible": False,
+            "status": "not_run",
+            "thresholds": thresholds,
+            "checks": checks,
+        }
+    return {
+        "profile": "production_default",
+        "enabled": True,
+        "production_eligible": passed,
+        "status": "pass" if passed else "fail",
+        "thresholds": thresholds,
+        "checks": checks,
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     gate1 = _load_gate1(args.gate1_script.resolve())
     parsed = gate1.parse_stru(args.case.resolve() / "STRU")
@@ -141,8 +259,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     positions = np.asarray(structure.cart_positions, dtype=np.float64)
     cell = np.asarray(structure.cell_bohr, dtype=np.float64)
     with np.load(args.oracle_npz.resolve(), allow_pickle=False) as payload:
-        r_keys = np.asarray(payload["r_keys"], dtype=np.int64)
+        r_keys_raw = np.asarray(payload["r_keys"])
         oracle_raw = np.asarray(payload["P2"])
+    if r_keys_raw.ndim != 2 or r_keys_raw.shape[1] != 3:
+        raise ValueError(f"oracle r_keys must be [nR,3], got {r_keys_raw.shape}")
+    if not np.isfinite(r_keys_raw).all():
+        raise ValueError("oracle r_keys contains NaN or infinity")
+    r_keys = r_keys_raw.astype(np.int64)
+    if not np.array_equal(r_keys_raw, r_keys):
+        raise ValueError("oracle r_keys must contain exact integer translations")
+    if len({tuple(row) for row in r_keys.tolist()}) != len(r_keys):
+        raise ValueError("oracle r_keys contains duplicate translations")
     oracle_imag = (
         float(np.max(np.abs(oracle_raw.imag), initial=0.0))
         if np.iscomplexobj(oracle_raw)
@@ -155,7 +282,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     oracle = np.asarray(oracle_raw.real, dtype=np.float64)
 
     cold_started = perf_counter()
-    store = P2TableStore(args.table_root.resolve())
+    store = P2TableStore(
+        args.table_root.resolve(), require_explicit_source_identity=True
+    )
+    declared_pp_orb = store.manifest.get("source", {}).get("pp_orb")
+    pp_orb_candidate = args.pp_orb
+    if pp_orb_candidate is None and declared_pp_orb:
+        pp_orb_candidate = Path(str(declared_pp_orb))
+    if pp_orb_candidate is None or not pp_orb_candidate.resolve().is_dir():
+        raise ValueError(
+            "direct-oracle production smoke must resolve the case ORB/UPF bundle; "
+            "pass --pp-orb explicitly"
+        )
+    pp_orb_root = pp_orb_candidate.resolve()
+    source_files: dict[str, dict[str, Path]] = {}
+    shells_by_symbol: dict[str, tuple[int, ...]] = {}
+    for symbol in sorted(set(symbols)):
+        if symbol not in parsed.specs:
+            raise KeyError(f"case STRU has no ORB/UPF specification for {symbol!r}")
+        source_spec = parsed.specs[symbol]
+        orbital_path = (pp_orb_root / str(source_spec.orbital)).resolve()
+        upf_path = (pp_orb_root / str(source_spec.pseudo)).resolve()
+        source_files[symbol] = {"orbital": orbital_path, "upf": upf_path}
+        orbital = gate1.read_abacus_orb(orbital_path)
+        shells_by_symbol[symbol] = tuple(
+            int(channel.l) for channel in orbital.channels
+        )
+    sample_contract = store.validate_sample_contract(
+        symbols=symbols,
+        atom_shells=[shells_by_symbol[symbol] for symbol in symbols],
+        source_files=source_files,
+        require_source_files=True,
+    )
     assembler = P2TableAssembler(store)
     table_p2 = assembler.assemble_dense_rkeys(
         symbols=symbols,
@@ -163,6 +321,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cell_bohr=cell,
         r_keys=r_keys,
     )
+    cold_batch_stats = assembler.batch_stats_snapshot()
     cold_seconds = perf_counter() - cold_started
     warm_started = perf_counter()
     table_p2_warm = assembler.assemble_dense_rkeys(
@@ -171,6 +330,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cell_bohr=cell,
         r_keys=r_keys,
     )
+    warm_batch_stats = assembler.batch_stats_snapshot()
     warm_seconds = perf_counter() - warm_started
     warm_repeat_error = float(
         np.max(np.abs(table_p2_warm - table_p2), initial=0.0)
@@ -200,6 +360,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "table": {
             "root": str(args.table_root.resolve()),
             "manifest_sha256": _sha256(args.table_root.resolve() / "manifest.json"),
+            "pp_orb": str(pp_orb_root),
+            "sample_contract": sample_contract,
+            "batch_stats": {
+                "cold": cold_batch_stats,
+                "warm": warm_batch_stats,
+            },
         },
         "metrics": {
             "dense_all": _metrics(oracle, table_p2),
@@ -216,6 +382,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else None,
         },
     }
+    thresholds = {
+        "max_active_mae_ry": float(args.max_active_mae_ry),
+        "max_active_rmse_ry": float(args.max_active_rmse_ry),
+        "max_active_p99_abs_ry": float(args.max_active_p99_abs_ry),
+        "max_active_abs_ry": float(args.max_active_abs_ry),
+        "min_active_r2": float(args.min_active_r2),
+        "max_table_hermiticity_ry": float(args.max_table_hermiticity_ry),
+        "max_oracle_hermiticity_ry": float(args.max_oracle_hermiticity_ry),
+    }
+    report["numerical_gate"] = _numerical_gate(
+        report["metrics"],
+        enabled=not bool(args.disable_numerical_gate),
+        thresholds=thresholds,
+    )
     _atomic_npz(
         args.output_npz.resolve(),
         r_keys=r_keys,
@@ -226,6 +406,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report["output_npz"] = str(args.output_npz.resolve())
     report["output_npz_sha256"] = _sha256(args.output_npz.resolve())
     _atomic_json(args.output_json.resolve(), report)
+    if report["numerical_gate"]["enabled"] and report["numerical_gate"]["status"] != "pass":
+        failed = [
+            check for check in report["numerical_gate"]["checks"] if not check["pass"]
+        ]
+        raise ValueError(
+            "P2 table direct-oracle numerical gate failed: "
+            + json.dumps(failed, sort_keys=True)
+        )
     return report
 
 
@@ -235,10 +423,51 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--oracle-npz", type=Path, required=True)
     parser.add_argument("--oracle-state", type=Path)
     parser.add_argument("--table-root", type=Path, required=True)
+    parser.add_argument(
+        "--pp-orb",
+        type=Path,
+        help=(
+            "ORB/UPF root selected by the case STRU; the table builder path is "
+            "used only when it still exists"
+        ),
+    )
     parser.add_argument("--gate1-script", type=Path, required=True)
     parser.add_argument("--output-npz", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--imag-tolerance", type=float, default=1.0e-10)
+    parser.add_argument(
+        "--max-active-mae-ry", type=float, default=DEFAULT_MAX_ACTIVE_MAE_RY
+    )
+    parser.add_argument(
+        "--max-active-rmse-ry", type=float, default=DEFAULT_MAX_ACTIVE_RMSE_RY
+    )
+    parser.add_argument(
+        "--max-active-p99-abs-ry",
+        type=float,
+        default=DEFAULT_MAX_ACTIVE_P99_ABS_RY,
+    )
+    parser.add_argument(
+        "--max-active-abs-ry", type=float, default=DEFAULT_MAX_ACTIVE_ABS_RY
+    )
+    parser.add_argument("--min-active-r2", type=float, default=DEFAULT_MIN_ACTIVE_R2)
+    parser.add_argument(
+        "--max-table-hermiticity-ry",
+        type=float,
+        default=DEFAULT_MAX_TABLE_HERMITICITY_RY,
+    )
+    parser.add_argument(
+        "--max-oracle-hermiticity-ry",
+        type=float,
+        default=DEFAULT_MAX_ORACLE_HERMITICITY_RY,
+    )
+    parser.add_argument(
+        "--disable-numerical-gate",
+        action="store_true",
+        help=(
+            "explicit diagnostic-only compatibility mode; the report is marked "
+            "non-production and must not qualify a table"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -249,6 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "case": report["case"],
                 "active_total": report["metrics"]["blocks"]["active_total"],
+                "numerical_gate": report["numerical_gate"],
                 "timing": report["timing"],
                 "output_npz": report["output_npz"],
             },
