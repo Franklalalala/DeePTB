@@ -230,6 +230,76 @@ def test_stru_geometry_identity_accepts_periodic_image_only(tmp_path):
         )
 
 
+def test_stru_geometry_identity_accepts_cell_serialization_roundoff(tmp_path):
+    cell_angstrom = np.diag([6.0, 7.0, 8.0])
+    positions = np.asarray([[0.5, 0.5, 0.5]])
+    structure = SimpleNamespace(
+        atoms=[SimpleNamespace(species="H")],
+        cart_positions=positions / dual_cache.Bohr2Ang,
+        cell_bohr=cell_angstrom / dual_cache.Bohr2Ang,
+    )
+    gate = SimpleNamespace(parse_stru=lambda _: SimpleNamespace(structure=structure))
+    case = tmp_path / "cell_roundoff"
+    case.mkdir()
+    (case / "STRU").write_text("synthetic\n", encoding="utf-8")
+    record = {
+        _keys.ATOMIC_NUMBERS_KEY: np.asarray([1]),
+        _keys.POSITIONS_KEY: positions,
+        _keys.CELL_KEY: cell_angstrom + np.diag([7.5e-5, 0.0, 0.0]),
+        _keys.PBC_KEY: np.asarray([True, True, True]),
+    }
+    _, _, _, provenance = dual_cache._structure_geometry_bohr(
+        record=record,
+        case_path=case,
+        gate1=gate,
+        table_species={"H": {}},
+    )
+    assert provenance["max_cell_identity_error_angstrom"] == pytest.approx(7.5e-5)
+
+    record[_keys.CELL_KEY] = cell_angstrom + np.diag([2.0e-4, 0.0, 0.0])
+    with pytest.raises(ValueError, match="compact geometry is not the STRU geometry"):
+        dual_cache._structure_geometry_bohr(
+            record=record,
+            case_path=case,
+            gate1=gate,
+            table_species={"H": {}},
+        )
+
+
+def test_resume_identity_allows_only_declared_geometry_tolerance_upgrade():
+    old_script = next(iter(dual_cache.LEGACY_GEOMETRY_IDENTITY_UPGRADES))
+    actual = {
+        "schema": dual_cache.IDENTITY_SCHEMA,
+        "materializer_script_sha256": old_script,
+        "geometry_tolerance_angstrom": 5.0e-5,
+        "unchanged": "bound-inputs",
+    }
+    actual["identity_sha256"] = dual_cache._json_sha256(actual)
+    expected = {
+        **actual,
+        "materializer_script_sha256": hashlib.sha256(b"new-script").hexdigest(),
+        "geometry_tolerance_angstrom": 1.0e-4,
+    }
+    expected.pop("identity_sha256")
+    expected["identity_sha256"] = dual_cache._json_sha256(expected)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        dual_cache._validate_identity(actual, expected)
+    migration = dual_cache._validate_identity(
+        actual, expected, allow_geometry_tolerance_upgrade=True
+    )
+    assert migration["kind"] == "geometry_serialization_tolerance_upgrade"
+
+    changed = dict(expected)
+    changed["unchanged"] = "different-input"
+    changed.pop("identity_sha256")
+    changed["identity_sha256"] = dual_cache._json_sha256(changed)
+    with pytest.raises(ValueError, match="identity changed"):
+        dual_cache._validate_identity(
+            actual, changed, allow_geometry_tolerance_upgrade=True
+        )
+
+
 def test_single_record_dual_materialization_preserves_p2_and_full_h():
     mapper = OrbitalMapper({"H": ["1s"]}, method="e3tb", device="cpu")
     record = _minimal_p2_record(mapper)
