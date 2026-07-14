@@ -701,8 +701,31 @@ def _structure_geometry_bohr(
     stored_cell = np.asarray(record[AtomicDataDict.CELL_KEY], dtype=np.float64).reshape(3, 3)
     if positions_bohr.shape != stored_positions.shape or cell_bohr.shape != (3, 3):
         raise ValueError(f"{case_path.name}: STRU/compact geometry shapes differ.")
+    stru_positions_angstrom = positions_bohr * Bohr2Ang
+    stru_cell_angstrom = cell_bohr * Bohr2Ang
+    raw_position_error = float(
+        np.max(np.abs(stru_positions_angstrom - stored_positions), initial=0.0)
+    )
+    # ABACUS/ASE conversion may wrap an atom into another image of the same
+    # periodic cell.  Compare positions modulo lattice vectors instead of
+    # requiring the same Cartesian representative.  Non-periodic directions
+    # remain exact and therefore cannot be hidden by this normalization.
+    pbc = np.asarray(record[AtomicDataDict.PBC_KEY], dtype=bool).reshape(-1)
+    if pbc.size == 1:
+        pbc = np.repeat(pbc, 3)
+    if pbc.size != 3:
+        raise ValueError(f"{case_path.name}: compact PBC field is not length 1 or 3.")
+    try:
+        fractional_delta = (
+            stru_positions_angstrom - stored_positions
+        ) @ np.linalg.inv(stru_cell_angstrom)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{case_path.name}: STRU cell is singular.") from exc
+    image_shift = np.zeros_like(fractional_delta)
+    image_shift[:, pbc] = np.rint(fractional_delta[:, pbc])
+    minimum_image_delta = (fractional_delta - image_shift) @ stru_cell_angstrom
     position_error = float(
-        np.max(np.abs(positions_bohr * Bohr2Ang - stored_positions), initial=0.0)
+        np.max(np.abs(minimum_image_delta), initial=0.0)
     )
     cell_error = float(
         np.max(np.abs(cell_bohr * Bohr2Ang - stored_cell), initial=0.0)
@@ -718,6 +741,8 @@ def _structure_geometry_bohr(
         "assembler_length_unit": "bohr",
         "bohr_to_angstrom": float(Bohr2Ang),
         "max_position_identity_error_angstrom": position_error,
+        "max_raw_position_image_error_angstrom": raw_position_error,
+        "position_identity_semantics": "minimum_image_on_periodic_axes",
         "max_cell_identity_error_angstrom": cell_error,
         "stru_sha256": _sha256(case_path / "STRU"),
     }

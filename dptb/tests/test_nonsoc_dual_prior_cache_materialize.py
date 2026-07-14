@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import lmdb
 import numpy as np
@@ -182,6 +183,50 @@ def test_abacus_gauge_addition_is_rotated_then_reverse_is_exact():
             node_shapes=node_shapes,
             edge_shapes=edge_shapes,
             species_contract=species,
+        )
+
+
+def test_stru_geometry_identity_accepts_periodic_image_only(tmp_path):
+    cell_angstrom = np.diag([6.0, 7.0, 8.0])
+    stored_positions = np.asarray([[0.5, 0.5, 0.5], [1.0, 2.0, 3.0]])
+    stru_positions = stored_positions.copy()
+    stru_positions[1] += cell_angstrom[0]
+    structure = SimpleNamespace(
+        atoms=[SimpleNamespace(species="H"), SimpleNamespace(species="H")],
+        cart_positions=stru_positions / dual_cache.Bohr2Ang,
+        cell_bohr=cell_angstrom / dual_cache.Bohr2Ang,
+    )
+    gate = SimpleNamespace(
+        parse_stru=lambda _: SimpleNamespace(structure=structure)
+    )
+    case = tmp_path / "periodic_image"
+    case.mkdir()
+    (case / "STRU").write_text("synthetic\n", encoding="utf-8")
+    record = {
+        _keys.ATOMIC_NUMBERS_KEY: np.asarray([1, 1]),
+        _keys.POSITIONS_KEY: stored_positions,
+        _keys.CELL_KEY: cell_angstrom,
+        _keys.PBC_KEY: np.asarray([True, True, True]),
+    }
+    _, _, _, provenance = dual_cache._structure_geometry_bohr(
+        record=record,
+        case_path=case,
+        gate1=gate,
+        table_species={"H": {}},
+    )
+    assert provenance["max_position_identity_error_angstrom"] < 1.0e-12
+    assert provenance["max_raw_position_image_error_angstrom"] == pytest.approx(6.0)
+    assert provenance["position_identity_semantics"] == (
+        "minimum_image_on_periodic_axes"
+    )
+
+    record[_keys.PBC_KEY] = np.asarray([False, True, True])
+    with pytest.raises(ValueError, match="compact geometry is not the STRU geometry"):
+        dual_cache._structure_geometry_bohr(
+            record=record,
+            case_path=case,
+            gate1=gate,
+            table_species={"H": {}},
         )
 
 
