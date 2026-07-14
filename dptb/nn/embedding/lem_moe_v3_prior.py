@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """LEM-MoE-v3 embedding driven by a first-class physical prior.
 
-The first implementation is deliberately narrow: real, non-SOC P2 features
+The implementation is deliberately narrow: real, non-SOC P2 or P23 features
 are required under dedicated node/edge keys.  The historical H0 embedding is
 reused as an implementation primitive but is not modified and none of its
 target-fallback behavior is exposed through this public API.
@@ -29,6 +29,7 @@ class P2MemoryInitLayer(torch.nn.Module):
         self,
         prior_init: H0InitLayer,
         *,
+        prior_kind: str,
         node_key: str,
         edge_key: str,
         use_node_init: bool,
@@ -55,6 +56,8 @@ class P2MemoryInitLayer(torch.nn.Module):
         self.idp = prior_init.idp
         self.irreps_out = prior_init.irreps_out
         self.prior_dim = prior_init.h0_dim
+        self.prior_kind = str(prior_kind).strip().lower()
+        self.prior_label = self.prior_kind.upper()
         self.node_key = str(node_key)
         self.edge_key = str(edge_key)
         self.use_node_init = bool(use_node_init)
@@ -93,33 +96,42 @@ class P2MemoryInitLayer(torch.nn.Module):
     ) -> None:
         if key not in data:
             raise KeyError(
-                f"lem_moe_v3_prior requires {label} P2 field {key!r}; "
+                f"lem_moe_v3_prior requires {label} {self.prior_label} "
+                f"field {key!r}; "
                 "target-H fallback is intentionally disabled."
             )
         value = data[key]
         if not isinstance(value, torch.Tensor):
-            raise TypeError(f"{label} P2 field {key!r} must be a torch.Tensor.")
+            raise TypeError(
+                f"{label} {self.prior_label} field {key!r} must be a torch.Tensor."
+            )
         if value.ndim != 2:
             raise ValueError(
-                f"{label} P2 field {key!r} must have rank 2 [rows, rme], "
+                f"{label} {self.prior_label} field {key!r} must have rank 2 "
+                "[rows, rme], "
                 f"got shape {tuple(value.shape)}."
             )
         expected = (rows, self.prior_dim)
         if tuple(value.shape) != expected:
             raise ValueError(
-                f"{label} P2 field {key!r} has shape {tuple(value.shape)}; "
+                f"{label} {self.prior_label} field {key!r} has shape "
+                f"{tuple(value.shape)}; "
                 f"expected {expected}."
             )
         if torch.is_complex(value):
             raise TypeError(
-                f"{label} P2 field {key!r} is complex; the first P2 route is non-SOC only."
+                f"{label} {self.prior_label} field {key!r} is complex; "
+                "the physical-prior route is non-SOC only."
             )
         if not torch.is_floating_point(value):
             raise TypeError(
-                f"{label} P2 field {key!r} must be floating point, got {value.dtype}."
+                f"{label} {self.prior_label} field {key!r} must be floating "
+                f"point, got {value.dtype}."
             )
         if self.validate_inputs and not torch.isfinite(value).all():
-            raise ValueError(f"{label} P2 field {key!r} contains NaN or infinity.")
+            raise ValueError(
+                f"{label} {self.prior_label} field {key!r} contains NaN or infinity."
+            )
 
     def forward(
         self,
@@ -177,7 +189,7 @@ class P2MemoryInitLayer(torch.nn.Module):
 
 @Embedding.register("lem_moe_v3_prior")
 class LemMoEV3Prior(LemMoEV3H0):
-    """Strict non-SOC P2 embedding with optional soft external edge memory."""
+    """Strict non-SOC P2/P23 embedding with optional soft edge memory."""
 
     def __init__(
         self,
@@ -209,9 +221,25 @@ class LemMoEV3Prior(LemMoEV3H0):
         soft_edge_memory_diagnostics_sample_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
-        if prior_kind is not None and str(prior_kind).lower() != "p2":
+        prior_kind = (
+            "p2" if prior_kind is None else str(prior_kind).strip().lower()
+        )
+        expected_fields = {
+            "p2": (_keys.NODE_P2_KEY, _keys.EDGE_P2_KEY),
+            "p23": (_keys.NODE_P23_KEY, _keys.EDGE_P23_KEY),
+        }
+        if prior_kind not in expected_fields:
             raise ValueError(
-                f"lem_moe_v3_prior currently supports prior_kind='p2', got {prior_kind!r}."
+                "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
+                f"got {prior_kind!r}."
+            )
+        expected_node_key, expected_edge_key = expected_fields[prior_kind]
+        if str(prior_node_key) != expected_node_key or str(prior_edge_key) != expected_edge_key:
+            raise ValueError(
+                f"prior_kind={prior_kind!r} requires prior_node_key="
+                f"{expected_node_key!r} and prior_edge_key={expected_edge_key!r}; "
+                f"got {prior_node_key!r}/{prior_edge_key!r}. Refusing to mix "
+                "physical-prior families."
             )
         (
             self.prior_init_scope,
@@ -272,7 +300,7 @@ class LemMoEV3Prior(LemMoEV3H0):
                 "lem_moe_v3_prior is intentionally non-SOC in the first implementation."
             )
 
-        self.prior_kind = "p2"
+        self.prior_kind = prior_kind
         self.prior_node_key = str(prior_node_key)
         self.prior_edge_key = str(prior_edge_key)
         self.use_prior_init = bool(use_prior_init)
@@ -285,6 +313,7 @@ class LemMoEV3Prior(LemMoEV3H0):
                 )
             self.init_layer = P2MemoryInitLayer(
                 self.init_layer,
+                prior_kind=self.prior_kind,
                 node_key=self.prior_node_key,
                 edge_key=self.prior_edge_key,
                 use_node_init=use_prior_node_init,

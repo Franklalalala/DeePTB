@@ -308,7 +308,7 @@ def test_h0_and_p2_init_boolean_combinations_collapse_to_scopes():
         warn_deprecated=False,
     )
     assert p2["prior_init_scope"] == "node"
-    assert "prior_kind" not in p2
+    assert p2["prior_kind"] == "p2"
 
 
 @pytest.mark.parametrize(

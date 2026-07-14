@@ -1125,7 +1125,8 @@ def train_data_sub():
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
-        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
+        Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
@@ -1133,6 +1134,7 @@ def train_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
@@ -1163,7 +1165,8 @@ def validation_data_sub():
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
-        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
+        Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
@@ -1171,6 +1174,7 @@ def validation_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
@@ -1201,7 +1205,8 @@ def reference_data_sub():
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
-        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
+        Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
@@ -1209,6 +1214,7 @@ def reference_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
         Argument("get_overlap", bool, optional=True, default=False, doc=doc_vlp),
@@ -1238,7 +1244,8 @@ def test_data_sub():
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
-        Argument("get_P2", bool, optional=True, default=False, doc="Load the first-class non-SOC P2 physical prior from raw hamiltonian_p2 blocks or node_p2/edge_p2 features."),
+        Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
@@ -1246,6 +1253,7 @@ def test_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
         Argument("get_eigenvalues", bool, optional=True, default=False, doc=doc_eig),
@@ -1802,17 +1810,18 @@ def soft_edge_memory_options():
 
 
 def slem_prior():
-    """Strict first-class physical-prior schema (P2 in the first release)."""
+    """Strict first-class non-SOC P2/P23 physical-prior schema."""
     return slem() + [
         Argument(
             "prior_init_scope",
             str,
             optional=True,
             default="both",
-            doc="P2 initialization scope: both, node, edge, auxiliary, or none.",
+            doc="Physical-prior initialization scope: both, node, edge, auxiliary, or none.",
         ),
-        Argument("prior_node_key", str, optional=True, default="node_p2", doc="Node-wise P2 RME field."),
-        Argument("prior_edge_key", str, optional=True, default="edge_p2", doc="Edge-wise P2 RME field."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Physical prior family: p2 or p23."),
+        Argument("prior_node_key", str, optional=True, default="node_p2", doc="Node-wise selected-prior RME field; P23 must explicitly use node_p23."),
+        Argument("prior_edge_key", str, optional=True, default="edge_p2", doc="Edge-wise selected-prior RME field; P23 must explicitly use edge_p23."),
         Argument("prior_node_mode", str, optional=True, default="direct", doc="Supported: direct or self_edge."),
         Argument("prior_merge_mode", str, optional=True, default="replace", doc="Supported: replace or add."),
         Argument("prior_self_edge_tol", float, optional=True, default=1e-8),
@@ -2145,19 +2154,65 @@ def loss_options():
 
 
 def _validate_p2_prior_full_h_contract(data):
-    """Semantic checks that cannot be expressed by independent dargs fields."""
+    """Semantic checks for first-class P2/P23 absolute Full-H routes."""
     common = data.get("common_options", {})
     model = data.get("model_options", {})
     embedding_options = model.get("embedding", {})
     prediction_options = model.get("prediction", {})
     embedding_is_prior = embedding_options.get("method") == "lem_moe_v3_prior"
-    needs_p2_rme = bool(
+    prior_specs = {
+        "p2": {
+            "raw": "hamiltonian_p2",
+            "node": "node_p2",
+            "edge": "edge_p2",
+            "node_blocks": "node_p2_blocks",
+            "edge_blocks": "edge_p2_blocks",
+            "label": "P2",
+        },
+        "p23": {
+            "raw": "hamiltonian_p23",
+            "node": "node_p23",
+            "edge": "edge_p23",
+            "node_blocks": "node_p23_blocks",
+            "edge_blocks": "edge_p23_blocks",
+            "label": "P23",
+        },
+    }
+    embedding_prior_kind = str(
+        embedding_options.get("prior_kind", "p2")
+    ).strip().lower()
+    if embedding_is_prior and embedding_prior_kind not in prior_specs:
+        raise ValueError(
+            "model_options.embedding.prior_kind must be 'p2' or 'p23'; "
+            f"got {embedding_prior_kind!r}."
+        )
+    prior_spec = prior_specs.get(embedding_prior_kind, prior_specs["p2"])
+    if embedding_is_prior:
+        for option, expected in (
+            ("prior_node_key", prior_spec["node"]),
+            ("prior_edge_key", prior_spec["edge"]),
+        ):
+            actual = embedding_options.get(option)
+            if actual != expected:
+                raise ValueError(
+                    f"model_options.embedding.prior_kind={embedding_prior_kind!r} "
+                    f"requires {option}={expected!r}; got {actual!r}. Refusing "
+                    "to mix P2 and P23 fields."
+                )
+
+    needs_prior_rme = bool(
         embedding_is_prior
         and embedding_options.get("prior_init_scope", "both")
         in {"both", "node", "edge"}
     )
     reconstruction = prediction_options.get("reconstruction", "direct")
     add_prior = reconstruction == "prior_residual"
+    if add_prior and not embedding_is_prior:
+        raise ValueError(
+            "prediction.reconstruction='prior_residual' requires "
+            "method='lem_moe_v3_prior' so "
+            "the RME conditioning and AO reconstruction cannot select different priors."
+        )
 
     data_options_value = data.get("data_options", {})
     configured_splits = {
@@ -2183,6 +2238,12 @@ def _validate_p2_prior_full_h_contract(data):
                     f"got {actual!r}."
                 )
 
+    def _is_sha256_hex(value):
+        text = str(value).strip().lower()
+        return len(text) == 64 and all(
+            character in "0123456789abcdef" for character in text
+        )
+
     # Dedicated Full-H supervision is a dataset/loss contract, not a property
     # of the P2 model alone.  Lock direct-Full-H arms to the same target fields.
     for split, split_options in configured_splits.items():
@@ -2192,7 +2253,8 @@ def _validate_p2_prior_full_h_contract(data):
         if isinstance(split_loss, dict):
             _require_absolute_target_keys(split, split_loss)
 
-    if not embedding_is_prior and not add_prior:
+    route_uses_prior = needs_prior_rme or add_prior
+    if not route_uses_prior:
         return
 
     if bool(common.get("has_soc", False)):
@@ -2210,34 +2272,89 @@ def _validate_p2_prior_full_h_contract(data):
             "blockwise_hamiltonian=true."
         )
 
-    for split, split_options in configured_splits.items():
-        if (needs_p2_rme or add_prior) and not bool(split_options.get("get_P2", False)):
+    if add_prior:
+        for option, expected in (
+            ("prior_node_block_field", prior_spec["node_blocks"]),
+            ("prior_edge_block_field", prior_spec["edge_blocks"]),
+        ):
+            actual = prediction_options.get(option)
+            if actual != expected:
+                raise ValueError(
+                    f"prediction.add_prior=true with prior_kind="
+                    f"{embedding_prior_kind!r} requires {option}={expected!r}; "
+                    f"got {actual!r}."
+                )
+        prior_label = str(prediction_options.get("prior_label", "")).strip().upper()
+        if prior_label != prior_spec["label"]:
             raise ValueError(
-                f"data_options.{split}.get_P2 must be true for the P2 prior route."
+                f"prediction.prior_label must be {prior_spec['label']!r} for "
+                f"prior_kind={embedding_prior_kind!r}; got {prior_label!r}."
             )
-        if add_prior:
-            if not bool(split_options.get("get_Hamiltonian", False)):
+    for split, split_options in configured_splits.items():
+        if not bool(split_options.get("get_P2", False)):
+            raise ValueError(
+                f"data_options.{split}.get_P2 must be true for the "
+                f"{prior_spec['label']} prior route."
+            )
+        split_prior_kind = str(split_options.get("prior_kind", "p2")).strip().lower()
+        if split_prior_kind != embedding_prior_kind:
+            raise ValueError(
+                f"data_options.{split}.prior_kind={split_prior_kind!r} does not "
+                f"match embedding prior_kind={embedding_prior_kind!r}."
+            )
+        if split_options.get("p2_key", "hamiltonian_p2") != prior_spec["raw"]:
+            raise ValueError(
+                f"data_options.{split}.prior_kind={embedding_prior_kind!r} "
+                f"requires p2_key={prior_spec['raw']!r}; got "
+                f"{split_options.get('p2_key')!r}."
+            )
+        if not bool(split_options.get("get_Hamiltonian", False)):
+            raise ValueError(
+                f"data_options.{split}.get_Hamiltonian must be true for "
+                "prior-conditioned Full-H supervision."
+            )
+        if bool(split_options.get("residual_hamiltonian", False)):
+            raise ValueError(
+                f"data_options.{split}.residual_hamiltonian must be false: "
+                "both direct and prior-plus-correction heads are supervised "
+                "against explicit absolute Full H."
+            )
+        if not bool(split_options.get("require_full_h_target", False)):
+            raise ValueError(
+                f"data_options.{split}.require_full_h_target must be true for "
+                "prior-conditioned direct or residual Full-H training."
+            )
+        expected_source_fingerprint = str(
+            split_options.get("expected_p2_source_fingerprint", "")
+        ).strip()
+        allow_unbound_source = bool(
+            split_options.get("allow_unbound_prior_source_fingerprint", False)
+        )
+        if expected_source_fingerprint:
+            if not _is_sha256_hex(expected_source_fingerprint):
                 raise ValueError(
-                    f"data_options.{split}.get_Hamiltonian must be true for Full-H supervision."
+                    f"data_options.{split}.expected_p2_source_fingerprint must "
+                    "be a non-empty 64-character SHA256 hex digest for "
+                    "prior-conditioned Full-H training."
                 )
-            if bool(split_options.get("residual_hamiltonian", False)):
-                raise ValueError(
-                    f"data_options.{split}.residual_hamiltonian must be false: "
-                    "prior_residual reconstruction is supervised against absolute Full H."
-                )
-            if not bool(split_options.get("require_full_h_target", False)):
-                raise ValueError(
-                    f"data_options.{split}.require_full_h_target must be true when "
-                    "prediction.reconstruction='prior_residual'."
-                )
-            if not bool(split_options.get("require_p2_blocks", False)):
-                raise ValueError(
-                    f"data_options.{split}.require_p2_blocks must be true when "
-                    "prediction.reconstruction='prior_residual'."
-                )
-
-    if not add_prior:
-        return
+        elif not allow_unbound_source:
+            raise ValueError(
+                f"data_options.{split}.expected_p2_source_fingerprint is "
+                "required for production prior-conditioned Full-H training. "
+                "Set allow_unbound_prior_source_fingerprint=true only for "
+                "synthetic/dev configs."
+            )
+        require_blocks = bool(split_options.get("require_p2_blocks", False))
+        if add_prior and not require_blocks:
+            raise ValueError(
+                f"data_options.{split}.require_p2_blocks must be true when "
+                "prediction.reconstruction='prior_residual'."
+            )
+        if not add_prior and require_blocks:
+            raise ValueError(
+                f"data_options.{split}.require_p2_blocks must be false for the "
+                "direct Full-H head; AO prior blocks are not consumed."
+            )
 
     full_node_key = prediction_options.get(
         "full_output_node_field", "node_full_hamil_blocks"
@@ -2254,14 +2371,20 @@ def _validate_p2_prior_full_h_contract(data):
         }:
             raise ValueError(
                 f"train_options.loss_options.{split}.method must use a blockwise "
-                "Hamiltonian loss for prediction.reconstruction='prior_residual'."
+                "Hamiltonian loss for prior-conditioned Full-H training."
             )
         pred_node_key = split_loss.get("pred_node_block_key", "node_hamil_blocks")
         pred_edge_key = split_loss.get("pred_edge_block_key", "edge_hamil_blocks")
-        if pred_node_key != full_node_key or pred_edge_key != full_edge_key:
+        expected_pred = (
+            (full_node_key, full_edge_key)
+            if add_prior
+            else ("node_hamil_blocks", "edge_hamil_blocks")
+        )
+        if (pred_node_key, pred_edge_key) != expected_pred:
+            mode = "reconstructed Full-H (prior-plus-correction)" if add_prior else "direct Full-H"
             raise ValueError(
-                f"train_options.loss_options.{split} must read reconstructed Full-H "
-                f"fields {full_node_key!r}/{full_edge_key!r}, got "
+                f"train_options.loss_options.{split} must read {mode} "
+                f"fields {expected_pred[0]!r}/{expected_pred[1]!r}, got "
                 f"{pred_node_key!r}/{pred_edge_key!r}."
             )
         _require_absolute_target_keys(split, split_loss)

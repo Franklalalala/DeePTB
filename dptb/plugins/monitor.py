@@ -1773,7 +1773,24 @@ class Validationer(Monitor):
 
     def _sync_flow_metrics(self, *, epoch=False, time=None):
         for name, value in getattr(self.trainer, "_last_flow_validation_state", {}).items():
+            # Monitor.iteration() records the primary field after _get_value()
+            # returns. Direct _get_value() callers and epoch validation still
+            # rely on this synchronization path, so defer only while the base
+            # iteration implementation is active.
+            if (
+                not epoch
+                and name == self.stat_name
+                and getattr(self, "_defer_primary_iteration_record", False)
+            ):
+                continue
             self._record_flow_metric(name, value, epoch=epoch, time=time)
+
+    def iteration(self, **kwargs):
+        self._defer_primary_iteration_record = True
+        try:
+            return super().iteration(**kwargs)
+        finally:
+            self._defer_primary_iteration_record = False
 
     def _get_value(self, **kwargs):
         if kwargs.get('field') == "iteration":

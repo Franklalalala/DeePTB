@@ -831,9 +831,15 @@ class Trainer(BaseTrainer):
         return loss_opt_for_log
 
     @classmethod
-    def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
+    def restart(cls, checkpoint, train_datasets, train_options=None, common_options=None, reference_datasets=None,
                 validation_datasets=None):
-        ckpt = torch.load(checkpoint, map_location=common_options["device"], weights_only=False)
+        train_options = {} if train_options is None else train_options
+        common_options = {} if common_options is None else common_options
+        ckpt = torch.load(
+            checkpoint,
+            map_location=common_options.get("device") or "cpu",
+            weights_only=False,
+        )
         ckpt_train_options = migrate_legacy_checkpoint_train_options(
             ckpt["config"]["train_options"]
         )
@@ -842,6 +848,8 @@ class Trainer(BaseTrainer):
             ckpt_train_options,
             logger=log,
         )
+        merged_common_options = copy.deepcopy(ckpt["config"]["common_options"])
+        merged_common_options.update(common_options)
         model_build_train_options = merged_train_options
         model_state = ckpt.get("model_state_dict", {})
         has_flat_distance_state = (
@@ -860,14 +868,13 @@ class Trainer(BaseTrainer):
         model = build_model(
             checkpoint,
             ckpt["config"]["model_options"],
-            ckpt["config"]["common_options"],
+            merged_common_options,
             train_options=model_build_train_options,
         )
         train_options = merged_train_options
-        if len(common_options) == 0: common_options = ckpt["config"]["common_options"]
         trainer = cls(model=model, train_datasets=train_datasets, reference_datasets=reference_datasets,
                       validation_datasets=validation_datasets, train_options=train_options,
-                      common_options=common_options)
+                      common_options=merged_common_options)
         trainer.ep = ckpt["epoch"] + 1
         trainer.iter = ckpt["iteration"] + 1
         trainer.stats = ckpt["stats"]

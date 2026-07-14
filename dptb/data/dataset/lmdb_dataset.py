@@ -26,13 +26,12 @@ from dptb.data.interfaces.ham_to_feature import block_to_feature
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
+    DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
-    P2_BLOCK_FINGERPRINT_KEY,
     P2_BUNDLE_FINGERPRINT_KEY,
-    P2_RME_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
-    P2_SOURCE_FINGERPRINT_KEY,
+    P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     ROW_ALIGNED_FIELD_CANDIDATES,
@@ -47,6 +46,7 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_text_fields,
     mapper_basis_fingerprint,
     require_sha256,
+    resolve_prior_field_spec,
 )
 import pickle
 
@@ -121,10 +121,12 @@ _PREPACKED_FULL_H_TARGET_KEYS = (
 def assert_absolute_full_h_target_contract(data_dict: Dict[str, Any]) -> None:
     """Require an explicit, versioned absolute-H target declaration."""
 
-    if data_dict.get(SAMPLE_SCHEMA_KEY) != P2_SAMPLE_SCHEMA:
+    allowed_schemas = {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}
+    if data_dict.get(SAMPLE_SCHEMA_KEY) not in allowed_schemas:
         raise ValueError(
             "Full-H supervision requires explicit sample schema "
-            f"{P2_SAMPLE_SCHEMA!r}; got {data_dict.get(SAMPLE_SCHEMA_KEY)!r}."
+            f"in {sorted(allowed_schemas)!r}; got "
+            f"{data_dict.get(SAMPLE_SCHEMA_KEY)!r}."
         )
     if data_dict.get(TARGET_SEMANTICS_KEY) != ABSOLUTE_FULL_H_SEMANTICS:
         raise ValueError(
@@ -160,17 +162,22 @@ def assert_absolute_full_h_target_contract(data_dict: Dict[str, Any]) -> None:
         )
 
 
-def _assert_expected_p2_source(
-    data_dict: Dict[str, Any], expected: Optional[str]
+def _assert_expected_prior_source(
+    data_dict: Dict[str, Any],
+    expected: Optional[str],
+    *,
+    prior_spec: Any,
 ) -> str:
     actual = require_sha256(
-        data_dict.get(P2_SOURCE_FINGERPRINT_KEY), field=P2_SOURCE_FINGERPRINT_KEY
+        data_dict.get(prior_spec.source_fingerprint_key),
+        field=prior_spec.source_fingerprint_key,
     )
     if expected:
         normalized = require_sha256(expected, field="expected_p2_source_fingerprint")
         if normalized != actual:
             raise ValueError(
-                "P2 source fingerprint does not match the configured table/provenance: "
+                f"{prior_spec.kind.upper()} source fingerprint does not match "
+                "the configured table/provenance: "
                 f"record={actual}, expected={normalized}."
             )
     return actual
@@ -279,7 +286,8 @@ def _lmdb_scalar_bool(value: Any) -> bool:
 
 
 def validate_non_soc_p2_blocks(blocks: Any, *, key: str = "hamiltonian_p2") -> None:
-    """Fail closed on malformed or SOC P2 AO-block dictionaries."""
+    """Fail closed on malformed or SOC physical-prior AO dictionaries."""
+    prior_label = "P23" if str(key) == "hamiltonian_p23" else "P2"
     if not isinstance(blocks, dict) or not blocks:
         raise ValueError(f"'{key}' must be a non-empty AO-block dictionary.")
     for block_key, value in blocks.items():
@@ -294,7 +302,7 @@ def validate_non_soc_p2_blocks(blocks: Any, *, key: str = "hamiltonian_p2") -> N
             )
         if np.iscomplexobj(array):
             raise NotImplementedError(
-                "The first P2 prior path is non-SOC only; complex P2 block "
+                f"The {prior_label} prior path is non-SOC only; complex block "
                 f"{block_key!r} is not accepted."
             )
         if not np.issubdtype(array.dtype, np.floating):
@@ -314,46 +322,60 @@ def validate_p2_feature_pair(
     num_nodes: Optional[int] = None,
     num_edges: Optional[int] = None,
     feature_dim: Optional[int] = None,
+    prior_kind: str = "p2",
+    check_finite: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Validate first-class real-RME P2 node/edge features."""
+    """Validate a first-class real-RME physical-prior feature pair.
+
+    The historical function name remains public for P2 callers.  ``prior_kind``
+    selects only the error label; field selection is handled by the loader's
+    :class:`PriorFieldSpec`.
+    """
+    prior_label = str(prior_kind).strip().upper()
+    node_field = f"node_{str(prior_kind).strip().lower()}"
+    edge_field = f"edge_{str(prior_kind).strip().lower()}"
     present = (node_p2 is not None, edge_p2 is not None)
     if any(present) and not all(present):
         raise ValueError(
-            "P2 prior must provide both node_p2 and edge_p2; refusing a partial prior."
+            f"{prior_label} prior must provide both {node_field} and {edge_field}; "
+            "refusing a partial prior."
         )
     if not all(present):
-        raise ValueError("P2 prior features are absent.")
+        raise ValueError(f"{prior_label} prior features are absent.")
     node = torch.as_tensor(node_p2)
     edge = torch.as_tensor(edge_p2)
     if node.ndim != 2 or edge.ndim != 2:
         raise ValueError(
-            "node_p2/edge_p2 must be rank-2 real-RME tensors; got "
+            f"{prior_label} node/edge fields must be rank-2 real-RME tensors; got "
             f"{tuple(node.shape)} and {tuple(edge.shape)}."
         )
     if torch.is_complex(node) or torch.is_complex(edge):
         raise NotImplementedError(
-            "The first P2 prior path is non-SOC only; complex P2 RME features are not accepted."
+            f"The {prior_label} prior path is non-SOC only; complex RME "
+            "features are not accepted."
         )
     if not torch.is_floating_point(node) or not torch.is_floating_point(edge):
         raise TypeError(
-            "node_p2/edge_p2 must be floating-point real-RME tensors; got "
+            f"{prior_label} node/edge fields must be floating-point real-RME tensors; got "
             f"{node.dtype} and {edge.dtype}."
         )
-    if not torch.isfinite(node).all() or not torch.isfinite(edge).all():
-        raise ValueError("node_p2/edge_p2 contain NaN or infinity.")
+    if check_finite and (
+        not torch.isfinite(node).all() or not torch.isfinite(edge).all()
+    ):
+        raise ValueError(f"{prior_label} node/edge fields contain NaN or infinity.")
     if num_nodes is not None and node.shape[0] != int(num_nodes):
         raise ValueError(
-            f"node_p2 rows {node.shape[0]} do not match num_nodes={int(num_nodes)}."
+            f"{prior_label} node rows {node.shape[0]} do not match num_nodes={int(num_nodes)}."
         )
     if num_edges is not None and edge.shape[0] != int(num_edges):
         raise ValueError(
-            f"edge_p2 rows {edge.shape[0]} do not match num_edges={int(num_edges)}."
+            f"{prior_label} edge rows {edge.shape[0]} do not match num_edges={int(num_edges)}."
         )
     if feature_dim is not None and (
         node.shape[1] != int(feature_dim) or edge.shape[1] != int(feature_dim)
     ):
         raise ValueError(
-            "node_p2/edge_p2 widths must match the mapper RME width "
+            f"{prior_label} node/edge widths must match the mapper RME width "
             f"{int(feature_dim)}; got {node.shape[1]} and {edge.shape[1]}."
         )
     return node, edge
@@ -369,8 +391,11 @@ def validate_non_soc_p2_block_tensors(
     num_edges: int,
     data: Optional[Any] = None,
     idp: Optional[Any] = None,
+    prior_kind: str = "p2",
+    expensive_checks: bool = True,
 ) -> None:
-    """Validate packed P2 AO canvases and their per-row valid extents."""
+    """Validate packed physical-prior AO canvases and valid extents."""
+    prior_label = str(prior_kind).strip().upper()
     entries = (
         ("node", torch.as_tensor(node_blocks), torch.as_tensor(node_shapes), num_nodes),
         ("edge", torch.as_tensor(edge_blocks), torch.as_tensor(edge_shapes), num_edges),
@@ -378,42 +403,51 @@ def validate_non_soc_p2_block_tensors(
     for label, blocks, shapes, rows in entries:
         if blocks.ndim != 3:
             raise ValueError(
-                f"{label}_p2_blocks must be rank-3 [rows, ni, nj], got {tuple(blocks.shape)}."
+                f"{label}_{prior_kind}_blocks must be rank-3 [rows, ni, nj], "
+                f"got {tuple(blocks.shape)}."
             )
         if blocks.shape[0] != int(rows):
             raise ValueError(
-                f"{label}_p2_blocks rows {blocks.shape[0]} do not match {label} count {int(rows)}."
+                f"{label}_{prior_kind}_blocks rows {blocks.shape[0]} do not match "
+                f"{label} count {int(rows)}."
             )
         if torch.is_complex(blocks):
             raise NotImplementedError(
-                "The first P2 Full-H reconstruction path is non-SOC only."
+                f"The {prior_label} Full-H reconstruction path is non-SOC only."
             )
         if not torch.is_floating_point(blocks):
-            raise TypeError(f"{label}_p2_blocks must be floating point, got {blocks.dtype}.")
-        if not torch.isfinite(blocks).all():
-            raise ValueError(f"{label}_p2_blocks contain NaN or infinity.")
+            raise TypeError(
+                f"{label}_{prior_kind}_blocks must be floating point, got {blocks.dtype}."
+            )
+        if expensive_checks and not torch.isfinite(blocks).all():
+            raise ValueError(f"{label}_{prior_kind}_blocks contain NaN or infinity.")
         if shapes.ndim != 2 or tuple(shapes.shape) != (int(rows), 2):
             raise ValueError(
-                f"{label}_p2_block_shape must have shape ({int(rows)}, 2), "
+                f"{label}_{prior_kind}_block_shape must have shape ({int(rows)}, 2), "
                 f"got {tuple(shapes.shape)}."
             )
         if torch.is_complex(shapes) or not torch.isfinite(shapes).all():
-            raise ValueError(f"{label}_p2_block_shape must contain finite real extents.")
+            raise ValueError(
+                f"{label}_{prior_kind}_block_shape must contain finite real extents."
+            )
         long_shapes = shapes.to(dtype=torch.long)
         if not torch.equal(shapes, long_shapes.to(dtype=shapes.dtype)):
-            raise ValueError(f"{label}_p2_block_shape extents must be integers.")
+            raise ValueError(f"{label}_{prior_kind}_block_shape extents must be integers.")
         if (long_shapes < 0).any():
-            raise ValueError(f"{label}_p2_block_shape extents must be non-negative.")
+            raise ValueError(
+                f"{label}_{prior_kind}_block_shape extents must be non-negative."
+            )
         limits = torch.tensor(
             blocks.shape[-2:], dtype=torch.long, device=long_shapes.device
         )
         if (long_shapes > limits).any():
             raise ValueError(
-                f"{label}_p2_block_shape exceeds packed canvas {tuple(blocks.shape[-2:])}."
+                f"{label}_{prior_kind}_block_shape exceeds packed canvas "
+                f"{tuple(blocks.shape[-2:])}."
             )
     if (data is None) != (idp is None):
-        raise ValueError("Strict P2 validation requires data and idp together.")
-    if data is not None:
+        raise ValueError(f"Strict {prior_label} validation requires data and idp together.")
+    if data is not None and expensive_checks:
         from dptb.data.interfaces.blockwise_tensor import validate_packed_non_soc_blocks
 
         validate_packed_non_soc_blocks(
@@ -423,7 +457,7 @@ def validate_non_soc_p2_block_tensors(
             edge_blocks,
             node_shapes,
             edge_shapes,
-            label="P2",
+            label=prior_label,
             require_symmetric_edges=True,
         )
 
@@ -545,6 +579,7 @@ class LMDBDataset(AtomicDataset):
     # Class defaults keep lightweight ``__new__``-based tooling and historical
     # tests backward compatible; normal construction always sets instances.
     get_P2 = False
+    prior_kind = "p2"
     p2_key = "hamiltonian_p2"
     prefer_precomputed_p2 = True
     require_full_h_target = False
@@ -569,6 +604,7 @@ class LMDBDataset(AtomicDataset):
             get_eigenvalues: bool = False,
             h0_key: str = "hamiltonian_0",
             prefer_precomputed_h0: bool = True,
+            prior_kind: str = "p2",
             p2_key: str = "hamiltonian_p2",
             prefer_precomputed_p2: bool = True,
             require_full_h_target: bool = False,
@@ -600,7 +636,9 @@ class LMDBDataset(AtomicDataset):
         self.get_H0 = get_H0
         self.get_P2 = get_P2
         if self.get_P2 and bool(getattr(type_mapper, "has_soc", False)):
-            raise NotImplementedError("get_P2=True is non-SOC only in the first implementation.")
+            raise NotImplementedError(
+                "The first-class P2/P23 physical-prior route is non-SOC only."
+            )
         self.residual_hamiltonian = residual_hamiltonian
         if self.residual_hamiltonian and not self.get_Hamiltonian:
             raise ValueError(
@@ -613,7 +651,16 @@ class LMDBDataset(AtomicDataset):
         self.orthogonal = orthogonal
         self.h0_key = h0_key
         self.prefer_precomputed_h0 = prefer_precomputed_h0
+        self.prior_spec = resolve_prior_field_spec(prior_kind)
+        self.prior_kind = self.prior_spec.kind
         self.p2_key = str(p2_key)
+        if self.get_P2 and self.p2_key != self.prior_spec.raw_key:
+            raise ValueError(
+                f"prior_kind={self.prior_kind!r} requires p2_key="
+                f"{self.prior_spec.raw_key!r}; got {self.p2_key!r}. "
+                "Refusing to select RME fields from one prior and raw fallback "
+                "blocks from another."
+            )
         self.prefer_precomputed_p2 = bool(prefer_precomputed_p2)
         self.require_full_h_target = bool(require_full_h_target)
         self.expected_p2_source_fingerprint = (
@@ -635,6 +682,13 @@ class LMDBDataset(AtomicDataset):
         self._lmdb_path_map = []
         self._lmdb_env_cache = {}
         self._dynamic_batch_cost_parts_cache = {}
+        # LMDB records are immutable for the lifetime of a read-only dataset
+        # worker.  Cryptographic graph/row/prior/target validation is therefore
+        # required only on the first successful read of each physical record in
+        # that worker.  Keep this cache process-local: a forked/spawned worker
+        # must establish the fail-closed contract for itself before reusing it.
+        self._validated_record_contracts = {}
+        self._validated_record_contracts_pid = os.getpid()
         for file in self.info_files.keys():
             lmdb_paths = self.simple_get_lmdb_path(file)
             for lmdb_path in lmdb_paths:
@@ -689,7 +743,55 @@ class LMDBDataset(AtomicDataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_lmdb_env_cache"] = {}
+        state["_validated_record_contracts"] = {}
+        state["_validated_record_contracts_pid"] = None
         return state
+
+    def _record_contract_validation_state(self, idx: int):
+        """Return the worker-local immutable-record cache key and cache.
+
+        The normal constructor builds an exact LMDB path for every dataset
+        index.  The tuple also contains the LMDB-internal integer key, so two
+        shards with the same local row number cannot alias.  A deterministic
+        path tuple is retained only for lightweight historical ``__new__``
+        callers that do not expose ``_lmdb_path_map``.
+        """
+
+        pid = os.getpid()
+        cache_pid = getattr(self, "_validated_record_contracts_pid", None)
+        cache = getattr(self, "_validated_record_contracts", None)
+        if not isinstance(cache, dict) or cache_pid != pid:
+            cache = {}
+            self._validated_record_contracts = cache
+            self._validated_record_contracts_pid = pid
+
+        raw_idx = int(idx)
+        index_map = getattr(self, "index_map", None)
+        record_idx = (
+            int(index_map[raw_idx])
+            if index_map is not None and len(index_map) > raw_idx
+            else raw_idx
+        )
+        lmdb_paths = getattr(self, "_lmdb_path_map", None)
+        if (
+            lmdb_paths is not None
+            and index_map is not None
+            and len(lmdb_paths) == len(index_map)
+        ):
+            path_identity = (os.path.realpath(lmdb_paths[raw_idx]),)
+        elif hasattr(self, "root") and hasattr(self, "file_map"):
+            path_identity = tuple(
+                os.path.realpath(path)
+                for path in self.simple_get_lmdb_path(self.file_map[raw_idx])
+            )
+        else:
+            # Compatibility only for lightweight ``__new__`` unit fixtures;
+            # normal LMDBDataset instances always take one of the path-backed
+            # branches above.
+            file_map = getattr(self, "file_map", ())
+            logical_file = file_map[raw_idx] if len(file_map) > raw_idx else "<memory>"
+            path_identity = (f"logical:{logical_file}:dataset:{id(self)}",)
+        return (path_identity, record_idx), cache
 
     def invalidate_dynamic_batch_costs(self) -> None:
         super().invalidate_dynamic_batch_costs()
@@ -732,7 +834,17 @@ class LMDBDataset(AtomicDataset):
             with env.begin(buffers=True) as txn:
                 data = txn.get(key)
                 if data is not None:
-                    return pickle.loads(bytes(data))
+                    serialized = bytes(data)
+                    # Read-only diagnostics used by the standalone loader
+                    # benchmark.  Recording the size of the bytes that are
+                    # already copied for pickle does not add another LMDB read
+                    # or warm the filesystem cache ahead of the timed get.
+                    self._last_lmdb_pickle_bytes = len(serialized)
+                    self._last_lmdb_record_identity = (
+                        os.path.realpath(lmdb_path),
+                        int(self.index_map[int(idx)]),
+                    )
+                    return pickle.loads(serialized)
         raise IndexError(f"LMDB entry {self.index_map[int(idx)]} not found for dataset index {idx}")
 
     def get_dynamic_batch_cost_parts(self, idx: int) -> Dict[str, int]:
@@ -783,20 +895,29 @@ class LMDBDataset(AtomicDataset):
 
     def get(self, idx):
         data_dict = self._load_data_dict(idx)
+        record_contract_key, validated_record_contracts = (
+            self._record_contract_validation_state(idx)
+        )
+        record_contract_already_validated = record_contract_key in validated_record_contracts
+        prior_spec = getattr(
+            self,
+            "prior_spec",
+            resolve_prior_field_spec(getattr(self, "prior_kind", "p2")),
+        )
         if getattr(self, "require_full_h_target", False):
             assert_absolute_full_h_target_contract(data_dict)
         stored_basis_fingerprint = data_dict.get(BASIS_FINGERPRINT_KEY)
-        basis_fingerprint = (
-            mapper_basis_fingerprint(self.type_mapper)
-            if self.type_mapper is not None
-            else None
-        )
+        # Historical, non-fingerprinted records need not expose a production
+        # OrbitalMapper.  Resolve the mapper fingerprint lazily only when the
+        # record actually declares the versioned physical-prior contract.
+        basis_fingerprint = None
         if stored_basis_fingerprint is not None:
-            if basis_fingerprint is None:
+            if self.type_mapper is None:
                 raise ValueError(
                     "A fingerprinted Hamiltonian record requires a configured "
                     "OrbitalMapper/basis."
                 )
+            basis_fingerprint = mapper_basis_fingerprint(self.type_mapper)
             stored_basis_fingerprint = require_sha256(
                 stored_basis_fingerprint, field=BASIS_FINGERPRINT_KEY
             )
@@ -851,28 +972,26 @@ class LMDBDataset(AtomicDataset):
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
         p2_blocks = data_dict.get(self.p2_key, None) if self.get_P2 else None
-        node_p2 = data_dict.get(AtomicDataDict.NODE_P2_KEY, None) if self.get_P2 else None
-        edge_p2 = data_dict.get(AtomicDataDict.EDGE_P2_KEY, None) if self.get_P2 else None
-        p2_blockwise_keys = (
-            AtomicDataDict.NODE_P2_BLOCKS_KEY,
-            AtomicDataDict.EDGE_P2_BLOCKS_KEY,
-            AtomicDataDict.NODE_P2_BLOCK_SHAPE_KEY,
-            AtomicDataDict.EDGE_P2_BLOCK_SHAPE_KEY,
-        )
+        node_p2 = data_dict.get(prior_spec.node_rme_key, None) if self.get_P2 else None
+        edge_p2 = data_dict.get(prior_spec.edge_rme_key, None) if self.get_P2 else None
+        p2_blockwise_keys = prior_spec.block_fields
         p2_blockwise_present = [key in data_dict for key in p2_blockwise_keys]
         full_h_target_present = [
             key in data_dict for key in _PREPACKED_FULL_H_TARGET_KEYS
         ]
         schema_v2_row_aligned = bool(
-            data_dict.get(SAMPLE_SCHEMA_KEY) == P2_SAMPLE_SCHEMA
+            data_dict.get(SAMPLE_SCHEMA_KEY)
+            in {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}
             and any(field in data_dict for field in ROW_ALIGNED_FIELD_CANDIDATES)
         )
         p2_feature_present = (node_p2 is not None, edge_p2 is not None)
         if any(p2_feature_present) and not all(p2_feature_present):
             raise ValueError(
-                "P2 prior must provide both node_p2 and edge_p2; refusing a partial prior."
+                f"{prior_spec.kind.upper()} prior must provide both "
+                f"{prior_spec.node_rme_key} and {prior_spec.edge_rme_key}; "
+                "refusing a partial prior."
             )
-        if p2_blocks is not None:
+        if p2_blocks is not None and not record_contract_already_validated:
             validate_non_soc_p2_blocks(p2_blocks, key=self.p2_key)
         node_physical_h0 = data_dict.get(AtomicDataDict.NODE_PHYSICAL_H0_KEY, None)
         edge_physical_h0 = data_dict.get(AtomicDataDict.EDGE_PHYSICAL_H0_KEY, None)
@@ -911,10 +1030,17 @@ class LMDBDataset(AtomicDataset):
             self.info_files[self.file_map[idx]].update(
                 {'orbital_energies': orbital_energies, 'orbital_coefficients': orbital_coefficients})
 
-        cache_info = {}
-        for key in ['train_polar', 'train_dip', 'wave_align', 'train_w_charge', 'train_w_eps', 'train_w_homo_lumo_gap']:
-            cache_info.update({key: self.info_files[self.file_map[idx]][key]})
-            del self.info_files[self.file_map[idx]][key]
+        cache_keys = [
+            'train_polar',
+            'train_dip',
+            'wave_align',
+            'train_w_charge',
+            'train_w_eps',
+            'train_w_homo_lumo_gap',
+        ]
+        cache_info = {
+            key: self.info_files[self.file_map[idx]][key] for key in cache_keys
+        }
 
         # transform blocks to atomicdata features, or use precomputed features directly
         need_main_features = bool(self.get_Hamiltonian or self.get_DM)
@@ -964,52 +1090,67 @@ class LMDBDataset(AtomicDataset):
             )
         canonical_stored_edge = canonical_stored_shift = None
         if has_stored_edge_graph:
-            canonical_stored_edge, canonical_stored_shift = canonical_edge_graph(
-                atomic_numbers, stored_edge_index, stored_edge_shift
-            )
+            if record_contract_already_validated:
+                canonical_stored_edge, canonical_stored_shift = (
+                    validated_record_contracts[record_contract_key]
+                )
+            else:
+                canonical_stored_edge, canonical_stored_shift = canonical_edge_graph(
+                    atomic_numbers, stored_edge_index, stored_edge_shift
+                )
             if requires_fingerprinted_graph:
                 if stored_basis_fingerprint is None or basis_fingerprint is None:
                     raise ValueError(
                         "Row-aligned P2/Full-H tensors require basis_fingerprint metadata."
                     )
-                actual_graph_fingerprint = edge_graph_fingerprint(
-                    atomic_numbers,
-                    canonical_stored_edge,
-                    canonical_stored_shift,
-                    basis_fingerprint=basis_fingerprint,
-                )
-                assert_record_fingerprint(
-                    data_dict,
-                    field=EDGE_GRAPH_FINGERPRINT_KEY,
-                    actual=actual_graph_fingerprint,
-                )
-                if schema_v2_row_aligned:
-                    actual_row_fingerprint = fingerprint_present_row_aligned_fields(
-                        data_dict
+                if not record_contract_already_validated:
+                    actual_graph_fingerprint = edge_graph_fingerprint(
+                        atomic_numbers,
+                        canonical_stored_edge,
+                        canonical_stored_shift,
+                        basis_fingerprint=basis_fingerprint,
                     )
                     assert_record_fingerprint(
                         data_dict,
-                        field=ROW_ALIGNED_DATA_FINGERPRINT_KEY,
-                        actual=actual_row_fingerprint,
+                        field=EDGE_GRAPH_FINGERPRINT_KEY,
+                        actual=actual_graph_fingerprint,
                     )
-                    actual_row_bundle = fingerprint_text_fields(
-                        {
-                            BASIS_FINGERPRINT_KEY: basis_fingerprint,
-                            EDGE_GRAPH_FINGERPRINT_KEY: actual_graph_fingerprint,
-                            ROW_ALIGNED_DATA_FINGERPRINT_KEY: actual_row_fingerprint,
-                        },
-                        (
-                            BASIS_FINGERPRINT_KEY,
-                            EDGE_GRAPH_FINGERPRINT_KEY,
-                            ROW_ALIGNED_DATA_FINGERPRINT_KEY,
-                        ),
-                    )
-                    assert_record_fingerprint(
-                        data_dict,
-                        field=ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
-                        actual=actual_row_bundle,
-                    )
-        info = self.info_files[self.file_map[idx]]
+                    if schema_v2_row_aligned:
+                        actual_row_fingerprint = fingerprint_present_row_aligned_fields(
+                            data_dict
+                        )
+                        assert_record_fingerprint(
+                            data_dict,
+                            field=ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+                            actual=actual_row_fingerprint,
+                        )
+                        actual_row_bundle = fingerprint_text_fields(
+                            {
+                                BASIS_FINGERPRINT_KEY: basis_fingerprint,
+                                EDGE_GRAPH_FINGERPRINT_KEY: actual_graph_fingerprint,
+                                ROW_ALIGNED_DATA_FINGERPRINT_KEY: actual_row_fingerprint,
+                            },
+                            (
+                                BASIS_FINGERPRINT_KEY,
+                                EDGE_GRAPH_FINGERPRINT_KEY,
+                                ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+                            ),
+                        )
+                        assert_record_fingerprint(
+                            data_dict,
+                            field=ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+                            actual=actual_row_bundle,
+                        )
+        # Keep dataset metadata immutable across failed reads.  Previously the
+        # six training-only flags were deleted in-place and restored only after
+        # graph construction; a fingerprint failure left the dataset poisoned
+        # and the next retry raised KeyError instead of the original contract
+        # error.
+        info = {
+            key: value
+            for key, value in self.info_files[self.file_map[idx]].items()
+            if key not in cache_info
+        }
         needs_missing_env_graph = (
             info.get("er_max", None) is not None
             and data_dict.get(AtomicDataDict.ENV_INDEX_KEY, None) is None
@@ -1190,9 +1331,11 @@ class LMDBDataset(AtomicDataset):
                     num_nodes=num_nodes,
                     num_edges=num_edges,
                     feature_dim=mapper_p2_dim,
+                    prior_kind=prior_spec.kind,
+                    check_finite=not record_contract_already_validated,
                 )
-                atomicdata[AtomicDataDict.NODE_P2_KEY] = node_p2
-                atomicdata[AtomicDataDict.EDGE_P2_KEY] = edge_p2
+                atomicdata[prior_spec.node_rme_key] = node_p2
+                atomicdata[prior_spec.edge_rme_key] = edge_p2
             elif p2_blocks is not None:
                 block_to_feature(
                     atomicdata,
@@ -1200,23 +1343,25 @@ class LMDBDataset(AtomicDataset):
                     p2_blocks,
                     False,
                     self.orthogonal,
-                    node_field=AtomicDataDict.NODE_P2_KEY,
-                    edge_field=AtomicDataDict.EDGE_P2_KEY,
+                    node_field=prior_spec.node_rme_key,
+                    edge_field=prior_spec.edge_rme_key,
                     missing_block_policy="error",
                 )
                 node_p2, edge_p2 = validate_p2_feature_pair(
-                    atomicdata[AtomicDataDict.NODE_P2_KEY]
-                    if AtomicDataDict.NODE_P2_KEY in atomicdata
+                    atomicdata[prior_spec.node_rme_key]
+                    if prior_spec.node_rme_key in atomicdata
                     else None,
-                    atomicdata[AtomicDataDict.EDGE_P2_KEY]
-                    if AtomicDataDict.EDGE_P2_KEY in atomicdata
+                    atomicdata[prior_spec.edge_rme_key]
+                    if prior_spec.edge_rme_key in atomicdata
                     else None,
                     num_nodes=num_nodes,
                     num_edges=num_edges,
                     feature_dim=mapper_p2_dim,
+                    prior_kind=prior_spec.kind,
+                    check_finite=not record_contract_already_validated,
                 )
-                atomicdata[AtomicDataDict.NODE_P2_KEY] = node_p2
-                atomicdata[AtomicDataDict.EDGE_P2_KEY] = edge_p2
+                atomicdata[prior_spec.node_rme_key] = node_p2
+                atomicdata[prior_spec.edge_rme_key] = edge_p2
             elif all(p2_feature_present):
                 node_p2, edge_p2 = validate_p2_feature_pair(
                     node_p2,
@@ -1224,34 +1369,57 @@ class LMDBDataset(AtomicDataset):
                     num_nodes=num_nodes,
                     num_edges=num_edges,
                     feature_dim=mapper_p2_dim,
+                    prior_kind=prior_spec.kind,
+                    check_finite=not record_contract_already_validated,
                 )
-                atomicdata[AtomicDataDict.NODE_P2_KEY] = node_p2
-                atomicdata[AtomicDataDict.EDGE_P2_KEY] = edge_p2
+                atomicdata[prior_spec.node_rme_key] = node_p2
+                atomicdata[prior_spec.edge_rme_key] = edge_p2
             else:
                 raise ValueError(
                     f"get_P2=True requires either raw '{self.p2_key}' AO blocks "
-                    "or precomputed node_p2/edge_p2 features."
+                    f"or precomputed {prior_spec.node_rme_key}/"
+                    f"{prior_spec.edge_rme_key} features."
                 )
 
             if requires_stored_p2_graph:
-                if data_dict.get(SAMPLE_SCHEMA_KEY) != P2_SAMPLE_SCHEMA:
+                sample_schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+                if sample_schema not in prior_spec.allowed_sample_schemas:
                     raise ValueError(
-                        "Precomputed P2 tensors require explicit sample schema "
-                        f"{P2_SAMPLE_SCHEMA!r}."
+                        f"Precomputed {prior_spec.kind.upper()} tensors require "
+                        "explicit sample schema in "
+                        f"{prior_spec.allowed_sample_schemas!r}; got "
+                        f"{sample_schema!r}."
                     )
-                _assert_expected_p2_source(
+                _assert_expected_prior_source(
                     data_dict,
                     getattr(self, "expected_p2_source_fingerprint", None),
+                    prior_spec=prior_spec,
                 )
-                actual_rme_fingerprint = fingerprint_fields(
-                    atomicdata,
-                    (AtomicDataDict.NODE_P2_KEY, AtomicDataDict.EDGE_P2_KEY),
-                )
-                assert_record_fingerprint(
-                    data_dict,
-                    field=P2_RME_FINGERPRINT_KEY,
-                    actual=actual_rme_fingerprint,
-                )
+                if prior_spec.kind == "p23":
+                    parent_p2_bundle = require_sha256(
+                        data_dict.get(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY),
+                        field=P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+                    )
+                    record_p2_bundle = require_sha256(
+                        data_dict.get(P2_BUNDLE_FINGERPRINT_KEY),
+                        field=P2_BUNDLE_FINGERPRINT_KEY,
+                    )
+                    if parent_p2_bundle != record_p2_bundle:
+                        raise ValueError(
+                            "P23 parent P2 bundle does not match this dual-prior "
+                            f"record: parent={parent_p2_bundle}, "
+                            f"record={record_p2_bundle}."
+                        )
+                if not record_contract_already_validated:
+                    actual_rme_fingerprint = fingerprint_fields(
+                        atomicdata,
+                        prior_spec.rme_fields,
+                    )
+                    assert_record_fingerprint(
+                        data_dict,
+                        field=prior_spec.rme_fingerprint_key,
+                        actual=actual_rme_fingerprint,
+                    )
 
         if uses_pre_physical_h0:
             node_physical_h0 = _expand_soc_uureal_compact(
@@ -1323,6 +1491,13 @@ class LMDBDataset(AtomicDataset):
         # Optional AO-block targets/H0 produced by the blockwise NexTHAM
         # conversion path. Keep this side channel independent of the feature
         # path so existing RME training remains unchanged.
+        load_prior_blocks = bool(
+            self.get_P2
+            and (
+                getattr(self, "require_p2_blocks", False)
+                or getattr(self, "audit_p2_representations", False)
+            )
+        )
         if self.get_Hamiltonian and getattr(self, "residual_hamiltonian", False):
             assert_residual_target_source_is_raw(data_dict)
         if self.get_P2 and any(p2_blockwise_present) and not all(p2_blockwise_present):
@@ -1331,7 +1506,8 @@ class LMDBDataset(AtomicDataset):
                 if not present
             ]
             raise ValueError(
-                "Prepacked P2 prior is incomplete; missing block fields "
+                f"Prepacked {prior_spec.kind.upper()} prior is incomplete; "
+                "missing block fields "
                 f"{missing}."
             )
         if any(full_h_target_present) and not all(full_h_target_present):
@@ -1357,7 +1533,7 @@ class LMDBDataset(AtomicDataset):
         ):
             if blockwise_key in data_dict:
                 atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
-        if self.get_P2:
+        if load_prior_blocks:
             for blockwise_key in p2_blockwise_keys:
                 if blockwise_key in data_dict:
                     atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
@@ -1418,9 +1594,9 @@ class LMDBDataset(AtomicDataset):
             attach_block_tensors(atomicdata, target_h0_blocks, prefix="h0")
 
         if (
-            self.get_P2
+            load_prior_blocks
             and p2_blocks is not None
-            and AtomicDataDict.NODE_P2_BLOCKS_KEY not in atomicdata
+            and prior_spec.node_blocks_key not in atomicdata
         ):
             from dptb.data.interfaces.blockwise_tensor import attach_block_tensors, block_dict_to_ordered_tensors
 
@@ -1433,12 +1609,12 @@ class LMDBDataset(AtomicDataset):
                 complete_edges=False,
                 strict_complete_edges=False,
             )
-            attach_block_tensors(atomicdata, target_p2_blocks, prefix="p2")
+            attach_block_tensors(atomicdata, target_p2_blocks, prefix=prior_spec.kind)
 
-        if self.get_P2:
+        if load_prior_blocks:
             required_p2_blocks = (
-                AtomicDataDict.NODE_P2_BLOCKS_KEY,
-                AtomicDataDict.EDGE_P2_BLOCKS_KEY,
+                prior_spec.node_blocks_key,
+                prior_spec.edge_blocks_key,
             )
             available_p2_blocks = [key in atomicdata for key in required_p2_blocks]
             if getattr(self, "require_p2_blocks", False) and not all(
@@ -1446,39 +1622,43 @@ class LMDBDataset(AtomicDataset):
             ):
                 missing = [key for key in p2_blockwise_keys if key not in atomicdata]
                 raise ValueError(
-                    "require_p2_blocks=True but the P2 AO reconstruction contract "
+                    "require_p2_blocks=True but the "
+                    f"{prior_spec.kind.upper()} AO reconstruction contract "
                     f"is incomplete; missing {missing}."
                 )
             if any(available_p2_blocks) and not all(available_p2_blocks):
                 raise ValueError(
-                    "P2 AO-block reconstruction requires both node_p2_blocks and "
-                    "edge_p2_blocks."
+                    f"{prior_spec.kind.upper()} AO-block reconstruction requires "
+                    f"both {prior_spec.node_blocks_key} and "
+                    f"{prior_spec.edge_blocks_key}."
                 )
             if all(available_p2_blocks):
                 p2_node_blocks = torch.as_tensor(
-                    atomicdata[AtomicDataDict.NODE_P2_BLOCKS_KEY]
+                    atomicdata[prior_spec.node_blocks_key]
                 )
                 p2_edge_blocks = torch.as_tensor(
-                    atomicdata[AtomicDataDict.EDGE_P2_BLOCKS_KEY]
+                    atomicdata[prior_spec.edge_blocks_key]
                 )
                 validate_non_soc_p2_block_tensors(
                     p2_node_blocks,
                     p2_edge_blocks,
-                    atomicdata[AtomicDataDict.NODE_P2_BLOCK_SHAPE_KEY],
-                    atomicdata[AtomicDataDict.EDGE_P2_BLOCK_SHAPE_KEY],
+                    atomicdata[prior_spec.node_shape_key],
+                    atomicdata[prior_spec.edge_shape_key],
                     num_nodes=num_nodes,
                     num_edges=num_edges,
                     data=atomicdata,
                     idp=self.type_mapper,
+                    prior_kind=prior_spec.kind,
+                    expensive_checks=not record_contract_already_validated,
                 )
 
-                if requires_stored_p2_graph:
+                if requires_stored_p2_graph and not record_contract_already_validated:
                     actual_block_fingerprint = fingerprint_fields(
                         atomicdata, p2_blockwise_keys
                     )
                     assert_record_fingerprint(
                         data_dict,
-                        field=P2_BLOCK_FINGERPRINT_KEY,
+                        field=prior_spec.block_fingerprint_key,
                         actual=actual_block_fingerprint,
                     )
                     actual_bundle = fingerprint_text_fields(
@@ -1487,31 +1667,39 @@ class LMDBDataset(AtomicDataset):
                             EDGE_GRAPH_FINGERPRINT_KEY: data_dict[
                                 EDGE_GRAPH_FINGERPRINT_KEY
                             ],
-                            P2_SOURCE_FINGERPRINT_KEY: data_dict[
-                                P2_SOURCE_FINGERPRINT_KEY
+                            prior_spec.source_fingerprint_key: data_dict[
+                                prior_spec.source_fingerprint_key
                             ],
-                            P2_RME_FINGERPRINT_KEY: data_dict[
-                                P2_RME_FINGERPRINT_KEY
+                            prior_spec.rme_fingerprint_key: data_dict[
+                                prior_spec.rme_fingerprint_key
                             ],
-                            P2_BLOCK_FINGERPRINT_KEY: data_dict[
-                                P2_BLOCK_FINGERPRINT_KEY
+                            prior_spec.block_fingerprint_key: data_dict[
+                                prior_spec.block_fingerprint_key
                             ],
+                            **{
+                                field: data_dict[field]
+                                for field in prior_spec.bundle_dependency_fields
+                            },
                         },
                         (
                             BASIS_FINGERPRINT_KEY,
                             EDGE_GRAPH_FINGERPRINT_KEY,
-                            P2_SOURCE_FINGERPRINT_KEY,
-                            P2_RME_FINGERPRINT_KEY,
-                            P2_BLOCK_FINGERPRINT_KEY,
+                            prior_spec.source_fingerprint_key,
+                            prior_spec.rme_fingerprint_key,
+                            prior_spec.block_fingerprint_key,
+                            *prior_spec.bundle_dependency_fields,
                         ),
                     )
                     assert_record_fingerprint(
                         data_dict,
-                        field=P2_BUNDLE_FINGERPRINT_KEY,
+                        field=prior_spec.bundle_fingerprint_key,
                         actual=actual_bundle,
                     )
 
-                if getattr(self, "audit_p2_representations", False):
+                if (
+                    getattr(self, "audit_p2_representations", False)
+                    and not record_contract_already_validated
+                ):
                     from dptb.data.interfaces.blockwise_tensor import (
                         block_mask_from_shapes,
                         feature_tensors_to_block_tensors,
@@ -1520,8 +1708,8 @@ class LMDBDataset(AtomicDataset):
                     reconstructed = feature_tensors_to_block_tensors(
                         atomicdata,
                         self.type_mapper,
-                        node_features=atomicdata[AtomicDataDict.NODE_P2_KEY],
-                        edge_features=atomicdata[AtomicDataDict.EDGE_P2_KEY],
+                        node_features=atomicdata[prior_spec.node_rme_key],
+                        edge_features=atomicdata[prior_spec.edge_rme_key],
                         node_pad_shape=tuple(p2_node_blocks.shape[-2:]),
                         edge_pad_shape=tuple(p2_edge_blocks.shape[-2:]),
                         complete_edges=True,
@@ -1542,7 +1730,8 @@ class LMDBDataset(AtomicDataset):
                         ) if bool(mask.any()) else 0.0
                         if error > 5.0e-5:
                             raise ValueError(
-                                f"P2 {label} RME/AO representations disagree; "
+                                f"{prior_spec.kind.upper()} {label} RME/AO "
+                                "representations disagree; "
                                 f"max valid-entry error {error:.3e}."
                             )
 
@@ -1554,17 +1743,21 @@ class LMDBDataset(AtomicDataset):
                 raise ValueError(f"Absolute Full-H target fields are missing: {missing}.")
             from dptb.data.interfaces.blockwise_tensor import validate_packed_non_soc_blocks
 
-            validate_packed_non_soc_blocks(
-                atomicdata,
-                self.type_mapper,
-                atomicdata[AtomicDataDict.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY],
-                atomicdata[AtomicDataDict.EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY],
-                atomicdata[AtomicDataDict.NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY],
-                atomicdata[AtomicDataDict.EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY],
-                label="absolute Full-H target",
-                require_symmetric_edges=True,
-            )
-            if data_dict.get(TARGET_SOURCE_KEY) == "dedicated_full_h_blocks":
+            if not record_contract_already_validated:
+                validate_packed_non_soc_blocks(
+                    atomicdata,
+                    self.type_mapper,
+                    atomicdata[AtomicDataDict.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY],
+                    atomicdata[AtomicDataDict.EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY],
+                    atomicdata[AtomicDataDict.NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY],
+                    atomicdata[AtomicDataDict.EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY],
+                    label="absolute Full-H target",
+                    require_symmetric_edges=True,
+                )
+            if (
+                data_dict.get(TARGET_SOURCE_KEY) == "dedicated_full_h_blocks"
+                and not record_contract_already_validated
+            ):
                 actual_target_fingerprint = fingerprint_fields(
                     atomicdata, _PREPACKED_FULL_H_TARGET_KEYS
                 )
@@ -1573,6 +1766,16 @@ class LMDBDataset(AtomicDataset):
                     field=FULL_H_TARGET_FINGERPRINT_KEY,
                     actual=actual_target_fingerprint,
                 )
+
+        # Mark only after every applicable graph/row/prior/target fingerprint
+        # and every downstream structural check has succeeded.  A malformed or
+        # tampered first read is never cached as trusted and will fail closed on
+        # every retry.
+        if requires_fingerprinted_graph and not record_contract_already_validated:
+            validated_record_contracts[record_contract_key] = (
+                canonical_stored_edge,
+                canonical_stored_shift,
+            )
 
         return atomicdata
 

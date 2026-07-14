@@ -20,6 +20,7 @@ data_options:
     prefer_precomputed_p2: true
     require_p2_blocks: true
     require_full_h_target: true
+    allow_unbound_prior_source_fingerprint: true
     audit_p2_representations: false
     residual_hamiltonian: false
     get_overlap: false

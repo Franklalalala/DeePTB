@@ -44,11 +44,11 @@ from dptb.nnops.expert_parallel_layout import (
     resolve_expert_parallel_layout,
 )
 from dptb.plugins.monitor import (
-    TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor,
+    Validationer, TensorBoardMonitor,
     DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, CUDAModuleMemoryMonitor,
-    TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor,
     ScalarFieldMonitor, CUDAMemoryMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
 )
+from dptb.plugins.training_monitor import register_core_training_monitors
 from dptb.plugins.train_logger import Logger
 from dptb.plugins.saver import Saver
 from dptb.utils.argcheck import collect_cutoffs, chk_avg_per_iter, normalize
@@ -588,21 +588,12 @@ def _multi_train_impl(
 
         avg_per_iter = chk_avg_per_iter(jdata)
 
-        trainer.register_plugin(
-            TrainLossMonitor(
-                sliding_win_size=jdata["train_options"]["sliding_win_size"],
-                avg_per_iter=avg_per_iter
-            )
+        register_core_training_monitors(
+            trainer,
+            train_endpoint_capable=train_endpoint_capable,
+            sliding_win_size=jdata["train_options"]["sliding_win_size"],
+            avg_per_iter=avg_per_iter,
         )
-        trainer.register_plugin(LearningRateMonitor())
-
-        if train_endpoint_capable:
-            trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
-            trainer.register_plugin(TrainHoppingLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
-        trainer.register_plugin(TrainZLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
-        trainer.register_plugin(ExpertLoadCVMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
-        trainer.register_plugin(ScalarFieldMonitor(stat_name="train_loss_opt", interval=[(1, 'iteration'), (1, 'epoch')]))
-        trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
         if validation_datasets and register_legacy_validation:
             trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_onsite_loss", interval=[(1, 'iteration'), (1, 'epoch')]))
             trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_hopping_loss", interval=[(1, 'iteration'), (1, 'epoch')]))

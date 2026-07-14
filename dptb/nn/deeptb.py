@@ -491,8 +491,8 @@ class NNENV(nn.Module):
     def from_reference(
         cls, 
         checkpoint, 
-        embedding: dict={},
-        prediction: dict={},
+        embedding: Optional[dict]=None,
+        prediction: Optional[dict]=None,
         overlap: bool=None,
         basis: Dict[str, Union[str, list]]=None,
         dtype: Union[str, torch.dtype]=None,
@@ -506,29 +506,23 @@ class NNENV(nn.Module):
                 log.warning("CUDA is not available. The model will be loaded on CPU.")
 
         ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-        common_options = {
+        checkpoint_model_options = migrate_legacy_checkpoint_model_options(
+            ckpt["config"]["model_options"]
+        )
+        model_options = {
+            "embedding": checkpoint_model_options["embedding"] if not embedding else embedding,
+            "prediction": checkpoint_model_options["prediction"] if not prediction else prediction,
+        }
+        common_options = dict(ckpt["config"]["common_options"])
+        common_options.update(kwargs)
+        for key, value in {
             "dtype": dtype,
             "device": device,
             "basis": basis,
             "overlap": overlap,
-        }
-
-        model_options = {
-            "embedding": embedding,
-            "prediction": prediction,
-        }
-
-        if len(embedding) == 0 or len(prediction) == 0:
-            model_options.update(
-                migrate_legacy_checkpoint_model_options(
-                    ckpt["config"]["model_options"]
-                )
-            )
-
-        for k,v in common_options.items():
-            if v is None:
-                common_options[k] = ckpt["config"]["common_options"][k]
-        common_options = ckpt["config"]["common_options"]
+        }.items():
+            if value is not None:
+                common_options[key] = value
         model = cls(**model_options, **common_options, transform=transform)
         model.load_state_dict(ckpt["model_state_dict"])
 

@@ -469,6 +469,7 @@ def test_four_ablation_configs_lock_hb0_and_comparable_loss(tmp_path):
         output_dir=tmp_path / "configs",
         total_steps=50_000,
         train_count=180,
+        expected_p2_source_fingerprint="a" * 64,
     )
     configs = {
         name: normalize(deepcopy(json.loads(path.read_text())))

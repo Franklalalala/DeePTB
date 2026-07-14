@@ -530,11 +530,13 @@ def canonicalize_embedding_options(
             )
 
     if method == "lem_moe_v3_prior":
-        prior_kind = out.pop("prior_kind", _MISSING)
-        if prior_kind is not _MISSING:
-            if _normalized_name(prior_kind) != "p2":
-                raise ValueError("lem_moe_v3_prior currently supports only the P2 prior.")
-            changes.append("prior_kind->embedding.method")
+        prior_kind = _normalized_name(out.get("prior_kind", "p2"))
+        if prior_kind not in {"p2", "p23"}:
+            raise ValueError(
+                "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
+                f"got {prior_kind!r}."
+            )
+        out["prior_kind"] = prior_kind
 
         legacy = (
             out.pop("use_prior_init", None),

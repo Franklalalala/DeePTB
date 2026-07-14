@@ -8,7 +8,8 @@ from dptb.configuration import (
 from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
-from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
+from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
+from dptb.plugins.training_monitor import register_core_training_monitors
 from dptb.plugins.train_logger import Logger
 from dptb.utils.argcheck import normalize, collect_cutoffs, chk_avg_per_iter
 from dptb.plugins.saver import Saver
@@ -593,17 +594,12 @@ def train(
                 if validation_field not in log_field:
                     log_field.append(validation_field)
     avg_per_iter = chk_avg_per_iter(jdata)
-    trainer.register_plugin(TrainLossMonitor(sliding_win_size=jdata["train_options"]["sliding_win_size"], avg_per_iter=avg_per_iter)) # by default, avg_per_iter is false, will not be activated.
-    trainer.register_plugin(LearningRateMonitor())
-    trainer.register_plugin(
-        ScalarFieldMonitor(
-            stat_name="train_loss_opt",
-            interval=[(1, 'iteration'), (1, 'epoch')],
-            sliding_win_size=jdata["train_options"]["sliding_win_size"],
-            avg_per_iter=avg_per_iter,
-        )
+    register_core_training_monitors(
+        trainer,
+        train_endpoint_capable=train_endpoint_capable,
+        sliding_win_size=jdata["train_options"]["sliding_win_size"],
+        avg_per_iter=avg_per_iter,
     )
-    trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
     for flow_stat_name in flow_scalar_fields:
         trainer.register_plugin(
             ScalarFieldMonitor(
@@ -620,18 +616,11 @@ def train(
                         interval=[(1, 'iteration'), (1, 'epoch')],
                     )
                 )
-##############################
-    if train_endpoint_capable:
-        trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-        trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-    trainer.register_plugin(TrainZLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-    trainer.register_plugin(ExpertLoadCVMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     log_field.append("mean_max_prob")
     log_field.append("expert_load_cv")
     if train_endpoint_capable:
         log_field.append("train_onsite_loss")
         log_field.append("train_hopping_loss")
-##############################
     current_bs = jdata["train_options"]["batch_size"]
     grad_log_file = os.path.join(output, f"grad_trace_bs{current_bs}.csv")
 
