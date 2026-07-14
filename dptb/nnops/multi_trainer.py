@@ -15,6 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torch.profiler import profile as torch_profile, ProfilerActivity
 
+from dptb.configuration import migrate_legacy_checkpoint_train_options
 from dptb.utils.tools import (
     get_lr_scheduler,
     get_optimizer,
@@ -197,6 +198,9 @@ class _StageTagger:
 
 class MultiTrainer(Trainer):
     object_keys = ["lr_schedulers", "optimizers"]
+    # Preserve the established stitched-endpoint scheduler semantics for the
+    # multi-expert trainer; the single-trainer regression does not apply here.
+    scheduler_metric_prefers_objective = False
 
     _P_LOSS_OPT_SUM = 0
     _P_ONSITE_WEIGHTED_SUM = 1
@@ -447,19 +451,21 @@ class MultiTrainer(Trainer):
         )
         self.expert_dp_process_group = self._create_expert_dp_process_group()
 
-        self.log_single_model_compatible_loss = bool(
-            self.train_options.get("log_single_model_compatible_loss", True)
-        )
-        self.log_single_model_compatible_loss_mode = str(
-            self.train_options.get("log_single_model_compatible_loss_mode", "reduce")
+        self.endpoint_loss_mode = str(
+            self.train_options.get("endpoint_loss_mode", "reduce")
         ).lower()
+        if self.endpoint_loss_mode not in {"reduce", "full_forward"}:
+            raise ValueError(
+                "train_options.endpoint_loss_mode must be 'reduce' or "
+                f"'full_forward', got {self.endpoint_loss_mode!r}."
+            )
 
-        if self.distributed_expert and self.log_single_model_compatible_loss_mode == "full_forward":
+        if self.distributed_expert and self.endpoint_loss_mode == "full_forward":
             log.warning(
                 "distributed_expert=True does not support full stitched forward across GPUs. "
-                "Fallback log_single_model_compatible_loss_mode from 'full_forward' to 'reduce'."
+                "Fallback endpoint_loss_mode from 'full_forward' to 'reduce'."
             )
-            self.log_single_model_compatible_loss_mode = "reduce"
+            self.endpoint_loss_mode = "reduce"
 
         # ---------------- per-expert optimizer / scheduler overrides ----------------
         self.expert_lrs = self._parse_expert_lrs(self.train_options.get("expert_lrs", None))
@@ -502,8 +508,7 @@ class MultiTrainer(Trainer):
             f"train_num_workers={self.train_num_workers}, ref_num_workers={self.ref_num_workers}, val_num_workers={self.val_num_workers}, "
             f"pin_memory={self.data_pin_memory}, persistent_workers={self.data_persistent_workers}, prefetch_factor={self.data_prefetch_factor}, "
             f"dynamic_batch_enabled={self.dynamic_batch_enabled}, dynamic_batch_oom_fallback={self.dynamic_batch_oom_fallback}, "
-            f"log_single_model_compatible_loss={self.log_single_model_compatible_loss}, "
-            f"mode={self.log_single_model_compatible_loss_mode}, "
+            f"endpoint_loss_mode={self.endpoint_loss_mode}, "
             f"expert_lrs={'(default optimizer.lr)' if self.expert_lrs is None else self.expert_lrs}, "
             f"expert_optimizer_overrides={self._summarize_expert_override_list(self.expert_optimizer_overrides)}, "
             f"expert_lr_scheduler_overrides={self._summarize_expert_override_list(self.expert_lr_scheduler_overrides)}."
@@ -2074,6 +2079,10 @@ class MultiTrainer(Trainer):
         prefix: str,
         criterion=None,
     ) -> Dict[str, torch.Tensor]:
+        if criterion is None:
+            criterion = self.train_lossfunc
+        if not Trainer._supports_endpoint_triplet(criterion):
+            return {}
         compatible_state = self._compute_compatible_state_from_pack(
             pack,
             criterion=criterion,
@@ -2105,6 +2114,7 @@ class MultiTrainer(Trainer):
         range_dis,
         capture_metrics=False,
         flow_prefix="train",
+        use_flow=None,
     ):
         with self._tagger.tag("expert/prepare_masks", it=self.iter, expert=expert_idx):
             expert_edge_mask, expert_node_mask = self._prepare_expert_masks(batch_dict, range_dis, expert_idx)
@@ -2117,7 +2127,12 @@ class MultiTrainer(Trainer):
         active_nodes = expert_node_mask.sum().detach()
         active_edges = expert_edge_mask.sum().detach()
 
-        flow_enabled = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
+        configured_flow = bool(
+            getattr(getattr(self, "flow_cfm", None), "enabled", False)
+        )
+        flow_enabled = configured_flow if use_flow is None else (
+            configured_flow and bool(use_flow)
+        )
         if flow_enabled:
             batch_for_loss = batch_copy.copy()
             if getattr(self.flow_cfm, "model_in_loss", False):
@@ -2183,9 +2198,26 @@ class MultiTrainer(Trainer):
                         flow_ref,
                         prefix=compatible_prefix,
                         legacy_prefix=flow_prefix,
+                        include_raw_stats=True,
                     )
+                    fallback_stats = compatible_state.pop("_endpoint_stats", None)
+                    if fallback_stats is not None:
+                        flow_state["_compatible_clean_stats"] = fallback_stats
                 if compatible_state is not None:
                     flow_state.update(compatible_state)
+
+            if compatible_state is None:
+                raise RuntimeError(
+                    "Enabled flow could not reconstruct an endpoint triplet in "
+                    "the criterion's metric space. Check that flow target keys "
+                    "and the configured Hamiltonian loss use the same block/RME "
+                    "representation."
+                )
+            Trainer._require_endpoint_triplet(
+                flow_state,
+                prefix=flow_prefix,
+                route="MultiTrainer flow training",
+            )
 
             out = {
                 "loss": loss,
@@ -2262,35 +2294,25 @@ class MultiTrainer(Trainer):
             load_cv_values.append(main["expert_load_cv"])
 
         if ref_batch_dict is not None:
+            reference_criterion = getattr(self, "reference_lossfunc", criterion)
             ref_res = self._run_one_expert_loss(
                 batch_dict=ref_batch_dict,
                 batch_info=ref_batch_info,
-                criterion=criterion,
+                criterion=reference_criterion,
                 expert_idx=expert_idx,
                 range_dis=range_dis,
                 capture_metrics=True,
                 flow_prefix=flow_prefix,
+                use_flow=bool(
+                    getattr(getattr(self, "flow_cfm", None), "apply_to_reference", False)
+                ),
             )
 
             total_loss = total_loss + ref_res["loss"]
-            active_nodes = active_nodes + ref_res["active_nodes"]
-            active_edges = active_edges + ref_res["active_edges"]
-            onsite_weighted_sum = onsite_weighted_sum + ref_res["onsite"] * ref_res["active_nodes"].to(dtype=self.dtype)
-            hopping_weighted_sum = hopping_weighted_sum + ref_res["hopping"] * ref_res["active_edges"].to(dtype=self.dtype)
-
-            if onsite_l1_sum is not None and ref_res["last_onsite_l1_sum"] is not None:
-                onsite_l1_sum = onsite_l1_sum + ref_res["last_onsite_l1_sum"]
-                onsite_mse_sum = onsite_mse_sum + ref_res["last_onsite_mse_sum"]
-                onsite_cnt = onsite_cnt + ref_res["last_onsite_count"]
-            if hopping_l1_sum is not None and ref_res["last_hopping_l1_sum"] is not None:
-                hopping_l1_sum = hopping_l1_sum + ref_res["last_hopping_l1_sum"]
-                hopping_mse_sum = hopping_mse_sum + ref_res["last_hopping_mse_sum"]
-                hopping_cnt = hopping_cnt + ref_res["last_hopping_count"]
-
-            if ref_res["z_loss"] is not None:
-                z_values.append(ref_res["z_loss"])
-            if ref_res["expert_load_cv"] is not None:
-                load_cv_values.append(ref_res["expert_load_cv"])
+            # Match the single Trainer contract: reference supervision affects
+            # the backward objective but never contaminates the main-batch
+            # endpoint triplet. Reference metrics can be reported separately
+            # by a future dedicated namespace.
 
         active_nodes_safe = active_nodes.to(dtype=self.dtype).clamp_min(1.0)
         active_edges_safe = active_edges.to(dtype=self.dtype).clamp_min(1.0)
@@ -2337,7 +2359,7 @@ class MultiTrainer(Trainer):
         if criterion is None:
             criterion = self.train_lossfunc
 
-        if (not self.log_single_model_compatible_loss) or (self.log_single_model_compatible_loss_mode != "reduce"):
+        if self.endpoint_loss_mode != "reduce":
             return None
 
         onsite_l1_sum = None
@@ -2435,6 +2457,8 @@ class MultiTrainer(Trainer):
     ):
         if criterion is None:
             criterion = self.train_lossfunc
+        if not Trainer._supports_endpoint_triplet(criterion):
+            return None
 
         onsite_cnt = pack[self._P_ONSITE_CNT_SUM]
         hopping_cnt = pack[self._P_HOPPING_CNT_SUM]
@@ -2657,18 +2681,6 @@ class MultiTrainer(Trainer):
             else train_loss_opt_mean
         )
 
-        global_onsite = reduced_pack[self._P_ONSITE_WEIGHTED_SUM] / reduced_pack[self._P_ACTIVE_NODES_SUM].clamp_min(1.0)
-        global_hopping = reduced_pack[self._P_HOPPING_WEIGHTED_SUM] / reduced_pack[self._P_ACTIVE_EDGES_SUM].clamp_min(1.0)
-        train_onsite_show = (
-            compatible_train_state["train_onsite_loss"]
-            if compatible_train_state is not None
-            else global_onsite
-        )
-        train_hopping_show = (
-            compatible_train_state["train_hopping_loss"]
-            if compatible_train_state is not None
-            else global_hopping
-        )
         total_grad_norm_mean = reduced_pack[self._P_GRAD_NORM_SUM] / reduced_pack[self._P_STEP_COUNT].clamp_min(1.0)
 
         avg_lr = sum(float(vec[3].item()) for vec in gathered) / max(len(gathered), 1)
@@ -2680,9 +2692,16 @@ class MultiTrainer(Trainer):
             "train_loss_opt": train_loss_opt_mean.detach() if torch.is_tensor(train_loss_opt_mean) else torch.tensor(float(train_loss_opt_mean), device=self.device, dtype=self.dtype),
             "lr": float(avg_lr),
             "total_grad_norm": float(total_grad_norm_mean.item()),
-            "train_onsite_loss": float(train_onsite_show.item()),
-            "train_hopping_loss": float(train_hopping_show.item()),
         }
+        if compatible_train_state is not None:
+            state.update({
+                "train_onsite_loss": float(
+                    compatible_train_state["train_onsite_loss"].item()
+                ),
+                "train_hopping_loss": float(
+                    compatible_train_state["train_hopping_loss"].item()
+                ),
+            })
 
         expert_metrics: Dict[int, List[torch.Tensor]] = {}
         for rank_idx, vec in enumerate(gathered):
@@ -2695,8 +2714,9 @@ class MultiTrainer(Trainer):
                 continue
             stacked = torch.stack(vecs)
             mean_vec = stacked.mean(dim=0)
-            state[f"expert_{expert_idx}_onsite"] = float(mean_vec[0].item())
-            state[f"expert_{expert_idx}_hopping"] = float(mean_vec[1].item())
+            if Trainer._supports_endpoint_triplet(self.train_lossfunc):
+                state[f"expert_{expert_idx}_onsite"] = float(mean_vec[0].item())
+                state[f"expert_{expert_idx}_hopping"] = float(mean_vec[1].item())
             state[f"expert_{expert_idx}_lr"] = float(mean_vec[3].item())
             state[f"expert_{expert_idx}_active_nodes"] = float(mean_vec[4].item())
             state[f"expert_{expert_idx}_active_edges"] = float(mean_vec[5].item())
@@ -3371,17 +3391,6 @@ class MultiTrainer(Trainer):
                     else total_loss_opt
                 )
                 self._local_scheduler_step(final_train_loss)
-                train_onsite_show = (
-                    self._to_float_scalar(compatible_train_state["train_onsite_loss"])
-                    if compatible_train_state is not None
-                    else global_onsite
-                )
-                train_hopping_show = (
-                    self._to_float_scalar(compatible_train_state["train_hopping_loss"])
-                    if compatible_train_state is not None
-                    else global_hopping
-                )
-
                 # ---------------- NEW: make lr consistent: use mean lr across experts ----------------
                 avg_lr = sum(float(opt.param_groups[0]['lr']) for opt in self.optimizers) / max(len(self.optimizers), 1)
                 # ----------------------------------------------------------------------------------
@@ -3393,13 +3402,21 @@ class MultiTrainer(Trainer):
                     "train_loss_opt": total_loss_opt,
                     "lr": avg_lr,
                     "total_grad_norm": sum(expert_grad_norms) / max(len(expert_grad_norms), 1),
-                    "train_onsite_loss": train_onsite_show,
-                    "train_hopping_loss": train_hopping_show,
                 }
+                if compatible_train_state is not None:
+                    state.update({
+                        "train_onsite_loss": self._to_float_scalar(
+                            compatible_train_state["train_onsite_loss"]
+                        ),
+                        "train_hopping_loss": self._to_float_scalar(
+                            compatible_train_state["train_hopping_loss"]
+                        ),
+                    })
 
                 for i in range(self.num_experts):
-                    state[f"expert_{i}_onsite"] = expert_onsite_dict.get(f"expert_{i}_onsite", 0.0)
-                    state[f"expert_{i}_hopping"] = expert_hopping_dict.get(f"expert_{i}_hopping", 0.0)
+                    if Trainer._supports_endpoint_triplet(self.train_lossfunc):
+                        state[f"expert_{i}_onsite"] = expert_onsite_dict.get(f"expert_{i}_onsite", 0.0)
+                        state[f"expert_{i}_hopping"] = expert_hopping_dict.get(f"expert_{i}_hopping", 0.0)
                     state[f"expert_{i}_lr"] = float(self.optimizers[i].param_groups[0]['lr'])
 
                 if expert_load_cv_values:
@@ -3512,7 +3529,19 @@ class MultiTrainer(Trainer):
         pred_batch.update(batch_info)
         batch_for_loss.update(batch_info)
 
-        return criterion(pred_batch, batch_for_loss)
+        optimization_loss = criterion(pred_batch, batch_for_loss)
+        endpoint_state = Trainer._endpoint_loss_state(
+            criterion,
+            optimization_loss,
+            prefix="validation",
+        )
+        if Trainer._supports_endpoint_triplet(criterion):
+            Trainer._require_endpoint_triplet(
+                endpoint_state,
+                prefix="validation",
+                route="MultiTrainer full-forward validation",
+            )
+        return endpoint_state["validation_loss"]
 
     def _build_validation_euler_payload(
         self,
@@ -3750,7 +3779,7 @@ class MultiTrainer(Trainer):
                                 )
                         if loss_i is None:
                             loss_i = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
-                    elif self.log_single_model_compatible_loss and self.log_single_model_compatible_loss_mode == "reduce":
+                    elif self.endpoint_loss_mode == "reduce":
                         payloads = []
                         local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
                         for expert_idx, range_dis in enumerate(self.distance_ranges):
@@ -3794,14 +3823,15 @@ class MultiTrainer(Trainer):
                             else:
                                 with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
                                     loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
-                                    fallback_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
-                                    self._accumulate_metric_state(
-                                        validation_metric_sums,
-                                        {
-                                            "validation_onsite_loss": fallback_metrics["onsite"],
-                                            "validation_hopping_loss": fallback_metrics["hopping"],
-                                        },
-                                    )
+                                    if Trainer._supports_endpoint_triplet(self.validation_lossfunc):
+                                        fallback_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
+                                        self._accumulate_metric_state(
+                                            validation_metric_sums,
+                                            {
+                                                "validation_onsite_loss": fallback_metrics["onsite"],
+                                                "validation_hopping_loss": fallback_metrics["hopping"],
+                                            },
+                                        )
                         else:
                             self._accumulate_metric_state(
                                 validation_metric_sums,
@@ -3814,14 +3844,15 @@ class MultiTrainer(Trainer):
                     else:
                         with self._tagger.tag("validation/full_forward_stitched", it=self.iter):
                             loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
-                        full_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
-                        self._accumulate_metric_state(
-                            validation_metric_sums,
-                            {
-                                "validation_onsite_loss": full_metrics["onsite"],
-                                "validation_hopping_loss": full_metrics["hopping"],
-                            },
-                        )
+                        if Trainer._supports_endpoint_triplet(self.validation_lossfunc):
+                            full_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
+                            self._accumulate_metric_state(
+                                validation_metric_sums,
+                                {
+                                    "validation_onsite_loss": full_metrics["onsite"],
+                                    "validation_hopping_loss": full_metrics["hopping"],
+                                },
+                            )
 
                 total_loss = total_loss + loss_i.detach()
                 num_batches += 1
@@ -3850,7 +3881,9 @@ class MultiTrainer(Trainer):
         )
         ckpt = torch.load(checkpoint, map_location=map_loc, weights_only=False)
 
-        ckpt_train_options = copy.deepcopy(ckpt["config"].get("train_options", {}))
+        ckpt_train_options = migrate_legacy_checkpoint_train_options(
+            ckpt["config"].get("train_options", {})
+        )
         merged_train_options = merge_restart_train_options(
             train_options,
             ckpt_train_options,

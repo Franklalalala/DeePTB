@@ -136,7 +136,7 @@ def run_backend(args: argparse.Namespace, backend: str) -> Dict[str, object]:
             "objective": "pixel_meanflow",
             "mode": "residual",
             "prior": "zero",
-            "strict_h0": True,
+            "missing_h0_policy": "error",
             "loss_type": "mse",
             "meanflow": {
                 "du_dt_backend": backend,

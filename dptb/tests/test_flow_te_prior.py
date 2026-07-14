@@ -116,6 +116,7 @@ class _CompactUuRealNoMaskIDP(_CompactUuRealIDP):
 
 
 class _FakeCompatibleLoss:
+    supports_endpoint_triplet = True
     onsite_boost = False
     z_loss_coef = 0.0
 
@@ -1669,8 +1670,7 @@ def test_compatible_pack_loss_falls_back_to_weighted_clean_components():
     trainer = object.__new__(MultiTrainer)
     trainer.dtype = torch.float32
     trainer.device = torch.device("cpu")
-    trainer.log_single_model_compatible_loss = True
-    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.endpoint_loss_mode = "reduce"
 
     pack = torch.zeros(MultiTrainer._PACK_LEN, dtype=torch.float32)
     pack[MultiTrainer._P_ONSITE_WEIGHTED_SUM] = 4.0

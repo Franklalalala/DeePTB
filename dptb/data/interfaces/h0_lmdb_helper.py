@@ -339,7 +339,7 @@ def _build_h0_model_from_input(input_json: str, device_override: str = None) -> 
     common_options = copy.deepcopy(jdata["common_options"])
     model_options["embedding"] = copy.deepcopy(model_options["embedding"])
     model_options["embedding"]["method"] = "lem_moe_v3_h0"
-    model_options["embedding"]["use_h0_init"] = True
+    model_options["embedding"]["h0_init_scope"] = "both"
     model_options["embedding"]["h0_node_mode"] = "direct"
     model_options["embedding"]["fallback_to_hamiltonian"] = False
     if device_override is not None:

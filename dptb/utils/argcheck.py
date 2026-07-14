@@ -3,6 +3,8 @@ from dargs import dargs, Argument, Variant, ArgumentEncoder
 import logging
 from numbers import Number
 
+from dptb.configuration import canonicalize_training_config
+
 
 log = logging.getLogger(__name__)
 
@@ -195,7 +197,7 @@ def flow_options():
         Argument("edge_sigma", (int, float), optional=True, default=1.0),
         Argument("residual_sigma_floor", (int, float), optional=True, default=1.0e-6),
         Argument("te_prior_sigma", (int, float), optional=True, default=1.0),
-        Argument("te_prior_mode", str, optional=True, default="irrep"),
+        Argument("te_prior_mode", str, optional=True, default="auto"),
         Argument("te_prior_per_graph", bool, optional=True, default=True),
         Argument("prior_node_key", str, optional=True, default=""),
         Argument("prior_edge_key", str, optional=True, default=""),
@@ -203,7 +205,6 @@ def flow_options():
         Argument("external_prior_strict", bool, optional=True, default=True),
         Argument("allow_complex_prior_real_projection", bool, optional=True, default=False),
         Argument("prior_skdata", str, optional=True, default=""),
-        Argument("dftb_skdata", str, optional=True, default=""),
         Argument("dftb_prior_overlap", bool, optional=True, default=False),
         Argument("dftb_prior_strict", bool, optional=True, default=True),
         Argument("dftb_prior_require_geometry", bool, optional=True, default=True),
@@ -212,7 +213,6 @@ def flow_options():
         Argument("basis_onsite_missing_value", (int, float), optional=True, default=0.0),
         Argument("basis_onsite_edge_value", (int, float), optional=True, default=0.0),
         Argument("huckel_k", (int, float), optional=True, default=1.75),
-        Argument("overlap_huckel_k", (int, float), optional=True, default=1.75),
         Argument("huckel_node_overlap_key", str, optional=True, default="node_overlap"),
         Argument("huckel_edge_overlap_key", str, optional=True, default="edge_overlap"),
         Argument("huckel_strict_overlap", bool, optional=True, default=True),
@@ -234,9 +234,6 @@ def flow_options():
                      "Non-scalar vectors must be constant within each orbpair slice; "
                      "prefer huckel_scale_mode='pair_block' with prior_calibration for "
                      "fingerprinted train-fit calibration."),
-        Argument("overlap_huckel_edge_channel_scale", (str, list, int, float, type(None)),
-                 optional=True, default=None,
-                 doc="Alias for huckel_edge_channel_scale."),
         Argument("prior_calibration", str, optional=True, default="",
                  doc="Path to a calibration artifact from tools/calibrate_huckel_scales.py "
                      "(edge_scale + node_table). Verified fail-closed against the idp basis."),
@@ -256,30 +253,33 @@ def flow_options():
         Argument("physical_prior_jitter_sigma", (int, float), optional=True, default=0.0),
         Argument("physical_prior_jitter_reference_scale", bool, optional=True, default=True),
         Argument("physical_prior_jitter_edge_decay", (int, float), optional=True, default=0.0),
-        Argument("prior_jitter_sigma", (int, float), optional=True, default=0.0),
         Argument("loss_type", str, optional=True, default="mse"),
         Argument("node_weight", (int, float), optional=True, default=1.0),
         Argument("edge_weight", (int, float), optional=True, default=1.0),
         Argument("z_loss_coef", (int, float), optional=True, default=0.0),
-        Argument("omit_time_scaling", bool, optional=True, default=True),
         Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
         Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
         Argument("component_reduction", str, optional=True, default="global_elements"),
         Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
         Argument("apply_to_reference", bool, optional=True, default=False),
-        Argument("log_compatible_loss", bool, optional=True, default=True),
-        Argument("log_validation_random_t_loss", bool, optional=True, default=True),
-        Argument("log_validation_t0_loss", bool, optional=True, default=True),
-        Argument("log_validation_flow_euler_loss", bool, optional=True, default=True),
-        # Backward-compatible accepted keys. Flow logging always maps endpoint-compatible
-        # metrics to legacy train/validation loss keys when flow is enabled.
-        Argument("log_train_compatible_loss", bool, optional=True, default=True),
-        Argument("log_validation_compatible_loss", bool, optional=True, default=True),
-        Argument("compatible_loss_to_legacy_keys", bool, optional=True, default=True),
+        Argument(
+            "validation_flow_metrics",
+            list,
+            optional=True,
+            default=["random_t", "one_step", "trajectory"],
+            doc="Optional flow-objective validation diagnostics. The Euler-1 "
+                "endpoint triplet is always evaluated separately.",
+        ),
         Argument("overwrite_feature_keys", bool, optional=True, default=True),
         Argument("detach_interpolated_h0", bool, optional=True, default=True),
-        Argument("warn_missing_h0", bool, optional=True, default=True),
-        Argument("strict_h0", bool, optional=True, default=True),
+        Argument(
+            "missing_h0_policy",
+            str,
+            optional=True,
+            default="error",
+            doc="Missing H0 handling: error, warn_zero, or zero. Replaces the "
+                "strict_h0/warn_missing_h0 boolean pair.",
+        ),
     ]
     return Argument(
         "flow_options",
@@ -473,15 +473,10 @@ def train_options():
     )
 
     # ================= stitched / compatible loss & scheduler =================
-    doc_log_single_model_compatible_loss = (
-        "Deprecated compatibility switch. Split/flow trainers now always reconstruct and log "
-        "endpoint-compatible legacy loss keys when the required packed stats are available. "
-        "This is mainly for fair metric comparison between the split-expert model and the unsplit single model. "
-        "Default: `True`"
-    )
-    doc_log_single_model_compatible_loss_mode = (
-        "Reduction mode for reconstructing the compatible stitched loss. "
-        "Currently the recommended mode is `reduce`. Default: `reduce`"
+    doc_endpoint_loss_mode = (
+        "Mode for reconstructing the canonical stitched endpoint loss. "
+        "Use `reduce` for packed statistics or `full_forward` for a stitched "
+        "validation forward. Default: `reduce`"
     )
 
     # ================= 轻量 debug tag =================
@@ -740,8 +735,7 @@ def train_options():
 
 
         # stitched loss / scheduler behavior
-        Argument("log_single_model_compatible_loss", bool, optional=True, default=True, doc=doc_log_single_model_compatible_loss),
-        Argument("log_single_model_compatible_loss_mode", str, optional=True, default="reduce", doc=doc_log_single_model_compatible_loss_mode),
+        Argument("endpoint_loss_mode", str, optional=True, default="reduce", doc=doc_endpoint_loss_mode),
 
         # lightweight stage debug
         Argument("debug_tags", bool, optional=True, default=False, doc=doc_debug_tags),
@@ -1626,11 +1620,9 @@ def slem():
 
 
 def slem_h0():
-    doc_use_h0_init = "Whether to replace the geometry init layer with the H0 init plugin. Default: `True`."
+    doc_h0_init_scope = "H0 initialization scope: both, node, edge, auxiliary, or none. Default: both."
     doc_h0_node_key = "Node-wise H0 key. Defaults to `node_h0`. When absent and fallback is enabled, the plugin checks `node_hamiltonian` first and then the configured fallback feature key."
     doc_h0_edge_key = "Edge-wise H0 key. Defaults to `edge_h0`. When absent and fallback is enabled, the plugin checks `edge_hamiltonian` first and then the configured fallback feature key."
-    doc_use_h0_node_init = "Whether H0 replaces/adds to the native node InitLayer output. Default: `True`."
-    doc_use_h0_edge_init = "Whether H0 replaces/adds to the native edge InitLayer output. Default: `True`."
     doc_h0_node_mode = "How to build node init from H0. Supported: `direct`, `self_edge`. Default: `direct`."
     doc_fallback_to_hamiltonian = "Whether to fall back to the LMDB Hamiltonian-derived node/edge features when explicit H0 keys are absent. Default: `True`."
     doc_fallback_node_key = "Fallback node key used when explicit H0 is absent. Default: `node_features`."
@@ -1645,14 +1637,11 @@ def slem_h0():
     doc_flow_time_missing_value = "Fallback normalized time when flow_time is absent. Default: `0.0`."
 
     return slem() + [
-        Argument("use_h0_init", bool, optional=True, default=True, doc=doc_use_h0_init),
+        Argument("h0_init_scope", str, optional=True, default="both", doc=doc_h0_init_scope),
         Argument("h0_node_key", str, optional=True, default="node_h0", doc=doc_h0_node_key),
         Argument("h0_edge_key", str, optional=True, default="edge_h0", doc=doc_h0_edge_key),
-        Argument("use_h0_node_init", bool, optional=True, default=True, doc=doc_use_h0_node_init),
-        Argument("use_h0_edge_init", bool, optional=True, default=True, doc=doc_use_h0_edge_init),
         Argument("h0_node_mode", str, optional=True, default="direct", doc=doc_h0_node_mode),
         Argument("fallback_to_hamiltonian", bool, optional=True, default=True, doc=doc_fallback_to_hamiltonian),
-        Argument("h0_fallback_to_hamiltonian", bool, optional=True, default=True, doc=doc_fallback_to_hamiltonian),
         Argument("fallback_node_key", str, optional=True, default="node_features", doc=doc_fallback_node_key),
         Argument("fallback_edge_key", str, optional=True, default="edge_features", doc=doc_fallback_edge_key),
         Argument("allow_target_fallback_in_training", bool, optional=True, default=False,
@@ -1750,14 +1739,20 @@ def e3tb_prediction():
         Argument("symmetrize_onsite", bool, optional=True, default=True, doc="Hermitian-complete onsite AO blocks in blockwise output."),
         Argument("complete_edges", bool, optional=True, default=True, doc="Fill missing edge AO entries from reverse directed edges in blockwise output."),
         Argument("strict_complete_edges", bool, optional=True, default=False, doc="Fail if reverse-edge completion leaves unresolved valid AO entries."),
-        Argument("add_h0", bool, optional=True, default=False, doc="Also expose full H block tensors by adding converted H0 blocks to delta predictions."),
-        Argument("add_prior", bool, optional=True, default=False, doc="Expose Full-H blocks as a physical prior plus learned correction. Mutually exclusive with add_h0."),
+        Argument(
+            "reconstruction",
+            str,
+            optional=True,
+            default="direct",
+            doc="Full-H reconstruction mode: direct, h0_residual, or prior_residual. "
+                "Replaces the mutually exclusive add_h0/add_prior flags.",
+        ),
         Argument("prior_node_block_field", str, optional=True, default="node_p2_blocks", doc="Node AO-block field used for physical-prior Full-H reconstruction."),
         Argument("prior_edge_block_field", str, optional=True, default="edge_p2_blocks", doc="Edge AO-block field used for physical-prior Full-H reconstruction."),
         Argument("prior_label", str, optional=True, default="P2"),
         Argument("validate_prior_blocks", bool, optional=True, default=False, doc="Debug-only finite checks for prior AO blocks during every model forward. Production caches are validated at dataset ingest."),
-        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks when add_h0 or add_prior is true."),
-        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks when add_h0 or add_prior is true."),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks in a residual reconstruction mode."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks in a residual reconstruction mode."),
     ]
 
     return nn
@@ -1772,43 +1767,65 @@ def block_native_prediction():
         Argument("scale_type", str, optional=True, default="no_scale", doc=doc_scale_type),
         Argument("block_decoder", str, optional=True, default="linear", doc=doc_block_decoder),
         Argument("blockwise_hamiltonian", bool, optional=True, default=True, doc=doc_blockwise_hamiltonian),
-        Argument("add_h0", bool, optional=True, default=False, doc="Also expose full-H AO blocks as H0 plus residual block-native predictions. Requires get_H0=true for every dataset split."),
-        Argument("add_prior", bool, optional=True, default=False, doc="Expose Full-H AO blocks as a physical prior plus learned correction. Mutually exclusive with add_h0."),
+        Argument(
+            "reconstruction",
+            str,
+            optional=True,
+            default="direct",
+            doc="Full-H reconstruction mode: direct, h0_residual, or prior_residual.",
+        ),
         Argument("prior_node_block_field", str, optional=True, default="node_p2_blocks"),
         Argument("prior_edge_block_field", str, optional=True, default="edge_p2_blocks"),
         Argument("prior_label", str, optional=True, default="P2"),
         Argument("validate_prior_blocks", bool, optional=True, default=False, doc="Debug-only finite checks for prior AO blocks during every model forward. Production caches are validated at dataset ingest."),
-        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks when add_h0 or add_prior is true."),
-        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks when add_h0 or add_prior is true."),
+        Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks in a residual reconstruction mode."),
+        Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks in a residual reconstruction mode."),
+    ]
+
+
+def soft_edge_memory_options():
+    return [
+        Argument("enabled", bool, optional=True, default=True),
+        Argument("num_slots", int, optional=True, default=64),
+        Argument("num_heads", int, optional=True, default=4),
+        Argument("head_dim", int, optional=True, default=16),
+        Argument("temperature", float, optional=True, default=1.0),
+        Argument("dropout", float, optional=True, default=0.0),
+        Argument("gate_mode", str, optional=True, default="deepseek"),
+        Argument("gate_bias", float, optional=True, default=0.0),
+        Argument("gate_eps", float, optional=True, default=1e-6),
+        Argument("zero_init_output", bool, optional=True, default=True),
+        Argument("input_norm", bool, optional=True, default=True),
+        Argument("diagnostics_mode", str, optional=True, default="off"),
+        Argument("diagnostics_sample_size", int, optional=True, default=1024),
     ]
 
 
 def slem_prior():
     """Strict first-class physical-prior schema (P2 in the first release)."""
     return slem() + [
-        Argument("prior_kind", str, optional=True, default="p2", doc="Physical prior family. The first implementation accepts only p2."),
-        Argument("use_prior_init", bool, optional=True, default=True, doc="Project the P2 RME prior into the equivariant node/edge hidden state."),
+        Argument(
+            "prior_init_scope",
+            str,
+            optional=True,
+            default="both",
+            doc="P2 initialization scope: both, node, edge, auxiliary, or none.",
+        ),
         Argument("prior_node_key", str, optional=True, default="node_p2", doc="Node-wise P2 RME field."),
         Argument("prior_edge_key", str, optional=True, default="edge_p2", doc="Edge-wise P2 RME field."),
-        Argument("use_prior_node_init", bool, optional=True, default=True),
-        Argument("use_prior_edge_init", bool, optional=True, default=True),
         Argument("prior_node_mode", str, optional=True, default="direct", doc="Supported: direct or self_edge."),
         Argument("prior_merge_mode", str, optional=True, default="replace", doc="Supported: replace or add."),
         Argument("prior_self_edge_tol", float, optional=True, default=1e-8),
-        Argument("use_soft_edge_memory", bool, optional=True, default=True, doc="Enable scalar-only multi-head external edge KV memory."),
-        Argument("soft_edge_memory_num_slots", int, optional=True, default=64),
-        Argument("soft_edge_memory_num_heads", int, optional=True, default=4),
-        Argument("soft_edge_memory_head_dim", int, optional=True, default=16),
-        Argument("soft_edge_memory_temperature", float, optional=True, default=1.0),
-        Argument("soft_edge_memory_dropout", float, optional=True, default=0.0),
-        Argument("soft_edge_memory_gate_mode", str, optional=True, default="deepseek", doc="Memory gate: deepseek normalized-similarity gate or linear scalar gate."),
-        Argument("soft_edge_memory_gate_bias", float, optional=True, default=0.0),
-        Argument("soft_edge_memory_gate_eps", float, optional=True, default=1e-6),
-        Argument("soft_edge_memory_zero_init_output", bool, optional=True, default=True),
-        Argument("soft_edge_memory_input_norm", bool, optional=True, default=True),
+        Argument(
+            "soft_edge_memory",
+            dict,
+            sub_fields=soft_edge_memory_options(),
+            sub_variants=[],
+            optional=True,
+            default={"enabled": True},
+            doc="Scalar-only equivariant edge-memory configuration.",
+        ),
         Argument("prior_validate_inputs", bool, optional=True, default=False, doc="Debug-only finite checks for P2 tensors during every forward; production LMDBs are validated at ingest."),
-        Argument("soft_edge_memory_diagnostics_mode", str, optional=True, default="off", doc="Attention diagnostics: off, sampled, or full."),
-        Argument("soft_edge_memory_diagnostics_sample_size", int, optional=True, default=1024),
     ]
 
 
@@ -2088,9 +2105,9 @@ def loss_options():
         Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, block_mae_mse, feature_compatible."),
         Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
         Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
-        Argument("log_feature_compatible", bool, optional=True, default=True),
+        Argument("log_feature_compatible", bool, optional=True, default=False, doc="Expensive opt-in: report exact old-RME-compatible endpoint metrics instead of native AO-block metrics. Enable selectively (for example validation only), not on every block-native train step."),
         Argument("feature_log_no_grad", bool, optional=True, default=True),
-        Argument("distributed_log_reduce", bool, optional=True, default=True),
+        Argument("distributed_log_reduce", bool, optional=True, default=False),
         Argument("expose_component_sums", bool, optional=True, default=True),
         Argument("loss_weight", [int, float], optional=True, default=1.0, doc="Global multiplier applied only to the optimization loss. Set 10.0 for the QHFlow2 Hamiltonian objective; unlike LR scaling, this also changes gradient-clipping behavior."),
         Argument("eps", float, optional=True, default=1e-12),
@@ -2136,14 +2153,11 @@ def _validate_p2_prior_full_h_contract(data):
     embedding_is_prior = embedding_options.get("method") == "lem_moe_v3_prior"
     needs_p2_rme = bool(
         embedding_is_prior
-        and embedding_options.get("use_prior_init", True)
-        and (
-            embedding_options.get("use_prior_node_init", True)
-            or embedding_options.get("use_prior_edge_init", True)
-        )
+        and embedding_options.get("prior_init_scope", "both")
+        in {"both", "node", "edge"}
     )
-    add_prior = bool(prediction_options.get("add_prior", False))
-    add_h0 = bool(prediction_options.get("add_h0", False))
+    reconstruction = prediction_options.get("reconstruction", "direct")
+    add_prior = reconstruction == "prior_residual"
 
     data_options_value = data.get("data_options", {})
     configured_splits = {
@@ -2183,17 +2197,17 @@ def _validate_p2_prior_full_h_contract(data):
 
     if bool(common.get("has_soc", False)):
         raise ValueError(
-            "lem_moe_v3_prior/add_prior is non-SOC only; set common_options.has_soc=false."
+            "lem_moe_v3_prior/prior_residual reconstruction is non-SOC only; "
+            "set common_options.has_soc=false."
         )
-    if add_prior and add_h0:
-        raise ValueError("prediction.add_prior and prediction.add_h0 are mutually exclusive.")
     if (
         add_prior
         and prediction_options.get("method") == "e3tb"
         and not bool(prediction_options.get("blockwise_hamiltonian", False))
     ):
         raise ValueError(
-            "e3tb prediction.add_prior=true requires blockwise_hamiltonian=true."
+            "e3tb prediction.reconstruction='prior_residual' requires "
+            "blockwise_hamiltonian=true."
         )
 
     for split, split_options in configured_splits.items():
@@ -2209,17 +2223,17 @@ def _validate_p2_prior_full_h_contract(data):
             if bool(split_options.get("residual_hamiltonian", False)):
                 raise ValueError(
                     f"data_options.{split}.residual_hamiltonian must be false: "
-                    "P2+dH is supervised against absolute Full H."
+                    "prior_residual reconstruction is supervised against absolute Full H."
                 )
             if not bool(split_options.get("require_full_h_target", False)):
                 raise ValueError(
                     f"data_options.{split}.require_full_h_target must be true when "
-                    "prediction.add_prior=true."
+                    "prediction.reconstruction='prior_residual'."
                 )
             if not bool(split_options.get("require_p2_blocks", False)):
                 raise ValueError(
                     f"data_options.{split}.require_p2_blocks must be true when "
-                    "prediction.add_prior=true."
+                    "prediction.reconstruction='prior_residual'."
                 )
 
     if not add_prior:
@@ -2240,7 +2254,7 @@ def _validate_p2_prior_full_h_contract(data):
         }:
             raise ValueError(
                 f"train_options.loss_options.{split}.method must use a blockwise "
-                "Hamiltonian loss when prediction.add_prior=true."
+                "Hamiltonian loss for prediction.reconstruction='prior_residual'."
             )
         pred_node_key = split_loss.get("pred_node_block_key", "node_hamil_blocks")
         pred_edge_key = split_loss.get("pred_edge_block_key", "edge_hamil_blocks")
@@ -3062,7 +3076,10 @@ def collect_cutoffs(jdata):
 
 
 def normalize(data):
-
+    # Resolve aliases and mutually dependent route switches before dargs inserts
+    # defaults.  Doing this afterwards silently hides alias values behind the
+    # canonical defaults (for example overlap_huckel_k behind huckel_k=1.75).
+    data = canonicalize_training_config(data)
     co = common_options()
     tr = train_options()
     da = data_options()

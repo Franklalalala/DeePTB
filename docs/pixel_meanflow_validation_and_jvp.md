@@ -12,15 +12,15 @@ untouched entry-point registration were replaced by the stricter variants below.
 Semantics after this change, for any `flow_options.objective` in
 {`pixel_meanflow`, `pixel_mean_flow`, `pmf`, `meanflow`, `mean_flow`}:
 
-- `meanflow.log_validation_compatible_loss` defaults to **true** (code layer,
-  no production config change needed). Validation euler-samples to the
-  endpoint (`validation_ode_steps`, default `(1, 3)`) and scores the plain
-  blockwise validation criterion on the sampled endpoint.
+- Validation always samples an Euler-1 endpoint baseline and scores the plain
+  validation criterion on it. `validation_ode_steps` controls only additional
+  endpoint diagnostics; it cannot remove step 1.
 - The euler-1 result is written to the legacy keys
   `validation_loss` / `validation_onsite_loss` / `validation_hopping_loss`,
-  so pMF curves are directly comparable with no-CFM and CFM runs.
-  Explicit opt-outs are honored: `meanflow.log_validation_compatible_loss=false`
-  or `meanflow.compatible_loss_to_legacy_keys=false`.
+  so pMF curves are directly comparable with no-CFM and CFM runs in the same
+  metric space. Block-native criteria use the same L1+RMSE endpoint family in
+  AO-block space unless their loss explicitly opts into the more expensive
+  old-RME-compatible reduction.
 - `Trainer.validation()` now **returns** that legacy `validation_loss` when it
   exists (previously it returned the accumulated random-time flow objective).
   This matches `MultiTrainer.validation` and what `Validationer`/saver/LR
@@ -32,24 +32,14 @@ Semantics after this change, for any `flow_options.objective` in
     previously emitted as `validation_one_step_flow_*`, which matched neither
     the TensorBoard prefix scan (`validation_flow_*` / `validation_compatible_*`)
     nor anything else, i.e. they were computed but never plotted.
-- No fabricated zeros:
-  - Scalar log fields are now registered from the **resolved flow object**
-    (`dptb.nnops.flow.resolve_flow_log_fields`) instead of raw top-level
-    `flow_options` keys. pMF never computes the raw-batch `train_compatible_*`
-    metrics, so those fields are no longer registered (previously they were
-    seeded 0.0 at registration and printed as a constant, perfect-looking 0).
-    Same for CFM-only keys pMF never emits (`validation_flow_t0_loss`,
-    `validation_flow_euler_N_loss`).
-  - Legacy `validation_onsite_loss`/`validation_hopping_loss` monitors are
-    only registered when the run will actually produce them.
-  - A scalar-only validation criterion (no onsite/hopping side effects) yields
-    `validation_loss` but **no** legacy component keys, instead of fake zeros.
-  - `pixel_meanflow.log_train_compatible_loss=true` is rejected with a warning
-    (forced off): the model-in-loss objective has no code path that computes
-    it, so accepting the flag could only produce lying zeros.
-- Wasted work removed: with compatible validation explicitly off, the pMF
-  validation branch no longer euler-samples at all (the samples had no other
-  consumer).
+- No fabricated zeros: endpoint all/onsite/hopping is one fail-closed contract.
+  A criterion that cannot produce the complete triplet raises immediately.
+  TensorBoard registers fields from the resolved flow object and suppresses the
+  duplicate `train_compatible_*` and Euler-1 compatible aliases; extra Euler-N
+  diagnostics remain visible.
+- `validation_flow_metrics` is the single selector for optional random-time,
+  one-step, and trajectory flow diagnostics. It does not control the endpoint
+  triplet.
 
 Trainer/MultiTrainer both key off the same flow attributes, so multi-GPU
 (hanhai `multi_train`) validation is aligned by the same defaults.
@@ -79,7 +69,7 @@ The new backend:
   "objective": "pixel_meanflow",
   "meanflow": {
     "du_dt_backend": "jvp",          // default: "finite_difference"
-    "jvp_fallback": true              // alias: jvp_fallback_to_finite_difference
+    "jvp_fallback": true
   }
 }
 ```
@@ -405,10 +395,6 @@ python -m pytest dptb/tests/test_hamiltonian_flow.py -q \
 python tools/bench_pixel_meanflow_du_dt_backend.py --device cuda --batch-size 96 --backend both
 ```
 
-Pre-existing failures at clean `d57c009` (verified via `git stash`; unrelated
-to this change): `test_dynamic_cost_batch.py` (2, missing
-`log_single_model_compatible_loss` attr in partially-stubbed MultiTrainer
-tests), `test_expert_data_parallel_layout.py` (1, same),
-`test_trainer_reference_batches.py` (1, same),
-`test_gpu_residency_hot_paths.py` (1, source-scan on `lem_moe_v3.py`
-`batch.max().item()`).
+The 0714 endpoint contract is always enabled; partially stubbed trainer tests
+therefore need only set `endpoint_loss_mode` when they exercise the packed
+`reduce` versus `full_forward` implementation choice.

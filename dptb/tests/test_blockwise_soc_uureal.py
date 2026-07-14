@@ -92,7 +92,11 @@ def test_soc_uureal_feature_block_roundtrip_and_loss_contract():
     loss_fn = HamilBlockwiseNexTHamLoss(idp=mapper)
     loss = loss_fn(loss_data)
     assert loss.item() == pytest.approx(0.0, abs=1e-12)
-    assert loss_fn.last_feature_count.item() == pytest.approx(25.0)
+    # Block-native heads keep endpoint accounting in block space by default;
+    # converting to RME is opt-in because it adds avoidable hot-path work.
+    assert loss_fn.last_endpoint_metric_space == "block"
+    assert loss_fn.last_block_count.item() == pytest.approx(25.0)
+    assert loss_fn.last_feature_count is None
     loss.backward()
     assert torch.isfinite(loss_data[NODE_PRED_HAMIL_BLOCKS_KEY].grad).all()
     assert torch.isfinite(loss_data[EDGE_PRED_HAMIL_BLOCKS_KEY].grad).all()

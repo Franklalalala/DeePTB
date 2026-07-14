@@ -2,16 +2,28 @@ from __future__ import annotations
 
 import inspect
 import json
+import pickle
 from copy import deepcopy
 
+import lmdb
 import numpy as np
 import pytest
 
 from dptb.data.interfaces.abacus import _abacus_parse, recursive_parse
+from dptb.data.interfaces.p2_table import P2_COMPONENT_NUMERICAL_GATE_SCHEMA
 from dptb.utils.argcheck import normalize
 from tools.build_nonsoc_p2_ablation_configs import DEFAULT_REFERENCE, build_configs
 from tools.materialize_nonsoc_p2_cache import (
+    RAW_CASE_SOURCE_FINGERPRINT_KEY,
     RY_TO_EV,
+    SCHEMA,
+    _case_source_fingerprint_map,
+    _dataset_source_identity,
+    _require_qualified_table_manifest,
+    _raw_staging_identity,
+    _validate_raw_record_source,
+    _validate_raw_staging_identity,
+    _write_raw_staging_identity,
     _guard_output,
     _required_block_keys_from_graph,
     complete_sparse_zero_blocks,
@@ -133,6 +145,211 @@ def test_guard_output_resume_requires_existing_disjoint_root(tmp_path):
         )
 
 
+def _write_case_sources(dataset, case_name="case-a"):
+    case = dataset / "cases" / case_name
+    output = case / "OUT.ABACUS"
+    output.mkdir(parents=True)
+    (output / "running_scf.log").write_text("structure-v1\n", encoding="utf-8")
+    (output / "data-HR-sparse_SPIN0.csr").write_text("full-h-v1\n", encoding="utf-8")
+    (output / "data-HR0_SPIN0.csr").write_text("h0-v1\n", encoding="utf-8")
+    (case / "STRU").write_text("stru-v1\n", encoding="utf-8")
+    dataset.mkdir(exist_ok=True)
+    (dataset / "ordered_paths.txt").write_text(f"{case.resolve()}\n", encoding="utf-8")
+    return case
+
+
+def _identity_inputs(tmp_path):
+    input_json = tmp_path / "input.json"
+    input_json.write_text('{"data_options": {}}\n', encoding="utf-8")
+    gate1_script = tmp_path / "gate1.py"
+    gate1_script.write_text("# synthetic gate1\n", encoding="utf-8")
+    dataset = tmp_path / "dataset"
+    case = _write_case_sources(dataset)
+    dataset_identity = _dataset_source_identity(
+        dataset,
+        [case],
+        require_stru=True,
+    )
+    return input_json, gate1_script, dataset_identity, case
+
+
+def test_raw_staging_identity_matching_resume_is_reusable(tmp_path):
+    input_json, gate1_script, dataset_identity, _case = _identity_inputs(tmp_path)
+    work = tmp_path / "work"
+    expected = _raw_staging_identity(
+        input_json=input_json,
+        gate1_script=gate1_script,
+        p2_source_fingerprint="a" * 64,
+        p2_source_kind="radial_table",
+        dataset_source_identity=dataset_identity,
+    )
+    _write_raw_staging_identity(work, expected)
+    (work / "manifest.partial.json").write_text(
+        json.dumps({"schema": SCHEMA, "raw_staging_identity": expected}),
+        encoding="utf-8",
+    )
+
+    _validate_raw_staging_identity(work, expected)
+
+
+def test_raw_staging_identity_rejects_missing_and_mismatch(tmp_path):
+    input_json, gate1_script, dataset_identity, _case = _identity_inputs(tmp_path)
+    work = tmp_path / "work"
+    expected = _raw_staging_identity(
+        input_json=input_json,
+        gate1_script=gate1_script,
+        p2_source_fingerprint="a" * 64,
+        p2_source_kind="radial_table",
+        dataset_source_identity=dataset_identity,
+    )
+    work.mkdir()
+    (work / "manifest.partial.json").write_text(
+        json.dumps({"schema": SCHEMA}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="identity is missing"):
+        _validate_raw_staging_identity(work, expected)
+
+    _write_raw_staging_identity(work, expected)
+    mismatched = _raw_staging_identity(
+        input_json=input_json,
+        gate1_script=gate1_script,
+        p2_source_fingerprint="b" * 64,
+        p2_source_kind="radial_table",
+        dataset_source_identity=dataset_identity,
+    )
+    (work / "manifest.partial.json").write_text(
+        json.dumps({"schema": SCHEMA, "raw_staging_identity": mismatched}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="identity mismatch"):
+        _validate_raw_staging_identity(work, expected)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "OUT.ABACUS/running_scf.log",
+        "OUT.ABACUS/data-HR-sparse_SPIN0.csr",
+        "OUT.ABACUS/data-HR0_SPIN0.csr",
+        "STRU",
+    ],
+)
+def test_dataset_source_identity_binds_each_authoritative_case_file(
+    tmp_path,
+    relative_path,
+):
+    dataset = tmp_path / "dataset"
+    case = _write_case_sources(dataset)
+    before = _dataset_source_identity(dataset, [case], require_stru=True)
+
+    (case / relative_path).write_text("changed source\n", encoding="utf-8")
+    after = _dataset_source_identity(dataset, [case], require_stru=True)
+
+    assert before["identity_sha256"] != after["identity_sha256"]
+    assert (
+        before["selected_cases"][0]["source_fingerprint"]
+        != after["selected_cases"][0]["source_fingerprint"]
+    )
+
+
+def test_raw_record_source_rejects_same_basename_other_root_and_source_update(tmp_path):
+    dataset_a = tmp_path / "a" / "dataset"
+    dataset_b = tmp_path / "b" / "dataset"
+    case_a = _write_case_sources(dataset_a, case_name="same")
+    case_b = _write_case_sources(dataset_b, case_name="same")
+    identity_a = _dataset_source_identity(dataset_a, [case_a], require_stru=True)
+    identity_b = _dataset_source_identity(dataset_b, [case_b], require_stru=True)
+    fingerprints_a = _case_source_fingerprint_map(identity_a)
+    fingerprints_b = _case_source_fingerprint_map(identity_b)
+    fingerprint_a = fingerprints_a[str(case_a.resolve())]
+    record = {
+        "source": str(case_a.resolve()),
+        RAW_CASE_SOURCE_FINGERPRINT_KEY: fingerprint_a,
+    }
+
+    with pytest.raises(ValueError, match="source path"):
+        _validate_raw_record_source(
+            record,
+            case_b,
+            case_source_fingerprints=fingerprints_b,
+            label="train[0]",
+        )
+
+    record["source"] = str(case_b.resolve())
+    with pytest.raises(ValueError, match="source fingerprint mismatch"):
+        _validate_raw_record_source(
+            record,
+            case_b,
+            case_source_fingerprints=fingerprints_b,
+            label="train[0]",
+        )
+
+
+@pytest.mark.parametrize("gate", [None, {"status": "fail"}])
+def test_materializer_rejects_table_without_persisted_pass_gate(tmp_path, gate):
+    manifest = {"complete": True, "component_numerical_gate": gate}
+    with pytest.raises(ValueError, match="persisted component numerical gate"):
+        _require_qualified_table_manifest(
+            manifest,
+            manifest_path=tmp_path / "manifest.json",
+        )
+
+    _require_qualified_table_manifest(
+        {
+            "complete": True,
+            "component_numerical_gate": {
+                "schema": P2_COMPONENT_NUMERICAL_GATE_SCHEMA,
+                "status": "pass",
+            },
+        },
+        manifest_path=tmp_path / "manifest.json",
+    )
+
+
+def test_raw_staging_identity_missing_rejects_tampered_symmetric_p2_row(tmp_path):
+    input_json, gate1_script, dataset_identity, _case = _identity_inputs(tmp_path)
+    work = tmp_path / "work"
+    expected = _raw_staging_identity(
+        input_json=input_json,
+        gate1_script=gate1_script,
+        p2_source_fingerprint="a" * 64,
+        p2_source_kind="radial_table",
+        dataset_source_identity=dataset_identity,
+    )
+    raw_split = work / "raw_staging" / "train" / "data.0000.lmdb"
+    raw_split.parent.mkdir(parents=True)
+    env = lmdb.open(str(raw_split), map_size=1 << 20, subdir=True, max_dbs=1)
+    try:
+        with env.begin(write=True) as txn:
+            txn.put(
+                (0).to_bytes(length=4, byteorder="big"),
+                pickle.dumps(
+                    {
+                        "case_id": "tampered",
+                        "hamiltonian_schema": "deeptb.p2_training_sample/v2",
+                        "p2_source_fingerprint": expected["p2_source_fingerprint"],
+                        "hamiltonian_p2": {
+                            "0_0_0_0_0": np.asarray([[123.0]], dtype=np.float32)
+                        },
+                        "p2_hermitian_projection": {
+                            "max_pre_projection_mismatch": 0.0,
+                        },
+                    },
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                ),
+            )
+    finally:
+        env.close()
+    (work / "manifest.partial.json").write_text(
+        json.dumps({"schema": SCHEMA}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="identity is missing"):
+        _validate_raw_staging_identity(work, expected)
+
+
 def test_table_cache_assembles_only_onsite_and_canonical_graph_blocks():
     keys = _required_block_keys_from_graph(
         np.asarray([1, 8]),
@@ -223,6 +440,27 @@ def test_p2_hermitian_projection_rejects_missing_reverse_graph_block():
         )
 
 
+def test_p2_hermitian_projection_rejects_large_mismatch_before_averaging():
+    blocks = {
+        "0_1_0_0_0": np.asarray([[1.0]], dtype=np.float32),
+        "1_0_0_0_0": np.asarray([[1.1]], dtype=np.float32),
+    }
+    with pytest.raises(ValueError, match="exceeds tolerance") as error:
+        project_non_soc_blocks_hermitian(
+            blocks,
+            required_keys=[(0, 1, 0, 0, 0), (1, 0, 0, 0, 0)],
+            mismatch_tolerance=1.0e-3,
+        )
+    assert '"above_tolerance_count": 1' in str(error.value)
+    # Input evidence is not modified on failure.
+    np.testing.assert_array_equal(
+        blocks["0_1_0_0_0"], np.asarray([[1.0]], dtype=np.float32)
+    )
+    np.testing.assert_array_equal(
+        blocks["1_0_0_0_0"], np.asarray([[1.1]], dtype=np.float32)
+    )
+
+
 def test_four_ablation_configs_lock_hb0_and_comparable_loss(tmp_path):
     paths = build_configs(
         reference=DEFAULT_REFERENCE,
@@ -269,10 +507,13 @@ def test_four_ablation_configs_lock_hb0_and_comparable_loss(tmp_path):
     p2 = configs["02_p2_residual_hb0"]
     memory = configs["03_p2_memory_hb0"]
     assert p2["data_options"]["train"]["get_P2"] is True
-    assert p2["model_options"]["embedding"]["use_soft_edge_memory"] is False
-    assert memory["model_options"]["embedding"]["use_soft_edge_memory"] is True
+    assert p2["model_options"]["embedding"]["soft_edge_memory"]["enabled"] is False
+    assert memory["model_options"]["embedding"]["soft_edge_memory"]["enabled"] is True
     for config in (p2, memory):
-        assert config["model_options"]["prediction"]["add_prior"] is True
+        assert (
+            config["model_options"]["prediction"]["reconstruction"]
+            == "prior_residual"
+        )
         assert config["data_options"]["train"]["require_p2_blocks"] is True
         assert config["data_options"]["train"]["require_full_h_target"] is True
         assert config["train_options"]["loss_options"]["train"][

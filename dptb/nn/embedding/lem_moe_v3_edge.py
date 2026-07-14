@@ -2,6 +2,7 @@ from typing import Any
 
 import torch
 
+from dptb.configuration import resolve_init_scope
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
@@ -246,13 +247,14 @@ class LemMoEV3EdgeH0(LemMoEV3Edge):
 
     def __init__(
         self,
-        use_h0_init: bool = True,
+        h0_init_scope: Any = None,
+        use_h0_init: Any = None,
         h0_node_key: str = _keys.NODE_H0_KEY,
         h0_edge_key: str = _keys.EDGE_H0_KEY,
-        use_h0_node_init: bool = True,
-        use_h0_edge_init: bool = True,
+        use_h0_node_init: Any = None,
+        use_h0_edge_init: Any = None,
         h0_node_mode: str = "direct",
-        fallback_to_hamiltonian: bool = True,
+        fallback_to_hamiltonian: Any = None,
         h0_fallback_to_hamiltonian: Any = None,
         allow_target_fallback_in_training: bool = False,
         fallback_node_key: str = _keys.NODE_FEATURES_KEY,
@@ -262,9 +264,32 @@ class LemMoEV3EdgeH0(LemMoEV3Edge):
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
-        self.use_h0_init = use_h0_init
-        if h0_fallback_to_hamiltonian is not None:
-            fallback_to_hamiltonian = bool(h0_fallback_to_hamiltonian)
+        (
+            self.h0_init_scope,
+            self.use_h0_init,
+            use_h0_node_init,
+            use_h0_edge_init,
+        ) = resolve_init_scope(
+            h0_init_scope,
+            enabled=use_h0_init,
+            node=use_h0_node_init,
+            edge=use_h0_edge_init,
+            option_name="h0_init_scope",
+        )
+        if fallback_to_hamiltonian is None:
+            fallback_to_hamiltonian = (
+                True
+                if h0_fallback_to_hamiltonian is None
+                else bool(h0_fallback_to_hamiltonian)
+            )
+        elif (
+            h0_fallback_to_hamiltonian is not None
+            and bool(fallback_to_hamiltonian) != bool(h0_fallback_to_hamiltonian)
+        ):
+            raise ValueError(
+                "fallback_to_hamiltonian conflicts with deprecated "
+                "h0_fallback_to_hamiltonian."
+            )
 
         if self.use_h0_init:
             self.init_layer = H0InitLayer(

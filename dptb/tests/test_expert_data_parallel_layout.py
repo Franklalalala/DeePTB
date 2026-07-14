@@ -508,7 +508,10 @@ def test_multi_trainer_expert_optimizer_uses_unwrapped_expert_parameters():
 
     assert "def _unwrap_expert_module" in trainer_text
     assert "return self._expert_module(expert_idx).parameters()" in expert_parameters
-    assert "return get_optimizer(model_param=self._expert_parameters(i), **opt_cfg)" in trainer_text
+    assert (
+        "return get_optimizer(model_param=self._expert_optimizer_parameters(i), **opt_cfg)"
+        in trainer_text
+    )
     assert "opt = _make_opt_for_expert(idx)" in trainer_text
 
 

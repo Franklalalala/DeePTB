@@ -17,9 +17,9 @@ absolute fields through `prior_node_key` and `prior_edge_key`. Since the edge
 field equals the residual-mode H0 base, its flow residual prior is exactly
 zero, reproducing A on the edge side.
 
-For D, `model_options.embedding.use_h0_node_init=false` preserves the native
-NN InitLayer node output while `use_h0_edge_init=true` retains H0 edge
-initialization. The non-CFM variants keep the same static initialization but
+For D, `model_options.embedding.h0_init_scope=edge` preserves the native NN
+InitLayer node output while retaining H0 edge initialization. The non-CFM
+variants keep the same static initialization but
 set `train_options.flow_options.enabled=false`; they therefore remain distinct
 instead of collapsing to one ordinary baseline.
 

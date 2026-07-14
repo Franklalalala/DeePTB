@@ -2,13 +2,14 @@ import copy
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
 from dptb.utils.argcheck import normalize
 from dptb.utils.tools import j_loader
+from dptb.configuration import canonicalize_training_config
 
 
 log = logging.getLogger(__name__)
@@ -117,10 +118,18 @@ def strip_deprecated_train_options(raw_config: Dict[str, Any]) -> Dict[str, Any]
     return raw_config
 
 
-def load_multi_train_config(input_path: str) -> Dict[str, Any]:
+def load_multi_train_config(
+    input_path: str,
+    *,
+    include_explicit: bool = False,
+) -> Union[Dict[str, Any], Tuple[Dict[str, Any], Dict[str, Any]]]:
     raw = j_loader(input_path)
     raw = strip_deprecated_train_options(raw)
-    return normalize(raw)
+    explicit = canonicalize_training_config(raw)
+    normalized = normalize(explicit)
+    if include_explicit:
+        return normalized, explicit
+    return normalized
 
 
 def configure_debug_env(train_opt: Dict[str, Any]) -> None:
@@ -177,10 +186,30 @@ def merge_restart_train_options(
     *,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
+    """Merge checkpoint options with only explicitly requested overrides.
+
+    Callers at CLI entrypoints must pass the pre-schema, canonicalized user
+    options.  This prevents dargs-injected defaults from disabling checkpoint
+    flow or changing endpoint execution mode.  Nested option blocks are merged
+    recursively so one explicit flow override does not replace the whole saved
+    flow contract.
+    """
+
+    def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+
     logger = logger or log
     ckpt_train_options = copy.deepcopy(ckpt_train_options or {})
-    merged_train_options = copy.deepcopy(ckpt_train_options)
-    merged_train_options.update(copy.deepcopy(requested_train_options or {}))
+    merged_train_options = _deep_merge(
+        ckpt_train_options,
+        copy.deepcopy(requested_train_options or {}),
+    )
 
     for key in RESTART_LOCKED_TRAIN_OPTION_KEYS:
         if key not in ckpt_train_options:

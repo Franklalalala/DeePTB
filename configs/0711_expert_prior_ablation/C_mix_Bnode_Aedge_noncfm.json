@@ -111,7 +111,6 @@
       "ffn_apply_to_last": false,
       "ffn_hidden_factor": 0.0,
       "h0_edge_key": "edge_h0",
-      "h0_fallback_to_hamiltonian": false,
       "h0_merge_mode": "replace",
       "h0_node_key": "node_overlap",
       "h0_node_mode": "direct",
@@ -236,12 +235,10 @@
       "tp_radial_emb": true,
       "universal": true,
       "use_angle": false,
-      "use_h0_init": true,
+      "h0_init_scope": "both",
       "use_interpolation_out": true,
       "use_layer_onehot_tp": true,
-      "use_out_onehot_tp": true,
-      "use_h0_node_init": true,
-      "use_h0_edge_init": true
+      "use_out_onehot_tp": true
     },
     "prediction": {
       "activation": "tanh",
@@ -339,7 +336,6 @@
     "expert_optimizer_overrides": [],
     "float32_matmul_precision": "high",
     "flow_options": {
-      "compatible_loss_to_legacy_keys": false,
       "component_reduction": "global_elements",
       "detach_interpolated_h0": true,
       "edge_h0_key": "edge_h0",
@@ -348,20 +344,16 @@
       "endpoint_weight_cap": 100,
       "endpoint_weight_power": 0,
       "external_prior_strict": true,
-      "log_compatible_loss": true,
-      "log_train_compatible_loss": true,
-      "log_validation_compatible_loss": false,
       "loss_type": "mse",
       "mode": "residual",
       "node_h0_key": "node_h0",
       "node_target_key": "node_features",
       "objective": "cfm",
-      "omit_time_scaling": true,
       "overwrite_feature_keys": true,
       "prior": "external",
       "prior_edge_key": "edge_overlap",
       "prior_node_key": "node_overlap",
-      "strict_h0": true,
+      "missing_h0_policy": "error",
       "t0_probability": 0,
       "t_max": 0.999,
       "t_min": 0,
@@ -373,8 +365,7 @@
         1
       ]
     },
-    "log_single_model_compatible_loss": true,
-    "log_single_model_compatible_loss_mode": "reduce",
+    "endpoint_loss_mode": "reduce",
     "loss_options": {
       "train": {
         "debug_flag": false,

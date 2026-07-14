@@ -9,10 +9,11 @@ target-fallback behavior is exposed through this public API.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from dptb.configuration import resolve_init_scope
 from dptb.data import AtomicDataDict, _keys
 from dptb.nn.embedding.emb import Embedding
 
@@ -181,50 +182,86 @@ class LemMoEV3Prior(LemMoEV3H0):
     def __init__(
         self,
         *,
-        prior_kind: str = "p2",
-        use_prior_init: bool = True,
+        prior_init_scope: Optional[str] = None,
+        prior_kind: Optional[str] = None,
+        use_prior_init: Optional[bool] = None,
         prior_node_key: str = _keys.NODE_P2_KEY,
         prior_edge_key: str = _keys.EDGE_P2_KEY,
-        use_prior_node_init: bool = True,
-        use_prior_edge_init: bool = True,
+        use_prior_node_init: Optional[bool] = None,
+        use_prior_edge_init: Optional[bool] = None,
         prior_node_mode: str = "direct",
         prior_merge_mode: str = "replace",
         prior_self_edge_tol: float = 1e-8,
-        use_soft_edge_memory: bool = True,
-        soft_edge_memory_num_slots: int = 64,
-        soft_edge_memory_num_heads: int = 4,
-        soft_edge_memory_head_dim: int = 16,
-        soft_edge_memory_temperature: float = 1.0,
-        soft_edge_memory_dropout: float = 0.0,
-        soft_edge_memory_gate_mode: str = "deepseek",
-        soft_edge_memory_gate_bias: float = 0.0,
-        soft_edge_memory_gate_eps: float = 1e-6,
-        soft_edge_memory_zero_init_output: bool = True,
-        soft_edge_memory_input_norm: bool = True,
+        soft_edge_memory: Optional[Dict[str, Any]] = None,
+        use_soft_edge_memory: Optional[bool] = None,
+        soft_edge_memory_num_slots: Optional[int] = None,
+        soft_edge_memory_num_heads: Optional[int] = None,
+        soft_edge_memory_head_dim: Optional[int] = None,
+        soft_edge_memory_temperature: Optional[float] = None,
+        soft_edge_memory_dropout: Optional[float] = None,
+        soft_edge_memory_gate_mode: Optional[str] = None,
+        soft_edge_memory_gate_bias: Optional[float] = None,
+        soft_edge_memory_gate_eps: Optional[float] = None,
+        soft_edge_memory_zero_init_output: Optional[bool] = None,
+        soft_edge_memory_input_norm: Optional[bool] = None,
         prior_validate_inputs: bool = False,
-        soft_edge_memory_diagnostics_mode: str = "off",
-        soft_edge_memory_diagnostics_sample_size: int = 1024,
+        soft_edge_memory_diagnostics_mode: Optional[str] = None,
+        soft_edge_memory_diagnostics_sample_size: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
-        prior_kind = str(prior_kind).lower()
-        if prior_kind != "p2":
+        if prior_kind is not None and str(prior_kind).lower() != "p2":
             raise ValueError(
                 f"lem_moe_v3_prior currently supports prior_kind='p2', got {prior_kind!r}."
             )
-        if use_soft_edge_memory and not use_prior_init:
+        (
+            self.prior_init_scope,
+            use_prior_init,
+            use_prior_node_init,
+            use_prior_edge_init,
+        ) = resolve_init_scope(
+            prior_init_scope,
+            enabled=use_prior_init,
+            node=use_prior_node_init,
+            edge=use_prior_edge_init,
+            option_name="prior_init_scope",
+        )
+
+        memory = dict(soft_edge_memory or {})
+        legacy_memory = {
+            "enabled": use_soft_edge_memory,
+            "num_slots": soft_edge_memory_num_slots,
+            "num_heads": soft_edge_memory_num_heads,
+            "head_dim": soft_edge_memory_head_dim,
+            "temperature": soft_edge_memory_temperature,
+            "dropout": soft_edge_memory_dropout,
+            "gate_mode": soft_edge_memory_gate_mode,
+            "gate_bias": soft_edge_memory_gate_bias,
+            "gate_eps": soft_edge_memory_gate_eps,
+            "zero_init_output": soft_edge_memory_zero_init_output,
+            "input_norm": soft_edge_memory_input_norm,
+            "diagnostics_mode": soft_edge_memory_diagnostics_mode,
+            "diagnostics_sample_size": soft_edge_memory_diagnostics_sample_size,
+        }
+        for key, value in legacy_memory.items():
+            if value is None:
+                continue
+            if key in memory and memory[key] != value:
+                raise ValueError(
+                    f"soft_edge_memory.{key} conflicts with deprecated flat option."
+                )
+            memory[key] = value
+        memory_enabled = bool(memory.get("enabled", True))
+        if memory_enabled and not use_prior_init:
             raise ValueError(
-                "use_soft_edge_memory=true requires use_prior_init=true in the P2 route."
+                "soft_edge_memory.enabled=true requires prior_init_scope != 'none'."
             )
 
         super().__init__(
-            use_h0_init=use_prior_init,
+            h0_init_scope=self.prior_init_scope,
             h0_node_key=prior_node_key,
             h0_edge_key=prior_edge_key,
-            use_h0_node_init=use_prior_node_init,
-            use_h0_edge_init=use_prior_edge_init,
             h0_node_mode=prior_node_mode,
             fallback_to_hamiltonian=False,
-            h0_fallback_to_hamiltonian=False,
             allow_target_fallback_in_training=False,
             h0_merge_mode=prior_merge_mode,
             h0_self_edge_tol=prior_self_edge_tol,
@@ -235,11 +272,11 @@ class LemMoEV3Prior(LemMoEV3H0):
                 "lem_moe_v3_prior is intentionally non-SOC in the first implementation."
             )
 
-        self.prior_kind = prior_kind
+        self.prior_kind = "p2"
         self.prior_node_key = str(prior_node_key)
         self.prior_edge_key = str(prior_edge_key)
         self.use_prior_init = bool(use_prior_init)
-        self.use_soft_edge_memory = bool(use_soft_edge_memory)
+        self.use_soft_edge_memory = memory_enabled
         if self.use_prior_init:
             if not isinstance(self.init_layer, H0InitLayer):
                 raise TypeError(
@@ -253,22 +290,24 @@ class LemMoEV3Prior(LemMoEV3H0):
                 use_node_init=use_prior_node_init,
                 use_edge_init=use_prior_edge_init,
                 use_soft_edge_memory=self.use_soft_edge_memory,
-                soft_edge_memory_num_slots=soft_edge_memory_num_slots,
-                soft_edge_memory_num_heads=soft_edge_memory_num_heads,
-                soft_edge_memory_head_dim=soft_edge_memory_head_dim,
-                soft_edge_memory_temperature=soft_edge_memory_temperature,
-                soft_edge_memory_dropout=soft_edge_memory_dropout,
-                soft_edge_memory_gate_mode=soft_edge_memory_gate_mode,
-                soft_edge_memory_gate_bias=soft_edge_memory_gate_bias,
-                soft_edge_memory_gate_eps=soft_edge_memory_gate_eps,
-                soft_edge_memory_zero_init_output=soft_edge_memory_zero_init_output,
-                soft_edge_memory_input_norm=soft_edge_memory_input_norm,
+                soft_edge_memory_num_slots=int(memory.get("num_slots", 64)),
+                soft_edge_memory_num_heads=int(memory.get("num_heads", 4)),
+                soft_edge_memory_head_dim=int(memory.get("head_dim", 16)),
+                soft_edge_memory_temperature=float(memory.get("temperature", 1.0)),
+                soft_edge_memory_dropout=float(memory.get("dropout", 0.0)),
+                soft_edge_memory_gate_mode=str(memory.get("gate_mode", "deepseek")),
+                soft_edge_memory_gate_bias=float(memory.get("gate_bias", 0.0)),
+                soft_edge_memory_gate_eps=float(memory.get("gate_eps", 1e-6)),
+                soft_edge_memory_zero_init_output=bool(
+                    memory.get("zero_init_output", True)
+                ),
+                soft_edge_memory_input_norm=bool(memory.get("input_norm", True)),
                 validate_inputs=prior_validate_inputs,
                 soft_edge_memory_diagnostics_mode=(
-                    soft_edge_memory_diagnostics_mode
+                    memory.get("diagnostics_mode", "off")
                 ),
                 soft_edge_memory_diagnostics_sample_size=(
-                    soft_edge_memory_diagnostics_sample_size
+                    int(memory.get("diagnostics_sample_size", 1024))
                 ),
                 dtype=self.dtype,
                 device=self.device,

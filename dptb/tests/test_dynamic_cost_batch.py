@@ -6,6 +6,7 @@ import torch
 from dptb.data.dataset._base_datasets import AtomicInMemoryDataset
 from dptb.data.dataset.lmdb_dataset import LMDBDataset
 from dptb.data import AtomicDataDict
+from dptb.data.transforms import OrbitalMapper
 from dptb.data.dataloader import (
     AtomicDataCostEstimator,
     DataLoader,
@@ -737,7 +738,7 @@ def test_lmdb_dataset_h0_raw_conversion_can_override_precomputed_h0(monkeypatch)
     dataset.orthogonal = False
     dataset.h0_key = "hamiltonian_0"
     dataset.prefer_precomputed_h0 = False
-    dataset.transform = object()
+    dataset.transform = OrbitalMapper({"H": "1s"}, method="e3tb", device="cpu")
     dataset.file_map = ["data.0000.lmdb"]
     dataset.info_files = {
         "data.0000.lmdb": {
@@ -752,7 +753,12 @@ def test_lmdb_dataset_h0_raw_conversion_can_override_precomputed_h0(monkeypatch)
             "train_polar": False,
         }
     }
-    h0_blocks = {"0_0_0_0_0": torch.zeros((1, 1))}
+    h0_blocks = {
+        "0_0_0_0_0": torch.zeros((1, 1)),
+        "0_1_0_0_0": torch.zeros((1, 1)),
+        "1_0_0_0_0": torch.zeros((1, 1)),
+        "1_1_0_0_0": torch.zeros((1, 1)),
+    }
     data_dict = {
         AtomicDataDict.CELL_KEY: torch.eye(3),
         AtomicDataDict.POSITIONS_KEY: torch.zeros((2, 3)),
@@ -767,7 +773,10 @@ def test_lmdb_dataset_h0_raw_conversion_can_override_precomputed_h0(monkeypatch)
     def _fake_from_points(**kwargs):
         return Data(
             pos=torch.as_tensor(kwargs["pos"]),
-            edge_index=torch.zeros((2, 4), dtype=torch.long),
+            edge_index=torch.tensor(
+                [[0, 0, 1, 1], [0, 1, 0, 1]],
+                dtype=torch.long,
+            ),
             edge_cell_shift=torch.zeros((4, 3), dtype=torch.long),
             atomic_numbers=torch.as_tensor(kwargs["atomic_numbers"]),
         )
@@ -800,7 +809,7 @@ def test_lmdb_dataset_reuses_stored_edge_graph_for_precomputed_features(monkeypa
     dataset.orthogonal = False
     dataset.h0_key = "hamiltonian_0"
     dataset.prefer_precomputed_h0 = True
-    dataset.transform = object()
+    dataset.transform = OrbitalMapper({"H": "1s"}, method="e3tb", device="cpu")
     dataset.file_map = ["data.0000.lmdb"]
     dataset.info_files = {
         "data.0000.lmdb": {

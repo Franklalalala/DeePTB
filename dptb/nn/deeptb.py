@@ -2,6 +2,12 @@ import torch.nn as nn
 import torch
 from typing import Union, Tuple, Optional, Callable, Dict
 import torch.nn.functional as F
+from dptb.configuration import (
+    canonicalize_embedding_options,
+    canonicalize_prediction_options,
+    migrate_legacy_checkpoint_model_options,
+    resolve_reconstruction_mode,
+)
 from dptb.nn.embedding import Embedding
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
@@ -133,6 +139,9 @@ class NNENV(nn.Module):
         """
         super(NNENV, self).__init__()
 
+        embedding = canonicalize_embedding_options(embedding)
+        prediction = canonicalize_prediction_options(prediction)
+
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
         self.dtype = dtype
@@ -148,10 +157,11 @@ class NNENV(nn.Module):
         scale_type = prediction_copy.get("scale_type")
         self.scale_type = scale_type
         self.blockwise_hamiltonian = bool(prediction_copy.get("blockwise_hamiltonian", False))
-        self.block_native_add_h0 = bool(prediction_copy.get("add_h0", False))
-        self.block_native_add_prior = bool(prediction_copy.get("add_prior", False))
-        if self.block_native_add_h0 and self.block_native_add_prior:
-            raise ValueError("prediction.add_h0 and prediction.add_prior are mutually exclusive.")
+        self.reconstruction = resolve_reconstruction_mode(
+            prediction_copy.get("reconstruction", "direct")
+        )
+        self.block_native_add_h0 = self.reconstruction == "h0_residual"
+        self.block_native_add_prior = self.reconstruction == "prior_residual"
         self.block_native_prior_node_field = prediction_copy.get(
             "prior_node_block_field", AtomicDataDict.NODE_P2_BLOCKS_KEY
         )
@@ -368,14 +378,16 @@ class NNENV(nn.Module):
             hamiltonian_cls = BlockwiseE3Hamiltonian if self.blockwise_hamiltonian else E3Hamiltonian
             blockwise_ham_kwargs = {}
             if self.blockwise_hamiltonian:
+                blockwise_ham_kwargs.update(
+                    add_h0=self.block_native_add_h0,
+                    add_prior=self.block_native_add_prior,
+                )
                 for key in (
                     "node_pad_shape",
                     "edge_pad_shape",
                     "symmetrize_onsite",
                     "complete_edges",
                     "strict_complete_edges",
-                    "add_h0",
-                    "add_prior",
                     "prior_node_block_field",
                     "prior_edge_block_field",
                     "prior_label",
@@ -507,7 +519,11 @@ class NNENV(nn.Module):
         }
 
         if len(embedding) == 0 or len(prediction) == 0:
-            model_options.update(ckpt["config"]["model_options"])
+            model_options.update(
+                migrate_legacy_checkpoint_model_options(
+                    ckpt["config"]["model_options"]
+                )
+            )
 
         for k,v in common_options.items():
             if v is None:

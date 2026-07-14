@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from dptb.configuration import canonicalize_flow_options
 from dptb.data import AtomicDataDict
 from dptb.nnops.flow import HamiltonianCFM, log
 from dptb.nnops.flow_context import PixelMFContext
@@ -38,12 +39,10 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         dtype: Any = torch.float32,
         device: Any = torch.device("cpu"),
     ) -> None:
+        options = canonicalize_flow_options(options)
         super().__init__(options, idp=idp, dtype=dtype, device=device)
-        options = dict(options or {})
-        mf = dict(options.get("meanflow", options.get("pixel_meanflow", {})) or {})
-        profile = str(mf.get("profile", options.get("meanflow_profile", "conservative"))).lower()
-        if bool(mf.get("aggressive", options.get("meanflow_aggressive", False))):
-            profile = "aggressive"
+        mf = dict(options.get("meanflow", {}) or {})
+        profile = str(mf.get("profile", "conservative")).lower()
         if profile not in {"conservative", "aggressive"}:
             raise ValueError("pixel meanflow profile must be 'conservative' or 'aggressive'.")
         aggressive = profile == "aggressive"
@@ -57,7 +56,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         self.meanflow_min_t = float(mf.get("min_t", 0.05))
         self.meanflow_fd_eps = float(mf.get("fd_eps", 1.0e-3))
         self.meanflow_du_dt_backend = str(
-            mf.get("du_dt_backend", mf.get("jvp_backend", "finite_difference"))
+            mf.get("du_dt_backend", "finite_difference")
         ).lower().replace("-", "_")
         if self.meanflow_du_dt_backend in {"fd", "finite_diff"}:
             self.meanflow_du_dt_backend = "finite_difference"
@@ -69,9 +68,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
         # jvp failures (forward-mode-unsupported ops, DDP wrappers, custom
         # kernels) fall back to finite_difference for the rest of the run
         # unless the user makes them fatal.
-        self.meanflow_jvp_fallback = bool(
-            mf.get("jvp_fallback", mf.get("jvp_fallback_to_finite_difference", True))
-        )
+        self.meanflow_jvp_fallback = bool(mf.get("jvp_fallback", True))
         # Memory-efficient jvp: compute the primal (training signal) in a normal
         # grad forward and the detached du/dt tangent in a separate no_grad
         # forward-mode pass, instead of one fused dual forward. The fused pass
@@ -110,7 +107,7 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             mf.get("aux_boundary_v_weight", 0.10 if aggressive else 0.0)
         )
         self.meanflow_objective = str(
-            mf.get("objective", mf.get("loss_objective", "finite_difference"))
+            mf.get("objective", "finite_difference")
         ).lower().replace("-", "_")
         if self.meanflow_objective in {"fd", "finite_diff", "jvp"}:
             self.meanflow_objective = "finite_difference"
@@ -609,8 +606,17 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
             if prefix == "train" and self.log_train_compatible_loss:
-                state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(node_x - ctx.node_clean, node_mask, "onsite")
+                self._merge_compatible_clean_stats(
+                    state,
+                    self._compatible_clean_stats(
+                        node_x - ctx.node_clean,
+                        node_mask,
+                        "onsite",
+                        metric_space=self._target_metric_space(
+                            self.node_target_key,
+                            node_x,
+                        ),
+                    )
                 )
             if primary_aliases:
                 state[f"{prefix}_flow_onsite_loss"] = comp_state[
@@ -636,8 +642,17 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
             if prefix == "train" and self.log_train_compatible_loss:
-                state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(edge_x - ctx.edge_clean, edge_mask, "hopping")
+                self._merge_compatible_clean_stats(
+                    state,
+                    self._compatible_clean_stats(
+                        edge_x - ctx.edge_clean,
+                        edge_mask,
+                        "hopping",
+                        metric_space=self._target_metric_space(
+                            self.edge_target_key,
+                            edge_x,
+                        ),
+                    )
                 )
             if primary_aliases:
                 state[f"{prefix}_flow_hopping_loss"] = comp_state[
@@ -1072,8 +1087,17 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
             if prefix == "train" and self.log_train_compatible_loss:
-                state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(node_x - ctx.node_clean, node_mask, "onsite")
+                self._merge_compatible_clean_stats(
+                    state,
+                    self._compatible_clean_stats(
+                        node_x - ctx.node_clean,
+                        node_mask,
+                        "onsite",
+                        metric_space=self._target_metric_space(
+                            self.node_target_key,
+                            node_x,
+                        ),
+                    )
                 )
             # Legacy aliases so pMF logs line up with CFM/supervised curves:
             # *_flow_onsite_loss mirrors the velocity objective; the train_*
@@ -1101,8 +1125,17 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             total = comp_total if total is None else total + comp_total
             state.update(comp_state)
             if prefix == "train" and self.log_train_compatible_loss:
-                state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(edge_x - ctx.edge_clean, edge_mask, "hopping")
+                self._merge_compatible_clean_stats(
+                    state,
+                    self._compatible_clean_stats(
+                        edge_x - ctx.edge_clean,
+                        edge_mask,
+                        "hopping",
+                        metric_space=self._target_metric_space(
+                            self.edge_target_key,
+                            edge_x,
+                        ),
+                    )
                 )
             state[f"{prefix}_flow_hopping_loss"] = comp_state[f"{prefix}_flow_hopping_velocity_loss"]
             if prefix == "train":
@@ -1267,13 +1300,3 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
             out[self.edge_target_key] = out[self.edge_h0_key]
         self._write_times(out, zero, zero)
         return out
-
-
-# Populate the backward-compatible ``dptb.nnops.flow.HamiltonianPixelMeanFlow``
-# alias.  When ``flow`` is imported first its bottom re-export already binds this
-# name; when ``flow_meanflow`` is imported first that re-export is skipped (the
-# class does not exist yet at that point), so bind it here instead.  ``flow`` is
-# fully importable by now via the module-top ``from dptb.nnops.flow import``.
-from dptb.nnops import flow as _flow_module
-
-_flow_module.HamiltonianPixelMeanFlow = HamiltonianPixelMeanFlow

@@ -55,10 +55,28 @@ class BaseTrainer(with_metaclass(ABCMeta, PluginUser)):
 
             if not self.update_lr_per_iter:
                 if lr_scheduler_requires_metric(self.lr_scheduler):
-                    if 'validation_loss' in self.stats and 'epoch_mean' in self.stats['validation_loss']:
-                        self.lr_scheduler.step(self.stats['validation_loss']['epoch_mean'])  # 使用验证损失
+                    flow_enabled = bool(
+                        getattr(getattr(self, "flow_cfm", None), "enabled", False)
+                    )
+                    prefer_optimization_metric = bool(
+                        getattr(self, "scheduler_metric_prefers_objective", False)
+                    ) and not flow_enabled
+                    validation_name = (
+                        "validation_loss"
+                        if not prefer_optimization_metric
+                        or "validation_loss_opt" not in self.stats
+                        else "validation_loss_opt"
+                    )
+                    train_name = (
+                        "train_loss"
+                        if not prefer_optimization_metric
+                        or "train_loss_opt" not in self.stats
+                        else "train_loss_opt"
+                    )
+                    if validation_name in self.stats and 'epoch_mean' in self.stats[validation_name]:
+                        self.lr_scheduler.step(self.stats[validation_name]['epoch_mean'])
                     else:
-                        self.lr_scheduler.step(self.stats["train_loss"]["epoch_mean"])
+                        self.lr_scheduler.step(self.stats[train_name]["epoch_mean"])
                 else:
                     self.lr_scheduler.step()  # modify the lr at each epoch (should we add it to pluggins so we could record the lr scheduler process? update 0927, this has been done in tensorboard monitor.)
 

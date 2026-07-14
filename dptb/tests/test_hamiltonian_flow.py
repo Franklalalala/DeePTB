@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
+from dptb.nnops.flow import (
+    HamiltonianCFM,
+    HamiltonianPixelMeanFlow,
+    assert_model_in_loss_endpoint_metric_space,
+    build_hamiltonian_flow,
+)
 from dptb.data import AtomicDataDict
 from dptb.nnops.loss import HamilLossAbs
 from dptb.nnops import trainer as trainer_module
@@ -204,6 +209,123 @@ class _StatsCompatibleLoss(torch.nn.Module):
         return 0.5 * (onsite + hopping), onsite, hopping
 
 
+class _DistinctEndpointLoss(torch.nn.Module):
+    endpoint_metric_space = "block"
+
+    def __init__(self):
+        super().__init__()
+        self.last_endpoint_loss = torch.tensor(99.0)
+        self.last_endpoint_metric_space = "saved"
+        self.last_onsite_loss = torch.tensor(88.0)
+        self.last_hopping_loss = torch.tensor(77.0)
+
+    def forward(self, pred, ref):
+        self.last_endpoint_loss = torch.tensor(2.0)
+        self.last_endpoint_metric_space = "block"
+        self.last_onsite_loss = torch.tensor(1.0)
+        self.last_hopping_loss = torch.tensor(3.0)
+        return torch.tensor(20.0)
+
+
+class _BlockEndpointFallbackLoss(_StatsCompatibleLoss):
+    endpoint_metric_space = "block"
+
+    def forward(self, pred, ref):
+        self.forward_calls += 1
+        self.last_endpoint_loss = torch.tensor(15.0)
+        self.last_endpoint_metric_space = "block"
+        self.last_onsite_loss = torch.tensor(10.0)
+        self.last_hopping_loss = torch.tensor(20.0)
+        self.last_onsite_l1_sum = torch.tensor(30.0)
+        self.last_onsite_mse_sum = torch.tensor(300.0)
+        self.last_onsite_count = torch.tensor(3.0)
+        self.last_hopping_l1_sum = torch.tensor(40.0)
+        self.last_hopping_mse_sum = torch.tensor(800.0)
+        self.last_hopping_count = torch.tensor(2.0)
+        return torch.tensor(100.0)
+
+
+def test_meanflow_block_endpoint_fails_fast_for_default_rme_target_keys():
+    flow = HamiltonianPixelMeanFlow(
+        {"enabled": True, "objective": "pixel_meanflow"}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"endpoint metric-space mismatch.*node_target_key='node_features'.*will not perform",
+    ):
+        assert_model_in_loss_endpoint_metric_space(
+            flow,
+            _BlockEndpointFallbackLoss(),
+        )
+
+
+def test_meanflow_block_endpoint_accepts_explicit_block_target_contract():
+    flow = HamiltonianPixelMeanFlow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "node_target_key": "node_full_hamil_blocks",
+            "edge_target_key": "edge_full_hamil_blocks",
+        }
+    )
+
+    assert_model_in_loss_endpoint_metric_space(
+        flow,
+        _BlockEndpointFallbackLoss(),
+    )
+
+
+def test_non_model_in_loss_cfm_does_not_use_meanflow_metric_space_guard():
+    flow = HamiltonianCFM({"enabled": True})
+
+    assert_model_in_loss_endpoint_metric_space(
+        flow,
+        _BlockEndpointFallbackLoss(),
+    )
+
+
+def test_flow_endpoint_stats_reject_mixed_node_edge_metric_spaces():
+    state = {}
+    HamiltonianCFM._merge_compatible_clean_stats(
+        state,
+        {"onsite_l1_sum": torch.tensor(1.0), "metric_space": "rme"},
+    )
+
+    with pytest.raises(ValueError, match="onsite and hopping targets"):
+        HamiltonianCFM._merge_compatible_clean_stats(
+            state,
+            {"hopping_l1_sum": torch.tensor(1.0), "metric_space": "block"},
+        )
+
+
+@pytest.mark.parametrize("trainer_cls", [Trainer, MultiTrainer])
+def test_single_and_multi_trainer_apply_meanflow_endpoint_contract(trainer_cls):
+    trainer = object.__new__(trainer_cls)
+    trainer.flow_cfm = HamiltonianPixelMeanFlow(
+        {"enabled": True, "objective": "pixel_meanflow"}
+    )
+    trainer.train_lossfunc = _BlockEndpointFallbackLoss()
+    trainer.use_reference = False
+
+    with pytest.raises(ValueError, match="trainer initialization"):
+        trainer._assert_model_in_loss_endpoint_contract()
+
+
+def test_meanflow_endpoint_contract_checks_validation_criterion_at_init():
+    trainer = object.__new__(Trainer)
+    trainer.flow_cfm = HamiltonianPixelMeanFlow(
+        {"enabled": True, "objective": "pixel_meanflow"}
+    )
+    trainer.train_lossfunc = SimpleNamespace(endpoint_metric_space="rme")
+    trainer.validation_lossfunc = _BlockEndpointFallbackLoss()
+    trainer.use_validation = True
+    trainer.use_reference = False
+
+    with pytest.raises(ValueError, match=r"metric-space mismatch.*validation criterion"):
+        trainer._assert_model_in_loss_endpoint_contract()
+
+
 def _compatible_clean_stats():
     return {
         "_compatible_clean_stats": {
@@ -342,6 +464,53 @@ def test_flow_compatible_loss_state_uses_no_grad_and_restores_side_effects():
 
     assert lossfunc.last_onsite_loss.item() == pytest.approx(123.0)
     assert lossfunc.last_hopping_loss.item() == pytest.approx(456.0)
+
+
+def test_compatible_forward_uses_endpoint_total_not_optimization_total():
+    lossfunc = _DistinctEndpointLoss()
+
+    state = Trainer._compatible_loss_state(
+        lossfunc,
+        {},
+        {},
+        prefix="validation_compatible_euler_1",
+        legacy_prefix="validation",
+    )
+
+    assert state["validation_loss"].item() == pytest.approx(2.0)
+    assert state["validation_onsite_loss"].item() == pytest.approx(1.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(3.0)
+    assert state["validation_compatible_euler_1_loss_opt"].item() == pytest.approx(20.0)
+    assert lossfunc.last_endpoint_loss.item() == pytest.approx(99.0)
+    assert lossfunc.last_endpoint_metric_space == "saved"
+
+
+def test_flow_stats_reject_cross_representation_endpoint_reduction():
+    from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
+
+    lossfunc = HamilBlockwiseNexTHamLoss(basis={"H": "1s"})
+    flow_state = _compatible_clean_stats()
+    flow_state["_compatible_clean_stats"]["metric_space"] = "rme"
+
+    assert Trainer._compatible_loss_state_from_flow_stats(
+        lossfunc,
+        flow_state,
+        source_prefix="train",
+        prefix="train_compatible",
+        legacy_prefix="train",
+    ) is None
+
+    flow_state["_compatible_clean_stats"]["metric_space"] = "block"
+    state = Trainer._compatible_loss_state_from_flow_stats(
+        lossfunc,
+        flow_state,
+        source_prefix="train",
+        prefix="train_compatible",
+        legacy_prefix="train",
+    )
+    assert state["train_loss"].item() == pytest.approx(
+        0.5 * (state["train_onsite_loss"] + state["train_hopping_loss"]).item()
+    )
 
 
 def test_flow_stats_fast_path_preserves_compatible_and_legacy_semantics():
@@ -783,7 +952,11 @@ def test_validation_compatible_loss_forces_legacy_keys(monkeypatch):
         assert legacy_prefix == "validation"
         return {
             f"{prefix}_loss": torch.tensor(9.0),
+            f"{prefix}_onsite_loss": torch.tensor(4.0),
+            f"{prefix}_hopping_loss": torch.tensor(5.0),
             "validation_loss": torch.tensor(9.0),
+            "validation_onsite_loss": torch.tensor(4.0),
+            "validation_hopping_loss": torch.tensor(5.0),
         }
 
     monkeypatch.setattr(
@@ -885,8 +1058,7 @@ def test_multitrainer_validation_uses_euler_sample_for_compatible_legacy_loss():
     trainer.local_expert_idx = 0
     trainer.distance_ranges = [(0.0, 1.0)]
     trainer.world_size = 1
-    trainer.log_single_model_compatible_loss = True
-    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.endpoint_loss_mode = "reduce"
     trainer._prepare_batch_bundle = lambda batch, with_lengths=True: (_two_graph_batch(), {})
     trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
         torch.ones(batch["edge_features"].shape[0], dtype=torch.bool),
@@ -974,6 +1146,16 @@ class _PreparedFlowWithStats(_PreparedFlow):
         }
 
 
+class _PreparedFlowWithRMEMetricStats(_PreparedFlow):
+    def loss(self, pred, ref, ctx):
+        state = _compatible_clean_stats()
+        state["_compatible_clean_stats"]["metric_space"] = "rme"
+        return pred["node_features"].sum() * 0.0 + torch.tensor(5.0), {
+            "train_flow_loss": torch.tensor(5.0),
+            **state,
+        }
+
+
 def test_multitrainer_expert_payload_applies_flow_before_model():
     trainer = object.__new__(MultiTrainer)
     trainer.iter = 1
@@ -1037,14 +1219,111 @@ def test_multitrainer_non_display_step_does_not_run_full_compatible_loss():
     assert result["hopping"].item() > 0.0
 
 
+def test_multitrainer_flow_fallback_replaces_cross_space_raw_stats():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 2
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer._tagger = _NoopTagger()
+    trainer.flow_cfm = _PreparedFlowWithRMEMetricStats()
+    trainer.model = _FlowPreparedModel()
+    trainer._prepare_expert_masks = lambda batch, range_dis, expert_idx: (
+        torch.ones(batch["edge_h0"].shape[0], dtype=torch.bool),
+        torch.ones(batch["node_h0"].shape[0], dtype=torch.bool),
+    )
+    lossfunc = _BlockEndpointFallbackLoss()
+
+    result = trainer._run_one_expert_loss(
+        _two_graph_batch(),
+        batch_info={},
+        criterion=lossfunc,
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+        capture_metrics=True,
+    )
+
+    assert lossfunc.stats_calls == 0
+    assert lossfunc.forward_calls == 1
+    assert result["onsite"].item() == pytest.approx(10.0)
+    assert result["hopping"].item() == pytest.approx(20.0)
+    assert result["last_onsite_l1_sum"].item() == pytest.approx(30.0)
+    assert result["last_hopping_l1_sum"].item() == pytest.approx(40.0)
+
+
+def test_multitrainer_reference_changes_opt_only_and_obeys_flow_scope():
+    trainer = object.__new__(MultiTrainer)
+    trainer.dtype = torch.float32
+    trainer.device = torch.device("cpu")
+    trainer.flow_cfm = SimpleNamespace(enabled=True, apply_to_reference=False)
+    trainer.reference_lossfunc = object()
+    calls = []
+
+    main = {
+        "loss": torch.tensor(2.0),
+        "active_nodes": torch.tensor(3.0),
+        "active_edges": torch.tensor(2.0),
+        "onsite": torch.tensor(1.0),
+        "hopping": torch.tensor(4.0),
+        "last_onsite_l1_sum": torch.tensor(3.0),
+        "last_onsite_mse_sum": torch.tensor(3.0),
+        "last_onsite_count": torch.tensor(3.0),
+        "last_hopping_l1_sum": torch.tensor(8.0),
+        "last_hopping_mse_sum": torch.tensor(32.0),
+        "last_hopping_count": torch.tensor(2.0),
+        "z_loss": None,
+        "expert_load_cv": None,
+    }
+    reference = dict(main)
+    reference.update(
+        loss=torch.tensor(3.0),
+        active_nodes=torch.tensor(30.0),
+        active_edges=torch.tensor(20.0),
+        onsite=torch.tensor(10.0),
+        hopping=torch.tensor(40.0),
+    )
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        return reference if kwargs["batch_dict"]["kind"] == "reference" else main
+
+    trainer._run_one_expert_loss = fake_run
+    payload = trainer._build_train_payload(
+        {"kind": "main"},
+        batch_info={},
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+        ref_batch_dict={"kind": "reference"},
+        ref_batch_info={},
+        criterion=object(),
+    )
+
+    assert payload["loss"].item() == pytest.approx(5.0)
+    assert payload["active_nodes"].item() == pytest.approx(3.0)
+    assert payload["onsite_l1_sum"].item() == pytest.approx(3.0)
+    assert calls[0].get("use_flow") is None
+    assert calls[1]["use_flow"] is False
+    assert calls[1]["criterion"] is trainer.reference_lossfunc
+
+
+def test_multitrainer_full_forward_returns_endpoint_not_opt_loss():
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 1
+    trainer.model = lambda batch: dict(batch)
+
+    assert trainer._run_full_batch_loss(
+        {},
+        {},
+        _DistinctEndpointLoss(),
+    ).item() == pytest.approx(2.0)
+
+
 def test_pixel_meanflow_train_endpoint_stats_feed_compatible_reducer():
     trainer = object.__new__(MultiTrainer)
     trainer.iter = 2
     trainer.dtype = torch.float32
     trainer.device = torch.device("cpu")
     trainer._tagger = _NoopTagger()
-    trainer.log_single_model_compatible_loss = True
-    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.endpoint_loss_mode = "reduce"
     trainer.flow_cfm = HamiltonianPixelMeanFlow(
         {
             "enabled": True,
@@ -1138,8 +1417,7 @@ def _trainer_for_compatible_pack(lossfunc):
     trainer.dtype = torch.float32
     trainer.device = torch.device("cpu")
     trainer.train_lossfunc = lossfunc
-    trainer.log_single_model_compatible_loss = True
-    trainer.log_single_model_compatible_loss_mode = "reduce"
+    trainer.endpoint_loss_mode = "reduce"
     trainer.iter = 2
     return trainer
 
@@ -1175,9 +1453,8 @@ def test_compatible_pack_component_tags_use_same_stats_semantics_as_total():
     assert state["validation_hopping_loss"].item() == pytest.approx(hopping)
 
 
-def test_compatible_pack_component_tags_ignore_legacy_reduce_flag():
+def test_compatible_pack_component_tags_are_always_emitted():
     trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
-    trainer.log_single_model_compatible_loss = False
     state = trainer._pack_component_state(
         _pack_with_conflicting_active_component_means(),
         prefix="validation",
@@ -1221,9 +1498,8 @@ def test_display_window_component_tags_use_compatible_stats_semantics():
     assert _scalar(state["train_hopping_loss"]) == pytest.approx(hopping)
 
 
-def test_display_window_component_tags_ignore_legacy_reduce_flag():
+def test_display_window_component_tags_are_always_emitted():
     trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
-    trainer.log_single_model_compatible_loss = False
     trainer.distributed_expert = False
     trainer.num_experts = 1
     trainer.world_size = 1
@@ -1329,6 +1605,7 @@ def test_tensorboard_monitor_writes_fresh_validation_iter_tags():
         num_experts=0,
         stats={
             "validation_loss": {"last": 0.5, "last_updated": 1000},
+            "validation_loss_opt": {"last": 0.7, "last_updated": 1000},
             "validation_onsite_loss": {"last": 0.2, "last_updated": 1000},
             "validation_hopping_loss": {"last": 0.3, "last_updated": 1000},
         },
@@ -1337,8 +1614,45 @@ def test_tensorboard_monitor_writes_fresh_validation_iter_tags():
     monitor.iteration(time=1000)
 
     assert ("validation_loss_iter/iteration", 0.5, 1000) in writes
+    assert ("validation_loss_opt_iter/iteration", 0.7, 1000) in writes
     assert ("validation_onsite_loss_iter/iteration", 0.2, 1000) in writes
     assert ("validation_hopping_loss_iter/iteration", 0.3, 1000) in writes
+
+
+def test_tensorboard_register_writes_endpoint_metric_space_metadata():
+    texts = []
+    scalars = []
+
+    class _Writer:
+        def add_text(self, tag, value, step):
+            texts.append((tag, value, step))
+
+        def add_scalar(self, tag, value, step):
+            scalars.append((tag, value, step))
+
+        def flush(self):
+            pass
+
+    monitor = object.__new__(TensorBoardMonitor)
+    monitor.writer = _Writer()
+    trainer = SimpleNamespace(
+        endpoint_metric_spaces={"train": "block", "validation": "rme"}
+    )
+
+    monitor.register(trainer)
+
+    assert ("metadata/train_endpoint_metric_space", "block", 0) in texts
+    assert ("metadata/validation_endpoint_metric_space", "rme", 0) in texts
+    assert (
+        "metadata/train_endpoint_metric_space_is_rme",
+        0.0,
+        0,
+    ) in scalars
+    assert (
+        "metadata/validation_endpoint_metric_space_is_rme",
+        1.0,
+        0,
+    ) in scalars
 
 
 def test_tensorboard_monitor_writes_epoch_validation_on_iteration_axis():
@@ -1402,9 +1716,9 @@ def test_tensorboard_monitor_writes_epoch_validation_on_iteration_axis():
     assert ("validation_loss_iter/iteration", 0.5, 4321) in writes
     assert ("validation_onsite_loss_iter/iteration", 0.2, 4321) in writes
     assert ("validation_hopping_loss_iter/iteration", 0.3, 4321) in writes
-    assert ("validation_compatible_euler_1_loss_iter/iteration", 0.5, 4321) in writes
-    assert ("validation_compatible_euler_1_onsite_loss_iter/iteration", 0.2, 4321) in writes
-    assert ("validation_compatible_euler_1_hopping_loss_iter/iteration", 0.3, 4321) in writes
+    assert ("validation_compatible_euler_1_loss_iter/iteration", 0.5, 4321) not in writes
+    assert ("validation_compatible_euler_1_onsite_loss_iter/iteration", 0.2, 4321) not in writes
+    assert ("validation_compatible_euler_1_hopping_loss_iter/iteration", 0.3, 4321) not in writes
     assert ("validation_flow_one_step_loss_iter/iteration", 0.9, 4321) in writes
 
 
@@ -1423,12 +1737,8 @@ def test_model_in_loss_skips_train_compatible_loss_from_raw_batch(monkeypatch):
     monkeypatch.setattr(trainer_module.AtomicData, "to_AtomicDataDict", fake_to_dict)
     monkeypatch.setattr(Trainer, "_compatible_loss_state", staticmethod(fail_compatible))
 
-    loss = trainer._loss_on_batch(_FakeBatch(), _ComponentLoss())
-
-    assert loss.item() == pytest.approx(7.0)
-    assert trainer._last_flow_state["train_flow_loss"].item() == pytest.approx(7.0)
-    assert trainer._last_flow_state["train_loss_opt"].item() == pytest.approx(7.0)
-    assert "train_loss" not in trainer._last_flow_state
+    with pytest.raises(RuntimeError, match="could not reconstruct"):
+        trainer._loss_on_batch(_FakeBatch(), _ComponentLoss())
 
 
 def test_model_in_loss_train_loss_aligns_from_endpoint_stats(monkeypatch):
@@ -1498,6 +1808,55 @@ def test_loss_on_batch_can_skip_flow_for_reference_batch(monkeypatch):
     assert loss.item() == pytest.approx(2.5)
     assert trainer._last_flow_state == {}
     assert model.calls == 1
+
+
+def test_iteration_reference_batch_does_not_overwrite_main_flow_state():
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.model = torch.nn.Linear(1, 1, bias=False)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    trainer.flow_cfm = SimpleNamespace(enabled=True, apply_to_reference=False)
+    trainer.train_lossfunc = object()
+    trainer.reference_lossfunc = object()
+    trainer.clip_grad_norm = 1.0
+    trainer.update_lr_per_iter = False
+    trainer.optimizer_diagnostics_freq = 999
+    trainer.iter = 2
+    trainer.num_experts = 0
+    captured = {}
+
+    def fake_loss_on_batch(
+        self,
+        batch,
+        lossfunc,
+        *,
+        use_flow=True,
+        allow_self_consistency=True,
+    ):
+        parameter = next(self.model.parameters())
+        if use_flow:
+            self._last_flow_state = {
+                "train_loss": torch.tensor(2.0),
+                "train_onsite_loss": torch.tensor(1.0),
+                "train_hopping_loss": torch.tensor(3.0),
+                "train_flow_loss": torch.tensor(7.0),
+                "train_loss_opt": torch.tensor(7.0),
+            }
+            self._last_self_consistency_state = {}
+            return parameter.sum() * 0.0 + 7.0
+        self._last_flow_state = {}
+        return parameter.sum() * 0.0 + 3.0
+
+    trainer._loss_on_batch = fake_loss_on_batch.__get__(trainer, Trainer)
+    trainer.call_plugins = lambda **kwargs: captured.update(kwargs)
+
+    trainer.iteration(_FakeBatch(), _FakeBatch())
+
+    assert captured["train_loss"].item() == pytest.approx(2.0)
+    assert captured["train_onsite_loss"].item() == pytest.approx(1.0)
+    assert captured["train_hopping_loss"].item() == pytest.approx(3.0)
+    assert captured["train_flow_loss"].item() == pytest.approx(7.0)
+    assert captured["train_loss_opt"].item() == pytest.approx(10.0)
 
 
 def test_pixel_meanflow_oracle_endpoint_has_zero_velocity_loss():
@@ -1783,20 +2142,14 @@ class _ScalarOnlyLoss(torch.nn.Module):
         return (pred["node_features"] - ref["node_features"]).abs().mean()
 
 
-def test_pixel_meanflow_validation_does_not_fabricate_missing_legacy_components(
+def test_pixel_meanflow_validation_fails_closed_without_endpoint_components(
     monkeypatch,
 ):
     trainer = _pixel_meanflow_validation_trainer(monkeypatch)
     trainer.validation_lossfunc = _ScalarOnlyLoss()
 
-    trainer.validation(fast=True)
-    st = trainer._last_flow_validation_state
-
-    # A scalar-only criterion has no onsite/hopping side effects: legacy
-    # component keys must stay absent instead of printing fabricated zeros.
-    assert "validation_loss" in st
-    assert "validation_onsite_loss" not in st
-    assert "validation_hopping_loss" not in st
+    with pytest.raises(RuntimeError, match="endpoint triplet"):
+        trainer.validation(fast=True)
 
 
 def test_pixel_meanflow_validation_compatible_sampling_is_forced(monkeypatch):
@@ -1840,8 +2193,8 @@ def test_resolve_flow_log_fields_pixel_meanflow_drops_never_computed_fields():
     assert "validation_flow_euler_3_loss" not in fields
     assert "validation_flow_one_step_loss" in fields
     assert "validation_flow_random_t_loss" in fields
-    # endpoint compatible fields stay on by default and legacy keys are expected
-    assert "validation_compatible_euler_1_loss" in fields
+    # Euler-1 maps to the common validation triplet; only extra steps are logged.
+    assert "validation_compatible_euler_1_loss" not in fields
     assert "validation_compatible_euler_3_hopping_loss" in fields
     # canary scalars so silent jvp fallbacks are visible in production logs
     assert "train_flow_du_dt_backend_jvp" in fields
@@ -1874,16 +2227,16 @@ def test_resolve_flow_log_fields_cfm_keeps_existing_fields():
     flow = build_hamiltonian_flow({"enabled": True, "objective": "cfm"})
     fields, register_legacy = resolve_flow_log_fields(flow)
 
-    assert "train_compatible_loss" in fields
+    assert "train_compatible_loss" not in fields
     assert "validation_flow_t0_loss" in fields
     assert "validation_flow_euler_1_loss" in fields
-    assert "validation_compatible_euler_1_loss" in fields
+    assert "validation_compatible_euler_1_loss" not in fields
     assert "validation_flow_one_step_loss" not in fields
     assert "train_flow_du_dt_backend_jvp" not in fields
     assert register_legacy is True
 
 
-def test_resolve_flow_log_fields_forces_validation_compatible_fields():
+def test_resolve_flow_log_fields_uses_common_triplet_for_euler_one():
     from dptb.nnops.flow import resolve_flow_log_fields
 
     flow = build_hamiltonian_flow(
@@ -1895,10 +2248,22 @@ def test_resolve_flow_log_fields_forces_validation_compatible_fields():
     )
     fields, register_legacy = resolve_flow_log_fields(flow)
 
-    assert "validation_compatible_euler_1_loss" in fields
-    assert "validation_compatible_euler_1_onsite_loss" in fields
-    assert "validation_compatible_euler_1_hopping_loss" in fields
+    assert "validation_compatible_euler_1_loss" not in fields
+    assert "validation_compatible_euler_1_onsite_loss" not in fields
+    assert "validation_compatible_euler_1_hopping_loss" not in fields
     assert register_legacy is True
+
+
+def test_validation_ode_steps_always_include_euler_one_endpoint_baseline():
+    flow = build_hamiltonian_flow(
+        {
+            "enabled": True,
+            "objective": "pixel_meanflow",
+            "validation_ode_steps": [3],
+        }
+    )
+
+    assert flow.validation_ode_steps == (1, 3)
 
 
 def test_resolve_flow_log_fields_disabled_flow_keeps_legacy_registration():

@@ -111,12 +111,9 @@ def _h0_embedding(r_max: dict[str, float]) -> dict[str, Any]:
             "method": "lem_moe_v3_h0",
             "h0_node_key": "node_h0",
             "h0_edge_key": "edge_h0",
-            "use_h0_init": True,
-            "use_h0_node_init": True,
-            "use_h0_edge_init": True,
+            "h0_init_scope": "both",
             "h0_node_mode": "direct",
             "h0_merge_mode": "replace",
-            "h0_fallback_to_hamiltonian": False,
             "fallback_to_hamiltonian": False,
         }
     )
@@ -128,43 +125,41 @@ def _p2_embedding(r_max: dict[str, float], *, use_memory: bool) -> dict[str, Any
     embedding.update(
         {
             "method": "lem_moe_v3_prior",
-            "prior_kind": "p2",
             "prior_node_key": "node_p2",
             "prior_edge_key": "edge_p2",
-            "use_prior_init": True,
+            "prior_init_scope": "both",
             "prior_merge_mode": "replace",
-            "use_soft_edge_memory": use_memory,
             "prior_validate_inputs": False,
-            "soft_edge_memory_diagnostics_mode": "off",
+            "soft_edge_memory": {
+                "enabled": use_memory,
+                "diagnostics_mode": "off",
+            },
         }
     )
     if use_memory:
-        embedding.update(
-            {
-                "soft_edge_memory_num_slots": 64,
-                "soft_edge_memory_num_heads": 4,
-                "soft_edge_memory_head_dim": 16,
-                "soft_edge_memory_temperature": 1.0,
-                "soft_edge_memory_dropout": 0.0,
-                "soft_edge_memory_gate_mode": "deepseek",
-                "soft_edge_memory_gate_bias": 0.0,
-                "soft_edge_memory_zero_init_output": True,
-            }
+        embedding["soft_edge_memory"].update(
+            num_slots=64,
+            num_heads=4,
+            head_dim=16,
+            temperature=1.0,
+            dropout=0.0,
+            gate_mode="deepseek",
+            gate_bias=0.0,
+            zero_init_output=True,
         )
     return embedding
 
 
-def _prediction(*, add_prior: bool) -> dict[str, Any]:
+def _prediction(*, reconstruction: str) -> dict[str, Any]:
     prediction: dict[str, Any] = {
         "method": "block_native",
         "scale_type": "no_scale",
         "block_decoder": "expansion_cg",
         "blockwise_hamiltonian": True,
-        "add_h0": False,
-        "add_prior": add_prior,
+        "reconstruction": reconstruction,
         "validate_prior_blocks": False,
     }
-    if add_prior:
+    if reconstruction == "prior_residual":
         prediction.update(
             {
                 "prior_node_block_field": "node_p2_blocks",
@@ -203,9 +198,6 @@ def _loss(*, full_output: bool, absolute_full_h_target: bool) -> dict[str, Any]:
             if absolute_full_h_target
             else "edge_delta_hamil_block_shape"
         ),
-        "log_feature_compatible": True,
-        "feature_log_no_grad": True,
-        "distributed_log_reduce": False,
     }
     if full_output:
         loss.update(
@@ -273,8 +265,7 @@ def _train_options(
         "ref_num_workers": 0,
         "data_pin_memory": False,
         "data_persistent_workers": False,
-        "log_single_model_compatible_loss": True,
-        "log_single_model_compatible_loss_mode": "reduce",
+        "endpoint_loss_mode": "reduce",
         "monitor_flag": False,
         "allow_tf32": False,
         "float32_matmul_precision": "highest",
@@ -313,7 +304,7 @@ def build_configs(
             "get_h0": True,
             "get_p2": False,
             "embedding": _h0_embedding(r_max),
-            "add_prior": False,
+            "reconstruction": "direct",
             "full_output": False,
             "absolute_full_h_target": False,
             "target_semantics": "cached dH=FullH-H0; block loss equals reconstructed Full-H error",
@@ -323,7 +314,7 @@ def build_configs(
             "get_h0": False,
             "get_p2": True,
             "embedding": _p2_embedding(r_max, use_memory=False),
-            "add_prior": True,
+            "reconstruction": "prior_residual",
             "full_output": True,
             "absolute_full_h_target": True,
             "target_semantics": "absolute Full-H",
@@ -333,7 +324,7 @@ def build_configs(
             "get_h0": False,
             "get_p2": True,
             "embedding": _p2_embedding(r_max, use_memory=True),
-            "add_prior": True,
+            "reconstruction": "prior_residual",
             "full_output": True,
             "absolute_full_h_target": True,
             "target_semantics": "absolute Full-H",
@@ -343,7 +334,7 @@ def build_configs(
             "get_h0": False,
             "get_p2": False,
             "embedding": _embedding_base(r_max),
-            "add_prior": False,
+            "reconstruction": "direct",
             "full_output": False,
             "absolute_full_h_target": True,
             "target_semantics": "absolute Full-H",
@@ -357,7 +348,7 @@ def build_configs(
             "common_options": copy.deepcopy(common),
             "model_options": {
                 "embedding": variant["embedding"],
-                "prediction": _prediction(add_prior=bool(variant["add_prior"])),
+                "prediction": _prediction(reconstruction=str(variant["reconstruction"])),
             },
             "train_options": _train_options(
                 total_steps=total_steps,
@@ -418,9 +409,9 @@ def build_configs(
                 "target_semantics": variant["target_semantics"],
                 "get_h0": bool(variant["get_h0"]),
                 "get_p2": bool(variant["get_p2"]),
-                "add_prior": bool(variant["add_prior"]),
+                "reconstruction": str(variant["reconstruction"]),
                 "soft_memory": bool(
-                    variant["embedding"].get("use_soft_edge_memory", False)
+                    variant["embedding"].get("soft_edge_memory", {}).get("enabled", False)
                 ),
             }
             for name, variant in variants.items()

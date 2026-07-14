@@ -30,7 +30,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import lmdb
 import numpy as np
@@ -66,12 +66,28 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_text_fields,
     mapper_basis_fingerprint,
 )
-from dptb.data.interfaces.p2_table import P2TableAssembler, P2TableStore
+from dptb.data.interfaces.p2_table import (
+    P2_COMPONENT_NUMERICAL_GATE_SCHEMA,
+    P2TableAssembler,
+    P2TableStore,
+)
 
 
 RY_TO_EV = 13.605698
 SCHEMA = "deeptb.nonsoc_p2_cache/v1"
+RAW_STAGING_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_raw_staging_identity/v2"
+RAW_DATASET_SOURCE_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_dataset_source/v1"
+RAW_CASE_SOURCE_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_case_source/v1"
+RAW_STAGING_IDENTITY_NAME = "identity.json"
+RAW_CASE_SOURCE_FINGERPRINT_KEY = "raw_case_source_fingerprint"
 MAP_SIZE = 1 << 40
+DEFAULT_P2_HERMITIAN_MISMATCH_TOLERANCE_EV = 5.0e-3
+
+_RAW_ABACUS_SOURCE_FILES = {
+    "structure_log": Path("OUT.ABACUS") / "running_scf.log",
+    "full_h": Path("OUT.ABACUS") / "data-HR-sparse_SPIN0.csr",
+    "h0": Path("OUT.ABACUS") / "data-HR0_SPIN0.csr",
+}
 
 _BASE_FIELDS = (
     AtomicDataDict.CELL_KEY,
@@ -246,6 +262,7 @@ def project_non_soc_blocks_hermitian(
     *,
     required_keys: Iterable[tuple[int, int, int, int, int]],
     label: str = "P2",
+    mismatch_tolerance: float = DEFAULT_P2_HERMITIAN_MISMATCH_TOLERANCE_EV,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Project graph-aligned real AO blocks onto exact Hermitian pairs.
 
@@ -253,9 +270,14 @@ def project_non_soc_blocks_hermitian(
     tiny numerical differences between ``H_ij(R)`` and ``H_ji(-R)^T`` even
     when the radial table itself satisfies reciprocity.  Cache that noise only
     after an explicit pair projection, so later loaders see an exactly
-    Hermitian prior instead of relying on a relaxed validation tolerance.
+    Hermitian prior instead of relying on a relaxed validation tolerance.  A
+    mismatch above ``mismatch_tolerance`` is evidence of a convention/source
+    error and fails before any averaging can hide it.
     """
 
+    tolerance = float(mismatch_tolerance)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("Hermitian mismatch tolerance must be finite and non-negative.")
     output = {key: np.asarray(value) for key, value in blocks.items()}
     required = sorted(set(required_keys))
     required_set = set(required)
@@ -264,9 +286,7 @@ def project_non_soc_blocks_hermitian(
         raise ValueError(f"{label} is missing required blocks {missing[:5]}.")
 
     seen: set[tuple[int, int, int, int, int]] = set()
-    max_mismatch = 0.0
-    max_correction = 0.0
-    pair_count = 0
+    pair_rows: list[tuple[str, str, np.ndarray, np.ndarray, float]] = []
     for key in required:
         if key in seen:
             continue
@@ -290,6 +310,40 @@ def project_non_soc_blocks_hermitian(
             )
         reverse_t = backward.T.conj()
         mismatch = float(np.max(np.abs(forward - reverse_t), initial=0.0))
+        pair_rows.append(
+            (forward_name, reverse_name, forward, backward, mismatch)
+        )
+        seen.add(key)
+        seen.add(reverse)
+
+    mismatches = np.asarray([row[-1] for row in pair_rows], dtype=np.float64)
+    mismatch_stats = {
+        "pair_count": len(pair_rows),
+        "max_pre_projection_mismatch": float(
+            np.max(mismatches, initial=0.0)
+        ),
+        "mean_pre_projection_mismatch": float(
+            np.mean(mismatches) if mismatches.size else 0.0
+        ),
+        "p95_pre_projection_mismatch": float(
+            np.quantile(mismatches, 0.95) if mismatches.size else 0.0
+        ),
+        "p99_pre_projection_mismatch": float(
+            np.quantile(mismatches, 0.99) if mismatches.size else 0.0
+        ),
+        "mismatch_tolerance": tolerance,
+        "above_tolerance_count": int(np.count_nonzero(mismatches > tolerance)),
+        "unit": "eV",
+    }
+    if mismatch_stats["above_tolerance_count"]:
+        raise ValueError(
+            f"{label} pre-projection Hermitian mismatch exceeds tolerance: "
+            + json.dumps(mismatch_stats, sort_keys=True)
+        )
+
+    max_correction = 0.0
+    for forward_name, reverse_name, forward, backward, _ in pair_rows:
+        reverse_t = backward.T.conj()
         calculation_dtype = np.complex128 if np.iscomplexobj(forward) else np.float64
         average = 0.5 * (
             forward.astype(calculation_dtype, copy=False)
@@ -304,15 +358,9 @@ def project_non_soc_blocks_hermitian(
         # Derive reverse from the already-cast forward block.  This makes
         # equality exact in storage, including for float32.
         output[reverse_name] = projected.T.conj().copy()
-        max_mismatch = max(max_mismatch, mismatch)
         max_correction = max(max_correction, correction, reverse_correction)
-        pair_count += 1
-        seen.add(key)
-        seen.add(reverse)
-
     return output, {
-        "pair_count": pair_count,
-        "max_pre_projection_mismatch": max_mismatch,
+        **mismatch_stats,
         "max_projection_correction": max_correction,
         "method": "pair_average_exact_reverse",
     }
@@ -336,6 +384,280 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     os.replace(temporary, path)
+
+
+def _identity_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_qualified_table_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+) -> None:
+    if manifest.get("complete") is not True:
+        raise ValueError(f"P2 table is not complete: {manifest_path}")
+    gate = manifest.get("component_numerical_gate")
+    if (
+        not isinstance(gate, Mapping)
+        or gate.get("schema") != P2_COMPONENT_NUMERICAL_GATE_SCHEMA
+        or gate.get("status") != "pass"
+    ):
+        raise ValueError(
+            "P2 table has not passed its persisted component numerical gate: "
+            f"{manifest_path}"
+        )
+
+
+def _stable_file_identity(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    before = resolved.stat()
+    checksum = _sha256(resolved)
+    after = resolved.stat()
+    before_signature = (int(before.st_size), int(before.st_mtime_ns))
+    after_signature = (int(after.st_size), int(after.st_mtime_ns))
+    if before_signature != after_signature:
+        raise ValueError(f"source file changed while hashing: {resolved}")
+    return {
+        "path": str(resolved),
+        "size": int(after.st_size),
+        "sha256": checksum,
+    }
+
+
+def _case_source_identity(
+    case: Path,
+    *,
+    require_stru: bool,
+) -> dict[str, Any]:
+    resolved_case = case.resolve()
+    if not resolved_case.is_dir():
+        raise NotADirectoryError(resolved_case)
+    files: dict[str, Any] = {}
+    for role, relative in _RAW_ABACUS_SOURCE_FILES.items():
+        file_identity = _stable_file_identity(resolved_case / relative)
+        file_identity["relative_path"] = relative.as_posix()
+        files[role] = file_identity
+    stru_path = resolved_case / "STRU"
+    if require_stru or stru_path.is_file():
+        stru_identity = _stable_file_identity(stru_path)
+        stru_identity["relative_path"] = "STRU"
+        files["stru"] = stru_identity
+    payload: dict[str, Any] = {
+        "schema": RAW_CASE_SOURCE_IDENTITY_SCHEMA,
+        "case_id": resolved_case.name,
+        "case_path": str(resolved_case),
+        "files": files,
+    }
+    payload["source_fingerprint"] = _identity_sha256(payload)
+    return payload
+
+
+def _dataset_source_identity(
+    dataset_root: Path,
+    cases: Iterable[Path],
+    *,
+    require_stru: bool,
+) -> dict[str, Any]:
+    resolved_root = dataset_root.resolve()
+    ordered_path = resolved_root / "ordered_paths.txt"
+    ordered_identity = _stable_file_identity(ordered_path)
+    case_identities = [
+        _case_source_identity(case, require_stru=require_stru) for case in cases
+    ]
+    paths = [str(item["case_path"]) for item in case_identities]
+    if len(paths) != len(set(paths)):
+        raise ValueError("selected P2 cases contain duplicate resolved paths")
+    payload: dict[str, Any] = {
+        "schema": RAW_DATASET_SOURCE_IDENTITY_SCHEMA,
+        "dataset_root": str(resolved_root),
+        "ordered_paths": ordered_identity,
+        "selected_cases": case_identities,
+    }
+    payload["identity_sha256"] = _identity_sha256(payload)
+    return payload
+
+
+def _validate_dataset_source_identity(payload: Mapping[str, Any]) -> None:
+    if payload.get("schema") != RAW_DATASET_SOURCE_IDENTITY_SCHEMA:
+        raise ValueError("dataset source identity has the wrong schema")
+    declared = str(payload.get("identity_sha256", "")).strip().lower()
+    if len(declared) != 64:
+        raise ValueError("dataset source identity lacks a SHA256 checksum")
+    unsigned = dict(payload)
+    unsigned.pop("identity_sha256", None)
+    if _identity_sha256(unsigned) != declared:
+        raise ValueError("dataset source identity SHA256 is inconsistent")
+
+
+def _case_source_fingerprint_map(
+    dataset_source_identity: Mapping[str, Any],
+) -> dict[str, str]:
+    _validate_dataset_source_identity(dataset_source_identity)
+    output: dict[str, str] = {}
+    for item in dataset_source_identity.get("selected_cases", []):
+        if not isinstance(item, Mapping):
+            raise ValueError("dataset source identity case entry is not a mapping")
+        path = str(item.get("case_path", ""))
+        fingerprint = str(item.get("source_fingerprint", "")).strip().lower()
+        if not path or len(fingerprint) != 64:
+            raise ValueError("dataset source identity has an invalid case entry")
+        if path in output:
+            raise ValueError(f"duplicate case path in dataset identity: {path}")
+        output[path] = fingerprint
+    if not output:
+        raise ValueError("dataset source identity has no selected cases")
+    return output
+
+
+def _raw_staging_identity(
+    *,
+    input_json: Path,
+    gate1_script: Path | None,
+    p2_source_fingerprint: str,
+    p2_source_kind: str,
+    dataset_source_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Content identity for raw staging reuse, including raw H/H0 sources."""
+
+    _validate_dataset_source_identity(dataset_source_identity)
+    payload: dict[str, Any] = {
+        "schema": RAW_STAGING_IDENTITY_SCHEMA,
+        "materializer_script_sha256": _sha256(Path(__file__).resolve()),
+        "gate1_script_sha256": (
+            _sha256(gate1_script.resolve()) if gate1_script is not None else None
+        ),
+        "input_json_sha256": _sha256(input_json.resolve()),
+        "p2_source_fingerprint": str(p2_source_fingerprint).strip().lower(),
+        "p2_source_kind": str(p2_source_kind),
+        "dataset_source_identity": dict(dataset_source_identity),
+    }
+    if len(payload["p2_source_fingerprint"]) != 64:
+        raise ValueError("p2_source_fingerprint must be a SHA256 hex string.")
+    payload["identity_sha256"] = _identity_sha256(payload)
+    return payload
+
+
+def _validate_raw_staging_identity_payload(
+    payload: Any,
+    expected: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError(f"Cannot resume raw staging: {label} is not a mapping.")
+    if payload.get("schema") != RAW_STAGING_IDENTITY_SCHEMA:
+        raise ValueError(
+            f"Cannot resume raw staging: {label} lacks raw staging identity "
+            f"schema {RAW_STAGING_IDENTITY_SCHEMA!r}; rebuild raw staging."
+        )
+    declared = str(payload.get("identity_sha256", "")).strip().lower()
+    if len(declared) != 64:
+        raise ValueError(
+            f"Cannot resume raw staging: {label} lacks raw staging identity "
+            "SHA256; rebuild raw staging."
+        )
+    without_digest = dict(payload)
+    without_digest.pop("identity_sha256", None)
+    actual = _identity_sha256(without_digest)
+    if declared != actual:
+        raise ValueError(
+            f"Cannot resume raw staging: {label} identity SHA256 is inconsistent; "
+            "rebuild raw staging."
+        )
+    if payload != expected:
+        mismatched = [
+            key
+            for key in sorted(set(payload) | set(expected))
+            if payload.get(key) != expected.get(key)
+        ]
+        raise ValueError(
+            "Cannot resume raw staging: raw staging identity mismatch for "
+            f"{label}: {mismatched}. Rebuild raw staging or use a new work root."
+        )
+
+
+def _write_raw_staging_identity(work_root: Path, identity: dict[str, Any]) -> None:
+    raw_root = work_root / "raw_staging"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    _write_json(raw_root / RAW_STAGING_IDENTITY_NAME, identity)
+
+
+def _validate_raw_staging_identity(
+    work_root: Path,
+    expected: dict[str, Any],
+) -> None:
+    identity_path = work_root / "raw_staging" / RAW_STAGING_IDENTITY_NAME
+    if not identity_path.is_file():
+        raise ValueError(
+            "Cannot resume raw staging: raw staging identity is missing; "
+            "legacy or manually edited raw staging must be rebuilt."
+        )
+    payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    _validate_raw_staging_identity_payload(
+        payload, expected, label=identity_path.name
+    )
+
+    manifest_paths = [
+        path
+        for path in (work_root / "manifest.partial.json", work_root / "manifest.json")
+        if path.is_file()
+    ]
+    if not manifest_paths:
+        raise ValueError(
+            "Cannot resume raw staging: no manifest.partial.json or manifest.json "
+            "with raw staging identity is present; rebuild raw staging."
+        )
+    for manifest_path in manifest_paths:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if "raw_staging_identity" not in manifest:
+            raise ValueError(
+                f"Cannot resume raw staging: {manifest_path.name} lacks raw "
+                "staging identity; rebuild raw staging."
+            )
+        _validate_raw_staging_identity_payload(
+            manifest["raw_staging_identity"],
+            expected,
+            label=manifest_path.name,
+        )
+
+
+def _validate_raw_record_source(
+    record: Mapping[str, Any],
+    case: Path,
+    *,
+    case_source_fingerprints: Mapping[str, str],
+    label: str,
+) -> str:
+    expected_path = str(case.resolve())
+    expected_fingerprint = case_source_fingerprints.get(expected_path)
+    if expected_fingerprint is None:
+        raise ValueError(
+            f"Cannot resume {label}: current dataset identity has no source "
+            f"fingerprint for {expected_path}."
+        )
+    if record.get("source") != expected_path:
+        raise ValueError(
+            f"Cannot resume {label}: source path {record.get('source')!r} != "
+            f"{expected_path!r}."
+        )
+    recorded_fingerprint = str(
+        record.get(RAW_CASE_SOURCE_FINGERPRINT_KEY, "")
+    ).strip().lower()
+    if recorded_fingerprint != expected_fingerprint:
+        raise ValueError(
+            f"Cannot resume {label}: raw H/H0/source fingerprint mismatch "
+            f"for {case.name}."
+        )
+    return expected_fingerprint
 
 
 def _heartbeat(work_root: Path, **payload: Any) -> None:
@@ -367,6 +689,21 @@ def parse_basis_lines(raw: bytes | str, expected_atoms: int) -> list[list[int]]:
             f"Basis lines ({len(result)}) do not match atoms ({expected_atoms})."
         )
     return result
+
+
+def _sample_source_files(parsed: Any, pp_orb_root: Path) -> dict[str, dict[str, Path]]:
+    """Resolve the exact ORB/UPF files selected by one STRU."""
+
+    files: dict[str, dict[str, Path]] = {}
+    symbols = {str(atom.species) for atom in parsed.structure.atoms}
+    for symbol in sorted(symbols):
+        if symbol not in parsed.specs:
+            raise KeyError(f"STRU has no source-file specification for {symbol!r}")
+        spec = parsed.specs[symbol]
+        orbital = (pp_orb_root / str(spec.orbital)).resolve()
+        upf = (pp_orb_root / str(spec.pseudo)).resolve()
+        files[symbol] = {"orbital": orbital, "upf": upf}
+    return files
 
 
 def dense_p2_to_deeptb_blocks(
@@ -435,6 +772,8 @@ def table_p2_to_deeptb_blocks(
     required_keys: Iterable[tuple[int, int, int, int, int]],
     basis_lines: bytes | str,
     atom_count: int,
+    source_files: dict[str, dict[str, Path]] | None = None,
+    require_source_files: bool = False,
 ) -> dict[str, np.ndarray]:
     """Assemble only sparse H/H0 blocks and rotate them to DeePTB AO order.
 
@@ -452,6 +791,12 @@ def table_p2_to_deeptb_blocks(
         )
     atom_shells = parse_basis_lines(basis_lines, atom_count)
     atom_norb = [sum(2 * l + 1 for l in shells) for shells in atom_shells]
+    assembler.store.validate_sample_contract(
+        symbols=symbols,
+        atom_shells=atom_shells,
+        source_files=source_files,
+        require_source_files=require_source_files,
+    )
     for index, (symbol, norb) in enumerate(zip(symbols, atom_norb)):
         table_norb = int(assembler.store.species[symbol]["orbital_norb"])
         if table_norb != int(norb):
@@ -460,21 +805,26 @@ def table_p2_to_deeptb_blocks(
                 f"does not match ABACUS basis dimension {norb}."
             )
 
+    required = sorted(
+        {
+            tuple(int(value) for value in key)
+            for key in required_keys
+        }
+    )
     converter = OrbAbacus2DeepTB()
+    assembled = assembler.assemble_sparse_blocks(
+        symbols=symbols,
+        positions_bohr=positions_bohr,
+        cell_bohr=cell_bohr,
+        block_keys=required,
+    )
     output: dict[str, np.ndarray] = {}
-    for i, j, rx, ry, rz in required_keys:
+    for i, j, rx, ry, rz in required:
         if i < 0 or i >= atom_count or j < 0 or j >= atom_count:
             raise ValueError(
                 f"P2 block atom indices {(i, j)} are outside [0,{atom_count - 1}]."
             )
-        block = assembler.assemble_block(
-            symbols=symbols,
-            positions_bohr=positions_bohr,
-            cell_bohr=cell_bohr,
-            i=i,
-            j=j,
-            translation=(rx, ry, rz),
-        )
+        block = assembled[(i, j, rx, ry, rz)]
         expected = (atom_norb[i], atom_norb[j])
         if tuple(block.shape) != expected:
             raise ValueError(
@@ -547,7 +897,10 @@ def _raw_split(
     p2_root: Path | None,
     p2_assembler: P2TableAssembler | None,
     gate1: Any | None,
+    p2_pp_orb_root: Path | None,
     p2_source_fingerprint: str,
+    case_source_fingerprints: Mapping[str, str],
+    p2_hermitian_mismatch_tolerance: float,
     input_json: Path,
     work_root: Path,
     split: str,
@@ -568,8 +921,17 @@ def _raw_split(
         )
     try:
         for index, case in enumerate(cases[start_index:], start=start_index):
+            resolved_case = case.resolve()
+            case_source_fingerprint = case_source_fingerprints.get(
+                str(resolved_case)
+            )
+            if case_source_fingerprint is None:
+                raise ValueError(
+                    f"Current dataset identity has no source fingerprint for "
+                    f"{resolved_case}."
+                )
             _abacus_parse(
-                str(case),
+                str(resolved_case),
                 str(raw_split),
                 "OUT.ABACUS",
                 output_mode="lmdb",
@@ -615,7 +977,11 @@ def _raw_split(
                 if p2_assembler is not None:
                     if gate1 is None:
                         raise RuntimeError("Table P2 assembly requires the STRU parser.")
-                    parsed = gate1.parse_stru(case / "STRU")
+                    if p2_pp_orb_root is None:
+                        raise RuntimeError(
+                            "Table P2 assembly requires a validated PP_ORB root."
+                        )
+                    parsed = gate1.parse_stru(resolved_case / "STRU")
                     structure = parsed.structure
                     symbols = [atom.species for atom in structure.atoms]
                     if len(symbols) != atom_count:
@@ -632,20 +998,28 @@ def _raw_split(
                         required_keys=required_keys,
                         basis_lines=record["basis"],
                         atom_count=atom_count,
+                        source_files=_sample_source_files(parsed, p2_pp_orb_root),
+                        require_source_files=True,
                     )
+                    p2_batch_stats = p2_assembler.batch_stats_snapshot()
                     p2_block_keys = set(required_keys)
                     p2_path = None
                     source_metadata = {
                         "kind": "radial_table",
                         "schema": SCHEMA,
                         "table_manifest_sha256": p2_source_fingerprint,
+                        "species_source_identity_sha256": (
+                            p2_assembler.store.species_source_identity_sha256
+                        ),
+                        "sample_source_identity_verified": True,
                         "energy_unit": "eV",
                         "ao_order": "DeePTB",
+                        "batch_stats": p2_batch_stats,
                     }
                 else:
                     if p2_root is None:
                         raise RuntimeError("Direct P2 source root is missing.")
-                    p2_path = p2_root / f"{case.name}.npz"
+                    p2_path = p2_root / f"{resolved_case.name}.npz"
                     if not p2_path.is_file():
                         raise FileNotFoundError(p2_path)
                     with np.load(p2_path, allow_pickle=False) as payload:
@@ -680,11 +1054,13 @@ def _raw_split(
                     p2_blocks,
                     required_keys=required_keys,
                     label=f"{case.name} P2",
+                    mismatch_tolerance=p2_hermitian_mismatch_tolerance,
                 )
                 record["hamiltonian_p2"] = p2_blocks
                 record["p2_hermitian_projection"] = projection
-                record["case_id"] = case.name
-                record["source"] = str(case)
+                record["case_id"] = resolved_case.name
+                record["source"] = str(resolved_case)
+                record[RAW_CASE_SOURCE_FINGERPRINT_KEY] = case_source_fingerprint
                 record["p2_cache_source"] = source_metadata
                 record[SAMPLE_SCHEMA_KEY] = P2_SAMPLE_SCHEMA
                 record[TARGET_SEMANTICS_KEY] = ABSOLUTE_FULL_H_SEMANTICS
@@ -705,7 +1081,7 @@ def _raw_split(
     finally:
         env.close()
     (raw_split / "data.0000.paths.txt").write_text(
-        "".join(f"{case}\n" for case in cases), encoding="utf-8"
+        "".join(f"{case.resolve()}\n" for case in cases), encoding="utf-8"
     )
     return rows
 
@@ -717,6 +1093,7 @@ def _raw_row(record: dict[str, Any], *, index: int) -> dict[str, Any]:
         "index": int(index),
         "case_id": record["case_id"],
         "source": record["source"],
+        RAW_CASE_SOURCE_FINGERPRINT_KEY: record[RAW_CASE_SOURCE_FINGERPRINT_KEY],
         "p2_source_kind": source["kind"],
         "p2_source": source.get("npz", "radial_table"),
         "p2_source_sha256": (
@@ -726,6 +1103,15 @@ def _raw_row(record: dict[str, Any], *, index: int) -> dict[str, Any]:
         "p2_max_pre_projection_mismatch": record.get(
             "p2_hermitian_projection", {}
         ).get("max_pre_projection_mismatch", 0.0),
+        "p2_p99_pre_projection_mismatch": record.get(
+            "p2_hermitian_projection", {}
+        ).get("p99_pre_projection_mismatch", 0.0),
+        "p2_hermitian_mismatch_tolerance": record.get(
+            "p2_hermitian_projection", {}
+        ).get("mismatch_tolerance"),
+        "p2_hermitian_above_tolerance_count": record.get(
+            "p2_hermitian_projection", {}
+        ).get("above_tolerance_count", 0),
         "p2_max_projection_correction": record.get(
             "p2_hermitian_projection", {}
         ).get("max_projection_correction", 0.0),
@@ -745,7 +1131,10 @@ def _reuse_raw_split(
     p2_root: Path | None,
     p2_assembler: P2TableAssembler | None,
     gate1: Any | None,
+    p2_pp_orb_root: Path | None,
     p2_source_fingerprint: str,
+    case_source_fingerprints: Mapping[str, str],
+    p2_hermitian_mismatch_tolerance: float,
     input_json: Path,
     work_root: Path,
     split: str,
@@ -762,7 +1151,9 @@ def _reuse_raw_split(
             for line in paths_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        if [path.name for path in staged_paths] != [case.name for case in cases]:
+        if [str(path.resolve()) for path in staged_paths] != [
+            str(case.resolve()) for case in cases
+        ]:
             raise ValueError(
                 f"Cannot resume {split}: staged case order does not match requested split."
             )
@@ -820,6 +1211,12 @@ def _reuse_raw_split(
                     raise ValueError(
                         f"Cannot resume {case.name}: P2 source fingerprint mismatch."
                     )
+                _validate_raw_record_source(
+                    record,
+                    case,
+                    case_source_fingerprints=case_source_fingerprints,
+                    label=f"{split}[{index}]",
+                )
                 committed += 1
 
             if entry_count != committed:
@@ -859,6 +1256,45 @@ def _reuse_raw_split(
                     raise ValueError(
                         f"Cannot resume {case.name}: P2 source fingerprint mismatch."
                     )
+                _validate_raw_record_source(
+                    record,
+                    case,
+                    case_source_fingerprints=case_source_fingerprints,
+                    label=f"{split}[{index}]",
+                )
+                if p2_assembler is not None:
+                    if gate1 is None or p2_pp_orb_root is None:
+                        raise RuntimeError(
+                            "Table P2 resume requires the STRU parser and PP_ORB root."
+                        )
+                    parsed = gate1.parse_stru(case / "STRU")
+                    symbols = [str(atom.species) for atom in parsed.structure.atoms]
+                    atom_count_for_contract = len(
+                        record[AtomicDataDict.ATOMIC_NUMBERS_KEY]
+                    )
+                    if len(symbols) != atom_count_for_contract:
+                        raise ValueError(
+                            f"Cannot resume {case.name}: STRU atoms {len(symbols)} != "
+                            f"record {atom_count_for_contract}."
+                        )
+                    p2_assembler.store.validate_sample_contract(
+                        symbols=symbols,
+                        atom_shells=parse_basis_lines(
+                            record["basis"], atom_count_for_contract
+                        ),
+                        source_files=_sample_source_files(parsed, p2_pp_orb_root),
+                        require_source_files=True,
+                    )
+                    source_metadata = dict(record.get("p2_cache_source", {}))
+                    source_metadata.update(
+                        {
+                            "species_source_identity_sha256": (
+                                p2_assembler.store.species_source_identity_sha256
+                            ),
+                            "sample_source_identity_verified": True,
+                        }
+                    )
+                    record["p2_cache_source"] = source_metadata
                 graph = AtomicData.from_points(
                     pos=np.asarray(record[AtomicDataDict.POSITIONS_KEY]).reshape(-1, 3),
                     cell=np.asarray(record[AtomicDataDict.CELL_KEY]).reshape(3, 3),
@@ -898,11 +1334,48 @@ def _reuse_raw_split(
                         f"Cannot resume {case.name}: P2 is missing exact graph "
                         f"blocks {missing_p2[:5]}."
                     )
-                projected, projection = project_non_soc_blocks_hermitian(
+                previous_projection = record.get("p2_hermitian_projection")
+                if not isinstance(previous_projection, dict) or (
+                    "max_pre_projection_mismatch" not in previous_projection
+                ):
+                    raise ValueError(
+                        f"Cannot resume {case.name}: prior P2 Hermitian projection "
+                        "statistics are missing. Rebuild this raw row."
+                    )
+                previous_max_mismatch = float(
+                    previous_projection["max_pre_projection_mismatch"]
+                )
+                if (
+                    not np.isfinite(previous_max_mismatch)
+                    or previous_max_mismatch > p2_hermitian_mismatch_tolerance
+                ):
+                    raise ValueError(
+                        f"Cannot resume {case.name}: recorded pre-projection P2 "
+                        f"Hermitian mismatch {previous_max_mismatch:.6e} eV exceeds "
+                        f"{p2_hermitian_mismatch_tolerance:.6e} eV."
+                    )
+                projected, resume_projection = project_non_soc_blocks_hermitian(
                     record["hamiltonian_p2"],
                     required_keys=required_keys,
                     label=f"{case.name} P2",
+                    mismatch_tolerance=p2_hermitian_mismatch_tolerance,
                 )
+                projection = dict(previous_projection)
+                projection.setdefault(
+                    "mean_pre_projection_mismatch", previous_max_mismatch
+                )
+                projection.setdefault(
+                    "p95_pre_projection_mismatch", previous_max_mismatch
+                )
+                projection.setdefault(
+                    "p99_pre_projection_mismatch", previous_max_mismatch
+                )
+                projection["mismatch_tolerance"] = float(
+                    p2_hermitian_mismatch_tolerance
+                )
+                projection["above_tolerance_count"] = 0
+                projection["unit"] = "eV"
+                projection["resume_exact_revalidation"] = resume_projection
                 record["hamiltonian_p2"] = projected
                 record["p2_hermitian_projection"] = projection
                 record["sparse_zero_completion"] = zero_completion
@@ -927,7 +1400,10 @@ def _reuse_raw_split(
             p2_root=p2_root,
             p2_assembler=p2_assembler,
             gate1=gate1,
+            p2_pp_orb_root=p2_pp_orb_root,
             p2_source_fingerprint=p2_source_fingerprint,
+            case_source_fingerprints=case_source_fingerprints,
+            p2_hermitian_mismatch_tolerance=p2_hermitian_mismatch_tolerance,
             input_json=input_json,
             work_root=work_root,
             split=split,
@@ -936,7 +1412,7 @@ def _reuse_raw_split(
         )
     if not paths_path.is_file():
         paths_path.write_text(
-            "".join(f"{case}\n" for case in cases), encoding="utf-8"
+            "".join(f"{case.resolve()}\n" for case in cases), encoding="utf-8"
         )
     return rows
 
@@ -1241,12 +1717,29 @@ def main(argv: list[str] | None = None) -> int:
     source_group.add_argument("--p2-root", type=Path)
     source_group.add_argument("--table-root", type=Path)
     parser.add_argument("--gate1-script", type=Path)
+    parser.add_argument(
+        "--pp-orb",
+        type=Path,
+        help=(
+            "ORB/UPF root used by selected STRU files; with --table-root the "
+            "builder manifest path is used only when it still exists"
+        ),
+    )
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--input-json", type=Path, required=True)
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--valid-count", type=int, default=20)
     parser.add_argument("--split-seed", default="nonsoc-p2-raw200-v1")
     parser.add_argument("--require-count", type=int, default=0)
+    parser.add_argument(
+        "--p2-hermitian-mismatch-tolerance-ev",
+        type=float,
+        default=DEFAULT_P2_HERMITIAN_MISMATCH_TOLERANCE_EV,
+        help=(
+            "fail before pair averaging when any raw P2/reverse mismatch exceeds "
+            "this value"
+        ),
+    )
     parser.add_argument(
         "--keep-raw-staging",
         action="store_true",
@@ -1280,22 +1773,43 @@ def main(argv: list[str] | None = None) -> int:
     split_cases = _split_cases(cases, valid_count=args.valid_count, seed=args.split_seed)
     p2_assembler = None
     gate1 = None
+    p2_pp_orb_root = None
     if table_root is not None:
         manifest_path = table_root / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(manifest_path)
         table_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not bool(table_manifest.get("complete", False)):
-            raise ValueError(f"P2 table is not complete: {manifest_path}")
+        _require_qualified_table_manifest(
+            table_manifest,
+            manifest_path=manifest_path,
+        )
         if args.gate1_script is None:
             raise ValueError("--gate1-script is required with --table-root.")
         p2_source_fingerprint = _sha256(manifest_path)
-        p2_assembler = P2TableAssembler(P2TableStore(table_root))
+        declared_pp_orb = table_manifest.get("source", {}).get("pp_orb")
+        pp_orb_candidate = args.pp_orb
+        if pp_orb_candidate is None and declared_pp_orb:
+            pp_orb_candidate = Path(str(declared_pp_orb))
+        if pp_orb_candidate is None or not pp_orb_candidate.resolve().is_dir():
+            raise ValueError(
+                "--table-root production materialization must resolve the STRU "
+                "ORB/UPF bundle; pass --pp-orb explicitly"
+            )
+        p2_pp_orb_root = pp_orb_candidate.resolve()
+        p2_store = P2TableStore(
+            table_root,
+            require_explicit_source_identity=True,
+        )
+        p2_assembler = P2TableAssembler(p2_store)
         gate1 = _load_module(args.gate1_script.resolve(), "deeptb_p2_cache_gate1")
         p2_source_manifest = {
             "kind": "radial_table",
             "root": str(table_root),
             "manifest_sha256": p2_source_fingerprint,
+            "pp_orb": str(p2_pp_orb_root),
+            "species_source_identity_sha256": (
+                p2_store.species_source_identity_sha256
+            ),
         }
     else:
         assert p2_root is not None
@@ -1309,6 +1823,23 @@ def main(argv: list[str] | None = None) -> int:
             "source_set_sha256": p2_source_fingerprint,
         }
 
+    dataset_source_identity = _dataset_source_identity(
+        dataset_root,
+        cases,
+        require_stru=table_root is not None,
+    )
+    case_source_fingerprints = _case_source_fingerprint_map(
+        dataset_source_identity
+    )
+    raw_identity = _raw_staging_identity(
+        input_json=input_json,
+        gate1_script=args.gate1_script.resolve()
+        if args.gate1_script is not None
+        else None,
+        p2_source_fingerprint=p2_source_fingerprint,
+        p2_source_kind=str(p2_source_manifest["kind"]),
+        dataset_source_identity=dataset_source_identity,
+    )
     torch.set_default_dtype(torch.float32)
     raw_root = work_root / "raw_staging"
     full_root = work_root / "full_h"
@@ -1322,9 +1853,18 @@ def main(argv: list[str] | None = None) -> int:
         "input_json": str(input_json),
         "input_json_sha256": _sha256(input_json),
         "script_sha256": _sha256(Path(__file__)),
+        "raw_staging_identity": raw_identity,
+        "p2_hermitian_mismatch_tolerance_ev": float(
+            args.p2_hermitian_mismatch_tolerance_ev
+        ),
         "split_seed": args.split_seed,
         "splits": {},
     }
+    if args.resume_raw_staging:
+        _validate_raw_staging_identity(work_root, raw_identity)
+    else:
+        _write_raw_staging_identity(work_root, raw_identity)
+        _write_json(work_root / "manifest.partial.json", manifest)
     for split, selected in split_cases.items():
         if not selected:
             continue
@@ -1336,7 +1876,12 @@ def main(argv: list[str] | None = None) -> int:
                 p2_root=p2_root,
                 p2_assembler=p2_assembler,
                 gate1=gate1,
+                p2_pp_orb_root=p2_pp_orb_root,
                 p2_source_fingerprint=p2_source_fingerprint,
+                case_source_fingerprints=case_source_fingerprints,
+                p2_hermitian_mismatch_tolerance=float(
+                    args.p2_hermitian_mismatch_tolerance_ev
+                ),
                 input_json=input_json,
                 work_root=work_root,
                 split=split,
@@ -1348,7 +1893,12 @@ def main(argv: list[str] | None = None) -> int:
                 p2_root=p2_root,
                 p2_assembler=p2_assembler,
                 gate1=gate1,
+                p2_pp_orb_root=p2_pp_orb_root,
                 p2_source_fingerprint=p2_source_fingerprint,
+                case_source_fingerprints=case_source_fingerprints,
+                p2_hermitian_mismatch_tolerance=float(
+                    args.p2_hermitian_mismatch_tolerance_ev
+                ),
                 input_json=input_json,
                 work_root=work_root,
                 split=split,

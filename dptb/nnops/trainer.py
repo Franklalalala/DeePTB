@@ -5,6 +5,7 @@ import csv
 import math
 import copy
 import torch.nn as nn
+from dptb.configuration import migrate_legacy_checkpoint_train_options
 from dptb.utils.tools import (
     get_lr_scheduler,
     get_optimizer,
@@ -12,12 +13,17 @@ from dptb.utils.tools import (
     lr_scheduler_requires_metric,
 )
 from dptb.nnops.base_trainer import BaseTrainer
+from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.plugins.monitor import Plugin
 from typing import Union, Optional
 from dptb.data import AtomicDataset, DataLoader, AtomicData
 from dptb.nn import build_model
 from dptb.nn.activation_recompute import configure_activation_recompute
-from dptb.nnops.flow import assert_flow_h0_keys_reach_model, build_hamiltonian_flow
+from dptb.nnops.flow import (
+    assert_flow_h0_keys_reach_model,
+    assert_model_in_loss_endpoint_metric_space,
+    build_hamiltonian_flow,
+)
 from dptb.nnops.loss import Loss
 from dptb.nnops.self_consistency import (
     SelfConsistencyScheduler,
@@ -29,6 +35,9 @@ log = logging.getLogger(__name__)
 
 
 class Trainer(BaseTrainer):
+    # SingleTrainer historically scheduled non-flow runs on the optimization
+    # objective.  Public endpoint metrics must not silently change that signal.
+    scheduler_metric_prefers_objective = True
     object_keys = ["lr_scheduler", "optimizer"]
 
     def __init__(
@@ -123,6 +132,34 @@ class Trainer(BaseTrainer):
                 idp=loss_idp,
             )
 
+        self.endpoint_metric_spaces = {}
+        criteria = {"train": self.train_lossfunc}
+        if self.use_validation:
+            criteria["validation"] = self.validation_lossfunc
+        if self.use_reference:
+            criteria["reference"] = self.reference_lossfunc
+        for name, criterion in criteria.items():
+            if not self._supports_endpoint_triplet(criterion):
+                continue
+            loss_obj = self._loss_component_source(criterion)
+            metric_space = str(
+                getattr(loss_obj, "endpoint_metric_space", "rme")
+            ).lower()
+            self.endpoint_metric_spaces[name] = metric_space
+            log.info("%s endpoint metric space: %s", name, metric_space)
+        if (
+            "train" in self.endpoint_metric_spaces
+            and "validation" in self.endpoint_metric_spaces
+            and self.endpoint_metric_spaces["train"]
+            != self.endpoint_metric_spaces["validation"]
+        ):
+            log.warning(
+                "Train and validation endpoint metric spaces differ: %s != %s. "
+                "Their common loss tags are not numerically comparable.",
+                self.endpoint_metric_spaces["train"],
+                self.endpoint_metric_spaces["validation"],
+            )
+
         flow_idp = getattr(self.train_lossfunc, "idp", loss_idp)
         self.flow_cfm = build_hamiltonian_flow(
             train_options.get("flow_options", None),
@@ -134,6 +171,11 @@ class Trainer(BaseTrainer):
         # keys the model's H0-init embedding never reads (silent prior
         # deactivation P0: flow.node_h0_key != embedding.h0_node_key).
         assert_flow_h0_keys_reach_model(self.flow_cfm, self.model)
+        # Model-in-loss MeanFlow exposes endpoint sums only in its configured
+        # target representation.  Reject a block/RME mismatch here instead of
+        # failing after the first expensive MeanFlow model calls, and never
+        # hide it behind an implicit online representation conversion.
+        self._assert_model_in_loss_endpoint_contract()
         self._last_flow_state = {}
         self._last_flow_validation_state = {}
         self._last_self_consistency_state = {}
@@ -144,6 +186,26 @@ class Trainer(BaseTrainer):
                                                      'uniform'], "The onsite function should be none or uniform for the skints loss function."
             log.info("The skints loss function is used for training, the model.transform is then set to False.")
             self.model.transform = False
+
+    def _assert_model_in_loss_endpoint_contract(self) -> None:
+        """Validate criteria used directly with a model-in-loss flow."""
+        assert_model_in_loss_endpoint_metric_space(
+            self.flow_cfm,
+            self.train_lossfunc,
+            criterion_name="train",
+        )
+        if getattr(self, "use_validation", False):
+            assert_model_in_loss_endpoint_metric_space(
+                self.flow_cfm,
+                self.validation_lossfunc,
+                criterion_name="validation",
+            )
+        if self.use_reference and getattr(self.flow_cfm, "apply_to_reference", False):
+            assert_model_in_loss_endpoint_metric_space(
+                self.flow_cfm,
+                self.reference_lossfunc,
+                criterion_name="reference",
+            )
 
     def _model_loss_idp(self):
         model = self.model
@@ -175,7 +237,32 @@ class Trainer(BaseTrainer):
                 break
         return loss_obj
 
+    @staticmethod
+    def _supports_endpoint_triplet(lossfunc) -> bool:
+        """Whether a criterion participates in the Hamiltonian endpoint API."""
+
+        loss_obj = Trainer._loss_component_source(lossfunc)
+        declared = getattr(loss_obj, "supports_endpoint_triplet", None)
+        if declared is not None:
+            return bool(declared)
+        if callable(getattr(loss_obj, "compatible_loss_from_stats", None)):
+            return True
+        # Backward compatibility for existing Hamiltonian criteria that
+        # exposed component side effects before the capability marker existed.
+        return all(
+            hasattr(loss_obj, name)
+            for name in ("last_onsite_loss", "last_hopping_loss")
+        )
+
     _COMPATIBLE_LOSS_SIDE_EFFECT_ATTRS = (
+        "last_endpoint_loss",
+        "last_endpoint_metric_space",
+        "last_feature_compat_loss",
+        "last_opt_loss",
+        "last_block_loss",
+        "last_block_element_mae",
+        "last_block_onsite_loss",
+        "last_block_hopping_loss",
         "last_onsite_loss",
         "last_hopping_loss",
         "last_z_loss",
@@ -372,8 +459,17 @@ class Trainer(BaseTrainer):
                     prefix="train_compatible",
                     legacy_prefix="train",
                 )
-            if compatible_state is not None:
-                flow_state.update(compatible_state)
+            if compatible_state is None:
+                raise RuntimeError(
+                    "Enabled flow could not reconstruct the non-CFM-compatible "
+                    "train endpoint loss from the configured criterion."
+                )
+            self._require_endpoint_triplet(
+                compatible_state,
+                prefix="train",
+                route="Enabled flow training",
+            )
+            flow_state.update(compatible_state)
             flow_state.pop("_compatible_clean_stats", None)
             self._last_flow_state = flow_state
             return loss
@@ -406,7 +502,52 @@ class Trainer(BaseTrainer):
         return state
 
     @staticmethod
-    def _compatible_loss_state(lossfunc, pred_data, ref_data, *, prefix, legacy_prefix=None):
+    def _endpoint_loss_state(lossfunc, optimization_loss, *, prefix):
+        """Build the common all/onsite/hopping endpoint metric contract."""
+
+        loss_obj = Trainer._loss_component_source(lossfunc)
+        endpoint_loss = getattr(loss_obj, "last_endpoint_loss", None)
+        if endpoint_loss is None:
+            endpoint_loss = getattr(loss_obj, "last_feature_compat_loss", None)
+        has_distinct_objective = endpoint_loss is not None
+        if endpoint_loss is None:
+            endpoint_loss = optimization_loss
+        if not torch.is_tensor(endpoint_loss):
+            endpoint_loss = torch.as_tensor(endpoint_loss)
+        if not torch.is_tensor(optimization_loss):
+            optimization_loss = endpoint_loss.new_tensor(float(optimization_loss))
+
+        state = {f"{prefix}_loss": endpoint_loss.detach()}
+        state.update(Trainer._loss_component_state(lossfunc, prefix=prefix))
+        if has_distinct_objective:
+            state[f"{prefix}_loss_opt"] = optimization_loss.detach()
+        return state
+
+    @staticmethod
+    def _require_endpoint_triplet(state, *, prefix, route):
+        required = (
+            f"{prefix}_loss",
+            f"{prefix}_onsite_loss",
+            f"{prefix}_hopping_loss",
+        )
+        missing = [key for key in required if key not in state]
+        if missing:
+            raise RuntimeError(
+                f"{route} must expose the non-CFM-compatible endpoint triplet; "
+                f"missing {missing}. Use a Hamiltonian criterion that provides "
+                "onsite/hopping metrics and compatible_loss_from_stats."
+            )
+
+    @staticmethod
+    def _compatible_loss_state(
+        lossfunc,
+        pred_data,
+        ref_data,
+        *,
+        prefix,
+        legacy_prefix=None,
+        include_raw_stats=False,
+    ):
         loss_obj = Trainer._loss_component_source(lossfunc)
         sentinel = object()
         saved_side_effects = {
@@ -418,12 +559,35 @@ class Trainer(BaseTrainer):
             with torch.no_grad():
                 compatible_loss = lossfunc(pred_data, ref_data)
 
-            state = {
-                f"{prefix}_loss": compatible_loss.detach()
-                if torch.is_tensor(compatible_loss)
-                else torch.as_tensor(compatible_loss)
-            }
-            state.update(Trainer._loss_component_state(lossfunc, prefix=prefix))
+            state = Trainer._endpoint_loss_state(
+                lossfunc,
+                compatible_loss,
+                prefix=prefix,
+            )
+            if include_raw_stats:
+                raw_stats = {}
+                for component in ("onsite", "hopping"):
+                    for source_suffix, target_suffix in (
+                        ("l1_sum", "l1_sum"),
+                        ("mse_sum", "mse_sum"),
+                        ("count", "count"),
+                    ):
+                        value = getattr(
+                            loss_obj,
+                            f"last_{component}_{source_suffix}",
+                            None,
+                        )
+                        if value is not None:
+                            raw_stats[f"{component}_{target_suffix}"] = (
+                                value.detach() if torch.is_tensor(value) else value
+                            )
+                if len(raw_stats) == 6:
+                    raw_stats["metric_space"] = getattr(
+                        loss_obj,
+                        "endpoint_metric_space",
+                        "rme",
+                    )
+                    state["_endpoint_stats"] = raw_stats
         finally:
             for attr, value in saved_side_effects.items():
                 if value is sentinel:
@@ -472,6 +636,17 @@ class Trainer(BaseTrainer):
             return None
 
         loss_obj = Trainer._loss_component_source(lossfunc)
+        stats_metric_space = stats.get("metric_space", None)
+        criterion_metric_space = getattr(
+            loss_obj,
+            "endpoint_metric_space",
+            "rme",
+        )
+        if (
+            stats_metric_space is not None
+            and str(stats_metric_space) != str(criterion_metric_space)
+        ):
+            return None
         reduce_from_stats = getattr(loss_obj, "compatible_loss_from_stats", None)
         if not callable(reduce_from_stats):
             return None
@@ -552,22 +727,57 @@ class Trainer(BaseTrainer):
         dynamic_batch_state = self._dynamic_batch_state_from_batch(batch)
 
         loss = self._loss_on_batch(batch, self.train_lossfunc, use_flow=True)
-        loss_for_log = loss.detach()
+        flow_enabled = bool(self.flow_cfm.enabled)
+        main_flow_state = dict(getattr(self, "_last_flow_state", {}))
+        main_self_consistency_state = dict(
+            getattr(self, "_last_self_consistency_state", {})
+        )
+        main_endpoint_state = {}
+        if flow_enabled:
+            loss_for_log = main_flow_state["train_loss"].detach()
+        else:
+            main_endpoint_state = self._endpoint_loss_state(
+                self.train_lossfunc,
+                loss,
+                prefix="train",
+            )
+            if self._supports_endpoint_triplet(self.train_lossfunc):
+                self._require_endpoint_triplet(
+                    main_endpoint_state,
+                    prefix="train",
+                    route="Non-CFM training",
+                )
+            loss_for_log = main_endpoint_state["train_loss"].detach()
+        loss_opt_for_log = loss.detach()
         loss.backward()
         del loss
 
         ref_component_state = {}
         if ref_batch is not None:
             reference_lossfunc = getattr(self, "reference_lossfunc", self.train_lossfunc)
+            apply_flow_to_reference = bool(
+                getattr(self.flow_cfm, "apply_to_reference", False)
+            )
             ref_loss = self._loss_on_batch(
                 ref_batch,
                 reference_lossfunc,
-                use_flow=self.flow_cfm.apply_to_reference,
+                use_flow=apply_flow_to_reference,
                 allow_self_consistency=False,
             )
-            loss_for_log = loss_for_log + ref_loss.detach()
+            loss_opt_for_log = loss_opt_for_log + ref_loss.detach()
             ref_loss.backward()
-            ref_component_state = self._loss_component_state(reference_lossfunc, prefix="ref")
+            if apply_flow_to_reference:
+                ref_flow_state = dict(getattr(self, "_last_flow_state", {}))
+                for suffix in ("loss", "onsite_loss", "hopping_loss"):
+                    source = f"train_{suffix}"
+                    if source in ref_flow_state:
+                        ref_component_state[f"ref_{suffix}"] = ref_flow_state[source]
+            else:
+                ref_component_state = self._endpoint_loss_state(
+                    reference_lossfunc,
+                    ref_loss,
+                    prefix="ref",
+                )
             del ref_loss
 
         total_norm = torch.nn.utils.clip_grad_norm_(
@@ -580,7 +790,10 @@ class Trainer(BaseTrainer):
         if self.update_lr_per_iter:
             if lr_scheduler_requires_metric(self.lr_scheduler):
                 if self.iter > 1:
-                    self.lr_scheduler.step(self.stats["train_loss"]['latest_avg_iter_loss'])
+                    scheduler_stat = "train_loss" if flow_enabled else "train_loss_opt"
+                    self.lr_scheduler.step(
+                        self.stats[scheduler_stat]['latest_avg_iter_loss']
+                    )
                 elif lr_scheduler_can_step_without_metric(self.lr_scheduler):
                     self.lr_scheduler.step()
             else:
@@ -589,6 +802,7 @@ class Trainer(BaseTrainer):
         state = {
             'field': 'iteration',
             "train_loss": loss_for_log,
+            "train_loss_opt": loss_opt_for_log,
             "lr": self.optimizer.state_dict()["param_groups"][0]['lr'],
             "total_grad_norm": total_norm.item()
         }
@@ -598,25 +812,37 @@ class Trainer(BaseTrainer):
             num_experts=getattr(self, "num_experts", getattr(self.model, "num_experts", 0)),
         )
         state.update(dynamic_batch_state)
-        if not self.flow_cfm.enabled:
-            state.update(self._loss_component_state(self.train_lossfunc))
+        state.update(main_endpoint_state)
         state.update(ref_component_state)
-        state.update(getattr(self, "_last_flow_state", {}))
-        state.update(getattr(self, "_last_self_consistency_state", {}))
+        state.update(main_flow_state)
+        # The backward objective can include a reference batch, whereas the
+        # canonical endpoint triplet remains scoped to the main batch.
+        state["train_loss_opt"] = loss_opt_for_log
+        state.update(main_self_consistency_state)
         if self._optimizer_diagnostics_due():
             state.update(self._optimizer_diagnostics(self.optimizer))
 
         self.call_plugins(queue_name='iteration', time=self.iter, **state)
         self.iter += 1
 
-        return loss_for_log
+        # Match MultiTrainer: iteration() returns the objective that was
+        # differentiated, while the comparable endpoint remains in
+        # state["train_loss"] for monitors/TensorBoard.
+        return loss_opt_for_log
 
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
                 validation_datasets=None):
         ckpt = torch.load(checkpoint, map_location=common_options["device"], weights_only=False)
-        ckpt_train_options = ckpt["config"]["train_options"]
-        model_build_train_options = train_options if len(train_options) != 0 else ckpt_train_options
+        ckpt_train_options = migrate_legacy_checkpoint_train_options(
+            ckpt["config"]["train_options"]
+        )
+        merged_train_options = merge_restart_train_options(
+            train_options,
+            ckpt_train_options,
+            logger=log,
+        )
+        model_build_train_options = merged_train_options
         model_state = ckpt.get("model_state_dict", {})
         has_flat_distance_state = (
             bool(ckpt_train_options.get("distance_ranges"))
@@ -637,7 +863,7 @@ class Trainer(BaseTrainer):
             ckpt["config"]["common_options"],
             train_options=model_build_train_options,
         )
-        if len(train_options) == 0: train_options = ckpt["config"]["train_options"]
+        train_options = merged_train_options
         if len(common_options) == 0: common_options = ckpt["config"]["common_options"]
         trainer = cls(model=model, train_datasets=train_datasets, reference_datasets=reference_datasets,
                       validation_datasets=validation_datasets, train_options=train_options,
@@ -738,15 +964,22 @@ class Trainer(BaseTrainer):
                             )
                             sampled.update(batch_info)
                             legacy_prefix = "validation" if int(num_steps) == 1 else None
+                            compatible_state = self._compatible_loss_state(
+                                self.validation_lossfunc,
+                                sampled,
+                                batch_for_loss,
+                                prefix=f"validation_compatible_euler_{num_steps}",
+                                legacy_prefix=legacy_prefix,
+                            )
+                            if int(num_steps) == 1:
+                                self._require_endpoint_triplet(
+                                    compatible_state,
+                                    prefix="validation",
+                                    route="MeanFlow validation",
+                                )
                             self._accumulate_metric_state(
                                 flow_metric_sums,
-                                self._compatible_loss_state(
-                                    self.validation_lossfunc,
-                                    sampled,
-                                    batch_for_loss,
-                                    prefix=f"validation_compatible_euler_{num_steps}",
-                                    legacy_prefix=legacy_prefix,
-                                ),
+                                compatible_state,
                             )
                         num_batches += 1
                         continue
@@ -819,6 +1052,12 @@ class Trainer(BaseTrainer):
                                 prefix=f"validation_compatible_euler_{num_steps}",
                                 legacy_prefix=legacy_prefix,
                             )
+                        if int(num_steps) == 1:
+                            self._require_endpoint_triplet(
+                                compatible_state,
+                                prefix="validation",
+                                route="CFM validation",
+                            )
                         self._accumulate_metric_state(
                             flow_metric_sums,
                             compatible_state,
@@ -828,13 +1067,21 @@ class Trainer(BaseTrainer):
                     batch.update(batch_info)
                     batch_for_loss.update(batch_info)
                     batch_loss = self.validation_lossfunc(batch, batch_for_loss)
-                    loss += batch_loss
+                    endpoint_state = self._endpoint_loss_state(
+                        self.validation_lossfunc,
+                        batch_loss,
+                        prefix="validation",
+                    )
+                    if self._supports_endpoint_triplet(self.validation_lossfunc):
+                        self._require_endpoint_triplet(
+                            endpoint_state,
+                            prefix="validation",
+                            route="Non-CFM validation",
+                        )
+                    loss += endpoint_state["validation_loss"]
                     self._accumulate_metric_state(
                         flow_metric_sums,
-                        self._loss_component_state(
-                            self.validation_lossfunc,
-                            prefix="validation",
-                        ),
+                        endpoint_state,
                     )
                 num_batches += 1
                 if fast: break

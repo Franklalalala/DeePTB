@@ -1,4 +1,5 @@
 from dptb.nn.deeptb import NNENV, MIX
+from dptb.configuration import migrate_legacy_checkpoint_model_options
 import logging
 from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
@@ -379,8 +380,11 @@ def build_model(
             ckpt_state_dict = f.get("model_state_dict", None)
             del f
 
-        if len(model_options) == 0:
-            model_options = ckptconfig["model_options"]
+        checkpoint_model_options = migrate_legacy_checkpoint_model_options(
+            ckptconfig["model_options"]
+        )
+        if len(model_options) == 0 or model_options == ckptconfig["model_options"]:
+            model_options = checkpoint_model_options
 
         if len(common_options) == 0:
             common_options = ckptconfig["common_options"]

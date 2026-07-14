@@ -12,8 +12,7 @@ train_options:
     prior: zero
     node_h0_key: node_physical_h0
     edge_h0_key: edge_physical_h0
-    strict_h0: true
-    warn_missing_h0: true
+    missing_h0_policy: error
     # Never enable this for the physical SOC prior.  AO blocks must be converted
     # through block_to_feature so imaginary SOC channels become explicit Re/Im RME.
     allow_complex_prior_real_projection: false

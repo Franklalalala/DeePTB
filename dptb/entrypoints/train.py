@@ -1,5 +1,11 @@
 from dptb.nnops.trainer import Trainer
 from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
+from dptb.configuration import (
+    canonicalize_training_config,
+    migrate_legacy_checkpoint_model_options,
+    migrate_legacy_checkpoint_train_options,
+)
+from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
 from dptb.plugins.monitor import TrainLossMonitor, LearningRateMonitor, Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, TrainOnsiteLossMonitor, TrainHoppingLossMonitor, TrainZLossMonitor, ExpertLoadCVMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
@@ -410,8 +416,10 @@ def train(
     set_log_handles(log_level, Path(log_path) if log_path else None)
     # parse the config. Since if use init, config file may not equals to current
 
-    jdata = j_loader(INPUT)
-    jdata = normalize(jdata)
+    explicit_jdata = canonicalize_training_config(j_loader(INPUT))
+    explicit_train_options = copy.deepcopy(explicit_jdata.get("train_options", {}))
+    explicit_model_options = explicit_jdata.get("model_options", None)
+    jdata = normalize(explicit_jdata)
     # update basis if init_model or restart
     # update jdata
     # this is not necessary, because if we init model from checkpoint, the build_model will load the model_options from checkpoints if not provided
@@ -427,14 +435,20 @@ def train(
             assert not restart, "json model can not be used as restart! should be a checkpoint file"
         else:
             f = torch.load(f, map_location="cpu", weights_only=False)
+            checkpoint_train_options = migrate_legacy_checkpoint_train_options(
+                f["config"].get("train_options", {})
+            )
+            checkpoint_model_options = migrate_legacy_checkpoint_model_options(
+                f["config"]["model_options"]
+            )
 
-            if jdata.get("model_options", None) is None:
-                jdata["model_options"] = f["config"]["model_options"]
+            if explicit_model_options is None:
+                jdata["model_options"] = checkpoint_model_options
 
             # update basis
             basis = f["config"]["common_options"]["basis"]
             # nnsk
-            if len(f["config"]["model_options"])==1 and f["config"]["model_options"].get("nnsk") != None:
+            if len(checkpoint_model_options)==1 and checkpoint_model_options.get("nnsk") != None:
                 for asym, orb in jdata["common_options"]["basis"].items():
                     assert asym in basis.keys(), f"Atom {asym} not found in model's basis"
                     if orb != basis[asym]:
@@ -452,32 +466,30 @@ def train(
 
             # update model options and train_options
             if restart:
-                #
-                if jdata.get("train_options", None) is not None:
-                    for obj in Trainer.object_keys:
-                        if jdata["train_options"].get(obj) != f["config"]["train_options"].get(obj):
-                            log.warning(f"{obj} in config file is not consistent with the checkpoint, using the one in checkpoint")
-                            jdata["train_options"][obj] = f["config"]["train_options"][obj]
-                else:
-                    jdata["train_options"] = f["config"]["train_options"] # restart can be preceeded without train_options
+                jdata["train_options"] = merge_restart_train_options(
+                    explicit_train_options,
+                    checkpoint_train_options,
+                    logger=log,
+                )
 
-                if jdata.get("model_options", None) is None or jdata["model_options"] != f["config"]["model_options"]:
+                if jdata.get("model_options", None) is None or jdata["model_options"] != checkpoint_model_options:
                     log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
-                    jdata["model_options"] = f["config"]["model_options"] # restart does not allow to change model options
+                    jdata["model_options"] = checkpoint_model_options # restart does not allow to change model options
             else:
                 # init model mode, allow model_options change (Would it cause some error later if the param mismatch?)
-                if jdata.get("train_options", None) is None:
-                    jdata["train_options"] = f["config"]["train_options"]
-                if jdata.get("model_options") is None:
-                    jdata["model_options"] = f["config"]["model_options"]
+                if not explicit_train_options:
+                    jdata["train_options"] = checkpoint_train_options
+                if explicit_model_options is None:
+                    jdata["model_options"] = checkpoint_model_options
 
                 ## add some warning !
                 for k, v in jdata["model_options"].items():
-                    if k not in f["config"]["model_options"]:
+                    if k not in checkpoint_model_options:
                         log.warning(f"The model options {k} is not defined in checkpoint, set to {v}.")
                     else:
-                        deep_dict_difference(k, v, f["config"]["model_options"])
+                        deep_dict_difference(k, v, checkpoint_model_options)
             del f
+            jdata = normalize(jdata)
     else:
         j_must_have(jdata, "model_options")
         j_must_have(jdata, "train_options")
@@ -540,7 +552,7 @@ def train(
 
     # register the plugin in trainer, to tract training info
     train_options = jdata["train_options"]
-    log_field = ["train_loss", "lr", "total_grad_norm"]
+    log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]
     # Register scalar fields from the *effective* flow flags on the resolved
     # flow object. Re-deriving them from raw flow_options keys drifts for
     # pixel meanflow (meanflow.* overrides, no raw-batch train_compatible
@@ -548,6 +560,16 @@ def train(
     # registered-but-never-updated field prints a misleading constant 0.
     flow_log_fields, register_legacy_validation = resolve_flow_log_fields(
         getattr(trainer, "flow_cfm", None)
+    )
+    train_endpoint_capable = trainer._supports_endpoint_triplet(
+        trainer.train_lossfunc
+    )
+    validation_endpoint_capable = bool(
+        validation_datasets
+        and trainer._supports_endpoint_triplet(trainer.validation_lossfunc)
+    )
+    register_legacy_validation = bool(
+        register_legacy_validation and validation_endpoint_capable
     )
     log_field.extend(flow_log_fields)
     flow_scalar_fields = list(flow_log_fields)
@@ -573,6 +595,14 @@ def train(
     avg_per_iter = chk_avg_per_iter(jdata)
     trainer.register_plugin(TrainLossMonitor(sliding_win_size=jdata["train_options"]["sliding_win_size"], avg_per_iter=avg_per_iter)) # by default, avg_per_iter is false, will not be activated.
     trainer.register_plugin(LearningRateMonitor())
+    trainer.register_plugin(
+        ScalarFieldMonitor(
+            stat_name="train_loss_opt",
+            interval=[(1, 'iteration'), (1, 'epoch')],
+            sliding_win_size=jdata["train_options"]["sliding_win_size"],
+            avg_per_iter=avg_per_iter,
+        )
+    )
     trainer.register_plugin(ScalarFieldMonitor(stat_name="total_grad_norm", interval=[(1, 'iteration'), (1, 'epoch')]))
     for flow_stat_name in flow_scalar_fields:
         trainer.register_plugin(
@@ -591,14 +621,16 @@ def train(
                     )
                 )
 ##############################
-    trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
-    trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
+    if train_endpoint_capable:
+        trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
+        trainer.register_plugin(TrainHoppingLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     trainer.register_plugin(TrainZLossMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     trainer.register_plugin(ExpertLoadCVMonitor(interval=[(jdata["train_options"]["validation_freq"], 'iteration'), (1, 'epoch')]))
     log_field.append("mean_max_prob")
     log_field.append("expert_load_cv")
-    log_field.append("train_onsite_loss")
-    log_field.append("train_hopping_loss")
+    if train_endpoint_capable:
+        log_field.append("train_onsite_loss")
+        log_field.append("train_hopping_loss")
 ##############################
     current_bs = jdata["train_options"]["batch_size"]
     grad_log_file = os.path.join(output, f"grad_trace_bs{current_bs}.csv")

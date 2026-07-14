@@ -27,22 +27,22 @@ data_options:
 model_options:
   embedding:
     method: lem_moe_v3_prior
-    prior_kind: p2
     prior_node_key: node_p2
     prior_edge_key: edge_p2
-    use_prior_init: true
+    prior_init_scope: both
     prior_merge_mode: replace
-    use_soft_edge_memory: true
-    soft_edge_memory_num_slots: 64
-    soft_edge_memory_num_heads: 4
-    soft_edge_memory_head_dim: 16
-    soft_edge_memory_temperature: 1.0
-    soft_edge_memory_dropout: 0.0
-    soft_edge_memory_gate_mode: deepseek
-    soft_edge_memory_gate_bias: 0.0
-    soft_edge_memory_zero_init_output: true
+    soft_edge_memory:
+      enabled: true
+      num_slots: 64
+      num_heads: 4
+      head_dim: 16
+      temperature: 1.0
+      dropout: 0.0
+      gate_mode: deepseek
+      gate_bias: 0.0
+      zero_init_output: true
+      diagnostics_mode: "off"
     prior_validate_inputs: false
-    soft_edge_memory_diagnostics_mode: "off"
     output_route: h_b0
     n_layers: 1
     avg_num_neighbors: 2.0
@@ -69,8 +69,7 @@ model_options:
     scale_type: no_scale
     block_decoder: expansion_cg
     blockwise_hamiltonian: true
-    add_h0: false
-    add_prior: true
+    reconstruction: prior_residual
     validate_prior_blocks: false
     prior_node_block_field: node_p2_blocks
     prior_edge_block_field: edge_p2_blocks

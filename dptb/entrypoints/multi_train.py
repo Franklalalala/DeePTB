@@ -24,6 +24,10 @@ from pathlib import Path
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
 from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
+from dptb.configuration import (
+    migrate_legacy_checkpoint_model_options,
+    migrate_legacy_checkpoint_train_options,
+)
 from dptb.nnops.ddp_utils import (
     configure_debug_env,
     configure_runtime_perf,
@@ -47,7 +51,7 @@ from dptb.plugins.monitor import (
 )
 from dptb.plugins.train_logger import Logger
 from dptb.plugins.saver import Saver
-from dptb.utils.argcheck import collect_cutoffs, chk_avg_per_iter
+from dptb.utils.argcheck import collect_cutoffs, chk_avg_per_iter, normalize
 from dptb.utils.cuda_cache_memory import (
     configure_cuda_cache_memory_monitor,
     cuda_cache_event_monitor_enabled,
@@ -316,7 +320,9 @@ def _multi_train_impl(
                 except Exception:
                     pass
 
-    jdata = load_multi_train_config(INPUT)
+    jdata, explicit_jdata = load_multi_train_config(INPUT, include_explicit=True)
+    explicit_train_options = copy.deepcopy(explicit_jdata.get("train_options", {}))
+    explicit_model_options = explicit_jdata.get("model_options", None)
 
     configure_debug_env(jdata.get("train_options", {}))
     configure_runtime_perf(jdata.get("train_options", {}))
@@ -346,11 +352,17 @@ def _multi_train_impl(
                 assert not restart, "json model can not be used as restart! should be a checkpoint file"
             else:
                 f = torch.load(f, map_location="cpu", weights_only=False)
-                if jdata.get("model_options", None) is None:
-                    jdata["model_options"] = f["config"]["model_options"]
+                checkpoint_train_options = migrate_legacy_checkpoint_train_options(
+                    f["config"].get("train_options", {})
+                )
+                checkpoint_model_options = migrate_legacy_checkpoint_model_options(
+                    f["config"]["model_options"]
+                )
+                if explicit_model_options is None:
+                    jdata["model_options"] = checkpoint_model_options
 
                 basis = f["config"]["common_options"]["basis"]
-                if len(f["config"]["model_options"]) == 1 and f["config"]["model_options"].get("nnsk") is not None:
+                if len(checkpoint_model_options) == 1 and checkpoint_model_options.get("nnsk") is not None:
                     for asym, orb in jdata["common_options"]["basis"].items():
                         assert asym in basis.keys(), f"Atom {asym} not found in model's basis"
                         if orb != basis[asym]:
@@ -366,25 +378,26 @@ def _multi_train_impl(
 
                 if restart:
                     jdata["train_options"] = merge_restart_train_options(
-                        jdata.get("train_options", None),
-                        f["config"].get("train_options", {}),
+                        explicit_train_options,
+                        checkpoint_train_options,
                         logger=log,
                     )
 
-                    if jdata.get("model_options", None) is None or jdata["model_options"] != f["config"]["model_options"]:
+                    if jdata.get("model_options", None) is None or jdata["model_options"] != checkpoint_model_options:
                         log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
-                        jdata["model_options"] = f["config"]["model_options"]
+                        jdata["model_options"] = checkpoint_model_options
                 else:
-                    if jdata.get("train_options", None) is None:
-                        jdata["train_options"] = f["config"]["train_options"]
-                    if jdata.get("model_options") is None:
-                        jdata["model_options"] = f["config"]["model_options"]
+                    if not explicit_train_options:
+                        jdata["train_options"] = checkpoint_train_options
+                    if explicit_model_options is None:
+                        jdata["model_options"] = checkpoint_model_options
                     for k, v in jdata["model_options"].items():
-                        if k not in f["config"]["model_options"]:
+                        if k not in checkpoint_model_options:
                             log.warning(f"The model options {k} is not defined in checkpoint, set to {v}.")
                         else:
-                            deep_dict_difference(k, v, f["config"]["model_options"])
+                            deep_dict_difference(k, v, checkpoint_model_options)
                 del f
+                jdata = normalize(jdata)
         else:
             j_must_have(jdata, "model_options")
             j_must_have(jdata, "train_options")
@@ -455,11 +468,8 @@ def _multi_train_impl(
 
     jdata["train_options"]["parallel_multi"] = parallel_multi
 
-    jdata["train_options"]["log_single_model_compatible_loss"] = bool(
-        jdata["train_options"].get("log_single_model_compatible_loss", True)
-    )
-    jdata["train_options"]["log_single_model_compatible_loss_mode"] = str(
-        jdata["train_options"].get("log_single_model_compatible_loss_mode", "reduce")
+    jdata["train_options"]["endpoint_loss_mode"] = str(
+        jdata["train_options"].get("endpoint_loss_mode", "reduce")
     )
 
     configure_cuda_cache_memory_monitor(
@@ -475,9 +485,8 @@ def _multi_train_impl(
     log.info(f"[MultiTrainer][rank={rank}] distributed_rank0_prepare_batch = {jdata['train_options'].get('distributed_rank0_prepare_batch', False)}")
     log.info(f"[MultiTrainer][rank={rank}] train_num_workers = {jdata['train_options'].get('train_num_workers', jdata['train_options'].get('num_workers', 0))}")
     log.info(
-        f"[MultiTrainer][rank={rank}] log_single_model_compatible_loss = "
-        f"{jdata['train_options']['log_single_model_compatible_loss']}, "
-        f"mode={jdata['train_options']['log_single_model_compatible_loss_mode']}"
+        f"[MultiTrainer][rank={rank}] endpoint_loss_mode = "
+        f"{jdata['train_options']['endpoint_loss_mode']}"
     )
     if cuda_cache_memory_monitor_enabled():
         log.info(
@@ -545,6 +554,16 @@ def _multi_train_impl(
         _, register_legacy_validation = resolve_flow_log_fields(
             getattr(trainer, "flow_cfm", None)
         )
+        train_endpoint_capable = trainer._supports_endpoint_triplet(
+            trainer.train_lossfunc
+        )
+        validation_endpoint_capable = bool(
+            validation_datasets
+            and trainer._supports_endpoint_triplet(trainer.validation_lossfunc)
+        )
+        register_legacy_validation = bool(
+            register_legacy_validation and validation_endpoint_capable
+        )
 
         if validation_datasets:
             validation_intervals = []
@@ -577,8 +596,9 @@ def _multi_train_impl(
         )
         trainer.register_plugin(LearningRateMonitor())
 
-        trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
-        trainer.register_plugin(TrainHoppingLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
+        if train_endpoint_capable:
+            trainer.register_plugin(TrainOnsiteLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
+            trainer.register_plugin(TrainHoppingLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(TrainZLossMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ExpertLoadCVMonitor(interval=[(1, 'iteration'), (1, 'epoch')]))
         trainer.register_plugin(ScalarFieldMonitor(stat_name="train_loss_opt", interval=[(1, 'iteration'), (1, 'epoch')]))
@@ -588,11 +608,14 @@ def _multi_train_impl(
             trainer.register_plugin(ScalarFieldMonitor(stat_name="validation_hopping_loss", interval=[(1, 'iteration'), (1, 'epoch')]))
 
         for i in range(trainer.num_experts):
-            trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_onsite", interval=[(1, 'iteration'), (1, 'epoch')]))
-            trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_hopping", interval=[(1, 'iteration'), (1, 'epoch')]))
+            if train_endpoint_capable:
+                trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_onsite", interval=[(1, 'iteration'), (1, 'epoch')]))
+                trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_hopping", interval=[(1, 'iteration'), (1, 'epoch')]))
             trainer.register_plugin(ScalarFieldMonitor(stat_name=f"expert_{i}_lr", interval=[(1, 'iteration'), (1, 'epoch')]))
 
-        log_field.extend(["mean_max_prob", "expert_load_cv", "train_onsite_loss", "train_hopping_loss"])
+        log_field.extend(["mean_max_prob", "expert_load_cv"])
+        if train_endpoint_capable:
+            log_field.extend(["train_onsite_loss", "train_hopping_loss"])
 
         cuda_memory_enabled = (
             bool(jdata["train_options"].get("monitor_cuda_memory", True))

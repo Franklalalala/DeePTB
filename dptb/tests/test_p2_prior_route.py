@@ -104,6 +104,23 @@ def test_strict_p2_full_h_config_and_semantic_guards():
         normalize(p2_as_target)
 
 
+def test_auxiliary_prior_scope_does_not_require_p2_dataset_fields():
+    payload = yaml.safe_load(
+        (REPO_ROOT / "configs" / "p2_prior_non_soc_full_h_smoke.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    payload["model_options"]["embedding"]["prior_init_scope"] = "auxiliary"
+    payload["model_options"]["prediction"]["reconstruction"] = "direct"
+    payload["data_options"]["train"]["get_P2"] = False
+    payload["data_options"]["train"]["require_p2_blocks"] = False
+
+    normalized = normalize(payload)
+
+    assert normalized["model_options"]["embedding"]["prior_init_scope"] == "auxiliary"
+    assert normalized["data_options"]["train"]["get_P2"] is False
+
+
 def test_p2_feature_and_block_contract_fails_closed():
     node = torch.zeros(2, 4)
     edge = torch.zeros(3, 4)
@@ -461,20 +478,22 @@ def _prior_model(device: str = "cpu"):
                 "so2_fusion_mode": "streamed_m_major_ref",
                 "rme_fusion_rank": 4,
                 "rme_fusion_init": 0.0,
-                "prior_kind": "p2",
-                "use_soft_edge_memory": True,
-                "soft_edge_memory_num_slots": 8,
-                "soft_edge_memory_num_heads": 2,
-                "soft_edge_memory_head_dim": 4,
-                "soft_edge_memory_gate_mode": "deepseek",
-                "soft_edge_memory_diagnostics_mode": "full",
+                "prior_init_scope": "both",
+                "soft_edge_memory": {
+                    "enabled": True,
+                    "num_slots": 8,
+                    "num_heads": 2,
+                    "head_dim": 4,
+                    "gate_mode": "deepseek",
+                    "diagnostics_mode": "full",
+                },
             },
             "prediction": {
                 "method": "block_native",
                 "scale_type": "no_scale",
                 "block_decoder": "expansion_cg",
                 "blockwise_hamiltonian": True,
-                "add_prior": True,
+                "reconstruction": "prior_residual",
             },
         },
         train_options={},

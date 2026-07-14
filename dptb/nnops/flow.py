@@ -15,9 +15,10 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from dptb.configuration import canonicalize_flow_options
 from dptb.data import AtomicDataDict, _keys
 from dptb.nnops import prior_physical
-from dptb.nnops.flow_context import CFMContext, PixelMFContext, _to_torch_dtype
+from dptb.nnops.flow_context import CFMContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
     BasisOnsiteFamily,
@@ -64,7 +65,7 @@ class HamiltonianCFM:
         dtype: Any = torch.float32,
         device: Any = torch.device("cpu"),
     ) -> None:
-        options = dict(options or {})
+        options = canonicalize_flow_options(options)
         self.enabled = bool(options.get("enabled", False))
         self.options = options
         self.idp = idp
@@ -123,7 +124,9 @@ class HamiltonianCFM:
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
         self.te_prior_sigma = float(options.get("te_prior_sigma", 1.0))
         default_te_prior_mode = "block" if self.prior == "block_te" else "irrep"
-        self.te_prior_mode = str(options.get("te_prior_mode", default_te_prior_mode)).lower().replace("-", "_")
+        self.te_prior_mode = str(options.get("te_prior_mode", "auto")).lower().replace("-", "_")
+        if self.te_prior_mode == "auto":
+            self.te_prior_mode = default_te_prior_mode
         if self.te_prior_mode == "type":
             self.te_prior_mode = "typewise"
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
@@ -215,34 +218,29 @@ class HamiltonianCFM:
         self.t_eps = float(options.get("t_eps", 1.0e-3))
         self.endpoint_weight_power = float(options.get("endpoint_weight_power", 0.0))
         self.endpoint_weight_cap = float(options.get("endpoint_weight_cap", 100.0))
-        self.omit_time_scaling = bool(options.get("omit_time_scaling", True))
-        self.validation_ode_steps = tuple(
-            sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
-        )
+        validation_ode_steps = {
+            int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0
+        }
+        # Euler-1 is the route-independent endpoint baseline. Additional steps
+        # are diagnostics; configuration may not disable the common curve.
+        validation_ode_steps.add(1)
+        self.validation_ode_steps = tuple(sorted(validation_ode_steps))
         self.apply_to_reference = bool(options.get("apply_to_reference", False))
-        self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
-        self.log_validation_random_t_loss = bool(
-            options.get("log_validation_random_t_loss", True)
+        self.validation_flow_metrics = frozenset(
+            str(value).lower().replace("-", "_")
+            for value in options.get(
+                "validation_flow_metrics",
+                ("random_t", "one_step", "trajectory"),
+            )
         )
-        self.log_validation_t0_loss = bool(
-            options.get("log_validation_t0_loss", True)
-        )
-        self.log_validation_flow_euler_loss = bool(
-            options.get("log_validation_flow_euler_loss", True)
-        )
-        self.log_train_compatible_loss = bool(
-            options.get("log_train_compatible_loss", self.log_compatible_loss)
-        )
-        self.log_validation_compatible_loss = bool(
-            options.get("log_validation_compatible_loss", self.log_compatible_loss)
-        )
-        self.compatible_loss_to_legacy_keys = bool(
-            options.get("compatible_loss_to_legacy_keys", True)
-        )
-        if self.enabled:
-            self.log_train_compatible_loss = True
-            self.log_validation_compatible_loss = True
-            self.compatible_loss_to_legacy_keys = True
+        self.log_validation_random_t_loss = "random_t" in self.validation_flow_metrics
+        self.log_validation_t0_loss = "one_step" in self.validation_flow_metrics
+        self.log_validation_flow_euler_loss = "trajectory" in self.validation_flow_metrics
+        # Endpoint-compatible metrics and their legacy aliases are a stable
+        # trainer contract, not optional logging features.
+        self.log_train_compatible_loss = True
+        self.log_validation_compatible_loss = True
+        self.compatible_loss_to_legacy_keys = True
         # Loss and regularization.
         self.loss_type = str(options.get("loss_type", "mse")).lower()
         if self.loss_type not in {"mse", "l1_rmse"}:
@@ -254,8 +252,15 @@ class HamiltonianCFM:
         # Safety switches.
         self.overwrite_feature_keys = bool(options.get("overwrite_feature_keys", True))
         self.detach_interpolated_h0 = bool(options.get("detach_interpolated_h0", True))
-        self.warn_missing_h0 = bool(options.get("warn_missing_h0", True))
-        self.strict_h0 = bool(options.get("strict_h0", True))
+        self.missing_h0_policy = str(options.get("missing_h0_policy", "error")).lower()
+        if self.missing_h0_policy not in {"error", "warn_zero", "zero"}:
+            raise ValueError(
+                "flow_options.missing_h0_policy must be 'error', 'warn_zero', or 'zero'."
+            )
+        # Read-only compatibility views for downstream code that inspected the
+        # old booleans. New configuration uses missing_h0_policy exclusively.
+        self.strict_h0 = self.missing_h0_policy == "error"
+        self.warn_missing_h0 = self.missing_h0_policy == "warn_zero"
         self.component_reduction = str(options.get("component_reduction", "global_elements")).lower()
         if self.component_reduction not in {"global_elements", "equal_components"}:
             raise ValueError(
@@ -406,7 +411,7 @@ class HamiltonianCFM:
             if self.strict_h0:
                 raise KeyError(
                     f"CFM residual mode requires `{h0_key}` for the {label} base; "
-                    "disable strict_h0 only for an explicit zero-base experiment."
+                    "set missing_h0_policy='zero' only for an explicit zero-base experiment."
                 )
             if self.warn_missing_h0:
                 log.warning(
@@ -1545,7 +1550,9 @@ class HamiltonianCFM:
         diff: torch.Tensor,
         mask: torch.Tensor,
         component: str,
-    ) -> Dict[str, torch.Tensor]:
+        *,
+        metric_space: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Collect non-CFM HamilLossAbs reductions from an already aligned diff."""
         with torch.no_grad():
             diff = diff.detach()
@@ -1557,10 +1564,39 @@ class HamiltonianCFM:
             f"{component}_l1_sum": abs_sum.detach(),
             f"{component}_mse_sum": square_sum.detach(),
             f"{component}_count": count.detach(),
+            "metric_space": metric_space
+            or ("block" if diff.ndim >= 3 else "rme"),
         }
 
+    @staticmethod
+    def _target_metric_space(target_key: str, tensor: torch.Tensor) -> str:
+        if "block" in str(target_key).lower():
+            return "block"
+        return "block" if tensor.ndim >= 3 else "rme"
+
+    @staticmethod
+    def _merge_compatible_clean_stats(
+        state: Dict[str, Any], stats: Dict[str, Any]
+    ) -> None:
+        """Merge endpoint sums only when node/edge share one representation."""
+
+        target = state.setdefault("_compatible_clean_stats", {})
+        existing_space = target.get("metric_space")
+        incoming_space = stats.get("metric_space")
+        if (
+            existing_space is not None
+            and incoming_space is not None
+            and str(existing_space) != str(incoming_space)
+        ):
+            raise ValueError(
+                "Flow endpoint metric-space mismatch between onsite and hopping "
+                f"targets: {existing_space!r} != {incoming_space!r}. Align "
+                "node_target_key and edge_target_key to one block or RME route."
+            )
+        target.update(stats)
+
     def _time_weight(self, t: torch.Tensor) -> torch.Tensor:
-        if self.omit_time_scaling or self.endpoint_weight_power == 0.0:
+        if self.endpoint_weight_power == 0.0:
             return torch.ones_like(t)
         denom = (1.0 - t).clamp_min(self.t_eps)
         w = denom.pow(-self.endpoint_weight_power)
@@ -1598,8 +1634,17 @@ class HamiltonianCFM:
                 node_diff, mask, self.loss_type, node_weights
             )
             if self.log_train_compatible_loss or self.log_validation_compatible_loss:
-                state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(node_diff, mask, "onsite")
+                self._merge_compatible_clean_stats(
+                    state,
+                    self._compatible_clean_stats(
+                        node_diff,
+                        mask,
+                        "onsite",
+                        metric_space=self._target_metric_space(
+                            self.node_target_key,
+                            node_diff,
+                        ),
+                    )
                 )
             total = self.node_weight * node_loss if total is None else total + self.node_weight * node_loss
             total_numerator = self.node_weight * node_numerator
@@ -1620,8 +1665,17 @@ class HamiltonianCFM:
                 edge_diff, mask, self.loss_type, edge_weights
             )
             if self.log_train_compatible_loss or self.log_validation_compatible_loss:
-                state.setdefault("_compatible_clean_stats", {}).update(
-                    self._compatible_clean_stats(edge_diff, mask, "hopping")
+                self._merge_compatible_clean_stats(
+                    state,
+                    self._compatible_clean_stats(
+                        edge_diff,
+                        mask,
+                        "hopping",
+                        metric_space=self._target_metric_space(
+                            self.edge_target_key,
+                            edge_diff,
+                        ),
+                    )
                 )
             total = self.edge_weight * edge_loss if total is None else total + self.edge_weight * edge_loss
             if total_numerator is None:
@@ -1772,9 +1826,11 @@ def build_hamiltonian_flow(
     dtype: Any = torch.float32,
     device: Any = torch.device("cpu"),
 ) -> HamiltonianCFM:
-    options = dict(options or {})
-    objective = str(options.get("objective", options.get("type", "cfm"))).lower()
+    options = canonicalize_flow_options(options)
+    objective = str(options.get("objective", "cfm")).lower()
     if objective in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
+        from dptb.nnops.flow_meanflow import HamiltonianPixelMeanFlow
+
         return HamiltonianPixelMeanFlow(options, idp=idp, dtype=dtype, device=device)
     return HamiltonianCFM(options, idp=idp, dtype=dtype, device=device)
 
@@ -1841,6 +1897,64 @@ def assert_flow_h0_keys_reach_model(flow: Any, model: Any) -> None:
     )
 
 
+def assert_model_in_loss_endpoint_metric_space(
+    flow: Any,
+    criterion: Any,
+    *,
+    criterion_name: str = "train",
+) -> None:
+    """Fail before training when MeanFlow and its endpoint criterion disagree.
+
+    Model-in-loss objectives build their compatible endpoint reductions directly
+    from ``flow.node_target_key`` / ``flow.edge_target_key``.  There is no model
+    output dictionary left for :class:`Trainer` to re-run a block criterion on,
+    so an RME-target MeanFlow cannot satisfy a block-native endpoint reducer.
+    Converting representations in this hot path is intentionally not an
+    implicit fallback: block-to-RME slice reductions can dominate a block-native
+    loss forward on GPU.
+
+    The check is deliberately limited to criteria that explicitly declare
+    ``endpoint_metric_space='block'`` and flows with ``model_in_loss=True``.
+    Other criteria keep their existing behavior.  At configuration time a
+    target key containing ``block`` is the flow's explicit block-space contract,
+    matching :meth:`HamiltonianCFM._target_metric_space` at runtime.
+    """
+    if (
+        flow is None
+        or not getattr(flow, "enabled", False)
+        or not getattr(flow, "model_in_loss", False)
+        or criterion is None
+    ):
+        return
+
+    metric_space = str(getattr(criterion, "endpoint_metric_space", "rme")).lower()
+    if metric_space != "block":
+        return
+
+    node_key = str(getattr(flow, "node_target_key", ""))
+    edge_key = str(getattr(flow, "edge_target_key", ""))
+    non_block_targets = []
+    if "block" not in node_key.lower():
+        non_block_targets.append(f"node_target_key={node_key!r}")
+    if "block" not in edge_key.lower():
+        non_block_targets.append(f"edge_target_key={edge_key!r}")
+    if not non_block_targets:
+        return
+
+    raise ValueError(
+        "Pixel MeanFlow endpoint metric-space mismatch at trainer initialization: "
+        f"the {criterion_name} criterion declares endpoint_metric_space='block', "
+        "but the configured MeanFlow target keys are not all block-space "
+        f"({', '.join(non_block_targets)}). MeanFlow computes endpoint statistics "
+        "directly in its target representation; Trainer will not perform an "
+        "implicit online block-to-RME or RME-to-block conversion. Configure "
+        "flow_options.node_target_key/edge_target_key as block-space endpoint "
+        "keys that the selected model route emits under the same names and align "
+        "the block criterion's prediction/target route, or use a matching "
+        "RME feature-space flow and endpoint criterion."
+    )
+
+
 def configure_jvp_friendly_backends(flow_options: Optional[Dict[str, Any]]) -> bool:
     """Best-effort process-level prep for the pixel-meanflow jvp backend.
 
@@ -1850,18 +1964,14 @@ def configure_jvp_friendly_backends(flow_options: Optional[Dict[str, Any]]) -> b
     resolved flow objective is meanflow-family with du_dt_backend=jvp.
     Returns True if e3nn was switched.
     """
-    options = dict(flow_options or {})
+    options = canonicalize_flow_options(flow_options)
     if not options.get("enabled", False):
         return False
-    objective = str(options.get("objective", options.get("type", "cfm"))).lower()
+    objective = str(options.get("objective", "cfm")).lower()
     if objective not in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
         return False
-    mf = dict(options.get("meanflow", options.get("pixel_meanflow", {})) or {})
-    backend = (
-        str(mf.get("du_dt_backend", mf.get("jvp_backend", "finite_difference")))
-        .lower()
-        .replace("-", "_")
-    )
+    mf = dict(options.get("meanflow", {}) or {})
+    backend = str(mf.get("du_dt_backend", "finite_difference")).lower().replace("-", "_")
     if backend != "jvp":
         return False
     try:
@@ -1945,17 +2055,14 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
     if not model_in_loss and getattr(flow, "log_validation_flow_euler_loss", True):
         for num_steps in ode_steps:
             fields.append(f"validation_flow_euler_{num_steps}_loss")
-    if getattr(flow, "log_train_compatible_loss", False) and not model_in_loss:
-        fields.extend(
-            [
-                "train_compatible_loss",
-                "train_compatible_onsite_loss",
-                "train_compatible_hopping_loss",
-            ]
-        )
+    # Euler-1 compatible metrics are exposed through the canonical non-CFM
+    # train/validation fields. Keep only extra-step endpoint diagnostics here
+    # to avoid duplicate TensorBoard curves.
     log_validation_compatible = True
     if log_validation_compatible:
         for num_steps in ode_steps:
+            if num_steps == 1:
+                continue
             fields.extend(
                 [
                     f"validation_compatible_euler_{num_steps}_loss",
@@ -1971,22 +2078,11 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
     return fields, register_legacy
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible re-export.  ``HamiltonianPixelMeanFlow`` now lives in
-# ``flow_meanflow``; importing it here (after ``HamiltonianCFM`` is defined,
-# which is what breaks the circular import) keeps existing
-# ``from dptb.nnops.flow import HamiltonianPixelMeanFlow`` call sites and the
-# ``build_hamiltonian_flow`` factory working. ``CFMContext``/``PixelMFContext``
-# /``_to_torch_dtype`` are already re-exported via the top-level flow_context
-# import.
-# When ``flow_meanflow`` is imported first, it triggers this module's execution
-# at its line-17 ``from dptb.nnops.flow import ...``; ``flow_meanflow`` is then
-# only partially initialised (its class not yet defined), so this import would
-# fail.  In that order the class is instead assigned back onto this module by
-# ``flow_meanflow`` once it finishes defining it, so tolerate the partial-init
-# ImportError here.
-# ---------------------------------------------------------------------------
-try:
-    from dptb.nnops.flow_meanflow import HamiltonianPixelMeanFlow
-except ImportError:
-    pass
+def __getattr__(name: str) -> Any:
+    """Lazy backward-compatible export without a circular-import side effect."""
+
+    if name == "HamiltonianPixelMeanFlow":
+        from dptb.nnops.flow_meanflow import HamiltonianPixelMeanFlow
+
+        return HamiltonianPixelMeanFlow
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

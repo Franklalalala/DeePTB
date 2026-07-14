@@ -1815,6 +1815,20 @@ class TensorBoardMonitor(Plugin):
 
     def register(self, trainer):
         self.trainer = trainer
+        for phase, metric_space in sorted(
+            getattr(trainer, "endpoint_metric_spaces", {}).items()
+        ):
+            self.writer.add_text(
+                f"metadata/{phase}_endpoint_metric_space",
+                str(metric_space),
+                0,
+            )
+            self.writer.add_scalar(
+                f"metadata/{phase}_endpoint_metric_space_is_rme",
+                1.0 if str(metric_space).lower() == "rme" else 0.0,
+                0,
+            )
+        self.writer.flush()
 
     def _to_float(self, val, default=None):
         if val is None:
@@ -1860,6 +1874,16 @@ class TensorBoardMonitor(Plugin):
             )
         return sorted(names)
 
+    @staticmethod
+    def _is_extra_flow_metric(name):
+        """Keep flow diagnostics without duplicating the common endpoint tags."""
+
+        if name.startswith(("train_flow_", "validation_flow_")):
+            return True
+        return name.startswith("validation_compatible_euler_") and not name.startswith(
+            "validation_compatible_euler_1_"
+        )
+
     def _write_epoch_stat(self, stat_name, tag, epoch, *, require_updated=False):
         if stat_name not in self.trainer.stats:
             return
@@ -1891,6 +1915,12 @@ class TensorBoardMonitor(Plugin):
             iteration_step,
         )
         self._write_validation_iter_stat_from_epoch(
+            'validation_loss_opt',
+            'validation_loss_opt_iter/iteration',
+            epoch,
+            iteration_step,
+        )
+        self._write_validation_iter_stat_from_epoch(
             'validation_onsite_loss',
             'validation_onsite_loss_iter/iteration',
             epoch,
@@ -1904,7 +1934,7 @@ class TensorBoardMonitor(Plugin):
         )
 
         for name in sorted(self.trainer.stats):
-            if not name.startswith(("validation_flow_", "validation_compatible_")):
+            if not self._is_extra_flow_metric(name):
                 continue
             self._write_validation_iter_stat_from_epoch(
                 name,
@@ -1929,6 +1959,11 @@ class TensorBoardMonitor(Plugin):
             if self._epoch_stat_updated('validation_loss', epoch)
             else None
         )
+        validation_loss_opt_mean = (
+            self._get_stat('validation_loss_opt', 'epoch_mean', None)
+            if self._epoch_stat_updated('validation_loss_opt', epoch)
+            else None
+        )
         total_grad_norm_mean = self._get_stat('total_grad_norm', 'epoch_mean', None)
 
         if lr is not None:
@@ -1941,11 +1976,15 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('test_loss_mean/epoch', test_loss_mean, epoch)
         if validation_loss_mean is not None:
             self.writer.add_scalar('validation_loss_mean/epoch', validation_loss_mean, epoch)
+        if validation_loss_opt_mean is not None:
+            self.writer.add_scalar(
+                'validation_loss_opt_mean/epoch', validation_loss_opt_mean, epoch
+            )
         if total_grad_norm_mean is not None:
             self.writer.add_scalar('total_grad_norm_mean/epoch', total_grad_norm_mean, epoch)
 
         for name in sorted(self.trainer.stats):
-            if not name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_")):
+            if not self._is_extra_flow_metric(name):
                 continue
             if name.startswith("validation_") and not self._epoch_stat_updated(name, epoch):
                 continue
@@ -2032,6 +2071,11 @@ class TensorBoardMonitor(Plugin):
             if self._iter_stat_updated('validation_loss', iteration)
             else None
         )
+        validation_loss_opt = (
+            self._get_stat('validation_loss_opt', 'last', None)
+            if self._iter_stat_updated('validation_loss_opt', iteration)
+            else None
+        )
         validation_onsite = (
             self._get_stat('validation_onsite_loss', 'last', None)
             if self._iter_stat_updated('validation_onsite_loss', iteration)
@@ -2061,18 +2105,20 @@ class TensorBoardMonitor(Plugin):
             self.writer.add_scalar('total_grad_norm_iter/iteration', total_grad_norm, iteration)
         if validation_loss is not None:
             self.writer.add_scalar('validation_loss_iter/iteration', validation_loss, iteration)
+        if validation_loss_opt is not None:
+            self.writer.add_scalar(
+                'validation_loss_opt_iter/iteration', validation_loss_opt, iteration
+            )
         if validation_onsite is not None:
             self.writer.add_scalar('validation_onsite_loss_iter/iteration', validation_onsite, iteration)
         if validation_hopping is not None:
             self.writer.add_scalar('validation_hopping_loss_iter/iteration', validation_hopping, iteration)
 
         flow_names = {
-            name for name in self.trainer.stats
-            if name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_"))
+            name for name in self.trainer.stats if self._is_extra_flow_metric(name)
         }
         flow_names.update(
-            name for name in kwargs
-            if name.startswith(("train_flow_", "train_compatible_", "validation_flow_", "validation_compatible_"))
+            name for name in kwargs if self._is_extra_flow_metric(name)
         )
         for name in sorted(flow_names):
             value = self._get_value(name, 'last', kwargs, default=None)

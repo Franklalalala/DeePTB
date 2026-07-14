@@ -50,7 +50,7 @@ train_options:
     te_prior_mode: typewise
     te_prior_sigma: 0.25
     te_prior_per_graph: true
-    strict_h0: true
+    missing_h0_policy: error
     node_target_key: node_features
     edge_target_key: edge_features
     node_h0_key: node_h0
@@ -63,14 +63,7 @@ train_options:
     t_min: 0.0
     t_max: 0.999
     t0_probability: 0.0
-    omit_time_scaling: true
     endpoint_weight_power: 0.0
     endpoint_weight_cap: 100.0
     validation_ode_steps: [1]
-    log_compatible_loss: true
-    log_validation_random_t_loss: true
-    log_validation_t0_loss: true
-    log_validation_flow_euler_loss: true
-    log_train_compatible_loss: true
-    log_validation_compatible_loss: true
-    compatible_loss_to_legacy_keys: true
+    validation_flow_metrics: [random_t, one_step, trajectory]

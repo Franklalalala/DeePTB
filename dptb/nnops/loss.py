@@ -616,6 +616,9 @@ from typing import Dict, Union
 
 @Loss.register("hamil_abs")
 class HamilLossAbs(nn.Module):
+    supports_endpoint_triplet = True
+    endpoint_metric_space = "rme"
+
     def __init__(
             self,
             basis: Dict[str, Union[str, list]] = None,

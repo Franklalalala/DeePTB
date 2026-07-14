@@ -102,7 +102,7 @@ module with Slater-Koster parameters:
     "prior_skdata": "/path/to/slater_koster_files_or_skparams.pth",
     "dftb_prior_overlap": false,
     "dftb_prior_require_geometry": true,
-    "strict_h0": false,
+    "missing_h0_policy": "warn_zero",
     "physical_prior_jitter_sigma": 0.02,
     "physical_prior_jitter_reference_scale": true,
     "physical_prior_jitter_edge_decay": 3.0
@@ -129,12 +129,37 @@ entries receive smaller perturbations.
 
 ## Comparable loss keys
 
-For CFM and Pixel MeanFlow runs, `train_loss`, `train_onsite_loss`,
-`train_hopping_loss`, `validation_loss`, `validation_onsite_loss`, and
-`validation_hopping_loss` are reserved for endpoint-compatible metrics, so they
-can be plotted against non-CFM runs. The actual flow/semigroup optimization
-objective remains visible under `train_loss_opt`, `train_flow_loss`, and
-`train_flow_*` / `validation_flow_*` keys.
+For non-CFM, block-native/P2, CFM, and Pixel MeanFlow runs, `train_loss`,
+`train_onsite_loss`, `train_hopping_loss`, `validation_loss`,
+`validation_onsite_loss`, and `validation_hopping_loss` are reserved for the
+route's clean endpoint metric. Feature/RME non-CFM, CFM, and MeanFlow use the
+same `hamil_abs` reduction and can be plotted together.
+
+Block-native heads use AO-block endpoint reductions by default. They keep the
+same six tag names, so a block-flow run can be compared with its block-native
+non-CFM baseline, but those values must not be presented as RME-space values.
+Setting `log_feature_compatible=true` on a blockwise loss opts into the exact old
+RME-compatible slice reduction. That slice walk does not materialize a full RME
+tensor, but it launches many small GPU reductions; prefer enabling it only on a
+separate validation loss when cross-representation comparison is essential.
+
+Pixel MeanFlow is a model-in-loss route: its training endpoint statistics are
+reduced directly from `flow_options.node_target_key` and `edge_target_key`.
+Consequently, a block-native training criterion (`endpoint_metric_space=block`)
+must use explicit block-space MeanFlow target keys that the selected model route
+also emits under those same names, with the criterion prediction/target route
+aligned. The default `node_features` / `edge_features` targets are RME-space and
+are rejected with a configuration-time error when paired with a block endpoint
+criterion. The Trainer intentionally does not add an online block-to-RME or
+RME-to-block conversion. If a model route cannot expose its endpoint under a
+shared block-space key, use the matching RME feature route/criterion instead.
+
+The actual block/flow/semigroup optimization objective remains visible under
+`train_loss_opt`. Single-Trainer flow runs additionally expose their detailed
+`train_flow_*` / `validation_flow_*` diagnostics; MultiTrainer does not invent
+a flow-only scalar when it cannot aggregate that objective unambiguously.
+TensorBoard hides the duplicate Euler-1 `compatible` aliases; extra Euler-step
+endpoint diagnostics remain available.
 
 ## Time-embedding vs finite-difference scale
 

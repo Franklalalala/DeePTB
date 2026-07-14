@@ -7,6 +7,7 @@ from torch import nn
 from types import SimpleNamespace
 
 from dptb.nnops import trainer as trainer_mod
+from dptb.nnops.base_trainer import BaseTrainer
 from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.nnops.trainer import Trainer
 
@@ -73,6 +74,41 @@ class RecordingLoss:
             )
         )
         return loss
+
+
+class ScalarLoss:
+    """A non-Hamiltonian criterion with no endpoint component side effects."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, batch, batch_for_loss):
+        self.calls.append(batch["name"])
+        return batch["pred"].sum()
+
+
+class DistinctEndpointLoss:
+    supports_endpoint_triplet = True
+
+    def __init__(self, endpoint_loss):
+        self.endpoint_loss = float(endpoint_loss)
+
+    def __call__(self, batch, batch_for_loss):
+        objective = batch["pred"].sum()
+        self.last_endpoint_loss = objective.detach().new_tensor(self.endpoint_loss)
+        self.last_onsite_loss = objective.detach().new_tensor(self.endpoint_loss + 1.0)
+        self.last_hopping_loss = objective.detach().new_tensor(self.endpoint_loss + 2.0)
+        return objective
+
+
+class RecordingMetricScheduler:
+    requires_metric = True
+
+    def __init__(self):
+        self.metrics = []
+
+    def step(self, metric):
+        self.metrics.append(float(metric))
 
 
 class CountingSGD(torch.optim.SGD):
@@ -232,6 +268,18 @@ def _fake_trainer(monkeypatch):
     return trainer, events, observed_states
 
 
+def _fake_validation_trainer(monkeypatch, lossfunc):
+    monkeypatch.setattr(trainer_mod.AtomicData, "to_AtomicDataDict", _batch_to_dict)
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = TinyModel([])
+    trainer.device = torch.device("cpu")
+    trainer.dtype = torch.float32
+    trainer.validation_loader = [FakeBatch("validation", 3.0)]
+    trainer.validation_lossfunc = lossfunc
+    trainer.flow_cfm = SimpleNamespace(enabled=False)
+    return trainer
+
+
 def test_optimizer_diagnostics_follow_display_frequency():
     trainer = Trainer.__new__(Trainer)
     trainer.optimizer_diagnostics_freq = 100
@@ -242,6 +290,141 @@ def test_optimizer_diagnostics_follow_display_frequency():
     assert not trainer._optimizer_diagnostics_due()
     trainer.iter = 100
     assert trainer._optimizer_diagnostics_due()
+
+
+def test_nonflow_scalar_criterion_survives_train_and_validation_without_triplet(
+    monkeypatch,
+):
+    trainer, _events, observed_states = _fake_trainer(monkeypatch)
+    train_loss = ScalarLoss()
+    trainer.train_lossfunc = train_loss
+
+    objective = trainer.iteration(FakeBatch("train", 2.0))
+
+    assert objective.item() == pytest.approx(2.0)
+    assert train_loss.calls == ["train"]
+    train_state = observed_states[0][2]
+    assert train_state["train_loss"].item() == pytest.approx(2.0)
+    assert train_state["train_loss_opt"].item() == pytest.approx(2.0)
+    assert "train_onsite_loss" not in train_state
+    assert "train_hopping_loss" not in train_state
+
+    validation_loss = ScalarLoss()
+    validation_trainer = _fake_validation_trainer(monkeypatch, validation_loss)
+    public_validation_loss = validation_trainer.validation(fast=True)
+
+    assert public_validation_loss.item() == pytest.approx(3.0)
+    assert validation_loss.calls == ["validation"]
+    validation_state = validation_trainer._last_flow_validation_state
+    assert validation_state["validation_loss"].item() == pytest.approx(3.0)
+    assert "validation_onsite_loss" not in validation_state
+    assert "validation_hopping_loss" not in validation_state
+
+
+def test_nonflow_per_iteration_scheduler_uses_objective_while_public_loss_is_endpoint(
+    monkeypatch,
+):
+    trainer, _events, observed_states = _fake_trainer(monkeypatch)
+    trainer.train_lossfunc = DistinctEndpointLoss(endpoint_loss=13.0)
+    trainer.update_lr_per_iter = True
+    trainer.iter = 2
+    trainer.stats = {
+        "train_loss": {"latest_avg_iter_loss": torch.tensor(91.0)},
+        "train_loss_opt": {"latest_avg_iter_loss": torch.tensor(17.0)},
+    }
+    trainer.lr_scheduler = RecordingMetricScheduler()
+
+    objective = trainer.iteration(FakeBatch("train", 2.0))
+
+    assert trainer.lr_scheduler.metrics == pytest.approx([17.0])
+    assert objective.item() == pytest.approx(2.0)
+    state = observed_states[0][2]
+    assert state["train_loss"].item() == pytest.approx(13.0)
+    assert state["train_loss_opt"].item() == pytest.approx(2.0)
+
+
+def test_flow_per_iteration_scheduler_keeps_endpoint_metric(monkeypatch):
+    trainer, _events, observed_states = _fake_trainer(monkeypatch)
+    trainer.flow_cfm = SimpleNamespace(enabled=True)
+    trainer.update_lr_per_iter = True
+    trainer.iter = 2
+    trainer.stats = {
+        "train_loss": {"latest_avg_iter_loss": torch.tensor(91.0)},
+        "train_loss_opt": {"latest_avg_iter_loss": torch.tensor(17.0)},
+    }
+    trainer.lr_scheduler = RecordingMetricScheduler()
+
+    def fake_flow_loss(batch, lossfunc, *, use_flow=True, allow_self_consistency=True):
+        trainer._last_flow_state = {
+            "train_loss": torch.tensor(13.0),
+            "train_onsite_loss": torch.tensor(14.0),
+            "train_hopping_loss": torch.tensor(15.0),
+        }
+        return trainer.model.weight * batch.x
+
+    trainer._loss_on_batch = fake_flow_loss
+
+    objective = trainer.iteration(FakeBatch("train", 2.0))
+
+    assert trainer.lr_scheduler.metrics == pytest.approx([91.0])
+    assert objective.item() == pytest.approx(2.0)
+    state = observed_states[0][2]
+    assert state["train_loss"].item() == pytest.approx(13.0)
+    assert state["train_loss_opt"].item() == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("prefer_objective", "flow_enabled", "expected_metric"),
+    [(True, False, 19.0), (True, True, 11.0), (False, False, 11.0)],
+)
+def test_epoch_scheduler_respects_single_trainer_objective_contract(
+    prefer_objective,
+    flow_enabled,
+    expected_metric,
+):
+    scheduler = RecordingMetricScheduler()
+    trainer = SimpleNamespace(
+        ep=1,
+        plugin_queues={},
+        epoch=lambda: None,
+        call_plugins=lambda **kwargs: None,
+        update=lambda: None,
+        update_lr_per_iter=False,
+        scheduler_metric_prefers_objective=prefer_objective,
+        lr_scheduler=scheduler,
+        flow_cfm=SimpleNamespace(enabled=flow_enabled),
+        stats={
+            "validation_loss": {"epoch_mean": torch.tensor(11.0)},
+            "validation_loss_opt": {"epoch_mean": torch.tensor(19.0)},
+            "train_loss": {"epoch_mean": torch.tensor(31.0)},
+            "train_loss_opt": {"epoch_mean": torch.tensor(37.0)},
+        },
+    )
+
+    BaseTrainer.run(trainer, epochs=1)
+
+    assert scheduler.metrics == pytest.approx([expected_metric])
+
+
+def test_scheduler_metric_preference_contract_is_single_trainer_only():
+    assert Trainer.scheduler_metric_prefers_objective is True
+    assert MultiTrainer.scheduler_metric_prefers_objective is False
+
+
+def test_nonflow_validation_keeps_endpoint_public_and_objective_separate(monkeypatch):
+    trainer = _fake_validation_trainer(
+        monkeypatch,
+        DistinctEndpointLoss(endpoint_loss=23.0),
+    )
+
+    public_validation_loss = trainer.validation(fast=True)
+
+    assert public_validation_loss.item() == pytest.approx(23.0)
+    state = trainer._last_flow_validation_state
+    assert state["validation_loss"].item() == pytest.approx(23.0)
+    assert state["validation_loss_opt"].item() == pytest.approx(3.0)
+    assert state["validation_onsite_loss"].item() == pytest.approx(24.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(25.0)
 
 
 def test_iteration_uses_reference_loss_and_backwards_train_before_reference(monkeypatch):
@@ -261,7 +444,11 @@ def test_iteration_uses_reference_loss_and_backwards_train_before_reference(monk
         "reference_backward:reference"
     )
     assert trainer.optimizer.step_calls == 1
+    # iteration() returns the differentiated objective, including reference
+    # supervision; the canonical endpoint remains scoped to the main batch.
     assert loss.item() == pytest.approx(5.0)
+    assert observed_states[0][2]["train_loss"].item() == pytest.approx(2.0)
+    assert observed_states[0][2]["train_loss_opt"].item() == pytest.approx(5.0)
     assert observed_states[0][2]["batch_cost"] == 7
     assert observed_states[0][2]["batch_num_nodes"] == 2
     assert observed_states[0][2]["train_onsite_loss"].item() == pytest.approx(11.0)
