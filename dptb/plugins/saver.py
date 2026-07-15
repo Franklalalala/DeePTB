@@ -707,7 +707,7 @@ class Saver(Plugin, StatefulPlugin):
             kind=CHECKPOINT_KIND_ITERATION,
         )
 
-        if self._is_main():
+        def _publish_iteration():
             if delete_name is not None:
                 delete_path = os.path.join(self.checkpoint_path, delete_name + ".pth")
                 try:
@@ -723,6 +723,10 @@ class Saver(Plugin, StatefulPlugin):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
                 self._atomic_publish(latest_ckpt_abs_path, latest_symlink)
             self._write_manifest()
+
+        # Publish is an agreed phase: a main-rank failure raises on ALL ranks
+        # (P0-4) instead of leaving them to wedge at the next collective.
+        self._finalize_publish(_publish_iteration)
 
         self._last_iteration_checkpoint_name = name
         self._last_iteration_checkpoint_iter = self.trainer.iter
@@ -770,7 +774,7 @@ class Saver(Plugin, StatefulPlugin):
                 kind=CHECKPOINT_KIND_EPOCH,
             )
 
-            if self._is_main():
+            def _publish_epoch_best():
                 if delete_name is not None:
                     delete_path = os.path.join(self.checkpoint_path, delete_name + ".pth")
                     if os.path.exists(delete_path):
@@ -788,6 +792,9 @@ class Saver(Plugin, StatefulPlugin):
                     self._atomic_publish(best_ckpt_abs_path, latest_symlink)
 
                 self._write_manifest()
+
+            # Agreed publish phase (P0-4): all ranks share the outcome.
+            self._finalize_publish(_publish_epoch_best)
 
     def _safe_harvest_plugin_states(self):
         harvester = getattr(self.trainer, "harvest_plugin_states", None)
@@ -832,7 +839,8 @@ class Saver(Plugin, StatefulPlugin):
         return ts.state_dict()
 
     def _assemble_checkpoint_obj(self, name, kind, model_options, common_options,
-                                 train_options, model_state, opt_blocks):
+                                 train_options, model_state, opt_blocks,
+                                 rank_states=None):
         """ONE checkpoint-dict assembly shared by single and dist-expert paths.
 
         Carries both the historical flat keys (``epoch``/``iteration``/``stats``
@@ -858,12 +866,62 @@ class Saver(Plugin, StatefulPlugin):
         # Single source of truth: the flat legacy key mirrors training_state's
         # canonical last-completed-step, so old and new readers agree.
         obj["iteration"] = int(training_state.get("global_step", self.trainer.iter))
+        # Per-rank resume state (P0-3): restore prefers the own-rank entry over
+        # the main-rank blob inside training_state.
+        obj["rank_states"] = dict(rank_states or {})
         # Top-level mirror keeps the legacy reader trivially able to find plugin
         # state even if it never learns the training_state schema.
         obj["plugin_state"] = training_state.get("plugin_state", {})
         for block in opt_blocks:
             obj.update(block)
         return obj
+
+    def _collect_rank_states(self):
+        """Gather per-rank resume state (P0-3: rank-local RNG).
+
+        The training-state blob is assembled on the main rank only, so its
+        ``rng_state`` is rank0's — restoring it identically on every rank would
+        correlate the ranks' dropout/noise streams. Collect each rank's own
+        snapshot with a collective (runs on ALL ranks in the distributed path)
+        and store them keyed by global rank; restore picks the own entry.
+        """
+        local = {"rng_state": capture_rng_state()}
+        if dist.is_available() and dist.is_initialized():
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local)
+            return {str(i): s for i, s in enumerate(gathered)}
+        return {"0": local}
+
+    def _finalize_publish(self, publish_fn):
+        """Run the main-rank retention/publish/manifest block as an agreed phase.
+
+        The checkpoint bytes are already committed by ``_save``; pointer
+        publication happens only on the main rank. If that fails, the other
+        ranks must not sail on into the next training collective (they would
+        wedge once the main rank died) — broadcast the outcome, raise uniformly
+        on every rank, then barrier so all ranks leave the checkpoint phase
+        together (P0-4).
+        """
+        publish_ok = [True]
+        publish_err = None
+        if self._is_main():
+            try:
+                publish_fn()
+            except Exception as exc:
+                publish_ok[0] = False
+                publish_err = exc
+                log.error("checkpoint publish failed on main rank: %s", exc)
+        dist_ready = dist.is_available() and dist.is_initialized()
+        if dist_ready:
+            dist.broadcast_object_list(publish_ok, src=0)
+        if not publish_ok[0]:
+            if publish_err is not None:
+                raise publish_err
+            raise RuntimeError(
+                "checkpoint publish failed on the main rank; aborting on all ranks"
+            )
+        if dist_ready:
+            self._barrier_on_current_device()
 
     def _save(self, name, model, model_options, common_options, train_options,
               kind=CHECKPOINT_KIND_ITERATION):
@@ -874,6 +932,8 @@ class Saver(Plugin, StatefulPlugin):
         if self._is_dist_expert():
             with self._profile_stage("gather_dist_states"):
                 expert_states, opt_states, sch_states = self._gather_dist_states()
+            # Collective: every rank contributes its own RNG snapshot (P0-3).
+            rank_states = self._collect_rank_states()
 
             # Rank0 writes; all ranks agree on success BEFORE the barrier so a
             # rank0 failure raises uniformly instead of leaving the other ranks
@@ -889,6 +949,7 @@ class Saver(Plugin, StatefulPlugin):
                         full_model_state,
                         [{"optimizers_state_dict": opt_states,
                           "lr_schedulers_state_dict": sch_states}],
+                        rank_states=rank_states,
                     )
                     f_path = os.path.join(self.checkpoint_path, name + ".pth")
                     self._profile_record(
@@ -941,6 +1002,7 @@ class Saver(Plugin, StatefulPlugin):
         obj = self._assemble_checkpoint_obj(
             name, kind, model_options, common_options, train_options,
             model_state, [optim_state, sched_state],
+            rank_states=self._collect_rank_states(),
         )
 
         f_path = os.path.join(self.checkpoint_path, name + ".pth")

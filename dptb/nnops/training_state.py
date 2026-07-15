@@ -228,3 +228,26 @@ def read_resume_metadata(ckpt: Dict[str, Any]) -> TrainingState:
         plugin_state=ckpt.get("plugin_state", {}) or {},
         schema_version=int(ckpt.get("checkpoint_schema_version", 0)),
     )
+
+
+def resolve_rank_rng_state(ckpt: Dict[str, Any], resume: "TrainingState") -> Optional[Dict[str, Any]]:
+    """Pick the RNG snapshot THIS process should restore (P0-3).
+
+    Checkpoints carry per-rank snapshots under ``rank_states`` (keyed by global
+    rank as a string); the training-state blob's single ``rng_state`` was
+    captured on the assembling (main) rank. Restoring that one blob on every
+    rank would correlate the ranks' dropout/noise streams, so prefer the
+    own-rank entry and fall back to the legacy blob only when absent.
+    """
+    rank = 0
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+    except Exception:  # pragma: no cover - defensive
+        rank = 0
+    rank_states = ckpt.get("rank_states") or {}
+    own = rank_states.get(str(rank))
+    if isinstance(own, dict) and own.get("rng_state") is not None:
+        return own["rng_state"]
+    return resume.rng_state

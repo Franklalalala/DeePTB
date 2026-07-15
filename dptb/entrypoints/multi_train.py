@@ -441,7 +441,14 @@ def _multi_train_impl(
                 **jdata["common_options"]
             )
 
-    jdata["common_options"]["overlap"] = False
+    # NOTE: an old hack mutated jdata["common_options"]["overlap"] = False here
+    # ("datasets consumed the flag"). The MODEL is built from the pristine
+    # deepcopy taken above (build_common_options, line ~416) so it kept its
+    # overlap head — but the MUTATED dict flowed into MultiTrainer and was
+    # persisted as the checkpoint's config, so every restart rebuilt the
+    # ensemble WITHOUT the overlap head and failed strict state loading
+    # (unexpected experts.*.overlaponsite_param/edge_prediction_s.* keys).
+    # The trainer itself never consumes the flag; keep the config truthful.
 
     distance_ranges = jdata["train_options"].get(
         "distance_ranges",

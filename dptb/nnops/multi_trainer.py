@@ -40,6 +40,7 @@ from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
     read_resume_metadata,
+    resolve_rank_rng_state,
     restore_rng_state,
 )
 from dptb.nnops.expert_parallel_layout import (
@@ -80,6 +81,23 @@ def _resolve_local_expert_dp_batch_size(
             "Set the corresponding expert DP batch size semantics to 'local' to opt into per-rank semantics."
         )
     return batch_size // expert_data_parallel_size
+
+
+def _state_dict_has_overlap_head(state_dict) -> bool:
+    """Whether a (wrapper) state dict contains overlap-head parameters.
+
+    Used by restart to reconcile a checkpoint whose config claims
+    ``overlap=False`` while its weights carry the overlap head (written by an
+    entrypoint version that mutated the flag after model construction).
+    """
+    try:
+        keys = state_dict.keys()
+    except AttributeError:  # pragma: no cover - defensive
+        return False
+    return any(
+        ("overlaponsite_param" in k) or ("edge_prediction_s." in k)
+        for k in keys
+    )
 
 
 def _base_train_options_for_multitrainer(train_options: dict) -> dict:
@@ -2636,6 +2654,11 @@ class MultiTrainer(Trainer):
             dynamic_batch_state=dynamic_batch_state,
         )
 
+        # The optimizer step for this batch is committed: advance the per-epoch
+        # cursor BEFORE plugins so a checkpoint fired here persists the correct
+        # mid-epoch position (OOM-skip paths return earlier and do not count).
+        self._batch_in_epoch = getattr(self, "_batch_in_epoch", 0) + 1
+
         if self._should_flush_display_window_now(self.iter):
             state = self._flush_display_window(time_idx=self.iter)
             if state is not None:
@@ -2953,6 +2976,11 @@ class MultiTrainer(Trainer):
                     self._add_optimizer_diagnostics_to_state(state)
                 self._add_cuda_memory_state(state, self._gather_cuda_memory_metrics())
 
+                # All expert optimizer steps for this batch are committed:
+                # advance the per-epoch cursor BEFORE plugins so a checkpoint
+                # fired here persists the correct mid-epoch position.
+                self._batch_in_epoch = getattr(self, "_batch_in_epoch", 0) + 1
+
                 with self._tagger.tag("iteration/call_plugins", it=self.iter):
                     self.call_plugins(queue_name='iteration', time=self.iter, **state)
 
@@ -2989,6 +3017,9 @@ class MultiTrainer(Trainer):
     # ---------------------------------------------------------------------
 
     def epoch(self) -> None:
+        # Reset the committed-batch cursor at each epoch start (mirrors
+        # Trainer.epoch) so iteration checkpoints persist a per-epoch position.
+        self._batch_in_epoch = 0
         self._set_expert_dp_sampler_epoch(self.ep)
 
         if self.distributed_expert and self.distributed_rank0_prepare_batch:
@@ -3416,6 +3447,21 @@ class MultiTrainer(Trainer):
         merged_common_options = copy.deepcopy(ckpt["config"]["common_options"])
         merged_common_options.update(common_options or {})
 
+        # Fail-safe for checkpoints written while an entrypoint hack mutated
+        # common_options["overlap"]=False AFTER the model was built with the
+        # pristine flag: the persisted config then contradicts the persisted
+        # weights and a strict ensemble rebuild fails on unexpected
+        # overlap-head keys. The weights are the ground truth — infer the flag.
+        state_for_probe = ckpt.get("model_state_dict") or {}
+        if not merged_common_options.get("overlap", False) and _state_dict_has_overlap_head(state_for_probe):
+            log.warning(
+                "Checkpoint config says overlap=False but the model state "
+                "contains overlap-head parameters; rebuilding with "
+                "overlap=True (config was written by a version that mutated "
+                "the flag after model construction)."
+            )
+            merged_common_options["overlap"] = True
+
         build_common_options = copy.deepcopy(merged_common_options)
         if distributed_expert:
             build_common_options["device"] = "cpu"
@@ -3466,24 +3512,56 @@ class MultiTrainer(Trainer):
                 items = getattr(trainer, key, None)
                 if items is not None:
                     saved_states = ckpt[key + "_state_dict"]
+                    # Strict length check: a silent zip truncation would leave
+                    # some experts on freshly-initialized optimizer/scheduler
+                    # state while others resume — a hard-to-detect divergence.
+                    if len(saved_states) != len(items):
+                        raise RuntimeError(
+                            f"Checkpoint {key}_state_dict holds "
+                            f"{len(saved_states)} entries but the trainer has "
+                            f"{len(items)} experts; refusing a partial restore."
+                        )
                     for obj, state in zip(items, saved_states):
                         if obj is not None:
                             obj.load_state_dict(state)
 
         if resume.checkpoint_kind == CHECKPOINT_KIND_ITERATION:
-            # Mid-epoch checkpoint: re-enter the SAME epoch so its remaining
-            # batches are not skipped (BUG 1). The multi-GPU sampler layout makes
-            # an exact per-batch fast-forward invasive, so take the documented
-            # safe path: re-run the epoch from its start (ep = ckpt_epoch, not
-            # +1). No batch/sampler cursor -> no mid-epoch RNG restore.
+            # Mid-epoch checkpoint: the checkpointed models/optimizers already
+            # contain the committed prefix's updates, and MultiTrainer has no
+            # exact per-batch fast-forward yet — re-running the epoch would
+            # apply those optimizer steps a second time. Fail closed unless the
+            # user explicitly opts into the inexact re-run.
+            if os.environ.get("DPTB_ALLOW_INEXACT_RESUME", "").strip() not in ("1", "true", "True"):
+                raise RuntimeError(
+                    "Cannot resume a MultiTrainer run from a mid-epoch "
+                    "(iteration) checkpoint: no exact batch fast-forward is "
+                    "implemented for the expert-parallel loaders, and re-running "
+                    "the epoch re-applies the committed prefix's optimizer "
+                    "updates. Resume from the last epoch checkpoint instead, or "
+                    "set DPTB_ALLOW_INEXACT_RESUME=1 to accept the inexact "
+                    "re-run."
+                )
+            log.warning(
+                "DPTB_ALLOW_INEXACT_RESUME=1: re-running epoch %s from its "
+                "start; optimizer updates for the committed prefix WILL be "
+                "applied a second time.",
+                int(resume.epoch),
+            )
             trainer.ep = int(resume.epoch)
+            # The restored stats hold the committed prefix's partial per-epoch
+            # accumulators; the full re-run would double-count them into
+            # epoch_mean (plateau LR + best gate). Reset before training.
+            trainer._reset_epoch_metric_accumulators()
         else:
             # Epoch-committed checkpoint: advance and replay the one pending
             # per-epoch LR step (Saver.epoch persists the scheduler before run()
             # steps it) to avoid an off-by-one LR transition on resume (BUG 1).
             trainer.ep = int(resume.epoch) + 1
-            if resume.rng_state is not None:
-                restore_rng_state(resume.rng_state)
+            # Prefer this rank's own RNG snapshot over the main-rank blob (P0-3)
+            # so the ranks' dropout/noise streams stay decorrelated on resume.
+            own_rng = resolve_rank_rng_state(ckpt, resume)
+            if own_rng is not None:
+                restore_rng_state(own_rng)
             if resume.epoch_scheduler_step_pending and not trainer.update_lr_per_iter:
                 try:
                     trainer._step_epoch_schedulers()

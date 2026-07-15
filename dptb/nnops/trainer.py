@@ -34,6 +34,7 @@ from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
     read_resume_metadata,
+    resolve_rank_rng_state,
     restore_rng_state,
 )
 
@@ -904,6 +905,9 @@ class Trainer(BaseTrainer):
             if item is not None:
                 item.load_state_dict(ckpt[key + "_state_dict"])
 
+        # Prefer this rank's own RNG snapshot over the main-rank blob (P0-3).
+        own_rng = resolve_rank_rng_state(ckpt, resume)
+
         if resume.checkpoint_kind == CHECKPOINT_KIND_ITERATION:
             # Mid-epoch checkpoint: re-enter the SAME epoch (do NOT skip it) and
             # fast-forward over the batches already committed into the saved
@@ -912,7 +916,7 @@ class Trainer(BaseTrainer):
             trainer._resume_plan = {
                 "target_epoch": int(resume.epoch),
                 "skip_batches": int(resume.batch_in_epoch),
-                "rng_state": resume.rng_state,
+                "rng_state": own_rng,
             }
         else:
             # Epoch-committed checkpoint: advance to the next epoch. The per-epoch
@@ -920,8 +924,8 @@ class Trainer(BaseTrainer):
             # the scheduler, so replay exactly one step to avoid an off-by-one
             # LR transition on resume (BUG 1, scheduler tail).
             trainer.ep = int(resume.epoch) + 1
-            if resume.rng_state is not None:
-                restore_rng_state(resume.rng_state)
+            if own_rng is not None:
+                restore_rng_state(own_rng)
             if resume.epoch_scheduler_step_pending and not trainer.update_lr_per_iter:
                 try:
                     trainer._lr_step_on_epoch_end()
@@ -939,27 +943,43 @@ class Trainer(BaseTrainer):
         self._batch_in_epoch = 0
         skip_batches, resume_rng = self._consume_resume_plan()
         if skip_batches and not self._loader_supports_exact_fast_forward():
-            # The loader's batch order is not guaranteed to reproduce across a
-            # restart (e.g. plain shuffle=True without a per-epoch-seeded
-            # sampler), so a byte-exact fast-forward could skip the wrong
-            # batches. Fall back to the safe path: re-run the whole epoch from
-            # its start (no epoch skipped; some pre-checkpoint batches recompute).
-            log.warning(
-                "train_loader order is not restart-deterministic; re-running epoch %s "
-                "from its start instead of fast-forwarding %s committed batches.",
-                int(self.ep), skip_batches,
-            )
-            skip_batches = 0
-            resume_rng = None
-            # Re-running a re-entered epoch from batch 0: the restored
-            # trainer.stats hold the PARTIAL per-epoch accumulators (sum,count)
-            # of the batches committed before the crash. Re-running every batch
-            # would add them a second time and skew epoch_mean, which feeds the
-            # plateau LR scheduler and the best-loss gate for this epoch. Reset
-            # the per-epoch accumulators so the re-run rebuilds them cleanly.
-            # (The exact-fast-forward path SKIPS the committed batches, so it
-            # must NOT reset — the restored partial is still correct there.)
-            self._reset_epoch_metric_accumulators()
+            # The loader's batch order is not restart-reproducible (e.g. plain
+            # shuffle=True without a per-epoch-seeded sampler), so an exact
+            # fast-forward is impossible. Re-running the epoch from its start is
+            # NOT a safe fallback either: the checkpointed model/optimizer
+            # already contain the updates of the committed prefix, so a re-run
+            # applies those optimizer steps a second time (momentum/Adam moments
+            # and the LR trajectory diverge from an uninterrupted run). Fail
+            # closed and tell the user to resume from the last EPOCH checkpoint,
+            # unless they explicitly opt into the inexact re-run.
+            if os.environ.get("DPTB_ALLOW_INEXACT_RESUME", "").strip() in ("1", "true", "True"):
+                log.warning(
+                    "DPTB_ALLOW_INEXACT_RESUME=1: re-running epoch %s from its "
+                    "start; optimizer updates for the %s already-committed "
+                    "batches WILL be applied a second time (training trajectory "
+                    "diverges from an uninterrupted run).",
+                    int(self.ep), skip_batches,
+                )
+                skip_batches = 0
+                resume_rng = None
+                # The restored trainer.stats hold the PARTIAL per-epoch
+                # accumulators of the committed prefix; re-running every batch
+                # would double-count them into epoch_mean (plateau LR + best
+                # gate). Reset so the re-run rebuilds them cleanly. (The exact
+                # fast-forward path SKIPS committed batches, so it must NOT
+                # reset — the restored partial is still correct there.)
+                self._reset_epoch_metric_accumulators()
+            else:
+                raise RuntimeError(
+                    f"Cannot resume mid-epoch (iteration checkpoint, "
+                    f"{skip_batches} committed batches) with a train_loader "
+                    f"whose order is not restart-deterministic "
+                    f"({type(self.train_loader).__name__}). Resume from the "
+                    f"last epoch checkpoint instead, or set "
+                    f"DPTB_ALLOW_INEXACT_RESUME=1 to re-run this epoch from "
+                    f"its start (re-applies the committed prefix's optimizer "
+                    f"updates)."
+                )
 
         # Seed the committed-batch cursor to the fast-forward offset so a SECOND
         # mid-epoch preemption during this resumed epoch persists an ABSOLUTE

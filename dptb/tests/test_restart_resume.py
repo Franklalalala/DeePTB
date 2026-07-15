@@ -162,20 +162,36 @@ def test_mid_epoch_resume_runs_each_remaining_batch_exactly_once(tmp_path):
     assert [b for (_e, b) in resumed.processed] == [0, 1, 2, 3, 4]
 
 
-def test_plain_shuffle_loader_falls_back_to_full_epoch_rerun(tmp_path):
-    # A torch DataLoader(shuffle=True) has no restart-reproducible order, so the
-    # fast-forward must be disabled and the whole epoch re-run from its start
-    # (no epoch skipped) rather than skipping the wrong batches.
+def test_plain_shuffle_loader_mid_epoch_resume_fails_closed(tmp_path, monkeypatch):
+    # A torch DataLoader(shuffle=True) has no restart-reproducible order, so an
+    # exact fast-forward is impossible — and re-running the epoch would apply
+    # the committed prefix's optimizer updates a SECOND time. Default: refuse
+    # with a clear remedy instead of silently diverging the trajectory.
     import torch.utils.data as tud
 
+    monkeypatch.delenv("DPTB_ALLOW_INEXACT_RESUME", raising=False)
     resumed = _make_trainer(tmp_path, n_batches=5)
     resumed.train_loader = tud.DataLoader(list(range(5)), batch_size=1, shuffle=True)
     assert resumed._loader_supports_exact_fast_forward() is False
 
     resumed.ep = 1
     resumed._resume_plan = {"target_epoch": 1, "skip_batches": 3, "rng_state": None}
+    with pytest.raises(RuntimeError, match="DPTB_ALLOW_INEXACT_RESUME"):
+        resumed.epoch()
+    assert resumed.processed == []  # nothing ran
+
+
+def test_plain_shuffle_loader_opt_in_reruns_full_epoch(tmp_path, monkeypatch):
+    # Explicit opt-in preserves the previous re-run-from-start behavior (with a
+    # loud warning): all batches run, no fast-forward.
+    import torch.utils.data as tud
+
+    monkeypatch.setenv("DPTB_ALLOW_INEXACT_RESUME", "1")
+    resumed = _make_trainer(tmp_path, n_batches=5)
+    resumed.train_loader = tud.DataLoader(list(range(5)), batch_size=1, shuffle=True)
+    resumed.ep = 1
+    resumed._resume_plan = {"target_epoch": 1, "skip_batches": 3, "rng_state": None}
     resumed.epoch()
-    # All 5 batches ran (skip was forced to 0), i.e. no fast-forward.
     assert len(resumed.processed) == 5
 
 
@@ -546,13 +562,14 @@ def test_epoch_best_checkpoint_is_epoch_kind_not_reused_iteration(tmp_path):
     assert read_resume_metadata(best).checkpoint_kind == CHECKPOINT_KIND_EPOCH
 
 
-def test_fallback_resume_resets_partial_epoch_stats(tmp_path):
-    # Regression (audit P2): the safe-fallback (non-deterministic loader) re-runs
-    # the whole epoch, so the restored PARTIAL per-epoch accumulators must be
-    # zeroed to avoid double-counting them into epoch_mean (which feeds the
-    # plateau LR scheduler and the best-loss gate).
+def test_fallback_resume_resets_partial_epoch_stats(tmp_path, monkeypatch):
+    # Regression (audit P2): the opt-in inexact re-run (non-deterministic
+    # loader + DPTB_ALLOW_INEXACT_RESUME=1) re-runs the whole epoch, so the
+    # restored PARTIAL per-epoch accumulators must be zeroed to avoid
+    # double-counting them into epoch_mean (plateau LR + best-loss gate).
     import torch.utils.data as tud
 
+    monkeypatch.setenv("DPTB_ALLOW_INEXACT_RESUME", "1")
     resumed = _make_trainer(tmp_path, n_batches=5)
     resumed.train_loader = tud.DataLoader(list(range(5)), batch_size=1, shuffle=True)
     assert resumed._loader_supports_exact_fast_forward() is False
@@ -622,6 +639,9 @@ def test_distributed_rank0_save_failure_propagates_before_barrier(tmp_path, monk
     monkeypatch.setattr(saver, "_is_dist_expert", lambda: True)
     monkeypatch.setattr(saver, "_is_main", lambda: True)
     monkeypatch.setattr(saver, "_gather_dist_states", lambda: ([{}], [None], [None]))
+    # Not under test here; the real impl issues an all_gather collective that
+    # needs an actual process group (covered by the gloo harness).
+    monkeypatch.setattr(saver, "_collect_rank_states", lambda: {"0": {"rng_state": None}})
     def boom(expert_states):
         raise RuntimeError("rank0 assemble failed")
     monkeypatch.setattr(saver, "_assemble_full_model_state", boom)
@@ -766,3 +786,69 @@ def test_epoch_checkpoint_stores_last_completed_step_and_resume_parity(tmp_path,
     )
     # Resumed next global step identical to the uninterrupted run: no skip.
     assert resumed.iter == ref_next_step
+
+
+def test_checkpoint_carries_rank_states_and_restore_prefers_own_rank(tmp_path, monkeypatch):
+    # P0-3: checkpoints persist per-rank RNG snapshots under rank_states; the
+    # restore path prefers this process's own entry over the main-rank blob
+    # inside training_state (which would correlate rank RNG streams).
+    from dptb.nnops.training_state import resolve_rank_rng_state
+
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(tmp_path, n_batches=2)
+    saver = Saver(interval=[(1, "epoch")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+    trainer.run(epochs=1)
+
+    ckpt = torch.load(str(ckpt_dir / "probe.latest.pth"),
+                      map_location="cpu", weights_only=False)
+    assert "rank_states" in ckpt
+    assert "0" in ckpt["rank_states"]
+    assert ckpt["rank_states"]["0"]["rng_state"] is not None
+
+    # resolve prefers the own-rank entry...
+    resume = read_resume_metadata(ckpt)
+    own = resolve_rank_rng_state(ckpt, resume)
+    assert own == ckpt["rank_states"]["0"]["rng_state"]
+    # ...and falls back to the legacy blob when rank_states is absent.
+    legacy = dict(ckpt)
+    legacy.pop("rank_states")
+    assert resolve_rank_rng_state(legacy, resume) == resume.rng_state
+
+
+def test_publish_failure_raises_instead_of_silent_continue(tmp_path, monkeypatch):
+    # P0-4 (single-process visible part): a failure in the retention/publish/
+    # manifest phase must surface as an exception via the agreed publish phase
+    # (in distributed runs the same helper broadcasts the failure to all ranks
+    # before the barrier so no rank wedges at the next collective).
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(tmp_path, n_batches=1)
+    saver = Saver(interval=[(1, "iteration")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+
+    def boom():
+        raise OSError("manifest disk full")
+
+    monkeypatch.setattr(saver, "_write_manifest", boom)
+    with pytest.raises(OSError, match="manifest disk full"):
+        trainer.run(epochs=1)
+
+
+def test_overlap_head_inference_from_state_dict():
+    # Restart fail-safe: checkpoints written while the entrypoint mutated
+    # common_options["overlap"]=False after model construction carry overlap
+    # weights but a contradicting config; the weights are the ground truth.
+    from dptb.nnops.multi_trainer import _state_dict_has_overlap_head
+
+    assert _state_dict_has_overlap_head(
+        {"experts.0.overlaponsite_param": torch.zeros(1)}
+    )
+    assert _state_dict_has_overlap_head(
+        {"experts.1.edge_prediction_s.out_layer.linear.weight": torch.zeros(1)}
+    )
+    assert not _state_dict_has_overlap_head(
+        {"experts.0.node_prediction_h.weight": torch.zeros(1)}
+    )
+    assert not _state_dict_has_overlap_head(None)
