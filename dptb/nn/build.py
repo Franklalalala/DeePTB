@@ -8,6 +8,7 @@ import torch.nn as nn
 from dptb.utils.tools import j_must_have, j_loader
 from dptb.data import AtomicDataDict
 from dptb.data.AtomicDataDict import with_edge_vectors
+from dptb.nn.output_spec import default_output_spec, ModelOutputSpecError
 import copy
 import random
 import numpy as np
@@ -53,7 +54,7 @@ class DeterministicExpertSeed:
 # [独立扩展模块] Distance Ensemble Wrapper
 # ======================================================================
 class DistanceEnsembleWrapper(nn.Module):
-    def __init__(self, experts, distance_ranges):
+    def __init__(self, experts, distance_ranges, strict_output_spec=False):
         super().__init__()
         assert len(experts) == len(distance_ranges), \
             f"len(experts) != len(distance_ranges): {len(experts)} vs {len(distance_ranges)}"
@@ -67,7 +68,10 @@ class DistanceEnsembleWrapper(nn.Module):
         self.device = getattr(base_model, "device", torch.device("cpu"))
         self.dtype = getattr(base_model, "dtype", torch.float32)
         self.model_options = copy.deepcopy(getattr(base_model, "model_options", {}))
-        self._excluded_stitch_keys = self._build_excluded_stitch_keys()
+        # Output-stitching contract.  Default is PERMISSIVE (warn + skip unknown
+        # keys, preserving legacy behaviour) but WITH the node-aligned merge path
+        # active.  ``strict_output_spec=True`` opts into fail-closed validation.
+        self._output_spec = default_output_spec(strict=bool(strict_output_spec))
 
     def __getattr__(self, name):
         try:
@@ -80,21 +84,6 @@ class DistanceEnsembleWrapper(nn.Module):
                 if hasattr(base_model, name):
                     return getattr(base_model, name)
             raise e
-
-    def _build_excluded_stitch_keys(self):
-        keys = {
-            "expert_idx", "expert_edge_mask", "expert_node_mask",
-            "__slices__", "__cumsum__", "__cat_dims__", "__num_nodes_list__",
-            "__data_class__", "edge_vec", "edge_index", "edge_type",
-            "atom_types", "batch", "ptr", "cell", "pbc", "pos", "positions",
-            "edge_lengths", "kpoints", "mean_max_prob", "expert_load_cv"
-        }
-        # 将特殊键统一纳入免缝合白名单
-        for const_name in ["ATOM_TYPE_KEY", "EDGE_TYPE_KEY", "EDGE_INDEX_KEY",
-                           "EDGE_VEC_KEY", "POSITIONS_KEY", "BATCH_KEY", "CELL_KEY", "PBC_KEY", "KPOINT_KEY"]:
-            v = getattr(AtomicDataDict, const_name, None)
-            if v is not None: keys.add(v)
-        return keys
 
     def _get_safe_num_nodes(self, batch):
         """安全地提取节点数，严格避开 NestedTensor 带来的底层报错"""
@@ -130,33 +119,108 @@ class DistanceEnsembleWrapper(nn.Module):
 
         return edge_mask, node_mask
 
-    def _stitch_edge_aligned_outputs(self, res, res_i, mask):
-        num_edges = mask.shape[0]
+    @staticmethod
+    def _apply_merge(merge, dst, src, mask):
+        """Dispatch a single merge op, mutating ``dst`` in place over ``mask``."""
+        if merge == "keep_first":
+            return
+        if merge == "masked_replace":
+            dst[mask] = src[mask]
+        elif merge == "sum":
+            dst[mask] = dst[mask] + src[mask]
+        elif merge == "mean":
+            dst[mask] = 0.5 * (dst[mask] + src[mask])
+        else:
+            raise ModelOutputSpecError(f"Unknown merge op '{merge}'.")
+
+    def _stitch_outputs(self, res, res_i, edge_mask, node_mask):
+        """Merge one expert's outputs (``res_i``) into the running result ``res``.
+
+        Iterates the *spec* fields (not the raw ``res_i`` keys) so alignment is
+        looked up, not guessed: edge-aligned fields use ``edge_mask``,
+        node-aligned fields use ``node_mask``, graph/scalar fields keep expert
+        0's value.  This is the core fix -- node-aligned outputs of experts
+        ``1..N`` were previously discarded because only an edge path existed.
+
+        In strict mode, undeclared keys / shape-alignment mismatches / node==edge
+        ambiguities raise :class:`ModelOutputSpecError`; in permissive mode they
+        warn and skip (expert-0 value preserved).
+        """
+        spec = self._output_spec
+        strict = bool(getattr(spec, "strict", False))
+
+        n_edge = int(edge_mask.shape[0])
+        n_node = int(node_mask.shape[0])
+
+        # Strict guard: shape-based node/edge validation is meaningless when the
+        # two counts coincide, so refuse rather than silently mis-align.
+        if strict and n_edge == n_node:
+            raise ModelOutputSpecError(
+                f"Ambiguous stitch: num_nodes ({n_node}) == num_edges ({n_edge}); "
+                "cannot validate node/edge alignment by shape in strict mode."
+            )
+
+        # Pass 1: flag output keys the expert produced that the spec does not
+        # declare (so their alignment cannot be inferred).
         for key, src in res_i.items():
-            # 1. 白名单过滤
-            if key in self._excluded_stitch_keys or key not in res:
+            if key in spec.fields:
+                continue
+            if not torch.is_tensor(src):
+                continue
+            if getattr(src, "is_nested", False) or getattr(src, "is_sparse", False):
+                continue
+            msg = (f"DistanceEnsembleWrapper: output key '{key}' is not declared in "
+                   f"ModelOutputSpec; cannot infer its node/edge alignment.")
+            if strict:
+                raise ModelOutputSpecError(msg)
+            log.warning(msg + " Keeping expert-0 value (permissive mode).")
+
+        # Pass 2: merge declared, masked-aligned fields.
+        masks = {"edge": edge_mask, "node": node_mask}
+        for field, fspec in spec.fields.items():
+            if field not in res_i:
+                continue
+            mask = masks.get(fspec.alignment)  # None for graph/scalar -> keep_first
+            if mask is None:
+                continue
+            if field not in res:
+                # Expert 0 produced no baseline tensor; a masked index-merge has
+                # no destination to write into.  Preserve legacy skip behaviour.
                 continue
 
-            dst = res[key]
+            src = res_i[field]
+            dst = res[field]
             if not torch.is_tensor(src) or not torch.is_tensor(dst):
                 continue
-
-            # 2. 危险张量过滤：拦截 NestedTensor 和 SparseTensor
+            # Keep the existing NestedTensor / SparseTensor guards.
             if getattr(src, "is_nested", False) or getattr(dst, "is_nested", False):
                 continue
             if getattr(src, "is_sparse", False) or getattr(dst, "is_sparse", False):
                 continue
 
-            # 3. 终极防御：如果仍有未知的奇葩张量导致 shape/掩码赋值崩溃，予以静默拦截
+            # Alignment assertion: the leading dim must match the mask length
+            # (and dst must match src so the index-assignment is well defined).
+            if src.ndim == 0 or int(src.shape[0]) != int(mask.shape[0]) or src.shape != dst.shape:
+                msg = (f"DistanceEnsembleWrapper: field '{field}' declared alignment "
+                       f"'{fspec.alignment}' but src shape {tuple(src.shape)} / dst shape "
+                       f"{tuple(dst.shape)} is incompatible with mask length {int(mask.shape[0])}.")
+                if strict:
+                    raise ModelOutputSpecError(msg)
+                log.warning(msg + " Skipping (permissive mode).")
+                continue
+
             try:
-                if src.ndim == 0 or dst.ndim == 0 or src.shape != dst.shape:
-                    continue
-                if src.shape[0] != num_edges:
-                    continue
-                dst[mask] = src[mask]
+                self._apply_merge(fspec.merge, dst, src, mask)
+            except ModelOutputSpecError:
+                raise
             except Exception as e:
+                # Terminal defense: never let an unexpected tensor crash the
+                # permissive inference path.
+                if strict:
+                    raise
                 log.warning(
-                    f"DistanceEnsembleWrapper safely skipped stitching key '{key}' due to internal tensor error: {e}")
+                    f"DistanceEnsembleWrapper safely skipped stitching key '{field}' "
+                    f"due to internal tensor error: {e}")
                 continue
 
     def forward(self, batch):
@@ -217,7 +281,9 @@ class DistanceEnsembleWrapper(nn.Module):
             batch_i["expert_node_mask"] = node_mask_i
 
             res_i = self.experts[i](batch_i)
-            self._stitch_edge_aligned_outputs(res, res_i, edge_mask_i)
+            # Pass BOTH masks so node-aligned outputs of experts 1..N are merged
+            # (edge-only stitching silently dropped every node_* output before).
+            self._stitch_outputs(res, res_i, edge_mask_i, node_mask_i)
 
         # 擦除注入的掩码，保证传出纯净的数据流
         if "expert_edge_mask" in res:
