@@ -24,14 +24,13 @@ except Exception:  # pragma: no cover
 
 from dptb.data.interfaces.blockwise_tensor import (
     EDGE_H0_BLOCKS_KEY,
-    EDGE_P2_BLOCKS_KEY,
     EDGE_PRED_HAMIL_BLOCKS_KEY,
     NODE_H0_BLOCKS_KEY,
-    NODE_P2_BLOCKS_KEY,
     NODE_PRED_HAMIL_BLOCKS_KEY,
     attach_prediction_block_tensors,
     feature_tensors_to_block_tensors,
 )
+from dptb.data.interfaces.p2_contract import build_prior_spec
 from dptb.nn.hamiltonian import E3Hamiltonian
 
 
@@ -170,9 +169,10 @@ class BlockwiseE3Hamiltonian(nn.Module):
         strict_complete_edges: bool = False,
         add_h0: bool = False,
         add_prior: bool = False,
-        prior_node_block_field: str = NODE_P2_BLOCKS_KEY,
-        prior_edge_block_field: str = EDGE_P2_BLOCKS_KEY,
-        prior_label: str = "P2",
+        prior_kind: Optional[str] = None,
+        prior_node_block_field: Optional[str] = None,
+        prior_edge_block_field: Optional[str] = None,
+        prior_label: Optional[str] = None,
         validate_prior_blocks: bool = False,
         full_output_node_field: str = "node_full_hamil_blocks",
         full_output_edge_field: str = "edge_full_hamil_blocks",
@@ -203,9 +203,28 @@ class BlockwiseE3Hamiltonian(nn.Module):
         self.add_prior = bool(add_prior)
         if self.add_h0 and self.add_prior:
             raise ValueError("add_h0 and add_prior are mutually exclusive.")
-        self.prior_node_block_field = str(prior_node_block_field)
-        self.prior_edge_block_field = str(prior_edge_block_field)
-        self.prior_label = str(prior_label)
+        # The AO-block field names and the human label are DERIVED from the
+        # single prior kind.  Explicit fields are honored only as overrides (for
+        # back-compat); an empty/omitted value derives from the kind so p2/p23
+        # can never disagree between the RME conditioning and the AO block that
+        # is added back for Full-H reconstruction.
+        prior_spec = build_prior_spec("p2" if prior_kind in (None, "") else prior_kind)
+        self.prior_kind = prior_spec.kind
+        self.prior_node_block_field = (
+            str(prior_node_block_field)
+            if prior_node_block_field not in (None, "")
+            else prior_spec.node_blocks_key
+        )
+        self.prior_edge_block_field = (
+            str(prior_edge_block_field)
+            if prior_edge_block_field not in (None, "")
+            else prior_spec.edge_blocks_key
+        )
+        self.prior_label = (
+            str(prior_label)
+            if prior_label not in (None, "")
+            else prior_spec.label
+        )
         self.validate_prior_blocks = bool(validate_prior_blocks)
         self.full_output_node_field = full_output_node_field
         self.full_output_edge_field = full_output_edge_field

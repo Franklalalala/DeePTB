@@ -574,18 +574,95 @@ def _expand_soc_uureal_compact(
 _ATOMICDATA_CONSTRUCTOR_OPTIONS = {"r_max", "er_max", "oer_max", "self_interaction"}
 
 
+def _reconcile_prior_alias(new_value, old_value, *, default, new_name, old_name):
+    """Merge a renamed prior_* constructor kwarg with its deprecated P2 alias.
+
+    ``None`` means "not supplied".  If both the canonical and the deprecated
+    name are supplied they must agree; otherwise whichever was supplied wins,
+    falling back to ``default``.
+    """
+
+    if new_value is not None and old_value is not None:
+        if new_value != old_value:
+            raise ValueError(
+                f"LMDBDataset received conflicting {new_name}={new_value!r} and "
+                f"deprecated {old_name}={old_value!r}; the deprecated alias must "
+                "equal the canonical value."
+            )
+        return new_value
+    if new_value is not None:
+        return new_value
+    if old_value is not None:
+        return old_value
+    return default
+
+
 class LMDBDataset(AtomicDataset):
     prefer_loaded_dynamic_batch_cost_parts = True
     # Class defaults keep lightweight ``__new__``-based tooling and historical
     # tests backward compatible; normal construction always sets instances.
-    get_P2 = False
+    # The public surface was renamed to the prior_*/get_prior family so that a
+    # single ``prior_kind`` derives every field name (see PriorSpec).
+    get_prior = False
     prior_kind = "p2"
-    p2_key = "hamiltonian_p2"
-    prefer_precomputed_p2 = True
+    prior_raw_key = "hamiltonian_p2"
+    prefer_precomputed_prior = True
     require_full_h_target = False
-    expected_p2_source_fingerprint = None
-    audit_p2_representations = False
-    require_p2_blocks = False
+    expected_prior_source_fingerprint = None
+    audit_prior_representations = False
+    require_prior_blocks = False
+
+    # --- Deprecated P2-named public attribute aliases -------------------------
+    # Read/write properties forward the historical attribute names to the
+    # prior_* storage so old callers (and tools that mutate the dataset in
+    # place, e.g. cache materializers) keep working after the rename.
+    @property
+    def get_P2(self):
+        return self.get_prior
+
+    @get_P2.setter
+    def get_P2(self, value):
+        self.get_prior = value
+
+    @property
+    def p2_key(self):
+        return self.prior_raw_key
+
+    @p2_key.setter
+    def p2_key(self, value):
+        self.prior_raw_key = value
+
+    @property
+    def prefer_precomputed_p2(self):
+        return self.prefer_precomputed_prior
+
+    @prefer_precomputed_p2.setter
+    def prefer_precomputed_p2(self, value):
+        self.prefer_precomputed_prior = value
+
+    @property
+    def expected_p2_source_fingerprint(self):
+        return self.expected_prior_source_fingerprint
+
+    @expected_p2_source_fingerprint.setter
+    def expected_p2_source_fingerprint(self, value):
+        self.expected_prior_source_fingerprint = value
+
+    @property
+    def audit_p2_representations(self):
+        return self.audit_prior_representations
+
+    @audit_p2_representations.setter
+    def audit_p2_representations(self, value):
+        self.audit_prior_representations = value
+
+    @property
+    def require_p2_blocks(self):
+        return self.require_prior_blocks
+
+    @require_p2_blocks.setter
+    def require_p2_blocks(self, value):
+        self.require_prior_blocks = value
 
     def __init__(
             self,
@@ -597,7 +674,7 @@ class LMDBDataset(AtomicDataset):
             orthogonal: bool = False,
             get_Hamiltonian: bool = False,
             get_H0: bool = False,
-            get_P2: bool = False,
+            get_prior: Optional[bool] = None,
             residual_hamiltonian: bool = False,
             get_overlap: bool = False,
             get_DM: bool = False,
@@ -605,13 +682,49 @@ class LMDBDataset(AtomicDataset):
             h0_key: str = "hamiltonian_0",
             prefer_precomputed_h0: bool = True,
             prior_kind: str = "p2",
-            p2_key: str = "hamiltonian_p2",
-            prefer_precomputed_p2: bool = True,
+            prior_raw_key: Optional[str] = None,
+            prefer_precomputed_prior: Optional[bool] = None,
             require_full_h_target: bool = False,
+            expected_prior_source_fingerprint: Optional[str] = None,
+            audit_prior_representations: Optional[bool] = None,
+            require_prior_blocks: Optional[bool] = None,
+            *,
+            get_P2: Optional[bool] = None,
+            p2_key: Optional[str] = None,
+            prefer_precomputed_p2: Optional[bool] = None,
             expected_p2_source_fingerprint: Optional[str] = None,
-            audit_p2_representations: bool = False,
-            require_p2_blocks: bool = False,
+            audit_p2_representations: Optional[bool] = None,
+            require_p2_blocks: Optional[bool] = None,
     ):
+        # Deprecated P2-named kwargs are accepted as aliases of the prior_*
+        # family; a supplied alias must equal the canonical value.
+        get_prior = _reconcile_prior_alias(
+            get_prior, get_P2, default=False,
+            new_name="get_prior", old_name="get_P2",
+        )
+        prior_raw_key = _reconcile_prior_alias(
+            prior_raw_key, p2_key, default=None,
+            new_name="prior_raw_key", old_name="p2_key",
+        )
+        prefer_precomputed_prior = _reconcile_prior_alias(
+            prefer_precomputed_prior, prefer_precomputed_p2, default=True,
+            new_name="prefer_precomputed_prior", old_name="prefer_precomputed_p2",
+        )
+        expected_prior_source_fingerprint = _reconcile_prior_alias(
+            expected_prior_source_fingerprint, expected_p2_source_fingerprint,
+            default=None,
+            new_name="expected_prior_source_fingerprint",
+            old_name="expected_p2_source_fingerprint",
+        )
+        audit_prior_representations = _reconcile_prior_alias(
+            audit_prior_representations, audit_p2_representations, default=False,
+            new_name="audit_prior_representations",
+            old_name="audit_p2_representations",
+        )
+        require_prior_blocks = _reconcile_prior_alias(
+            require_prior_blocks, require_p2_blocks, default=False,
+            new_name="require_prior_blocks", old_name="require_p2_blocks",
+        )
         # TO DO, this may be simplified
         # See if a subclass defines some inputs
         self.url = getattr(type(self), "URL", url)
@@ -634,8 +747,8 @@ class LMDBDataset(AtomicDataset):
         super().__init__(root=root, type_mapper=type_mapper)  # the type_mapper will be called in getitem in PyG data class
         self.get_Hamiltonian = get_Hamiltonian
         self.get_H0 = get_H0
-        self.get_P2 = get_P2
-        if self.get_P2 and bool(getattr(type_mapper, "has_soc", False)):
+        self.get_prior = bool(get_prior)
+        if self.get_prior and bool(getattr(type_mapper, "has_soc", False)):
             raise NotImplementedError(
                 "The first-class P2/P23 physical-prior route is non-SOC only."
             )
@@ -653,27 +766,33 @@ class LMDBDataset(AtomicDataset):
         self.prefer_precomputed_h0 = prefer_precomputed_h0
         self.prior_spec = resolve_prior_field_spec(prior_kind)
         self.prior_kind = self.prior_spec.kind
-        self.p2_key = str(p2_key)
-        if self.get_P2 and self.p2_key != self.prior_spec.raw_key:
+        # The raw LMDB prior key is DERIVED from prior_kind; an explicit
+        # prior_raw_key/p2_key is accepted only as a deprecated echo that must
+        # match the derived value, so a single prior_kind selects everything.
+        if prior_raw_key in (None, ""):
+            self.prior_raw_key = self.prior_spec.raw_key
+        else:
+            self.prior_raw_key = str(prior_raw_key)
+        if self.get_prior and self.prior_raw_key != self.prior_spec.raw_key:
             raise ValueError(
-                f"prior_kind={self.prior_kind!r} requires p2_key="
-                f"{self.prior_spec.raw_key!r}; got {self.p2_key!r}. "
+                f"prior_kind={self.prior_kind!r} requires the raw prior key "
+                f"{self.prior_spec.raw_key!r}; got {self.prior_raw_key!r}. "
                 "Refusing to select RME fields from one prior and raw fallback "
                 "blocks from another."
             )
-        self.prefer_precomputed_p2 = bool(prefer_precomputed_p2)
+        self.prefer_precomputed_prior = bool(prefer_precomputed_prior)
         self.require_full_h_target = bool(require_full_h_target)
-        self.expected_p2_source_fingerprint = (
-            str(expected_p2_source_fingerprint)
-            if expected_p2_source_fingerprint not in {None, ""}
+        self.expected_prior_source_fingerprint = (
+            str(expected_prior_source_fingerprint)
+            if expected_prior_source_fingerprint not in {None, ""}
             else None
         )
-        self.audit_p2_representations = bool(audit_p2_representations)
-        self.require_p2_blocks = bool(require_p2_blocks)
+        self.audit_prior_representations = bool(audit_prior_representations)
+        self.require_prior_blocks = bool(require_prior_blocks)
         if self.require_full_h_target and not self.get_Hamiltonian:
             raise ValueError("require_full_h_target=True requires get_Hamiltonian=True.")
-        if self.require_p2_blocks and not self.get_P2:
-            raise ValueError("require_p2_blocks=True requires get_P2=True.")
+        if self.require_prior_blocks and not self.get_prior:
+            raise ValueError("require_prior_blocks=True requires get_prior=True.")
         assert not get_Hamiltonian * get_DM, "Hamiltonian and Density Matrix can only loaded one at a time, for which will occupy the same attribute in the AtomicData."
 
         self.num_graphs = 0
@@ -861,7 +980,7 @@ class LMDBDataset(AtomicDataset):
         block_keys = [
             "hamiltonian",
             getattr(self, "h0_key", "hamiltonian_0"),
-            getattr(self, "p2_key", "hamiltonian_p2"),
+            getattr(self, "prior_raw_key", "hamiltonian_p2"),
             "hamiltonian_0",
             "density_matrix",
             "overlap",
@@ -971,9 +1090,9 @@ class LMDBDataset(AtomicDataset):
         h0_blocks = data_dict.get(self.h0_key, None) if self.get_H0 else None
         node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if self.get_H0 else None
         edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if self.get_H0 else None
-        p2_blocks = data_dict.get(self.p2_key, None) if self.get_P2 else None
-        node_p2 = data_dict.get(prior_spec.node_rme_key, None) if self.get_P2 else None
-        edge_p2 = data_dict.get(prior_spec.edge_rme_key, None) if self.get_P2 else None
+        p2_blocks = data_dict.get(self.prior_raw_key, None) if self.get_prior else None
+        node_p2 = data_dict.get(prior_spec.node_rme_key, None) if self.get_prior else None
+        edge_p2 = data_dict.get(prior_spec.edge_rme_key, None) if self.get_prior else None
         p2_blockwise_keys = prior_spec.block_fields
         p2_blockwise_present = [key in data_dict for key in p2_blockwise_keys]
         full_h_target_present = [
@@ -992,7 +1111,7 @@ class LMDBDataset(AtomicDataset):
                 "refusing a partial prior."
             )
         if p2_blocks is not None and not record_contract_already_validated:
-            validate_non_soc_p2_blocks(p2_blocks, key=self.p2_key)
+            validate_non_soc_p2_blocks(p2_blocks, key=self.prior_raw_key)
         node_physical_h0 = data_dict.get(AtomicDataDict.NODE_PHYSICAL_H0_KEY, None)
         edge_physical_h0 = data_dict.get(AtomicDataDict.EDGE_PHYSICAL_H0_KEY, None)
         physical_h0_present = (node_physical_h0 is not None, edge_physical_h0 is not None)
@@ -1059,7 +1178,7 @@ class LMDBDataset(AtomicDataset):
             and edge_h0 is not None
         )
         uses_p2 = bool(
-            self.get_P2
+            self.get_prior
             and (all(p2_feature_present) or p2_blocks is not None)
         )
         stored_edge_index = data_dict.get(AtomicDataDict.EDGE_INDEX_KEY, None)
@@ -1072,7 +1191,7 @@ class LMDBDataset(AtomicDataset):
             )
         has_stored_edge_graph = all(graph_present)
         requires_stored_p2_graph = bool(
-            self.get_P2 and (all(p2_feature_present) or any(p2_blockwise_present))
+            self.get_prior and (all(p2_feature_present) or any(p2_blockwise_present))
         )
         requires_stored_target_graph = bool(
             getattr(self, "require_full_h_target", False)
@@ -1323,8 +1442,8 @@ class LMDBDataset(AtomicDataset):
                     keep_mask=soc_uureal_keep_mask,
                 )
 
-        if self.get_P2:
-            if self.prefer_precomputed_p2 and all(p2_feature_present):
+        if self.get_prior:
+            if self.prefer_precomputed_prior and all(p2_feature_present):
                 node_p2, edge_p2 = validate_p2_feature_pair(
                     node_p2,
                     edge_p2,
@@ -1376,8 +1495,8 @@ class LMDBDataset(AtomicDataset):
                 atomicdata[prior_spec.edge_rme_key] = edge_p2
             else:
                 raise ValueError(
-                    f"get_P2=True requires either raw '{self.p2_key}' AO blocks "
-                    f"or precomputed {prior_spec.node_rme_key}/"
+                    f"get_prior=True requires either raw '{self.prior_raw_key}' AO "
+                    f"blocks or precomputed {prior_spec.node_rme_key}/"
                     f"{prior_spec.edge_rme_key} features."
                 )
 
@@ -1392,7 +1511,7 @@ class LMDBDataset(AtomicDataset):
                     )
                 _assert_expected_prior_source(
                     data_dict,
-                    getattr(self, "expected_p2_source_fingerprint", None),
+                    getattr(self, "expected_prior_source_fingerprint", None),
                     prior_spec=prior_spec,
                 )
                 if prior_spec.kind == "p23":
@@ -1492,15 +1611,15 @@ class LMDBDataset(AtomicDataset):
         # conversion path. Keep this side channel independent of the feature
         # path so existing RME training remains unchanged.
         load_prior_blocks = bool(
-            self.get_P2
+            self.get_prior
             and (
-                getattr(self, "require_p2_blocks", False)
-                or getattr(self, "audit_p2_representations", False)
+                getattr(self, "require_prior_blocks", False)
+                or getattr(self, "audit_prior_representations", False)
             )
         )
         if self.get_Hamiltonian and getattr(self, "residual_hamiltonian", False):
             assert_residual_target_source_is_raw(data_dict)
-        if self.get_P2 and any(p2_blockwise_present) and not all(p2_blockwise_present):
+        if self.get_prior and any(p2_blockwise_present) and not all(p2_blockwise_present):
             missing = [
                 key for key, present in zip(p2_blockwise_keys, p2_blockwise_present)
                 if not present
@@ -1617,12 +1736,12 @@ class LMDBDataset(AtomicDataset):
                 prior_spec.edge_blocks_key,
             )
             available_p2_blocks = [key in atomicdata for key in required_p2_blocks]
-            if getattr(self, "require_p2_blocks", False) and not all(
+            if getattr(self, "require_prior_blocks", False) and not all(
                 key in atomicdata for key in p2_blockwise_keys
             ):
                 missing = [key for key in p2_blockwise_keys if key not in atomicdata]
                 raise ValueError(
-                    "require_p2_blocks=True but the "
+                    "require_prior_blocks=True but the "
                     f"{prior_spec.kind.upper()} AO reconstruction contract "
                     f"is incomplete; missing {missing}."
                 )
@@ -1697,7 +1816,7 @@ class LMDBDataset(AtomicDataset):
                     )
 
                 if (
-                    getattr(self, "audit_p2_representations", False)
+                    getattr(self, "audit_prior_representations", False)
                     and not record_contract_already_validated
                 ):
                     from dptb.data.interfaces.blockwise_tensor import (

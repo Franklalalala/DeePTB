@@ -284,7 +284,7 @@ class DatasetBuilder:
                 orthogonal=orthogonal,
                 get_Hamiltonian=get_Hamiltonian,
                 get_H0=kwargs.get("get_H0", False),
-                get_P2=kwargs.get("get_P2", False),
+                get_prior=kwargs.get("get_prior", kwargs.get("get_P2", False)),
                 residual_hamiltonian=kwargs.get("residual_hamiltonian", False),
                 get_overlap=get_overlap,
                 get_DM=get_DM,
@@ -292,15 +292,24 @@ class DatasetBuilder:
                 h0_key=kwargs.get("h0_key", "hamiltonian_0"),
                 prefer_precomputed_h0=kwargs.get("prefer_precomputed_h0", True),
                 prior_kind=kwargs.get("prior_kind", "p2"),
-                p2_key=kwargs.get("p2_key", "hamiltonian_p2"),
-                prefer_precomputed_p2=kwargs.get("prefer_precomputed_p2", True),
-                require_p2_blocks=kwargs.get("require_p2_blocks", False),
-                require_full_h_target=kwargs.get("require_full_h_target", False),
-                expected_p2_source_fingerprint=kwargs.get(
-                    "expected_p2_source_fingerprint", ""
+                # Deprecated config aliases (p2_key/prefer_precomputed_p2/...) are
+                # still honored; the raw key is otherwise derived from prior_kind.
+                prior_raw_key=kwargs.get("prior_raw_key", kwargs.get("p2_key", None)),
+                prefer_precomputed_prior=kwargs.get(
+                    "prefer_precomputed_prior",
+                    kwargs.get("prefer_precomputed_p2", True),
                 ),
-                audit_p2_representations=kwargs.get(
-                    "audit_p2_representations", False
+                require_prior_blocks=kwargs.get(
+                    "require_prior_blocks", kwargs.get("require_p2_blocks", False)
+                ),
+                require_full_h_target=kwargs.get("require_full_h_target", False),
+                expected_prior_source_fingerprint=kwargs.get(
+                    "expected_prior_source_fingerprint",
+                    kwargs.get("expected_p2_source_fingerprint", ""),
+                ),
+                audit_prior_representations=kwargs.get(
+                    "audit_prior_representations",
+                    kwargs.get("audit_p2_representations", False),
                 ),
                 info_files = info_files
             )

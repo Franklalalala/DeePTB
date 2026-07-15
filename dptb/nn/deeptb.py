@@ -12,6 +12,7 @@ from dptb.nn.embedding import Embedding
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
+from dptb.data.interfaces.p2_contract import build_prior_spec
 from dptb.nn.blockwise_hamiltonian import (
     BlockwiseE3Hamiltonian,
     attach_full_hamiltonian_from_h0,
@@ -162,13 +163,30 @@ class NNENV(nn.Module):
         )
         self.block_native_add_h0 = self.reconstruction == "h0_residual"
         self.block_native_add_prior = self.reconstruction == "prior_residual"
-        self.block_native_prior_node_field = prediction_copy.get(
-            "prior_node_block_field", AtomicDataDict.NODE_P2_BLOCKS_KEY
+        # The prior AO-block fields and label are DERIVED from the single prior
+        # kind carried by the embedding.  Explicit prediction fields are honored
+        # only as overrides; when omitted (or left empty) they derive from the
+        # kind so the RME conditioning and the AO reconstruction always agree.
+        embedding_prior_kind = str(
+            embedding.get("prior_kind", "p2") or "p2"
+        ).strip().lower()
+        try:
+            block_native_prior_spec = build_prior_spec(embedding_prior_kind)
+        except ValueError:
+            block_native_prior_spec = build_prior_spec("p2")
+        self.block_native_prior_kind = block_native_prior_spec.kind
+        self.block_native_prior_node_field = (
+            prediction_copy.get("prior_node_block_field")
+            or block_native_prior_spec.node_blocks_key
         )
-        self.block_native_prior_edge_field = prediction_copy.get(
-            "prior_edge_block_field", AtomicDataDict.EDGE_P2_BLOCKS_KEY
+        self.block_native_prior_edge_field = (
+            prediction_copy.get("prior_edge_block_field")
+            or block_native_prior_spec.edge_blocks_key
         )
-        self.block_native_prior_label = prediction_copy.get("prior_label", "P2")
+        self.block_native_prior_label = (
+            prediction_copy.get("prior_label")
+            or block_native_prior_spec.label
+        )
         self.block_native_validate_prior_blocks = bool(
             prediction_copy.get("validate_prior_blocks", False)
         )
@@ -381,6 +399,7 @@ class NNENV(nn.Module):
                 blockwise_ham_kwargs.update(
                     add_h0=self.block_native_add_h0,
                     add_prior=self.block_native_add_prior,
+                    prior_kind=self.block_native_prior_kind,
                 )
                 for key in (
                     "node_pad_shape",

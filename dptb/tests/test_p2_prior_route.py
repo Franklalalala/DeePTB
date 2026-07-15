@@ -588,6 +588,8 @@ def _compact_selected_prior_dataset(
     require_blocks,
     audit=False,
 ):
+    # New consolidated surface: a single ``prior_kind`` selects the raw key,
+    # RME fields and AO blocks -- no separate p2_key needed.
     return DatasetBuilder()(
         root=str(root),
         r_max=2.0,
@@ -597,15 +599,90 @@ def _compact_selected_prior_dataset(
         separator=".",
         basis={"H": "1s"},
         get_Hamiltonian=True,
-        get_P2=True,
+        get_prior=True,
         prior_kind=prior_kind,
-        p2_key=f"hamiltonian_{prior_kind}",
-        require_p2_blocks=require_blocks,
+        require_prior_blocks=require_blocks,
         require_full_h_target=True,
-        audit_p2_representations=audit,
-        expected_p2_source_fingerprint=source_fingerprint,
+        audit_prior_representations=audit,
+        expected_prior_source_fingerprint=source_fingerprint,
         residual_hamiltonian=False,
     )
+
+
+def test_lmdb_dataset_prior_kwargs_new_names_and_deprecated_aliases(tmp_path):
+    from dptb.data.dataset.lmdb_dataset import _reconcile_prior_alias
+
+    record, p2_source = _compact_p2_record()
+    _write_single_lmdb(tmp_path, "prior-kwargs", record)
+
+    # Canonical prior_* surface: prior_kind alone selects the raw key, RME and
+    # AO-block fields -- no p2_key required.
+    new_named = DatasetBuilder()(
+        root=str(tmp_path),
+        r_max=2.0,
+        er_max=3.0,
+        type="LMDBDataset",
+        prefix="prior-kwargs",
+        separator=".",
+        basis={"H": "1s"},
+        get_Hamiltonian=True,
+        get_prior=True,
+        prior_kind="p2",
+        require_prior_blocks=True,
+        require_full_h_target=True,
+        audit_prior_representations=True,
+        expected_prior_source_fingerprint=p2_source,
+        residual_hamiltonian=False,
+    )
+    assert new_named.get_prior is True
+    assert new_named.prior_raw_key == "hamiltonian_p2"
+    assert new_named.require_prior_blocks is True
+    assert new_named.expected_prior_source_fingerprint == p2_source
+    # Deprecated attribute aliases still read through to the prior_* storage.
+    assert new_named.get_P2 is True
+    assert new_named.p2_key == "hamiltonian_p2"
+    assert new_named.require_p2_blocks is True
+    assert new_named.expected_p2_source_fingerprint == p2_source
+    torch.testing.assert_close(
+        new_named.get(0)[_keys.NODE_P2_KEY], torch.tensor([[1.0], [1.1]])
+    )
+
+    # Deprecated P2-named kwargs still work as construction aliases.
+    alias_named = DatasetBuilder()(
+        root=str(tmp_path),
+        r_max=2.0,
+        er_max=3.0,
+        type="LMDBDataset",
+        prefix="prior-kwargs",
+        separator=".",
+        basis={"H": "1s"},
+        get_Hamiltonian=True,
+        get_P2=True,
+        prior_kind="p2",
+        p2_key="hamiltonian_p2",
+        require_p2_blocks=True,
+        require_full_h_target=True,
+        audit_p2_representations=True,
+        expected_p2_source_fingerprint=p2_source,
+        residual_hamiltonian=False,
+    )
+    assert alias_named.get_prior is True
+    assert alias_named.prior_raw_key == "hamiltonian_p2"
+    torch.testing.assert_close(
+        alias_named.get(0)[_keys.NODE_P2_KEY], torch.tensor([[1.0], [1.1]])
+    )
+
+    # A deprecated alias that disagrees with the canonical value fails closed.
+    assert (
+        _reconcile_prior_alias(
+            None, True, default=False, new_name="get_prior", old_name="get_P2"
+        )
+        is True
+    )
+    with pytest.raises(ValueError, match="deprecated alias must equal"):
+        _reconcile_prior_alias(
+            True, False, default=False, new_name="get_prior", old_name="get_P2"
+        )
 
 
 def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):

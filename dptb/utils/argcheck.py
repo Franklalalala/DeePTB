@@ -1130,7 +1130,7 @@ def train_data_sub():
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
-        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
@@ -1170,7 +1170,7 @@ def validation_data_sub():
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
-        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
@@ -1210,7 +1210,7 @@ def reference_data_sub():
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
-        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
@@ -1249,7 +1249,7 @@ def test_data_sub():
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
-        Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
+        Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
@@ -1755,9 +1755,9 @@ def e3tb_prediction():
             doc="Full-H reconstruction mode: direct, h0_residual, or prior_residual. "
                 "Replaces the mutually exclusive add_h0/add_prior flags.",
         ),
-        Argument("prior_node_block_field", str, optional=True, default="node_p2_blocks", doc="Node AO-block field used for physical-prior Full-H reconstruction."),
-        Argument("prior_edge_block_field", str, optional=True, default="edge_p2_blocks", doc="Edge AO-block field used for physical-prior Full-H reconstruction."),
-        Argument("prior_label", str, optional=True, default="P2"),
+        Argument("prior_node_block_field", str, optional=True, default="", doc="Deprecated/optional: node AO-block field used for physical-prior Full-H reconstruction. Leave empty to derive from the embedding prior_kind (node_p2_blocks/node_p23_blocks); an explicit value must match the derived one."),
+        Argument("prior_edge_block_field", str, optional=True, default="", doc="Deprecated/optional: edge AO-block field used for physical-prior Full-H reconstruction. Leave empty to derive from the embedding prior_kind (edge_p2_blocks/edge_p23_blocks); an explicit value must match the derived one."),
+        Argument("prior_label", str, optional=True, default="", doc="Deprecated/optional: human label for the physical prior. Leave empty to derive from prior_kind (P2/P23)."),
         Argument("validate_prior_blocks", bool, optional=True, default=False, doc="Debug-only finite checks for prior AO blocks during every model forward. Production caches are validated at dataset ingest."),
         Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks in a residual reconstruction mode."),
         Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks in a residual reconstruction mode."),
@@ -1782,9 +1782,9 @@ def block_native_prediction():
             default="direct",
             doc="Full-H reconstruction mode: direct, h0_residual, or prior_residual.",
         ),
-        Argument("prior_node_block_field", str, optional=True, default="node_p2_blocks"),
-        Argument("prior_edge_block_field", str, optional=True, default="edge_p2_blocks"),
-        Argument("prior_label", str, optional=True, default="P2"),
+        Argument("prior_node_block_field", str, optional=True, default="", doc="Deprecated/optional: leave empty to derive from the embedding prior_kind (node_p2_blocks/node_p23_blocks); an explicit value must match the derived one."),
+        Argument("prior_edge_block_field", str, optional=True, default="", doc="Deprecated/optional: leave empty to derive from the embedding prior_kind (edge_p2_blocks/edge_p23_blocks); an explicit value must match the derived one."),
+        Argument("prior_label", str, optional=True, default="", doc="Deprecated/optional: leave empty to derive from prior_kind (P2/P23)."),
         Argument("validate_prior_blocks", bool, optional=True, default=False, doc="Debug-only finite checks for prior AO blocks during every model forward. Production caches are validated at dataset ingest."),
         Argument("full_output_node_field", str, optional=True, default="node_full_hamil_blocks", doc="Output key for reconstructed Full-H node blocks in a residual reconstruction mode."),
         Argument("full_output_edge_field", str, optional=True, default="edge_full_hamil_blocks", doc="Output key for reconstructed Full-H edge blocks in a residual reconstruction mode."),
@@ -1819,9 +1819,9 @@ def slem_prior():
             default="both",
             doc="Physical-prior initialization scope: both, node, edge, auxiliary, or none.",
         ),
-        Argument("prior_kind", str, optional=True, default="p2", doc="Physical prior family: p2 or p23."),
-        Argument("prior_node_key", str, optional=True, default="node_p2", doc="Node-wise selected-prior RME field; P23 must explicitly use node_p23."),
-        Argument("prior_edge_key", str, optional=True, default="edge_p2", doc="Edge-wise selected-prior RME field; P23 must explicitly use edge_p23."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Physical prior family: p2 or p23. This single value derives the node/edge RME fields, AO-block fields and label."),
+        Argument("prior_node_key", str, optional=True, default="", doc="Deprecated/optional: node-wise selected-prior RME field. Leave empty to derive from prior_kind (node_p2/node_p23); an explicit value must match the derived one."),
+        Argument("prior_edge_key", str, optional=True, default="", doc="Deprecated/optional: edge-wise selected-prior RME field. Leave empty to derive from prior_kind (edge_p2/edge_p23); an explicit value must match the derived one."),
         Argument("prior_node_mode", str, optional=True, default="direct", doc="Supported: direct or self_edge."),
         Argument("prior_merge_mode", str, optional=True, default="replace", doc="Supported: replace or add."),
         Argument("prior_self_edge_tol", float, optional=True, default=1e-8),
@@ -2160,40 +2160,34 @@ def _validate_p2_prior_full_h_contract(data):
     embedding_options = model.get("embedding", {})
     prediction_options = model.get("prediction", {})
     embedding_is_prior = embedding_options.get("method") == "lem_moe_v3_prior"
-    prior_specs = {
-        "p2": {
-            "raw": "hamiltonian_p2",
-            "node": "node_p2",
-            "edge": "edge_p2",
-            "node_blocks": "node_p2_blocks",
-            "edge_blocks": "edge_p2_blocks",
-            "label": "P2",
-        },
-        "p23": {
-            "raw": "hamiltonian_p23",
-            "node": "node_p23",
-            "edge": "edge_p23",
-            "node_blocks": "node_p23_blocks",
-            "edge_blocks": "edge_p23_blocks",
-            "label": "P23",
-        },
-    }
+    # Single source of truth: every kind-dependent field name and label is
+    # DERIVED from the one prior kind via build_prior_spec instead of a parallel
+    # hand-maintained table.  Deprecated explicit fields are still policed, but
+    # an empty/omitted value is derived rather than reconciled, so switching
+    # p2 <-> p23 is a single-value (prior_kind) change with no cross-field skew.
+    from dptb.data.interfaces.p2_contract import (
+        PRIOR_FIELD_SPECS,
+        build_prior_spec,
+    )
+
     embedding_prior_kind = str(
         embedding_options.get("prior_kind", "p2")
     ).strip().lower()
-    if embedding_is_prior and embedding_prior_kind not in prior_specs:
+    if embedding_is_prior and embedding_prior_kind not in PRIOR_FIELD_SPECS:
         raise ValueError(
             "model_options.embedding.prior_kind must be 'p2' or 'p23'; "
             f"got {embedding_prior_kind!r}."
         )
-    prior_spec = prior_specs.get(embedding_prior_kind, prior_specs["p2"])
+    prior_spec = build_prior_spec(
+        embedding_prior_kind if embedding_prior_kind in PRIOR_FIELD_SPECS else "p2"
+    )
     if embedding_is_prior:
         for option, expected in (
-            ("prior_node_key", prior_spec["node"]),
-            ("prior_edge_key", prior_spec["edge"]),
+            ("prior_node_key", prior_spec.node_rme_key),
+            ("prior_edge_key", prior_spec.edge_rme_key),
         ):
             actual = embedding_options.get(option)
-            if actual != expected:
+            if actual not in (None, "") and actual != expected:
                 raise ValueError(
                     f"model_options.embedding.prior_kind={embedding_prior_kind!r} "
                     f"requires {option}={expected!r}; got {actual!r}. Refusing "
@@ -2274,20 +2268,20 @@ def _validate_p2_prior_full_h_contract(data):
 
     if add_prior:
         for option, expected in (
-            ("prior_node_block_field", prior_spec["node_blocks"]),
-            ("prior_edge_block_field", prior_spec["edge_blocks"]),
+            ("prior_node_block_field", prior_spec.node_blocks_key),
+            ("prior_edge_block_field", prior_spec.edge_blocks_key),
         ):
             actual = prediction_options.get(option)
-            if actual != expected:
+            if actual not in (None, "") and actual != expected:
                 raise ValueError(
                     f"prediction.add_prior=true with prior_kind="
                     f"{embedding_prior_kind!r} requires {option}={expected!r}; "
                     f"got {actual!r}."
                 )
         prior_label = str(prediction_options.get("prior_label", "")).strip().upper()
-        if prior_label != prior_spec["label"]:
+        if prior_label and prior_label != prior_spec.label:
             raise ValueError(
-                f"prediction.prior_label must be {prior_spec['label']!r} for "
+                f"prediction.prior_label must be {prior_spec.label!r} for "
                 f"prior_kind={embedding_prior_kind!r}; got {prior_label!r}."
             )
     for split, split_options in configured_splits.items():
@@ -2302,11 +2296,12 @@ def _validate_p2_prior_full_h_contract(data):
                 f"data_options.{split}.prior_kind={split_prior_kind!r} does not "
                 f"match embedding prior_kind={embedding_prior_kind!r}."
             )
-        if split_options.get("p2_key", "hamiltonian_p2") != prior_spec["raw"]:
+        split_p2_key = split_options.get("p2_key")
+        if split_p2_key not in (None, "") and split_p2_key != prior_spec.raw_key:
             raise ValueError(
                 f"data_options.{split}.prior_kind={embedding_prior_kind!r} "
-                f"requires p2_key={prior_spec['raw']!r}; got "
-                f"{split_options.get('p2_key')!r}."
+                f"requires p2_key={prior_spec.raw_key!r}; got "
+                f"{split_p2_key!r}."
             )
         if not bool(split_options.get("get_Hamiltonian", False)):
             raise ValueError(

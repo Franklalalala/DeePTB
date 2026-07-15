@@ -86,8 +86,16 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
-class PriorFieldSpec:
-    """All record fields that must move together for one physical prior."""
+class PriorSpec:
+    """Single source of truth for one physical prior (p2 or p23).
+
+    Every record field, RME/AO-block key, provenance fingerprint key, human
+    label, and reconstruction semantics that must move together for one prior
+    family is derived from ``kind`` here.  Callers that need any of these values
+    read them from this object instead of re-deriving a parallel ``kind->field``
+    table, so switching ``p2`` <-> ``p23`` is a single-value change with no
+    cross-field skew possible.
+    """
 
     kind: str
     raw_key: str
@@ -103,6 +111,13 @@ class PriorFieldSpec:
     bundle_fingerprint_key: str
     allowed_sample_schemas: tuple[str, ...]
     bundle_dependency_fields: tuple[str, ...] = ()
+    # Full-H reconstruction semantics implied by conditioning on this prior.
+    reconstruction_mode: str = "prior_residual"
+
+    @property
+    def label(self) -> str:
+        """Human/config label for this prior, e.g. 'P2' or 'P23'."""
+        return self.kind.upper()
 
     @property
     def rme_fields(self) -> tuple[str, str]:
@@ -118,8 +133,13 @@ class PriorFieldSpec:
         )
 
 
+# Backwards-compatible name retained for callers/imports that predate the
+# ``PriorSpec`` rename.  It is the exact same class.
+PriorFieldSpec = PriorSpec
+
+
 PRIOR_FIELD_SPECS = {
-    "p2": PriorFieldSpec(
+    "p2": PriorSpec(
         kind="p2",
         raw_key="hamiltonian_p2",
         node_rme_key="node_p2",
@@ -134,7 +154,7 @@ PRIOR_FIELD_SPECS = {
         bundle_fingerprint_key=P2_BUNDLE_FINGERPRINT_KEY,
         allowed_sample_schemas=(P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA),
     ),
-    "p23": PriorFieldSpec(
+    "p23": PriorSpec(
         kind="p23",
         raw_key="hamiltonian_p23",
         node_rme_key="node_p23",
@@ -153,7 +173,7 @@ PRIOR_FIELD_SPECS = {
 }
 
 
-def resolve_prior_field_spec(kind: Any) -> PriorFieldSpec:
+def resolve_prior_field_spec(kind: Any) -> PriorSpec:
     normalized = str(kind).strip().lower()
     try:
         return PRIOR_FIELD_SPECS[normalized]
@@ -163,7 +183,20 @@ def resolve_prior_field_spec(kind: Any) -> PriorFieldSpec:
         ) from exc
 
 
-def resolve_prior_field_spec_from_raw_key(raw_key: Any) -> PriorFieldSpec:
+def build_prior_spec(kind: Any) -> PriorSpec:
+    """Return the single derived :class:`PriorSpec` for ``kind`` (p2/p23).
+
+    This is the canonical entry point every consumer (dataset loader, argcheck,
+    embedding, block decoder, prediction head) should call so that all
+    kind-dependent field names, labels, and reconstruction semantics come from
+    one place.  It is a thin, intention-revealing wrapper over
+    :func:`resolve_prior_field_spec`.
+    """
+
+    return resolve_prior_field_spec(kind)
+
+
+def resolve_prior_field_spec_from_raw_key(raw_key: Any) -> PriorSpec:
     normalized = str(raw_key).strip()
     for spec in PRIOR_FIELD_SPECS.values():
         if normalized == spec.raw_key:
@@ -400,6 +433,7 @@ __all__ = [
     "P23_SOURCE_FINGERPRINT_KEY",
     "PRIOR_FIELD_SPECS",
     "PriorFieldSpec",
+    "PriorSpec",
     "ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY",
     "ROW_ALIGNED_DATA_FINGERPRINT_KEY",
     "ROW_ALIGNED_FIELD_CANDIDATES",
@@ -407,6 +441,7 @@ __all__ = [
     "TARGET_SEMANTICS_KEY",
     "TARGET_SOURCE_KEY",
     "assert_record_fingerprint",
+    "build_prior_spec",
     "canonical_edge_graph",
     "edge_graph_fingerprint",
     "fingerprint_fields",

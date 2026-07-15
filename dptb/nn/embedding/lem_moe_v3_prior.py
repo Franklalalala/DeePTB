@@ -14,7 +14,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from dptb.configuration import resolve_init_scope
-from dptb.data import AtomicDataDict, _keys
+from dptb.data import AtomicDataDict
+from dptb.data.interfaces.p2_contract import build_prior_spec
 from dptb.nn.embedding.emb import Embedding
 
 from .lem_moe_v3_h0 import LemMoEV3H0
@@ -197,8 +198,8 @@ class LemMoEV3Prior(LemMoEV3H0):
         prior_init_scope: Optional[str] = None,
         prior_kind: Optional[str] = None,
         use_prior_init: Optional[bool] = None,
-        prior_node_key: str = _keys.NODE_P2_KEY,
-        prior_edge_key: str = _keys.EDGE_P2_KEY,
+        prior_node_key: str = "",
+        prior_edge_key: str = "",
         use_prior_node_init: Optional[bool] = None,
         use_prior_edge_init: Optional[bool] = None,
         prior_node_mode: str = "direct",
@@ -224,17 +225,29 @@ class LemMoEV3Prior(LemMoEV3H0):
         prior_kind = (
             "p2" if prior_kind is None else str(prior_kind).strip().lower()
         )
-        expected_fields = {
-            "p2": (_keys.NODE_P2_KEY, _keys.EDGE_P2_KEY),
-            "p23": (_keys.NODE_P23_KEY, _keys.EDGE_P23_KEY),
-        }
-        if prior_kind not in expected_fields:
+        try:
+            prior_spec = build_prior_spec(prior_kind)
+        except ValueError as exc:
             raise ValueError(
                 "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
                 f"got {prior_kind!r}."
-            )
-        expected_node_key, expected_edge_key = expected_fields[prior_kind]
-        if str(prior_node_key) != expected_node_key or str(prior_edge_key) != expected_edge_key:
+            ) from exc
+        # The node/edge RME keys are DERIVED from the single prior kind.  An
+        # explicit key is accepted only as a deprecated echo that must match the
+        # derived value, so p2/p23 fields can never be mixed by cross-field skew.
+        expected_node_key = prior_spec.node_rme_key
+        expected_edge_key = prior_spec.edge_rme_key
+        prior_node_key = (
+            expected_node_key
+            if prior_node_key in (None, "")
+            else str(prior_node_key)
+        )
+        prior_edge_key = (
+            expected_edge_key
+            if prior_edge_key in (None, "")
+            else str(prior_edge_key)
+        )
+        if prior_node_key != expected_node_key or prior_edge_key != expected_edge_key:
             raise ValueError(
                 f"prior_kind={prior_kind!r} requires prior_node_key="
                 f"{expected_node_key!r} and prior_edge_key={expected_edge_key!r}; "
