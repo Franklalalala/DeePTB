@@ -33,6 +33,9 @@ from dptb.nnops.metric_pack import (
     DynamicBatchStat,
     ExpertDisplayMetric,
 )
+from dptb.nnops.metric_reducer import MetricReducer
+from dptb.nnops.dynamic_batch_controller import DynamicBatchController
+from dptb.nnops.objective import Objective, FlowObjective
 from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
@@ -2092,30 +2095,35 @@ class MultiTrainer(Trainer):
     ) -> Dict[str, torch.Tensor]:
         if criterion is None:
             criterion = self.train_lossfunc
-        if not Trainer._supports_endpoint_triplet(criterion):
-            return {}
-        compatible_state = self._compute_compatible_state_from_pack(
+        return MetricReducer.component_state_from_pack(
             pack,
-            criterion=criterion,
+            loss_module=self._resolve_loss_module(criterion),
+            supports_triplet=Trainer._supports_endpoint_triplet(criterion),
+            dtype=self.dtype,
+            device=self.device,
             prefix=prefix,
+            global_step=getattr(self, "iter", None),
         )
-        if compatible_state is not None:
-            return {
-                f"{prefix}_onsite_loss": compatible_state[f"{prefix}_onsite_loss"],
-                f"{prefix}_hopping_loss": compatible_state[f"{prefix}_hopping_loss"],
-            }
-
-        mp = MetricPack.from_tensor(pack)
-        onsite_cnt = mp.active_nodes_sum.to(dtype=self.dtype).clamp_min(1.0)
-        hopping_cnt = mp.active_edges_sum.to(dtype=self.dtype).clamp_min(1.0)
-        return {
-            f"{prefix}_onsite_loss": (mp.onsite_weighted_sum / onsite_cnt).detach(),
-            f"{prefix}_hopping_loss": (mp.hopping_weighted_sum / hopping_cnt).detach(),
-        }
 
     # ---------------------------------------------------------------------
     # core expert fwd/loss
     # ---------------------------------------------------------------------
+
+    @property
+    def _objective(self) -> Objective:
+        obj = self.__dict__.get("_objective_obj")
+        if obj is None:
+            obj = Objective(self)
+            self.__dict__["_objective_obj"] = obj
+        return obj
+
+    @property
+    def _flow_objective(self) -> FlowObjective:
+        obj = self.__dict__.get("_flow_objective_obj")
+        if obj is None:
+            obj = FlowObjective(self)
+            self.__dict__["_flow_objective_obj"] = obj
+        return obj
 
     def _run_one_expert_loss(
         self,
@@ -2146,208 +2154,39 @@ class MultiTrainer(Trainer):
             configured_flow and bool(use_flow)
         )
         if flow_enabled:
-            batch_for_loss = batch_copy.copy()
-            if getattr(self.flow_cfm, "model_in_loss", False):
-                with self._tagger.tag("expert/flow_loss_with_model", it=self.iter, expert=expert_idx):
-                    loss, flow_state = self.flow_cfm.loss_with_model(
-                        self.model,
-                        batch_copy,
-                        batch_for_loss,
-                    )
-                flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
-                flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
-                compatible_prefix = f"{flow_prefix}_compatible"
-                compatible_state = Trainer._compatible_loss_state_from_flow_stats(
-                    criterion,
-                    flow_state,
-                    source_prefix=flow_prefix,
-                    prefix=compatible_prefix,
-                    legacy_prefix=flow_prefix,
-                    global_step=self.iter,
-                )
-                if compatible_state is not None:
-                    flow_state.update(compatible_state)
-            else:
-                with self._tagger.tag("expert/flow_prepare_batch", it=self.iter, expert=expert_idx):
-                    flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
-                        batch_copy,
-                        batch_for_loss,
-                    )
-
-                with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
-                    with cuda_cache_memory_context(
-                        iteration=self.iter,
-                        stage="expert/model_forward",
-                        expert=expert_idx,
-                    ):
-                        pred_batch = self.model(flow_batch)
-
-                pred_batch["global_step"] = int(self.iter)
-                pred_batch.setdefault("expert_edge_mask", expert_edge_mask)
-                pred_batch.setdefault("expert_node_mask", expert_node_mask)
-                pred_batch.setdefault("expert_idx", int(expert_idx))
-                pred_batch.update(batch_info)
-                flow_ref.update(batch_info)
-
-                with self._tagger.tag("expert/flow_loss", it=self.iter, expert=expert_idx):
-                    loss, flow_state = self.flow_cfm.loss(pred_batch, flow_ref, flow_ctx)
-
-                flow_state = self._flow_state_with_prefix(flow_state, flow_prefix)
-                flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
-                compatible_prefix = f"{flow_prefix}_compatible"
-                compatible_state = Trainer._compatible_loss_state_from_flow_stats(
-                    criterion,
-                    flow_state,
-                    source_prefix=flow_prefix,
-                    prefix=compatible_prefix,
-                    legacy_prefix=flow_prefix,
-                    global_step=self.iter,
-                )
-                if compatible_state is None:
-                    compatible_state = Trainer._compatible_loss_state(
-                        criterion,
-                        pred_batch,
-                        flow_ref,
-                        prefix=compatible_prefix,
-                        legacy_prefix=flow_prefix,
-                        include_raw_stats=True,
-                    )
-                    fallback_stats = compatible_state.pop("_endpoint_stats", None)
-                    if fallback_stats is not None:
-                        flow_state["_compatible_clean_stats"] = fallback_stats
-                if compatible_state is not None:
-                    flow_state.update(compatible_state)
-
-            if compatible_state is None:
-                raise RuntimeError(
-                    "Enabled flow could not reconstruct an endpoint triplet in "
-                    "the criterion's metric space. Check that flow target keys "
-                    "and the configured Hamiltonian loss use the same block/RME "
-                    "representation."
-                )
-            Trainer._require_endpoint_triplet(
-                flow_state,
-                prefix=flow_prefix,
-                route="MultiTrainer flow training",
+            return self._flow_objective.run(
+                batch_copy=batch_copy,
+                batch_info=batch_info,
+                criterion=criterion,
+                expert_idx=expert_idx,
+                expert_edge_mask=expert_edge_mask,
+                expert_node_mask=expert_node_mask,
+                active_nodes=active_nodes,
+                active_edges=active_edges,
+                flow_prefix=flow_prefix,
             )
 
-            out = {
-                "loss": loss,
-                "active_nodes": active_nodes,
-                "active_edges": active_edges,
-            }
-            out.update(self._payload_metrics_from_flow_state(flow_state, prefix=flow_prefix))
-            flow_state.pop("_compatible_clean_stats", None)
-            return out
-
-        with self._tagger.tag("expert/model_forward", it=self.iter, expert=expert_idx):
-            with cuda_cache_memory_context(
-                iteration=self.iter,
-                stage="expert/model_forward",
-                expert=expert_idx,
-            ):
-                pred_batch = self.model(batch_copy)
-
-        pred_batch["global_step"] = int(self.iter)
-
-        with self._tagger.tag("expert/attach_batch_info", it=self.iter, expert=expert_idx):
-            pred_batch.update(batch_info)
-            batch_for_loss = batch_copy.copy()
-            batch_for_loss.update(batch_info)
-
-        with self._tagger.tag("expert/loss_forward", it=self.iter, expert=expert_idx):
-            loss = criterion(pred_batch, batch_for_loss)
-
-        out = {
-            "loss": loss,
-            "active_nodes": active_nodes,
-            "active_edges": active_edges,
-        }
-        if capture_metrics:
-            out.update(self._snapshot_loss_metrics(criterion))
-        return out
+        return self._objective.run(
+            batch_copy=batch_copy,
+            batch_info=batch_info,
+            criterion=criterion,
+            expert_idx=expert_idx,
+            active_nodes=active_nodes,
+            active_edges=active_edges,
+            capture_metrics=capture_metrics,
+        )
 
     def _build_train_payload(
         self, batch_dict, batch_info, expert_idx, range_dis,
         ref_batch_dict=None, ref_batch_info=None, criterion=None, flow_prefix="train"
     ):
-        if criterion is None:
-            criterion = self.train_lossfunc
-
-        main = self._run_one_expert_loss(
-            batch_dict=batch_dict,
-            batch_info=batch_info,
+        return self._objective.build_train_payload(
+            batch_dict, batch_info, expert_idx, range_dis,
+            ref_batch_dict=ref_batch_dict,
+            ref_batch_info=ref_batch_info,
             criterion=criterion,
-            expert_idx=expert_idx,
-            range_dis=range_dis,
-            capture_metrics=True,
             flow_prefix=flow_prefix,
         )
-
-        total_loss = main["loss"]
-        active_nodes = main["active_nodes"]
-        active_edges = main["active_edges"]
-
-        onsite_weighted_sum = main["onsite"] * active_nodes.to(dtype=self.dtype)
-        hopping_weighted_sum = main["hopping"] * active_edges.to(dtype=self.dtype)
-
-        onsite_l1_sum = main["last_onsite_l1_sum"]
-        onsite_mse_sum = main["last_onsite_mse_sum"]
-        onsite_cnt = main["last_onsite_count"]
-        hopping_l1_sum = main["last_hopping_l1_sum"]
-        hopping_mse_sum = main["last_hopping_mse_sum"]
-        hopping_cnt = main["last_hopping_count"]
-
-        z_values = []
-        load_cv_values = []
-        if main["z_loss"] is not None:
-            z_values.append(main["z_loss"])
-        if main["expert_load_cv"] is not None:
-            load_cv_values.append(main["expert_load_cv"])
-
-        if ref_batch_dict is not None:
-            reference_criterion = getattr(self, "reference_lossfunc", criterion)
-            ref_res = self._run_one_expert_loss(
-                batch_dict=ref_batch_dict,
-                batch_info=ref_batch_info,
-                criterion=reference_criterion,
-                expert_idx=expert_idx,
-                range_dis=range_dis,
-                capture_metrics=True,
-                flow_prefix=flow_prefix,
-                use_flow=bool(
-                    getattr(getattr(self, "flow_cfm", None), "apply_to_reference", False)
-                ),
-            )
-
-            total_loss = total_loss + ref_res["loss"]
-            # Match the single Trainer contract: reference supervision affects
-            # the backward objective but never contaminates the main-batch
-            # endpoint triplet. Reference metrics can be reported separately
-            # by a future dedicated namespace.
-
-        active_nodes_safe = active_nodes.to(dtype=self.dtype).clamp_min(1.0)
-        active_edges_safe = active_edges.to(dtype=self.dtype).clamp_min(1.0)
-        expert_onsite = onsite_weighted_sum / active_nodes_safe
-        expert_hopping = hopping_weighted_sum / active_edges_safe
-
-        return {
-            "loss": total_loss,
-            "expert_onsite": expert_onsite.detach(),
-            "expert_hopping": expert_hopping.detach(),
-            "onsite_weighted_sum": onsite_weighted_sum.detach(),
-            "hopping_weighted_sum": hopping_weighted_sum.detach(),
-            "active_nodes": active_nodes.detach(),
-            "active_edges": active_edges.detach(),
-            "onsite_l1_sum": onsite_l1_sum.detach() if torch.is_tensor(onsite_l1_sum) else None,
-            "onsite_mse_sum": onsite_mse_sum.detach() if torch.is_tensor(onsite_mse_sum) else None,
-            "onsite_cnt": onsite_cnt.detach() if torch.is_tensor(onsite_cnt) else None,
-            "hopping_l1_sum": hopping_l1_sum.detach() if torch.is_tensor(hopping_l1_sum) else None,
-            "hopping_mse_sum": hopping_mse_sum.detach() if torch.is_tensor(hopping_mse_sum) else None,
-            "hopping_cnt": hopping_cnt.detach() if torch.is_tensor(hopping_cnt) else None,
-            "z_values": [z.detach() for z in z_values],
-            "load_cv_values": [cv.detach() for cv in load_cv_values],
-        }
 
     # ---------------------------------------------------------------------
     # stitched loss helpers
@@ -2355,17 +2194,7 @@ class MultiTrainer(Trainer):
 
     @staticmethod
     def _maybe_call_or_value(x, default: float = 1.0) -> float:
-        if x is None:
-            return float(default)
-        if callable(x):
-            try:
-                return float(x())
-            except Exception:
-                return float(default)
-        try:
-            return float(x)
-        except Exception:
-            return float(default)
+        return MetricReducer.maybe_call_or_value(x, default)
 
     def _compute_stitched_loss_by_reduce(self, payloads: List[Dict[str, Any]], criterion=None) -> Optional[torch.Tensor]:
         if criterion is None:
@@ -2374,90 +2203,13 @@ class MultiTrainer(Trainer):
         if self.endpoint_loss_mode != "reduce":
             return None
 
-        onsite_l1_sum = None
-        onsite_mse_sum = None
-        onsite_cnt = None
-        hopping_l1_sum = None
-        hopping_mse_sum = None
-        hopping_cnt = None
-        z_vals = []
-
-        for p in payloads:
-            if p is None:
-                continue
-
-            if p.get("onsite_l1_sum") is not None:
-                onsite_l1_sum = p["onsite_l1_sum"] if onsite_l1_sum is None else (onsite_l1_sum + p["onsite_l1_sum"])
-                onsite_mse_sum = p["onsite_mse_sum"] if onsite_mse_sum is None else (onsite_mse_sum + p["onsite_mse_sum"])
-                onsite_cnt = p["onsite_cnt"] if onsite_cnt is None else (onsite_cnt + p["onsite_cnt"])
-
-            if p.get("hopping_l1_sum") is not None:
-                hopping_l1_sum = p["hopping_l1_sum"] if hopping_l1_sum is None else (hopping_l1_sum + p["hopping_l1_sum"])
-                hopping_mse_sum = p["hopping_mse_sum"] if hopping_mse_sum is None else (hopping_mse_sum + p["hopping_mse_sum"])
-                hopping_cnt = p["hopping_cnt"] if hopping_cnt is None else (hopping_cnt + p["hopping_cnt"])
-
-            for z in p.get("z_values", []):
-                if z is not None:
-                    z_vals.append(z)
-
-        if onsite_cnt is None and hopping_cnt is None:
-            return None
-
-        loss_module = self._resolve_loss_module(criterion)
-        reduce_from_stats = getattr(loss_module, "compatible_loss_from_stats", None)
-        if callable(reduce_from_stats) and all(
-            value is not None
-            for value in (
-                onsite_l1_sum,
-                onsite_mse_sum,
-                onsite_cnt,
-                hopping_l1_sum,
-                hopping_mse_sum,
-                hopping_cnt,
-            )
-        ):
-            z_loss = None
-            if z_vals:
-                z_loss = torch.stack([z.to(self.device, dtype=self.dtype) for z in z_vals]).mean()
-            total, _onsite_loss, _hopping_loss = reduce_from_stats(
-                onsite_l1_sum=onsite_l1_sum,
-                onsite_mse_sum=onsite_mse_sum,
-                onsite_count=onsite_cnt,
-                hopping_l1_sum=hopping_l1_sum,
-                hopping_mse_sum=hopping_mse_sum,
-                hopping_count=hopping_cnt,
-                z_loss=z_loss,
-                global_step=self.iter,
-            )
-            return total.detach()
-
-        def _safe_mean(sum_t, cnt_t):
-            if sum_t is None or cnt_t is None:
-                return torch.zeros((), dtype=self.dtype, device=self.device)
-            return sum_t / cnt_t.to(dtype=self.dtype).clamp_min(1.0)
-
-        onsite_l1_mean = _safe_mean(onsite_l1_sum, onsite_cnt)
-        onsite_mse_mean = _safe_mean(onsite_mse_sum, onsite_cnt)
-        hopping_l1_mean = _safe_mean(hopping_l1_sum, hopping_cnt)
-        hopping_mse_mean = _safe_mean(hopping_mse_sum, hopping_cnt)
-
-        onsite_loss = 0.5 * (onsite_l1_mean + torch.sqrt(onsite_mse_mean))
-        hopping_loss = 0.5 * (hopping_l1_mean + torch.sqrt(hopping_mse_mean))
-
-        onsite_boost = bool(getattr(loss_module, "onsite_boost", False))
-        onsite_boost_w = self._maybe_call_or_value(getattr(loss_module, "_current_onsite_weight", None), default=1.0)
-        z_coef = float(getattr(loss_module, "z_loss_coef", 0.0))
-
-        if onsite_boost:
-            total = onsite_boost_w * onsite_loss + hopping_loss
-        else:
-            total = 0.5 * (onsite_loss + hopping_loss)
-
-        if z_coef > 0.0 and len(z_vals) > 0:
-            z_mean = torch.stack([z.to(self.device, dtype=self.dtype) for z in z_vals]).mean()
-            total = total + z_coef * z_mean
-
-        return total.detach()
+        return MetricReducer.stitched_loss_reduce(
+            payloads,
+            loss_module=self._resolve_loss_module(criterion),
+            dtype=self.dtype,
+            device=self.device,
+            global_step=self.iter,
+        )
 
     def _compute_compatible_state_from_pack(
         self,
@@ -2469,73 +2221,17 @@ class MultiTrainer(Trainer):
     ):
         if criterion is None:
             criterion = self.train_lossfunc
-        if not Trainer._supports_endpoint_triplet(criterion):
-            return None
-
-        mp = MetricPack.from_tensor(pack)
-        onsite_cnt = mp.onsite_cnt_sum
-        hopping_cnt = mp.hopping_cnt_sum
-        loss_module = self._resolve_loss_module(criterion)
-        reduce_from_stats = getattr(loss_module, "compatible_loss_from_stats", None)
         if global_step is None:
             global_step = getattr(self, "iter", None)
-
-        def _safe_mean(sum_t, cnt_t):
-            return sum_t / cnt_t.to(dtype=self.dtype).clamp_min(1.0)
-
-        if float(onsite_cnt.item()) > 0.0 or float(hopping_cnt.item()) > 0.0:
-            if callable(reduce_from_stats):
-                z_loss = None
-                if float(mp.z_cnt.item()) > 0.0:
-                    z_loss = mp.z_sum / mp.z_cnt.clamp_min(1.0)
-                total, _onsite_loss, _hopping_loss = reduce_from_stats(
-                    onsite_l1_sum=mp.onsite_l1_sum,
-                    onsite_mse_sum=mp.onsite_mse_sum,
-                    onsite_count=onsite_cnt,
-                    hopping_l1_sum=mp.hopping_l1_sum,
-                    hopping_mse_sum=mp.hopping_mse_sum,
-                    hopping_count=hopping_cnt,
-                    z_loss=z_loss,
-                    global_step=global_step,
-                )
-                return {
-                    f"{prefix}_loss": total.detach(),
-                    f"{prefix}_onsite_loss": _onsite_loss.detach(),
-                    f"{prefix}_hopping_loss": _hopping_loss.detach(),
-                }
-
-            onsite_l1_mean = _safe_mean(mp.onsite_l1_sum, onsite_cnt)
-            onsite_mse_mean = _safe_mean(mp.onsite_mse_sum, onsite_cnt)
-            hopping_l1_mean = _safe_mean(mp.hopping_l1_sum, hopping_cnt)
-            hopping_mse_mean = _safe_mean(mp.hopping_mse_sum, hopping_cnt)
-
-            onsite_loss = 0.5 * (onsite_l1_mean + torch.sqrt(onsite_mse_mean))
-            hopping_loss = 0.5 * (hopping_l1_mean + torch.sqrt(hopping_mse_mean))
-        else:
-            active_nodes = mp.active_nodes_sum
-            active_edges = mp.active_edges_sum
-            if float(active_nodes.item()) <= 0.0 and float(active_edges.item()) <= 0.0:
-                return None
-            onsite_loss = _safe_mean(mp.onsite_weighted_sum, active_nodes)
-            hopping_loss = _safe_mean(mp.hopping_weighted_sum, active_edges)
-
-        onsite_boost = bool(getattr(loss_module, "onsite_boost", False))
-        onsite_boost_w = self._maybe_call_or_value(getattr(loss_module, "_current_onsite_weight", None), default=1.0)
-        z_coef = float(getattr(loss_module, "z_loss_coef", 0.0))
-
-        if onsite_boost:
-            total = onsite_boost_w * onsite_loss + hopping_loss
-        else:
-            total = 0.5 * (onsite_loss + hopping_loss)
-
-        if z_coef > 0.0 and float(mp.z_cnt.item()) > 0.0:
-            total = total + z_coef * (mp.z_sum / mp.z_cnt.clamp_min(1.0))
-
-        return {
-            f"{prefix}_loss": total.detach(),
-            f"{prefix}_onsite_loss": onsite_loss.detach(),
-            f"{prefix}_hopping_loss": hopping_loss.detach(),
-        }
+        return MetricReducer.compatible_state_from_pack(
+            pack,
+            loss_module=self._resolve_loss_module(criterion),
+            supports_triplet=Trainer._supports_endpoint_triplet(criterion),
+            dtype=self.dtype,
+            device=self.device,
+            prefix=prefix,
+            global_step=global_step,
+        )
 
     def _compute_compatible_loss_from_pack(self, pack: torch.Tensor, criterion=None, *, global_step=None):
         state = self._compute_compatible_state_from_pack(
@@ -2690,76 +2386,19 @@ class MultiTrainer(Trainer):
             return None
         total_steps = max(raw_total_steps, 1.0)
 
-        train_loss_opt_mean = reduced_mp.loss_opt_sum / total_steps
-        compatible_train_state = self._compute_compatible_state_from_pack(
+        state = MetricReducer.display_state_from_packs(
             reduced_pack,
-            self.train_lossfunc,
-            prefix="train",
-            global_step=time_idx,
+            reduced_dynamic_pack,
+            gathered,
+            total_steps=total_steps,
+            num_experts=self.num_experts,
+            rank_to_expert_idx=self._rank_to_expert_idx,
+            train_loss_module=self._resolve_loss_module(self.train_lossfunc),
+            supports_triplet=Trainer._supports_endpoint_triplet(self.train_lossfunc),
+            dtype=self.dtype,
+            device=self.device,
+            time_idx=time_idx,
         )
-        train_loss_show = (
-            compatible_train_state["train_loss"]
-            if compatible_train_state is not None
-            else train_loss_opt_mean
-        )
-
-        total_grad_norm_mean = reduced_mp.grad_norm_sum / reduced_mp.step_count.clamp_min(1.0)
-
-        avg_lr = sum(
-            float(ExpertDisplayMetric.from_tensor(vec).lr.item()) for vec in gathered
-        ) / max(len(gathered), 1)
-
-        state = {
-            'field': 'iteration',
-            'window_steps': int(round(total_steps)),
-            "train_loss": train_loss_show.detach() if torch.is_tensor(train_loss_show) else torch.tensor(float(train_loss_show), device=self.device, dtype=self.dtype),
-            "train_loss_opt": train_loss_opt_mean.detach() if torch.is_tensor(train_loss_opt_mean) else torch.tensor(float(train_loss_opt_mean), device=self.device, dtype=self.dtype),
-            "lr": float(avg_lr),
-            "total_grad_norm": float(total_grad_norm_mean.item()),
-        }
-        if compatible_train_state is not None:
-            state.update({
-                "train_onsite_loss": float(
-                    compatible_train_state["train_onsite_loss"].item()
-                ),
-                "train_hopping_loss": float(
-                    compatible_train_state["train_hopping_loss"].item()
-                ),
-            })
-
-        expert_metrics: Dict[int, List[torch.Tensor]] = {}
-        for rank_idx, vec in enumerate(gathered):
-            expert_idx = self._rank_to_expert_idx(rank_idx)
-            expert_metrics.setdefault(expert_idx, []).append(vec)
-
-        for expert_idx in range(self.num_experts):
-            vecs = expert_metrics.get(expert_idx, [])
-            if not vecs:
-                continue
-            stacked = torch.stack(vecs)
-            mean_metric = ExpertDisplayMetric.from_tensor(stacked.mean(dim=0))
-            if Trainer._supports_endpoint_triplet(self.train_lossfunc):
-                state[f"expert_{expert_idx}_onsite"] = float(mean_metric.expert_onsite.item())
-                state[f"expert_{expert_idx}_hopping"] = float(mean_metric.expert_hopping.item())
-            state[f"expert_{expert_idx}_lr"] = float(mean_metric.lr.item())
-            state[f"expert_{expert_idx}_active_nodes"] = float(mean_metric.active_nodes.item())
-            state[f"expert_{expert_idx}_active_edges"] = float(mean_metric.active_edges.item())
-
-        if float(reduced_mp.cv_cnt.item()) > 0.0:
-            state["expert_load_cv"] = float((reduced_mp.cv_sum / reduced_mp.cv_cnt).item())
-        if float(reduced_mp.z_cnt.item()) > 0.0:
-            state["mean_max_prob"] = float((reduced_mp.z_sum / reduced_mp.z_cnt).item())
-
-        dynamic_batch_steps = float(reduced_db.step_count.item())
-        if dynamic_batch_steps > 0.0:
-            denom = reduced_db.step_count.clamp_min(1.0)
-            state["batch_num_graphs"] = float((reduced_db.num_graphs_sum / denom).item())
-            state["batch_cost"] = float((reduced_db.cost_sum / denom).item())
-            state["batch_num_nodes"] = float((reduced_db.num_nodes_sum / denom).item())
-            state["batch_num_edges"] = float((reduced_db.num_edges_sum / denom).item())
-            state["batch_max_item_cost"] = float((reduced_db.max_item_cost_sum / denom).item())
-        if dynamic_batch_oom_skips > 0:
-            state["dynamic_batch_oom_skipped_iters"] = dynamic_batch_oom_skips
 
         self._add_optimizer_diagnostics_to_state(state)
         self._add_cuda_memory_state(state, cuda_memory_metrics)
@@ -3063,48 +2702,28 @@ class MultiTrainer(Trainer):
     # dynamic batch OOM fallback helpers
     # ---------------------------------------------------------------------
 
+    @property
+    def _dynamic_batch_controller(self) -> DynamicBatchController:
+        # Lazily attached so trainers built via ``object.__new__`` (unit tests)
+        # get a working controller without ``__init__`` running.
+        dbc = self.__dict__.get("_dynamic_batch_controller_obj")
+        if dbc is None:
+            dbc = DynamicBatchController(self)
+            self.__dict__["_dynamic_batch_controller_obj"] = dbc
+        return dbc
+
     @staticmethod
     def _is_cuda_oom(exc: BaseException) -> bool:
-        oom_cls = getattr(torch, "OutOfMemoryError", None)
-        if oom_cls is not None and isinstance(exc, oom_cls):
-            return True
-        return "out of memory" in str(exc).lower()
+        return DynamicBatchController.is_cuda_oom(exc)
 
     def _disable_dynamic_batch_oom_fallback(self, message: str, *args):
-        log.warning(message, *args)
-        self.dynamic_batch_oom_fallback = False
-        if isinstance(getattr(self, "dynamic_batch_options", None), dict):
-            self.dynamic_batch_options["oom_fallback"] = False
+        return self._dynamic_batch_controller.disable_oom_fallback(message, *args)
 
     def _configure_dynamic_batch_oom_fallback(self):
-        self.dynamic_batch_oom_fallback = bool(self.dynamic_batch_options.get("oom_fallback", False))
-        self.dynamic_batch_oom_shrink_factor = float(self.dynamic_batch_options.get("oom_shrink_factor", 0.8))
-        self.dynamic_batch_oom_skipped_iters = 0
-        self.dynamic_batch_oom_skipped_since_display = 0
-
-        if not (self.dynamic_batch_enabled and self.dynamic_batch_oom_fallback):
-            return
-        if not (0.0 < self.dynamic_batch_oom_shrink_factor < 1.0):
-            self._disable_dynamic_batch_oom_fallback(
-                "dynamic_batch OOM skip fallback is disabled because oom_shrink_factor=%s is not in (0, 1).",
-                self.dynamic_batch_oom_shrink_factor,
-            )
-            return
-        if self.distributed_rank0_prepare_batch:
-            self._disable_dynamic_batch_oom_fallback(
-                "dynamic_batch OOM skip fallback is disabled for distributed_rank0_prepare_batch in this version; "
-                "dynamic cost batching remains enabled."
-            )
-            return
-        if self._dynamic_batch_oom_requires_expert_dp_consensus():
-            self._disable_dynamic_batch_oom_fallback(
-                "dynamic_batch OOM skip fallback is disabled for expert_data_parallel_size=%s because "
-                "a no-sync fallback cannot guarantee expert-DP rank consensus; dynamic cost batching remains enabled.",
-                self.expert_data_parallel_size,
-            )
+        return self._dynamic_batch_controller.configure_oom_fallback()
 
     def _dynamic_batch_oom_requires_expert_dp_consensus(self) -> bool:
-        return self.distributed_expert and int(getattr(self, "expert_data_parallel_size", 1)) > 1
+        return self._dynamic_batch_controller.requires_expert_dp_consensus()
 
     @classmethod
     def _dynamic_batch_state_from_batch(cls, batch) -> Dict[str, Any]:
@@ -3126,158 +2745,38 @@ class MultiTrainer(Trainer):
         }
 
     def _clear_after_oom(self):
-        for opt in getattr(self, "optimizers", []):
-            if opt is not None:
-                opt.zero_grad(set_to_none=True)
-        if self._is_cuda_device():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+        return self._dynamic_batch_controller.clear_after_oom()
 
     def _runtime_dynamic_batch_sampler(self):
-        sampler = getattr(getattr(self, "train_loader", None), "batch_sampler", None)
-        if sampler is None or not hasattr(sampler, "max_cost"):
-            return None
-        return sampler
+        return self._dynamic_batch_controller.runtime_sampler()
 
     def _set_runtime_dynamic_batch_max_cost(self, sampler, max_cost: int):
-        sampler.max_cost = int(max_cost)
-        opts = getattr(self.train_loader, "dynamic_batch_options", None)
-        if isinstance(opts, dict):
-            opts["max_cost"] = int(max_cost)
-            if "max_edge" in opts:
-                opts["max_edge"] = int(max_cost)
+        return self._dynamic_batch_controller.set_runtime_max_cost(sampler, max_cost)
 
     def _invalidate_runtime_dynamic_batch_cache(self):
-        invalidate_cache = getattr(self.train_loader, "invalidate_dynamic_batch_cache", None)
-        if not callable(invalidate_cache):
-            return
-        try:
-            invalidate_cache(clear_costs=False)
-        except TypeError:
-            invalidate_cache()
-        except Exception:
-            log.exception("dynamic_batch OOM fallback failed to invalidate cached batches after shrink.")
+        return self._dynamic_batch_controller.invalidate_runtime_cache()
 
     def _shrink_dynamic_batch_after_oom(self, batch):
-        sampler = self._runtime_dynamic_batch_sampler()
-        if sampler is None:
-            return None, None
-        old_max = int(sampler.max_cost)
-        if old_max <= 1:
-            self._disable_dynamic_batch_oom_fallback(
-                "[DYNAMIC_BATCH_OOM_SHRINK] disabled fallback because runtime max_cost=%s cannot shrink further",
-                old_max,
-            )
-            return old_max, old_max
-        new_max = max(1, int(math.floor(old_max * self.dynamic_batch_oom_shrink_factor)))
-        if new_max >= old_max:
-            self._disable_dynamic_batch_oom_fallback(
-                "[DYNAMIC_BATCH_OOM_SHRINK] disabled fallback because shrink would not progress: "
-                "old_max_cost=%s new_max_cost=%s shrink_factor=%s",
-                old_max,
-                new_max,
-                self.dynamic_batch_oom_shrink_factor,
-            )
-            return old_max, new_max
-        self._set_runtime_dynamic_batch_max_cost(sampler, new_max)
-        self._invalidate_runtime_dynamic_batch_cache()
-        log_values = self._dynamic_batch_oom_log_values(batch)
-        batch_max_item_cost = log_values["batch_max_item_cost"]
-        if batch_max_item_cost is not None:
-            try:
-                if float(batch_max_item_cost) > float(new_max):
-                    log.warning(
-                        "[DYNAMIC_BATCH_OOM_SHRINK] current batch contains item cost %s above new_max_cost=%s; "
-                        "future iterators may still emit oversized singletons unless drop_oversized is enabled.",
-                        batch_max_item_cost,
-                        new_max,
-                    )
-            except Exception:
-                pass
-        log.warning(
-            "[DYNAMIC_BATCH_OOM_SHRINK] old_max_cost=%s new_max_cost=%s batch_cost=%s "
-            "batch_max_item_cost=%s applies=next_loader_iterator",
-            old_max,
-            new_max,
-            log_values["batch_cost"],
-            batch_max_item_cost,
-        )
-        return old_max, new_max
+        return self._dynamic_batch_controller.shrink_after_oom(batch)
 
     def _can_skip_dynamic_batch_after_oom(self, ref_batch=None, optimizer_step_started: bool = False) -> bool:
-        return (
-            self.dynamic_batch_enabled
-            and self.dynamic_batch_oom_fallback
-            and not self.distributed_rank0_prepare_batch
-            and not self._dynamic_batch_oom_requires_expert_dp_consensus()
-            and ref_batch is None
-            and not optimizer_step_started
+        return self._dynamic_batch_controller.can_skip_after_oom(
+            ref_batch=ref_batch, optimizer_step_started=optimizer_step_started
         )
 
     def _record_dynamic_batch_oom_skip(self):
-        self.dynamic_batch_oom_skipped_iters = int(getattr(self, "dynamic_batch_oom_skipped_iters", 0)) + 1
-        self.dynamic_batch_oom_skipped_since_display = (
-            int(getattr(self, "dynamic_batch_oom_skipped_since_display", 0)) + 1
-        )
-        pack = getattr(self, "_display_window_dynamic_batch_pack_local", None)
-        oom_slot = DynamicBatchStat.index("oom_skipped_count")
-        if torch.is_tensor(pack) and pack.numel() > oom_slot:
-            pack[oom_slot] += 1.0
+        return self._dynamic_batch_controller.record_oom_skip()
 
     def _flush_display_window_after_oom_skip_if_needed(self, where: str):
-        if not self.distributed_expert:
-            return
-        if not self._should_flush_display_window_now(self.iter):
-            return
-        if not hasattr(self, "_display_window_pack_local"):
-            return
-        skipped_since_display = getattr(self, "dynamic_batch_oom_skipped_since_display", 0)
-        state = self._flush_display_window(time_idx=self.iter)
-        if state is not None:
-            log.warning(
-                "dynamic_batch OOM fallback joined display flush at iter=%s where=%s skipped_since_display=%s",
-                self.iter,
-                where,
-                skipped_since_display,
-            )
-            self.call_plugins(queue_name='iteration', time=self.iter, **state)
+        return self._dynamic_batch_controller.flush_display_after_oom_skip_if_needed(where)
 
     def _handle_dynamic_batch_oom_skip(self, batch, *, local_oom: bool, where: str):
-        self._clear_after_oom()
-        self._reset_cuda_memory_peak()
-        old_max_cost, new_max_cost = self._shrink_dynamic_batch_after_oom(batch)
-        self._record_dynamic_batch_oom_skip()
-        log_values = self._dynamic_batch_oom_log_values(batch)
-        log.warning(
-            "[DYNAMIC_BATCH_OOM_SKIP] iter=%s rank=%s where=%s local_oom=%s "
-            "batch_cost=%s batch_max_item_cost=%s num_graphs=%s old_max_cost=%s new_max_cost=%s "
-            "total_skipped=%s skipped_since_display=%s",
-            self.iter,
-            getattr(self, "rank", 0),
-            where,
-            bool(local_oom),
-            log_values["batch_cost"],
-            log_values["batch_max_item_cost"],
-            log_values["num_graphs"],
-            old_max_cost,
-            new_max_cost,
-            self.dynamic_batch_oom_skipped_iters,
-            self.dynamic_batch_oom_skipped_since_display,
-        )
-        self._flush_display_window_after_oom_skip_if_needed(where)
-        if self.distributed_expert:
-            self.iter += 1
-        return None
+        return self._dynamic_batch_controller.handle_oom_skip(batch, local_oom=local_oom, where=where)
 
     def _maybe_skip_dynamic_batch_after_oom(self, batch, *, local_oom: bool, where: str, ref_batch=None) -> bool:
-        if not self._can_skip_dynamic_batch_after_oom(ref_batch=ref_batch):
-            return False
-        if not local_oom:
-            return False
-        self._handle_dynamic_batch_oom_skip(batch, local_oom=local_oom, where=where)
-        return True
+        return self._dynamic_batch_controller.maybe_skip_after_oom(
+            batch, local_oom=local_oom, where=where, ref_batch=ref_batch
+        )
 
     # ---------------------------------------------------------------------
     # public iteration
