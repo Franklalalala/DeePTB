@@ -28,6 +28,12 @@ from dptb.data import _keys
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nnops.trainer import Trainer
 from dptb.nnops.ddp_utils import merge_restart_train_options
+from dptb.nnops.training_state import (
+    CHECKPOINT_KIND_EPOCH,
+    CHECKPOINT_KIND_ITERATION,
+    read_resume_metadata,
+    restore_rng_state,
+)
 from dptb.nnops.expert_parallel_layout import (
     rank_to_expert_parallel,
     resolve_expert_parallel_layout,
@@ -3922,10 +3928,14 @@ class MultiTrainer(Trainer):
             world_size=world_size,
         )
 
-        trainer.ep = ckpt["epoch"] + 1
-        trainer.iter = ckpt["iteration"] + 1
+        trainer.iter = int(ckpt["iteration"]) + 1
         trainer.stats = ckpt["stats"]
 
+        # ---- resume state machine (legacy-tolerant) -----------------------
+        resume = read_resume_metadata(ckpt)
+        trainer._restored_plugin_state = dict(resume.plugin_state or {})
+
+        # Load optimizer/scheduler states first (before any epoch-end LR replay).
         if distributed_expert:
             idx = trainer.local_expert_idx
             opt_states = ckpt.get("optimizers_state_dict", None)
@@ -3942,6 +3952,28 @@ class MultiTrainer(Trainer):
                     for obj, state in zip(items, saved_states):
                         if obj is not None:
                             obj.load_state_dict(state)
+
+        if resume.checkpoint_kind == CHECKPOINT_KIND_ITERATION:
+            # Mid-epoch checkpoint: re-enter the SAME epoch so its remaining
+            # batches are not skipped (BUG 1). The multi-GPU sampler layout makes
+            # an exact per-batch fast-forward invasive, so take the documented
+            # safe path: re-run the epoch from its start (ep = ckpt_epoch, not
+            # +1). No batch/sampler cursor -> no mid-epoch RNG restore.
+            trainer.ep = int(resume.epoch)
+        else:
+            # Epoch-committed checkpoint: advance and replay the one pending
+            # per-epoch LR step (Saver.epoch persists the scheduler before run()
+            # steps it) to avoid an off-by-one LR transition on resume (BUG 1).
+            trainer.ep = int(resume.epoch) + 1
+            if resume.rng_state is not None:
+                restore_rng_state(resume.rng_state)
+            if resume.epoch_scheduler_step_pending and not trainer.update_lr_per_iter:
+                try:
+                    trainer._step_epoch_schedulers()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning(
+                        "Failed to replay epoch-end LR step on restart: %s", exc
+                    )
 
         return trainer
 

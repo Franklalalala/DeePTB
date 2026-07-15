@@ -864,6 +864,9 @@ class LMDBDataset(AtomicDataset):
         state["_lmdb_env_cache"] = {}
         state["_validated_record_contracts"] = {}
         state["_validated_record_contracts_pid"] = None
+        # Drop the process-local dynamic-batch cost cache so it is not pickled
+        # into DataLoader worker processes (stale/oversized across a fork) (BUG 6).
+        state["_dynamic_batch_cost_parts_cache"] = None
         return state
 
     def _record_contract_validation_state(self, idx: int):

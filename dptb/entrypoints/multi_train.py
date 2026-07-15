@@ -722,6 +722,12 @@ def _multi_train_impl(
     if distributed_expert and is_dist_ready():
         dist_barrier_on_current_device()
 
+    # Realign plugin event queues to the absolute grid for the (possibly
+    # resumed) current iter/epoch so a restart does not fire every plugin
+    # immediately then drift off the interval grid (BUG 3). MultiTrainer.restart
+    # previously had no cadence code at all.
+    trainer.rebase_plugin_cadence()
+
     with entry_tagger.tag("trainer/run", device=torch.device(jdata["common_options"]["device"])):
         start_time = time.time()
         trainer.run(trainer.train_options["num_epoch"])

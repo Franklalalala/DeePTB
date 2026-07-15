@@ -717,6 +717,11 @@ def train(
 
     start_time = time.time()
 
+    # Realign plugin event queues to the absolute save/validation/display grid
+    # for the (possibly resumed) current iter/epoch, so a restart does not fire
+    # every plugin immediately then drift off the interval grid (BUG 3).
+    trainer.rebase_plugin_cadence()
+
     trainer.run(trainer.train_options["num_epoch"])
 
     end_time = time.time()

@@ -12,6 +12,23 @@ log = logging.getLogger(__name__)
 
 import csv
 import os
+
+
+def _open_csv_appending(csv_path, header):
+    """Open ``csv_path`` for appending, writing ``header`` only if the file is
+    missing or empty.
+
+    Diagnostic monitors historically truncated their CSV with mode ``'w'`` at
+    construction, so a restart wiped every row collected before the interruption
+    (BUG 5). Appending with a header-if-missing guard preserves prior rows and
+    never duplicates the header.
+    """
+    needs_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+    if needs_header:
+        with open(csv_path, 'a', newline='') as f:
+            csv.writer(f).writerow(header)
+
+
 from dptb.nn.norm import SeperableLayerNorm
 import math
 import torch.nn as nn
@@ -101,9 +118,7 @@ class PreTPBlockMonitor(Plugin):
             'decay_ratio'  # 衰减率 (Out/In), < 0.1 说明此处阻断
         ]
 
-        with open(self.csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self.header)
+        _open_csv_appending(self.csv_path, self.header)
 
     def register(self, trainer):
         self.trainer = trainer
@@ -251,9 +266,7 @@ class SO2ModuleMonitor(Plugin):
             'status'
         ]
 
-        with open(self.csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self.header)
+        _open_csv_appending(self.csv_path, self.header)
 
     def register(self, trainer):
         self.trainer = trainer
@@ -432,9 +445,7 @@ class CUDAModuleMemoryMonitor(Plugin):
             "peak_reserved_before_mb", "peak_reserved_after_mb", "peak_reserved_delta_mb",
             "global_peak_crossed",
         ]
-        with open(self.csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self.header)
+        _open_csv_appending(self.csv_path, self.header)
 
     def register(self, trainer):
         self.trainer = trainer
@@ -643,16 +654,23 @@ class DeepDoctorMonitor(Plugin):
             "total_grad": ['iter', 'total_norm', 'clipped']  # [新增]
         }
 
-        # 初始化 CSV
+        # 初始化 CSV (append + header-if-missing so a restart keeps prior rows)
         for key, filepath in self.files.items():
-            with open(filepath, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(self.headers[key])
+            _open_csv_appending(filepath, self.headers[key])
 
     def register(self, trainer):
         self.trainer = trainer
         self._register_hooks()
         log.info(f"🚑 [DeepDoctor] 启动监控 | One-Shot 诊断 + 持续 Total Norm 记录")
+
+    # StatefulPlugin protocol: the one-shot cliff analysis must not re-run after
+    # a restart, so persist whether it has already fired.
+    def state_dict(self):
+        return {"has_run_once": bool(self.has_run_once)}
+
+    def load_state_dict(self, state):
+        if state and "has_run_once" in state:
+            self.has_run_once = bool(state["has_run_once"])
 
     def _analyze_tensor(self, t):
         if t is None: return 0.0, 0.0, 0.0
@@ -808,6 +826,23 @@ class Monitor(Plugin):
             self.loss_queue = collections.deque(maxlen=sliding_win_size)
         self.avg_per_iter = avg_per_iter
 
+    # StatefulPlugin protocol: the sliding-window deque feeds
+    # latest_avg_iter_loss (a per-iter LR-scheduler metric) and lives only on
+    # the plugin, not in trainer.stats, so it must be checkpointed to survive a
+    # restart. Running-average / epoch means already round-trip through stats.
+    def state_dict(self):
+        if getattr(self, "avg_per_iter", False) and hasattr(self, "loss_queue"):
+            return {"loss_queue": list(self.loss_queue)}
+        return {}
+
+    def load_state_dict(self, state):
+        if not state:
+            return
+        window = state.get("loss_queue")
+        if window is not None and getattr(self, "avg_per_iter", False) and hasattr(self, "loss_queue"):
+            self.loss_queue.clear()
+            self.loss_queue.extend(window)
+
     def _normalize_scalar(self, val):
         if val is None:
             return None
@@ -822,13 +857,16 @@ class Monitor(Plugin):
         self.trainer = trainer
         stats = self.trainer.stats.setdefault(self.stat_name, {})
 
-        stats['last'] = 0.0
+        # setdefault each VALUE key so stats restored from a checkpoint survive a
+        # re-register on restart, while a fresh run still initialises to 0 (BUG 4).
+        stats.setdefault('last', 0.0)
         if self.with_running_average:
-            stats['running_avg'] = 0.0
+            stats.setdefault('running_avg', 0.0)
         if self.with_epoch_average:
-            stats['epoch_mean'] = 0.0
-            stats['epoch_stats'] = (0, 0)
+            stats.setdefault('epoch_mean', 0.0)
+            stats.setdefault('epoch_stats', (0, 0))
 
+        # Formatting metadata is configuration (not training state): always set.
         stats['log_format'] = self.log_format
         stats['log_unit'] = self.log_unit
         stats['log_iter_fields'] = self.log_iter_fields
@@ -959,6 +997,14 @@ class CUDAMemoryMonitor(Plugin):
         super(CUDAMemoryMonitor, self).__init__(interval)
         self.precision = int(precision)
         self._epoch_max = {}
+
+    # StatefulPlugin protocol: per-epoch running maxima live on the plugin only.
+    def state_dict(self):
+        return {"epoch_max": dict(self._epoch_max)}
+
+    def load_state_dict(self, state):
+        if state and isinstance(state.get("epoch_max"), dict):
+            self._epoch_max = dict(state["epoch_max"])
 
     @classmethod
     def is_memory_field(cls, name):
@@ -1387,6 +1433,15 @@ class ParamDynamicsMonitor(Plugin):
         self._param_state = {}
         self._dead_streak = {}
         self._warned_no_groups = False
+
+    # StatefulPlugin protocol: consecutive-dead-step counters must persist so a
+    # restart does not reset a module's dead-streak (and lose an imminent alert).
+    def state_dict(self):
+        return {"dead_streak": dict(self._dead_streak)}
+
+    def load_state_dict(self, state):
+        if state and isinstance(state.get("dead_streak"), dict):
+            self._dead_streak = dict(state["dead_streak"])
 
     def register(self, trainer):
         self.trainer = trainer

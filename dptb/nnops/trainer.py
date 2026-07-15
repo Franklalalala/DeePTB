@@ -30,6 +30,12 @@ from dptb.nnops.self_consistency import (
     SelfConsistencySchedulerConfig,
     compute_self_consistency_payload_loss,
 )
+from dptb.nnops.training_state import (
+    CHECKPOINT_KIND_EPOCH,
+    CHECKPOINT_KIND_ITERATION,
+    read_resume_metadata,
+    restore_rng_state,
+)
 
 log = logging.getLogger(__name__)
 
@@ -799,6 +805,13 @@ class Trainer(BaseTrainer):
             else:
                 self.lr_scheduler.step()
 
+        # The optimizer step for this batch is now baked into the model; count
+        # it as committed *before* call_plugins so a checkpoint fired by
+        # Saver.iteration persists the correct mid-epoch fast-forward cursor.
+        # getattr-guarded: some unit tests drive iteration() on trainers built
+        # without BaseTrainer.__init__.
+        self._batch_in_epoch = getattr(self, "_batch_in_epoch", 0) + 1
+
         state = {
             'field': 'iteration',
             "train_loss": loss_for_log,
@@ -875,19 +888,78 @@ class Trainer(BaseTrainer):
         trainer = cls(model=model, train_datasets=train_datasets, reference_datasets=reference_datasets,
                       validation_datasets=validation_datasets, train_options=train_options,
                       common_options=merged_common_options)
-        trainer.ep = ckpt["epoch"] + 1
-        trainer.iter = ckpt["iteration"] + 1
         trainer.stats = ckpt["stats"]
-        queues_name = list(trainer.plugin_queues.keys())
-        for unit in queues_name:
-            for plugin in trainer.plugin_queues[unit]:
-                plugin = (getattr(trainer, unit) + plugin[0], plugin[1], plugin[2])
+
+        # ---- resume state machine (legacy-tolerant) -----------------------
+        resume = read_resume_metadata(ckpt)
+        trainer.iter = int(ckpt["iteration"]) + 1
+        # Stash restored per-plugin state so plugins restore themselves at
+        # register time (plugins are registered by the entrypoint *after*
+        # restart()); e.g. Saver's best_loss / retention queues (BUG 2).
+        trainer._restored_plugin_state = dict(resume.plugin_state or {})
+
+        # Load optimizer/scheduler *before* any epoch-end LR replay.
         for key in Trainer.object_keys:
             item = getattr(trainer, key, None)
-            if item is not None: item.load_state_dict(ckpt[key + "_state_dict"])
+            if item is not None:
+                item.load_state_dict(ckpt[key + "_state_dict"])
+
+        if resume.checkpoint_kind == CHECKPOINT_KIND_ITERATION:
+            # Mid-epoch checkpoint: re-enter the SAME epoch (do NOT skip it) and
+            # fast-forward over the batches already committed into the saved
+            # model, so each remaining batch runs exactly once (BUG 1).
+            trainer.ep = int(resume.epoch)
+            trainer._resume_plan = {
+                "target_epoch": int(resume.epoch),
+                "skip_batches": int(resume.batch_in_epoch),
+                "rng_state": resume.rng_state,
+            }
+        else:
+            # Epoch-committed checkpoint: advance to the next epoch. The per-epoch
+            # LR step for the committed epoch fired *after* Saver.epoch persisted
+            # the scheduler, so replay exactly one step to avoid an off-by-one
+            # LR transition on resume (BUG 1, scheduler tail).
+            trainer.ep = int(resume.epoch) + 1
+            if resume.rng_state is not None:
+                restore_rng_state(resume.rng_state)
+            if resume.epoch_scheduler_step_pending and not trainer.update_lr_per_iter:
+                try:
+                    trainer._lr_step_on_epoch_end()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning(
+                        "Failed to replay epoch-end LR step on restart: %s", exc
+                    )
         return trainer
 
     def epoch(self) -> None:
+        # Reset the per-epoch committed-batch cursor; consume any one-shot
+        # resume plan left by restart() so the *first* epoch after a mid-epoch
+        # restart fast-forwards over already-committed batches and restores the
+        # RNG trajectory before running the remainder exactly once.
+        self._batch_in_epoch = 0
+        skip_batches, resume_rng = self._consume_resume_plan()
+        if skip_batches and not self._loader_supports_exact_fast_forward():
+            # The loader's batch order is not guaranteed to reproduce across a
+            # restart (e.g. plain shuffle=True without a per-epoch-seeded
+            # sampler), so a byte-exact fast-forward could skip the wrong
+            # batches. Fall back to the safe path: re-run the whole epoch from
+            # its start (no epoch skipped; some pre-checkpoint batches recompute).
+            log.warning(
+                "train_loader order is not restart-deterministic; re-running epoch %s "
+                "from its start instead of fast-forwarding %s committed batches.",
+                int(self.ep), skip_batches,
+            )
+            skip_batches = 0
+            resume_rng = None
+
+        # Seed the committed-batch cursor to the fast-forward offset so a SECOND
+        # mid-epoch preemption during this resumed epoch persists an ABSOLUTE
+        # batch position. Otherwise the cursor would restart from 0 and a later
+        # restart would recompute (and double-step the optimizer over) the
+        # already-fast-forwarded batches. In the safe-fallback path
+        # skip_batches == 0, so this is a no-op.
+        self._batch_in_epoch = skip_batches
+
         batch_sampler = getattr(self.train_loader, "batch_sampler", None)
         if hasattr(batch_sampler, "set_epoch"):
             batch_sampler.set_epoch(int(self.ep))
@@ -896,7 +968,25 @@ class Trainer(BaseTrainer):
             if hasattr(ref_batch_sampler, "set_epoch"):
                 ref_batch_sampler.set_epoch(int(self.ep))
         reference_iter = iter(self.reference_loader) if self.use_reference else None
-        for ibatch in self.train_loader:
+        rng_restored = False
+        for batch_index, ibatch in enumerate(self.train_loader):
+            if batch_index < skip_batches:
+                # Fast-forward: this batch was already committed pre-restart.
+                # Keep the reference stream aligned but do not re-optimize.
+                if self.use_reference:
+                    try:
+                        next(reference_iter)
+                    except StopIteration:
+                        reference_iter = iter(self.reference_loader)
+                        next(reference_iter)
+                continue
+            if not rng_restored:
+                # Restore exactly once, right before the first re-executed batch,
+                # so it sees the RNG state an uninterrupted run would have had
+                # (the fast-forward above must not perturb it).
+                if resume_rng is not None:
+                    restore_rng_state(resume_rng)
+                rng_restored = True
             if self.use_reference:
                 try:
                     ref_batch = next(reference_iter)
@@ -906,6 +996,47 @@ class Trainer(BaseTrainer):
                 self.iteration(ibatch, ref_batch)
             else:
                 self.iteration(ibatch)
+
+    def _consume_resume_plan(self):
+        """Pop the one-shot restart plan for the current epoch.
+
+        Returns ``(skip_batches, rng_state)``.  The plan only applies to the
+        first epoch re-entered after restart (matched by target epoch); any
+        later epoch runs from a clean cursor.
+        """
+        plan = getattr(self, "_resume_plan", None)
+        if not plan:
+            return 0, None
+        if int(plan.get("target_epoch", self.ep)) != int(self.ep):
+            return 0, None
+        # Consume so subsequent epochs are unaffected.
+        self._resume_plan = None
+        return int(plan.get("skip_batches", 0)), plan.get("rng_state")
+
+    def _loader_supports_exact_fast_forward(self):
+        """Whether ``train_loader`` reproduces its batch order across a restart.
+
+        Exact when the batch sampler is per-epoch seeded (``set_epoch`` -> the
+        dynamic-cost sampler used for large production jobs), or when the loader
+        is not a torch ``DataLoader`` at all (fixed-order sequences / test
+        fixtures). A plain ``DataLoader(shuffle=True)`` draws from the global RNG
+        with no per-epoch seed, so its order is not restart-reproducible.
+        """
+        loader = self.train_loader
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+            return True
+        try:
+            import torch.utils.data as _tud
+            if not isinstance(loader, _tud.DataLoader):
+                return True
+        except Exception:  # pragma: no cover - defensive
+            return True
+        # A torch DataLoader with no per-epoch-seeded sampler: safe only if it
+        # is not shuffling (deterministic sequential order).
+        sampler = getattr(loader, "sampler", None)
+        sampler_name = type(sampler).__name__ if sampler is not None else ""
+        return "Random" not in sampler_name
 
     def update(self, **kwargs):
         pass

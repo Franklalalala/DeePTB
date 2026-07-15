@@ -2,6 +2,14 @@ import gc
 import json
 import shutil
 from dptb.plugins.base_plugin import Plugin
+from dptb.plugins.checkpoint_state import StatefulPlugin
+from dptb.nnops.training_state import (
+    CHECKPOINT_KIND_EPOCH,
+    CHECKPOINT_KIND_ITERATION,
+    CHECKPOINT_SCHEMA_VERSION,
+    TrainingState,
+    capture_rng_state,
+)
 import logging
 import os
 import torch
@@ -37,7 +45,7 @@ def _delta(end, start):
     return end - start
 
 
-class Saver(Plugin):
+class Saver(Plugin, StatefulPlugin):
     def __init__(self, interval=None):
         if interval is None:
             interval = [(1, 'iteration'), (1, 'epoch')]
@@ -48,11 +56,106 @@ class Saver(Plugin):
         self._last_iteration_checkpoint_name = None
         self._last_iteration_checkpoint_iter = None
         self._profile_save_name = None
+        # Set True once load_state_dict restores persisted best/retention state
+        # (BUG 2): prevents register() from re-seeding best_loss from disk and
+        # clobbering the restored value.
+        self._state_restored = False
+
+    # ------------------------------------------------------------------
+    # StatefulPlugin protocol: persist best_loss + retention queues so a
+    # resumed run does not treat its first epoch as a new best and overwrite
+    # .best.pth with a worse checkpoint (BUG 2).
+    # ------------------------------------------------------------------
+    def state_dict(self):
+        return {
+            "best_loss": float(self.best_loss),
+            "best_quene": list(self.best_quene),
+            "latest_quene": list(self.latest_quene),
+            "last_iteration_checkpoint_name": self._last_iteration_checkpoint_name,
+            "last_iteration_checkpoint_iter": self._last_iteration_checkpoint_iter,
+        }
+
+    def load_state_dict(self, state):
+        if not state:
+            return
+        if "best_loss" in state and state["best_loss"] is not None:
+            self.best_loss = float(state["best_loss"])
+        if isinstance(state.get("best_quene"), list):
+            self.best_quene = list(state["best_quene"])
+        if isinstance(state.get("latest_quene"), list):
+            self.latest_quene = list(state["latest_quene"])
+        self._last_iteration_checkpoint_name = state.get(
+            "last_iteration_checkpoint_name", self._last_iteration_checkpoint_name
+        )
+        self._last_iteration_checkpoint_iter = state.get(
+            "last_iteration_checkpoint_iter", self._last_iteration_checkpoint_iter
+        )
+        self._state_restored = True
 
     def register(self, trainer, checkpoint_path):
         self.checkpoint_path = checkpoint_path
         self.trainer = trainer
+        # If no persisted state was restored (legacy checkpoint or fresh run
+        # that already trained), seed best_loss from the restored stats or an
+        # existing best.pth so a resumed worse epoch cannot clobber .best.pth.
+        if not self._state_restored:
+            self._seed_best_loss_from_disk_or_stats()
 
+        self._configure_push()
+
+    def _seed_best_loss_from_disk_or_stats(self):
+        """Best-effort recovery of best_loss when no persisted state exists.
+
+        Prefer the loss stored inside an existing ``.best.pth`` (the true best);
+        fall back to the restored ``trainer.stats`` epoch means.  A conservative
+        seed here stops a resumed *worse* epoch from overwriting ``.best.pth``
+        for legacy checkpoints that predate persisted Saver state (BUG 2).
+        """
+        # 0) Cheapest: the durable manifest records best_loss directly.
+        manifest = self._read_manifest()
+        if manifest is not None and manifest.get("best_loss") is not None:
+            try:
+                self.best_loss = float(manifest["best_loss"])
+                if isinstance(manifest.get("best_quene"), list):
+                    self.best_quene = list(manifest["best_quene"])
+                if isinstance(manifest.get("latest_quene"), list):
+                    self.latest_quene = list(manifest["latest_quene"])
+                return
+            except (TypeError, ValueError):
+                pass
+
+        model_name = getattr(getattr(self.trainer, "model", None), "name", None)
+        # 1) Try the on-disk best checkpoint's recorded stats.
+        if model_name is not None:
+            best_path = os.path.join(self.checkpoint_path, model_name + ".best.pth")
+            try:
+                if os.path.lexists(best_path):
+                    prev = torch.load(best_path, map_location="cpu", weights_only=False)
+                    seed = self._loss_from_stats(prev.get("stats", {}))
+                    if seed is not None:
+                        self.best_loss = seed
+                        return
+            except Exception as exc:
+                log.info("Could not seed best_loss from %s: %s", best_path, exc)
+        # 2) Fall back to the restored in-memory stats.
+        seed = self._loss_from_stats(getattr(self.trainer, "stats", {}))
+        if seed is not None:
+            self.best_loss = seed
+
+    @staticmethod
+    def _loss_from_stats(stats):
+        if not isinstance(stats, dict):
+            return None
+        for key in ("validation_loss", "train_loss"):
+            entry = stats.get(key)
+            if isinstance(entry, dict) and entry.get("epoch_mean") is not None:
+                try:
+                    return float(entry["epoch_mean"])
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _configure_push(self):
         if self.trainer.model.name == "nnsk":
             push_option = self.trainer.model.model_options["nnsk"].get("push", False)
             if push_option:
@@ -79,6 +182,101 @@ class Saver(Plugin):
         except Exception as e:
             log.warning(f"Failed to create symlink {dst} -> {src_abs}, fallback to copy. Reason: {e}")
         shutil.copy2(src_abs, dst)
+
+    def _write_checkpoint_atomic(self, obj, f_path):
+        """Serialize to ``<f_path>.tmp`` then ``os.replace`` onto the final name.
+
+        An interrupted/failed ``torch.save`` therefore never leaves a truncated
+        ``.pth`` behind: readers only ever observe the fully written previous
+        file or the fully written new one (BUG 2, atomicity).
+        """
+        tmp_path = f"{f_path}.tmp{os.getpid()}"
+        try:
+            with self._profile_stage("torch_save"):
+                torch.save(obj, f=tmp_path)
+            os.replace(tmp_path, f_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _atomic_publish(self, src_abs, link_path):
+        """Publish ``link_path`` -> ``src_abs`` atomically (symlink, else copy).
+
+        Writes a uniquely named temp then ``os.replace`` swaps it into place so a
+        concurrent reader never sees a missing or half-written latest/best link.
+        """
+        tmp_path = f"{link_path}.tmp{os.getpid()}"
+        if os.path.lexists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        published = False
+        try:
+            os.symlink(src_abs, tmp_path)
+            published = True
+        except Exception as e:
+            log.warning(
+                "Failed to create symlink %s -> %s, fallback to copy. Reason: %s",
+                tmp_path, src_abs, e,
+            )
+            shutil.copy2(src_abs, tmp_path)
+            published = True
+        if published:
+            os.replace(tmp_path, link_path)
+
+    MANIFEST_NAME = "checkpoint_manifest.json"
+
+    def _manifest_path(self):
+        return os.path.join(self.checkpoint_path, self.MANIFEST_NAME)
+
+    def _write_manifest(self):
+        """Atomically record a durable pointer to best/latest + retention state.
+
+        Written on the main process after each publish so an operator (or a
+        restart) can find the current best/latest and the rotation queues
+        without loading any ``.pth``. Best-effort: a manifest failure never
+        aborts a checkpoint.
+        """
+        if not self._is_main():
+            return
+        model_name = getattr(getattr(self.trainer, "model", None), "name", None)
+        manifest = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "global_step": int(getattr(self.trainer, "iter", 1)),
+            "epoch": int(getattr(self.trainer, "ep", 1)),
+            "best_loss": float(self.best_loss),
+            "best": (model_name + ".best.pth") if model_name else None,
+            "latest": (model_name + ".latest.pth") if model_name else None,
+            "best_quene": list(self.best_quene),
+            "latest_quene": list(self.latest_quene),
+        }
+        path = self._manifest_path()
+        tmp_path = f"{path}.tmp{os.getpid()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, indent=2, sort_keys=True)
+            os.replace(tmp_path, path)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Failed to write checkpoint manifest %s: %s", path, exc)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _read_manifest(self):
+        try:
+            path = self._manifest_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+        except Exception as exc:
+            log.info("Could not read checkpoint manifest: %s", exc)
+        return None
 
     def _is_dist_expert(self):
         return bool(getattr(self.trainer, "distributed_expert", False)) and dist.is_available() and dist.is_initialized()
@@ -506,6 +704,7 @@ class Saver(Plugin):
             model_options=self.trainer.model.model_options,
             common_options=self.trainer.common_options,
             train_options=self.trainer.train_options,
+            kind=CHECKPOINT_KIND_ITERATION,
         )
 
         if self._is_main():
@@ -518,13 +717,12 @@ class Saver(Plugin):
 
             if not self.push:
                 latest_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".latest.pth")
-                if os.path.lexists(latest_symlink):
-                    os.unlink(latest_symlink)
                 latest_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
                 latest_ckpt_abs_path = os.path.abspath(latest_ckpt)
                 if not os.path.exists(latest_ckpt_abs_path):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
-                self._safe_link_or_copy(latest_ckpt_abs_path, latest_symlink)
+                self._atomic_publish(latest_ckpt_abs_path, latest_symlink)
+            self._write_manifest()
 
         self._last_iteration_checkpoint_name = name
         self._last_iteration_checkpoint_iter = self.trainer.iter
@@ -541,6 +739,11 @@ class Saver(Plugin):
         max_ckpt = self.trainer.train_options["max_ckpt"]
 
         if updated_loss < self.best_loss:
+            # Commit the new best BEFORE saving so the harvested Saver state in
+            # this very checkpoint persists the updated best_loss (otherwise a
+            # resume would restore the stale, higher best and could treat a
+            # worse later epoch as best) (BUG 2).
+            self.best_loss = updated_loss
             suffix = ".ep{}".format(self.trainer.ep)
             name = self.trainer.model.name + suffix
             self.best_quene.append(name)
@@ -550,20 +753,27 @@ class Saver(Plugin):
                 delete_name = self.best_quene.pop(0)
 
             reused_iter_checkpoint = False
+            # Reuse the just-written iteration checkpoint as the epoch-best file
+            # only when it is the SAME committed step. trainer.iter has already
+            # advanced by one past the last iteration() by the time epoch plugins
+            # fire, so the stable comparison is iter-1 (BUG 2, off-by-one reuse).
             if (
                 _env_flag("DPTB_SAVER_REUSE_ITER_CKPT_FOR_EPOCH_BEST", True)
                 and self._last_iteration_checkpoint_name is not None
-                and self._last_iteration_checkpoint_iter == self.trainer.iter
+                and self._last_iteration_checkpoint_iter == self.trainer.iter - 1
             ):
                 iter_ckpt = os.path.join(self.checkpoint_path, self._last_iteration_checkpoint_name + ".pth")
                 epoch_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
                 reuse_decision = [False]
                 if self._is_main() and os.path.exists(iter_ckpt):
-                    if os.path.lexists(epoch_ckpt):
-                        os.unlink(epoch_ckpt)
-                    self._safe_link_or_copy(os.path.abspath(iter_ckpt), epoch_ckpt)
+                    # COPY bytes, never symlink: the source .iter file is in the
+                    # rotating latest_quene and max_ckpt may delete it, which
+                    # would leave this .ep best file dangling (BUG 2).
+                    tmp_epoch = f"{epoch_ckpt}.tmp{os.getpid()}"
+                    shutil.copy2(os.path.abspath(iter_ckpt), tmp_epoch)
+                    os.replace(tmp_epoch, epoch_ckpt)
                     log.info(
-                        "checkpoint %s reused from same-iteration checkpoint %s",
+                        "checkpoint %s reused (copied) from same-iteration checkpoint %s",
                         name,
                         self._last_iteration_checkpoint_name,
                     )
@@ -580,9 +790,8 @@ class Saver(Plugin):
                     model_options=self.trainer.model.model_options,
                     common_options=self.trainer.common_options,
                     train_options=self.trainer.train_options,
+                    kind=CHECKPOINT_KIND_EPOCH,
                 )
-
-            self.best_loss = updated_loss
 
             if self._is_main():
                 if delete_name is not None:
@@ -591,60 +800,137 @@ class Saver(Plugin):
                         os.remove(delete_path)
 
                 best_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".best.pth")
-                if os.path.lexists(best_symlink):
-                    os.unlink(best_symlink)
                 best_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
                 best_ckpt_abs_path = os.path.abspath(best_ckpt)
                 if not os.path.exists(best_ckpt_abs_path):
                     raise FileNotFoundError(f"Source file {best_ckpt_abs_path} does not exist.")
-                self._safe_link_or_copy(best_ckpt_abs_path, best_symlink)
+                self._atomic_publish(best_ckpt_abs_path, best_symlink)
 
                 if _env_flag("DPTB_SAVER_EPOCH_UPDATES_LATEST", True):
                     latest_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".latest.pth")
-                    if os.path.lexists(latest_symlink):
-                        os.unlink(latest_symlink)
-                    self._safe_link_or_copy(best_ckpt_abs_path, latest_symlink)
+                    self._atomic_publish(best_ckpt_abs_path, latest_symlink)
 
-    def _save(self, name, model, model_options, common_options, train_options):
+                self._write_manifest()
+
+    def _safe_harvest_plugin_states(self):
+        harvester = getattr(self.trainer, "harvest_plugin_states", None)
+        if not callable(harvester):
+            return {}
+        try:
+            return harvester()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Failed to harvest plugin states for checkpoint: %s", exc)
+            return {}
+
+    def _build_training_state_blob(self, kind):
+        """Assemble the resume state machine block (BUG 1/2/3 metadata).
+
+        ``epoch_scheduler_step_pending`` is only true for an epoch checkpoint
+        under per-epoch LR scheduling: Saver.epoch fires before run()'s epoch-end
+        LR step, so the resumed run must replay exactly one step.
+        """
+        trainer = self.trainer
+        epoch_pending = (
+            kind == CHECKPOINT_KIND_EPOCH
+            and not bool(getattr(trainer, "update_lr_per_iter", False))
+        )
+        ts = TrainingState(
+            global_step=int(getattr(trainer, "iter", 1)),
+            epoch=int(getattr(trainer, "ep", 1)),
+            batch_in_epoch=int(getattr(trainer, "_batch_in_epoch", 0)),
+            checkpoint_kind=kind,
+            epoch_scheduler_step_pending=epoch_pending,
+            rng_state=capture_rng_state(),
+            plugin_state=self._safe_harvest_plugin_states(),
+            metrics={"best_loss": float(self.best_loss)},
+        )
+        return ts.state_dict()
+
+    def _assemble_checkpoint_obj(self, name, kind, model_options, common_options,
+                                 train_options, model_state, opt_blocks):
+        """ONE checkpoint-dict assembly shared by single and dist-expert paths.
+
+        Carries both the historical flat keys (``epoch``/``iteration``/``stats``
+        + optimizer/scheduler) *and* the new ``training_state``/``plugin_state``
+        blocks, so legacy readers and the new state machine both resolve. This is
+        the single source of truth the CheckpointCoordinator refactor centralises.
+        """
+        obj = {
+            "config": {
+                "model_options": model_options,
+                "common_options": common_options,
+                "train_options": train_options,
+            },
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_kind": kind,
+            "model_state_dict": model_state,
+            "task": self.trainer.task,
+            "epoch": self.trainer.ep,
+            "iteration": self.trainer.iter,
+            "stats": self.trainer.stats,
+        }
+        training_state = self._build_training_state_blob(kind)
+        obj["training_state"] = training_state
+        # Top-level mirror keeps the legacy reader trivially able to find plugin
+        # state even if it never learns the training_state schema.
+        obj["plugin_state"] = training_state.get("plugin_state", {})
+        for block in opt_blocks:
+            obj.update(block)
+        return obj
+
+    def _save(self, name, model, model_options, common_options, train_options,
+              kind=CHECKPOINT_KIND_ITERATION):
         previous_profile_save_name = self._profile_save_name
         self._profile_save_name = name
         self._profile_record("save_start")
-        obj = {}
-        obj.update({"config": {"model_options": model_options, "common_options": common_options,
-                               "train_options": train_options}})
 
         if self._is_dist_expert():
             with self._profile_stage("gather_dist_states"):
                 expert_states, opt_states, sch_states = self._gather_dist_states()
 
+            # Rank0 writes; all ranks agree on success BEFORE the barrier so a
+            # rank0 failure raises uniformly instead of leaving the other ranks
+            # blocked forever on dist.barrier() (BUG 2, distributed hang).
+            save_ok = [True]
+            save_err = None
             if self._is_main():
-                with self._profile_stage("assemble_full_model_state"):
-                    full_model_state = self._assemble_full_model_state(expert_states)
+                try:
+                    with self._profile_stage("assemble_full_model_state"):
+                        full_model_state = self._assemble_full_model_state(expert_states)
+                    obj = self._assemble_checkpoint_obj(
+                        name, kind, model_options, common_options, train_options,
+                        full_model_state,
+                        [{"optimizers_state_dict": opt_states,
+                          "lr_schedulers_state_dict": sch_states}],
+                    )
+                    f_path = os.path.join(self.checkpoint_path, name + ".pth")
+                    self._profile_record(
+                        "save_object_summary",
+                        model_tensor_bytes=self._tensor_bytes(full_model_state),
+                        optimizer_tensor_bytes=self._tensor_bytes(opt_states),
+                        scheduler_tensor_bytes=self._tensor_bytes(sch_states),
+                    )
+                    self._write_checkpoint_atomic(obj, f_path)
+                    self._profile_record(
+                        "save_file_summary",
+                        checkpoint_file_bytes=os.path.getsize(f_path) if os.path.exists(f_path) else None,
+                    )
+                    log.info(msg="checkpoint saved as {}".format(name))
+                except Exception as exc:
+                    save_ok[0] = False
+                    save_err = exc
+                    log.error("rank0 checkpoint save failed for %s: %s", name, exc)
 
-                obj.update({
-                    "model_state_dict": full_model_state,
-                    "task": self.trainer.task,
-                    "epoch": self.trainer.ep,
-                    "iteration": self.trainer.iter,
-                    "stats": self.trainer.stats,
-                    "optimizers_state_dict": opt_states,
-                    "lr_schedulers_state_dict": sch_states,
-                })
-
-                f_path = os.path.join(self.checkpoint_path, name + ".pth")
-                self._profile_record(
-                    "save_object_summary",
-                    model_tensor_bytes=self._tensor_bytes(full_model_state),
-                    optimizer_tensor_bytes=self._tensor_bytes(opt_states),
-                    scheduler_tensor_bytes=self._tensor_bytes(sch_states),
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast_object_list(save_ok, src=0)
+            if not save_ok[0]:
+                # Uniform failure on every rank, raised before the barrier.
+                self._profile_save_name = previous_profile_save_name
+                if save_err is not None:
+                    raise save_err
+                raise RuntimeError(
+                    f"rank0 failed to save checkpoint {name}; aborting on all ranks"
                 )
-                with self._profile_stage("torch_save"):
-                    torch.save(obj, f=f_path)
-                self._profile_record(
-                    "save_file_summary",
-                    checkpoint_file_bytes=os.path.getsize(f_path) if os.path.exists(f_path) else None,
-                )
-                log.info(msg="checkpoint saved as {}".format(name))
 
             with self._profile_stage("post_save_barrier"):
                 dist.barrier()
@@ -665,16 +951,10 @@ class Saver(Plugin):
         with self._profile_stage("local_model_state_dict"):
             model_state = model.state_dict()
 
-        obj.update({
-            "model_state_dict": model_state,
-            "task": self.trainer.task,
-            "epoch": self.trainer.ep,
-            "iteration": self.trainer.iter,
-            "stats": self.trainer.stats
-        })
-
-        obj.update(optim_state)
-        obj.update(sched_state)
+        obj = self._assemble_checkpoint_obj(
+            name, kind, model_options, common_options, train_options,
+            model_state, [optim_state, sched_state],
+        )
 
         f_path = os.path.join(self.checkpoint_path, name + ".pth")
         self._profile_record(
@@ -683,8 +963,7 @@ class Saver(Plugin):
             optimizer_tensor_bytes=self._tensor_bytes(optim_state),
             scheduler_tensor_bytes=self._tensor_bytes(sched_state),
         )
-        with self._profile_stage("torch_save"):
-            torch.save(obj, f=f_path)
+        self._write_checkpoint_atomic(obj, f_path)
         self._profile_record(
             "save_file_summary",
             checkpoint_file_bytes=os.path.getsize(f_path) if os.path.exists(f_path) else None,
