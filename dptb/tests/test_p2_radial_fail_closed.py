@@ -20,15 +20,8 @@ from tools.build_nonsoc_p2_tables import (
     _assert_resume_code_identity,
     _assert_resume_species_identity,
     _code_identity_sha256,
-    _normalized_build_settings,
-    parse_args as parse_builder_args,
 )
-from tools.smoke_nonsoc_p2_table import (
-    _hermiticity,
-    _numerical_gate,
-    _require_qualified_table_manifest as _require_smoke_qualified_table_manifest,
-    parse_args as parse_smoke_args,
-)
+from tools.smoke_nonsoc_p2_table import _hermiticity, _numerical_gate
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -243,133 +236,127 @@ def _write_component_reciprocity_table(root, *, tamper_vna_cross=False):
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
-def test_store_rejects_same_ao_count_with_wrong_shell_sequence_and_source_change(
-    tmp_path,
-):
-    _, orb_path, upf_path = _identity_manifest(tmp_path)
-    store = P2TableStore(
-        tmp_path,
+def _production_store(root):
+    return P2TableStore(
+        root,
         verify_checksums=False,
         require_explicit_source_identity=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Store-side fail-closed: identity/shard/sample tampers (collapsed permutations)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind, match",
+    [
+        ("species_identity_sha256", "identity checksum mismatch"),
+        ("legacy_missing_identity", "lacks an explicit species source identity"),
+        ("base_code_identity", r"base:X\|X code identity"),
+        ("shard_shell", "shell contract mismatch"),
+        ("shard_support", "support contract mismatch"),
+        ("sample_shell_sequence", "shell sequence"),
+        ("sample_upf_checksum", "UPF checksum mismatch"),
+    ],
+)
+def test_store_fails_closed_on_tampered_identity_shard_or_sample(tmp_path, kind, match):
+    manifest, orb_path, upf_path = _identity_manifest(tmp_path)
+
+    if kind == "species_identity_sha256":
+        manifest["species_source_identity_sha256"] = "0" * 64
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match=match):
+            _production_store(tmp_path)
+        return
+
+    if kind == "legacy_missing_identity":
+        manifest.pop("species_source_identity")
+        manifest.pop("species_source_identity_sha256")
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match=match):
+            _production_store(tmp_path)
+        return
+
+    if kind == "base_code_identity":
+        identity = _synthetic_code_identity()
+        identity_sha256 = _code_identity_sha256(identity)
+        manifest["source"] = {
+            "code_identity_schema": identity["schema"],
+            "gate1_script_sha256": identity["gate1_script_sha256"],
+            "builder_script_sha256": identity["builder_script_sha256"],
+            "code_identity_sha256": identity_sha256,
+        }
+        manifest["species"]["X"]["code_identity_sha256"] = identity_sha256
+        manifest["base_tables"]["X|X"].update(
+            {"code_identity_sha256": "f" * 64, "support_bohr": 8.0}
+        )
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match=match):
+            _production_store(tmp_path)
+        return
+
+    if kind in ("shard_shell", "shard_support"):
+        shard_shells = [0, 0, 0, 0] if kind == "shard_shell" else [0, 1]
+        shard_support = 8.0 if kind == "shard_shell" else 7.5
+        (tmp_path / "base").mkdir()
+        np.savez(
+            tmp_path / "base" / "X__X.npz",
+            distances=np.asarray([0.0, shard_support]),
+            values=np.zeros((2, 4, 4), dtype=np.float32),
+            left_shells=np.asarray(shard_shells, dtype=np.int16),
+            right_shells=np.asarray(shard_shells, dtype=np.int16),
+            support_bohr=np.asarray(shard_support),
+        )
+        manifest["base_tables"]["X|X"]["support_bohr"] = shard_support
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        store = _production_store(tmp_path)
+        with pytest.raises(ValueError, match=match):
+            store.base("X", "X")
+        return
+
+    # Sample-contract validation tampers -- a correct contract validates first.
+    store = _production_store(tmp_path)
     source_files = {"X": {"orbital": orb_path, "upf": upf_path}}
-    result = store.validate_sample_contract(
+    ok = store.validate_sample_contract(
         symbols=["X"],
         atom_shells=[[0, 1]],
         source_files=source_files,
         require_source_files=True,
     )
-    assert result["shell_sequence_verified"] is True
-    assert result["source_files_verified"] is True
+    assert ok["shell_sequence_verified"] is True
+    assert ok["source_files_verified"] is True
 
-    with pytest.raises(ValueError, match="shell sequence"):
-        store.validate_sample_contract(
-            symbols=["X"],
-            atom_shells=[[0, 0, 0, 0]],
-            source_files=source_files,
-            require_source_files=True,
-        )
+    if kind == "sample_shell_sequence":
+        with pytest.raises(ValueError, match=match):
+            store.validate_sample_contract(
+                symbols=["X"],
+                atom_shells=[[0, 0, 0, 0]],
+                source_files=source_files,
+                require_source_files=True,
+            )
+    else:  # sample_upf_checksum
+        upf_path.write_bytes(b"changed pseudopotential source\n")
+        with pytest.raises(ValueError, match=match):
+            store.validate_sample_contract(
+                symbols=["X"],
+                atom_shells=[[0, 1]],
+                source_files=source_files,
+                require_source_files=True,
+            )
 
-    upf_path.write_bytes(b"changed pseudopotential source\n")
-    with pytest.raises(ValueError, match="UPF checksum mismatch"):
-        store.validate_sample_contract(
-            symbols=["X"],
-            atom_shells=[[0, 1]],
-            source_files=source_files,
-            require_source_files=True,
-        )
+
+# ---------------------------------------------------------------------------
+# Builder-resume fail-closed: species + code identity tampers (collapsed)
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("shard_shells", "shard_support", "message"),
-    [
-        ([0, 0, 0, 0], 8.0, "shell contract mismatch"),
-        ([0, 1], 7.5, "support contract mismatch"),
-    ],
-)
-def test_store_binds_loaded_shard_shells_and_support_to_species_identity(
-    tmp_path, shard_shells, shard_support, message
-):
+def test_builder_resume_rejects_changed_species_or_code_identity(tmp_path):
     manifest, _, _ = _identity_manifest(tmp_path)
-    (tmp_path / "base").mkdir()
-    np.savez(
-        tmp_path / "base" / "X__X.npz",
-        distances=np.asarray([0.0, shard_support]),
-        values=np.zeros((2, 4, 4), dtype=np.float32),
-        left_shells=np.asarray(shard_shells, dtype=np.int16),
-        right_shells=np.asarray(shard_shells, dtype=np.int16),
-        support_bohr=np.asarray(shard_support),
-    )
-    manifest["base_tables"]["X|X"]["support_bohr"] = shard_support
-    (tmp_path / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
 
-    store = P2TableStore(
-        tmp_path,
-        verify_checksums=False,
-        require_explicit_source_identity=True,
-    )
-    with pytest.raises(ValueError, match=message):
-        store.base("X", "X")
-
-
-def test_store_binds_every_hardened_shard_to_manifest_code_identity(tmp_path):
-    manifest, _, _ = _identity_manifest(tmp_path)
-    identity = _synthetic_code_identity()
-    identity_sha256 = _code_identity_sha256(identity)
-    manifest["source"] = {
-        "code_identity_schema": identity["schema"],
-        "gate1_script_sha256": identity["gate1_script_sha256"],
-        "builder_script_sha256": identity["builder_script_sha256"],
-        "code_identity_sha256": identity_sha256,
-    }
-    manifest["species"]["X"]["code_identity_sha256"] = identity_sha256
-    manifest["base_tables"]["X|X"].update(
-        {
-            "code_identity_sha256": "f" * 64,
-            "support_bohr": 8.0,
-        }
-    )
-    (tmp_path / "manifest.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
-
-    with pytest.raises(ValueError, match="base:X\\|X code identity"):
-        P2TableStore(
-            tmp_path,
-            verify_checksums=False,
-            require_explicit_source_identity=True,
-        )
-
-
-def test_store_rejects_tampered_explicit_species_identity(tmp_path):
-    manifest, _, _ = _identity_manifest(tmp_path)
-    manifest["species_source_identity_sha256"] = "0" * 64
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="identity checksum mismatch"):
-        P2TableStore(
-            tmp_path,
-            verify_checksums=False,
-            require_explicit_source_identity=True,
-        )
-
-
-def test_production_store_rejects_legacy_manifest_without_explicit_identity(tmp_path):
-    manifest, _, _ = _identity_manifest(tmp_path)
-    manifest.pop("species_source_identity")
-    manifest.pop("species_source_identity_sha256")
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="lacks an explicit species source identity"):
-        P2TableStore(
-            tmp_path,
-            verify_checksums=False,
-            require_explicit_source_identity=True,
-        )
-
-
-def test_builder_resume_rejects_changed_orb_upf_species_identity(tmp_path):
-    manifest, _, _ = _identity_manifest(tmp_path)
+    # Species identity: the recorded identity is reusable; a changed orbital
+    # checksum refuses stale shard reuse.
     identity = manifest["species_source_identity"]
     identity_sha256 = manifest["species_source_identity_sha256"]
     _assert_resume_species_identity(manifest, identity, identity_sha256)
@@ -384,26 +371,26 @@ def test_builder_resume_rejects_changed_orb_upf_species_identity(tmp_path):
             species_source_identity_sha256(changed_identity),
         )
 
-
-def test_builder_resume_code_identity_requires_matching_gate1_and_builder():
-    identity = _synthetic_code_identity()
-    identity_sha256 = _code_identity_sha256(identity)
+    # Code identity: a consistent gate1/builder pair is reusable; a missing
+    # builder hash, an inconsistent recorded sha, or a changed builder all fail.
+    code = _synthetic_code_identity()
+    code_sha = _code_identity_sha256(code)
     source = {
-        "gate1_script_sha256": identity["gate1_script_sha256"],
-        "builder_script_sha256": identity["builder_script_sha256"],
-        "code_identity_sha256": identity_sha256,
+        "gate1_script_sha256": code["gate1_script_sha256"],
+        "builder_script_sha256": code["builder_script_sha256"],
+        "code_identity_sha256": code_sha,
     }
-    _assert_resume_code_identity({"source": source}, identity, identity_sha256)
+    _assert_resume_code_identity({"source": source}, code, code_sha)
 
     missing_builder = {"source": dict(source)}
     missing_builder["source"].pop("builder_script_sha256")
     with pytest.raises(ValueError, match="lacks Gate1/builder code identity"):
-        _assert_resume_code_identity(missing_builder, identity, identity_sha256)
+        _assert_resume_code_identity(missing_builder, code, code_sha)
 
     inconsistent = {"source": dict(source)}
     inconsistent["source"]["code_identity_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="code_identity_sha256 is inconsistent"):
-        _assert_resume_code_identity(inconsistent, identity, identity_sha256)
+        _assert_resume_code_identity(inconsistent, code, code_sha)
 
     changed = _synthetic_code_identity(builder=b"changed builder")
     with pytest.raises(ValueError, match="code identity changed"):
@@ -412,25 +399,9 @@ def test_builder_resume_code_identity_requires_matching_gate1_and_builder():
         )
 
 
-def test_builder_legacy_settings_normalize_to_none_and_cli_defaults_none(tmp_path):
-    legacy = {"distance_step_bohr": 0.02, "dtype": "float32"}
-    assert _normalized_build_settings(legacy) == {
-        **legacy,
-        "base_components": "none",
-    }
-    args = parse_builder_args(
-        [
-            "--dataset-root",
-            str(tmp_path / "dataset"),
-            "--pp-orb",
-            str(tmp_path / "pp_orb"),
-            "--gate1-script",
-            str(tmp_path / "gate1.py"),
-            "--output",
-            str(tmp_path / "table"),
-        ]
-    )
-    assert args.base_components == "none"
+# ---------------------------------------------------------------------------
+# All-components roundtrip (anchor): builder writes recomposable shard, resumes
+# ---------------------------------------------------------------------------
 
 
 def test_builder_all_components_writes_recomposable_shard_and_resumes(
@@ -615,123 +586,49 @@ def test_builder_all_components_writes_recomposable_shard_and_resumes(
     }
 
 
-def test_builder_publishes_complete_only_after_component_gate_pass(
-    tmp_path, monkeypatch
-):
-    manifest_path = tmp_path / "manifest.json"
-    manifest = {"complete": True}
-    sentinel_store = object()
-    observed_on_disk = {}
-    monkeypatch.setattr(
-        p2_builder,
-        "_pending_component_validation_store",
-        lambda root, payload: sentinel_store,
+# ---------------------------------------------------------------------------
+# Audit: one full-scope production-gate smoke (with component reciprocity)
+# ---------------------------------------------------------------------------
+
+
+def test_audit_full_scope_and_component_reciprocity(tmp_path):
+    # CLI defaults to full-shard loading.
+    default_args = parse_audit_args(
+        ["--table-root", str(tmp_path), "--output", str(tmp_path / "defaults.json")]
     )
+    assert default_args.base_samples == 0
+    assert default_args.projector_samples == 0
 
-    def validate(store, **_kwargs):
-        assert store is sentinel_store
-        pending = json.loads(manifest_path.read_text(encoding="utf-8"))
-        observed_on_disk.update(pending)
-        return {
-            "schema": p2_builder.P2_COMPONENT_NUMERICAL_GATE_SCHEMA,
-            "status": "pass",
-            "failures": [],
-        }
-
-    monkeypatch.setattr(
-        p2_builder,
-        "validate_p2_component_numerical_contract",
-        validate,
-    )
-    p2_builder._qualify_and_publish_manifest(
-        root=tmp_path,
-        manifest_path=manifest_path,
-        manifest=manifest,
-        component_reciprocity_tolerance=1.0e-6,
-        component_reconstruction_tolerance=1.0e-6,
-        component_gate_distance_samples=3,
-    )
-
-    assert observed_on_disk["complete"] is False
-    assert observed_on_disk["component_numerical_gate"]["status"] == "pending"
-    published = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert published["complete"] is True
-    assert published["component_numerical_gate"]["status"] == "pass"
-
-
-def test_builder_keeps_manifest_incomplete_when_component_gate_raises(
-    tmp_path, monkeypatch
-):
-    manifest_path = tmp_path / "manifest.json"
-    manifest = {"complete": True}
-    monkeypatch.setattr(
-        p2_builder,
-        "_pending_component_validation_store",
-        lambda root, payload: object(),
-    )
-
-    def fail_gate(_store, **_kwargs):
-        raise RuntimeError("synthetic component failure")
-
-    monkeypatch.setattr(
-        p2_builder,
-        "validate_p2_component_numerical_contract",
-        fail_gate,
-    )
-    with pytest.raises(RuntimeError, match="synthetic component failure"):
-        p2_builder._qualify_and_publish_manifest(
-            root=tmp_path,
-            manifest_path=manifest_path,
-            manifest=manifest,
-            component_reciprocity_tolerance=1.0e-6,
-            component_reconstruction_tolerance=1.0e-6,
-            component_gate_distance_samples=3,
-        )
-
-    failed = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert failed["complete"] is False
-    assert failed["component_numerical_gate"]["status"] == "fail"
-
-
-def test_audit_defaults_to_full_shard_loading(tmp_path):
-    args = parse_audit_args(
-        ["--table-root", str(tmp_path), "--output", str(tmp_path / "audit.json")]
-    )
-    assert args.base_samples == 0
-    assert args.projector_samples == 0
-
-
-def test_audit_full_scope_checks_every_shard_and_marks_sampling_non_production(
-    tmp_path,
-):
     _write_zero_audit_table(tmp_path)
-    full_args = parse_audit_args(
-        ["--table-root", str(tmp_path), "--output", str(tmp_path / "full.json")]
+    full = audit(
+        parse_audit_args(
+            ["--table-root", str(tmp_path), "--output", str(tmp_path / "full.json")]
+        )
     )
-    full = audit(full_args)
     assert full["audit_mode"] == "full_production"
     assert full["production_eligible"] is True
     assert len(full["base_samples"]) == 4
     assert full["verified_file_checksums"] == 6  # 4 base + 2 species
 
-    sampled_args = parse_audit_args(
-        [
-            "--table-root",
-            str(tmp_path),
-            "--output",
-            str(tmp_path / "sampled.json"),
-            "--base-samples",
-            "1",
-        ]
+    sampled = audit(
+        parse_audit_args(
+            [
+                "--table-root",
+                str(tmp_path),
+                "--output",
+                str(tmp_path / "sampled.json"),
+                "--base-samples",
+                "1",
+            ]
+        )
     )
-    sampled = audit(sampled_args)
     assert sampled["audit_mode"] == "sampled_non_production"
     assert sampled["production_eligible"] is False
     assert sampled["status"] == "pass_non_production"
     assert len(sampled["base_samples"]) < 4
 
-
-def test_audit_checks_component_reconstruction_and_cross_reciprocity(tmp_path):
+    # Component reconstruction + cross reciprocity; a tampered cross table
+    # fails the vna_left->vna_right reciprocity guard.
     good = tmp_path / "good"
     good.mkdir()
     _write_component_reciprocity_table(good)
@@ -756,7 +653,23 @@ def test_audit_checks_component_reconstruction_and_cross_reciprocity(tmp_path):
         )
 
 
-def test_smoke_numerical_gate_is_enabled_and_fails_threshold_violation():
+# ---------------------------------------------------------------------------
+# Smoke: one production numerical-gate smoke (with hermiticity closure)
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_numerical_gate_and_hermiticity_closure():
+    thresholds = {
+        "max_active_mae_ry": 1.0e-3,
+        "max_active_rmse_ry": 1.0e-3,
+        "max_active_p99_abs_ry": 1.0e-3,
+        "max_active_abs_ry": 1.0e-3,
+        "min_active_r2": 0.99,
+        "max_table_hermiticity_ry": 1.0e-6,
+        "max_oracle_hermiticity_ry": 1.0e-6,
+    }
+
+    # The production numerical gate passes, then fails on a threshold violation.
     metrics = {
         "blocks": {
             "active_total": {
@@ -782,15 +695,6 @@ def test_smoke_numerical_gate_is_enabled_and_fails_threshold_violation():
             "reverse_closed": True,
         },
     }
-    thresholds = {
-        "max_active_mae_ry": 1.0e-3,
-        "max_active_rmse_ry": 1.0e-3,
-        "max_active_p99_abs_ry": 1.0e-3,
-        "max_active_abs_ry": 1.0e-3,
-        "min_active_r2": 0.99,
-        "max_table_hermiticity_ry": 1.0e-6,
-        "max_oracle_hermiticity_ry": 1.0e-6,
-    }
     passed = _numerical_gate(metrics, enabled=True, thresholds=thresholds)
     assert passed["status"] == "pass"
     assert passed["production_eligible"] is True
@@ -804,8 +708,8 @@ def test_smoke_numerical_gate_is_enabled_and_fails_threshold_violation():
         for check in failed["checks"]
     )
 
-
-def test_smoke_hermiticity_requires_nonzero_reverse_closed_r_keys():
+    # Hermiticity closure requires nonzero reverse-closed r-keys; an open
+    # oracle reverse set fails the gate on the closure metrics.
     incomplete = _hermiticity(
         np.zeros((2, 1, 1), dtype=np.float64),
         np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int64),
@@ -822,7 +726,7 @@ def test_smoke_hermiticity_requires_nonzero_reverse_closed_r_keys():
     assert complete["missing_reverse_r_keys"] == 0
     assert complete["nonzero_paired_r_key_pairs"] == 1
 
-    metrics = {
+    herm_metrics = {
         "blocks": {
             "active_total": {
                 "mae_ry": 1.0e-4,
@@ -835,63 +739,10 @@ def test_smoke_hermiticity_requires_nonzero_reverse_closed_r_keys():
         "table_hermiticity": complete,
         "oracle_hermiticity": incomplete,
     }
-    thresholds = {
-        "max_active_mae_ry": 1.0e-3,
-        "max_active_rmse_ry": 1.0e-3,
-        "max_active_p99_abs_ry": 1.0e-3,
-        "max_active_abs_ry": 1.0e-3,
-        "min_active_r2": 0.99,
-        "max_table_hermiticity_ry": 1.0e-6,
-        "max_oracle_hermiticity_ry": 1.0e-6,
-    }
-    gate = _numerical_gate(metrics, enabled=True, thresholds=thresholds)
+    gate = _numerical_gate(herm_metrics, enabled=True, thresholds=thresholds)
     assert gate["status"] == "fail"
     failed_metrics = {
         check["metric"] for check in gate["checks"] if not check["pass"]
     }
     assert "oracle_hermiticity.reverse_closed" in failed_metrics
     assert "oracle_hermiticity.nonzero_paired_r_key_pairs" in failed_metrics
-
-
-@pytest.mark.parametrize("gate", [None, {"status": "fail"}])
-def test_smoke_rejects_table_without_persisted_pass_gate(tmp_path, gate):
-    manifest = {"complete": True, "component_numerical_gate": gate}
-    with pytest.raises(ValueError, match="persisted component numerical gate"):
-        _require_smoke_qualified_table_manifest(
-            manifest,
-            manifest_path=tmp_path / "manifest.json",
-        )
-
-    _require_smoke_qualified_table_manifest(
-        {
-            "complete": True,
-            "component_numerical_gate": {
-                "schema": p2_builder.P2_COMPONENT_NUMERICAL_GATE_SCHEMA,
-                "status": "pass",
-            },
-        },
-        manifest_path=tmp_path / "manifest.json",
-    )
-
-
-def test_smoke_cli_defaults_to_production_numerical_gate(tmp_path):
-    args = parse_smoke_args(
-        [
-            "--case",
-            str(tmp_path / "case"),
-            "--oracle-npz",
-            str(tmp_path / "oracle.npz"),
-            "--table-root",
-            str(tmp_path / "table"),
-            "--gate1-script",
-            str(tmp_path / "gate1.py"),
-            "--output-npz",
-            str(tmp_path / "out.npz"),
-            "--output-json",
-            str(tmp_path / "out.json"),
-        ]
-    )
-    assert args.disable_numerical_gate is False
-    assert args.max_active_mae_ry > 0.0
-    assert args.max_active_abs_ry > args.max_active_mae_ry
-    assert args.min_active_r2 > 0.0

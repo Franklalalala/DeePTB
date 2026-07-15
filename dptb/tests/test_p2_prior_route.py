@@ -3,13 +3,11 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import pickle
-from pathlib import Path
 
 import lmdb
 import numpy as np
 import pytest
 import torch
-import yaml
 
 from dptb.data import _keys
 from dptb.data.build import DatasetBuilder
@@ -66,152 +64,6 @@ from dptb.nn.blockwise_hamiltonian import (
 )
 from dptb.nn.build import build_model
 from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
-from dptb.utils.argcheck import normalize
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def test_strict_p2_full_h_config_and_semantic_guards():
-    payload = yaml.safe_load(
-        (REPO_ROOT / "configs" / "p2_prior_non_soc_full_h_smoke.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    normalized = normalize(deepcopy(payload))
-    assert normalized["data_options"]["train"]["residual_hamiltonian"] is False
-    assert normalized["data_options"]["train"]["require_full_h_target"] is True
-    assert normalized["data_options"]["train"]["require_p2_blocks"] is True
-    assert (
-        normalized["data_options"]["train"][
-            "allow_unbound_prior_source_fingerprint"
-        ]
-        is True
-    )
-    assert normalized["model_options"]["embedding"]["method"] == "lem_moe_v3_prior"
-    assert normalized["train_options"]["loss_options"]["train"][
-        "pred_node_block_key"
-    ] == "node_full_hamil_blocks"
-
-    residual = deepcopy(payload)
-    residual["data_options"]["train"]["residual_hamiltonian"] = True
-    with pytest.raises(ValueError, match="absolute Full H"):
-        normalize(residual)
-
-    correction_loss = deepcopy(payload)
-    correction_loss["train_options"]["loss_options"]["train"][
-        "pred_node_block_key"
-    ] = "node_hamil_blocks"
-    with pytest.raises(ValueError, match="reconstructed Full-H"):
-        normalize(correction_loss)
-
-    p2_as_target = deepcopy(payload)
-    p2_as_target["train_options"]["loss_options"]["train"].update(
-        {
-            "target_node_block_key": "node_p2_blocks",
-            "target_edge_block_key": "edge_p2_blocks",
-            "target_node_shape_key": "node_p2_block_shape",
-            "target_edge_shape_key": "edge_p2_block_shape",
-        }
-    )
-    with pytest.raises(ValueError, match="explicit absolute Full-H"):
-        normalize(p2_as_target)
-
-
-def test_auxiliary_prior_scope_does_not_require_p2_dataset_fields():
-    payload = yaml.safe_load(
-        (REPO_ROOT / "configs" / "p2_prior_non_soc_full_h_smoke.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    payload["model_options"]["embedding"]["prior_init_scope"] = "auxiliary"
-    payload["model_options"]["prediction"]["reconstruction"] = "direct"
-    payload["data_options"]["train"]["get_P2"] = False
-    payload["data_options"]["train"]["require_p2_blocks"] = False
-
-    normalized = normalize(payload)
-
-    assert normalized["model_options"]["embedding"]["prior_init_scope"] == "auxiliary"
-    assert normalized["data_options"]["train"]["get_P2"] is False
-
-
-def _p23_config(*, direct: bool = False):
-    payload = yaml.safe_load(
-        (REPO_ROOT / "configs" / "p2_prior_non_soc_full_h_smoke.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    embedding = payload["model_options"]["embedding"]
-    embedding.update(
-        {
-            "prior_kind": "p23",
-            "prior_node_key": "node_p23",
-            "prior_edge_key": "edge_p23",
-        }
-    )
-    prediction = payload["model_options"]["prediction"]
-    prediction.update(
-        {
-            "prior_node_block_field": "node_p23_blocks",
-            "prior_edge_block_field": "edge_p23_blocks",
-            "prior_label": "P23",
-        }
-    )
-    for split_options in payload["data_options"].values():
-        if isinstance(split_options, dict) and "get_P2" in split_options:
-            split_options["prior_kind"] = "p23"
-            split_options["p2_key"] = "hamiltonian_p23"
-            split_options["require_p2_blocks"] = not direct
-    if direct:
-        prediction["reconstruction"] = "direct"
-        for split_loss in payload["train_options"]["loss_options"].values():
-            split_loss["pred_node_block_key"] = "node_hamil_blocks"
-            split_loss["pred_edge_block_key"] = "edge_hamil_blocks"
-    return payload
-
-
-def test_p23_residual_and_direct_configs_fail_closed_on_cross_wiring():
-    residual = normalize(_p23_config(direct=False))
-    assert residual["model_options"]["prediction"]["reconstruction"] == "prior_residual"
-    assert residual["data_options"]["train"]["prior_kind"] == "p23"
-
-    direct = normalize(_p23_config(direct=True))
-    assert direct["model_options"]["prediction"]["reconstruction"] == "direct"
-    assert direct["data_options"]["train"]["require_p2_blocks"] is False
-    assert direct["train_options"]["loss_options"]["train"][
-        "pred_node_block_key"
-    ] == "node_hamil_blocks"
-
-    wrong_rme = _p23_config(direct=False)
-    wrong_rme["model_options"]["embedding"]["prior_edge_key"] = "edge_p2"
-    with pytest.raises(ValueError, match="mix P2 and P23"):
-        normalize(wrong_rme)
-
-    wrong_raw = _p23_config(direct=False)
-    wrong_raw["data_options"]["train"]["p2_key"] = "hamiltonian_p2"
-    with pytest.raises(ValueError, match="requires p2_key='hamiltonian_p23'"):
-        normalize(wrong_raw)
-
-    wrong_blocks = _p23_config(direct=False)
-    wrong_blocks["model_options"]["prediction"][
-        "prior_node_block_field"
-    ] = "node_p2_blocks"
-    with pytest.raises(ValueError, match="requires prior_node_block_field"):
-        normalize(wrong_blocks)
-
-    direct_with_blocks = _p23_config(direct=True)
-    direct_with_blocks["data_options"]["train"]["require_p2_blocks"] = True
-    with pytest.raises(ValueError, match="direct Full-H head"):
-        normalize(direct_with_blocks)
-
-    direct_delta_target = _p23_config(direct=True)
-    direct_delta_target["train_options"]["loss_options"]["train"][
-        "target_node_block_key"
-    ] = "node_delta_hamil_blocks"
-    with pytest.raises(ValueError, match="explicit absolute Full-H"):
-        normalize(direct_delta_target)
-
-
 def test_p2_feature_and_block_contract_fails_closed():
     node = torch.zeros(2, 4)
     edge = torch.zeros(3, 4)
