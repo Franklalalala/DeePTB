@@ -194,6 +194,72 @@ def build_prior_spec(kind: Any) -> PriorSpec:
     return resolve_prior_field_spec(kind)
 
 
+# Explicit constructor/config field name -> the PriorSpec attribute it must
+# match.  This is the single vocabulary understood by
+# :func:`validate_explicit_prior_fields`.
+_EXPLICIT_PRIOR_FIELD_TO_SPEC_ATTRIBUTE = {
+    "prior_node_key": "node_rme_key",
+    "prior_edge_key": "edge_rme_key",
+    "prior_node_block_field": "node_blocks_key",
+    "prior_edge_block_field": "edge_blocks_key",
+    "prior_node_shape_field": "node_shape_key",
+    "prior_edge_shape_field": "edge_shape_key",
+    "prior_raw_key": "raw_key",
+    "prior_label": "label",
+}
+
+
+def validate_explicit_prior_fields(spec: PriorSpec, **explicit: Any) -> None:
+    """Fail closed when explicit prior-field overrides contradict ``spec``.
+
+    Direct-API constructors (``BlockwiseE3Hamiltonian``, ``NNENV``, embeddings)
+    historically accepted explicit ``prior_node_key`` / ``prior_edge_key`` /
+    ``prior_*_block_field`` / ``prior_label`` values alongside the single
+    ``prior_kind``.  An explicit value is only a deprecated echo of what the
+    derived :class:`PriorSpec` already knows; any non-empty value that
+    disagrees with the derived one would silently mix prior families (e.g. p2
+    RME conditioning with p23 AO blocks), so it raises instead.
+
+    ``None`` and ``""`` mean "derive from the spec" and always pass, matching
+    the consumers' own empty-value handling.  ``prior_label`` is compared
+    case-insensitively (labels are human-facing); every other field must match
+    the derived value exactly.
+    """
+
+    if not isinstance(spec, PriorSpec):
+        raise TypeError(
+            f"spec must be a PriorSpec, got {type(spec).__name__!s}."
+        )
+    unknown = sorted(set(explicit) - set(_EXPLICIT_PRIOR_FIELD_TO_SPEC_ATTRIBUTE))
+    if unknown:
+        raise ValueError(
+            f"Unknown explicit prior field(s) {unknown}; validatable fields are "
+            f"{sorted(_EXPLICIT_PRIOR_FIELD_TO_SPEC_ATTRIBUTE)}."
+        )
+    mismatches = []
+    for name in sorted(explicit):
+        value = explicit[name]
+        if value is None:
+            continue
+        text = str(value)
+        if text == "":
+            continue
+        expected = str(getattr(spec, _EXPLICIT_PRIOR_FIELD_TO_SPEC_ATTRIBUTE[name]))
+        if name == "prior_label":
+            matched = text.strip().lower() == expected.lower()
+        else:
+            matched = text == expected
+        if not matched:
+            mismatches.append(f"{name}={text!r} (derived {expected!r})")
+    if mismatches:
+        raise ValueError(
+            f"prior_kind={spec.kind!r} derives every prior field name, but "
+            f"explicit value(s) contradict it: {'; '.join(mismatches)}. "
+            "Leave these empty (or None) to derive from the prior kind. "
+            "Refusing to mix physical-prior families."
+        )
+
+
 def resolve_prior_field_spec_from_raw_key(raw_key: Any) -> PriorSpec:
     normalized = str(raw_key).strip()
     for spec in PRIOR_FIELD_SPECS.values():
@@ -449,4 +515,5 @@ __all__ = [
     "require_sha256",
     "resolve_prior_field_spec",
     "resolve_prior_field_spec_from_raw_key",
+    "validate_explicit_prior_fields",
 ]

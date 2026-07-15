@@ -43,10 +43,12 @@ class ModelOutputSpecError(Exception):
     """Raised when ensemble output stitching violates the declared spec.
 
     In *strict* mode this surfaces (a) outputs whose leading dimension does not
-    match the declared alignment, (b) output keys that the spec does not
-    declare, and (c) node/edge ambiguities (``num_nodes == num_edges``) that
-    make shape-based validation meaningless.  In permissive mode these become
-    warnings and the offending field is skipped (expert-0 value preserved).
+    match the declared alignment, and (b) output keys that the spec does not
+    declare -- whose alignment would have to be guessed from shape, which is
+    outright impossible when ``num_nodes == num_edges``.  Declared fields carry
+    a declared alignment, so the node/edge count coincidence never affects
+    them.  In permissive mode these become warnings and the offending field is
+    skipped (expert-0 value preserved).
     """
 
 

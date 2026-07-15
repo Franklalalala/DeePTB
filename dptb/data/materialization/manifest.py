@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,22 +23,62 @@ from typing import Any, Mapping
 NONSOC_P2_CACHE_SCHEMA = "deeptb.nonsoc_p2_cache/v1"
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync of a directory entry so a rename survives power loss.
+
+    Directory fsync is a POSIX durability idiom; Windows cannot open a
+    directory with :func:`os.open`, and some filesystems refuse to fsync one.
+    Both cases degrade gracefully to a no-op -- the data file itself has
+    already been fsynced by the caller.
+    """
+
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def write_json(path: Path | str, payload: Mapping[str, Any]) -> None:
-    """Atomically write ``payload`` as canonical pretty JSON.
+    """Atomically and durably write ``payload`` as canonical pretty JSON.
 
     The payload is serialized with ``indent=2`` and ``sort_keys=True`` plus a
-    trailing newline, written to a sibling ``*.tmp`` file and then swapped into
-    place with :func:`os.replace`.  Preserving these exact bytes keeps existing
-    manifests/heartbeats/identity files byte-compatible.
+    trailing newline (exact legacy bytes, including platform newline
+    translation) into a UUID-suffixed sibling temp file, flushed and fsynced,
+    then swapped into place with :func:`os.replace`, followed by a best-effort
+    fsync of the parent directory.  A crash at any point leaves either the old
+    complete file or the new complete file -- never a partial final file; the
+    temp file is removed if the write or swap fails.  Preserving the exact
+    serialization keeps existing manifests/heartbeats/identity files
+    byte-compatible.
     """
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, path)
+    # UUID suffix: concurrent writers (or a takeover after a crash) never
+    # collide on the temp name, so an interrupted write cannot corrupt a
+    # later one's in-flight temp file.
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        # newline translation intentionally matches the legacy
+        # ``Path.write_text`` behaviour so on-disk bytes are unchanged.
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+    _fsync_directory(path.parent)
 
 
 class ManifestStore:

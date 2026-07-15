@@ -35,10 +35,12 @@ import torch
 
 import dptb.data.AtomicDataDict as AtomicDataDict
 from dptb.data.materialization import (
+    DEFAULT_LOCK_STALE_SECONDS,
     MAP_SIZE,
     ManifestStore,
     NONSOC_P2_CACHE_SCHEMA,
     ResumeJournal,
+    WorkRootLock,
     guard_work_root,
     json_sha256 as _identity_sha256,
     load_module as _load_module,
@@ -1644,6 +1646,7 @@ def _guard_output(
     overwrite: bool,
     *,
     resume_raw_staging: bool = False,
+    lock_stale_after_seconds: float | None = None,
 ) -> None:
     resolved_work = work_root.resolve()
     guard_work_root(
@@ -1660,6 +1663,7 @@ def _guard_output(
         missing_work_root_message=(
             f"--resume-raw-staging requires an existing work root: {resolved_work}"
         ),
+        lock_stale_after_seconds=lock_stale_after_seconds,
     )
 
 
@@ -1707,6 +1711,16 @@ def main(argv: list[str] | None = None) -> int:
             "materialization; partial compact outputs are rebuilt"
         ),
     )
+    parser.add_argument(
+        "--lock-stale-seconds",
+        type=float,
+        default=DEFAULT_LOCK_STALE_SECONDS,
+        help=(
+            "age after which a leftover work-root advisory lock (from a hard "
+            "crash on another host) is considered stale and taken over; a "
+            "live lock always refuses the run"
+        ),
+    )
     args = parser.parse_args(argv)
 
     dataset_root = args.dataset_root.resolve()
@@ -1719,7 +1733,31 @@ def main(argv: list[str] | None = None) -> int:
         work_root,
         args.overwrite,
         resume_raw_staging=args.resume_raw_staging,
+        lock_stale_after_seconds=args.lock_stale_seconds,
     )
+    # Advisory lock: a concurrent materializer on the same work root is
+    # refused; a stale lock from a hard crash is taken over.  Released on
+    # (clean or exception) exit -- only a hard kill leaves it behind.
+    with WorkRootLock(work_root, stale_after_seconds=args.lock_stale_seconds):
+        return _run_materialization(
+            args,
+            dataset_root=dataset_root,
+            p2_root=p2_root,
+            table_root=table_root,
+            work_root=work_root,
+            input_json=input_json,
+        )
+
+
+def _run_materialization(
+    args: argparse.Namespace,
+    *,
+    dataset_root: Path,
+    p2_root: Path | None,
+    table_root: Path | None,
+    work_root: Path,
+    input_json: Path,
+) -> int:
     cases = _ordered_cases(dataset_root, args.case)
     if args.require_count and len(cases) != args.require_count:
         raise ValueError(f"Selected {len(cases)} cases; required {args.require_count}.")

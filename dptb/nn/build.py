@@ -54,6 +54,23 @@ class DeterministicExpertSeed:
 # [独立扩展模块] Distance Ensemble Wrapper
 # ======================================================================
 class DistanceEnsembleWrapper(nn.Module):
+    """Distance-range multi-expert ensemble with spec-driven output stitching.
+
+    Routing (ownership) policy
+    --------------------------
+    ``_build_expert_masks`` implements the DEFAULT, pre-existing routing
+    semantics: each expert owns the edges whose length falls inside its
+    ``(d_min, d_max)`` range, while ALL nodes are assigned to the expert(s)
+    whose ``d_min == 0`` (in practice expert 0); every other expert receives an
+    all-False node mask.  The :class:`~dptb.nn.output_spec.ModelOutputSpec`
+    contract fixed the *stitch capability* -- node-aligned outputs of experts
+    ``1..N`` are merged under their node masks instead of being silently
+    dropped -- but it did NOT change this ownership policy: under default
+    routing experts ``1..N`` still own no nodes, so their node outputs are
+    (correctly) never merged.  Custom node-ownership schemes should override
+    ``_build_expert_masks``; the stitch path honors whatever masks it returns.
+    """
+
     def __init__(self, experts, distance_ranges, strict_output_spec=False):
         super().__init__()
         assert len(experts) == len(distance_ranges), \
@@ -142,23 +159,24 @@ class DistanceEnsembleWrapper(nn.Module):
         0's value.  This is the core fix -- node-aligned outputs of experts
         ``1..N`` were previously discarded because only an edge path existed.
 
-        In strict mode, undeclared keys / shape-alignment mismatches / node==edge
-        ambiguities raise :class:`ModelOutputSpecError`; in permissive mode they
-        warn and skip (expert-0 value preserved).
+        In strict mode, undeclared keys and shape-alignment mismatches raise
+        :class:`ModelOutputSpecError`; in permissive mode they warn and skip
+        (expert-0 value preserved).
+
+        The ``num_nodes == num_edges`` ambiguity only matters where alignment
+        must be GUESSED from a tensor's leading dimension, i.e. for keys the
+        spec does not declare.  Declared fields carry a declared alignment and
+        need no shape disambiguation, so they are stitched normally even when
+        the two counts coincide.
         """
         spec = self._output_spec
         strict = bool(getattr(spec, "strict", False))
 
         n_edge = int(edge_mask.shape[0])
         n_node = int(node_mask.shape[0])
-
-        # Strict guard: shape-based node/edge validation is meaningless when the
-        # two counts coincide, so refuse rather than silently mis-align.
-        if strict and n_edge == n_node:
-            raise ModelOutputSpecError(
-                f"Ambiguous stitch: num_nodes ({n_node}) == num_edges ({n_edge}); "
-                "cannot validate node/edge alignment by shape in strict mode."
-            )
+        # Shape-based node/edge inference is impossible when the two counts
+        # coincide.  This is only consulted for UNDECLARED keys below.
+        ambiguous = n_edge == n_node
 
         # Pass 1: handle output keys the expert produced that the spec does not
         # declare. In strict mode this is an error (alignment cannot be
@@ -177,9 +195,16 @@ class DistanceEnsembleWrapper(nn.Module):
             if getattr(src, "is_nested", False) or getattr(src, "is_sparse", False):
                 continue
             if strict:
-                raise ModelOutputSpecError(
+                msg = (
                     f"DistanceEnsembleWrapper: output key '{key}' is not declared in "
-                    f"ModelOutputSpec; cannot infer its node/edge alignment.")
+                    f"ModelOutputSpec; cannot infer its node/edge alignment."
+                )
+                if ambiguous:
+                    msg += (
+                        f" Ambiguous shapes make inference impossible: num_nodes "
+                        f"({n_node}) == num_edges ({n_edge})."
+                    )
+                raise ModelOutputSpecError(msg)
             dst = res.get(key)
             if (
                 torch.is_tensor(dst)
@@ -190,6 +215,13 @@ class DistanceEnsembleWrapper(nn.Module):
                 and not getattr(dst, "is_sparse", False)
             ):
                 # Legacy edge-aligned stitch for an undeclared key.
+                if ambiguous:
+                    log.warning(
+                        f"DistanceEnsembleWrapper: undeclared output key '{key}' "
+                        f"stitched as edge-aligned by the legacy shape guess, but "
+                        f"num_nodes == num_edges ({n_node}) makes that guess "
+                        f"ambiguous. Declare the key in ModelOutputSpec to fix "
+                        f"its alignment.")
                 dst[edge_mask] = src[edge_mask]
             else:
                 log.warning(

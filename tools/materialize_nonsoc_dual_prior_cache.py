@@ -82,11 +82,13 @@ from dptb.utils.constants import Bohr2Ang
 
 from dptb.data.materialization import (
     BoundedEnvCache,
+    DEFAULT_LOCK_STALE_SECONDS,
     DatasetAuditor,
     ManifestStore,
     NONSOC_P2_CACHE_SCHEMA as P2_CACHE_SCHEMA,
     ResumeJournal,
     TransactionalLMDBWriter,
+    WorkRootLock,
     bytes_sha256 as _bytes_sha256,
     drop_uncommitted_tail,
     guard_work_root,
@@ -191,6 +193,7 @@ def _guard_roots(
     *,
     overwrite: bool,
     resume: bool,
+    lock_stale_after_seconds: float | None = None,
 ) -> None:
     resolved_work = work_root.resolve()
     guard_work_root(
@@ -204,6 +207,7 @@ def _guard_roots(
         ),
         mutually_exclusive_message="--overwrite and --resume are mutually exclusive.",
         missing_work_root_message=f"--resume requires existing work root {resolved_work}.",
+        lock_stale_after_seconds=lock_stale_after_seconds,
     )
 
 
@@ -1248,6 +1252,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--allow-geometry-tolerance-upgrade", action="store_true")
+    parser.add_argument(
+        "--lock-stale-seconds",
+        type=float,
+        default=DEFAULT_LOCK_STALE_SECONDS,
+        help=(
+            "age after which a leftover work-root advisory lock (from a hard "
+            "crash on another host) is considered stale and taken over; a "
+            "live lock always refuses the run"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1276,8 +1290,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         work_root,
         overwrite=bool(args.overwrite),
         resume=bool(args.resume),
+        lock_stale_after_seconds=args.lock_stale_seconds,
     )
+    # Advisory lock: a concurrent materializer on the same work root is
+    # refused; a stale lock from a hard crash is taken over.  Released on
+    # (clean or exception) exit -- only a hard kill leaves it behind.
+    with WorkRootLock(work_root, stale_after_seconds=args.lock_stale_seconds):
+        return _run_materialization(
+            args,
+            p2_cache_root=p2_cache_root,
+            p2_cache_manifest=p2_cache_manifest,
+            p23_table_root=p23_table_root,
+            p23_table_audit=p23_table_audit,
+            dataset_root=dataset_root,
+            gate1_script=gate1_script,
+            input_json=input_json,
+            work_root=work_root,
+        )
 
+
+def _run_materialization(
+    args: argparse.Namespace,
+    *,
+    p2_cache_root: Path,
+    p2_cache_manifest: Path,
+    p23_table_root: Path,
+    p23_table_audit: Path,
+    dataset_root: Path,
+    gate1_script: Path,
+    input_json: Path,
+    work_root: Path,
+) -> int:
     p2_manifest = json.loads(p2_cache_manifest.read_text(encoding="utf-8"))
     declared_input_sha = p2_manifest.get("input_json_sha256")
     if declared_input_sha not in (None, "") and _sha256(input_json) != str(

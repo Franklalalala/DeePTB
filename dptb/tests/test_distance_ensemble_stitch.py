@@ -186,7 +186,7 @@ def test_node_stitch_was_previously_dropped_now_merges_even_when_shape0_differs(
 
 
 # ---------------------------------------------------------------------------
-# (c) strict mode raises on undeclared key and on node==edge ambiguity
+# (c) strict mode raises on undeclared keys (only they need shape inference)
 # ---------------------------------------------------------------------------
 def test_strict_mode_raises_on_undeclared_key():
     w = _make_wrapper(strict=True)
@@ -207,13 +207,51 @@ def test_strict_mode_raises_on_undeclared_key():
         w._stitch_outputs(res, res_i, edge_mask, node_mask)
 
 
-def test_strict_mode_raises_on_node_edge_ambiguity():
+def test_strict_mode_stitches_declared_fields_despite_node_edge_ambiguity():
+    # num_nodes == num_edges no longer refuses outright in strict mode:
+    # DECLARED fields carry a declared alignment, so no shape disambiguation is
+    # needed and the merge proceeds under the declared mask.
     w = _make_wrapper(strict=True)
-    n = 4  # num_nodes == num_edges -> shape-based alignment is ambiguous
+    n = 4  # num_nodes == num_edges
 
-    res = {"node_hamiltonian": torch.zeros(n, 4)}
-    res_i = {"node_hamiltonian": torch.ones(n, 4)}
+    res = {
+        "node_hamiltonian": torch.zeros(n, 4),
+        "edge_hamiltonian": torch.zeros(n, 2),
+    }
+    res_i = {
+        "node_hamiltonian": torch.ones(n, 4),
+        "edge_hamiltonian": torch.ones(n, 2) * 2.0,
+    }
+    node_mask = torch.tensor([True, False, True, False])
+    edge_mask = torch.tensor([False, True, False, True])
+
+    w._stitch_outputs(res, res_i, edge_mask, node_mask)  # must not raise
+
+    assert torch.equal(res["node_hamiltonian"][node_mask], torch.ones(2, 4))
+    assert torch.equal(res["node_hamiltonian"][~node_mask], torch.zeros(2, 4))
+    assert torch.equal(res["edge_hamiltonian"][edge_mask], torch.full((2, 2), 2.0))
+    assert torch.equal(res["edge_hamiltonian"][~edge_mask], torch.zeros(2, 2))
+
+
+def test_strict_mode_node_edge_ambiguity_raises_only_for_undeclared_keys():
+    # With an UNDECLARED key present, strict mode still refuses -- alignment
+    # would have to be guessed from shape and num_nodes == num_edges makes that
+    # guess impossible.  The error names the offending key and the ambiguity.
+    w = _make_wrapper(strict=True)
+    n = 4  # num_nodes == num_edges
+
+    res = {
+        "node_hamiltonian": torch.zeros(n, 4),
+        "mystery_out": torch.zeros(n, 4),
+    }
+    res_i = {
+        "node_hamiltonian": torch.ones(n, 4),
+        "mystery_out": torch.ones(n, 4),
+    }
     mask = torch.tensor([True, False, True, False])
+
+    with pytest.raises(ModelOutputSpecError, match="mystery_out"):
+        w._stitch_outputs(res, res_i, mask, mask)
 
     with pytest.raises(ModelOutputSpecError, match="Ambiguous"):
         w._stitch_outputs(res, res_i, mask, mask)
@@ -336,3 +374,76 @@ def test_forward_multiexpert_passes_both_edge_and_node_masks():
 
     # Node outputs owned by expert 0 (expert-1 node_mask is all-False), so kept.
     assert torch.equal(out_res["node_hamiltonian"], torch.zeros(n_node, 2))
+
+
+# ---------------------------------------------------------------------------
+# e2e: forward() honors NON-DEFAULT node ownership by a non-zero expert
+# ---------------------------------------------------------------------------
+class _CustomNodeRoutingWrapper(DistanceEnsembleWrapper):
+    """Routing override giving expert 1 genuine node ownership.
+
+    Default routing assigns all nodes to the ``d_min == 0`` expert; this
+    subclass reroutes nodes ``1..N-1`` to expert 1 (node 0 stays with expert 0)
+    so the ensemble ``forward()`` must merge expert 1's node outputs.
+    """
+
+    def _build_expert_masks(self, batch, expert_idx):
+        edge_mask, node_mask = super()._build_expert_masks(batch, expert_idx)
+        custom = torch.zeros_like(node_mask)
+        if expert_idx == 0:
+            custom[0] = True
+        elif expert_idx == 1:
+            custom[1:] = True
+        return edge_mask, custom
+
+
+def test_forward_merges_node_outputs_owned_by_nonzero_expert():
+    n_node, n_edge = 3, 4
+
+    def out(offset):
+        return {
+            "node_hamiltonian": torch.zeros(n_node, 2) + float(offset),
+            "node_h0": torch.zeros(n_node, 3) + 10.0 * float(offset),
+            "edge_hamiltonian": torch.zeros(n_edge, 2) + float(offset),
+        }
+
+    experts = [_StubExpert(out(0)), _StubExpert(out(1))]
+    w = _CustomNodeRoutingWrapper(
+        experts=experts,
+        distance_ranges=[(0.0, 3.0), (3.0, 6.0)],
+        strict_output_spec=False,
+    )
+
+    batch = {
+        "pos": torch.zeros(n_node, 3),
+        # two edges in expert-0 range [0,3), two in expert-1 range [3,6)
+        "edge_lengths": torch.tensor([1.0, 1.5, 3.0, 4.0]),
+    }
+    res = w.forward(batch)
+
+    # Expert 1 genuinely owns nodes 1..2: its node outputs must land in the
+    # merged result (this drives forward(), not just _stitch_outputs).
+    expected_node = torch.zeros(n_node, 2)
+    expected_node[1:] = 1.0
+    assert torch.equal(res["node_hamiltonian"], expected_node)
+
+    expected_h0 = torch.zeros(n_node, 3)
+    expected_h0[1:] = 10.0
+    assert torch.equal(res["node_h0"], expected_h0)
+
+    # Edge stitching is unchanged: expert 1 owns edges 2..3 by distance.
+    expected_edge = torch.zeros(n_edge, 2)
+    expected_edge[2:] = 1.0
+    assert torch.equal(res["edge_hamiltonian"], expected_edge)
+
+    # The injected routing masks never leak into the merged output.
+    assert "expert_edge_mask" not in res
+    assert "expert_node_mask" not in res
+
+
+def test_wrapper_documents_default_node_ownership_policy():
+    # 1(c): the ownership policy (all nodes -> d_min == 0 expert) is routing
+    # semantics, documented on the wrapper; the spec only fixed stitching.
+    doc = DistanceEnsembleWrapper.__doc__ or ""
+    assert "d_min == 0" in doc
+    assert "ownership" in doc.lower()

@@ -40,7 +40,14 @@ from .resume import (
     sign_identity,
     write_heartbeat,
 )
-from .workroot import guard_work_root
+from .workroot import (
+    DEFAULT_LOCK_STALE_SECONDS,
+    LOCK_FILE_NAME,
+    WorkRootLock,
+    WorkRootLockError,
+    check_work_root_lock,
+    guard_work_root,
+)
 
 
 def load_module(path: Path, name: str) -> ModuleType:
@@ -82,6 +89,11 @@ __all__ = [
     "reverse_edge_rows",
     "structure_geometry_bohr",
     # workroot
+    "DEFAULT_LOCK_STALE_SECONDS",
+    "LOCK_FILE_NAME",
+    "WorkRootLock",
+    "WorkRootLockError",
+    "check_work_root_lock",
     "guard_work_root",
     # audit
     "DatasetAuditor",

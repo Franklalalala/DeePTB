@@ -30,7 +30,10 @@ from dptb.data.interfaces.blockwise_tensor import (
     attach_prediction_block_tensors,
     feature_tensors_to_block_tensors,
 )
-from dptb.data.interfaces.p2_contract import build_prior_spec
+from dptb.data.interfaces.p2_contract import (
+    build_prior_spec,
+    validate_explicit_prior_fields,
+)
 from dptb.nn.hamiltonian import E3Hamiltonian
 
 
@@ -179,6 +182,17 @@ class BlockwiseE3Hamiltonian(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        # Fail-closed prior contract FIRST: derive the single spec from the
+        # kind and refuse explicit overrides that contradict it before any
+        # submodule is built, so direct-API construction can never mix prior
+        # families (e.g. p2 RME conditioning with p23 AO blocks).
+        prior_spec = build_prior_spec("p2" if prior_kind in (None, "") else prior_kind)
+        validate_explicit_prior_fields(
+            prior_spec,
+            prior_node_block_field=prior_node_block_field,
+            prior_edge_block_field=prior_edge_block_field,
+            prior_label=prior_label,
+        )
         self.e3 = E3Hamiltonian(
             basis=basis,
             idp=idp,
@@ -204,11 +218,10 @@ class BlockwiseE3Hamiltonian(nn.Module):
         if self.add_h0 and self.add_prior:
             raise ValueError("add_h0 and add_prior are mutually exclusive.")
         # The AO-block field names and the human label are DERIVED from the
-        # single prior kind.  Explicit fields are honored only as overrides (for
-        # back-compat); an empty/omitted value derives from the kind so p2/p23
-        # can never disagree between the RME conditioning and the AO block that
-        # is added back for Full-H reconstruction.
-        prior_spec = build_prior_spec("p2" if prior_kind in (None, "") else prior_kind)
+        # single prior kind (validated against the explicit echoes above); an
+        # empty/omitted value derives from the kind so p2/p23 can never
+        # disagree between the RME conditioning and the AO block that is added
+        # back for Full-H reconstruction.
         self.prior_kind = prior_spec.kind
         self.prior_node_block_field = (
             str(prior_node_block_field)

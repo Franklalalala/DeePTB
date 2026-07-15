@@ -12,7 +12,10 @@ from dptb.nn.embedding import Embedding
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
-from dptb.data.interfaces.p2_contract import build_prior_spec
+from dptb.data.interfaces.p2_contract import (
+    build_prior_spec,
+    validate_explicit_prior_fields,
+)
 from dptb.nn.blockwise_hamiltonian import (
     BlockwiseE3Hamiltonian,
     attach_full_hamiltonian_from_h0,
@@ -174,6 +177,18 @@ class NNENV(nn.Module):
             block_native_prior_spec = build_prior_spec(embedding_prior_kind)
         except ValueError:
             block_native_prior_spec = build_prior_spec("p2")
+        # Fail closed on direct-API construction: any explicit (non-empty)
+        # prior field passed through the embedding/prediction dicts must agree
+        # with the spec derived from the single prior kind, so p2 RME
+        # conditioning can never be mixed with p23 AO blocks (or vice versa).
+        validate_explicit_prior_fields(
+            block_native_prior_spec,
+            prior_node_key=embedding.get("prior_node_key"),
+            prior_edge_key=embedding.get("prior_edge_key"),
+            prior_node_block_field=prediction_copy.get("prior_node_block_field"),
+            prior_edge_block_field=prediction_copy.get("prior_edge_block_field"),
+            prior_label=prediction_copy.get("prior_label"),
+        )
         self.block_native_prior_kind = block_native_prior_spec.kind
         self.block_native_prior_node_field = (
             prediction_copy.get("prior_node_block_field")

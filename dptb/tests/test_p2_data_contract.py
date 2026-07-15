@@ -21,12 +21,14 @@ from dptb.data.interfaces.p2_contract import (
     TARGET_SEMANTICS_KEY,
     TARGET_SOURCE_KEY,
     assert_record_fingerprint,
+    build_prior_spec,
     canonical_edge_graph,
     edge_graph_fingerprint,
     fingerprint_fields,
     fingerprint_present_row_aligned_fields,
     fingerprint_text_fields,
     mapper_basis_fingerprint,
+    validate_explicit_prior_fields,
 )
 from dptb.data.transforms_upper_triangle import OrbitalMapper
 
@@ -232,4 +234,146 @@ def test_row_aligned_bundle_binds_h0_and_targets_to_graph_order():
             record,
             field=ROW_ALIGNED_DATA_FINGERPRINT_KEY,
             actual=fingerprint_present_row_aligned_fields(record),
+        )
+
+
+# ===========================================================================
+# validate_explicit_prior_fields: explicit echoes must match the derived spec
+# ===========================================================================
+
+
+@pytest.mark.parametrize("kind", ["p2", "p23"])
+def test_validate_explicit_prior_fields_empty_and_matching_pass(kind):
+    spec = build_prior_spec(kind)
+
+    # No explicit values at all.
+    validate_explicit_prior_fields(spec)
+
+    # None / "" mean "derive" and always pass.
+    validate_explicit_prior_fields(
+        spec,
+        prior_node_key=None,
+        prior_edge_key="",
+        prior_node_block_field=None,
+        prior_edge_block_field="",
+        prior_label=None,
+    )
+
+    # Exact echoes of every derived value pass.
+    validate_explicit_prior_fields(
+        spec,
+        prior_node_key=spec.node_rme_key,
+        prior_edge_key=spec.edge_rme_key,
+        prior_node_block_field=spec.node_blocks_key,
+        prior_edge_block_field=spec.edge_blocks_key,
+        prior_node_shape_field=spec.node_shape_key,
+        prior_edge_shape_field=spec.edge_shape_key,
+        prior_raw_key=spec.raw_key,
+        prior_label=spec.label,
+    )
+
+    # The human label is compared case-insensitively.
+    validate_explicit_prior_fields(spec, prior_label=spec.kind)
+
+
+def test_validate_explicit_prior_fields_mismatch_raises():
+    p2 = build_prior_spec("p2")
+    with pytest.raises(ValueError, match="Refusing to mix"):
+        validate_explicit_prior_fields(p2, prior_node_block_field="node_p23_blocks")
+    with pytest.raises(ValueError, match="prior_edge_key"):
+        validate_explicit_prior_fields(p2, prior_edge_key="edge_p23")
+
+    p23 = build_prior_spec("p23")
+    with pytest.raises(ValueError, match="prior_label"):
+        validate_explicit_prior_fields(p23, prior_label="P2")
+    with pytest.raises(ValueError, match="prior_raw_key"):
+        validate_explicit_prior_fields(p23, prior_raw_key="hamiltonian_p2")
+
+    # All mismatching fields are reported in one deterministic message.
+    with pytest.raises(
+        ValueError, match=r"prior_edge_block_field.*prior_node_key"
+    ):
+        validate_explicit_prior_fields(
+            p2,
+            prior_node_key="node_p23",
+            prior_edge_block_field="edge_p23_blocks",
+        )
+
+
+def test_validate_explicit_prior_fields_rejects_unknown_field_and_bad_spec():
+    with pytest.raises(ValueError, match="Unknown explicit prior field"):
+        validate_explicit_prior_fields(build_prior_spec("p2"), prior_bogus="x")
+    with pytest.raises(TypeError):
+        validate_explicit_prior_fields("p2", prior_label="P2")
+
+
+def test_blockwise_hamiltonian_ctor_rejects_mixed_prior_fields():
+    from dptb.nn.blockwise_hamiltonian import BlockwiseE3Hamiltonian
+
+    # Validation fires before any submodule is built, so the mismatch raises
+    # even for direct-API construction (no argcheck/normalize in the path).
+    with pytest.raises(ValueError, match="Refusing to mix"):
+        BlockwiseE3Hamiltonian(
+            basis={"H": "1s"},
+            prior_kind="p2",
+            prior_node_block_field="node_p23_blocks",
+        )
+    with pytest.raises(ValueError, match="Refusing to mix"):
+        BlockwiseE3Hamiltonian(
+            basis={"H": "1s"},
+            prior_kind="p23",
+            prior_label="P2",
+        )
+
+
+def test_blockwise_hamiltonian_ctor_accepts_matching_or_empty_fields():
+    from dptb.nn.blockwise_hamiltonian import BlockwiseE3Hamiltonian
+
+    explicit = BlockwiseE3Hamiltonian(
+        basis={"H": "1s"},
+        prior_kind="p23",
+        prior_node_block_field="node_p23_blocks",
+        prior_edge_block_field="edge_p23_blocks",
+        prior_label="P23",
+    )
+    assert explicit.prior_kind == "p23"
+    assert explicit.prior_node_block_field == "node_p23_blocks"
+    assert explicit.prior_edge_block_field == "edge_p23_blocks"
+    assert explicit.prior_label == "P23"
+
+    derived = BlockwiseE3Hamiltonian(basis={"H": "1s"}, prior_kind="p23")
+    assert derived.prior_node_block_field == "node_p23_blocks"
+    assert derived.prior_edge_block_field == "edge_p23_blocks"
+    assert derived.prior_label == "P23"
+
+
+def test_nnenv_ctor_rejects_mixed_prior_fields():
+    from dptb.nn.deeptb import NNENV
+
+    # p2 embedding RME key skewed to p23: refuse before building anything.
+    with pytest.raises(ValueError, match="Refusing to mix"):
+        NNENV(
+            embedding={
+                "method": "lem_moe_v3_prior",
+                "prior_kind": "p2",
+                "prior_init_scope": "both",
+                "prior_node_key": "node_p23",
+            },
+            prediction={"method": "e3tb"},
+            basis={"H": "1s"},
+        )
+
+    # p2 kind with an explicit p23 AO-block field on the prediction side.
+    with pytest.raises(ValueError, match="Refusing to mix"):
+        NNENV(
+            embedding={
+                "method": "lem_moe_v3_prior",
+                "prior_kind": "p2",
+                "prior_init_scope": "both",
+            },
+            prediction={
+                "method": "e3tb",
+                "prior_edge_block_field": "edge_p23_blocks",
+            },
+            basis={"H": "1s"},
         )
