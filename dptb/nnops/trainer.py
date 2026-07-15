@@ -951,6 +951,15 @@ class Trainer(BaseTrainer):
             )
             skip_batches = 0
             resume_rng = None
+            # Re-running a re-entered epoch from batch 0: the restored
+            # trainer.stats hold the PARTIAL per-epoch accumulators (sum,count)
+            # of the batches committed before the crash. Re-running every batch
+            # would add them a second time and skew epoch_mean, which feeds the
+            # plateau LR scheduler and the best-loss gate for this epoch. Reset
+            # the per-epoch accumulators so the re-run rebuilds them cleanly.
+            # (The exact-fast-forward path SKIPS the committed batches, so it
+            # must NOT reset — the restored partial is still correct there.)
+            self._reset_epoch_metric_accumulators()
 
         # Seed the committed-batch cursor to the fast-forward offset so a SECOND
         # mid-epoch preemption during this resumed epoch persists an ABSOLUTE
@@ -996,6 +1005,17 @@ class Trainer(BaseTrainer):
                 self.iteration(ibatch, ref_batch)
             else:
                 self.iteration(ibatch)
+
+    def _reset_epoch_metric_accumulators(self):
+        """Zero the per-epoch (sum, count) accumulators in ``trainer.stats``.
+
+        Mirrors what Monitor.epoch does at an epoch boundary. Used only when a
+        re-entered epoch is re-run from its start after a restart, so the
+        restored partial accumulators are not double-counted into epoch_mean.
+        """
+        for entry in self.stats.values():
+            if isinstance(entry, dict) and 'epoch_stats' in entry:
+                entry['epoch_stats'] = (0, 0)
 
     def _consume_resume_plan(self):
         """Pop the one-shot restart plan for the current epoch.

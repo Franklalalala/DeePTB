@@ -524,6 +524,58 @@ def test_manifest_written_atomically_and_seeds_best_loss(tmp_path):
     assert saver2.best_loss == pytest.approx(0.75)
 
 
+def test_epoch_best_checkpoint_is_epoch_kind_not_reused_iteration(tmp_path):
+    # Regression (audit P1): the epoch-best checkpoint must embed
+    # checkpoint_kind=EPOCH. A former optimization byte-copied the last
+    # ITERATION checkpoint into best.pth/latest.pth, so those files carried
+    # checkpoint_kind='iteration' and a restart mislabeled the committed epoch
+    # boundary as mid-epoch (re-running the epoch, skipping its LR step, and
+    # restoring a stale best_loss that could clobber the true best model).
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(tmp_path, n_batches=2, epoch_losses={1: 0.5})
+    # Both iteration and epoch saves fire; the iteration save lands on the last
+    # committed batch of the epoch -- the former reuse trigger.
+    saver = Saver(interval=[(1, "iteration"), (1, "epoch")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+    trainer.run(epochs=1)
+
+    best = torch.load(
+        str(ckpt_dir / "probe.best.pth"), map_location="cpu", weights_only=False
+    )
+    assert read_resume_metadata(best).checkpoint_kind == CHECKPOINT_KIND_EPOCH
+
+
+def test_fallback_resume_resets_partial_epoch_stats(tmp_path):
+    # Regression (audit P2): the safe-fallback (non-deterministic loader) re-runs
+    # the whole epoch, so the restored PARTIAL per-epoch accumulators must be
+    # zeroed to avoid double-counting them into epoch_mean (which feeds the
+    # plateau LR scheduler and the best-loss gate).
+    import torch.utils.data as tud
+
+    resumed = _make_trainer(tmp_path, n_batches=5)
+    resumed.train_loader = tud.DataLoader(list(range(5)), batch_size=1, shuffle=True)
+    assert resumed._loader_supports_exact_fast_forward() is False
+    resumed.ep = 1
+    resumed._resume_plan = {"target_epoch": 1, "skip_batches": 3, "rng_state": None}
+    resumed.stats["train_loss"] = {"epoch_stats": (12.0, 3), "epoch_mean": 4.0}
+    resumed.epoch()
+    assert resumed.stats["train_loss"]["epoch_stats"] == (0, 0)
+
+
+def test_fast_forward_resume_preserves_partial_epoch_stats(tmp_path):
+    # The exact-fast-forward path SKIPS the committed batches, so their restored
+    # partial-accumulator contribution must be KEPT (not reset) to reconstruct
+    # the full epoch_mean.
+    resumed = _make_trainer(tmp_path, n_batches=5)  # list loader -> exact fast-forward
+    assert resumed._loader_supports_exact_fast_forward() is True
+    resumed.ep = 1
+    resumed._resume_plan = {"target_epoch": 1, "skip_batches": 3, "rng_state": None}
+    resumed.stats["train_loss"] = {"epoch_stats": (12.0, 3), "epoch_mean": 4.0}
+    resumed.epoch()
+    assert resumed.stats["train_loss"]["epoch_stats"] == (12.0, 3)
+
+
 def test_atomic_write_leaves_no_partial_file_on_failure(tmp_path):
     ckpt_dir = tmp_path / "ck"
     ckpt_dir.mkdir()

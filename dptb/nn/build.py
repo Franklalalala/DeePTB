@@ -160,8 +160,15 @@ class DistanceEnsembleWrapper(nn.Module):
                 "cannot validate node/edge alignment by shape in strict mode."
             )
 
-        # Pass 1: flag output keys the expert produced that the spec does not
-        # declare (so their alignment cannot be inferred).
+        # Pass 1: handle output keys the expert produced that the spec does not
+        # declare. In strict mode this is an error (alignment cannot be
+        # inferred). In permissive mode, fall back to the LEGACY shape-based
+        # edge stitch for backward compatibility: any tensor whose leading dim
+        # equals num_edges is edge-aligned and merged via edge_mask, exactly as
+        # the pre-spec implementation did -- otherwise an undeclared edge-aligned
+        # output (e.g. a Full-H reconstruction field not in _keys.py) would
+        # silently keep only expert 0's contribution. Non-edge-shaped undeclared
+        # tensors keep expert-0's value, matching the old behaviour.
         for key, src in res_i.items():
             if key in spec.fields:
                 continue
@@ -169,11 +176,25 @@ class DistanceEnsembleWrapper(nn.Module):
                 continue
             if getattr(src, "is_nested", False) or getattr(src, "is_sparse", False):
                 continue
-            msg = (f"DistanceEnsembleWrapper: output key '{key}' is not declared in "
-                   f"ModelOutputSpec; cannot infer its node/edge alignment.")
             if strict:
-                raise ModelOutputSpecError(msg)
-            log.warning(msg + " Keeping expert-0 value (permissive mode).")
+                raise ModelOutputSpecError(
+                    f"DistanceEnsembleWrapper: output key '{key}' is not declared in "
+                    f"ModelOutputSpec; cannot infer its node/edge alignment.")
+            dst = res.get(key)
+            if (
+                torch.is_tensor(dst)
+                and src.ndim > 0
+                and int(src.shape[0]) == n_edge
+                and src.shape == dst.shape
+                and not getattr(dst, "is_nested", False)
+                and not getattr(dst, "is_sparse", False)
+            ):
+                # Legacy edge-aligned stitch for an undeclared key.
+                dst[edge_mask] = src[edge_mask]
+            else:
+                log.warning(
+                    f"DistanceEnsembleWrapper: undeclared output key '{key}' kept as "
+                    f"expert-0 value (permissive; not edge-aligned by shape).")
 
         # Pass 2: merge declared, masked-aligned fields.
         masks = {"edge": edge_mask, "node": node_mask}

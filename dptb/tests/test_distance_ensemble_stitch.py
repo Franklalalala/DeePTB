@@ -237,17 +237,24 @@ def test_strict_mode_raises_on_alignment_shape_mismatch():
 # ---------------------------------------------------------------------------
 # (d) permissive mode warns + keeps expert 0
 # ---------------------------------------------------------------------------
-def test_permissive_mode_warns_and_keeps_expert0_on_undeclared_key():
+def test_permissive_mode_legacy_stitches_undeclared_edge_key_and_keeps_others():
+    # Backward-compat: an UNDECLARED but edge-shaped output (leading dim ==
+    # num_edges) must still be stitched via edge_mask, exactly as the old
+    # shape-based implementation did -- otherwise experts 1..N silently lose
+    # their contribution to Full-H reconstruction fields not listed in _keys.py.
+    # An undeclared key that is NOT edge-shaped keeps expert-0's value + warns.
     w = _make_wrapper(strict=False)
     n_node, n_edge = 3, 5
 
     res = {
         "node_hamiltonian": torch.zeros(n_node, 4),
-        "mystery_out": torch.full((n_edge, 4), 7.0),
+        "mystery_edge": torch.full((n_edge, 4), 7.0),   # undeclared, edge-shaped
+        "mystery_scalar": torch.full((2,), 7.0),        # undeclared, not edge-shaped
     }
     res_i = {
         "node_hamiltonian": torch.ones(n_node, 4),
-        "mystery_out": torch.full((n_edge, 4), 99.0),
+        "mystery_edge": torch.full((n_edge, 4), 99.0),
+        "mystery_scalar": torch.full((2,), 99.0),
     }
     node_mask = torch.tensor([True, False, True])
     edge_mask = torch.tensor([False, True, True, False, True])
@@ -259,10 +266,13 @@ def test_permissive_mode_warns_and_keeps_expert0_on_undeclared_key():
         _release_build_warnings(handler, prev_level)
 
     messages = [rec.getMessage() for rec in handler.records]
-    # a warning naming the undeclared key was emitted
-    assert any("mystery_out" in m for m in messages), messages
-    # the undeclared key kept expert-0's value (never merged)
-    assert torch.equal(res["mystery_out"], torch.full((n_edge, 4), 7.0))
+    # undeclared edge-shaped key legacy-stitched via edge_mask
+    expected_edge = torch.full((n_edge, 4), 7.0)
+    expected_edge[edge_mask] = 99.0
+    assert torch.equal(res["mystery_edge"], expected_edge)
+    # undeclared non-edge-shaped key kept expert-0's value, with a warning
+    assert torch.equal(res["mystery_scalar"], torch.full((2,), 7.0))
+    assert any("mystery_scalar" in m for m in messages), messages
     # declared node output still merged as normal
     assert torch.equal(res["node_hamiltonian"][node_mask], torch.ones(2, 4))
 

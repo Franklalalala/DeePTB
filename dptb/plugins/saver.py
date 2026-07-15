@@ -752,46 +752,23 @@ class Saver(Plugin, StatefulPlugin):
             if len(self.best_quene) > max_ckpt:
                 delete_name = self.best_quene.pop(0)
 
-            reused_iter_checkpoint = False
-            # Reuse the just-written iteration checkpoint as the epoch-best file
-            # only when it is the SAME committed step. trainer.iter has already
-            # advanced by one past the last iteration() by the time epoch plugins
-            # fire, so the stable comparison is iter-1 (BUG 2, off-by-one reuse).
-            if (
-                _env_flag("DPTB_SAVER_REUSE_ITER_CKPT_FOR_EPOCH_BEST", True)
-                and self._last_iteration_checkpoint_name is not None
-                and self._last_iteration_checkpoint_iter == self.trainer.iter - 1
-            ):
-                iter_ckpt = os.path.join(self.checkpoint_path, self._last_iteration_checkpoint_name + ".pth")
-                epoch_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
-                reuse_decision = [False]
-                if self._is_main() and os.path.exists(iter_ckpt):
-                    # COPY bytes, never symlink: the source .iter file is in the
-                    # rotating latest_quene and max_ckpt may delete it, which
-                    # would leave this .ep best file dangling (BUG 2).
-                    tmp_epoch = f"{epoch_ckpt}.tmp{os.getpid()}"
-                    shutil.copy2(os.path.abspath(iter_ckpt), tmp_epoch)
-                    os.replace(tmp_epoch, epoch_ckpt)
-                    log.info(
-                        "checkpoint %s reused (copied) from same-iteration checkpoint %s",
-                        name,
-                        self._last_iteration_checkpoint_name,
-                    )
-                    reuse_decision[0] = True
-                if dist.is_available() and dist.is_initialized():
-                    dist.broadcast_object_list(reuse_decision, src=0)
-                reused_iter_checkpoint = bool(reuse_decision[0])
-                self._barrier_on_current_device()
-
-            if not reused_iter_checkpoint:
-                self._save(
-                    name=name,
-                    model=self.trainer.model,
-                    model_options=self.trainer.model.model_options,
-                    common_options=self.trainer.common_options,
-                    train_options=self.trainer.train_options,
-                    kind=CHECKPOINT_KIND_EPOCH,
-                )
+            # The epoch-best checkpoint is ALWAYS written fresh with
+            # kind=CHECKPOINT_KIND_EPOCH. An earlier optimization reused (byte-
+            # copied) the last *iteration* checkpoint here to save one
+            # re-serialization, but that file embeds checkpoint_kind='iteration'
+            # and the pre-epoch Saver best_loss. best.pth/latest.pth pointing at
+            # such a copy made a restart mislabel a committed epoch boundary as
+            # mid-epoch (re-running the whole epoch, skipping its per-epoch LR
+            # step) and restore a stale higher best_loss that could clobber the
+            # true best model. Correctness outweighs the once-per-best-epoch save.
+            self._save(
+                name=name,
+                model=self.trainer.model,
+                model_options=self.trainer.model.model_options,
+                common_options=self.trainer.common_options,
+                train_options=self.trainer.train_options,
+                kind=CHECKPOINT_KIND_EPOCH,
+            )
 
             if self._is_main():
                 if delete_name is not None:
