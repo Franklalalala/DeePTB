@@ -60,11 +60,23 @@ class PluginUser(object):
         plugin._plugin_id = f"{cls_name}#{n}"
         return plugin._plugin_id
 
-    def register_plugin(self, plugin, **kwargs):
+    def register_plugin(self, plugin, plugin_id=None, **kwargs):
+        """Register ``plugin``; extra kwargs are forwarded to ``plugin.register``.
+
+        ``plugin_id`` (optional) overrides the default ``ClassName#index``
+        identity. The explicit id is what persisted/harvested plugin state is
+        keyed by, so two instances of the same class can round-trip their
+        checkpoint state unambiguously as long as the restart registers them
+        with the same ids. When omitted, behavior is identical to before.
+        """
         plugin.register(self, **kwargs)
 
         # Stable identity + de-duplicated registration bookkeeping, then restore
         # any checkpointed state for this plugin (e.g. Saver best_loss/queues).
+        if plugin_id is not None:
+            # _assign_plugin_id prefers a configured ``plugin_id`` attribute,
+            # so the explicit kwarg wins over the ClassName#index default.
+            plugin.plugin_id = str(plugin_id)
         self._assign_plugin_id(plugin)
         if plugin not in self._registered_plugins:
             self._registered_plugins.append(plugin)

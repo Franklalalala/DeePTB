@@ -447,3 +447,26 @@ def test_wrapper_documents_default_node_ownership_policy():
     doc = DistanceEnsembleWrapper.__doc__ or ""
     assert "d_min == 0" in doc
     assert "ownership" in doc.lower()
+
+
+def test_input_descriptor_fields_are_structural_not_stitched():
+    # Regression (natlan P2 multi-expert smoke): node_attrs/edge_attrs are
+    # INPUT descriptors (one-hot species / pair attributes) consumed by
+    # embedding forwards whose backward needs the original values. They carry
+    # node_/edge_ prefixes but must NOT be masked_replace-stitched — the
+    # in-place write mutated a tensor still referenced by autograd and broke
+    # loss.backward() with a version-counter error at the first iteration.
+    spec = default_output_spec()
+    for key in ("node_attrs", "edge_attrs", "edge_cell_shift", "edge_vectors"):
+        s = spec.get(key)
+        assert s is not None and s.alignment == "graph" and s.merge == "keep_first", key
+
+    # And the stitch itself must leave them untouched.
+    w = _make_wrapper(strict=False)
+    res = {"node_attrs": torch.zeros(3, 2), "edge_attrs": torch.zeros(5, 4)}
+    res_i = {"node_attrs": torch.ones(3, 2), "edge_attrs": torch.ones(5, 4)}
+    node_mask = torch.tensor([True, True, True])
+    edge_mask = torch.ones(5, dtype=torch.bool)
+    w._stitch_outputs(res, res_i, edge_mask, node_mask)
+    assert torch.equal(res["node_attrs"], torch.zeros(3, 2))
+    assert torch.equal(res["edge_attrs"], torch.zeros(5, 4))

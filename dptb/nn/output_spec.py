@@ -163,9 +163,20 @@ STRUCTURAL_FIELDS = frozenset(
         "edge_index",
         "edge_type",
         "edge_vec",
+        "edge_vectors",
         "edge_lengths",
+        "edge_cell_shift",
         "kpoint",
         "kpoints",
+        # INPUT descriptors (one-hot species / pair attributes): identical
+        # across experts and consumed by embedding forward passes whose
+        # backward needs the original values. They carry node_/edge_ prefixes
+        # but are NOT model outputs — stitching them masked_replace mutated
+        # them in place mid-autograd and broke backward with a tensor-version
+        # error (ScalarOnehotTP einsum over node_attrs, seen on the natlan P2
+        # multi-expert smoke). keep_first is both correct and safe.
+        "node_attrs",
+        "edge_attrs",
     }
 )
 

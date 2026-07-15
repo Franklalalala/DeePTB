@@ -2354,6 +2354,33 @@ class MultiTrainer(Trainer):
     def _should_flush_display_window_now(self, it: int) -> bool:
         return (it == 1) or (it % self.display_sync_freq == 0)
 
+    def _cheap_iteration_state(
+        self,
+        loss_detached=None,
+        current_local_lr: Optional[float] = None,
+        dynamic_batch_state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Per-step plugin state for non-flush ticks (P0-5). No collectives.
+
+        Carries only fields that are already available on this rank for the
+        step just committed, so the per-step plugin tick never adds a
+        collective. Display metrics that require gathered/reduced values
+        (``train_loss``, ``total_grad_norm``, ``expert_*`` aggregates) are
+        deliberately absent: ``Monitor._get_value`` returns ``None`` for a
+        missing key and the monitor skips the update, so gathered stats only
+        refresh on the display-flush cadence. ``field='iteration'`` is
+        included because ``Validationer`` keys its iteration-cadence
+        validation off it.
+        """
+        state: Dict[str, Any] = {"field": "iteration", "window_steps": 0}
+        if current_local_lr is not None:
+            state["lr"] = float(current_local_lr)
+        if loss_detached is not None:
+            state["loss_detached"] = self._to_float_scalar(loss_detached)
+        if dynamic_batch_state:
+            state.update(dynamic_batch_state)
+        return state
+
     def _gather_display_window_expert_metrics(self) -> List[torch.Tensor]:
         local_pack = MetricPack.from_tensor(self._display_window_pack_local)
         local_steps = max(float(local_pack.step_count.item()), 1.0)
@@ -2659,11 +2686,29 @@ class MultiTrainer(Trainer):
         # mid-epoch position (OOM-skip paths return earlier and do not count).
         self._batch_in_epoch = getattr(self, "_batch_in_epoch", 0) + 1
 
+        # P0-5: the plugin dispatcher ticks on EVERY committed optimizer step,
+        # decoupling cadence plugins (Saver save_freq, Validationer
+        # validation_freq) from the display window. Previously call_plugins ran
+        # only when the display window flushed, so those schedules were
+        # quantized to (and drifted by) display_freq. Non-flush ticks carry a
+        # cheap, locally-available state assembled WITHOUT any collective; the
+        # expensive gathered/display metrics keep their display_sync_freq
+        # cadence and ride the full flush state. Whether the flush fires (and
+        # whether it yields a state — the reduced pack is rank-uniform) is
+        # agreed on all ranks, so every rank issues the same single
+        # call_plugins per committed step and no collective is added, removed,
+        # or reordered relative to the flush path.
+        state = None
         if self._should_flush_display_window_now(self.iter):
             state = self._flush_display_window(time_idx=self.iter)
-            if state is not None:
-                with self._tagger.tag("iteration/call_plugins", it=self.iter):
-                    self.call_plugins(queue_name='iteration', time=self.iter, **state)
+        if state is None:
+            state = self._cheap_iteration_state(
+                loss_detached=payload["loss_detached"],
+                current_local_lr=current_local_lr,
+                dynamic_batch_state=dynamic_batch_state,
+            )
+        with self._tagger.tag("iteration/call_plugins", it=self.iter):
+            self.call_plugins(queue_name='iteration', time=self.iter, **state)
 
         with self._tagger.tag("iteration/exit", it=self.iter):
             self.iter += 1
