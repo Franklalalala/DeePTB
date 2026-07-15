@@ -22,12 +22,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
-import os
 import pickle
 import shutil
-import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -37,6 +34,19 @@ import numpy as np
 import torch
 
 import dptb.data.AtomicDataDict as AtomicDataDict
+from dptb.data.materialization import (
+    MAP_SIZE,
+    ManifestStore,
+    NONSOC_P2_CACHE_SCHEMA,
+    ResumeJournal,
+    guard_work_root,
+    json_sha256 as _identity_sha256,
+    load_module as _load_module,
+    open_read_env as _open_read,
+    open_write_env as _open_write,
+    sha256_file as _sha256,
+    write_json as _write_json,
+)
 from dptb.data import AtomicData
 from dptb.data.interfaces.abacus import OrbAbacus2DeepTB, _abacus_parse
 from dptb.data.interfaces.h0_lmdb_helper import (
@@ -74,13 +84,16 @@ from dptb.data.interfaces.p2_table import (
 
 
 RY_TO_EV = 13.605698
-SCHEMA = "deeptb.nonsoc_p2_cache/v1"
+# Single source of truth lives in dptb.data.materialization.manifest; kept as a
+# module attribute here for the tests and the dual tool that import it.
+SCHEMA = NONSOC_P2_CACHE_SCHEMA
 RAW_STAGING_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_raw_staging_identity/v2"
 RAW_DATASET_SOURCE_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_dataset_source/v1"
 RAW_CASE_SOURCE_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_case_source/v1"
 RAW_STAGING_IDENTITY_NAME = "identity.json"
 RAW_CASE_SOURCE_FINGERPRINT_KEY = "raw_case_source_fingerprint"
-MAP_SIZE = 1 << 40
+# Resume journal bound to this cache's schema; drives heartbeats.
+_JOURNAL = ResumeJournal(schema=SCHEMA)
 DEFAULT_P2_HERMITIAN_MISMATCH_TOLERANCE_EV = 5.0e-3
 
 _RAW_ABACUS_SOURCE_FILES = {
@@ -123,24 +136,6 @@ _P2_BLOCK_FIELDS = (
     AtomicDataDict.NODE_P2_BLOCK_SHAPE_KEY,
     AtomicDataDict.EDGE_P2_BLOCK_SHAPE_KEY,
 )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _load_module(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot import helper module {path}.")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _required_block_keys_from_graph(
@@ -375,25 +370,6 @@ def _source_set_fingerprint(cases: list[Path], p2_root: Path) -> str:
         digest.update(_sha256(path).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, path)
-
-
-def _identity_sha256(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _require_qualified_table_manifest(
@@ -661,10 +637,7 @@ def _validate_raw_record_source(
 
 
 def _heartbeat(work_root: Path, **payload: Any) -> None:
-    _write_json(
-        work_root / "heartbeat.json",
-        {"schema": SCHEMA, "updated_unix": time.time(), **payload},
-    )
+    _JOURNAL.heartbeat(work_root, **payload)
 
 
 def parse_basis_lines(raw: bytes | str, expected_atoms: int) -> list[list[int]]:
@@ -875,19 +848,6 @@ def _split_cases(
         "train": [case for case in cases if case.name not in validation_names],
         "validation": [case for case in cases if case.name in validation_names],
     }
-
-
-def _open_write(path: Path) -> lmdb.Environment:
-    path.mkdir(parents=True, exist_ok=True)
-    return lmdb.open(
-        str(path), map_size=MAP_SIZE, subdir=True, lock=True, readahead=False, max_dbs=1
-    )
-
-
-def _open_read(path: Path) -> lmdb.Environment:
-    return lmdb.open(
-        str(path), readonly=True, lock=False, readahead=False, max_readers=512, subdir=True
-    )
 
 
 def _raw_split(
@@ -1685,29 +1645,22 @@ def _guard_output(
     *,
     resume_raw_staging: bool = False,
 ) -> None:
-    dataset_root = dataset_root.resolve()
-    work_root = work_root.resolve()
-    if (
-        dataset_root == work_root
-        or dataset_root in work_root.parents
-        or work_root in dataset_root.parents
-    ):
-        raise ValueError(
+    resolved_work = work_root.resolve()
+    guard_work_root(
+        dataset_root,
+        work_root,
+        overwrite=overwrite,
+        resume=resume_raw_staging,
+        disjoint_message=(
             "dataset_root and work_root must be disjoint; neither may contain the other."
-        )
-    if resume_raw_staging:
-        if overwrite:
-            raise ValueError("--resume-raw-staging and --overwrite are mutually exclusive.")
-        if not work_root.is_dir():
-            raise FileNotFoundError(
-                f"--resume-raw-staging requires an existing work root: {work_root}"
-            )
-        return
-    if work_root.exists():
-        if not overwrite:
-            raise FileExistsError(work_root)
-        shutil.rmtree(work_root)
-    work_root.mkdir(parents=True)
+        ),
+        mutually_exclusive_message=(
+            "--resume-raw-staging and --overwrite are mutually exclusive."
+        ),
+        missing_work_root_message=(
+            f"--resume-raw-staging requires an existing work root: {resolved_work}"
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1844,6 +1797,7 @@ def main(argv: list[str] | None = None) -> int:
     raw_root = work_root / "raw_staging"
     full_root = work_root / "full_h"
     delta_root = work_root / "h0_delta"
+    manifest_store = ManifestStore(work_root)
     manifest: dict[str, Any] = {
         "schema": SCHEMA,
         "created_unix": time.time(),
@@ -1864,7 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
         _validate_raw_staging_identity(work_root, raw_identity)
     else:
         _write_raw_staging_identity(work_root, raw_identity)
-        _write_json(work_root / "manifest.partial.json", manifest)
+        manifest_store.write_partial(manifest)
     for split, selected in split_cases.items():
         if not selected:
             continue
@@ -1924,7 +1878,7 @@ def main(argv: list[str] | None = None) -> int:
             "records": raw_rows,
             **stats,
         }
-        _write_json(work_root / "manifest.partial.json", manifest)
+        manifest_store.write_partial(manifest)
 
     manifest["completed_unix"] = time.time()
     manifest["full_h_root"] = str(full_root)
@@ -1932,7 +1886,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest["raw_staging_retained"] = bool(args.keep_raw_staging)
     if not args.keep_raw_staging:
         shutil.rmtree(raw_root)
-    _write_json(work_root / "manifest.json", manifest)
+    manifest_store.write_final(manifest)
     _heartbeat(work_root, stage="complete", manifest=str(work_root / "manifest.json"))
     print(json.dumps({"status": "complete", "manifest": str(work_root / "manifest.json")}), flush=True)
     return 0

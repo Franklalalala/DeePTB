@@ -22,20 +22,12 @@ manifest is treated as an uncommitted tail and removed.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 import pickle
-import shutil
-import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import ase.data
 import lmdb
 import numpy as np
 import torch
@@ -88,35 +80,37 @@ from dptb.data.dataset.lmdb_dataset import (
 )
 from dptb.utils.constants import Bohr2Ang
 
-if __package__:
-    from tools.materialize_nonsoc_p2_cache import (
-        MAP_SIZE,
-        SCHEMA as P2_CACHE_SCHEMA,
-        _load_module,
-        _open_read,
-        _open_write,
-        _sha256,
-        _write_json,
-    )
-else:  # pragma: no cover - exercised by the production CLI entrypoint
-    from materialize_nonsoc_p2_cache import (  # type: ignore
-        MAP_SIZE,
-        SCHEMA as P2_CACHE_SCHEMA,
-        _load_module,
-        _open_read,
-        _open_write,
-        _sha256,
-        _write_json,
-    )
+from dptb.data.materialization import (
+    BoundedEnvCache,
+    DatasetAuditor,
+    ManifestStore,
+    NONSOC_P2_CACHE_SCHEMA as P2_CACHE_SCHEMA,
+    ResumeJournal,
+    TransactionalLMDBWriter,
+    bytes_sha256 as _bytes_sha256,
+    drop_uncommitted_tail,
+    guard_work_root,
+    json_sha256 as _json_sha256,
+    load_module as _load_module,
+    open_read_env as _open_read,
+    sha256_file as _sha256,
+)
+from dptb.data.materialization.geometry import (
+    GEOMETRY_TOLERANCE_ANGSTROM,
+    reverse_edge_rows as _reverse_edge_rows,
+    structure_geometry_bohr as _structure_geometry_bohr,
+)
 
 
 SCHEMA = "deeptb.nonsoc_dual_prior_cache/v1"
 IDENTITY_SCHEMA = "deeptb.nonsoc_dual_prior_cache_identity/v1"
 AGGREGATE_P2_CACHE_SCHEMA = "deeptb.raw200_parallel_cache/v1"
-# Compact records and STRU cells are serialized through different decimal
-# paths.  Raw200 contains legitimate cell round-off just above 5e-5 Angstrom;
-# 1e-4 remains far below any physically meaningful geometry displacement.
-GEOMETRY_TOLERANCE_ANGSTROM = 1.0e-4
+# GEOMETRY_TOLERANCE_ANGSTROM is imported from
+# dptb.data.materialization.geometry (single source of truth for the
+# STRU/compact serialization tolerance; raw200 has legitimate cell round-off
+# just above 5e-5 A while 1e-4 stays far below any physical displacement).
+# Resume journal bound to this cache's schema; drives heartbeats.
+_JOURNAL = ResumeJournal(schema=SCHEMA)
 LEGACY_GEOMETRY_IDENTITY_UPGRADES = {
     # 7e67c343: periodic-image aware materializer with the original 5e-5 A
     # serialization tolerance.  The upgrade changes only that tolerance.
@@ -185,17 +179,6 @@ _P23_PROVENANCE_FIELDS = (
 )
 
 
-def _json_sha256(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _bytes_sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _require_fields(record: Mapping[str, Any], fields: Iterable[str], *, label: str) -> None:
     missing = [field for field in fields if field not in record]
     if missing:
@@ -209,35 +192,23 @@ def _guard_roots(
     overwrite: bool,
     resume: bool,
 ) -> None:
-    source_root = source_root.resolve()
-    work_root = work_root.resolve()
-    if (
-        source_root == work_root
-        or source_root in work_root.parents
-        or work_root in source_root.parents
-    ):
-        raise ValueError(
+    resolved_work = work_root.resolve()
+    guard_work_root(
+        source_root,
+        work_root,
+        overwrite=overwrite,
+        resume=resume,
+        disjoint_message=(
             "P2 cache root and dual-cache work root must be disjoint; neither "
             "may contain the other."
-        )
-    if overwrite and resume:
-        raise ValueError("--overwrite and --resume are mutually exclusive.")
-    if resume:
-        if not work_root.is_dir():
-            raise FileNotFoundError(f"--resume requires existing work root {work_root}.")
-        return
-    if work_root.exists():
-        if not overwrite:
-            raise FileExistsError(work_root)
-        shutil.rmtree(work_root)
-    work_root.mkdir(parents=True)
+        ),
+        mutually_exclusive_message="--overwrite and --resume are mutually exclusive.",
+        missing_work_root_message=f"--resume requires existing work root {resolved_work}.",
+    )
 
 
 def _heartbeat(work_root: Path, **payload: Any) -> None:
-    _write_json(
-        work_root / "heartbeat.json",
-        {"schema": SCHEMA, "updated_unix": time.time(), **payload},
-    )
+    _JOURNAL.heartbeat(work_root, **payload)
 
 
 def _source_case_map(dataset_root: Path) -> dict[str, Path]:
@@ -680,105 +651,8 @@ def _assert_source_p2_contract(
     )
 
 
-def _structure_geometry_bohr(
-    *,
-    record: Mapping[str, Any],
-    case_path: Path,
-    gate1: Any,
-    table_species: Mapping[str, Any],
-    tolerance_angstrom: float = GEOMETRY_TOLERANCE_ANGSTROM,
-) -> tuple[list[str], np.ndarray, np.ndarray, dict[str, Any]]:
-    parsed = gate1.parse_stru(case_path / "STRU")
-    structure = parsed.structure
-    symbols = [str(atom.species) for atom in structure.atoms]
-    numbers = np.asarray(
-        [ase.data.atomic_numbers[symbol] for symbol in symbols], dtype=np.int64
-    )
-    stored_numbers = np.asarray(record[AtomicDataDict.ATOMIC_NUMBERS_KEY]).reshape(-1)
-    if not np.array_equal(numbers, stored_numbers.astype(np.int64)):
-        raise ValueError(f"{case_path.name}: STRU atom order differs from compact record.")
-    missing_species = sorted(set(symbols) - set(table_species))
-    if missing_species:
-        raise KeyError(f"P23 table lacks structure species {missing_species}.")
-
-    positions_bohr = np.asarray(structure.cart_positions, dtype=np.float64)
-    cell_bohr = np.asarray(structure.cell_bohr, dtype=np.float64)
-    stored_positions = np.asarray(
-        record[AtomicDataDict.POSITIONS_KEY], dtype=np.float64
-    ).reshape(-1, 3)
-    stored_cell = np.asarray(record[AtomicDataDict.CELL_KEY], dtype=np.float64).reshape(3, 3)
-    if positions_bohr.shape != stored_positions.shape or cell_bohr.shape != (3, 3):
-        raise ValueError(f"{case_path.name}: STRU/compact geometry shapes differ.")
-    stru_positions_angstrom = positions_bohr * Bohr2Ang
-    stru_cell_angstrom = cell_bohr * Bohr2Ang
-    raw_position_error = float(
-        np.max(np.abs(stru_positions_angstrom - stored_positions), initial=0.0)
-    )
-    # ABACUS/ASE conversion may wrap an atom into another image of the same
-    # periodic cell.  Compare positions modulo lattice vectors instead of
-    # requiring the same Cartesian representative.  Non-periodic directions
-    # remain exact and therefore cannot be hidden by this normalization.
-    pbc = np.asarray(record[AtomicDataDict.PBC_KEY], dtype=bool).reshape(-1)
-    if pbc.size == 1:
-        pbc = np.repeat(pbc, 3)
-    if pbc.size != 3:
-        raise ValueError(f"{case_path.name}: compact PBC field is not length 1 or 3.")
-    try:
-        fractional_delta = (
-            stru_positions_angstrom - stored_positions
-        ) @ np.linalg.inv(stru_cell_angstrom)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"{case_path.name}: STRU cell is singular.") from exc
-    image_shift = np.zeros_like(fractional_delta)
-    image_shift[:, pbc] = np.rint(fractional_delta[:, pbc])
-    minimum_image_delta = (fractional_delta - image_shift) @ stru_cell_angstrom
-    position_error = float(
-        np.max(np.abs(minimum_image_delta), initial=0.0)
-    )
-    cell_error = float(
-        np.max(np.abs(cell_bohr * Bohr2Ang - stored_cell), initial=0.0)
-    )
-    if max(position_error, cell_error) > float(tolerance_angstrom):
-        raise ValueError(
-            f"{case_path.name}: compact geometry is not the STRU geometry in "
-            f"Angstrom (position error={position_error:.3e}, "
-            f"cell error={cell_error:.3e} Angstrom)."
-        )
-    return symbols, positions_bohr, cell_bohr, {
-        "compact_length_unit": "angstrom",
-        "assembler_length_unit": "bohr",
-        "bohr_to_angstrom": float(Bohr2Ang),
-        "max_position_identity_error_angstrom": position_error,
-        "max_raw_position_image_error_angstrom": raw_position_error,
-        "position_identity_semantics": "minimum_image_on_periodic_axes",
-        "max_cell_identity_error_angstrom": cell_error,
-        "stru_sha256": _sha256(case_path / "STRU"),
-    }
-
-
-def _reverse_edge_rows(edge_index: Any, edge_cell_shift: Any) -> np.ndarray:
-    edge = np.asarray(edge_index, dtype=np.int64)
-    shift_raw = np.asarray(edge_cell_shift, dtype=np.float64)
-    shift = np.rint(shift_raw).astype(np.int64)
-    if edge.ndim != 2 or edge.shape[0] != 2 or shift.shape != (edge.shape[1], 3):
-        raise ValueError("edge graph has invalid shape for gauge transformation.")
-    if float(np.max(np.abs(shift_raw - shift), initial=0.0)) > 1.0e-6:
-        raise ValueError("edge shifts are not integer-valued.")
-    lookup: dict[tuple[int, int, int, int, int], int] = {}
-    for row, ((i, j), cell_shift) in enumerate(zip(edge.T, shift)):
-        key = (int(i), int(j), *(int(value) for value in cell_shift))
-        if key in lookup:
-            raise ValueError(f"duplicate directed graph row {key}.")
-        lookup[key] = row
-    reverse = np.empty(edge.shape[1], dtype=np.int64)
-    for row, ((i, j), cell_shift) in enumerate(zip(edge.T, shift)):
-        key = (int(j), int(i), *(-cell_shift).tolist())
-        if key not in lookup:
-            raise ValueError(f"edge row {row} has no reverse row {key}.")
-        reverse[row] = lookup[key]
-    if not np.array_equal(reverse[reverse], np.arange(len(reverse))):
-        raise ValueError("reverse-edge map is not an involution.")
-    return reverse
+# _structure_geometry_bohr and _reverse_edge_rows are imported (as module-level
+# names) from dptb.data.materialization.geometry; see the import block above.
 
 
 def transform_vna3c_abacus_to_deeptb(
@@ -1308,17 +1182,7 @@ def _validated_prefix(
     expected_p23_source: str,
 ) -> int:
     with env.begin(write=True) as txn:
-        entries = int(txn.stat()["entries"])
-        if entries == len(rows) + 1:
-            tail_key = len(rows).to_bytes(length=4, byteorder="big")
-            if not txn.delete(tail_key):
-                raise KeyError("Cannot resume: failed to remove uncommitted LMDB tail.")
-            entries -= 1
-        if entries != len(rows):
-            raise ValueError(
-                f"Cannot resume: output has {entries} rows but partial manifest "
-                f"commits {len(rows)}."
-            )
+        drop_uncommitted_tail(txn, committed_rows=len(rows))
     for index, row in enumerate(rows):
         if index >= len(cases) or row.get("case_id") != cases[index]:
             raise ValueError("Cannot resume: committed case order changed.")
@@ -1348,31 +1212,23 @@ def _strict_audit_output(
     p23_source: str,
     work_root: Path,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for split, contract in contracts.items():
-        split_root = full_h_root / split
-        split_result: dict[str, int] = {}
-        for kind, source in (("p2", p2_source), ("p23", p23_source)):
-            dataset, _ = _build_context_dataset(str(input_json), str(split_root))
-            try:
-                if len(dataset) != int(contract["entries"]):
-                    raise ValueError(f"Output audit {split}: dataset length mismatch.")
-                _configure_strict_dataset(dataset, kind=kind, source=source)
-                for index in range(len(dataset)):
-                    dataset.get(index)
-                    _heartbeat(
-                        work_root,
-                        stage="strict_audit",
-                        split=split,
-                        prior_kind=kind,
-                        completed=index + 1,
-                        total=len(dataset),
-                    )
-                split_result[kind] = len(dataset)
-            finally:
-                _close_dataset(dataset)
-        result[split] = split_result
-    return result
+    # The build/configure/close/heartbeat callables are resolved from this
+    # module's globals at call time so tests may monkeypatch them.
+    auditor = DatasetAuditor(
+        build_context_dataset=_build_context_dataset,
+        configure_strict_dataset=_configure_strict_dataset,
+        close_dataset=_close_dataset,
+        heartbeat=_heartbeat,
+    )
+    return auditor.audit(
+        input_json=input_json,
+        split_roots={split: full_h_root / split for split in contracts},
+        prior_sources=(("p2", p2_source), ("p23", p23_source)),
+        expected_entries={
+            split: int(contract["entries"]) for split, contract in contracts.items()
+        },
+        work_root=work_root,
+    )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1460,7 +1316,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_root=dataset_root,
         contracts=contracts,
     )
-    partial_path = work_root / "manifest.partial.json"
+    manifest_store = ManifestStore(work_root)
+    partial_path = manifest_store.partial_path
     if args.resume:
         if not partial_path.is_file():
             raise FileNotFoundError("Cannot resume without manifest.partial.json.")
@@ -1484,7 +1341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             manifest.setdefault("identity_migrations", []).append(identity_migration)
             manifest["identity"] = identity
-            _write_json(partial_path, manifest)
+            manifest_store.write_partial(manifest)
         if manifest.get("complete") is True:
             raise ValueError("Dual cache is already complete; refusing a duplicate run.")
     else:
@@ -1515,7 +1372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for split, contract in contracts.items()
             },
         }
-        _write_json(partial_path, manifest)
+        manifest_store.write_partial(manifest)
 
     gate1 = _load_module(gate1_script, "deeptb_dual_prior_gate1")
     assembler = P23VNAFactorAssembler(
@@ -1552,11 +1409,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"Source dataset {split!r} row {global_index} is bound to "
                     "a different physical shard/local index than the paths contract."
                 )
-        source_envs = {
-            Path(shard["lmdb"]).resolve(): _open_read(Path(shard["lmdb"]))
-            for shard in contract["source_shards"]
-        }
-        output_env = _open_write(output_lmdb)
+        # Source rows are visited in shard order, so a small bounded LRU cache
+        # keeps at most a handful of read environments (file descriptors) open
+        # at once instead of one per source shard for the whole split.
+        source_reader = BoundedEnvCache(opener=_open_read)
+        writer = TransactionalLMDBWriter(output_lmdb)
+        output_env = writer.env
         split_rows = manifest["splits"][split]["records"]
         start = _validated_prefix(
             env=output_env,
@@ -1573,7 +1431,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise RuntimeError("Physical source-row/case contract changed in memory.")
                 source_key = int(source_local_index).to_bytes(length=4, byteorder="big")
                 key = index.to_bytes(length=4, byteorder="big")
-                with source_envs[Path(source_path).resolve()].begin() as txn:
+                source_env = source_reader.get(Path(source_path).resolve())
+                with source_env.begin() as txn:
                     source_payload = txn.get(source_key)
                 if source_payload is None:
                     raise KeyError(f"Missing P2 source row {split}[{index}].")
@@ -1610,13 +1469,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_payload = pickle.dumps(
                     dual_record, protocol=pickle.HIGHEST_PROTOCOL
                 )
-                with output_env.begin(write=True) as txn:
-                    if txn.get(key) is not None:
-                        raise ValueError(
-                            f"Output row {split}[{index}] already exists outside "
-                            "the validated committed prefix."
-                        )
-                    txn.put(key, output_payload)
+                writer.put_new(
+                    key,
+                    output_payload,
+                    exists_message=(
+                        f"Output row {split}[{index}] already exists outside "
+                        "the validated committed prefix."
+                    ),
+                )
                 row = {
                     "index": index,
                     "case_id": case_id,
@@ -1642,7 +1502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 split_rows.append(row)
                 completed_global += 1
                 manifest["updated_unix"] = time.time()
-                _write_json(partial_path, manifest)
+                manifest_store.write_partial(manifest)
                 _heartbeat(
                     work_root,
                     stage="materialize",
@@ -1668,9 +1528,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
         finally:
-            for env in source_envs.values():
-                env.close()
-            output_env.close()
+            source_reader.close_all()
+            writer.close()
             _close_dataset(dataset)
         output_split.mkdir(parents=True, exist_ok=True)
         (output_split / "data.0000.paths.txt").write_text(
@@ -1681,7 +1540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest["splits"][split]["source_paths_sha256"] = contract[
             "source_paths_sha256"
         ]
-        _write_json(partial_path, manifest)
+        manifest_store.write_partial(manifest)
 
     audit = _strict_audit_output(
         input_json=input_json,
@@ -1696,9 +1555,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest["completed_unix"] = time.time()
     manifest["updated_unix"] = manifest["completed_unix"]
     manifest["complete"] = True
-    _write_json(partial_path, manifest)
-    final_path = work_root / "manifest.json"
-    _write_json(final_path, manifest)
+    manifest_store.write_partial(manifest)
+    final_path = manifest_store.final_path
+    manifest_store.write_final(manifest)
     _heartbeat(
         work_root,
         stage="complete",
