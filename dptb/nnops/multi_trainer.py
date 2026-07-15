@@ -28,6 +28,11 @@ from dptb.data import _keys
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nnops.trainer import Trainer
 from dptb.nnops.ddp_utils import merge_restart_train_options
+from dptb.nnops.metric_pack import (
+    MetricPack,
+    DynamicBatchStat,
+    ExpertDisplayMetric,
+)
 from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
@@ -2100,11 +2105,12 @@ class MultiTrainer(Trainer):
                 f"{prefix}_hopping_loss": compatible_state[f"{prefix}_hopping_loss"],
             }
 
-        onsite_cnt = pack[self._P_ACTIVE_NODES_SUM].to(dtype=self.dtype).clamp_min(1.0)
-        hopping_cnt = pack[self._P_ACTIVE_EDGES_SUM].to(dtype=self.dtype).clamp_min(1.0)
+        mp = MetricPack.from_tensor(pack)
+        onsite_cnt = mp.active_nodes_sum.to(dtype=self.dtype).clamp_min(1.0)
+        hopping_cnt = mp.active_edges_sum.to(dtype=self.dtype).clamp_min(1.0)
         return {
-            f"{prefix}_onsite_loss": (pack[self._P_ONSITE_WEIGHTED_SUM] / onsite_cnt).detach(),
-            f"{prefix}_hopping_loss": (pack[self._P_HOPPING_WEIGHTED_SUM] / hopping_cnt).detach(),
+            f"{prefix}_onsite_loss": (mp.onsite_weighted_sum / onsite_cnt).detach(),
+            f"{prefix}_hopping_loss": (mp.hopping_weighted_sum / hopping_cnt).detach(),
         }
 
     # ---------------------------------------------------------------------
@@ -2466,8 +2472,9 @@ class MultiTrainer(Trainer):
         if not Trainer._supports_endpoint_triplet(criterion):
             return None
 
-        onsite_cnt = pack[self._P_ONSITE_CNT_SUM]
-        hopping_cnt = pack[self._P_HOPPING_CNT_SUM]
+        mp = MetricPack.from_tensor(pack)
+        onsite_cnt = mp.onsite_cnt_sum
+        hopping_cnt = mp.hopping_cnt_sum
         loss_module = self._resolve_loss_module(criterion)
         reduce_from_stats = getattr(loss_module, "compatible_loss_from_stats", None)
         if global_step is None:
@@ -2479,14 +2486,14 @@ class MultiTrainer(Trainer):
         if float(onsite_cnt.item()) > 0.0 or float(hopping_cnt.item()) > 0.0:
             if callable(reduce_from_stats):
                 z_loss = None
-                if float(pack[self._P_Z_CNT].item()) > 0.0:
-                    z_loss = pack[self._P_Z_SUM] / pack[self._P_Z_CNT].clamp_min(1.0)
+                if float(mp.z_cnt.item()) > 0.0:
+                    z_loss = mp.z_sum / mp.z_cnt.clamp_min(1.0)
                 total, _onsite_loss, _hopping_loss = reduce_from_stats(
-                    onsite_l1_sum=pack[self._P_ONSITE_L1_SUM],
-                    onsite_mse_sum=pack[self._P_ONSITE_MSE_SUM],
+                    onsite_l1_sum=mp.onsite_l1_sum,
+                    onsite_mse_sum=mp.onsite_mse_sum,
                     onsite_count=onsite_cnt,
-                    hopping_l1_sum=pack[self._P_HOPPING_L1_SUM],
-                    hopping_mse_sum=pack[self._P_HOPPING_MSE_SUM],
+                    hopping_l1_sum=mp.hopping_l1_sum,
+                    hopping_mse_sum=mp.hopping_mse_sum,
                     hopping_count=hopping_cnt,
                     z_loss=z_loss,
                     global_step=global_step,
@@ -2497,20 +2504,20 @@ class MultiTrainer(Trainer):
                     f"{prefix}_hopping_loss": _hopping_loss.detach(),
                 }
 
-            onsite_l1_mean = _safe_mean(pack[self._P_ONSITE_L1_SUM], onsite_cnt)
-            onsite_mse_mean = _safe_mean(pack[self._P_ONSITE_MSE_SUM], onsite_cnt)
-            hopping_l1_mean = _safe_mean(pack[self._P_HOPPING_L1_SUM], hopping_cnt)
-            hopping_mse_mean = _safe_mean(pack[self._P_HOPPING_MSE_SUM], hopping_cnt)
+            onsite_l1_mean = _safe_mean(mp.onsite_l1_sum, onsite_cnt)
+            onsite_mse_mean = _safe_mean(mp.onsite_mse_sum, onsite_cnt)
+            hopping_l1_mean = _safe_mean(mp.hopping_l1_sum, hopping_cnt)
+            hopping_mse_mean = _safe_mean(mp.hopping_mse_sum, hopping_cnt)
 
             onsite_loss = 0.5 * (onsite_l1_mean + torch.sqrt(onsite_mse_mean))
             hopping_loss = 0.5 * (hopping_l1_mean + torch.sqrt(hopping_mse_mean))
         else:
-            active_nodes = pack[self._P_ACTIVE_NODES_SUM]
-            active_edges = pack[self._P_ACTIVE_EDGES_SUM]
+            active_nodes = mp.active_nodes_sum
+            active_edges = mp.active_edges_sum
             if float(active_nodes.item()) <= 0.0 and float(active_edges.item()) <= 0.0:
                 return None
-            onsite_loss = _safe_mean(pack[self._P_ONSITE_WEIGHTED_SUM], active_nodes)
-            hopping_loss = _safe_mean(pack[self._P_HOPPING_WEIGHTED_SUM], active_edges)
+            onsite_loss = _safe_mean(mp.onsite_weighted_sum, active_nodes)
+            hopping_loss = _safe_mean(mp.hopping_weighted_sum, active_edges)
 
         onsite_boost = bool(getattr(loss_module, "onsite_boost", False))
         onsite_boost_w = self._maybe_call_or_value(getattr(loss_module, "_current_onsite_weight", None), default=1.0)
@@ -2521,8 +2528,8 @@ class MultiTrainer(Trainer):
         else:
             total = 0.5 * (onsite_loss + hopping_loss)
 
-        if z_coef > 0.0 and float(pack[self._P_Z_CNT].item()) > 0.0:
-            total = total + z_coef * (pack[self._P_Z_SUM] / pack[self._P_Z_CNT].clamp_min(1.0))
+        if z_coef > 0.0 and float(mp.z_cnt.item()) > 0.0:
+            total = total + z_coef * (mp.z_sum / mp.z_cnt.clamp_min(1.0))
 
         return {
             f"{prefix}_loss": total.detach(),
@@ -2553,8 +2560,8 @@ class MultiTrainer(Trainer):
 
     def _reset_display_window_buffers(self):
         dev = self._device_obj()
-        self._display_window_pack_local = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=dev)
-        self._display_window_dynamic_batch_pack_local = torch.zeros((self._DB_PACK_LEN,), dtype=self.dtype, device=dev)
+        self._display_window_pack_local = torch.zeros((MetricPack.LENGTH,), dtype=self.dtype, device=dev)
+        self._display_window_dynamic_batch_pack_local = torch.zeros((DynamicBatchStat.LENGTH,), dtype=self.dtype, device=dev)
         self._display_window_expert_onsite_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_hopping_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_nodes_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
@@ -2564,54 +2571,57 @@ class MultiTrainer(Trainer):
         self._reset_cuda_memory_peak()
 
     def _has_pending_display_window(self) -> bool:
-        if float(self._display_window_pack_local[self._P_STEP_COUNT].item()) > 0.0:
+        local_pack = MetricPack.from_tensor(self._display_window_pack_local)
+        if float(local_pack.step_count.item()) > 0.0:
             return True
+        local_dynamic = DynamicBatchStat.from_tensor(self._display_window_dynamic_batch_pack_local)
         return (
             self.distributed_expert
-            and float(self._display_window_dynamic_batch_pack_local[self._DB_OOM_SKIPPED_COUNT].item()) > 0.0
+            and float(local_dynamic.oom_skipped_count.item()) > 0.0
         )
 
     def _make_step_pack(self, payload: Dict[str, Any]) -> torch.Tensor:
-        vec = torch.zeros((self._PACK_LEN,), dtype=self.dtype, device=self.device)
-
-        vec[self._P_LOSS_OPT_SUM] = self._as_scalar_tensor(payload.get("loss_detached", 0.0))
-        vec[self._P_ONSITE_WEIGHTED_SUM] = self._as_scalar_tensor(payload.get("onsite_weighted_sum", 0.0))
-        vec[self._P_HOPPING_WEIGHTED_SUM] = self._as_scalar_tensor(payload.get("hopping_weighted_sum", 0.0))
-        vec[self._P_ACTIVE_NODES_SUM] = self._as_scalar_tensor(payload.get("active_nodes", 0.0))
-        vec[self._P_ACTIVE_EDGES_SUM] = self._as_scalar_tensor(payload.get("active_edges", 0.0))
-
-        vec[self._P_ONSITE_L1_SUM] = self._as_scalar_tensor(payload.get("onsite_l1_sum", 0.0))
-        vec[self._P_ONSITE_MSE_SUM] = self._as_scalar_tensor(payload.get("onsite_mse_sum", 0.0))
-        vec[self._P_ONSITE_CNT_SUM] = self._as_scalar_tensor(payload.get("onsite_cnt", 0.0))
-        vec[self._P_HOPPING_L1_SUM] = self._as_scalar_tensor(payload.get("hopping_l1_sum", 0.0))
-        vec[self._P_HOPPING_MSE_SUM] = self._as_scalar_tensor(payload.get("hopping_mse_sum", 0.0))
-        vec[self._P_HOPPING_CNT_SUM] = self._as_scalar_tensor(payload.get("hopping_cnt", 0.0))
+        # Build the typed pack with named fields; ``to_tensor`` reproduces the
+        # exact legacy ``_P_*`` slot layout on the wire (byte-identical).
+        pack = MetricPack(
+            loss_opt_sum=self._as_scalar_tensor(payload.get("loss_detached", 0.0)),
+            onsite_weighted_sum=self._as_scalar_tensor(payload.get("onsite_weighted_sum", 0.0)),
+            hopping_weighted_sum=self._as_scalar_tensor(payload.get("hopping_weighted_sum", 0.0)),
+            active_nodes_sum=self._as_scalar_tensor(payload.get("active_nodes", 0.0)),
+            active_edges_sum=self._as_scalar_tensor(payload.get("active_edges", 0.0)),
+            onsite_l1_sum=self._as_scalar_tensor(payload.get("onsite_l1_sum", 0.0)),
+            onsite_mse_sum=self._as_scalar_tensor(payload.get("onsite_mse_sum", 0.0)),
+            onsite_cnt_sum=self._as_scalar_tensor(payload.get("onsite_cnt", 0.0)),
+            hopping_l1_sum=self._as_scalar_tensor(payload.get("hopping_l1_sum", 0.0)),
+            hopping_mse_sum=self._as_scalar_tensor(payload.get("hopping_mse_sum", 0.0)),
+            hopping_cnt_sum=self._as_scalar_tensor(payload.get("hopping_cnt", 0.0)),
+            grad_norm_sum=self._as_scalar_tensor(payload.get("grad_norm", 0.0)),
+            step_count=1.0,
+        )
 
         z_vals = [self._as_scalar_tensor(z, default=0.0) for z in payload.get("z_values", []) if z is not None]
         if z_vals:
-            vec[self._P_Z_SUM] = torch.stack(z_vals).sum()
-            vec[self._P_Z_CNT] = float(len(z_vals))
+            pack.z_sum = torch.stack(z_vals).sum()
+            pack.z_cnt = float(len(z_vals))
 
         cv_vals = [self._as_scalar_tensor(v, default=0.0) for v in payload.get("load_cv_values", []) if v is not None]
         if cv_vals:
-            vec[self._P_CV_SUM] = torch.stack(cv_vals).sum()
-            vec[self._P_CV_CNT] = float(len(cv_vals))
+            pack.cv_sum = torch.stack(cv_vals).sum()
+            pack.cv_cnt = float(len(cv_vals))
 
-        vec[self._P_GRAD_NORM_SUM] = self._as_scalar_tensor(payload.get("grad_norm", 0.0))
-        vec[self._P_STEP_COUNT] = 1.0
-        return vec
+        return pack.to_tensor(dtype=self.dtype, device=self.device)
 
     def _make_dynamic_batch_pack(self, dynamic_batch_state: Optional[Dict[str, Any]]) -> torch.Tensor:
-        vec = torch.zeros((self._DB_PACK_LEN,), dtype=self.dtype, device=self.device)
         if not dynamic_batch_state:
-            return vec
-        vec[self._DB_NUM_GRAPHS_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_num_graphs", 0.0))
-        vec[self._DB_COST_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_cost", 0.0))
-        vec[self._DB_NUM_NODES_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_num_nodes", 0.0))
-        vec[self._DB_NUM_EDGES_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_num_edges", 0.0))
-        vec[self._DB_MAX_ITEM_COST_SUM] = self._as_scalar_tensor(dynamic_batch_state.get("batch_max_item_cost", 0.0))
-        vec[self._DB_STEP_COUNT] = 1.0
-        return vec
+            return DynamicBatchStat().to_tensor(dtype=self.dtype, device=self.device)
+        return DynamicBatchStat(
+            num_graphs_sum=self._as_scalar_tensor(dynamic_batch_state.get("batch_num_graphs", 0.0)),
+            cost_sum=self._as_scalar_tensor(dynamic_batch_state.get("batch_cost", 0.0)),
+            num_nodes_sum=self._as_scalar_tensor(dynamic_batch_state.get("batch_num_nodes", 0.0)),
+            num_edges_sum=self._as_scalar_tensor(dynamic_batch_state.get("batch_num_edges", 0.0)),
+            max_item_cost_sum=self._as_scalar_tensor(dynamic_batch_state.get("batch_max_item_cost", 0.0)),
+            step_count=1.0,
+        ).to_tensor(dtype=self.dtype, device=self.device)
 
     def _update_display_window_local(
         self,
@@ -2631,16 +2641,19 @@ class MultiTrainer(Trainer):
         return (it == 1) or (it % self.display_sync_freq == 0)
 
     def _gather_display_window_expert_metrics(self) -> List[torch.Tensor]:
-        local_steps = max(float(self._display_window_pack_local[self._P_STEP_COUNT].item()), 1.0)
+        local_pack = MetricPack.from_tensor(self._display_window_pack_local)
+        local_steps = max(float(local_pack.step_count.item()), 1.0)
 
-        local_metric = torch.stack([
-            self._display_window_expert_onsite_sum_local / local_steps,
-            self._display_window_expert_hopping_sum_local / local_steps,
-            self._display_window_pack_local[self._P_GRAD_NORM_SUM] / local_steps,
-            torch.tensor(float(self._display_window_last_lr_local), dtype=self.dtype, device=self.device),
-            self._display_window_expert_active_nodes_sum_local / local_steps,
-            self._display_window_expert_active_edges_sum_local / local_steps,
-        ])
+        # ExpertDisplayMetric.to_tensor reproduces the bare 6-slot gather layout
+        # exactly (slot 2 == grad_norm is written but never read downstream).
+        local_metric = ExpertDisplayMetric(
+            expert_onsite=self._display_window_expert_onsite_sum_local / local_steps,
+            expert_hopping=self._display_window_expert_hopping_sum_local / local_steps,
+            grad_norm=local_pack.grad_norm_sum / local_steps,
+            lr=torch.tensor(float(self._display_window_last_lr_local), dtype=self.dtype, device=self.device),
+            active_nodes=self._display_window_expert_active_nodes_sum_local / local_steps,
+            active_edges=self._display_window_expert_active_edges_sum_local / local_steps,
+        ).to_tensor(dtype=self.dtype, device=self.device)
 
         if not self._dist_ready():
             return [local_metric]
@@ -2661,9 +2674,12 @@ class MultiTrainer(Trainer):
             self._all_reduce_(reduced_dynamic_pack, name="dist/all_reduce(display_window_dynamic_batch_packed)")
             gathered = self._gather_display_window_expert_metrics()
 
+        reduced_mp = MetricPack.from_tensor(reduced_pack)
+        reduced_db = DynamicBatchStat.from_tensor(reduced_dynamic_pack)
+
         full_loss_steps = self.num_experts if self._dist_ready() else 1
-        raw_total_steps = float(reduced_pack[self._P_STEP_COUNT].item()) / full_loss_steps
-        dynamic_batch_oom_skips = int(round(float(reduced_dynamic_pack[self._DB_OOM_SKIPPED_COUNT].item())))
+        raw_total_steps = float(reduced_mp.step_count.item()) / full_loss_steps
+        dynamic_batch_oom_skips = int(round(float(reduced_db.oom_skipped_count.item())))
         if raw_total_steps <= 0.0:
             if dynamic_batch_oom_skips > 0:
                 log.warning(
@@ -2674,7 +2690,7 @@ class MultiTrainer(Trainer):
             return None
         total_steps = max(raw_total_steps, 1.0)
 
-        train_loss_opt_mean = reduced_pack[self._P_LOSS_OPT_SUM] / total_steps
+        train_loss_opt_mean = reduced_mp.loss_opt_sum / total_steps
         compatible_train_state = self._compute_compatible_state_from_pack(
             reduced_pack,
             self.train_lossfunc,
@@ -2687,9 +2703,11 @@ class MultiTrainer(Trainer):
             else train_loss_opt_mean
         )
 
-        total_grad_norm_mean = reduced_pack[self._P_GRAD_NORM_SUM] / reduced_pack[self._P_STEP_COUNT].clamp_min(1.0)
+        total_grad_norm_mean = reduced_mp.grad_norm_sum / reduced_mp.step_count.clamp_min(1.0)
 
-        avg_lr = sum(float(vec[3].item()) for vec in gathered) / max(len(gathered), 1)
+        avg_lr = sum(
+            float(ExpertDisplayMetric.from_tensor(vec).lr.item()) for vec in gathered
+        ) / max(len(gathered), 1)
 
         state = {
             'field': 'iteration',
@@ -2719,27 +2737,27 @@ class MultiTrainer(Trainer):
             if not vecs:
                 continue
             stacked = torch.stack(vecs)
-            mean_vec = stacked.mean(dim=0)
+            mean_metric = ExpertDisplayMetric.from_tensor(stacked.mean(dim=0))
             if Trainer._supports_endpoint_triplet(self.train_lossfunc):
-                state[f"expert_{expert_idx}_onsite"] = float(mean_vec[0].item())
-                state[f"expert_{expert_idx}_hopping"] = float(mean_vec[1].item())
-            state[f"expert_{expert_idx}_lr"] = float(mean_vec[3].item())
-            state[f"expert_{expert_idx}_active_nodes"] = float(mean_vec[4].item())
-            state[f"expert_{expert_idx}_active_edges"] = float(mean_vec[5].item())
+                state[f"expert_{expert_idx}_onsite"] = float(mean_metric.expert_onsite.item())
+                state[f"expert_{expert_idx}_hopping"] = float(mean_metric.expert_hopping.item())
+            state[f"expert_{expert_idx}_lr"] = float(mean_metric.lr.item())
+            state[f"expert_{expert_idx}_active_nodes"] = float(mean_metric.active_nodes.item())
+            state[f"expert_{expert_idx}_active_edges"] = float(mean_metric.active_edges.item())
 
-        if float(reduced_pack[self._P_CV_CNT].item()) > 0.0:
-            state["expert_load_cv"] = float((reduced_pack[self._P_CV_SUM] / reduced_pack[self._P_CV_CNT]).item())
-        if float(reduced_pack[self._P_Z_CNT].item()) > 0.0:
-            state["mean_max_prob"] = float((reduced_pack[self._P_Z_SUM] / reduced_pack[self._P_Z_CNT]).item())
+        if float(reduced_mp.cv_cnt.item()) > 0.0:
+            state["expert_load_cv"] = float((reduced_mp.cv_sum / reduced_mp.cv_cnt).item())
+        if float(reduced_mp.z_cnt.item()) > 0.0:
+            state["mean_max_prob"] = float((reduced_mp.z_sum / reduced_mp.z_cnt).item())
 
-        dynamic_batch_steps = float(reduced_dynamic_pack[self._DB_STEP_COUNT].item())
+        dynamic_batch_steps = float(reduced_db.step_count.item())
         if dynamic_batch_steps > 0.0:
-            denom = reduced_dynamic_pack[self._DB_STEP_COUNT].clamp_min(1.0)
-            state["batch_num_graphs"] = float((reduced_dynamic_pack[self._DB_NUM_GRAPHS_SUM] / denom).item())
-            state["batch_cost"] = float((reduced_dynamic_pack[self._DB_COST_SUM] / denom).item())
-            state["batch_num_nodes"] = float((reduced_dynamic_pack[self._DB_NUM_NODES_SUM] / denom).item())
-            state["batch_num_edges"] = float((reduced_dynamic_pack[self._DB_NUM_EDGES_SUM] / denom).item())
-            state["batch_max_item_cost"] = float((reduced_dynamic_pack[self._DB_MAX_ITEM_COST_SUM] / denom).item())
+            denom = reduced_db.step_count.clamp_min(1.0)
+            state["batch_num_graphs"] = float((reduced_db.num_graphs_sum / denom).item())
+            state["batch_cost"] = float((reduced_db.cost_sum / denom).item())
+            state["batch_num_nodes"] = float((reduced_db.num_nodes_sum / denom).item())
+            state["batch_num_edges"] = float((reduced_db.num_edges_sum / denom).item())
+            state["batch_max_item_cost"] = float((reduced_db.max_item_cost_sum / denom).item())
         if dynamic_batch_oom_skips > 0:
             state["dynamic_batch_oom_skipped_iters"] = dynamic_batch_oom_skips
 
@@ -3204,8 +3222,9 @@ class MultiTrainer(Trainer):
             int(getattr(self, "dynamic_batch_oom_skipped_since_display", 0)) + 1
         )
         pack = getattr(self, "_display_window_dynamic_batch_pack_local", None)
-        if torch.is_tensor(pack) and pack.numel() > self._DB_OOM_SKIPPED_COUNT:
-            pack[self._DB_OOM_SKIPPED_COUNT] += 1.0
+        oom_slot = DynamicBatchStat.index("oom_skipped_count")
+        if torch.is_tensor(pack) and pack.numel() > oom_slot:
+            pack[oom_slot] += 1.0
 
     def _flush_display_window_after_oom_skip_if_needed(self, where: str):
         if not self.distributed_expert:
@@ -3380,7 +3399,7 @@ class MultiTrainer(Trainer):
                 global_onsite = global_onsite_sum / max(total_active_nodes, 1)
                 global_hopping = global_hopping_sum / max(total_active_edges, 1)
 
-                local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
+                local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
                 for payload in reduce_payloads:
                     local_pack = local_pack + self._make_step_pack(payload)
 
@@ -3743,7 +3762,7 @@ class MultiTrainer(Trainer):
                         with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
                             loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
                         if loss_i is None:
-                            loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
+                            loss_i = MetricPack.from_tensor(reduced_pack).loss_opt_sum.detach() / max(self.world_size, 1)
 
                         self._accumulate_metric_state(
                             validation_metric_sums,
@@ -3758,7 +3777,7 @@ class MultiTrainer(Trainer):
                     if flow_euler_validation:
                         loss_i = None
                         for num_steps in self.flow_cfm.validation_ode_steps:
-                            local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
+                            local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
                             for expert_idx, range_dis in enumerate(self.distance_ranges):
                                 payload = self._build_validation_euler_payload(
                                     batch_dict=batch_dict,
@@ -3787,7 +3806,7 @@ class MultiTrainer(Trainer):
                             loss_i = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
                     elif self.endpoint_loss_mode == "reduce":
                         payloads = []
-                        local_pack = torch.zeros(self._PACK_LEN, device=self.device, dtype=self.dtype)
+                        local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
                         for expert_idx, range_dis in enumerate(self.distance_ranges):
                             res = self._run_one_expert_loss(
                                 batch_dict=batch_dict,
@@ -3815,9 +3834,8 @@ class MultiTrainer(Trainer):
 
                         if loss_i is None:
                             if bool(getattr(getattr(self, "flow_cfm", None), "enabled", False)):
-                                loss_i = local_pack[self._P_LOSS_OPT_SUM].detach() / local_pack[
-                                    self._P_STEP_COUNT
-                                ].clamp_min(1.0)
+                                local_mp = MetricPack.from_tensor(local_pack)
+                                loss_i = local_mp.loss_opt_sum.detach() / local_mp.step_count.clamp_min(1.0)
                                 self._accumulate_metric_state(
                                     validation_metric_sums,
                                     self._pack_component_state(
