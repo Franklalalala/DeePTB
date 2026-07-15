@@ -815,3 +815,30 @@ def test_warn_deprecated_false_emits_no_warnings():
         )
     assert out["huckel_k"] == pytest.approx(9.0)
     assert out["missing_h0_policy"] == "error"
+
+
+def test_deprecated_train_option_keys_dropped_with_warning():
+    # Deprecated train_options keys are dropped during canonicalization (with a
+    # FutureWarning) so a config still carrying them normalizes cleanly instead
+    # of tripping strict argcheck. The DDP loader shares the same tuple.
+    from dptb.configuration import DEPRECATED_TRAIN_OPTION_KEYS
+    from dptb.nnops.ddp_utils import DEPRECATED_TRAIN_OPTION_KEYS as _ddp_keys
+
+    assert _ddp_keys is DEPRECATED_TRAIN_OPTION_KEYS  # single source of truth
+
+    cfg = {"train_options": {
+        "num_epoch": 1,
+        "shared_scheduler_metric": True,
+        "independent_expert_scheduler": False,
+        "distributed_global_reduce_every": 1,
+    }}
+    with pytest.warns(FutureWarning):
+        out = canonicalize_training_config(cfg)
+    for k in DEPRECATED_TRAIN_OPTION_KEYS:
+        assert k not in out["train_options"]
+    # warn_deprecated=False stays silent but still drops them
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        out2 = canonicalize_training_config(cfg, warn_deprecated=False)
+    assert "independent_expert_scheduler" not in out2["train_options"]

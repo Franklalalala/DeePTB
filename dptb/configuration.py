@@ -895,6 +895,16 @@ def _flatten_train_option_groups(train: MutableMapping[str, Any]) -> None:
             train[key] = value
 
 
+# Deprecated train_options keys dropped during canonicalization. The DDP loader
+# (dptb.nnops.ddp_utils) imports this same tuple, so there is a single source of
+# truth for which keys are stripped and one place that records their removal.
+DEPRECATED_TRAIN_OPTION_KEYS = (
+    "shared_scheduler_metric",
+    "independent_expert_scheduler",
+    "distributed_global_reduce_every",
+)
+
+
 def canonicalize_training_config(
     data: Mapping[str, Any],
     *,
@@ -912,6 +922,19 @@ def canonicalize_training_config(
         # physical_prior.flow_options block is canonicalized by the flow path
         # below exactly like a top-level flow_options block.
         _flatten_train_option_groups(train)
+        # Drop deprecated train_options keys (the DDP loader's strip shares this
+        # same tuple) with a FutureWarning, so a config still carrying them
+        # canonicalizes cleanly instead of tripping strict argcheck later.
+        for _dep_key in DEPRECATED_TRAIN_OPTION_KEYS:
+            if _dep_key in train:
+                train.pop(_dep_key, None)
+                if warn_deprecated:
+                    warnings.warn(
+                        f"train_options.{_dep_key} is deprecated and ignored "
+                        f"(scheduled for removal in 2.3).",
+                        FutureWarning,
+                        stacklevel=2,
+                    )
         train_changes: List[_AliasHit] = []
         _apply_alias_registry(train, _TRAIN_ENDPOINT_REGISTRY, changes=train_changes)
         if "flow_options" in train:
@@ -936,6 +959,7 @@ def canonicalize_training_config(
 
 
 __all__ = [
+    "DEPRECATED_TRAIN_OPTION_KEYS",
     "canonicalize_embedding_options",
     "canonicalize_flow_options",
     "canonicalize_prediction_options",

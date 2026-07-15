@@ -111,8 +111,6 @@ class PriorSpec:
     bundle_fingerprint_key: str
     allowed_sample_schemas: tuple[str, ...]
     bundle_dependency_fields: tuple[str, ...] = ()
-    # Full-H reconstruction semantics implied by conditioning on this prior.
-    reconstruction_mode: str = "prior_residual"
 
     @property
     def label(self) -> str:

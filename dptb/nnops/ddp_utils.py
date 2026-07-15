@@ -14,11 +14,9 @@ from dptb.configuration import canonicalize_training_config
 
 log = logging.getLogger(__name__)
 
-DEPRECATED_TRAIN_OPTION_KEYS = (
-    "shared_scheduler_metric",
-    "independent_expert_scheduler",
-    "distributed_global_reduce_every",
-)
+# Single source of truth lives in dptb.configuration (also applied there during
+# config canonicalization); re-exported here for the DDP loader's own strip.
+from dptb.configuration import DEPRECATED_TRAIN_OPTION_KEYS
 
 RESTART_LOCKED_TRAIN_OPTION_KEYS = (
     "optimizer",
