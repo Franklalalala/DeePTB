@@ -119,7 +119,11 @@ def test_builds_unique_complete_eight_arm_matrix(tmp_path: Path) -> None:
     assert manifest["iteration_contract"]["formal_eval_iter"] == 50_000
     assert manifest["iteration_contract"]["scheduler_total_steps"] == 50_000
     assert manifest["iteration_contract"]["scheduled_data_steps"] == 50_040
+    assert manifest["iteration_contract"]["save_freq"] == 1000
+    assert manifest["iteration_contract"]["validation_freq"] == 1000
     assert manifest["iteration_contract"]["validation_epoch_freq"] == 0
+    assert manifest["iteration_contract"]["display_freq"] == 1000
+    assert manifest["iteration_contract"]["expected_validation_points"] == 50
     for name, path in written.items():
         entry = manifest["files"][name]
         assert Path(entry["path"]) == path

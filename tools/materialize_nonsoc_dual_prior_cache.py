@@ -113,7 +113,15 @@ else:  # pragma: no cover - exercised by the production CLI entrypoint
 SCHEMA = "deeptb.nonsoc_dual_prior_cache/v1"
 IDENTITY_SCHEMA = "deeptb.nonsoc_dual_prior_cache_identity/v1"
 AGGREGATE_P2_CACHE_SCHEMA = "deeptb.raw200_parallel_cache/v1"
-GEOMETRY_TOLERANCE_ANGSTROM = 5.0e-5
+# Compact records and STRU cells are serialized through different decimal
+# paths.  Raw200 contains legitimate cell round-off just above 5e-5 Angstrom;
+# 1e-4 remains far below any physically meaningful geometry displacement.
+GEOMETRY_TOLERANCE_ANGSTROM = 1.0e-4
+LEGACY_GEOMETRY_IDENTITY_UPGRADES = {
+    # 7e67c343: periodic-image aware materializer with the original 5e-5 A
+    # serialization tolerance.  The upgrade changes only that tolerance.
+    "8ce23a6335aed526f94b6ba73a63cafaa71865c42c2136f7982498b69d3303ed": 5.0e-5,
+}
 RME_AO_ROUNDTRIP_TOLERANCE_EV = 5.0e-5
 
 _BASE_FIELDS = (
@@ -1236,7 +1244,12 @@ def _build_identity(
     return payload
 
 
-def _validate_identity(actual: Any, expected: Mapping[str, Any]) -> None:
+def _validate_identity(
+    actual: Any,
+    expected: Mapping[str, Any],
+    *,
+    allow_geometry_tolerance_upgrade: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(actual, Mapping) or actual.get("schema") != IDENTITY_SCHEMA:
         raise ValueError("Cannot resume: dual-cache identity is missing or incompatible.")
     declared = require_sha256(
@@ -1246,13 +1259,45 @@ def _validate_identity(actual: Any, expected: Mapping[str, Any]) -> None:
     without_digest.pop("identity_sha256", None)
     if declared != _json_sha256(without_digest):
         raise ValueError("Cannot resume: stored dual-cache identity is internally inconsistent.")
-    if dict(actual) != dict(expected):
-        changed = [
-            key
-            for key in sorted(set(actual) | set(expected))
-            if actual.get(key) != expected.get(key)
-        ]
-        raise ValueError(f"Cannot resume: dual-cache identity changed for {changed}.")
+    if dict(actual) == dict(expected):
+        return None
+    if allow_geometry_tolerance_upgrade:
+        old_script = actual.get("materializer_script_sha256")
+        old_tolerance = actual.get("geometry_tolerance_angstrom")
+        legacy_tolerance = LEGACY_GEOMETRY_IDENTITY_UPGRADES.get(old_script)
+        actual_comparable = dict(actual)
+        expected_comparable = dict(expected)
+        actual_comparable.pop("identity_sha256", None)
+        expected_comparable.pop("identity_sha256", None)
+        actual_comparable["materializer_script_sha256"] = expected_comparable.get(
+            "materializer_script_sha256"
+        )
+        actual_comparable["geometry_tolerance_angstrom"] = expected_comparable.get(
+            "geometry_tolerance_angstrom"
+        )
+        if (
+            legacy_tolerance is not None
+            and float(old_tolerance) == float(legacy_tolerance)
+            and float(expected["geometry_tolerance_angstrom"]) == 1.0e-4
+            and actual_comparable == expected_comparable
+        ):
+            return {
+                "kind": "geometry_serialization_tolerance_upgrade",
+                "old_materializer_script_sha256": old_script,
+                "new_materializer_script_sha256": expected[
+                    "materializer_script_sha256"
+                ],
+                "old_geometry_tolerance_angstrom": float(old_tolerance),
+                "new_geometry_tolerance_angstrom": float(
+                    expected["geometry_tolerance_angstrom"]
+                ),
+            }
+    changed = [
+        key
+        for key in sorted(set(actual) | set(expected))
+        if actual.get(key) != expected.get(key)
+    ]
+    raise ValueError(f"Cannot resume: dual-cache identity changed for {changed}.")
 
 
 def _validated_prefix(
@@ -1346,6 +1391,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contraction-chunk-terms", type=int, default=2048)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow-geometry-tolerance-upgrade", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1419,7 +1465,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not partial_path.is_file():
             raise FileNotFoundError("Cannot resume without manifest.partial.json.")
         manifest = json.loads(partial_path.read_text(encoding="utf-8"))
-        _validate_identity(manifest.get("identity"), identity)
+        identity_migration = _validate_identity(
+            manifest.get("identity"),
+            identity,
+            allow_geometry_tolerance_upgrade=bool(
+                args.allow_geometry_tolerance_upgrade
+            ),
+        )
+        if identity_migration is not None:
+            identity_migration.update(
+                {
+                    "accepted_unix": time.time(),
+                    "committed_rows_before_upgrade": {
+                        split: len(payload.get("records", []))
+                        for split, payload in manifest.get("splits", {}).items()
+                    },
+                }
+            )
+            manifest.setdefault("identity_migrations", []).append(identity_migration)
+            manifest["identity"] = identity
+            _write_json(partial_path, manifest)
         if manifest.get("complete") is True:
             raise ValueError("Dual cache is already complete; refusing a duplicate run.")
     else:
