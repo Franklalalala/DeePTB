@@ -7,18 +7,28 @@ legacy value can be silently hidden by a default.  This module canonicalizes
 raw input *before* schema defaults are applied and is also used by constructors
 that are called directly in tests or downstream code.
 
-Keep this module dependency-free: configuration normalization happens before
-Torch/model imports in several entrypoints.
+Every legacy alias is expressed as one row of a small migration registry and
+applied through the generic :func:`_apply_alias_registry` engine, which records
+a per-key deprecation so exactly one :class:`FutureWarning` fires for each used
+legacy key.  Keep this module dependency-free: configuration normalization
+happens before Torch/model imports in several entrypoints, and
+``dptb.utils.argcheck`` imports this module (so it must not import argcheck).
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 import warnings
 
 
 _MISSING = object()
+
+# Default DeePTB version in which the deprecated aliases below are scheduled to
+# be removed.  Individual registry rows may override this if their timeline
+# diverges.
+_ALIAS_REMOVAL_VERSION = "2.3"
 
 
 # The 0711 schema normalized both sides of these alias pairs into saved
@@ -37,6 +47,15 @@ _LEGACY_CHECKPOINT_FLOW_ALIAS_DEFAULTS = (
 )
 
 
+@dataclass(frozen=True)
+class _AliasHit:
+    """One recorded use of a deprecated key during canonicalization."""
+
+    legacy: str
+    canonical: str
+    removal_version: str
+
+
 def _same_value(left: Any, right: Any) -> bool:
     try:
         result = left == right
@@ -49,8 +68,9 @@ def _merge_aliases(
     values: MutableMapping[str, Any],
     canonical: str,
     aliases: Iterable[str],
+    removal_version: str,
     *,
-    changes: list[str],
+    changes: List[_AliasHit],
 ) -> None:
     """Move aliases onto one key and reject conflicting explicit values."""
 
@@ -70,14 +90,92 @@ def _merge_aliases(
                     f"and deprecated alias {alias!r}: "
                     f"{canonical_value!r} != {alias_value!r}."
                 )
-        changes.append(f"{alias}->{canonical}")
+        changes.append(_AliasHit(alias, canonical, removal_version))
 
 
-def _warn_changes(kind: str, changes: Iterable[str], *, enabled: bool) -> None:
-    unique = tuple(dict.fromkeys(changes))
-    if enabled and unique:
+# ---------------------------------------------------------------------------
+# Generic alias-migration registry.
+#
+# The five historical canonicalization branches (flow options, endpoint loss
+# mode, legacy-checkpoint flow defaults, embedding switches, prediction
+# reconstruction) are all expressed as ordered lists of rows and applied by the
+# same engine.  A row is either a simple :class:`_Rename` (a fail-closed alias
+# merge onto one canonical key) or a :class:`_Transform` wrapping a semantic
+# collapse that cannot be reduced to a rename (e.g. the endpoint-loss-mode truth
+# table or the init-scope boolean fan-in).  Every row carries a removal_version
+# so the emitted FutureWarnings can name it.
+# ---------------------------------------------------------------------------
+class _AliasRule:
+    """Base row of the alias-migration registry."""
+
+    removal_version: str
+
+    def apply(self, container: MutableMapping[str, Any], changes: List[_AliasHit]) -> None:
+        raise NotImplementedError
+
+
+class _Rename(_AliasRule):
+    """Merge one or more legacy keys onto a canonical key (fail-closed)."""
+
+    def __init__(
+        self,
+        canonical: str,
+        legacy: Union[str, Sequence[str]],
+        removal_version: str = _ALIAS_REMOVAL_VERSION,
+    ) -> None:
+        self.canonical = canonical
+        self.legacy: Tuple[str, ...] = (
+            (legacy,) if isinstance(legacy, str) else tuple(legacy)
+        )
+        self.removal_version = removal_version
+
+    def apply(self, container: MutableMapping[str, Any], changes: List[_AliasHit]) -> None:
+        _merge_aliases(
+            container, self.canonical, self.legacy, self.removal_version, changes=changes
+        )
+
+
+class _Transform(_AliasRule):
+    """Wrap a semantic collapse that records its own consumed legacy keys."""
+
+    def __init__(
+        self,
+        fn: Callable[[MutableMapping[str, Any], List[_AliasHit], str], None],
+        *,
+        removal_version: str = _ALIAS_REMOVAL_VERSION,
+    ) -> None:
+        self.fn = fn
+        self.removal_version = removal_version
+
+    def apply(self, container: MutableMapping[str, Any], changes: List[_AliasHit]) -> None:
+        self.fn(container, changes, self.removal_version)
+
+
+def _apply_alias_registry(
+    container: MutableMapping[str, Any],
+    rules: Iterable[_AliasRule],
+    *,
+    changes: List[_AliasHit],
+) -> None:
+    """Apply every registry row to ``container`` in order."""
+
+    for rule in rules:
+        rule.apply(container, changes)
+
+
+def _emit_alias_warnings(changes: Iterable[_AliasHit], *, enabled: bool) -> None:
+    """Emit exactly one FutureWarning per used legacy key."""
+
+    if not enabled:
+        return
+    seen: set[str] = set()
+    for hit in changes:
+        if hit.legacy in seen:
+            continue
+        seen.add(hit.legacy)
         warnings.warn(
-            f"Deprecated {kind} options were canonicalized: {', '.join(unique)}.",
+            f"Deprecated configuration key {hit.legacy!r} was canonicalized to "
+            f"{hit.canonical!r}; it will be removed in DeePTB {hit.removal_version}.",
             FutureWarning,
             stacklevel=3,
         )
@@ -151,64 +249,21 @@ def resolve_init_scope(
     }
 
 
-def canonicalize_flow_options(
-    options: Optional[Mapping[str, Any]],
-    *,
-    warn_deprecated: bool = True,
-) -> Dict[str, Any]:
-    """Return one fail-closed representation of ``train_options.flow_options``."""
-
-    if options is None:
-        return {}
-    if not isinstance(options, Mapping):
-        raise TypeError("train_options.flow_options must be a mapping.")
-    out: Dict[str, Any] = deepcopy(dict(options))
-    changes: list[str] = []
-
-    _merge_aliases(out, "objective", ("type",), changes=changes)
-    _merge_aliases(out, "meanflow", ("pixel_meanflow",), changes=changes)
-    _merge_aliases(out, "huckel_k", ("overlap_huckel_k",), changes=changes)
-    _merge_aliases(
-        out,
-        "huckel_edge_channel_scale",
-        ("overlap_huckel_edge_channel_scale",),
-        changes=changes,
-    )
-    _merge_aliases(
-        out,
-        "prior_skdata",
-        ("dftb_skdata", "skdata"),
-        changes=changes,
-    )
-    _merge_aliases(
-        out,
-        "physical_prior_jitter_sigma",
-        ("prior_jitter_sigma",),
-        changes=changes,
-    )
-
+# ---------------------------------------------------------------------------
+# flow_options registry rows.
+# ---------------------------------------------------------------------------
+def _flow_meanflow_subtree(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     meanflow = out.get("meanflow", {}) or {}
     if not isinstance(meanflow, Mapping):
         raise TypeError("flow_options.meanflow must be a mapping.")
     meanflow = deepcopy(dict(meanflow))
+    _merge_aliases(meanflow, "du_dt_backend", ("jvp_backend",), rv, changes=changes)
     _merge_aliases(
-        meanflow,
-        "du_dt_backend",
-        ("jvp_backend",),
-        changes=changes,
+        meanflow, "jvp_fallback", ("jvp_fallback_to_finite_difference",), rv, changes=changes
     )
-    _merge_aliases(
-        meanflow,
-        "jvp_fallback",
-        ("jvp_fallback_to_finite_difference",),
-        changes=changes,
-    )
-    _merge_aliases(
-        meanflow,
-        "objective",
-        ("loss_objective",),
-        changes=changes,
-    )
+    _merge_aliases(meanflow, "objective", ("loss_objective",), rv, changes=changes)
     for dead_flag in (
         "log_compatible_loss",
         "log_train_compatible_loss",
@@ -217,7 +272,7 @@ def canonicalize_flow_options(
     ):
         if dead_flag in meanflow:
             meanflow.pop(dead_flag)
-            changes.append(f"meanflow.{dead_flag}->always_on")
+            changes.append(_AliasHit(f"meanflow.{dead_flag}", "always_on", rv))
 
     top_profile = out.pop("meanflow_profile", _MISSING)
     if top_profile is not _MISSING:
@@ -226,7 +281,7 @@ def canonicalize_flow_options(
         ):
             raise ValueError("Conflicting flow_options.meanflow.profile and meanflow_profile.")
         meanflow["profile"] = top_profile
-        changes.append("meanflow_profile->meanflow.profile")
+        changes.append(_AliasHit("meanflow_profile", "meanflow.profile", rv))
     aggressive_values = []
     if "meanflow_aggressive" in out:
         aggressive_values.append(("meanflow_aggressive", bool(out.pop("meanflow_aggressive"))))
@@ -241,9 +296,14 @@ def canonicalize_flow_options(
         if "profile" in meanflow and _normalized_name(meanflow["profile"]) != "aggressive":
             raise ValueError("Aggressive MeanFlow flag conflicts with meanflow.profile.")
         meanflow["profile"] = "aggressive"
-    changes.extend(f"{name}->meanflow.profile" for name, _value in aggressive_values)
+    for name, _value in aggressive_values:
+        changes.append(_AliasHit(name, "meanflow.profile", rv))
     out["meanflow"] = meanflow
 
+
+def _flow_missing_h0_policy(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     strict = out.pop("strict_h0", _MISSING)
     warn_missing = out.pop("warn_missing_h0", _MISSING)
     if strict is not _MISSING or warn_missing is not _MISSING:
@@ -256,9 +316,9 @@ def canonicalize_flow_options(
             )
         out["missing_h0_policy"] = legacy_policy
         if strict is not _MISSING:
-            changes.append("strict_h0->missing_h0_policy")
+            changes.append(_AliasHit("strict_h0", "missing_h0_policy", rv))
         if warn_missing is not _MISSING:
-            changes.append("warn_missing_h0->missing_h0_policy")
+            changes.append(_AliasHit("warn_missing_h0", "missing_h0_policy", rv))
     if "missing_h0_policy" in out:
         policy = _normalized_name(out["missing_h0_policy"])
         policy = {"warn": "warn_zero", "silent_zero": "zero"}.get(policy, policy)
@@ -268,6 +328,10 @@ def canonicalize_flow_options(
             )
         out["missing_h0_policy"] = policy
 
+
+def _flow_validation_metrics(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     metric_order = ("random_t", "one_step", "trajectory")
     metric_aliases = {"t0": "one_step", "euler": "trajectory"}
     configured_metrics = out.get("validation_flow_metrics", _MISSING)
@@ -309,29 +373,39 @@ def canonicalize_flow_options(
                 "validation logging flags."
             )
         normalized_metrics = legacy_metrics
-        changes.extend(
-            f"{flag}->validation_flow_metrics"
-            for flag, metric in legacy_metric_flags.items()
-            if metric in present_legacy_metrics
-        )
+        for flag, metric in legacy_metric_flags.items():
+            if metric in present_legacy_metrics:
+                changes.append(_AliasHit(flag, "validation_flow_metrics", rv))
     if configured_metrics is not _MISSING or present_legacy_metrics:
         out["validation_flow_metrics"] = [
             metric for metric in metric_order if metric in normalized_metrics
         ]
 
+
+def _flow_validation_ode_steps(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     if "validation_ode_steps" in out:
         steps = {int(value) for value in out["validation_ode_steps"] if int(value) > 0}
         steps.add(1)
         out["validation_ode_steps"] = sorted(steps)
 
+
+def _flow_omit_time_scaling(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     if "omit_time_scaling" in out:
         omit = bool(out.pop("omit_time_scaling"))
         if omit:
             # This reproduces the legacy short-circuit exactly, including when
             # endpoint_weight_power was configured to a non-zero value.
             out["endpoint_weight_power"] = 0.0
-        changes.append("omit_time_scaling->endpoint_weight_power")
+        changes.append(_AliasHit("omit_time_scaling", "endpoint_weight_power", rv))
 
+
+def _flow_dead_top_flags(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     # These switches have been hard invariants since the endpoint-compatible
     # logging fix.  Accept and discard them so old configs keep loading without
     # pretending that ``false`` changes runtime behavior.
@@ -343,8 +417,12 @@ def canonicalize_flow_options(
     ):
         if dead_flag in out:
             out.pop(dead_flag)
-            changes.append(f"{dead_flag}->always_on")
+            changes.append(_AliasHit(dead_flag, "always_on", rv))
 
+
+def _flow_final_normalize(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
     if "objective" in out:
         out["objective"] = _normalized_name(out["objective"])
     if "prior" in out and isinstance(out["prior"], str):
@@ -352,14 +430,49 @@ def canonicalize_flow_options(
     if "te_prior_mode" in out:
         out["te_prior_mode"] = _normalized_name(out["te_prior_mode"])
 
-    _warn_changes("flow", changes, enabled=warn_deprecated)
+
+# Ordered registry for ``flow_options``.  Order is load-bearing: pixel_meanflow
+# must be merged onto ``meanflow`` before the meanflow subtree is processed, and
+# the final normalization must run last.
+_FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
+    _Rename("objective", ("type",)),
+    _Rename("meanflow", ("pixel_meanflow",)),
+    _Rename("huckel_k", ("overlap_huckel_k",)),
+    _Rename("huckel_edge_channel_scale", ("overlap_huckel_edge_channel_scale",)),
+    _Rename("prior_skdata", ("dftb_skdata", "skdata")),
+    _Rename("physical_prior_jitter_sigma", ("prior_jitter_sigma",)),
+    _Transform(_flow_meanflow_subtree),
+    _Transform(_flow_missing_h0_policy),
+    _Transform(_flow_validation_metrics),
+    _Transform(_flow_validation_ode_steps),
+    _Transform(_flow_omit_time_scaling),
+    _Transform(_flow_dead_top_flags),
+    _Transform(_flow_final_normalize),
+)
+
+
+def canonicalize_flow_options(
+    options: Optional[Mapping[str, Any]],
+    *,
+    warn_deprecated: bool = True,
+) -> Dict[str, Any]:
+    """Return one fail-closed representation of ``train_options.flow_options``."""
+
+    if options is None:
+        return {}
+    if not isinstance(options, Mapping):
+        raise TypeError("train_options.flow_options must be a mapping.")
+    out: Dict[str, Any] = deepcopy(dict(options))
+    changes: List[_AliasHit] = []
+    _apply_alias_registry(out, _FLOW_REGISTRY, changes=changes)
+    _emit_alias_warnings(changes, enabled=warn_deprecated)
     return out
 
 
 def _canonicalize_endpoint_loss_mode(
     options: MutableMapping[str, Any],
-    *,
-    changes: list[str],
+    changes: List[_AliasHit],
+    removal_version: str,
 ) -> None:
     """Preserve the legacy boolean+mode execution truth table.
 
@@ -407,9 +520,21 @@ def _canonicalize_endpoint_loss_mode(
     if canonical_mode is not _MISSING:
         options["endpoint_loss_mode"] = canonical_mode
     if legacy_enabled is not _MISSING:
-        changes.append("log_single_model_compatible_loss->endpoint_loss_mode")
+        changes.append(
+            _AliasHit("log_single_model_compatible_loss", "endpoint_loss_mode", removal_version)
+        )
     if legacy_mode is not _MISSING:
-        changes.append("log_single_model_compatible_loss_mode->endpoint_loss_mode")
+        changes.append(
+            _AliasHit(
+                "log_single_model_compatible_loss_mode", "endpoint_loss_mode", removal_version
+            )
+        )
+
+
+# Registry for the top-level train_options endpoint truth table.
+_TRAIN_ENDPOINT_REGISTRY: Tuple[_AliasRule, ...] = (
+    _Transform(_canonicalize_endpoint_loss_mode),
+)
 
 
 def migrate_legacy_checkpoint_flow_options(
@@ -430,7 +555,7 @@ def migrate_legacy_checkpoint_flow_options(
     if not isinstance(options, Mapping):
         raise TypeError("checkpoint train_options.flow_options must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
-    changes: list[str] = []
+    changes: List[_AliasHit] = []
     for canonical, alias, old_default in _LEGACY_CHECKPOINT_FLOW_ALIAS_DEFAULTS:
         if canonical not in out or alias not in out:
             continue
@@ -441,15 +566,15 @@ def migrate_legacy_checkpoint_flow_options(
         if canonical_is_default and not alias_is_default:
             out[canonical] = alias_value
             out.pop(alias)
-            changes.append(f"{alias}->{canonical} (overrode legacy default)")
+            changes.append(_AliasHit(alias, canonical, _ALIAS_REMOVAL_VERSION))
         elif alias_is_default or _same_value(canonical_value, alias_value):
             out.pop(alias)
-            changes.append(f"discarded defaulted {alias}")
+            changes.append(_AliasHit(alias, canonical, _ALIAS_REMOVAL_VERSION))
 
     # This retains the strict conflict check for all unrecognized collisions
     # and also migrates aliases that were not populated by the old schema.
     migrated = canonicalize_flow_options(out, warn_deprecated=warn_deprecated)
-    _warn_changes("legacy checkpoint flow", changes, enabled=warn_deprecated)
+    _emit_alias_warnings(changes, enabled=warn_deprecated)
     return migrated
 
 
@@ -465,14 +590,133 @@ def migrate_legacy_checkpoint_train_options(
     if not isinstance(options, Mapping):
         raise TypeError("checkpoint train_options must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
-    changes: list[str] = []
-    _canonicalize_endpoint_loss_mode(out, changes=changes)
+    changes: List[_AliasHit] = []
+    _apply_alias_registry(out, _TRAIN_ENDPOINT_REGISTRY, changes=changes)
     if "flow_options" in out:
         out["flow_options"] = migrate_legacy_checkpoint_flow_options(
             out.get("flow_options"), warn_deprecated=warn_deprecated
         )
-    _warn_changes("legacy checkpoint training", changes, enabled=warn_deprecated)
+    _emit_alias_warnings(changes, enabled=warn_deprecated)
     return out
+
+
+# ---------------------------------------------------------------------------
+# model_options.embedding registry rows.
+# ---------------------------------------------------------------------------
+_H0_METHODS = {"lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_non_linear_h0"}
+
+_SOFT_EDGE_MEMORY_ALIASES = {
+    "use_soft_edge_memory": "enabled",
+    "soft_edge_memory_num_slots": "num_slots",
+    "soft_edge_memory_num_heads": "num_heads",
+    "soft_edge_memory_head_dim": "head_dim",
+    "soft_edge_memory_temperature": "temperature",
+    "soft_edge_memory_dropout": "dropout",
+    "soft_edge_memory_gate_mode": "gate_mode",
+    "soft_edge_memory_gate_bias": "gate_bias",
+    "soft_edge_memory_gate_eps": "gate_eps",
+    "soft_edge_memory_zero_init_output": "zero_init_output",
+    "soft_edge_memory_input_norm": "input_norm",
+    "soft_edge_memory_diagnostics_mode": "diagnostics_mode",
+    "soft_edge_memory_diagnostics_sample_size": "diagnostics_sample_size",
+}
+
+
+def _embedding_h0_scope(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
+    method = _normalized_name(out.get("method", ""))
+    if method not in _H0_METHODS and not any(
+        key in out
+        for key in (
+            "h0_init_scope",
+            "use_h0_init",
+            "use_h0_node_init",
+            "use_h0_edge_init",
+        )
+    ):
+        return
+    legacy = (
+        out.pop("use_h0_init", None),
+        out.pop("use_h0_node_init", None),
+        out.pop("use_h0_edge_init", None),
+    )
+    scope, *_ = resolve_init_scope(
+        out.get("h0_init_scope"),
+        enabled=legacy[0],
+        node=legacy[1],
+        edge=legacy[2],
+        option_name="model_options.embedding.h0_init_scope",
+    )
+    out["h0_init_scope"] = scope
+    for name, value in zip(
+        ("use_h0_init", "use_h0_node_init", "use_h0_edge_init"), legacy
+    ):
+        if value is not None:
+            changes.append(_AliasHit(name, "h0_init_scope", rv))
+
+
+def _embedding_prior(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
+    method = _normalized_name(out.get("method", ""))
+    if method != "lem_moe_v3_prior":
+        return
+    prior_kind = _normalized_name(out.get("prior_kind", "p2"))
+    if prior_kind not in {"p2", "p23"}:
+        raise ValueError(
+            "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
+            f"got {prior_kind!r}."
+        )
+    out["prior_kind"] = prior_kind
+
+    legacy = (
+        out.pop("use_prior_init", None),
+        out.pop("use_prior_node_init", None),
+        out.pop("use_prior_edge_init", None),
+    )
+    scope, *_ = resolve_init_scope(
+        out.get("prior_init_scope"),
+        enabled=legacy[0],
+        node=legacy[1],
+        edge=legacy[2],
+        option_name="model_options.embedding.prior_init_scope",
+    )
+    out["prior_init_scope"] = scope
+    for name, value in zip(
+        ("use_prior_init", "use_prior_node_init", "use_prior_edge_init"), legacy
+    ):
+        if value is not None:
+            changes.append(_AliasHit(name, "prior_init_scope", rv))
+
+    memory = out.get("soft_edge_memory", {}) or {}
+    if not isinstance(memory, Mapping):
+        raise TypeError("embedding.soft_edge_memory must be a mapping.")
+    memory = deepcopy(dict(memory))
+    for old, new in _SOFT_EDGE_MEMORY_ALIASES.items():
+        if old not in out:
+            continue
+        value = out.pop(old)
+        if new in memory and not _same_value(memory[new], value):
+            raise ValueError(
+                f"Conflicting embedding.soft_edge_memory.{new} and {old}."
+            )
+        memory[new] = value
+        changes.append(_AliasHit(old, f"soft_edge_memory.{new}", rv))
+    if memory or "soft_edge_memory" in out:
+        out["soft_edge_memory"] = memory
+    if scope == "none" and bool(memory.get("enabled", True)):
+        raise ValueError(
+            "embedding.soft_edge_memory.enabled=true requires "
+            "prior_init_scope != 'none'."
+        )
+
+
+_EMBEDDING_REGISTRY: Tuple[_AliasRule, ...] = (
+    _Rename("fallback_to_hamiltonian", ("h0_fallback_to_hamiltonian",)),
+    _Transform(_embedding_h0_scope),
+    _Transform(_embedding_prior),
+)
 
 
 def canonicalize_embedding_options(
@@ -487,117 +731,9 @@ def canonicalize_embedding_options(
     if not isinstance(options, Mapping):
         raise TypeError("model_options.embedding must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
-    changes: list[str] = []
-    method = _normalized_name(out.get("method", ""))
-
-    _merge_aliases(
-        out,
-        "fallback_to_hamiltonian",
-        ("h0_fallback_to_hamiltonian",),
-        changes=changes,
-    )
-
-    h0_methods = {"lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_non_linear_h0"}
-    if method in h0_methods or any(
-        key in out
-        for key in (
-            "h0_init_scope",
-            "use_h0_init",
-            "use_h0_node_init",
-            "use_h0_edge_init",
-        )
-    ):
-        legacy = (
-            out.pop("use_h0_init", None),
-            out.pop("use_h0_node_init", None),
-            out.pop("use_h0_edge_init", None),
-        )
-        scope, *_ = resolve_init_scope(
-            out.get("h0_init_scope"),
-            enabled=legacy[0],
-            node=legacy[1],
-            edge=legacy[2],
-            option_name="model_options.embedding.h0_init_scope",
-        )
-        out["h0_init_scope"] = scope
-        if any(value is not None for value in legacy):
-            changes.extend(
-                f"{name}->h0_init_scope"
-                for name, value in zip(
-                    ("use_h0_init", "use_h0_node_init", "use_h0_edge_init"), legacy
-                )
-                if value is not None
-            )
-
-    if method == "lem_moe_v3_prior":
-        prior_kind = _normalized_name(out.get("prior_kind", "p2"))
-        if prior_kind not in {"p2", "p23"}:
-            raise ValueError(
-                "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
-                f"got {prior_kind!r}."
-            )
-        out["prior_kind"] = prior_kind
-
-        legacy = (
-            out.pop("use_prior_init", None),
-            out.pop("use_prior_node_init", None),
-            out.pop("use_prior_edge_init", None),
-        )
-        scope, *_ = resolve_init_scope(
-            out.get("prior_init_scope"),
-            enabled=legacy[0],
-            node=legacy[1],
-            edge=legacy[2],
-            option_name="model_options.embedding.prior_init_scope",
-        )
-        out["prior_init_scope"] = scope
-        if any(value is not None for value in legacy):
-            changes.extend(
-                f"{name}->prior_init_scope"
-                for name, value in zip(
-                    ("use_prior_init", "use_prior_node_init", "use_prior_edge_init"), legacy
-                )
-                if value is not None
-            )
-
-        memory = out.get("soft_edge_memory", {}) or {}
-        if not isinstance(memory, Mapping):
-            raise TypeError("embedding.soft_edge_memory must be a mapping.")
-        memory = deepcopy(dict(memory))
-        memory_aliases = {
-            "use_soft_edge_memory": "enabled",
-            "soft_edge_memory_num_slots": "num_slots",
-            "soft_edge_memory_num_heads": "num_heads",
-            "soft_edge_memory_head_dim": "head_dim",
-            "soft_edge_memory_temperature": "temperature",
-            "soft_edge_memory_dropout": "dropout",
-            "soft_edge_memory_gate_mode": "gate_mode",
-            "soft_edge_memory_gate_bias": "gate_bias",
-            "soft_edge_memory_gate_eps": "gate_eps",
-            "soft_edge_memory_zero_init_output": "zero_init_output",
-            "soft_edge_memory_input_norm": "input_norm",
-            "soft_edge_memory_diagnostics_mode": "diagnostics_mode",
-            "soft_edge_memory_diagnostics_sample_size": "diagnostics_sample_size",
-        }
-        for old, new in memory_aliases.items():
-            if old not in out:
-                continue
-            value = out.pop(old)
-            if new in memory and not _same_value(memory[new], value):
-                raise ValueError(
-                    f"Conflicting embedding.soft_edge_memory.{new} and {old}."
-                )
-            memory[new] = value
-            changes.append(f"{old}->soft_edge_memory.{new}")
-        if memory or "soft_edge_memory" in out:
-            out["soft_edge_memory"] = memory
-        if scope == "none" and bool(memory.get("enabled", True)):
-            raise ValueError(
-                "embedding.soft_edge_memory.enabled=true requires "
-                "prior_init_scope != 'none'."
-            )
-
-    _warn_changes("embedding", changes, enabled=warn_deprecated)
+    changes: List[_AliasHit] = []
+    _apply_alias_registry(out, _EMBEDDING_REGISTRY, changes=changes)
+    _emit_alias_warnings(changes, enabled=warn_deprecated)
     return out
 
 
@@ -636,6 +772,28 @@ def resolve_reconstruction_mode(
     return resolved
 
 
+def _prediction_reconstruction(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
+    add_h0 = out.pop("add_h0", None)
+    add_prior = out.pop("add_prior", None)
+    if add_h0 is not None or add_prior is not None:
+        out["reconstruction"] = resolve_reconstruction_mode(
+            out.get("reconstruction"), add_h0=add_h0, add_prior=add_prior
+        )
+        if add_h0 is not None:
+            changes.append(_AliasHit("add_h0", "reconstruction", rv))
+        if add_prior is not None:
+            changes.append(_AliasHit("add_prior", "reconstruction", rv))
+    elif "reconstruction" in out:
+        out["reconstruction"] = resolve_reconstruction_mode(out["reconstruction"])
+
+
+_PREDICTION_REGISTRY: Tuple[_AliasRule, ...] = (
+    _Transform(_prediction_reconstruction),
+)
+
+
 def canonicalize_prediction_options(
     options: Optional[Mapping[str, Any]],
     *,
@@ -646,20 +804,9 @@ def canonicalize_prediction_options(
     if not isinstance(options, Mapping):
         raise TypeError("model_options.prediction must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
-    changes: list[str] = []
-    add_h0 = out.pop("add_h0", None)
-    add_prior = out.pop("add_prior", None)
-    if add_h0 is not None or add_prior is not None:
-        out["reconstruction"] = resolve_reconstruction_mode(
-            out.get("reconstruction"), add_h0=add_h0, add_prior=add_prior
-        )
-        if add_h0 is not None:
-            changes.append("add_h0->reconstruction")
-        if add_prior is not None:
-            changes.append("add_prior->reconstruction")
-    elif "reconstruction" in out:
-        out["reconstruction"] = resolve_reconstruction_mode(out["reconstruction"])
-    _warn_changes("prediction", changes, enabled=warn_deprecated)
+    changes: List[_AliasHit] = []
+    _apply_alias_registry(out, _PREDICTION_REGISTRY, changes=changes)
+    _emit_alias_warnings(changes, enabled=warn_deprecated)
     return out
 
 
@@ -682,23 +829,18 @@ def migrate_legacy_checkpoint_model_options(
     if not isinstance(options, Mapping):
         raise TypeError("checkpoint model_options must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
-    changes: list[str] = []
+    changes: List[_AliasHit] = []
     embedding = out.get("embedding")
     if isinstance(embedding, Mapping):
         embedding = deepcopy(dict(embedding))
         alias = "h0_fallback_to_hamiltonian"
         canonical = "fallback_to_hamiltonian"
         if alias in embedding:
+            # Old runtime precedence: the alias value always wins, even when it
+            # disagrees with the canonical key persisted alongside it.
             alias_value = embedding.pop(alias)
-            if canonical in embedding and not _same_value(
-                embedding[canonical], alias_value
-            ):
-                changes.append(
-                    f"{alias}->{canonical} (preserved legacy alias override)"
-                )
-            else:
-                changes.append(f"{alias}->{canonical}")
             embedding[canonical] = alias_value
+            changes.append(_AliasHit(alias, canonical, _ALIAS_REMOVAL_VERSION))
         out["embedding"] = canonicalize_embedding_options(
             embedding, warn_deprecated=warn_deprecated
         )
@@ -707,8 +849,50 @@ def migrate_legacy_checkpoint_model_options(
         out["prediction"] = canonicalize_prediction_options(
             prediction, warn_deprecated=warn_deprecated
         )
-    _warn_changes("legacy checkpoint model", changes, enabled=warn_deprecated)
+    _emit_alias_warnings(changes, enabled=warn_deprecated)
     return out
+
+
+# Typed nested train_options groups (PR-F). These names must stay in sync with
+# dptb.utils.argcheck.TRAIN_OPTION_GROUP_MEMBERS; configuration.py deliberately
+# does not import argcheck (argcheck imports this module), so the coupling is
+# asserted by test instead. Unlike the alias registry above, using a group is
+# NOT deprecated: it is the new preferred input form, so no FutureWarning fires.
+_TRAIN_OPTION_GROUP_NAMES = (
+    "runtime",
+    "distributed",
+    "checkpoint",
+    "observers",
+    "physical_prior",
+)
+
+
+def _flatten_train_option_groups(train: MutableMapping[str, Any]) -> None:
+    """Hoist typed nested train_options groups onto their flat keys in place.
+
+    The trainer reads flat train_options keys, so a nested group such as
+    ``distributed: {use_ddp: true}`` is flattened to ``use_ddp: true`` here,
+    before dargs inserts defaults.  Flattening is idempotent (a second pass sees
+    no groups) and fail-closed: a nested key that disagrees with an explicit
+    flat key of the same name is rejected rather than silently overriding.
+    """
+
+    for group in _TRAIN_OPTION_GROUP_NAMES:
+        if group not in train:
+            continue
+        block = train.pop(group)
+        if block is None:
+            continue
+        if not isinstance(block, Mapping):
+            raise TypeError(f"train_options.{group} must be a mapping.")
+        for key, value in dict(block).items():
+            if key in train and not _same_value(train[key], value):
+                raise ValueError(
+                    f"Conflicting configuration values: nested "
+                    f"train_options.{group}.{key} ({value!r}) and flat "
+                    f"train_options.{key} ({train[key]!r})."
+                )
+            train[key] = value
 
 
 def canonicalize_training_config(
@@ -724,13 +908,17 @@ def canonicalize_training_config(
     train = out.get("train_options")
     if isinstance(train, Mapping):
         train = dict(train)
-        train_changes: list[str] = []
-        _canonicalize_endpoint_loss_mode(train, changes=train_changes)
+        # Flatten typed nested groups onto flat keys first so that, e.g., a
+        # physical_prior.flow_options block is canonicalized by the flow path
+        # below exactly like a top-level flow_options block.
+        _flatten_train_option_groups(train)
+        train_changes: List[_AliasHit] = []
+        _apply_alias_registry(train, _TRAIN_ENDPOINT_REGISTRY, changes=train_changes)
         if "flow_options" in train:
             train["flow_options"] = canonicalize_flow_options(
                 train.get("flow_options"), warn_deprecated=warn_deprecated
             )
-        _warn_changes("training", train_changes, enabled=warn_deprecated)
+        _emit_alias_warnings(train_changes, enabled=warn_deprecated)
         out["train_options"] = train
     model = out.get("model_options")
     if isinstance(model, Mapping):

@@ -20,7 +20,16 @@ data_options:
     prefer_precomputed_p2: true
     require_p2_blocks: true
     require_full_h_target: true
-    allow_unbound_prior_source_fingerprint: true
+    # ===================================================================
+    # DEV-ONLY ESCAPE HATCH -- DO NOT COPY INTO A PRODUCTION CONFIG.
+    # This smoke fixture omits expected_p2_source_fingerprint on purpose,
+    # so it must set allow_unbound_prior_source_fingerprint=true to pass
+    # the Full-H prior contract. Production runs MUST leave this false
+    # (the schema default) and instead pin expected_p2_source_fingerprint
+    # to the SHA256 of the P2 source table. See argcheck.py
+    # (_validate_p2_prior_full_h_contract) for the enforced red line.
+    # ===================================================================
+    allow_unbound_prior_source_fingerprint: true  # DEV-ONLY; schema default is false
     audit_p2_representations: false
     residual_hamiltonian: false
     get_overlap: false

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from dptb.configuration import (
     canonicalize_embedding_options,
@@ -14,7 +17,17 @@ from dptb.configuration import (
 from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.nnops.flow import HamiltonianCFM
 from dptb.nnops.flow_priors import OverlapHuckelFamily
-from dptb.utils.argcheck import flow_options
+from dptb.utils.argcheck import (
+    flow_options,
+    reference_data_sub,
+    train_data_sub,
+    train_options,
+    validation_data_sub,
+)
+# Aliased so pytest does not collect the schema builder as a test case.
+from dptb.utils.argcheck import test_data_sub as _test_data_sub
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _schema_then_runtime(raw):
@@ -519,3 +532,286 @@ def test_meanflow_export_is_order_independent():
     from dptb.nnops.flow_meanflow import HamiltonianPixelMeanFlow
 
     assert compatibility_alias is HamiltonianPixelMeanFlow
+
+
+# --------------------------------------------------------------------------
+# (3) DEV-only prior-fingerprint escape hatch: schema default must stay False.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "split_builder",
+    [train_data_sub, validation_data_sub, reference_data_sub, _test_data_sub],
+)
+def test_allow_unbound_prior_source_fingerprint_schema_default_is_false(split_builder):
+    field = split_builder().sub_fields["allow_unbound_prior_source_fingerprint"]
+    assert field.default is False
+
+
+def test_smoke_config_keeps_dev_only_flag_and_loud_warning_comment():
+    smoke = REPO_ROOT / "configs" / "p2_prior_non_soc_full_h_smoke.yaml"
+    text = smoke.read_text(encoding="utf-8")
+
+    # The dev-only override is still present (the P2 smoke fixture omits the
+    # source fingerprint on purpose) ...
+    payload = yaml.safe_load(text)
+    assert (
+        payload["data_options"]["train"]["allow_unbound_prior_source_fingerprint"]
+        is True
+    )
+    # ... but it must be guarded by a loud DEV-ONLY comment so nobody copies
+    # it into a production config.
+    assert "DEV-ONLY ESCAPE HATCH" in text
+    flag_line = next(
+        line
+        for line in text.splitlines()
+        if line.strip().startswith("allow_unbound_prior_source_fingerprint:")
+    )
+    assert "DEV-ONLY" in flag_line
+
+
+# --------------------------------------------------------------------------
+# (2) Typed nested train_options groups mirror + normalize to the flat keys.
+# --------------------------------------------------------------------------
+_KNOWN_GOOD_LOSS = {
+    "train": {
+        "method": "hamil_blockwise_nextham",
+        "optimization": "block_mae",
+        "block_reduction": "global",
+    }
+}
+
+
+def _normalized_train_options(train_opts):
+    """Canonicalize then run the real train_options schema, as normalize() does."""
+
+    canonical = canonicalize_training_config(
+        {"train_options": train_opts}, warn_deprecated=False
+    )["train_options"]
+    schema = train_options()
+    normalized = schema.normalize_value(canonical)
+    schema.check_value(normalized, strict=True)
+    return normalized
+
+
+def test_train_option_group_names_match_schema():
+    from dptb.configuration import _TRAIN_OPTION_GROUP_NAMES
+    from dptb.utils.argcheck import TRAIN_OPTION_GROUP_MEMBERS
+
+    assert set(_TRAIN_OPTION_GROUP_NAMES) == set(TRAIN_OPTION_GROUP_MEMBERS)
+
+
+def test_every_group_member_is_a_real_flat_train_option_key():
+    from dptb.utils.argcheck import TRAIN_OPTION_GROUP_MEMBERS
+
+    schema = train_options()
+    flat_keys = set(schema.sub_fields.keys())
+    for group, members in TRAIN_OPTION_GROUP_MEMBERS.items():
+        for member in members:
+            assert member in flat_keys, f"{group}.{member} is not a flat key"
+        # The group name itself must not shadow a flat key.
+        assert group in flat_keys  # declared as an optional group
+        for member in members:
+            assert member != group
+
+
+def test_nested_groups_normalize_identically_to_flat():
+    flat = {
+        "num_epoch": 3,
+        "use_ddp": True,
+        "ddp_backend": "gloo",
+        "expert_data_parallel_size": 2,
+        "save_freq": 25,
+        "max_ckpt": 8,
+        "use_tensorboard": True,
+        "monitor_flag": True,
+        "debug_profile": True,
+        "cudnn_benchmark": True,
+        "allow_tf32": False,
+        "train_num_workers": 4,
+        "flow_options": {"enabled": True, "prior": "zero"},
+        "self_consistency": {"enabled": True, "weight": 0.2},
+        "loss_options": _KNOWN_GOOD_LOSS,
+    }
+    nested = {
+        "num_epoch": 3,
+        "distributed": {
+            "use_ddp": True,
+            "ddp_backend": "gloo",
+            "expert_data_parallel_size": 2,
+        },
+        "checkpoint": {"save_freq": 25, "max_ckpt": 8},
+        "observers": {
+            "use_tensorboard": True,
+            "monitor_flag": True,
+            "debug_profile": True,
+        },
+        "runtime": {
+            "cudnn_benchmark": True,
+            "allow_tf32": False,
+            "train_num_workers": 4,
+        },
+        "physical_prior": {
+            "flow_options": {"enabled": True, "prior": "zero"},
+            "self_consistency": {"enabled": True, "weight": 0.2},
+        },
+        "loss_options": _KNOWN_GOOD_LOSS,
+    }
+
+    normalized_flat = _normalized_train_options(flat)
+    normalized_nested = _normalized_train_options(nested)
+
+    # The trainer reads flat keys; no group survives normalization.
+    for group in ("runtime", "distributed", "checkpoint", "observers", "physical_prior"):
+        assert group not in normalized_flat
+        assert group not in normalized_nested
+
+    assert normalized_nested == normalized_flat
+    assert normalized_nested["use_ddp"] is True
+    assert normalized_nested["save_freq"] == 25
+    assert normalized_nested["flow_options"]["enabled"] is True
+    assert normalized_nested["self_consistency"]["weight"] == pytest.approx(0.2)
+
+
+def test_nested_group_conflicting_with_flat_key_fails_closed():
+    with pytest.raises(ValueError, match="Conflicting configuration values"):
+        canonicalize_training_config(
+            {
+                "train_options": {
+                    "use_ddp": False,
+                    "distributed": {"use_ddp": True},
+                }
+            },
+            warn_deprecated=False,
+        )
+
+
+def test_nested_group_matching_flat_key_is_accepted():
+    canonical = canonicalize_training_config(
+        {
+            "train_options": {
+                "save_freq": 25,
+                "checkpoint": {"save_freq": 25, "max_ckpt": 8},
+            }
+        },
+        warn_deprecated=False,
+    )["train_options"]
+    assert canonical["save_freq"] == 25
+    assert canonical["max_ckpt"] == 8
+    assert "checkpoint" not in canonical
+
+
+def test_flatten_train_option_groups_is_idempotent():
+    once = canonicalize_training_config(
+        {"train_options": {"distributed": {"use_ddp": True}}},
+        warn_deprecated=False,
+    )
+    twice = canonicalize_training_config(once, warn_deprecated=False)
+    assert twice == once
+    assert twice["train_options"]["use_ddp"] is True
+    assert "distributed" not in twice["train_options"]
+
+
+# --------------------------------------------------------------------------
+# (1) Unified alias-migration registry + one FutureWarning per used legacy key.
+# --------------------------------------------------------------------------
+def test_alias_registry_engine_applies_rename_rows_generically():
+    from dptb.configuration import _apply_alias_registry, _AliasHit, _Rename
+
+    container = {"legacy_a": 1, "legacy_b": 2, "canon_c": 3}
+    changes: list = []
+    _apply_alias_registry(
+        container,
+        [
+            _Rename("canon_a", ("legacy_a",), "9.9"),
+            _Rename("canon_b", "legacy_b", "9.9"),
+        ],
+        changes=changes,
+    )
+    assert container == {"canon_a": 1, "canon_b": 2, "canon_c": 3}
+    assert {hit.legacy for hit in changes} == {"legacy_a", "legacy_b"}
+    assert all(isinstance(hit, _AliasHit) for hit in changes)
+    assert all(hit.removal_version == "9.9" for hit in changes)
+
+
+def test_every_canonicalizer_is_backed_by_a_registry_of_alias_rules():
+    from dptb.configuration import (
+        _AliasRule,
+        _EMBEDDING_REGISTRY,
+        _FLOW_REGISTRY,
+        _PREDICTION_REGISTRY,
+        _TRAIN_ENDPOINT_REGISTRY,
+    )
+
+    for registry in (
+        _FLOW_REGISTRY,
+        _EMBEDDING_REGISTRY,
+        _PREDICTION_REGISTRY,
+        _TRAIN_ENDPOINT_REGISTRY,
+    ):
+        assert len(registry) >= 1
+        assert all(isinstance(rule, _AliasRule) for rule in registry)
+
+
+def test_emit_alias_warnings_is_one_per_legacy_key():
+    from dptb.configuration import _AliasHit, _emit_alias_warnings
+
+    hits = [
+        _AliasHit("dup_key", "canon", "2.3"),
+        _AliasHit("dup_key", "canon", "2.3"),
+        _AliasHit("other_key", "canon", "2.3"),
+    ]
+    with pytest.warns(FutureWarning) as record:
+        _emit_alias_warnings(hits, enabled=True)
+    messages = [str(w.message) for w in record]
+    assert len(messages) == 2
+    assert sum("'dup_key'" in m for m in messages) == 1
+    assert sum("'other_key'" in m for m in messages) == 1
+
+
+def test_legacy_flow_aliases_resolve_and_warn_once_per_key():
+    with pytest.warns(FutureWarning) as record:
+        out = canonicalize_flow_options(
+            {"overlap_huckel_k": 9.0, "dftb_skdata": "sentinel"},
+            warn_deprecated=True,
+        )
+    assert out["huckel_k"] == pytest.approx(9.0)
+    assert out["prior_skdata"] == "sentinel"
+    assert "overlap_huckel_k" not in out
+    assert "dftb_skdata" not in out
+
+    messages = [str(w.message) for w in record if w.category is FutureWarning]
+    assert sum("'overlap_huckel_k'" in m for m in messages) == 1
+    assert sum("'dftb_skdata'" in m for m in messages) == 1
+    # Each deprecation names the removal version.
+    assert all("2.3" in m for m in messages)
+
+
+def test_endpoint_truth_table_alias_warns_once_per_key():
+    with pytest.warns(FutureWarning) as record:
+        canonical = canonicalize_training_config(
+            {
+                "train_options": {
+                    "log_single_model_compatible_loss": False,
+                    "log_single_model_compatible_loss_mode": "reduce",
+                }
+            },
+            warn_deprecated=True,
+        )["train_options"]
+    # Truth table preserved: enabled=False forces full_forward regardless of mode.
+    assert canonical["endpoint_loss_mode"] == "full_forward"
+
+    messages = [str(w.message) for w in record if w.category is FutureWarning]
+    assert sum("'log_single_model_compatible_loss'" in m for m in messages) == 1
+    assert sum("'log_single_model_compatible_loss_mode'" in m for m in messages) == 1
+
+
+def test_warn_deprecated_false_emits_no_warnings():
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")  # any warning becomes an error
+        out = canonicalize_flow_options(
+            {"overlap_huckel_k": 9.0, "strict_h0": True},
+            warn_deprecated=False,
+        )
+    assert out["huckel_k"] == pytest.approx(9.0)
+    assert out["missing_h0_policy"] == "error"

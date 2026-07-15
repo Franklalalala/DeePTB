@@ -797,9 +797,167 @@ def train_options():
         self_consistency_options(),
     ]
 
+    # ================= typed nested input groups (PR-F) =================
+    # Optional organizational groups that mirror a subset of the flat
+    # train_options keys above, so a config can be written by concern instead
+    # of as one ~100-key flat block. Each group is declared WITHOUT a default,
+    # so dargs never injects an empty group into a purely flat config (see
+    # Argument._assign_default: injection is skipped when default is _Flags.NONE).
+    # The nested form is flattened back onto the *identical* flat keys in
+    # dptb.configuration.canonicalize_training_config, which runs BEFORE dargs
+    # inserts defaults; the trainer keeps reading the flat keys unchanged.
+    #
+    # Note on `optimizer`: the optimizer surface is already a typed nested group
+    # (`optimizer` + `lr_scheduler`, each with sub_variants), so it is not
+    # re-wrapped here -- adding a second top-level `optimizer` key would collide
+    # with, and clobber, the existing optimizer dict field.
+    args = args + train_option_groups(args)
+
     doc_train_options = "Options that define the training behaviour of DeePTB, including optimizer/scheduler, expert split, distributed expert-parallel execution, debugging and profiling."
 
     return Argument("train_options", dict, sub_fields=args, sub_variants=[], optional=True, doc=doc_train_options)
+
+
+# Membership of the typed nested train_options groups (PR-F). Every name must
+# be a flat train_options key; each group hoists onto the identical flat keys.
+TRAIN_OPTION_GROUP_MEMBERS = {
+    "runtime": [
+        "cudnn_benchmark",
+        "allow_tf32",
+        "float32_matmul_precision",
+        "precompute_lem_active_edges",
+        "precompute_lem_cutoff_coeffs",
+        "cuda_launch_blocking",
+        "train_num_workers",
+        "ref_num_workers",
+        "val_num_workers",
+        "data_pin_memory",
+        "data_persistent_workers",
+        "data_prefetch_factor",
+    ],
+    "distributed": [
+        "use_ddp",
+        "ddp_backend",
+        "ddp_master_addr",
+        "ddp_master_port",
+        "ddp_timeout_sec",
+        "expert_data_parallel_size",
+        "expert_dp_size",
+        "parallel_multi",
+        "distributed_rank0_prepare_batch",
+        "sync_expert_dp_buffers",
+        "expert_dp_backend",
+        "expert_dp_use_ddp",
+        "expert_dp_batch_size_semantics",
+        "expert_dp_train_batch_size_semantics",
+        "expert_dp_ref_batch_size_semantics",
+        "expert_dp_val_batch_size_semantics",
+        "expert_dp_train_sampler_drop_last",
+        "expert_dp_ref_sampler_drop_last",
+        "expert_dp_val_sampler_drop_last",
+        "expert_dp_ddp_static_graph",
+        "expert_dp_ddp_gradient_as_bucket_view",
+        "expert_dp_ddp_find_unused_parameters",
+        "expert_dp_ddp_broadcast_buffers",
+        "expert_dp_ddp_bucket_cap_mb",
+        "expert_dp_grad_sync_mode",
+        "expert_dp_grad_check_mode",
+        "expert_dp_grad_bucket_mb",
+        "expert_dp_buffer_sync_mode",
+        "expert_dp_buffer_bucket_mb",
+        "ddp_debug_detail",
+        "nccl_debug",
+        "nccl_debug_level",
+        "nccl_async_error_handling",
+    ],
+    "checkpoint": [
+        "save_freq",
+        "max_ckpt",
+    ],
+    "observers": [
+        "monitor_flag",
+        "monitor_param_dynamics",
+        "monitor_param_dynamics_freq",
+        "monitor_param_dynamics_tensorboard",
+        "monitor_param_dynamics_dead_patience",
+        "monitor_param_dynamics_delta_eps",
+        "monitor_param_dynamics_grad_eps",
+        "monitor_param_dynamics_delta_norm_dead_threshold",
+        "monitor_param_dynamics_grad_norm_dead_threshold",
+        "monitor_gated_edge_attention",
+        "monitor_gated_edge_attention_freq",
+        "monitor_gated_edge_attention_tensorboard",
+        "monitor_gated_edge_attention_heatmap",
+        "monitor_gated_edge_attention_heatmap_size",
+        "use_tensorboard",
+        "monitor_cuda_memory",
+        "monitor_cuda_cache_memory",
+        "monitor_cuda_cache_memory_sync",
+        "monitor_cuda_cache_memory_min_delta_mb",
+        "monitor_cuda_cache_events",
+        "monitor_cuda_cache_event_summary_interval",
+        "monitor_cuda_module_memory",
+        "monitor_cuda_module_memory_sync",
+        "monitor_cuda_module_memory_min_delta_mb",
+        "debug_tags",
+        "debug_tag_freq",
+        "debug_tag_cuda_mem",
+        "debug_tag_cuda_sync",
+        "debug_tag_reset_peak",
+        "debug_oom_dump",
+        "debug_profile",
+        "debug_profile_start_iter",
+        "debug_profile_end_iter",
+        "debug_profile_dir",
+    ],
+    "physical_prior": [
+        "flow_options",
+        "self_consistency",
+    ],
+}
+
+TRAIN_OPTION_GROUP_DOCS = {
+    "runtime": "Optional grouping of runtime/performance and DataLoader knobs. "
+               "Mirrors the identical flat train_options keys; normalized back to flat.",
+    "distributed": "Optional grouping of DDP / expert-data-parallel and NCCL knobs. "
+                   "Mirrors the identical flat train_options keys; normalized back to flat.",
+    "checkpoint": "Optional grouping of checkpoint save/retention knobs. "
+                  "Mirrors the identical flat train_options keys; normalized back to flat.",
+    "observers": "Optional grouping of monitors, TensorBoard, debug tags and profiler knobs. "
+                 "Mirrors the identical flat train_options keys; normalized back to flat.",
+    "physical_prior": "Optional grouping of the physical-prior machinery "
+                      "(flow_options + self_consistency). Mirrors the identical flat "
+                      "train_options keys; normalized back to flat.",
+}
+
+
+def train_option_groups(flat_args):
+    """Build the optional nested train_options groups from the flat Argument list.
+
+    Each group reuses the *same* flat Argument instances (dargs only reads
+    sub_fields during normalize/check, so sharing is safe) so the nested schema
+    can never drift from the flat one.
+    """
+    by_name = {arg.name: arg for arg in flat_args}
+    groups = []
+    for group_name, members in TRAIN_OPTION_GROUP_MEMBERS.items():
+        try:
+            sub_fields = [by_name[name] for name in members]
+        except KeyError as exc:  # pragma: no cover - guards schema drift
+            raise KeyError(
+                f"train_options group {group_name!r} references unknown flat key {exc}."
+            ) from exc
+        groups.append(
+            Argument(
+                group_name,
+                dict,
+                optional=True,
+                sub_fields=sub_fields,
+                sub_variants=[],
+                doc=TRAIN_OPTION_GROUP_DOCS[group_name],
+            )
+        )
+    return groups
 
 
 def test_options():
