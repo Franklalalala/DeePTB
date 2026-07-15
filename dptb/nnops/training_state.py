@@ -31,7 +31,13 @@ log = logging.getLogger(__name__)
 # reader must branch on.  v2 introduces the ``training_state``/``plugin_state``
 # blocks and the ``checkpoint_kind`` discriminator.  Absent/`< 2` means the
 # historical flat shape.
-CHECKPOINT_SCHEMA_VERSION = 2
+# v3 fixes the global-step semantics: ``iteration``/``global_step`` store the
+# LAST COMPLETED optimizer step for BOTH checkpoint kinds (epoch checkpoints
+# previously stored the post-increment counter, so restart's uniform ``+1``
+# skipped one global-step value). Restart resumes at ``global_step + 1`` for
+# every kind; checkpoints written with schema < 3 keep their historical
+# resume numbering (parity — no silent renumbering of old runs).
+CHECKPOINT_SCHEMA_VERSION = 3
 
 # Discriminates a mid-epoch (iteration) checkpoint, whose epoch is *not*
 # committed and must be re-entered, from an epoch-boundary checkpoint whose

@@ -811,8 +811,16 @@ class Saver(Plugin, StatefulPlugin):
             kind == CHECKPOINT_KIND_EPOCH
             and not bool(getattr(trainer, "update_lr_per_iter", False))
         )
+        # Schema >=3 canonical semantics: global_step == LAST COMPLETED optimizer
+        # step for BOTH kinds; restart resumes at global_step + 1. Saver.iteration
+        # fires before trainer.iter increments (iter == the step just committed),
+        # but Saver.epoch fires after the whole loop, when iter has already been
+        # advanced past the last step — store iter-1 there or an epoch resume
+        # skips one global-step value (LR/warmup/cadence all keyed off it).
+        current_iter = int(getattr(trainer, "iter", 1))
+        last_completed = current_iter - 1 if kind == CHECKPOINT_KIND_EPOCH else current_iter
         ts = TrainingState(
-            global_step=int(getattr(trainer, "iter", 1)),
+            global_step=last_completed,
             epoch=int(getattr(trainer, "ep", 1)),
             batch_in_epoch=int(getattr(trainer, "_batch_in_epoch", 0)),
             checkpoint_kind=kind,
@@ -843,11 +851,13 @@ class Saver(Plugin, StatefulPlugin):
             "model_state_dict": model_state,
             "task": self.trainer.task,
             "epoch": self.trainer.ep,
-            "iteration": self.trainer.iter,
             "stats": self.trainer.stats,
         }
         training_state = self._build_training_state_blob(kind)
         obj["training_state"] = training_state
+        # Single source of truth: the flat legacy key mirrors training_state's
+        # canonical last-completed-step, so old and new readers agree.
+        obj["iteration"] = int(training_state.get("global_step", self.trainer.iter))
         # Top-level mirror keeps the legacy reader trivially able to find plugin
         # state even if it never learns the training_state schema.
         obj["plugin_state"] = training_state.get("plugin_state", {})

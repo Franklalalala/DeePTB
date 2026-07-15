@@ -725,3 +725,44 @@ def test_new_checkpoint_carries_schema_and_training_state(tmp_path):
     assert ts["batch_in_epoch"] == 2  # both batches committed
     assert "rng_state" in ts
     assert saver._plugin_id in saved["plugin_state"]
+
+
+def test_epoch_checkpoint_stores_last_completed_step_and_resume_parity(tmp_path, monkeypatch):
+    # Schema v3 semantics: BOTH checkpoint kinds store the LAST COMPLETED
+    # optimizer step, so restart's uniform `stored + 1` resumes at exactly the
+    # next step. Previously the epoch path stored the post-increment counter
+    # (next step) and restart's +1 skipped one global-step value, shifting
+    # everything keyed off trainer.iter (warmup, cadence, logging).
+    n_batches = 3
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+
+    # Uninterrupted reference: iter after epoch 1 (3 batches, started at 1).
+    ref = _make_trainer(tmp_path, n_batches=n_batches)
+    ref.run(epochs=1)
+    ref_next_step = ref.iter  # == n_batches + 1
+
+    original = _make_trainer(tmp_path, n_batches=n_batches)
+    saver = Saver(interval=[(1, "epoch")])
+    original.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+    original.run(epochs=1)
+
+    ckpt = torch.load(str(ckpt_dir / "probe.latest.pth"),
+                      map_location="cpu", weights_only=False)
+    # Stored value = last completed step (3), NOT the post-increment counter (4).
+    assert ckpt["iteration"] == n_batches
+    assert ckpt["training_state"]["global_step"] == n_batches
+    assert ckpt["checkpoint_schema_version"] >= 3
+
+    def fake_build_model(checkpoint_path, model_options, common_options, **kwargs):
+        return TinyModel()
+
+    monkeypatch.setattr(trainer_mod, "build_model", fake_build_model)
+    resumed = ProbeTrainer.restart(
+        str(ckpt_dir / "probe.latest.pth"),
+        train_datasets=list(range(n_batches)),
+        train_options={"max_ckpt": 50, "update_lr_per_iter": False},
+        common_options={"device": "cpu", "dtype": "float32"},
+    )
+    # Resumed next global step identical to the uninterrupted run: no skip.
+    assert resumed.iter == ref_next_step

@@ -31,6 +31,43 @@ def _contract_cg_rme(cg_basis: torch.Tensor, rme2: torch.Tensor) -> torch.Tensor
     return torch.einsum("nrc,ijr->ncij", rme2, cg_basis)
 
 
+def _migrate_plain_tensor_state(module, fn):
+    """Apply ``nn.Module._apply``'s fn to tensors living outside parameters/buffers.
+
+    The E3/SK Hamiltonian classes keep their CG/SK basis tensors in plain dicts
+    (``cgbasis``/``skbasis``/``soc_base_matrix``) and allocate work tensors on
+    ``self.device`` inside forward(). ``.to()``/``.cuda()``/``.float()`` only
+    migrate parameters and buffers, so an expert moved after construction
+    (multi-GPU expert placement calls ``expert.to(cuda_i)``) would otherwise
+    contract CUDA activations against CPU basis tensors and crash. Migrating
+    here (instead of registering buffers) keeps ``state_dict()`` keys unchanged
+    so existing checkpoints still load.
+    """
+    for attr in ("cgbasis", "skbasis", "soc_base_matrix"):
+        d = getattr(module, attr, None)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if torch.is_tensor(v):
+                    d[k] = fn(v)
+    for attr in ("oyzx2spin",):  # plain tensor attributes (SOC spin transform)
+        v = getattr(module, attr, None)
+        if torch.is_tensor(v):
+            setattr(module, attr, fn(v))
+    probe = None
+    for attr in ("cgbasis", "skbasis"):
+        d = getattr(module, attr, None)
+        if isinstance(d, dict):
+            probe = next((v for v in d.values() if torch.is_tensor(v)), None)
+            if probe is not None:
+                break
+    if probe is not None:
+        module.device = probe.device
+        if probe.is_floating_point():
+            module.dtype = probe.dtype
+            if hasattr(module, "cdtype"):
+                module.cdtype = float2comlex(module.dtype)
+
+
 class E3Hamiltonian(torch.nn.Module):
     def __init__(
         self,
@@ -346,6 +383,13 @@ class E3Hamiltonian(torch.nn.Module):
 
         return data
 
+    def _apply(self, fn, recurse=True):
+        # Keep plain-dict basis tensors + self.device/dtype in step with
+        # .to()/.cuda()/.float() (see _migrate_plain_tensor_state).
+        module = super()._apply(fn, recurse)
+        _migrate_plain_tensor_state(self, fn)
+        return module
+
     def forward(self, data):
         self._forward_calls += 1
 
@@ -514,8 +558,9 @@ class E3Hamiltonian(torch.nn.Module):
 
 class SKHamiltonian_old(torch.nn.Module):
     # transform SK parameters to SK hamiltonian with E3 CG basis, strain is included.
+    # NOTE: kept as a reference implementation; not referenced by production code.
     def __init__(
-        self, 
+        self,
         basis: Dict[str, Union[str, list]]=None,
         idp_sk: Union[OrbitalMapper, None]=None,
         dtype: Union[str, torch.dtype] = torch.float32, 
@@ -527,7 +572,7 @@ class SKHamiltonian_old(torch.nn.Module):
         soc: bool = False,
         **kwargs,
         ) -> None:
-        super(SKHamiltonian, self).__init__()
+        super(SKHamiltonian_old, self).__init__()
 
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
@@ -601,6 +646,13 @@ class SKHamiltonian_old(torch.nn.Module):
                 'd':get_soc_matrix_cubic_basis(orbital='d', device=self.device, dtype=self.dtype)
             }
             self.cdtype =  float2comlex(self.dtype)
+
+    def _apply(self, fn, recurse=True):
+        # Keep plain-dict basis tensors + self.device/dtype in step with
+        # .to()/.cuda()/.float() (see _migrate_plain_tensor_state).
+        module = super()._apply(fn, recurse)
+        _migrate_plain_tensor_state(self, fn)
+        return module
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         # transform sk parameters to irreducible matrix element
@@ -808,6 +860,13 @@ class SKHamiltonian(torch.nn.Module):
                 'd':get_soc_matrix_cubic_basis(orbital='d', device=self.device, dtype=self.dtype)
             }
             self.cdtype =  float2comlex(self.dtype)
+
+    def _apply(self, fn, recurse=True):
+        # Keep plain-dict basis tensors + self.device/dtype in step with
+        # .to()/.cuda()/.float() (see _migrate_plain_tensor_state).
+        module = super()._apply(fn, recurse)
+        _migrate_plain_tensor_state(self, fn)
+        return module
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         # transform sk parameters to irreducible matrix element
