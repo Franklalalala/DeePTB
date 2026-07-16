@@ -39,6 +39,7 @@ from dptb.nnops.objective import Objective, FlowObjective
 from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
+    preflight_restart_checkpoint,
     read_resume_metadata,
     resolve_rank_rng_state,
     restore_rng_state,
@@ -3491,10 +3492,8 @@ class MultiTrainer(Trainer):
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
                 validation_datasets=None, distributed_expert=False, rank=0, world_size=1):
-        map_loc = "cpu" if distributed_expert else (
-            common_options["device"] if len(common_options) > 0 and "device" in common_options else "cpu"
-        )
-        ckpt = torch.load(checkpoint, map_location=map_loc, weights_only=False)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        preflight_restart_checkpoint(checkpoint, ckpt, trainer_kind="multi_trainer")
 
         ckpt_train_options = migrate_legacy_checkpoint_train_options(
             ckpt["config"].get("train_options", {})

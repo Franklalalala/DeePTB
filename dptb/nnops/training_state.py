@@ -21,6 +21,8 @@ flat shape (top-level ``epoch``/``iteration``/``stats`` with no
 from __future__ import annotations
 
 import logging
+import json
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -44,6 +46,8 @@ CHECKPOINT_SCHEMA_VERSION = 3
 # epoch is committed and whose per-epoch LR step is still pending at save time.
 CHECKPOINT_KIND_ITERATION = "iteration"
 CHECKPOINT_KIND_EPOCH = "epoch"
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -227,6 +231,134 @@ def read_resume_metadata(ckpt: Dict[str, Any]) -> TrainingState:
         rng_state=ckpt.get("rng_state"),
         plugin_state=ckpt.get("plugin_state", {}) or {},
         schema_version=int(ckpt.get("checkpoint_schema_version", 0)),
+    )
+
+
+def _read_sibling_manifest(checkpoint: str) -> Dict[str, Any]:
+    path = os.path.join(os.path.dirname(os.path.abspath(checkpoint)),
+                        "checkpoint_manifest.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _manifest_entry_for_checkpoint(
+    checkpoint: str, manifest: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    basename = os.path.basename(os.fspath(checkpoint))
+    target = basename
+    if basename == manifest.get("latest"):
+        target = manifest.get("latest_target") or target
+    elif basename == manifest.get("best"):
+        target = manifest.get("best_target") or target
+    elif basename == manifest.get("latest_resumable"):
+        target = manifest.get("latest_resumable_target") or target
+    for entry in manifest.get("entries", []):
+        if isinstance(entry, dict) and entry.get("filename") == target:
+            return entry
+    return None
+
+
+def _infer_latest_resumable_path(
+    checkpoint: str, manifest: Dict[str, Any]
+) -> Optional[str]:
+    directory = os.path.dirname(os.path.abspath(checkpoint))
+    pointer = manifest.get("latest_resumable")
+    if pointer:
+        candidate = os.path.join(directory, os.path.basename(pointer))
+        if os.path.exists(candidate):
+            return candidate
+
+    basename = os.path.basename(os.fspath(checkpoint))
+    stem = basename
+    for marker in (".latest.pth", ".best.pth", ".iter", ".ep"):
+        if marker in stem:
+            stem = stem.split(marker, 1)[0]
+            break
+    candidate = os.path.join(directory, stem + ".latest_resumable.pth")
+    return candidate if os.path.exists(candidate) else None
+
+
+def preflight_restart_checkpoint(
+    checkpoint: str,
+    ckpt: Dict[str, Any],
+    *,
+    trainer_kind: str,
+) -> None:
+    """Reject a known-inexact iteration restart before model construction.
+
+    New checkpoints persist ``resume_capability``. Legacy checkpoints that lack
+    it remain tolerated: single-Trainer restart defers to its runtime loader
+    check, preserving old compatibility. MultiTrainer has no exact mid-epoch
+    fast-forward and can therefore decide from ``checkpoint_kind`` alone.
+    """
+    resume = read_resume_metadata(ckpt)
+    if resume.checkpoint_kind != CHECKPOINT_KIND_ITERATION:
+        return
+    if os.environ.get("DPTB_ALLOW_INEXACT_RESUME", "").strip().lower() in _TRUE_ENV_VALUES:
+        return
+
+    manifest = _read_sibling_manifest(os.fspath(checkpoint))
+    entry = _manifest_entry_for_checkpoint(os.fspath(checkpoint), manifest)
+    capability = ckpt.get("resume_capability")
+    if capability is None and entry is not None:
+        capability = entry.get("resume_capability")
+
+    is_multi = str(trainer_kind).lower() in {"multi", "multitrainer", "multi_trainer"}
+    if not is_multi and capability in (None, "exact"):
+        # Missing is a legacy checkpoint: do not invent a new incompatibility.
+        return
+
+    alternative = _infer_latest_resumable_path(os.fspath(checkpoint), manifest)
+    alternative_step = None
+    if alternative is not None:
+        target = manifest.get("latest_resumable_target")
+        for candidate_entry in manifest.get("entries", []):
+            if (
+                isinstance(candidate_entry, dict)
+                and target
+                and candidate_entry.get("filename") == target
+            ):
+                alternative_step = candidate_entry.get("last_completed_step")
+                break
+        if alternative_step is None:
+            try:
+                import torch
+                alternative_ckpt = torch.load(
+                    alternative, map_location="cpu", weights_only=False
+                )
+                alternative_step = read_resume_metadata(alternative_ckpt).global_step
+            except Exception:
+                alternative_step = None
+
+    rollback = None
+    if alternative_step is not None:
+        rollback = max(int(resume.global_step) - int(alternative_step), 0)
+
+    reason = (
+        "MultiTrainer has no exact mid-epoch fast-forward"
+        if is_multi
+        else f"checkpoint resume_capability={capability!r}"
+    )
+    if alternative is not None:
+        rollback_text = (
+            f"; rolls back {rollback} optimizer step(s)"
+            if rollback is not None else ""
+        )
+        fallback = (
+            f"Nearest committed fallback: {alternative}{rollback_text}.\n"
+            f"Retry with:\n--restart \"{alternative}\""
+        )
+    else:
+        fallback = "No latest_resumable checkpoint is available in the same directory."
+    raise RuntimeError(
+        "Restart preflight rejected this iteration checkpoint before model "
+        f"construction: {reason}.\n{fallback}\n"
+        "Set DPTB_ALLOW_INEXACT_RESUME=1 only to explicitly accept replaying "
+        "already-committed optimizer steps."
     )
 
 

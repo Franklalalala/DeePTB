@@ -33,6 +33,7 @@ from dptb.nnops.self_consistency import (
 from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
+    preflight_restart_checkpoint,
     read_resume_metadata,
     resolve_rank_rng_state,
     restore_rng_state,
@@ -852,9 +853,10 @@ class Trainer(BaseTrainer):
         common_options = {} if common_options is None else common_options
         ckpt = torch.load(
             checkpoint,
-            map_location=common_options.get("device") or "cpu",
+            map_location="cpu",
             weights_only=False,
         )
+        preflight_restart_checkpoint(checkpoint, ckpt, trainer_kind="trainer")
         ckpt_train_options = migrate_legacy_checkpoint_train_options(
             ckpt["config"]["train_options"]
         )

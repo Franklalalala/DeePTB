@@ -54,8 +54,13 @@ class Saver(Plugin, StatefulPlugin):
         self.best_loss = 1e7
         self.best_quene = []
         self.latest_quene = []
+        self.epoch_quene = []
         self._last_iteration_checkpoint_name = None
         self._last_iteration_checkpoint_iter = None
+        self._latest_checkpoint_name = None
+        self._best_checkpoint_name = None
+        self._latest_resumable_checkpoint_name = None
+        self._pending_manifest_entries = {}
         self._profile_save_name = None
         # Set True once load_state_dict restores persisted best/retention state
         # (BUG 2): prevents register() from re-seeding best_loss from disk and
@@ -72,6 +77,7 @@ class Saver(Plugin, StatefulPlugin):
             "best_loss": float(self.best_loss),
             "best_quene": list(self.best_quene),
             "latest_quene": list(self.latest_quene),
+            "epoch_quene": list(self.epoch_quene),
             "last_iteration_checkpoint_name": self._last_iteration_checkpoint_name,
             "last_iteration_checkpoint_iter": self._last_iteration_checkpoint_iter,
         }
@@ -85,6 +91,8 @@ class Saver(Plugin, StatefulPlugin):
             self.best_quene = list(state["best_quene"])
         if isinstance(state.get("latest_quene"), list):
             self.latest_quene = list(state["latest_quene"])
+        if isinstance(state.get("epoch_quene"), list):
+            self.epoch_quene = list(state["epoch_quene"])
         self._last_iteration_checkpoint_name = state.get(
             "last_iteration_checkpoint_name", self._last_iteration_checkpoint_name
         )
@@ -121,6 +129,22 @@ class Saver(Plugin, StatefulPlugin):
                     self.best_quene = list(manifest["best_quene"])
                 if isinstance(manifest.get("latest_quene"), list):
                     self.latest_quene = list(manifest["latest_quene"])
+                if isinstance(manifest.get("epoch_quene"), list):
+                    self.epoch_quene = list(manifest["epoch_quene"])
+                def _checkpoint_name(target):
+                    if isinstance(target, str) and target.endswith(".pth"):
+                        return target[:-4]
+                    return target
+
+                self._latest_checkpoint_name = _checkpoint_name(
+                    manifest.get("latest_target")
+                )
+                self._best_checkpoint_name = _checkpoint_name(
+                    manifest.get("best_target")
+                )
+                self._latest_resumable_checkpoint_name = _checkpoint_name(
+                    manifest.get("latest_resumable_target")
+                )
                 return
             except (TypeError, ValueError):
                 pass
@@ -246,6 +270,18 @@ class Saver(Plugin, StatefulPlugin):
         if not self._is_main():
             return
         model_name = getattr(getattr(self.trainer, "model", None), "name", None)
+        previous = self._read_manifest() or {}
+        entries_by_name = {
+            entry.get("filename"): dict(entry)
+            for entry in previous.get("entries", [])
+            if isinstance(entry, dict) and entry.get("filename")
+        }
+        entries_by_name.update(
+            {
+                entry["filename"]: dict(entry)
+                for entry in self._pending_manifest_entries.values()
+            }
+        )
         manifest = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "global_step": int(getattr(self.trainer, "iter", 1)),
@@ -253,8 +289,31 @@ class Saver(Plugin, StatefulPlugin):
             "best_loss": float(self.best_loss),
             "best": (model_name + ".best.pth") if model_name else None,
             "latest": (model_name + ".latest.pth") if model_name else None,
+            "latest_resumable": (
+                model_name + ".latest_resumable.pth" if model_name else None
+            ),
+            "best_target": (
+                self._best_checkpoint_name + ".pth"
+                if self._best_checkpoint_name else None
+            ),
+            "latest_target": (
+                self._latest_checkpoint_name + ".pth"
+                if self._latest_checkpoint_name else None
+            ),
+            "latest_resumable_target": (
+                self._latest_resumable_checkpoint_name + ".pth"
+                if self._latest_resumable_checkpoint_name else None
+            ),
             "best_quene": list(self.best_quene),
             "latest_quene": list(self.latest_quene),
+            "epoch_quene": list(self.epoch_quene),
+            "entries": sorted(
+                entries_by_name.values(),
+                key=lambda entry: (
+                    int(entry.get("last_completed_step", -1)),
+                    str(entry.get("filename", "")),
+                ),
+            ),
         }
         path = self._manifest_path()
         tmp_path = f"{path}.tmp{os.getpid()}"
@@ -762,6 +821,7 @@ class Saver(Plugin, StatefulPlugin):
                 if not os.path.exists(latest_ckpt_abs_path):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
                 self._atomic_publish(latest_ckpt_abs_path, latest_symlink)
+                self._latest_checkpoint_name = name
             self._write_manifest(strict=True)
             self._gc_checkpoint_best_effort(delete_name)
 
@@ -782,60 +842,87 @@ class Saver(Plugin, StatefulPlugin):
             updated_loss = self.trainer.stats.get("train_loss").get("epoch_mean", 1e6)
 
         max_ckpt = self.trainer.train_options["max_ckpt"]
+        configured_max_epoch = self.trainer.train_options.get("max_epoch_ckpt")
+        max_epoch_ckpt = (
+            max_ckpt if configured_max_epoch is None else int(configured_max_epoch)
+        )
+        is_new_best = updated_loss < self.best_loss
+        suffix = ".ep{}".format(self.trainer.ep)
+        name = self.trainer.model.name + suffix
 
-        if updated_loss < self.best_loss:
+        best_delete_name = None
+        if is_new_best:
             # Commit the new best BEFORE saving so the harvested Saver state in
             # this very checkpoint persists the updated best_loss (otherwise a
             # resume would restore the stale, higher best and could treat a
             # worse later epoch as best) (BUG 2).
             self.best_loss = updated_loss
-            suffix = ".ep{}".format(self.trainer.ep)
-            name = self.trainer.model.name + suffix
             self.best_quene.append(name)
-
-            delete_name = None
             if len(self.best_quene) > max_ckpt:
-                delete_name = self.best_quene.pop(0)
+                best_delete_name = self.best_quene.pop(0)
 
-            # The epoch-best checkpoint is ALWAYS written fresh with
-            # kind=CHECKPOINT_KIND_EPOCH. An earlier optimization reused (byte-
-            # copied) the last *iteration* checkpoint here to save one
-            # re-serialization, but that file embeds checkpoint_kind='iteration'
-            # and the pre-epoch Saver best_loss. best.pth/latest.pth pointing at
-            # such a copy made a restart mislabel a committed epoch boundary as
-            # mid-epoch (re-running the whole epoch, skipping its per-epoch LR
-            # step) and restore a stale higher best_loss that could clobber the
-            # true best model. Correctness outweighs the once-per-best-epoch save.
-            self._save(
-                name=name,
-                model=self.trainer.model,
-                model_options=self.trainer.model.model_options,
-                common_options=self.trainer.common_options,
-                train_options=self.trainer.train_options,
-                kind=CHECKPOINT_KIND_EPOCH,
-            )
+        # Every completed epoch gets a committed checkpoint, independently of
+        # whether its metric improved the best gate.
+        self.epoch_quene.append(name)
+        epoch_delete_name = None
+        if len(self.epoch_quene) > max_epoch_ckpt:
+            epoch_delete_name = self.epoch_quene.pop(0)
 
-            def _publish_epoch_best():
+        self._save(
+            name=name,
+            model=self.trainer.model,
+            model_options=self.trainer.model.model_options,
+            common_options=self.trainer.common_options,
+            train_options=self.trainer.train_options,
+            kind=CHECKPOINT_KIND_EPOCH,
+        )
+
+        def _publish_epoch_committed():
+            epoch_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
+            epoch_ckpt_abs_path = os.path.abspath(epoch_ckpt)
+            if not os.path.exists(epoch_ckpt_abs_path):
+                raise FileNotFoundError(
+                    f"Source file {epoch_ckpt_abs_path} does not exist."
+                )
+
+            if is_new_best:
                 best_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".best.pth")
-                best_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
-                best_ckpt_abs_path = os.path.abspath(best_ckpt)
-                if not os.path.exists(best_ckpt_abs_path):
-                    raise FileNotFoundError(f"Source file {best_ckpt_abs_path} does not exist.")
-                self._atomic_publish(best_ckpt_abs_path, best_symlink)
+                self._atomic_publish(epoch_ckpt_abs_path, best_symlink)
+                self._best_checkpoint_name = name
 
                 if _env_flag("DPTB_SAVER_EPOCH_UPDATES_LATEST", True):
                     latest_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".latest.pth")
-                    self._atomic_publish(best_ckpt_abs_path, latest_symlink)
+                    self._atomic_publish(epoch_ckpt_abs_path, latest_symlink)
+                    self._latest_checkpoint_name = name
 
-                self._write_manifest(strict=True)
-                self._gc_checkpoint_best_effort(delete_name)
+            latest_resumable = os.path.join(
+                self.checkpoint_path,
+                self.trainer.model.name + ".latest_resumable.pth",
+            )
+            self._atomic_publish(epoch_ckpt_abs_path, latest_resumable)
+            self._latest_resumable_checkpoint_name = name
 
-            # Agreed publish phase (P0-4): all ranks share the outcome.
-            self._finalize_publish(_publish_epoch_best)
+            self._write_manifest(strict=True)
+            self._gc_checkpoint_best_effort(best_delete_name)
+            self._gc_checkpoint_best_effort(epoch_delete_name)
+
+        # Agreed publish phase (P0-4): all ranks share the outcome.
+        self._finalize_publish(_publish_epoch_committed)
 
     def _gc_checkpoint_best_effort(self, checkpoint_name):
         """Delete a rotated checkpoint only after pointer+manifest commit."""
         if checkpoint_name is None:
+            return
+        protected = set(self.best_quene + self.latest_quene + self.epoch_quene)
+        protected.update(
+            name for name in (
+                self._latest_checkpoint_name,
+                self._best_checkpoint_name,
+                self._latest_resumable_checkpoint_name,
+            )
+            if name is not None
+        )
+        if checkpoint_name in protected:
             return
         delete_path = os.path.join(self.checkpoint_path, checkpoint_name + ".pth")
         try:
@@ -886,6 +973,19 @@ class Saver(Plugin, StatefulPlugin):
         )
         return ts.state_dict()
 
+    def _resume_capability(self, kind):
+        """Classify this checkpoint without over-promising replay exactness."""
+        if kind == CHECKPOINT_KIND_EPOCH:
+            return "exact"
+        checker = getattr(self.trainer, "_loader_supports_exact_fast_forward", None)
+        if callable(checker):
+            try:
+                if checker():
+                    return "exact"
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("Could not determine iteration resume capability: %s", exc)
+        return "inexact_opt_in"
+
     def _assemble_checkpoint_obj(self, name, kind, model_options, common_options,
                                  train_options, model_state, opt_blocks,
                                  rank_states=None):
@@ -914,6 +1014,24 @@ class Saver(Plugin, StatefulPlugin):
         # Single source of truth: the flat legacy key mirrors training_state's
         # canonical last-completed-step, so old and new readers agree.
         obj["iteration"] = int(training_state.get("global_step", self.trainer.iter))
+        resume_capability = self._resume_capability(kind)
+        committed_epoch = (
+            int(training_state.get("epoch", self.trainer.ep))
+            if kind == CHECKPOINT_KIND_EPOCH
+            else max(int(training_state.get("epoch", self.trainer.ep)) - 1, 0)
+        )
+        world_size = int(getattr(self.trainer, "world_size", 1))
+        obj["resume_capability"] = resume_capability
+        obj["committed_epoch"] = committed_epoch
+        obj["world_size"] = world_size
+        self._pending_manifest_entries[name] = {
+            "filename": name + ".pth",
+            "checkpoint_kind": kind,
+            "resume_capability": resume_capability,
+            "last_completed_step": int(training_state["global_step"]),
+            "committed_epoch": committed_epoch,
+            "world_size": world_size,
+        }
         # Per-rank resume state (P0-3): restore prefers the own-rank entry over
         # the main-rank blob inside training_state.
         obj["rank_states"] = dict(rank_states or {})

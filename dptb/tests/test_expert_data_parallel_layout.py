@@ -531,6 +531,14 @@ def test_saver_uses_unwrapped_local_expert_state_dict_for_ddp_wrapped_expert():
     )
 
 
+def test_multi_restart_preflight_precedes_model_build():
+    trainer_text = _read_repo_text("dptb/nnops/multi_trainer.py")
+    restart = _method_source(trainer_text, "restart")
+    assert restart.index("preflight_restart_checkpoint(") < restart.index(
+        "model = build_model("
+    )
+
+
 def test_saver_collapses_replica_states_to_one_state_per_expert():
     text = _read_repo_text("dptb/plugins/saver.py")
 

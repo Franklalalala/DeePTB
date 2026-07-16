@@ -448,6 +448,10 @@ def train_options():
         "so the common default value `1` remains valid when expert_data_parallel_size > 1. Default: `1`"
     )
     doc_max_ckpt = "The maximum number of saved checkpoints, Default: `4`"
+    doc_max_epoch_ckpt = (
+        "The maximum number of committed epoch checkpoints. When omitted, "
+        "inherits max_ckpt."
+    )
     doc_distance_ranges = "The ranges split for distance-based MoE / expert parallelism. Default: `[[0.0, 1.0], [1.0, 2.0], [2.0, 4.0], [4.0, 6.0]]`"
 
     # ================= 分布式 / DDP / expert-parallel =================
@@ -707,6 +711,8 @@ def train_options():
         Argument("display_freq", int, optional=True, default=1, doc=doc_display_freq),
         Argument("use_tensorboard", bool, optional=True, default=False, doc=doc_use_tensorboard),
         Argument("max_ckpt", int, optional=True, default=4, doc=doc_max_ckpt),
+        Argument("max_epoch_ckpt", [int, None], optional=True, default=None,
+                 doc=doc_max_epoch_ckpt),
 
         # distributed / DDP
         Argument("use_ddp", bool, optional=True, default=False, doc=doc_use_ddp),
@@ -873,6 +879,7 @@ TRAIN_OPTION_GROUP_MEMBERS = {
     "checkpoint": [
         "save_freq",
         "max_ckpt",
+        "max_epoch_ckpt",
     ],
     "observers": [
         "monitor_flag",

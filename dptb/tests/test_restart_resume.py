@@ -344,6 +344,7 @@ def test_saver_state_dict_round_trip():
     s.best_loss = 0.123
     s.best_quene = ["probe.ep3"]
     s.latest_quene = ["probe.iter90", "probe.iter100"]
+    s.epoch_quene = ["probe.ep2", "probe.ep3"]
     blob = s.state_dict()
 
     s2 = Saver()
@@ -352,6 +353,7 @@ def test_saver_state_dict_round_trip():
     assert s2.best_loss == pytest.approx(0.123)
     assert s2.best_quene == ["probe.ep3"]
     assert s2.latest_quene == ["probe.iter90", "probe.iter100"]
+    assert s2.epoch_quene == ["probe.ep2", "probe.ep3"]
     assert s2._state_restored is True
 
 
@@ -529,8 +531,22 @@ def test_manifest_written_atomically_and_seeds_best_loss(tmp_path):
     assert manifest["schema_version"] == CHECKPOINT_SCHEMA_VERSION
     assert manifest["best"] == "probe.best.pth"
     assert manifest["latest"] == "probe.latest.pth"
+    assert manifest["latest_resumable"] == "probe.latest_resumable.pth"
     assert manifest["best_loss"] == pytest.approx(0.75)
     assert manifest["global_step"] >= 1
+    assert manifest["latest_resumable_target"] == "probe.ep1.pth"
+    entry = next(
+        item for item in manifest["entries"]
+        if item["filename"] == "probe.ep1.pth"
+    )
+    assert entry == {
+        "filename": "probe.ep1.pth",
+        "checkpoint_kind": CHECKPOINT_KIND_EPOCH,
+        "resume_capability": "exact",
+        "last_completed_step": 2,
+        "committed_epoch": 1,
+        "world_size": 1,
+    }
 
     # A legacy-style resume (no restored plugin_state) seeds best_loss from the
     # manifest cheaply, so a worse epoch cannot clobber best.
@@ -538,6 +554,7 @@ def test_manifest_written_atomically_and_seeds_best_loss(tmp_path):
     saver2 = Saver(interval=[(1, "epoch")])
     fresh.register_plugin(saver2, checkpoint_path=str(ckpt_dir))
     assert saver2.best_loss == pytest.approx(0.75)
+    assert saver2._latest_resumable_checkpoint_name == "probe.ep1"
 
 
 def test_epoch_best_checkpoint_is_epoch_kind_not_reused_iteration(tmp_path):
@@ -560,6 +577,87 @@ def test_epoch_best_checkpoint_is_epoch_kind_not_reused_iteration(tmp_path):
         str(ckpt_dir / "probe.best.pth"), map_location="cpu", weights_only=False
     )
     assert read_resume_metadata(best).checkpoint_kind == CHECKPOINT_KIND_EPOCH
+
+
+def test_every_epoch_is_committed_and_epoch_retention_rotates(tmp_path):
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(
+        tmp_path,
+        n_batches=1,
+        epoch_losses={1: 3.0, 2: 4.0, 3: 2.0, 4: 5.0},
+    )
+    trainer.train_options.update({"max_ckpt": 1, "max_epoch_ckpt": 2})
+    saver = Saver(interval=[(1, "epoch")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+    trainer.run(epochs=4)
+
+    # Epochs 2 and 4 are non-best but still produced committed checkpoints.
+    assert saver.epoch_quene == ["probe.ep3", "probe.ep4"]
+    assert not (ckpt_dir / "probe.ep1.pth").exists()
+    assert not (ckpt_dir / "probe.ep2.pth").exists()
+    assert (ckpt_dir / "probe.ep3.pth").exists()
+    assert (ckpt_dir / "probe.ep4.pth").exists()
+
+    resumable = torch.load(
+        str(ckpt_dir / "probe.latest_resumable.pth"),
+        map_location="cpu", weights_only=False,
+    )
+    assert resumable["epoch"] == 4
+    assert resumable["checkpoint_kind"] == CHECKPOINT_KIND_EPOCH
+    # Existing latest semantics remain best/iteration oriented: non-best epoch
+    # 4 does not replace the latest pointer published by best epoch 3.
+    latest = torch.load(
+        str(ckpt_dir / "probe.latest.pth"), map_location="cpu", weights_only=False
+    )
+    assert latest["epoch"] == 3
+
+
+def test_restart_preflight_reports_resumable_path_and_rollback_before_build(
+    tmp_path, monkeypatch
+):
+    import torch.utils.data as tud
+
+    monkeypatch.delenv("DPTB_ALLOW_INEXACT_RESUME", raising=False)
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(tmp_path, n_batches=1, epoch_losses={1: 1.0})
+    trainer.train_loader = tud.DataLoader(
+        list(range(1)), batch_size=1, shuffle=True
+    )
+    saver = Saver(interval=[(1, "iteration"), (1, "epoch")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+    trainer.run(epochs=1)
+
+    # Commit one step of epoch 2 without completing the epoch. latest now points
+    # at an inexact iteration checkpoint; latest_resumable remains epoch 1.
+    trainer._batch_in_epoch = 0
+    trainer.iteration(torch.tensor([0]))
+    latest_path = ckpt_dir / "probe.latest.pth"
+    latest = torch.load(str(latest_path), map_location="cpu", weights_only=False)
+    assert latest["resume_capability"] == "inexact_opt_in"
+
+    build_called = {"value": False}
+
+    def must_not_build(*args, **kwargs):
+        build_called["value"] = True
+        raise AssertionError("build_model must not run before restart preflight")
+
+    monkeypatch.setattr(trainer_mod, "build_model", must_not_build)
+    with pytest.raises(RuntimeError) as exc_info:
+        ProbeTrainer.restart(
+            str(latest_path),
+            train_datasets=[0],
+            train_options={"max_ckpt": 1},
+            common_options={"device": "cpu", "dtype": "float32"},
+        )
+
+    message = str(exc_info.value)
+    alternative = os.path.abspath(str(ckpt_dir / "probe.latest_resumable.pth"))
+    assert alternative in message
+    assert "rolls back 1 optimizer step(s)" in message
+    assert f'--restart "{alternative}"' in message
+    assert build_called["value"] is False
 
 
 def test_fallback_resume_resets_partial_epoch_stats(tmp_path, monkeypatch):
