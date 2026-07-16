@@ -28,6 +28,9 @@ from dptb.nnops.training_state import (
     CHECKPOINT_SCHEMA_VERSION,
     TrainingState,
     read_resume_metadata,
+    resolve_rank_rng_state,
+    validate_checkpoint_invariants,
+    validate_checkpoint_world_size,
 )
 
 
@@ -580,7 +583,8 @@ def test_manifest_written_atomically_and_seeds_best_loss(tmp_path):
     assert manifest["latest"] == "probe.latest.pth"
     assert manifest["latest_resumable"] == "probe.latest_resumable.pth"
     assert manifest["best_loss"] == pytest.approx(0.75)
-    assert manifest["global_step"] >= 1
+    assert manifest["step_semantics"] == "last_completed"
+    assert manifest["global_step"] == 2
     assert manifest["latest_resumable_target"] == "probe.ep1.pth"
     entry = next(
         item for item in manifest["entries"]
@@ -947,8 +951,6 @@ def test_checkpoint_carries_rank_states_and_restore_prefers_own_rank(tmp_path, m
     # P0-3: checkpoints persist per-rank RNG snapshots under rank_states; the
     # restore path prefers this process's own entry over the main-rank blob
     # inside training_state (which would correlate rank RNG streams).
-    from dptb.nnops.training_state import resolve_rank_rng_state
-
     ckpt_dir = tmp_path / "ck"
     ckpt_dir.mkdir()
     trainer = _make_trainer(tmp_path, n_batches=2)
@@ -972,6 +974,78 @@ def test_checkpoint_carries_rank_states_and_restore_prefers_own_rank(tmp_path, m
     assert resolve_rank_rng_state(legacy, resume) == resume.rng_state
 
 
+@pytest.mark.parametrize(
+    "top_field,nested_field,bad_value",
+    [
+        ("iteration", "global_step", 8),
+        ("epoch", "epoch", 3),
+        ("checkpoint_kind", "checkpoint_kind", CHECKPOINT_KIND_ITERATION),
+        ("checkpoint_schema_version", "schema_version", 2),
+    ],
+)
+def test_schema_v3_mirror_mismatch_raises(top_field, nested_field, bad_value):
+    nested = TrainingState(
+        global_step=7,
+        epoch=2,
+        checkpoint_kind=CHECKPOINT_KIND_EPOCH,
+    ).state_dict()
+    ckpt = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "iteration": 7,
+        "epoch": 2,
+        "checkpoint_kind": CHECKPOINT_KIND_EPOCH,
+        "training_state": nested,
+    }
+    if top_field == "checkpoint_schema_version":
+        ckpt[top_field] = CHECKPOINT_SCHEMA_VERSION
+        ckpt["training_state"][nested_field] = bad_value
+    else:
+        ckpt[top_field] = bad_value
+    with pytest.raises(RuntimeError, match=top_field):
+        validate_checkpoint_invariants(ckpt)
+
+
+def test_schema_v3_missing_rank_entry_raises_but_v2_falls_back():
+    legacy_rng = {"torch": torch.get_rng_state()}
+    resume_v3 = TrainingState(rng_state=legacy_rng, schema_version=3)
+    ckpt_v3 = {
+        "checkpoint_schema_version": 3,
+        "training_state": resume_v3.state_dict(),
+        "rank_states": {"1": {"rng_state": legacy_rng}},
+    }
+    with pytest.raises(RuntimeError, match="missing.*rank 0"):
+        resolve_rank_rng_state(ckpt_v3, resume_v3)
+
+    resume_v2 = TrainingState(rng_state=legacy_rng, schema_version=2)
+    ckpt_v2 = {
+        "checkpoint_schema_version": 2,
+        "training_state": resume_v2.state_dict(),
+        "rank_states": {"1": {"rng_state": legacy_rng}},
+    }
+    assert resolve_rank_rng_state(ckpt_v2, resume_v2) is legacy_rng
+
+
+def test_checkpoint_world_size_mismatch_and_single_process_rank0_warning(
+    monkeypatch, caplog
+):
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+    with pytest.raises(RuntimeError, match="checkpoint world_size=2.*current world_size=1"):
+        validate_checkpoint_world_size({"world_size": 2})
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="checkpoint world_size=2.*current world_size=3"):
+        validate_checkpoint_world_size(
+            {"world_size": 2}, current_world_size=3
+        )
+    caplog.set_level("WARNING")
+    validate_checkpoint_world_size({"world_size": 2})
+    assert "rank0 state will be used" in caplog.text
+
+
 def test_publish_failure_raises_instead_of_silent_continue(tmp_path, monkeypatch):
     # P0-4 (single-process visible part): a failure in the retention/publish/
     # manifest phase must surface as an exception via the agreed publish phase
@@ -983,7 +1057,7 @@ def test_publish_failure_raises_instead_of_silent_continue(tmp_path, monkeypatch
     saver = Saver(interval=[(1, "iteration")])
     trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
 
-    def boom(strict=False):
+    def boom(strict=False, **kwargs):
         raise OSError("manifest disk full")
 
     monkeypatch.setattr(saver, "_write_manifest", boom)

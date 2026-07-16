@@ -37,6 +37,8 @@ from dptb.nnops.training_state import (
     read_resume_metadata,
     resolve_rank_rng_state,
     restore_rng_state,
+    validate_checkpoint_invariants,
+    validate_checkpoint_world_size,
 )
 
 log = logging.getLogger(__name__)
@@ -856,6 +858,8 @@ class Trainer(BaseTrainer):
             map_location="cpu",
             weights_only=False,
         )
+        validate_checkpoint_invariants(ckpt)
+        validate_checkpoint_world_size(ckpt)
         preflight_restart_checkpoint(checkpoint, ckpt, trainer_kind="trainer")
         ckpt_train_options = migrate_legacy_checkpoint_train_options(
             ckpt["config"]["train_options"]

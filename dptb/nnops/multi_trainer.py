@@ -43,6 +43,8 @@ from dptb.nnops.training_state import (
     read_resume_metadata,
     resolve_rank_rng_state,
     restore_rng_state,
+    validate_checkpoint_invariants,
+    validate_checkpoint_world_size,
 )
 from dptb.nnops.expert_parallel_layout import (
     rank_to_expert_parallel,
@@ -3489,10 +3491,33 @@ class MultiTrainer(Trainer):
     # restart
     # ---------------------------------------------------------------------
 
+    @staticmethod
+    def _validate_distributed_resume_state_list(
+        saved_states, *, expected_count, local_idx, label
+    ):
+        if saved_states is None:
+            return
+        if len(saved_states) != int(expected_count):
+            raise RuntimeError(
+                f"Checkpoint {label} holds {len(saved_states)} entries but "
+                f"the trainer has {int(expected_count)} experts; refusing a "
+                "partial distributed restore."
+            )
+        if int(local_idx) < 0 or int(local_idx) >= len(saved_states):
+            raise RuntimeError(
+                f"Distributed resume local expert index {int(local_idx)} is "
+                f"outside checkpoint {label} bounds [0, {len(saved_states)})."
+            )
+
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
                 validation_datasets=None, distributed_expert=False, rank=0, world_size=1):
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        validate_checkpoint_invariants(ckpt)
+        validate_checkpoint_world_size(
+            ckpt,
+            current_world_size=world_size if distributed_expert else None,
+        )
         preflight_restart_checkpoint(checkpoint, ckpt, trainer_kind="multi_trainer")
 
         ckpt_train_options = migrate_legacy_checkpoint_train_options(
@@ -3563,6 +3588,19 @@ class MultiTrainer(Trainer):
             idx = trainer.local_expert_idx
             opt_states = ckpt.get("optimizers_state_dict", None)
             sch_states = ckpt.get("lr_schedulers_state_dict", None)
+            expected_count = int(getattr(trainer, "num_experts", len(trainer.optimizers)))
+            cls._validate_distributed_resume_state_list(
+                opt_states,
+                expected_count=expected_count,
+                local_idx=idx,
+                label="optimizers_state_dict",
+            )
+            cls._validate_distributed_resume_state_list(
+                sch_states,
+                expected_count=expected_count,
+                local_idx=idx,
+                label="lr_schedulers_state_dict",
+            )
             if opt_states is not None and trainer.optimizers[idx] is not None:
                 trainer.optimizers[idx].load_state_dict(opt_states[idx])
             if sch_states is not None and trainer.lr_schedulers[idx] is not None:

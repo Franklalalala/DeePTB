@@ -55,6 +55,11 @@ def capture_rng_state() -> Dict[str, Any]:
 
     All returned tensors live on CPU so the snapshot pickles cleanly through
     ``torch.save`` and reloads on a host with a different device layout.
+
+    CUDA currently uses ``get_rng_state_all``: the snapshot is tied to the
+    capturing process's visible-device ordering/count, not stable device UUIDs.
+    Restore therefore applies it only when the current visible device count
+    matches; it cannot remap RNG streams across a changed CUDA topology.
     """
     import torch
 
@@ -234,6 +239,71 @@ def read_resume_metadata(ckpt: Dict[str, Any]) -> TrainingState:
     )
 
 
+def validate_checkpoint_invariants(ckpt: Dict[str, Any]) -> None:
+    """Fail closed when schema-v3 flat mirrors disagree with training_state."""
+    nested = ckpt.get("training_state")
+    if not isinstance(nested, dict):
+        return
+    top_schema = int(ckpt.get("checkpoint_schema_version", 0))
+    nested_schema = int(nested.get("schema_version", 0))
+    if max(top_schema, nested_schema) < 3:
+        return
+
+    checks = (
+        ("checkpoint_schema_version", top_schema, "training_state.schema_version", nested_schema),
+        ("iteration", ckpt.get("iteration"), "training_state.global_step", nested.get("global_step")),
+        ("epoch", ckpt.get("epoch"), "training_state.epoch", nested.get("epoch")),
+        (
+            "checkpoint_kind", ckpt.get("checkpoint_kind"),
+            "training_state.checkpoint_kind", nested.get("checkpoint_kind"),
+        ),
+    )
+    for top_name, top_value, nested_name, nested_value in checks:
+        if top_value != nested_value:
+            raise RuntimeError(
+                "checkpoint schema-v3 invariant violation: "
+                f"{top_name}={top_value!r} but {nested_name}={nested_value!r}"
+            )
+
+
+def validate_checkpoint_world_size(
+    ckpt: Dict[str, Any], *, current_world_size: Optional[int] = None
+) -> None:
+    """Reject distributed topology changes; warn on single-process inspection."""
+    recorded = ckpt.get("world_size")
+    if recorded is None:
+        return
+    recorded = int(recorded)
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            current = int(dist.get_world_size())
+            if current != recorded:
+                raise RuntimeError(
+                    "checkpoint world_size mismatch: "
+                    f"checkpoint world_size={recorded}, current world_size={current}"
+                )
+            return
+    except RuntimeError:
+        raise
+    except Exception:  # pragma: no cover - defensive
+        pass
+    if current_world_size is not None:
+        current = int(current_world_size)
+        if current != recorded:
+            raise RuntimeError(
+                "checkpoint world_size mismatch: "
+                f"checkpoint world_size={recorded}, current world_size={current}"
+            )
+        return
+    if recorded > 1:
+        log.warning(
+            "Loading a world_size=%d checkpoint in a single process; rank0 "
+            "state will be used for rank-local resume data.",
+            recorded,
+        )
+
+
 def _read_sibling_manifest(checkpoint: str) -> Dict[str, Any]:
     path = os.path.join(os.path.dirname(os.path.abspath(checkpoint)),
                         "checkpoint_manifest.json")
@@ -382,4 +452,13 @@ def resolve_rank_rng_state(ckpt: Dict[str, Any], resume: "TrainingState") -> Opt
     own = rank_states.get(str(rank))
     if isinstance(own, dict) and own.get("rng_state") is not None:
         return own["rng_state"]
+    schema = max(
+        int(ckpt.get("checkpoint_schema_version", 0)),
+        int((ckpt.get("training_state") or {}).get("schema_version", 0)),
+    )
+    if schema >= 3 and rank_states:
+        raise RuntimeError(
+            "checkpoint schema-v3 rank_states is missing the required entry "
+            f"for rank {rank}; available ranks={sorted(rank_states.keys())}"
+        )
     return resume.rng_state

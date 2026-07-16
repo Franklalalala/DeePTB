@@ -258,7 +258,7 @@ class Saver(Plugin, StatefulPlugin):
     def _manifest_path(self):
         return os.path.join(self.checkpoint_path, self.MANIFEST_NAME)
 
-    def _write_manifest(self, strict=False):
+    def _write_manifest(self, strict=False, published_checkpoint_name=None):
         """Atomically record a durable pointer to best/latest + retention state.
 
         Written on the main process after each publish so an operator (or a
@@ -282,9 +282,18 @@ class Saver(Plugin, StatefulPlugin):
                 for entry in self._pending_manifest_entries.values()
             }
         )
+        published_entry = self._pending_manifest_entries.get(
+            published_checkpoint_name
+        )
+        last_completed_step = (
+            int(published_entry["last_completed_step"])
+            if published_entry is not None
+            else max(int(getattr(self.trainer, "iter", 1)) - 1, 0)
+        )
         manifest = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "global_step": int(getattr(self.trainer, "iter", 1)),
+            "global_step": last_completed_step,
+            "step_semantics": "last_completed",
             "epoch": int(getattr(self.trainer, "ep", 1)),
             "best_loss": float(self.best_loss),
             "best": (model_name + ".best.pth") if model_name else None,
@@ -822,7 +831,9 @@ class Saver(Plugin, StatefulPlugin):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
                 self._atomic_publish(latest_ckpt_abs_path, latest_symlink)
                 self._latest_checkpoint_name = name
-            self._write_manifest(strict=True)
+            self._write_manifest(
+                strict=True, published_checkpoint_name=name
+            )
             self._gc_checkpoint_best_effort(delete_name)
 
         # Publish is an agreed phase: a main-rank failure raises on ALL ranks
@@ -902,7 +913,9 @@ class Saver(Plugin, StatefulPlugin):
             self._atomic_publish(epoch_ckpt_abs_path, latest_resumable)
             self._latest_resumable_checkpoint_name = name
 
-            self._write_manifest(strict=True)
+            self._write_manifest(
+                strict=True, published_checkpoint_name=name
+            )
             self._gc_checkpoint_best_effort(best_delete_name)
             self._gc_checkpoint_best_effort(epoch_delete_name)
 

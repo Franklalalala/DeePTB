@@ -534,9 +534,27 @@ def test_saver_uses_unwrapped_local_expert_state_dict_for_ddp_wrapped_expert():
 def test_multi_restart_preflight_precedes_model_build():
     trainer_text = _read_repo_text("dptb/nnops/multi_trainer.py")
     restart = _method_source(trainer_text, "restart")
+    assert restart.index("validate_checkpoint_invariants(") < restart.index(
+        "preflight_restart_checkpoint("
+    )
     assert restart.index("preflight_restart_checkpoint(") < restart.index(
         "model = build_model("
     )
+
+
+def test_distributed_restart_rejects_state_list_length_mismatch():
+    from dptb.nnops.multi_trainer import MultiTrainer
+
+    with pytest.raises(RuntimeError, match="holds 1 entries.*2 experts"):
+        MultiTrainer._validate_distributed_resume_state_list(
+            [{}], expected_count=2, local_idx=0,
+            label="optimizers_state_dict",
+        )
+    with pytest.raises(RuntimeError, match="outside checkpoint.*bounds"):
+        MultiTrainer._validate_distributed_resume_state_list(
+            [{}, {}], expected_count=2, local_idx=2,
+            label="lr_schedulers_state_dict",
+        )
 
 
 def test_saver_collapses_replica_states_to_one_state_per_expert():
