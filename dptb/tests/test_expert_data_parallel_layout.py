@@ -517,12 +517,17 @@ def test_multi_trainer_expert_optimizer_uses_unwrapped_expert_parameters():
 
 def test_saver_uses_unwrapped_local_expert_state_dict_for_ddp_wrapped_expert():
     saver_text = _read_repo_text("dptb/plugins/saver.py")
-    gather_dist_states = _method_source(saver_text, "_gather_dist_states")
+    # Phase-1 local state_dict materialization intentionally happens before the
+    # prepare-status exchange and large gather.
+    prepare_local_dist_states = _method_source(
+        saver_text, "_prepare_local_dist_states"
+    )
 
     assert (
         "self.trainer._unwrap_expert_module(self.trainer.model.experts[local_idx]).state_dict()"
-        in gather_dist_states
-        or "self.trainer._expert_module(local_idx).state_dict()" in gather_dist_states
+        in prepare_local_dist_states
+        or "self.trainer._expert_module(local_idx).state_dict()"
+        in prepare_local_dist_states
     )
 
 

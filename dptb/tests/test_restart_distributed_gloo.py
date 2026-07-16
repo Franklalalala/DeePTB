@@ -12,6 +12,8 @@ single-process tests can only mock:
 (c) save assembly-failure propagation: a rank0 ``_assemble_full_model_state``
     failure inside the real ``Saver._save`` distributed path raises on BOTH
     ranks BEFORE the post-save barrier — no deadlock.
+(d) real manifest ``os.replace`` failure and rank-local prepare failure both
+    propagate to BOTH ranks before any peer can enter an unmatched collective.
 
 Every test drives the workers with a join timeout so a hang FAILS the test
 instead of blocking the suite. If 2-rank gloo init is genuinely impossible on
@@ -310,6 +312,91 @@ def _worker_assembly_failure_propagates(rank, world_size, init_method, ckpt_dir,
         _destroy_pg()
 
 
+def _worker_manifest_io_failure_propagates(rank, world_size, init_method, ckpt_dir, result_dir):
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    _trace_stage(result_dir, rank, "worker_start")
+    try:
+        if not _init_pg(rank, world_size, init_method, result_dir):
+            return
+        try:
+            import dptb.plugins.saver as saver_mod
+
+            saver, trainer = _make_saver(rank, world_size, ckpt_dir)
+            real_replace = saver_mod.os.replace
+            manifest_path = os.path.normcase(
+                os.path.join(ckpt_dir, Saver.MANIFEST_NAME)
+            )
+
+            if rank == 0:
+                def fail_manifest_replace(src, dst):
+                    if os.path.normcase(os.fspath(dst)) == manifest_path:
+                        raise OSError("real manifest replace failed")
+                    return real_replace(src, dst)
+
+                saver_mod.os.replace = fail_manifest_replace
+
+            _trace_stage(result_dir, rank, "iteration_save_enter")
+            try:
+                saver.iteration(field="iteration")
+            except OSError as exc:
+                if rank == 0 and "real manifest replace failed" in str(exc):
+                    _write_result(result_dir, rank, "OK")
+                    return
+                raise
+            except RuntimeError as exc:
+                if rank != 0 and "aborting on all ranks" in str(exc):
+                    _write_result(result_dir, rank, "OK")
+                    return
+                raise
+            _write_result(result_dir, rank, f"FAIL:manifest I/O did not raise on rank {rank}")
+        except Exception:
+            _write_result(result_dir, rank, "FAIL:\n" + traceback.format_exc())
+    finally:
+        _destroy_pg()
+
+
+def _worker_rank1_prepare_failure_propagates(rank, world_size, init_method, ckpt_dir, result_dir):
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    _trace_stage(result_dir, rank, "worker_start")
+    try:
+        if not _init_pg(rank, world_size, init_method, result_dir):
+            return
+        try:
+            saver, trainer = _make_saver(rank, world_size, ckpt_dir)
+            if rank == 1:
+                expert = trainer.model.experts[trainer.local_expert_idx]
+
+                def fail_local_state_dict(*args, **kwargs):
+                    raise RuntimeError("rank1 local state_dict failed")
+
+                expert.state_dict = fail_local_state_dict
+
+            _trace_stage(result_dir, rank, "prepare_failure_save_enter")
+            try:
+                saver._save(
+                    name="probe.iter5",
+                    model=trainer.model,
+                    model_options=trainer.model.model_options,
+                    common_options=trainer.common_options,
+                    train_options=trainer.train_options,
+                    kind=CHECKPOINT_KIND_ITERATION,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                if (
+                    "checkpoint local prepare failed on rank 1" in message
+                    and "rank1 local state_dict failed" in message
+                ):
+                    _write_result(result_dir, rank, "OK")
+                    return
+                raise
+            _write_result(result_dir, rank, f"FAIL:prepare failure did not raise on rank {rank}")
+        except Exception:
+            _write_result(result_dir, rank, "FAIL:\n" + traceback.format_exc())
+    finally:
+        _destroy_pg()
+
+
 # ---------------------------------------------------------------------------
 # Parent-side runner
 # ---------------------------------------------------------------------------
@@ -455,6 +542,14 @@ def test_save_assembly_failure_propagates_before_barrier(tmp_path, monkeypatch):
     _run_two_rank(_worker_assembly_failure_propagates, tmp_path, monkeypatch)
 
 
+def test_real_manifest_io_failure_propagates_to_all_ranks(tmp_path, monkeypatch):
+    _run_two_rank(_worker_manifest_io_failure_propagates, tmp_path, monkeypatch)
+
+
+def test_rank1_prepare_failure_propagates_before_large_gather(tmp_path, monkeypatch):
+    _run_two_rank(_worker_rank1_prepare_failure_propagates, tmp_path, monkeypatch)
+
+
 if __name__ == "__main__":
     workers = {
         fn.__name__: fn
@@ -462,6 +557,8 @@ if __name__ == "__main__":
             _worker_rank_states_roundtrip,
             _worker_publish_failure_propagates,
             _worker_assembly_failure_propagates,
+            _worker_manifest_io_failure_propagates,
+            _worker_rank1_prepare_failure_propagates,
         )
     }
     if len(sys.argv) != 8 or sys.argv[1] != "--gloo-worker":

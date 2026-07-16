@@ -15,6 +15,7 @@ import os
 import torch
 import torch.distributed as dist
 import time
+import traceback
 from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
@@ -233,13 +234,14 @@ class Saver(Plugin, StatefulPlugin):
     def _manifest_path(self):
         return os.path.join(self.checkpoint_path, self.MANIFEST_NAME)
 
-    def _write_manifest(self):
+    def _write_manifest(self, strict=False):
         """Atomically record a durable pointer to best/latest + retention state.
 
         Written on the main process after each publish so an operator (or a
         restart) can find the current best/latest and the rotation queues
-        without loading any ``.pth``. Best-effort: a manifest failure never
-        aborts a checkpoint.
+        without loading any ``.pth``. Diagnostic callers retain best-effort
+        behavior; transactional publish callers pass ``strict=True`` so an I/O
+        failure participates in the all-rank publish outcome.
         """
         if not self._is_main():
             return
@@ -260,13 +262,15 @@ class Saver(Plugin, StatefulPlugin):
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)
             os.replace(tmp_path, path)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             log.warning("Failed to write checkpoint manifest %s: %s", path, exc)
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+            if strict:
+                raise
 
     def _read_manifest(self):
         try:
@@ -529,39 +533,13 @@ class Saver(Plugin, StatefulPlugin):
         visit(obj)
         return stats
 
-    def _validate_expert_dp_replicas(self, expert_obj, opt_obj):
-        if (
-            int(getattr(self.trainer, "expert_data_parallel_size", 1)) <= 1
-            or not _env_flag("DPTB_SAVER_VALIDATE_EXPERT_DP_REPLICAS", False)
-        ):
-            return
-        group = getattr(self.trainer, "expert_dp_process_group", None)
-        if group is None or not (dist.is_available() and dist.is_initialized()):
-            return
+    def _prepare_local_dist_states(self):
+        """Prepare this rank's checkpoint payload without world collectives.
 
-        with self._profile_stage("expert_dp_replica_fingerprint"):
-            fp = self._state_fingerprint({"model": expert_obj, "optimizer": opt_obj})
-            if torch.cuda.is_available():
-                fp = fp.to(torch.cuda.current_device())
-            gathered = [torch.zeros_like(fp) for _ in range(int(getattr(self.trainer, "expert_data_parallel_size", 1)))]
-            dist.all_gather(gathered, fp, group=group)
-
-        base = gathered[0].detach().cpu()
-        atol = _env_float("DPTB_SAVER_EXPERT_DP_CHECK_ATOL", 1e-6)
-        rtol = _env_float("DPTB_SAVER_EXPERT_DP_CHECK_RTOL", 1e-5)
-        for dp_rank, other in enumerate(gathered[1:], start=1):
-            other_cpu = other.detach().cpu()
-            if not torch.allclose(base, other_cpu, atol=atol, rtol=rtol):
-                msg = (
-                    "expert-DP replica checkpoint fingerprints differ for expert "
-                    f"{getattr(self.trainer, 'local_expert_idx', None)} between dp_rank=0 and "
-                    f"dp_rank={dp_rank}: base={base.tolist()} other={other_cpu.tolist()}"
-                )
-                if _env_flag("DPTB_SAVER_STRICT_EXPERT_DP_REPLICA_CHECK", True):
-                    raise RuntimeError(msg)
-                log.warning(msg)
-
-    def _gather_dist_states(self):
+        Failures here are exchanged as small status objects before any large
+        object gather, preventing one rank from entering the gather while a
+        peer has already failed during ``state_dict`` or CPU materialization.
+        """
         local_idx = self.trainer.local_expert_idx
         dp_size = int(getattr(self.trainer, "expert_data_parallel_size", 1))
         num_experts = int(getattr(self.trainer, "num_experts", max(1, self.trainer.world_size // max(dp_size, 1))))
@@ -584,8 +562,6 @@ class Saver(Plugin, StatefulPlugin):
                 raw_opt_state = local_opt.state_dict() if local_opt is not None else None
                 raw_sch_state = local_sch.state_dict() if local_sch is not None else None
 
-            self._validate_expert_dp_replicas(raw_expert_state, raw_opt_state)
-
             with self._profile_stage("local_expert_state_to_cpu", expert_idx=local_idx, canonical=is_canonical):
                 local_expert_state = self._to_cpu_obj(raw_expert_state)
             with self._profile_stage("local_optimizer_state_to_cpu", expert_idx=local_idx, canonical=is_canonical):
@@ -597,7 +573,20 @@ class Saver(Plugin, StatefulPlugin):
             with self._profile_stage("local_state_dict_for_fingerprint", expert_idx=local_idx, canonical=is_canonical):
                 raw_expert_state = self.trainer._unwrap_expert_module(self.trainer.model.experts[local_idx]).state_dict()
                 raw_opt_state = local_opt.state_dict() if local_opt is not None else None
-            self._validate_expert_dp_replicas(raw_expert_state, raw_opt_state)
+
+        replica_fingerprint = None
+        if (
+            _env_flag("DPTB_SAVER_VALIDATE_EXPERT_DP_REPLICAS", False)
+            and int(getattr(self.trainer, "expert_data_parallel_size", 1)) > 1
+        ):
+            with self._profile_stage(
+                "expert_dp_replica_fingerprint_local",
+                expert_idx=local_idx,
+                canonical=is_canonical,
+            ):
+                replica_fingerprint = self._state_fingerprint(
+                    {"model": raw_expert_state, "optimizer": raw_opt_state}
+                )
 
         self._profile_record(
             "local_state_prepared",
@@ -608,6 +597,64 @@ class Saver(Plugin, StatefulPlugin):
             local_expert_tensor_bytes=local_expert_tensor_bytes,
             local_optimizer_tensor_bytes=local_opt_tensor_bytes,
         )
+
+        return {
+            "local_expert_state": local_expert_state,
+            "local_opt_state": local_opt_state,
+            "local_sch_state": local_sch_state,
+            "local_idx": local_idx,
+            "dp_size": dp_size,
+            "num_experts": num_experts,
+            "canonical_only": canonical_only,
+            "is_canonical": is_canonical,
+            "replica_fingerprint": replica_fingerprint,
+        }
+
+    def _validate_prepared_expert_dp_replicas(self, prepare_statuses):
+        """Compare fingerprints carried by the agreed small status exchange."""
+        dp_size = int(getattr(self.trainer, "expert_data_parallel_size", 1))
+        if (
+            dp_size <= 1
+            or not _env_flag("DPTB_SAVER_VALIDATE_EXPERT_DP_REPLICAS", False)
+        ):
+            return
+        atol = _env_float("DPTB_SAVER_EXPERT_DP_CHECK_ATOL", 1e-6)
+        rtol = _env_float("DPTB_SAVER_EXPERT_DP_CHECK_RTOL", 1e-5)
+        by_expert = {}
+        for status in prepare_statuses:
+            fingerprint = status.get("replica_fingerprint")
+            if fingerprint is None:
+                continue
+            by_expert.setdefault(int(status["local_expert_idx"]), []).append(status)
+
+        for expert_idx, replicas in sorted(by_expert.items()):
+            replicas.sort(key=lambda status: int(status["expert_dp_rank"]))
+            base_status = replicas[0]
+            base = torch.tensor(base_status["replica_fingerprint"], dtype=torch.float64)
+            for other_status in replicas[1:]:
+                other = torch.tensor(
+                    other_status["replica_fingerprint"], dtype=torch.float64
+                )
+                if torch.allclose(base, other, atol=atol, rtol=rtol):
+                    continue
+                msg = (
+                    "expert-DP replica checkpoint fingerprints differ for expert "
+                    f"{expert_idx} between dp_rank={base_status['expert_dp_rank']} and "
+                    f"dp_rank={other_status['expert_dp_rank']}: "
+                    f"base={base.tolist()} other={other.tolist()}"
+                )
+                if _env_flag("DPTB_SAVER_STRICT_EXPERT_DP_REPLICA_CHECK", True):
+                    raise RuntimeError(msg)
+                log.warning(msg)
+
+    def _gather_dist_states(self, prepared):
+        local_expert_state = prepared["local_expert_state"]
+        local_opt_state = prepared["local_opt_state"]
+        local_sch_state = prepared["local_sch_state"]
+        dp_size = prepared["dp_size"]
+        num_experts = prepared["num_experts"]
+        canonical_only = prepared["canonical_only"]
+        is_canonical = prepared["is_canonical"]
 
         if _env_flag("DPTB_SAVER_GATHER_TO_MAIN_ONLY", True):
             expert_states = [None for _ in range(self.trainer.world_size)] if self._is_main() else None
@@ -708,13 +755,6 @@ class Saver(Plugin, StatefulPlugin):
         )
 
         def _publish_iteration():
-            if delete_name is not None:
-                delete_path = os.path.join(self.checkpoint_path, delete_name + ".pth")
-                try:
-                    os.remove(delete_path)
-                except Exception:
-                    log.info(f"Failed to delete the checkpoint file {delete_path}.")
-
             if not self.push:
                 latest_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".latest.pth")
                 latest_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
@@ -722,7 +762,8 @@ class Saver(Plugin, StatefulPlugin):
                 if not os.path.exists(latest_ckpt_abs_path):
                     raise FileNotFoundError(f"Source file {latest_ckpt_abs_path} does not exist.")
                 self._atomic_publish(latest_ckpt_abs_path, latest_symlink)
-            self._write_manifest()
+            self._write_manifest(strict=True)
+            self._gc_checkpoint_best_effort(delete_name)
 
         # Publish is an agreed phase: a main-rank failure raises on ALL ranks
         # (P0-4) instead of leaving them to wedge at the next collective.
@@ -775,11 +816,6 @@ class Saver(Plugin, StatefulPlugin):
             )
 
             def _publish_epoch_best():
-                if delete_name is not None:
-                    delete_path = os.path.join(self.checkpoint_path, delete_name + ".pth")
-                    if os.path.exists(delete_path):
-                        os.remove(delete_path)
-
                 best_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".best.pth")
                 best_ckpt = os.path.join(self.checkpoint_path, name + ".pth")
                 best_ckpt_abs_path = os.path.abspath(best_ckpt)
@@ -791,10 +827,22 @@ class Saver(Plugin, StatefulPlugin):
                     latest_symlink = os.path.join(self.checkpoint_path, self.trainer.model.name + ".latest.pth")
                     self._atomic_publish(best_ckpt_abs_path, latest_symlink)
 
-                self._write_manifest()
+                self._write_manifest(strict=True)
+                self._gc_checkpoint_best_effort(delete_name)
 
             # Agreed publish phase (P0-4): all ranks share the outcome.
             self._finalize_publish(_publish_epoch_best)
+
+    def _gc_checkpoint_best_effort(self, checkpoint_name):
+        """Delete a rotated checkpoint only after pointer+manifest commit."""
+        if checkpoint_name is None:
+            return
+        delete_path = os.path.join(self.checkpoint_path, checkpoint_name + ".pth")
+        try:
+            if os.path.exists(delete_path):
+                os.remove(delete_path)
+        except Exception as exc:
+            log.warning("Failed to GC checkpoint %s: %s", delete_path, exc)
 
     def _safe_harvest_plugin_states(self):
         harvester = getattr(self.trainer, "harvest_plugin_states", None)
@@ -930,8 +978,60 @@ class Saver(Plugin, StatefulPlugin):
         self._profile_record("save_start")
 
         if self._is_dist_expert():
+            prepared = None
+            prepare_exc = None
+            try:
+                with self._profile_stage("prepare_local_dist_states"):
+                    prepared = self._prepare_local_dist_states()
+                prepare_status = {
+                    "ok": True,
+                    "rank": self._rank(),
+                    "error_type": None,
+                    "error": None,
+                    "traceback": None,
+                    "local_expert_idx": prepared["local_idx"],
+                    "expert_dp_rank": int(getattr(self.trainer, "expert_dp_rank", 0)),
+                    "replica_fingerprint": (
+                        prepared["replica_fingerprint"].tolist()
+                        if prepared["replica_fingerprint"] is not None
+                        else None
+                    ),
+                }
+            except Exception as exc:
+                prepare_exc = exc
+                prepare_status = {
+                    "ok": False,
+                    "rank": self._rank(),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "local_expert_idx": getattr(self.trainer, "local_expert_idx", None),
+                    "expert_dp_rank": int(getattr(self.trainer, "expert_dp_rank", 0)),
+                    "replica_fingerprint": None,
+                }
+
+            prepare_statuses = [None] * dist.get_world_size()
+            dist.all_gather_object(prepare_statuses, prepare_status)
+            failed_prepare = next(
+                (status for status in prepare_statuses if not status.get("ok", False)),
+                None,
+            )
+            if failed_prepare is not None:
+                self._profile_save_name = previous_profile_save_name
+                message = (
+                    "checkpoint local prepare failed on rank "
+                    f"{failed_prepare.get('rank')}: "
+                    f"{failed_prepare.get('error_type')}: {failed_prepare.get('error')}"
+                )
+                if prepare_exc is not None and self._rank() == failed_prepare.get("rank"):
+                    raise RuntimeError(message) from prepare_exc
+                raise RuntimeError(message)
+
+            # Fingerprints ride the same small status exchange, so replica
+            # mismatch detection is uniform and adds no pre-gather collective.
+            self._validate_prepared_expert_dp_replicas(prepare_statuses)
             with self._profile_stage("gather_dist_states"):
-                expert_states, opt_states, sch_states = self._gather_dist_states()
+                expert_states, opt_states, sch_states = self._gather_dist_states(prepared)
             # Collective: every rank contributes its own RNG snapshot (P0-3).
             rank_states = self._collect_rank_states()
 

@@ -638,7 +638,12 @@ def test_distributed_rank0_save_failure_propagates_before_barrier(tmp_path, monk
     # Force the distributed-expert path and a rank0 assembly failure.
     monkeypatch.setattr(saver, "_is_dist_expert", lambda: True)
     monkeypatch.setattr(saver, "_is_main", lambda: True)
-    monkeypatch.setattr(saver, "_gather_dist_states", lambda: ([{}], [None], [None]))
+    monkeypatch.setattr(
+        saver, "_prepare_local_dist_states",
+        lambda: {"local_idx": 0, "replica_fingerprint": None},
+    )
+    monkeypatch.setattr(saver, "_validate_prepared_expert_dp_replicas", lambda statuses: None)
+    monkeypatch.setattr(saver, "_gather_dist_states", lambda prepared: ([{}], [None], [None]))
     # Not under test here; the real impl issues an all_gather collective that
     # needs an actual process group (covered by the gloo harness).
     monkeypatch.setattr(saver, "_collect_rank_states", lambda: {"0": {"rng_state": None}})
@@ -649,6 +654,11 @@ def test_distributed_rank0_save_failure_propagates_before_barrier(tmp_path, monk
     barrier_calls = {"n": 0}
     monkeypatch.setattr(saver_mod.dist, "is_available", lambda: True)
     monkeypatch.setattr(saver_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(saver_mod.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(
+        saver_mod.dist, "all_gather_object",
+        lambda gathered, value: gathered.__setitem__(0, value),
+    )
     monkeypatch.setattr(saver_mod.dist, "broadcast_object_list",
                         lambda lst, src=0: None)  # keep rank0's False flag
 
@@ -828,12 +838,91 @@ def test_publish_failure_raises_instead_of_silent_continue(tmp_path, monkeypatch
     saver = Saver(interval=[(1, "iteration")])
     trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
 
-    def boom():
+    def boom(strict=False):
         raise OSError("manifest disk full")
 
     monkeypatch.setattr(saver, "_write_manifest", boom)
     with pytest.raises(OSError, match="manifest disk full"):
         trainer.run(epochs=1)
+
+
+def test_real_manifest_replace_failure_is_strict(tmp_path, monkeypatch):
+    import dptb.plugins.saver as saver_mod
+
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(tmp_path, n_batches=1)
+    saver = Saver(interval=[(1, "iteration")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+
+    manifest_path = os.path.normcase(str(ckpt_dir / Saver.MANIFEST_NAME))
+    real_replace = saver_mod.os.replace
+
+    def fail_manifest_replace(src, dst):
+        if os.path.normcase(os.fspath(dst)) == manifest_path:
+            raise OSError("manifest replace disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(saver_mod.os, "replace", fail_manifest_replace)
+    with pytest.raises(OSError, match="manifest replace disk full"):
+        trainer.run(epochs=1)
+
+
+def test_iteration_publish_failure_keeps_previous_latest_target(tmp_path, monkeypatch):
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(tmp_path, n_batches=2)
+    trainer.train_options["max_ckpt"] = 1
+    saver = Saver(interval=[(1, "iteration")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+
+    real_publish = saver._atomic_publish
+
+    def fail_second_publish(src, dst):
+        if str(src).endswith("probe.iter2.pth"):
+            raise OSError("latest publish failed")
+        return real_publish(src, dst)
+
+    monkeypatch.setattr(saver, "_atomic_publish", fail_second_publish)
+    with pytest.raises(OSError, match="latest publish failed"):
+        trainer.run(epochs=1)
+
+    old_checkpoint = ckpt_dir / "probe.iter1.pth"
+    assert old_checkpoint.exists(), "retention GC ran before publish committed"
+    latest = torch.load(
+        str(ckpt_dir / "probe.latest.pth"), map_location="cpu", weights_only=False
+    )
+    assert latest["iteration"] == 1
+
+
+def test_epoch_publish_failure_keeps_previous_best_target(tmp_path, monkeypatch):
+    ckpt_dir = tmp_path / "ck"
+    ckpt_dir.mkdir()
+    trainer = _make_trainer(
+        tmp_path, n_batches=1, epoch_losses={1: 2.0, 2: 1.0}
+    )
+    trainer.train_options["max_ckpt"] = 1
+    saver = Saver(interval=[(1, "epoch")])
+    trainer.register_plugin(saver, checkpoint_path=str(ckpt_dir))
+    trainer.run(epochs=1)
+
+    real_publish = saver._atomic_publish
+
+    def fail_second_best(src, dst):
+        if str(src).endswith("probe.ep2.pth") and str(dst).endswith("probe.best.pth"):
+            raise OSError("best publish failed")
+        return real_publish(src, dst)
+
+    monkeypatch.setattr(saver, "_atomic_publish", fail_second_best)
+    with pytest.raises(OSError, match="best publish failed"):
+        trainer.run(epochs=2)
+
+    old_checkpoint = ckpt_dir / "probe.ep1.pth"
+    assert old_checkpoint.exists(), "best retention GC ran before publish committed"
+    best = torch.load(
+        str(ckpt_dir / "probe.best.pth"), map_location="cpu", weights_only=False
+    )
+    assert best["epoch"] == 1
 
 
 def test_overlap_head_inference_from_state_dict():
