@@ -104,7 +104,15 @@ def test_noncanonical_expert_dp_rank_sends_empty_checkpoint_payload(monkeypatch)
         lambda obj, object_gather_list=None, dst=0: gathered.append(obj),
     )
 
-    assert saver._gather_dist_states() == (None, None, None)
+    # Two-phase since the publish-transaction hardening: rank-local prepare
+    # (no collectives) decides the payload; gather ships it. A non-canonical
+    # expert-DP rank must prepare an EMPTY payload and gather Nones.
+    prepared = saver._prepare_local_dist_states()
+    assert prepared["is_canonical"] is False
+    assert prepared["local_expert_state"] is None
+    assert prepared["local_opt_state"] is None
+    assert prepared["local_sch_state"] is None
+    assert saver._gather_dist_states(prepared) == (None, None, None)
     assert gathered == [None, None, None]
 
 
