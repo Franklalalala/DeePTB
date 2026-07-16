@@ -977,7 +977,9 @@ class Saver(Plugin, StatefulPlugin):
         """Classify this checkpoint without over-promising replay exactness."""
         if kind == CHECKPOINT_KIND_EPOCH:
             return "exact"
-        checker = getattr(self.trainer, "_loader_supports_exact_fast_forward", None)
+        checker = getattr(self.trainer, "_loaders_support_exact_fast_forward", None)
+        if not callable(checker):
+            checker = getattr(self.trainer, "_loader_supports_exact_fast_forward", None)
         if callable(checker):
             try:
                 if checker():

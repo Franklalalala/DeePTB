@@ -945,7 +945,8 @@ class Trainer(BaseTrainer):
         # RNG trajectory before running the remainder exactly once.
         self._batch_in_epoch = 0
         skip_batches, resume_rng = self._consume_resume_plan()
-        if skip_batches and not self._loader_supports_exact_fast_forward():
+        replay_failure = self._exact_fast_forward_failure()
+        if skip_batches and replay_failure is not None:
             # The loader's batch order is not restart-reproducible (e.g. plain
             # shuffle=True without a per-epoch-seeded sampler), so an exact
             # fast-forward is impossible. Re-running the epoch from its start is
@@ -973,11 +974,12 @@ class Trainer(BaseTrainer):
                 # reset — the restored partial is still correct there.)
                 self._reset_epoch_metric_accumulators()
             else:
+                loader_name, loader, failure_reason = replay_failure
                 raise RuntimeError(
                     f"Cannot resume mid-epoch (iteration checkpoint, "
-                    f"{skip_batches} committed batches) with a train_loader "
-                    f"whose order is not restart-deterministic "
-                    f"({type(self.train_loader).__name__}). Resume from the "
+                    f"{skip_batches} committed batches) because {loader_name} "
+                    f"is not restart-deterministic "
+                    f"({type(loader).__name__}: {failure_reason}). Resume from the "
                     f"last epoch checkpoint instead, or set "
                     f"DPTB_ALLOW_INEXACT_RESUME=1 to re-run this epoch from "
                     f"its start (re-applies the committed prefix's optimizer "
@@ -1056,30 +1058,54 @@ class Trainer(BaseTrainer):
         self._resume_plan = None
         return int(plan.get("skip_batches", 0)), plan.get("rng_state")
 
-    def _loader_supports_exact_fast_forward(self):
-        """Whether ``train_loader`` reproduces its batch order across a restart.
+    @staticmethod
+    def _loader_exact_replay_status(loader):
+        """Return ``(is_exact, reason)`` for one loader's replay boundary.
 
-        Exact when the batch sampler is per-epoch seeded (``set_epoch`` -> the
-        dynamic-cost sampler used for large production jobs), or when the loader
-        is not a torch ``DataLoader`` at all (fixed-order sequences / test
-        fixtures). A plain ``DataLoader(shuffle=True)`` draws from the global RNG
-        with no per-epoch seed, so its order is not restart-reproducible.
+        This deliberately covers only deterministic batch *order*. It does not
+        capture worker RNG state or arbitrary random dataset transforms, so any
+        ``num_workers > 0`` loader is conservatively inexact.
         """
-        loader = self.train_loader
+        if int(getattr(loader, "num_workers", 0) or 0) > 0:
+            return False, "num_workers>0 worker RNG/random transforms are not replayed"
         batch_sampler = getattr(loader, "batch_sampler", None)
         if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
-            return True
+            return True, "per-epoch-seeded batch sampler"
         try:
             import torch.utils.data as _tud
             if not isinstance(loader, _tud.DataLoader):
-                return True
+                return True, "fixed-order non-DataLoader sequence"
         except Exception:  # pragma: no cover - defensive
-            return True
+            return True, "non-DataLoader sequence"
         # A torch DataLoader with no per-epoch-seeded sampler: safe only if it
         # is not shuffling (deterministic sequential order).
         sampler = getattr(loader, "sampler", None)
         sampler_name = type(sampler).__name__ if sampler is not None else ""
-        return "Random" not in sampler_name
+        if "Random" in sampler_name:
+            return False, f"random sampler {sampler_name} has no epoch replay token"
+        return True, f"deterministic sampler {sampler_name or '<none>'}"
+
+    def _exact_fast_forward_failure(self):
+        loaders = [("train_loader", self.train_loader)]
+        if getattr(self, "use_reference", False):
+            loaders.append(("reference_loader", self.reference_loader))
+        for loader_name, loader in loaders:
+            exact, reason = self._loader_exact_replay_status(loader)
+            if not exact:
+                return loader_name, loader, reason
+        return None
+
+    def _loaders_support_exact_fast_forward(self):
+        """Whether every consumed loader can replay the committed prefix.
+
+        Reference batches advance in lockstep with train batches during resume,
+        so ``use_reference=True`` requires both loader streams to be exact.
+        """
+        return self._exact_fast_forward_failure() is None
+
+    def _loader_supports_exact_fast_forward(self):
+        """Backward-compatible alias for the all-loader exactness decision."""
+        return self._loaders_support_exact_fast_forward()
 
     def update(self, **kwargs):
         pass

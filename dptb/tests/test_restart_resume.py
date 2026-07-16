@@ -178,6 +178,53 @@ def test_plain_shuffle_loader_mid_epoch_resume_fails_closed(tmp_path, monkeypatc
     resumed._resume_plan = {"target_epoch": 1, "skip_batches": 3, "rng_state": None}
     with pytest.raises(RuntimeError, match="DPTB_ALLOW_INEXACT_RESUME"):
         resumed.epoch()
+
+
+def test_reference_shuffle_loader_mid_epoch_resume_fails_closed(tmp_path, monkeypatch):
+    import torch.utils.data as tud
+
+    monkeypatch.delenv("DPTB_ALLOW_INEXACT_RESUME", raising=False)
+    resumed = _make_trainer(tmp_path, n_batches=5)
+    resumed.use_reference = True
+    resumed.reference_loader = tud.DataLoader(
+        list(range(5)), batch_size=1, shuffle=True
+    )
+    assert resumed._loaders_support_exact_fast_forward() is False
+
+    resumed.ep = 1
+    resumed._resume_plan = {
+        "target_epoch": 1, "skip_batches": 2, "rng_state": None
+    }
+    with pytest.raises(RuntimeError, match="reference_loader") as exc_info:
+        resumed.epoch()
+    assert "RandomSampler" in str(exc_info.value)
+
+
+def test_reference_replayable_loader_allows_exact_fast_forward(tmp_path):
+    resumed = _make_trainer(tmp_path, n_batches=5)
+    resumed.use_reference = True
+    resumed.reference_loader = list(range(5))
+    assert resumed._loaders_support_exact_fast_forward() is True
+
+    resumed.ep = 1
+    resumed._resume_plan = {
+        "target_epoch": 1, "skip_batches": 2, "rng_state": None
+    }
+    resumed.epoch()
+    assert [batch for _epoch, batch in resumed.processed] == [2, 3, 4]
+
+
+def test_loader_workers_make_fast_forward_inexact(tmp_path):
+    import torch.utils.data as tud
+
+    resumed = _make_trainer(tmp_path, n_batches=5)
+    resumed.train_loader = tud.DataLoader(
+        list(range(5)), batch_size=1, shuffle=False, num_workers=1
+    )
+    assert resumed._loaders_support_exact_fast_forward() is False
+    loader_name, _loader, reason = resumed._exact_fast_forward_failure()
+    assert loader_name == "train_loader"
+    assert "num_workers>0" in reason
     assert resumed.processed == []  # nothing ran
 
 
