@@ -815,6 +815,7 @@ class Trainer(BaseTrainer):
 
         state = {
             'field': 'iteration',
+            'window_steps': 1,
             "train_loss": loss_for_log,
             "train_loss_opt": loss_opt_for_log,
             "lr": self.optimizer.state_dict()["param_groups"][0]['lr'],

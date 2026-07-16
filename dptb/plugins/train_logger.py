@@ -5,6 +5,7 @@ import logging
 log = logging.getLogger(__name__)
 
 class Logger(Plugin):
+    event_clock = "display_window"
     alignment = 4
     # 不同字段之间的分隔符
     separator = '-' * 81 

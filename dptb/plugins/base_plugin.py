@@ -14,6 +14,11 @@ log = logging.getLogger(__name__)
 
 
 class Plugin(object):
+    # Iteration plugins run on one of two independent event clocks. Cadence and
+    # control plugins default to the committed optimizer-step clock; consumers
+    # of reduced display-window data opt into ``display_window``.
+    event_clock = "committed_step"
+
     def __init__(self, interval=None):
         if interval is None:
             interval = []
@@ -34,6 +39,9 @@ class PluginUser(object):
                 '''
         self.stats = {}  # the status of Trainer.
         self.plugin_queues = {'disposable': [], 'iteration': [], 'epoch': [], 'batch': [], 'update': []}
+        self.display_window_plugin_queues = {
+            'disposable': [], 'iteration': [], 'epoch': [], 'batch': [], 'update': []
+        }
         # EventScheduler / StatefulPlugin bookkeeping.
         self._registered_plugins = []          # de-duplicated registration order
         self._plugin_id_counts = {}            # per-class instance counter -> stable id
@@ -60,7 +68,7 @@ class PluginUser(object):
         plugin._plugin_id = f"{cls_name}#{n}"
         return plugin._plugin_id
 
-    def register_plugin(self, plugin, plugin_id=None, **kwargs):
+    def register_plugin(self, plugin, plugin_id=None, event_clock=None, **kwargs):
         """Register ``plugin``; extra kwargs are forwarded to ``plugin.register``.
 
         ``plugin_id`` (optional) overrides the default ``ClassName#index``
@@ -68,8 +76,21 @@ class PluginUser(object):
         keyed by, so two instances of the same class can round-trip their
         checkpoint state unambiguously as long as the restart registers them
         with the same ids. When omitted, behavior is identical to before.
+
+        ``event_clock`` selects an independent scheduler for iteration data:
+        ``committed_step`` (default) or ``display_window``.  The latter is only
+        advanced by calls carrying a complete reduced display window, so cheap
+        per-step ticks cannot consume its due events.
         """
         plugin.register(self, **kwargs)
+
+        clock = event_clock or getattr(plugin, "event_clock", "committed_step")
+        if clock not in {"committed_step", "display_window"}:
+            raise ValueError(
+                f"unsupported plugin event_clock={clock!r}; expected "
+                "'committed_step' or 'display_window'"
+            )
+        plugin._event_clock = clock
 
         # Stable identity + de-duplicated registration bookkeeping, then restore
         # any checkpointed state for this plugin (e.g. Saver best_loss/queues).
@@ -90,10 +111,15 @@ class PluginUser(object):
 
         for duration, unit in intervals:
             # unit the plugin type.
-            queue = self.plugin_queues[unit]
+            queues = (
+                self.display_window_plugin_queues
+                if clock == "display_window"
+                else self.plugin_queues
+            )
+            queue = queues[unit]
             # Add the plugin events. duration is the trigger interval. len(queue) is the priority levels for the same duration,
             # the smaller the higher and is determined by the order of registration.
-            queue.append((duration, len(queue), plugin))
+            heapq.heappush(queue, (duration, len(queue), plugin))
 
     def harvest_plugin_states(self):
         """Collect ``{plugin_id: state_dict()}`` for all stateful plugins."""
@@ -119,26 +145,27 @@ class PluginUser(object):
                 "iteration": int(getattr(self, "iter", 1)),
                 "epoch": int(getattr(self, "ep", 1)),
             }
-        for unit, current in counters.items():
-            queue = self.plugin_queues.get(unit)
-            if not queue:
-                continue
-            current = int(current)
-            rebased = []
-            for entry in queue:
-                due, priority, plugin = entry
-                interval = self._plugin_interval_for(plugin, unit)
-                if interval is None or interval <= 0:
-                    # One-shot / non-periodic entry: leave the due untouched.
-                    rebased.append(entry)
+        for queues in (self.plugin_queues, self.display_window_plugin_queues):
+            for unit, current in counters.items():
+                queue = queues.get(unit)
+                if not queue:
                     continue
-                # smallest multiple of interval that is >= current counter
-                next_due = ((current + interval - 1) // interval) * interval
-                if next_due < current:
-                    next_due = current
-                rebased.append((next_due, priority, plugin))
-            self.plugin_queues[unit] = rebased
-            heapq.heapify(self.plugin_queues[unit])
+                current = int(current)
+                rebased = []
+                for entry in queue:
+                    due, priority, plugin = entry
+                    interval = self._plugin_interval_for(plugin, unit)
+                    if interval is None or interval <= 0:
+                        # One-shot / non-periodic entry: leave the due untouched.
+                        rebased.append(entry)
+                        continue
+                    # smallest multiple of interval that is >= current counter
+                    next_due = ((current + interval - 1) // interval) * interval
+                    if next_due < current:
+                        next_due = current
+                    rebased.append((next_due, priority, plugin))
+                queues[unit] = rebased
+                heapq.heapify(queues[unit])
 
     @staticmethod
     def _plugin_interval_for(plugin, unit):
@@ -156,27 +183,53 @@ class PluginUser(object):
                 return duration
         return None
 
-    def call_plugins(self, queue_name, time, **kwargs):
+    def call_plugins(self, queue_name, time, event_clock=None, **kwargs):
         # args should contain: [input, target, output, loss]
         # TODO: why we need a time update here?
         # kwargs.update({"time": time})
         # time can be iteration or epoch ...
-        queue = self.plugin_queues[queue_name]
-        if len(queue) == 0:
-            return
-        while queue[0][0] <= time:
-            plugin = queue[0][2]
+        if event_clock is None:
+            queue_sets = (
+                self.plugin_queues,
+                self.display_window_plugin_queues,
+            )
+        elif event_clock == "committed_step":
+            queue_sets = (self.plugin_queues,)
+        elif event_clock == "display_window":
+            queue_sets = (self.display_window_plugin_queues,)
+        else:
+            raise ValueError(
+                f"unsupported plugin event_clock={event_clock!r}; expected "
+                "'committed_step' or 'display_window'"
+            )
+
+        # A full-state call drives both clocks. Preserve cross-clock plugin
+        # registration order so splitting the queues does not reorder existing
+        # single-Trainer behavior (for example Validationer -> monitors ->
+        # TensorBoard/Logger -> Saver).
+        registration_order = {
+            id(plugin): index
+            for index, plugin in enumerate(self._registered_plugins)
+        }
+        due_entries = []
+        for queues in queue_sets:
+            queue = queues[queue_name]
+            for entry in queue:
+                if entry[0] <= time:
+                    due_entries.append(
+                        (registration_order.get(id(entry[2]), len(registration_order)), queue, entry)
+                    )
+        due_entries.sort(key=lambda item: (item[0], item[2][1]))
+
+        for _, queue, entry in due_entries:
+            due, priority, plugin = entry
             # the plugin must have at-least one of the iteration、batch、epoch and update events.
             getattr(plugin, queue_name)(time=time, **kwargs)
-            for trigger in plugin.trigger_interval:
-                if trigger[1] == queue_name:
-                    interval = trigger[0]
+            interval = self._plugin_interval_for(plugin, queue_name)
+            # Mutate the scheduler only after a successful callback. If a
+            # plugin raises, its due entry remains retryable as before.
+            queue.remove(entry)
+            heapq.heapify(queue)
             # 根据插件的事件触发间隔，来更新事件队列里的事件 duration
-            if queue[0][0] > 0:
-                new_item = (time + interval, queue[0][1], plugin)
-                heapq.heappushpop(queue, new_item)
-                '''加入新的事件并弹出最小堆的堆头。最小堆重新排序。'''
-            else:
-                heapq.heappop(queue)
-                if len(queue) == 0:
-                    return
+            if due > 0 and interval is not None:
+                heapq.heappush(queue, (time + interval, priority, plugin))

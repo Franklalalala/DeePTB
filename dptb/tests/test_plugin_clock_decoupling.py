@@ -129,6 +129,7 @@ class _DistPathProbeTrainer(MultiTrainer):
 
         # Observability for assertions.
         self.validation_calls = []
+        self.reference_train_losses = []
 
     # -- stubs -------------------------------------------------------------
     def _prepare_batch_bundle(self, batch, with_lengths=True):
@@ -139,6 +140,7 @@ class _DistPathProbeTrainer(MultiTrainer):
                              criterion=None):
         expert = self.model.experts[expert_idx]
         loss = (expert.weight ** 2).sum()
+        self.reference_train_losses.append(float(loss.detach().item()))
         return {
             "loss": loss,
             "expert_onsite": 0.1,
@@ -256,18 +258,58 @@ def test_plugins_tick_every_committed_step_with_cheap_state(tmp_path):
             assert state["batch_num_graphs"] == 2
 
 
-def test_monitors_tolerate_sparse_state_and_update_on_flush_only(tmp_path):
+def test_display_freq_larger_than_epoch_flushes_all_steps(tmp_path):
     trainer, _recorder, _ = _make_probe(
         tmp_path, save_freq=3, display_freq=100, with_saver=False
     )
-    for i in range(12):
-        trainer.iteration(_StubBatch(i))  # no crash on cheap ticks
+    trainer.train_loader = [_StubBatch(i) for i in range(12)]
+    trainer.epoch()  # no crash on cheap ticks; epoch tail forces a full flush
 
-    # train_loss requires gathered values -> updated only at the flush (step 1).
-    assert trainer.stats["train_loss"]["last_updated"] == 1
+    train_stats = trainer.stats["train_loss"]
+    weighted_sum, weighted_count = train_stats["epoch_stats"]
+    assert weighted_count == 12
+    expected = sum(trainer.reference_train_losses) / 12
+    assert weighted_sum / weighted_count == pytest.approx(expected)
+    assert train_stats["last_updated"] == 12
+
+    trainer.call_plugins(queue_name="epoch", time=trainer.ep)
+    assert train_stats["epoch_mean"] == pytest.approx(expected)
     # lr is locally available -> updated on every committed step.
     assert trainer.stats["lr"]["last_updated"] == 12
     assert trainer.stats["lr"]["last"] == pytest.approx(0.1)
+
+
+def test_non_divisible_display_window_consumes_two_step_tail(tmp_path):
+    trainer, _recorder, _ = _make_probe(
+        tmp_path, save_freq=3, display_freq=5, with_saver=False
+    )
+    trainer.train_loader = [_StubBatch(i) for i in range(12)]
+    trainer.epoch()
+
+    weighted_sum, weighted_count = trainer.stats["train_loss"]["epoch_stats"]
+    assert weighted_count == 12
+    assert trainer.stats["train_loss"]["last_updated"] == 12
+    assert weighted_sum / weighted_count == pytest.approx(
+        sum(trainer.reference_train_losses) / 12
+    )
+
+
+def test_epoch_mean_weights_windows_by_step_count():
+    user = PluginUser()
+    user.register_plugin(TrainLossMonitor())
+
+    user.call_plugins(
+        queue_name="iteration", time=1, event_clock="display_window",
+        field="iteration", train_loss=1.0, window_steps=5,
+    )
+    user.call_plugins(
+        queue_name="iteration", time=2, event_clock="display_window",
+        field="iteration", train_loss=7.0, window_steps=1,
+    )
+
+    assert user.stats["train_loss"]["epoch_stats"] == pytest.approx((12.0, 6))
+    user.call_plugins(queue_name="epoch", time=1)
+    assert user.stats["train_loss"]["epoch_mean"] == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------

@@ -798,6 +798,10 @@ class DeepDoctorMonitor(Plugin):
         pass
 
 class Monitor(Plugin):
+    # Scalar monitors consume reduced/full display state. Their cadence must not
+    # be advanced by sparse committed-step ticks that omit those fields.
+    event_clock = "display_window"
+
     def __init__(self, running_average=True, epoch_average=True, smoothing=0.7,
                  precision=None, number_format=None, unit='', sliding_win_size=50, avg_per_iter=False):
 
@@ -886,7 +890,26 @@ class Monitor(Plugin):
 
         if self.with_epoch_average:
             curr_s, curr_c = stats.get('epoch_stats', (0, 0))
-            stats['epoch_stats'] = (curr_s + val, curr_c + 1)
+            window_steps = kwargs.get('window_steps')
+            if window_steps is None:
+                if not getattr(self, '_warned_missing_window_steps', False):
+                    log.warning(
+                        "%s received no window_steps; falling back to one "
+                        "sample per display event for epoch aggregation.",
+                        type(self).__name__,
+                    )
+                    self._warned_missing_window_steps = True
+                window_steps = 1
+            try:
+                window_steps = int(window_steps)
+            except (TypeError, ValueError):
+                window_steps = 1
+            if window_steps <= 0:
+                window_steps = 1
+            stats['epoch_stats'] = (
+                curr_s + val * window_steps,
+                curr_c + window_steps,
+            )
 
         if self.with_running_average:
             previous_avg = stats.get('running_avg', 0.0)
@@ -989,6 +1012,7 @@ class CUDAMemoryMonitor(Plugin):
     fields into ``trainer.stats`` so Logger and TensorBoard can consume them.
     """
 
+    event_clock = "display_window"
     _EXPERT_MEMORY_RE = re.compile(r"^expert_\d+_cuda_.*_mb$")
 
     def __init__(self, interval=None, precision=1):
@@ -1782,6 +1806,8 @@ class TestLossMonitor(Monitor):
 
 class LearningRateMonitor(Monitor):
     stat_name = 'lr'
+    # LR is rank-local and present in the cheap committed-step state.
+    event_clock = "committed_step"
 
     def __init__(self):
         super(LearningRateMonitor, self).__init__(
@@ -1795,6 +1821,8 @@ class LearningRateMonitor(Monitor):
 
 class Validationer(Monitor):
     stat_name = 'validation_loss'
+    # Validation cadence is a control clock, independent of display reduction.
+    event_clock = "committed_step"
 
     def __init__(self, interval, fast_mode=True):
         super(Validationer, self).__init__(
@@ -1880,6 +1908,8 @@ class TensorBoardMonitor(Plugin):
     - iteration / epoch 均支持 expert_i_lr
     - 优先使用 kwargs["time"] 作为 step
     """
+    event_clock = "display_window"
+
     def __init__(self, interval, log_dir='./tensorboard_logs', flush_every=20):
         super(TensorBoardMonitor, self).__init__(interval=interval)
         self.writer = SummaryWriter(log_dir=log_dir)

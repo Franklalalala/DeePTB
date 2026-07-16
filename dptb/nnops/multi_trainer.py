@@ -2707,8 +2707,18 @@ class MultiTrainer(Trainer):
                 current_local_lr=current_local_lr,
                 dynamic_batch_state=dynamic_batch_state,
             )
-        with self._tagger.tag("iteration/call_plugins", it=self.iter):
-            self.call_plugins(queue_name='iteration', time=self.iter, **state)
+            with self._tagger.tag("iteration/call_plugins", it=self.iter):
+                self.call_plugins(
+                    queue_name='iteration',
+                    time=self.iter,
+                    event_clock='committed_step',
+                    **state,
+                )
+        else:
+            # Full reduced state: drive both independent clocks while preserving
+            # the original cross-plugin registration order.
+            with self._tagger.tag("iteration/call_plugins", it=self.iter):
+                self.call_plugins(queue_name='iteration', time=self.iter, **state)
 
         with self._tagger.tag("iteration/exit", it=self.iter):
             self.iter += 1
@@ -3093,7 +3103,10 @@ class MultiTrainer(Trainer):
                 flush_time = max(self.iter - 1, 1)
                 state = self._flush_display_window(time_idx=flush_time)
                 if state is not None:
-                    self.call_plugins(queue_name='iteration', time=flush_time, **state)
+                    self.call_plugins(
+                        queue_name='iteration', time=flush_time,
+                        event_clock='display_window', **state
+                    )
             return
 
         if self.use_reference:
@@ -3113,7 +3126,10 @@ class MultiTrainer(Trainer):
             flush_time = max(self.iter - 1, 1)
             state = self._flush_display_window(time_idx=flush_time)
             if state is not None:
-                self.call_plugins(queue_name='iteration', time=flush_time, **state)
+                self.call_plugins(
+                    queue_name='iteration', time=flush_time,
+                    event_clock='display_window', **state
+                )
 
     # ---------------------------------------------------------------------
     # validation
