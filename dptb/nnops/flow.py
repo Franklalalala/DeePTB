@@ -80,6 +80,44 @@ class HamiltonianCFM:
         self.node_target_key = str(options.get("node_target_key", _keys.NODE_FEATURES_KEY))
         self.edge_target_key = str(options.get("edge_target_key", _keys.EDGE_FEATURES_KEY))
         self.flow_time_key = str(options.get("flow_time_key", "flow_time"))
+        self.output_space = str(options.get("output_space", "rme")).lower().replace("-", "_")
+        if self.output_space in {"block", "ao", "ao_blocks"}:
+            self.output_space = "ao_block"
+        if self.output_space not in {"rme", "ao_block"}:
+            raise ValueError(
+                "flow_options.output_space must be 'rme' or 'ao_block', got "
+                f"{self.output_space!r}."
+            )
+        self.node_output_key = str(
+            options.get("node_output_key", getattr(_keys, "NODE_PRED_HAMIL_BLOCKS_KEY", "node_hamil_blocks"))
+        )
+        self.edge_output_key = str(
+            options.get("edge_output_key", getattr(_keys, "EDGE_PRED_HAMIL_BLOCKS_KEY", "edge_hamil_blocks"))
+        )
+        self.node_block_target_key = str(
+            options.get(
+                "node_block_target_key",
+                getattr(_keys, "NODE_DELTA_HAMIL_BLOCKS_KEY", "node_delta_hamil_blocks"),
+            )
+        )
+        self.edge_block_target_key = str(
+            options.get(
+                "edge_block_target_key",
+                getattr(_keys, "EDGE_DELTA_HAMIL_BLOCKS_KEY", "edge_delta_hamil_blocks"),
+            )
+        )
+        self.node_block_shape_key = str(
+            options.get(
+                "node_block_shape_key",
+                getattr(_keys, "NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY", "node_delta_hamil_block_shape"),
+            )
+        )
+        self.edge_block_shape_key = str(
+            options.get(
+                "edge_block_shape_key",
+                getattr(_keys, "EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY", "edge_delta_hamil_block_shape"),
+            )
+        )
 
         # Residual CFM is the recommended mode for DeePTB: base = DFT/NextHAM H0.
         self.mode = str(options.get("mode", "residual")).lower()
@@ -219,6 +257,11 @@ class HamiltonianCFM:
         self.validation_ode_steps = tuple(
             sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
         )
+        if self.output_space == "ao_block" and self.validation_ode_steps != (1,):
+            raise ValueError(
+                "flow_options.output_space='ao_block' is a cross-space one-step "
+                "endpoint adapter and requires validation_ode_steps=[1]."
+            )
         self.apply_to_reference = bool(options.get("apply_to_reference", False))
         self.log_compatible_loss = bool(options.get("log_compatible_loss", True))
         self.log_validation_random_t_loss = bool(
@@ -266,9 +309,11 @@ class HamiltonianCFM:
         self._te_irrep_slices_cache: Dict[int, Optional[Tuple[Tuple[int, int, int], ...]]] = {}
         if self.enabled:
             log.info(
-                "Hamiltonian CFM enabled: mode=%s prior=%s t=[%.3g, %.3g] t0_prob=%.3g loss=%s",
+                "Hamiltonian CFM enabled: mode=%s prior=%s output_space=%s "
+                "t=[%.3g, %.3g] t0_prob=%.3g loss=%s",
                 self.mode,
                 self.prior,
+                self.output_space,
                 self.t_min,
                 self.t_max,
                 self.t0_probability,
@@ -1516,6 +1561,117 @@ class HamiltonianCFM:
         return pred, mask
 
     @staticmethod
+    def _active_block_mask(
+        blocks: torch.Tensor,
+        shapes: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if blocks.ndim != 3:
+            raise ValueError(
+                "AO-block flow expects [n_item, max_norb, max_norb] tensors; "
+                f"got shape={tuple(blocks.shape)}."
+            )
+        if shapes is None:
+            return torch.ones_like(blocks, dtype=torch.bool)
+        shapes = torch.as_tensor(shapes, device=blocks.device, dtype=torch.long)
+        if shapes.ndim != 2 or shapes.shape != (blocks.shape[0], 2):
+            raise ValueError(
+                "AO-block shape metadata must be [n_item, 2]; "
+                f"got shape={tuple(shapes.shape)} for blocks={tuple(blocks.shape)}."
+            )
+        rows = torch.arange(blocks.shape[-2], device=blocks.device)
+        cols = torch.arange(blocks.shape[-1], device=blocks.device)
+        return (rows[None, :, None] < shapes[:, 0, None, None]) & (
+            cols[None, None, :] < shapes[:, 1, None, None]
+        )
+
+    def _block_endpoint_loss(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """One-step endpoint loss for an H-B0 direct AO-block decoder.
+
+        Interpolation and time conditioning remain in RME/H0 feature space, while
+        the endpoint is supervised in AO-block space.  This is deliberately
+        restricted to one-step validation: it is a cross-space endpoint adapter,
+        not a same-coordinate multi-step ODE.
+        """
+        state: Dict[str, torch.Tensor] = {
+            "train_flow_t": ctx.t.detach().mean(),
+            "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
+        }
+        total = total_numerator = total_count = None
+
+        for label, pred_key, target_key, shape_key, weight, item_t in (
+            (
+                "onsite",
+                self.node_output_key,
+                self.node_block_target_key,
+                self.node_block_shape_key,
+                self.node_weight,
+                ctx.node_t,
+            ),
+            (
+                "hopping",
+                self.edge_output_key,
+                self.edge_block_target_key,
+                self.edge_block_shape_key,
+                self.edge_weight,
+                ctx.edge_t,
+            ),
+        ):
+            pred = pred_data.get(pred_key, None)
+            target = ref_data.get(target_key, None)
+            if pred is None or target is None:
+                continue
+            target = torch.as_tensor(target, device=pred.device, dtype=pred.dtype)
+            if pred.shape != target.shape:
+                raise ValueError(
+                    f"AO-block flow {label} prediction/target mismatch: "
+                    f"{pred_key}={tuple(pred.shape)} vs {target_key}={tuple(target.shape)}."
+                )
+            mask = self._active_block_mask(pred, ref_data.get(shape_key, None))
+            diff = pred - target
+            item_weights = None if item_t is None else self._time_weight(item_t)
+            component, numerator, count = self._metric_stats(
+                diff, mask, self.loss_type, item_weights
+            )
+            weighted_component = weight * component
+            weighted_numerator = weight * numerator
+            weighted_count = weight * count
+            total = weighted_component if total is None else total + weighted_component
+            total_numerator = (
+                weighted_numerator
+                if total_numerator is None
+                else total_numerator + weighted_numerator
+            )
+            total_count = weighted_count if total_count is None else total_count + weighted_count
+            state[f"train_flow_{label}_loss"] = component.detach()
+            state[f"train_{label}_loss"] = component.detach()
+
+        if total is None:
+            raise KeyError(
+                "AO-block CFM could not compute a loss because outputs/targets do "
+                f"not contain {self.node_output_key}/{self.edge_output_key} and "
+                f"{self.node_block_target_key}/{self.edge_block_target_key}."
+            )
+        if self.component_reduction == "global_elements":
+            total = total_numerator / total_count.clamp_min(1.0)
+
+        mean_max_prob = pred_data.get("mean_max_prob", None)
+        if torch.is_tensor(mean_max_prob):
+            state["mean_max_prob"] = mean_max_prob.detach()
+            if self.router_z_loss_coef > 0.0:
+                total = total + self.router_z_loss_coef * mean_max_prob
+        expert_load_cv = pred_data.get("expert_load_cv", None)
+        if torch.is_tensor(expert_load_cv):
+            state["expert_load_cv"] = expert_load_cv.detach()
+        state["train_flow_loss"] = total.detach()
+        self.last_state = state
+        return total, state
+
+    @staticmethod
     def _metric_stats(
         diff: torch.Tensor,
         mask: torch.Tensor,
@@ -1576,6 +1732,9 @@ class HamiltonianCFM:
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if not self.enabled:
             raise RuntimeError("HamiltonianCFM.loss called while disabled")
+
+        if self.output_space == "ao_block":
+            return self._block_endpoint_loss(pred_data, ref_data, ctx)
 
         t_weight = self._time_weight(ctx.t).to(device=ctx.t.device, dtype=ctx.t.dtype)
         total = None
@@ -1723,6 +1882,29 @@ class HamiltonianCFM:
 
         like = node_current if node_current is not None else edge_current
         num_graphs = self._num_graphs(state)
+        if self.output_space == "ao_block":
+            if num_steps != 1:
+                raise ValueError(
+                    "AO-block CFM is a cross-space endpoint adapter and supports "
+                    "only num_steps=1."
+                )
+            if node_current is not None:
+                state[self.node_h0_key] = node_current
+                if self.overwrite_feature_keys:
+                    state[self.node_target_key] = node_current
+            if edge_current is not None:
+                state[self.edge_h0_key] = edge_current
+                if self.overwrite_feature_keys:
+                    state[self.edge_target_key] = edge_current
+            state[self.flow_time_key] = torch.zeros(
+                num_graphs, device=like.device, dtype=like.dtype
+            )
+            prediction = model(state)
+            prediction[self.flow_time_key] = torch.ones(
+                num_graphs, device=like.device, dtype=like.dtype
+            )
+            return prediction
+
         dt = 1.0 / float(num_steps)
         for step in range(num_steps):
             cur_t = float(step) * dt

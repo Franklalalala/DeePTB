@@ -179,6 +179,13 @@ def flow_options():
         Argument("edge_h0_key", str, optional=True, default="edge_h0"),
         Argument("node_target_key", str, optional=True, default="node_features"),
         Argument("edge_target_key", str, optional=True, default="edge_features"),
+        Argument("output_space", str, optional=True, default="rme"),
+        Argument("node_output_key", str, optional=True, default="node_hamil_blocks"),
+        Argument("edge_output_key", str, optional=True, default="edge_hamil_blocks"),
+        Argument("node_block_target_key", str, optional=True, default="node_delta_hamil_blocks"),
+        Argument("edge_block_target_key", str, optional=True, default="edge_delta_hamil_blocks"),
+        Argument("node_block_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
+        Argument("edge_block_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
         Argument("flow_time_r_key", str, optional=True, default="flow_time_r"),
         Argument("flow_time_t_key", str, optional=True, default="flow_time_t"),
@@ -3254,4 +3261,3 @@ def normalize_skf2nnsk(data):
     base.check_value(data, strict=True)
 
     return data
-

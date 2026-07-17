@@ -36,6 +36,84 @@ def _two_graph_ref():
     }
 
 
+def _two_graph_block_ref():
+    ref = _two_graph_ref()
+    ref.update(
+        {
+            "node_delta_hamil_blocks": torch.full((3, 2, 2), 2.0),
+            "edge_delta_hamil_blocks": torch.full((2, 2, 2), 4.0),
+            "node_delta_hamil_block_shape": torch.tensor([[2, 2], [1, 2], [2, 1]]),
+            "edge_delta_hamil_block_shape": torch.tensor([[2, 2], [1, 1]]),
+        }
+    )
+    return ref
+
+
+class _TrainableBlockEndpoint(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.node_value = torch.nn.Parameter(torch.tensor(1.0))
+        self.edge_value = torch.nn.Parameter(torch.tensor(3.0))
+
+    def forward(self, data):
+        out = data.copy()
+        out["node_hamil_blocks"] = self.node_value.expand(3, 2, 2)
+        out["edge_hamil_blocks"] = self.edge_value.expand(2, 2, 2)
+        return out
+
+
+def test_ao_block_output_space_trains_hb0_endpoint_and_masks_padding():
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "prior": "zero",
+            "output_space": "ao_block",
+            "validation_ode_steps": [1],
+        }
+    )
+    model = _TrainableBlockEndpoint()
+    data, ref, ctx = flow.prepare_batch(
+        _two_graph_batch(), _two_graph_block_ref(), t=torch.tensor([0.0, 0.5])
+    )
+    pred = model(data)
+    loss, state = flow.loss(pred, ref, ctx)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert model.node_value.grad is not None
+    assert model.edge_value.grad is not None
+    assert "train_flow_onsite_loss" in state
+    assert "train_flow_hopping_loss" in state
+
+
+def test_ao_block_output_space_samples_one_step_only():
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "prior": "zero",
+            "output_space": "ao_block",
+            "validation_ode_steps": [1],
+        }
+    )
+    sampled = flow.sample(_TrainableBlockEndpoint(), _two_graph_batch(), num_steps=1)
+    assert sampled["node_hamil_blocks"].shape == (3, 2, 2)
+    assert sampled["edge_hamil_blocks"].shape == (2, 2, 2)
+    assert torch.equal(sampled["flow_time"], torch.ones(2))
+    with pytest.raises(ValueError, match="only num_steps=1"):
+        flow.sample(_TrainableBlockEndpoint(), _two_graph_batch(), num_steps=2)
+
+
+def test_ao_block_output_space_rejects_multistep_validation():
+    with pytest.raises(ValueError, match="validation_ode_steps=\\[1\\]"):
+        HamiltonianCFM(
+            {
+                "enabled": True,
+                "output_space": "ao_block",
+                "validation_ode_steps": [1, 3],
+            }
+        )
+
+
 def test_prepare_batch_samples_and_expands_time_per_graph():
     flow = HamiltonianCFM(
         {
