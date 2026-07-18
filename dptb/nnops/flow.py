@@ -13,6 +13,7 @@ features.
 import copy
 import logging
 import math
+import re
 from numbers import Integral
 from typing import Any, Dict, Optional, Tuple
 
@@ -26,7 +27,11 @@ from dptb.data.interfaces.blockwise_tensor import (
     strict_reverse_edge_index,
 )
 from dptb.nnops import prior_physical
-from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
+from dptb.nnops.block_flow_codec import (
+    BlockStateCodec,
+    _FLOW_PROJECTED_STATE_TOKEN,
+    project_block_state,
+)
 from dptb.nnops.flow_context import CFMContext, PixelMFContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
@@ -67,6 +72,21 @@ _VALIDATION_SEED_STREAMS = {
     "prior": 0x9E3779B97F4A7C15,
     "time": 0xD1B54A32D192ED03,
 }
+
+
+def _parse_strict_certification(value: Any) -> Tuple[str, int]:
+    cadence = str(value).strip().lower()
+    if cadence == "always":
+        return cadence, 1
+    if cadence == "first_batch":
+        return cadence, 0
+    match = re.fullmatch(r"every_n\(([1-9][0-9]*)\)", cadence)
+    if match is not None:
+        return "every_n", int(match.group(1))
+    raise ValueError(
+        "flow_options.strict_certification must be 'always', 'first_batch', "
+        "or 'every_n(N)' with N >= 1."
+    )
 
 
 class HamiltonianCFM:
@@ -194,6 +214,14 @@ class HamiltonianCFM:
         if not math.isfinite(self.block_inverse_atol) or self.block_inverse_atol < 0:
             raise ValueError("flow_options.block_inverse_atol must be finite and non-negative.")
         self.strict_h0 = bool(options.get("strict_h0", True))
+        self.strict_certification = str(
+            options.get("strict_certification", "always")
+        ).strip().lower()
+        (
+            self._strict_certification_mode,
+            self._strict_certification_period,
+        ) = _parse_strict_certification(self.strict_certification)
+        self._strict_certification_batches = 0
 
         # Residual CFM is the recommended mode for DeePTB: base = DFT/NextHAM H0.
         self.mode = str(options.get("mode", "residual")).lower()
@@ -2035,10 +2063,16 @@ class HamiltonianCFM:
         h0_blocks: BlockTensorResult,
         *,
         prior_seed: Optional[int] = None,
+        certify_image: bool = True,
     ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
         """Draw one endpoint-independent start state and certify its codec image."""
         assert self.block_codec is not None
-        node_h0, edge_h0 = self.block_codec.blocks_to_rme(data, h0_blocks)
+        node_h0, edge_h0 = self.block_codec.blocks_to_rme(
+            data,
+            h0_blocks,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
         if self.prior == "zero":
             if prior_seed is not None:
                 raise ValueError("block-space prior_seed requires prior='projected_te'.")
@@ -2096,7 +2130,12 @@ class HamiltonianCFM:
                     h0_blocks.edge_shapes,
                 ),
             )
-            node_start, edge_start = self.block_codec.blocks_to_rme(data, start)
+            node_start, edge_start = self.block_codec.blocks_to_rme(
+                data,
+                start,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
             roundtrip = self.block_codec.rme_to_blocks(
                 data, node_start, edge_start, project=True
             )
@@ -2115,6 +2154,16 @@ class HamiltonianCFM:
             return draw(None)
         generator = self._seeded_generator(h0_blocks.node_blocks.device, prior_seed)
         return draw(generator)
+
+    def _strict_image_certification_due(self) -> bool:
+        """Schedule only the pure repack/residual image-space self-check."""
+
+        batch = self._strict_certification_batches
+        if self._strict_certification_mode == "always":
+            return True
+        if self._strict_certification_mode == "first_batch":
+            return batch == 0
+        return batch % self._strict_certification_period == 0
 
     def prepare_batch(
         self,
@@ -2210,6 +2259,7 @@ class HamiltonianCFM:
 
         if self.block_ode:
             assert self.block_codec is not None
+            certify_image = self._strict_image_certification_due()
             h0_blocks, h0_projection_residual = self._physical_h0_blocks(
                 data, device=device, dtype=dtype
             )
@@ -2227,10 +2277,23 @@ class HamiltonianCFM:
             # Coupled RME is generated only from certified blocks.  Legacy main
             # and H0 feature side channels are intentionally ignored because
             # older LMDBs store AO-product gathers under the same key names.
-            node_base, edge_base = self.block_codec.blocks_to_rme(data, h0_blocks)
-            node_target, edge_target = self.block_codec.blocks_to_rme(data, endpoint)
+            node_base, edge_base = self.block_codec.blocks_to_rme(
+                data,
+                h0_blocks,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            node_target, edge_target = self.block_codec.blocks_to_rme(
+                data,
+                endpoint,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
             block_start, node_prior, edge_prior = self._block_initial_state(
-                data, h0_blocks, prior_seed=prior_seed
+                data,
+                h0_blocks,
+                prior_seed=prior_seed,
+                certify_image=certify_image,
             )
 
             full_endpoint = self.block_codec.endpoint_to_full(endpoint, h0_blocks)
@@ -2250,7 +2313,10 @@ class HamiltonianCFM:
                 ),
             )
             node_current, edge_current = self.block_codec.blocks_to_rme(
-                data, block_current
+                data,
+                block_current,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
             )
             if self.detach_interpolated_h0:
                 node_current = node_current.detach()
@@ -2273,6 +2339,9 @@ class HamiltonianCFM:
             # Trainer's input/reference copies, so an in-place model cannot
             # rewrite the labels used below by ``loss``.
             self._drop_block_authority_fields(data)
+            # Advance only after all unconditional contract gates and any due
+            # certification pass; a failed batch remains due on retry.
+            self._strict_certification_batches += 1
             return data, ref_data, CFMContext(
                 t=t,
                 node_t=node_t,

@@ -43,6 +43,7 @@ train_options:
     strict_h0: true
     block_inverse_mode: strict
     block_inverse_atol: 2.0e-5  # float32; fp64 certification uses 1.0e-10
+    strict_certification: always  # opt-in example after offline audit: first_batch
     node_block_target_key: node_full_hamil_target_blocks
     edge_block_target_key: edge_full_hamil_target_blocks
     node_block_shape_key: node_full_hamil_target_block_shape

@@ -38,6 +38,9 @@ class _BlockProjectorMetadata:
 _PROJECTOR_CACHE_LIMIT = 16
 _PROJECTOR_CACHE: "OrderedDict[Tuple[Any, ...], _BlockProjectorMetadata]" = OrderedDict()
 _PROJECTOR_CACHE_LOCK = threading.Lock()
+# Private capability proving a cadence-skipped inverse received a state from
+# HamiltonianCFM's physical projector path, not an arbitrary external tensor.
+_FLOW_PROJECTED_STATE_TOKEN = object()
 _PROJECTOR_TOPOLOGY_KEYS = (
     "edge_index",
     "edge_cell_shift",
@@ -358,8 +361,24 @@ class BlockStateCodec:
         self,
         data: Mapping[str, Any],
         state: BlockTensorResult,
+        *,
+        certify_image: bool = True,
+        _construction_token: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Canonical-gather product features, then apply the inverse CG."""
+        if not certify_image and _construction_token is not _FLOW_PROJECTED_STATE_TOKEN:
+            raise RuntimeError(
+                "Skipping strict image certification requires the internal "
+                "projected-state construction token."
+            )
+        metadata = None
+        if _construction_token is _FLOW_PROJECTED_STATE_TOKEN:
+            metadata = _projector_metadata(
+                data,
+                self.idp,
+                node=state.node_blocks,
+                edge=state.edge_blocks,
+            )
         gathered = canonical_block_tensors_to_feature_tensors(
             data,
             self.idp,
@@ -369,6 +388,14 @@ class BlockStateCodec:
             edge_shapes=state.edge_shapes,
             mode=self.inverse_mode,
             atol=self.atol,
+            certify_image=certify_image,
+            _expected_node_shapes=(
+                None if metadata is None else metadata.expected_node_shapes
+            ),
+            _expected_edge_shapes=(
+                None if metadata is None else metadata.expected_edge_shapes
+            ),
+            _reverse_validated=metadata is not None,
         )
         if gathered.node_features is None or gathered.edge_features is None:
             raise ValueError("BlockStateCodec requires both node and edge components.")

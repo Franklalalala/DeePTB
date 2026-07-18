@@ -25,7 +25,7 @@ from dptb.tests.test_block_ode_flow import (
     _pd_legacy_product_h0_case,
     _scaled_endpoint,
 )
-from dptb.utils.argcheck import slem_h0, validate_block_ode_contract
+from dptb.utils.argcheck import flow_options, slem_h0, validate_block_ode_contract
 
 
 FP64_ATOL = 1e-10
@@ -368,6 +368,29 @@ def test_red_strict_schema_accepts_required_flow_time_missing_gate():
     assert {"flow_time_allow_missing", "require_full_block_edge_coverage"} <= names
 
 
+def test_strict_certification_argcheck_default_and_allowed_values():
+    schema = flow_options()
+    default = schema.normalize_value({"enabled": False})
+    schema.check_value(default, strict=True)
+    assert default["strict_certification"] == "always"
+    for cadence in ("always", "first_batch", "every_n(7)"):
+        value = schema.normalize_value(
+            {"enabled": False, "strict_certification": cadence}
+        )
+        schema.check_value(value, strict=True)
+        assert value["strict_certification"] == cadence
+
+
+@pytest.mark.parametrize(
+    "cadence", ["", "sometimes", "every_n", "every_n(0)", "every_n(-1)"]
+)
+def test_strict_certification_contract_rejects_invalid_cadence(cadence):
+    config = _valid_contract()
+    config["train_options"]["flow_options"]["strict_certification"] = cadence
+    with pytest.raises(ValueError, match="strict_certification"):
+        validate_block_ode_contract(config)
+
+
 def test_red_codec_ignores_non_tensor_trainer_batch_metadata():
     idp, data, codec, h0 = _case()
     with_metadata = {
@@ -429,6 +452,7 @@ def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
             option: flow[option] for option in expected_fields[flow["target_semantics"]]
         } == expected_fields[flow["target_semantics"]]
         assert flow["strict_h0"] is True
+        assert flow["strict_certification"] == "always"
         assert overlay["common_options"]["has_soc"] is False
         embedding = overlay["model_options"]["embedding"]
         assert {

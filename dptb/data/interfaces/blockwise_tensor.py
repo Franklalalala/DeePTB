@@ -1048,6 +1048,10 @@ def canonical_block_tensors_to_feature_tensors(
     edge_shapes: Optional[torch.Tensor] = None,
     mode: str = "strict",
     atol: float = 1e-10,
+    certify_image: bool = True,
+    _expected_node_shapes: Optional[torch.Tensor] = None,
+    _expected_edge_shapes: Optional[torch.Tensor] = None,
+    _reverse_validated: bool = False,
 ) -> FeatureTensorResult:
     """Canonical-gather inverse of :func:`feature_tensors_to_block_tensors`.
 
@@ -1069,14 +1073,18 @@ def canonical_block_tensors_to_feature_tensors(
             "values turn image-space certification into silent projection."
         )
     symbols = symbols_from_data(data, idp)
-    inferred_node, inferred_edge = infer_block_shapes(data, idp)
+    if _expected_node_shapes is None or _expected_edge_shapes is None:
+        inferred_node, inferred_edge = infer_block_shapes(data, idp)
+    else:
+        inferred_node = _expected_node_shapes
+        inferred_edge = _expected_edge_shapes
     node_blocks, node_shapes = _validate_inverse_component(
         node_blocks, node_shapes, inferred_node, label="node"
     )
     edge_blocks, edge_shapes = _validate_inverse_component(
         edge_blocks, edge_shapes, inferred_edge, label="edge"
     )
-    if edge_blocks is not None:
+    if edge_blocks is not None and not _reverse_validated:
         strict_reverse_edge_index(data, device=edge_blocks.device, idp=idp)
 
     width = int(idp.reduced_matrix_element)
@@ -1116,6 +1124,19 @@ def canonical_block_tensors_to_feature_tensors(
             for row, col, feat in edge_feature_slices(idp, sym_i, sym_j):
                 gathered[:, feat] = sub[:, row, col].reshape(idx.numel(), -1)
             edge_features.index_copy_(0, idx, gathered)
+
+    if not certify_image:
+        # Shape/dtype/finite/species/reverse-edge contract gates above remain
+        # unconditional.  Only the pure canonical-image self-check is skipped
+        # under HamiltonianCFM's explicitly scheduled certification cadence.
+        return FeatureTensorResult(
+            node_features=node_features,
+            edge_features=edge_features,
+            node_projection_residual=None,
+            edge_projection_residual=None,
+            projected_node_blocks=None,
+            projected_edge_blocks=None,
+        )
 
     repacked = feature_tensors_to_block_tensors(
         data,

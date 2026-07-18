@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from dptb.data import _keys
+from dptb.data.interfaces import blockwise_tensor as blockwise_module
 from dptb.data.interfaces.blockwise_tensor import (
     BlockTensorResult,
     block_mask_from_shapes,
@@ -831,6 +832,108 @@ def test_projected_te_seed_pairs_n1_n3_without_advancing_global_rng():
     round_node, round_edge = flow.block_codec.blocks_to_rme(data, initial_blocks)
     torch.testing.assert_close(round_node, initial_rme[0], rtol=0.0, atol=ATOL)
     torch.testing.assert_close(round_edge, initial_rme[1], rtol=0.0, atol=ATOL)
+
+
+def _cadence_case(cadence="always"):
+    idp, data, codec, h0 = _case()
+    flow = _flow(idp, strict_certification=cadence)
+    node_target = data["node_h0"] * 1.25
+    edge_target = data["edge_h0"] * 1.25
+    endpoint = codec.rme_to_blocks(
+        data, node_target, edge_target, project=True
+    )
+    ref = _ref_for(flow, data, codec, h0, endpoint, node_target, edge_target)
+    return flow, data, ref, codec, h0
+
+
+@pytest.mark.parametrize(
+    "cadence,expected_cumulative",
+    [
+        ("always", [4, 8, 12]),
+        ("first_batch", [4, 4, 4]),
+        ("every_n(2)", [4, 4, 8]),
+    ],
+)
+def test_strict_certification_cadence_counts_only_repack_self_checks(
+    cadence, expected_cumulative, monkeypatch
+):
+    flow, data, ref, _, _ = _cadence_case(cadence)
+    original = blockwise_module.feature_tensors_to_block_tensors
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        blockwise_module, "feature_tensors_to_block_tensors", counted
+    )
+    for expected in expected_cumulative:
+        flow.prepare_batch(
+            _fresh(data), _fresh(ref), t=torch.tensor([0.4], dtype=torch.float64)
+        )
+        assert calls == expected
+
+
+def test_default_strict_certification_is_always():
+    idp, _, _, _ = _case()
+    flow = _flow(idp)
+    assert flow.strict_certification == "always"
+    assert flow._strict_image_certification_due() is True
+
+
+def test_certification_skip_requires_internal_projected_state_token():
+    _, data, codec, h0 = _case()
+    with pytest.raises(RuntimeError, match="projected-state construction token"):
+        codec.blocks_to_rme(data, h0, certify_image=False)
+
+
+def test_every_n_still_catches_image_error_on_certification_batch(monkeypatch):
+    flow, data, ref, _, _ = _cadence_case("every_n(2)")
+    flow.prepare_batch(
+        _fresh(data), _fresh(ref), t=torch.tensor([0.4], dtype=torch.float64)
+    )
+    original = blockwise_module.feature_tensors_to_block_tensors
+
+    def corrupt_repack(*args, **kwargs):
+        packed = original(*args, **kwargs)
+        corrupt_node = packed.node_blocks.clone()
+        corrupt_node[0, 0, 0] += 1.0e-3
+        return BlockTensorResult(
+            corrupt_node,
+            packed.edge_blocks,
+            packed.node_shapes,
+            packed.edge_shapes,
+        )
+
+    monkeypatch.setattr(
+        blockwise_module, "feature_tensors_to_block_tensors", corrupt_repack
+    )
+    # Batch index 1 is not a certification batch, so the pure repack oracle is
+    # absent while all projector/topology/shape/time contract gates still run.
+    flow.prepare_batch(
+        _fresh(data), _fresh(ref), t=torch.tensor([0.4], dtype=torch.float64)
+    )
+    with pytest.raises(ValueError, match="outside the canonical packer image"):
+        flow.prepare_batch(
+            _fresh(data), _fresh(ref), t=torch.tensor([0.4], dtype=torch.float64)
+        )
+
+
+def test_first_batch_cadence_never_skips_topology_contract_gate():
+    flow, data, ref, _, _ = _cadence_case("first_batch")
+    flow.prepare_batch(
+        _fresh(data), _fresh(ref), t=torch.tensor([0.4], dtype=torch.float64)
+    )
+    for batch in (data, ref):
+        batch["edge_index"] = batch["edge_index"][:, :1]
+        batch["edge_cell_shift"] = batch["edge_cell_shift"][:1]
+        batch[_keys.EDGE_TYPE_KEY] = batch[_keys.EDGE_TYPE_KEY][:1]
+    with pytest.raises(ValueError, match="missing reverse"):
+        flow.prepare_batch(
+            _fresh(data), _fresh(ref), t=torch.tensor([0.4], dtype=torch.float64)
+        )
 
 
 def test_prepare_is_block_authoritative_over_legacy_product_sidechannels():

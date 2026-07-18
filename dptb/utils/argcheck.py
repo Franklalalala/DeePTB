@@ -2,6 +2,7 @@ from typing import List, Callable, Dict, Any, Union
 from dargs import dargs, Argument, Variant, ArgumentEncoder
 import logging
 import math
+import re
 from numbers import Integral, Number
 
 
@@ -187,6 +188,7 @@ def flow_options():
         Argument("time_conditioning_required", bool, optional=True, default=False),
         Argument("block_inverse_mode", str, optional=True, default="strict"),
         Argument("block_inverse_atol", [int, float, None], optional=True, default=None),
+        Argument("strict_certification", str, optional=True, default="always"),
         Argument("node_output_key", str, optional=True, default="node_hamil_blocks"),
         Argument("edge_output_key", str, optional=True, default="edge_hamil_blocks"),
         Argument("node_block_target_key", str, optional=True, default="node_delta_hamil_blocks"),
@@ -452,6 +454,16 @@ def validate_block_ode_contract(data):
         )
     if str(flow.get("block_inverse_mode", "strict")).lower() != "strict":
         raise ValueError("block_ode requires block_inverse_mode='strict'")
+    strict_certification = str(
+        flow.get("strict_certification", "always")
+    ).strip().lower()
+    if strict_certification not in {"always", "first_batch"} and re.fullmatch(
+        r"every_n\(([1-9][0-9]*)\)", strict_certification
+    ) is None:
+        raise ValueError(
+            "block_ode strict_certification must be 'always', 'first_batch', "
+            "or 'every_n(N)' with N >= 1"
+        )
     common = dict(data.get("common_options", {}) or {})
     configured_dtype = str(common.get("dtype", "float32")).lower().replace(
         "torch.", ""
