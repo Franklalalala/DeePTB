@@ -35,7 +35,7 @@ train_options:
     prediction_add_h0: false
     time_conditioning_required: true
     block_inverse_mode: strict
-    block_inverse_atol: 1.0e-10
+    block_inverse_atol: 2.0e-5  # float32; fp64 certification uses 1.0e-10
     node_block_target_key: node_delta_hamil_blocks
     edge_block_target_key: edge_delta_hamil_blocks
     node_block_shape_key: node_delta_hamil_block_shape

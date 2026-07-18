@@ -185,7 +185,7 @@ def flow_options():
         Argument("prediction_add_h0", bool, optional=True, default=False),
         Argument("time_conditioning_required", bool, optional=True, default=False),
         Argument("block_inverse_mode", str, optional=True, default="strict"),
-        Argument("block_inverse_atol", (int, float), optional=True, default=1.0e-10),
+        Argument("block_inverse_atol", [int, float, None], optional=True, default=None),
         Argument("node_output_key", str, optional=True, default="node_hamil_blocks"),
         Argument("edge_output_key", str, optional=True, default="edge_hamil_blocks"),
         Argument("node_block_target_key", str, optional=True, default="node_delta_hamil_blocks"),

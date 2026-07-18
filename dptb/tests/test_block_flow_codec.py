@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from e3nn import o3
 
 from dptb.data.interfaces.blockwise_tensor import (
     BlockTensorResult,
@@ -11,6 +12,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 )
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.hamiltonian import E3Hamiltonian
+from dptb.nn.embedding.late_block_expansion_cg import LateBlockExpansionCGHead
 from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
 
 
@@ -280,3 +282,57 @@ def test_endpoint_semantics_absolute_and_residual_add_h0_exactly_once():
     assert torch.equal(absolute.edge_blocks, endpoint.edge_blocks)
     assert torch.all(residual.node_blocks == 5.0)
     assert torch.all(residual.edge_blocks == 5.0)
+
+
+def test_h_b0_head_random_rotation_covariance_fp64_gate():
+    irreps = o3.Irreps("2x0e+1x1o")
+    head = LateBlockExpansionCGHead(
+        irreps,
+        ["1s", "1p"],
+        symmetrize=False,
+        rank=2,
+        dtype=torch.float64,
+    )
+    generator = torch.Generator().manual_seed(20260718)
+    features = torch.randn(4, irreps.dim, dtype=torch.float64, generator=generator)
+    raw = torch.randn(3, 3, dtype=torch.float64, generator=generator)
+    q, _ = torch.linalg.qr(raw)
+    if torch.linalg.det(q) < 0:
+        q[:, 0] *= -1
+    d_input = torch.block_diag(torch.eye(2, dtype=torch.float64), q)
+    d_ao = torch.block_diag(torch.eye(1, dtype=torch.float64), q)
+    got = head(features @ d_input.T)
+    expected = torch.einsum("ij,njk,lk->nil", d_ao, head(features), d_ao)
+    assert (got - expected).abs().max().item() <= FP64_FLOOR
+
+
+def test_real_h_b0_head_output_projected_block_rme_block_gate():
+    idp = OrbitalMapper({"Si": ["3s", "3p"]}, method="e3tb", device="cpu")
+    idp.get_orbital_maps()
+    idp.get_irreps(no_parity=False)
+    irreps = o3.Irreps("2x0e+2x1o+2x2e")
+    node_head = LateBlockExpansionCGHead(
+        irreps, idp.full_basis, symmetrize=True, rank=2, dtype=torch.float64
+    )
+    edge_head = LateBlockExpansionCGHead(
+        irreps, idp.full_basis, symmetrize=False, rank=2, dtype=torch.float64
+    )
+    features = torch.randn(1, irreps.dim, dtype=torch.float64)
+    atom_type = idp.chemical_symbol_to_type["Si"]
+    data = {
+        "pos": torch.zeros(1, 3, dtype=torch.float64),
+        "edge_index": torch.tensor([[0], [0]], dtype=torch.long),
+        "edge_cell_shift": torch.zeros(1, 3, dtype=torch.float64),
+        "atom_types": torch.tensor([atom_type]),
+        "edge_types": torch.tensor([idp.bond_to_type["Si-Si"]]),
+    }
+    shapes = torch.tensor([[4, 4]])
+    head_state = BlockTensorResult(
+        node_head(features), edge_head(features), shapes, shapes
+    )
+    projected = project_block_state(data, idp, head_state)
+    codec = BlockStateCodec(idp, dtype=torch.float64)
+    node_rme, edge_rme = codec.blocks_to_rme(data, projected)
+    rebuilt = codec.rme_to_blocks(data, node_rme, edge_rme)
+    assert (rebuilt.node_blocks - projected.node_blocks).abs().max().item() <= FP64_FLOOR
+    assert (rebuilt.edge_blocks - projected.edge_blocks).abs().max().item() <= FP64_FLOOR

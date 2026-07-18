@@ -141,11 +141,11 @@ class HamiltonianCFM:
         self.prediction_add_h0 = bool(options.get("prediction_add_h0", False))
         self.time_conditioning_required = bool(options.get("time_conditioning_required", False))
         self.block_inverse_mode = str(options.get("block_inverse_mode", "strict")).lower()
+        configured_block_atol = options.get("block_inverse_atol", None)
         self.block_inverse_atol = float(
-            options.get(
-                "block_inverse_atol",
-                1e-10 if self.dtype == torch.float64 else 2e-5,
-            )
+            (1e-10 if self.dtype == torch.float64 else 2e-5)
+            if configured_block_atol is None
+            else configured_block_atol
         )
 
         # Residual CFM is the recommended mode for DeePTB: base = DFT/NextHAM H0.
