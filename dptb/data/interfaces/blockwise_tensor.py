@@ -613,10 +613,14 @@ def strict_reverse_edge_index(
             pbc = raw_pbc.to(dtype=torch.bool)
         else:
             raise ValueError(f"pbc must have shape [3] or [B,3], got {tuple(raw_pbc.shape)}.")
-        if pbc.shape[0] > 1 and batch.numel() and int(batch.max().item()) >= pbc.shape[0]:
+        if pbc.shape[0] != 1 and (
+            pbc.shape[0] == 0
+            or (batch.numel() and int(batch.max().item()) >= pbc.shape[0])
+        ):
+            max_batch = None if not batch.numel() else int(batch.max().item())
             raise ValueError(
                 f"pbc has {pbc.shape[0]} graph rows but batch contains graph "
-                f"index {int(batch.max().item())}."
+                f"index {max_batch}."
             )
 
     raw_shift = data_get(data, key("EDGE_CELL_SHIFT_KEY", "edge_cell_shift"), None)

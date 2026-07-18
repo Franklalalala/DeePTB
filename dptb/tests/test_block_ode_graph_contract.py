@@ -91,6 +91,18 @@ def test_strict_graph_rejects_cross_batch_edges():
         strict_reverse_edge_index(data)
 
 
+@pytest.mark.parametrize("empty_edges", [True, False])
+def test_strict_graph_rejects_zero_row_pbc_with_contract_error(empty_edges):
+    data = _two_atom_graph()
+    data[_keys.PBC_KEY] = torch.empty((0, 3), dtype=torch.bool)
+    if empty_edges:
+        data[_keys.EDGE_INDEX_KEY] = torch.empty((2, 0), dtype=torch.long)
+        data[_keys.EDGE_CELL_SHIFT_KEY] = torch.empty((0, 3), dtype=torch.long)
+
+    with pytest.raises(ValueError, match="pbc has 0 graph rows"):
+        strict_reverse_edge_index(data)
+
+
 def test_strict_graph_validates_explicit_edge_type_against_mapper():
     mapper = _mapper()
     data = _two_atom_graph()

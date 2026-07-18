@@ -414,6 +414,124 @@ def test_two_and_three_step_rollouts_match_manual_endpoint_blends(num_steps):
         _assert_state_invariants(data, current)
     assert (result["node_hamil_blocks"] - current.node_blocks).abs().max() <= ATOL
     assert (result["edge_hamil_blocks"] - current.edge_blocks).abs().max() <= ATOL
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [_keys.NODE_PRED_HAMIL_BLOCKS_KEY, _keys.EDGE_PRED_HAMIL_BLOCKS_KEY],
+)
+def test_block_ode_multistep_requires_fresh_endpoint_outputs(missing_key):
+    idp, data, codec, _ = _case()
+    endpoint = _scaled_endpoint(
+        codec, data, data[_keys.NODE_H0_KEY], data[_keys.EDGE_H0_KEY], 1.1
+    )
+
+    class FirstStepCompleteSecondStepIncomplete(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, batch):
+            self.calls += 1
+            out = batch.copy()
+            outputs = {
+                _keys.NODE_PRED_HAMIL_BLOCKS_KEY: endpoint.node_blocks,
+                _keys.EDGE_PRED_HAMIL_BLOCKS_KEY: endpoint.edge_blocks,
+            }
+            for key, value in outputs.items():
+                if self.calls == 1 or key != missing_key:
+                    out[key] = value
+            return out
+
+    with pytest.raises(ValueError, match=rf"step 2.*{missing_key}"):
+        _flow(idp).sample(
+            FirstStepCompleteSecondStepIncomplete(),
+            _fresh(data),
+            num_steps=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("node_values", "edge_value", "expected"),
+    [
+        ([1.0, 1.0], 3.0, 1.790760441090),
+        ([0.0, 0.0], 0.0, 0.0),
+    ],
+)
+def test_block_ode_global_l1_rmse_frozen_golden(
+    node_values, edge_value, expected
+):
+    idp = OrbitalMapper({"H": ["1s"]}, method="e3tb", device="cpu")
+    idp.get_orbital_maps()
+    idp.get_irreps(no_parity=False)
+    atom_type = idp.chemical_symbol_to_type["H"]
+    edge_type = idp.bond_to_type["H-H"]
+    data = {
+        _keys.POSITIONS_KEY: torch.zeros((2, 3), dtype=torch.float64),
+        _keys.CELL_KEY: torch.eye(3, dtype=torch.float64).unsqueeze(0),
+        _keys.PBC_KEY: torch.tensor([False, False, False]),
+        _keys.BATCH_KEY: torch.zeros(2, dtype=torch.long),
+        _keys.EDGE_INDEX_KEY: torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        _keys.EDGE_CELL_SHIFT_KEY: torch.zeros((2, 3), dtype=torch.long),
+        _keys.ATOM_TYPE_KEY: torch.full((2,), atom_type, dtype=torch.long),
+        _keys.EDGE_TYPE_KEY: torch.full((2,), edge_type, dtype=torch.long),
+    }
+    shapes = torch.ones((2, 2), dtype=torch.long)
+    h0 = BlockTensorResult(
+        torch.zeros((2, 1, 1), dtype=torch.float64),
+        torch.zeros((2, 1, 1), dtype=torch.float64),
+        shapes,
+        shapes.clone(),
+    )
+    codec = BlockStateCodec(idp, dtype=torch.float64)
+    node_h0, edge_h0 = codec.blocks_to_rme(data, h0)
+    data.update(
+        {
+            _keys.NODE_H0_KEY: node_h0,
+            _keys.EDGE_H0_KEY: edge_h0,
+            _keys.NODE_FEATURES_KEY: node_h0.clone(),
+            _keys.EDGE_FEATURES_KEY: edge_h0.clone(),
+            _keys.NODE_H0_BLOCKS_KEY: h0.node_blocks,
+            _keys.EDGE_H0_BLOCKS_KEY: h0.edge_blocks,
+            _keys.NODE_H0_BLOCK_SHAPE_KEY: h0.node_shapes,
+            _keys.EDGE_H0_BLOCK_SHAPE_KEY: h0.edge_shapes,
+        }
+    )
+    ref = _fresh(data)
+    ref.update(
+        {
+            _keys.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY: h0.node_blocks.clone(),
+            _keys.EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY: h0.edge_blocks.clone(),
+            _keys.NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY: h0.node_shapes.clone(),
+            _keys.EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY: h0.edge_shapes.clone(),
+        }
+    )
+    flow = _flow(
+        idp,
+        loss_type="l1_rmse",
+        component_reduction="global_elements",
+        omit_time_scaling=True,
+    )
+    prepared, prepared_ref, ctx = flow.prepare_batch(
+        _fresh(data), ref, t=torch.tensor([0.0], dtype=torch.float64)
+    )
+    pred = dict(prepared)
+    pred.update(
+        {
+            _keys.NODE_PRED_HAMIL_BLOCKS_KEY: torch.tensor(
+                node_values, dtype=torch.float64
+            ).reshape(2, 1, 1),
+            _keys.EDGE_PRED_HAMIL_BLOCKS_KEY: torch.full(
+                (2, 1, 1), edge_value, dtype=torch.float64
+            ),
+        }
+    )
+
+    actual, _ = flow.loss(pred, prepared_ref, ctx)
+
+    assert actual.item() == pytest.approx(expected, abs=1.0e-12)
+
+
 def test_full_contract_never_adds_h0_and_residual_contract_adds_exactly_once():
     idp, data, codec, h0 = _case()
     delta = _scaled_endpoint(codec, data, data["node_h0"], data["edge_h0"], 0.25)

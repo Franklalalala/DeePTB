@@ -48,6 +48,14 @@ from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 log = logging.getLogger(__name__)
 
 
+_BLOCK_ODE_OUTPUT_ONLY_KEYS = (
+    _keys.NODE_PRED_HAMIL_BLOCKS_KEY,
+    _keys.EDGE_PRED_HAMIL_BLOCKS_KEY,
+    _keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+    _keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+)
+
+
 class HamiltonianCFM:
     """Trainer-side residual conditional flow matching helper.
 
@@ -1703,6 +1711,34 @@ class HamiltonianCFM:
         ):
             data.pop(key, None)
 
+    def _block_ode_output_only_keys(self) -> Tuple[str, ...]:
+        """Model outputs that must never be recycled as the next step's input."""
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.node_output_key,
+                    self.edge_output_key,
+                    *_BLOCK_ODE_OUTPUT_ONLY_KEYS,
+                )
+            )
+        )
+
+    def _require_fresh_block_ode_outputs(
+        self,
+        prediction: AtomicDataDict.Type,
+        *,
+        step: int,
+    ) -> None:
+        missing = [
+            key
+            for key in (self.node_output_key, self.edge_output_key)
+            if key not in prediction
+        ]
+        if missing:
+            raise ValueError(
+                f"Block-space ODE step {step} is missing fresh model output keys={missing}."
+            )
+
     @classmethod
     def _require_matching_block_topology(
         cls,
@@ -2159,7 +2195,7 @@ class HamiltonianCFM:
             mask = self._active_block_mask(pred, ref_data.get(shape_key, None))
             diff = pred - target
             item_weights = None if item_t is None else self._time_weight(item_t)
-            stats = self._metric_stats(
+            stats = self._legacy_metric_stats(
                 diff, mask, self.loss_type, item_weights
             )
             component = stats[0]
@@ -2173,7 +2209,7 @@ class HamiltonianCFM:
                 f"not contain {self.node_output_key}/{self.edge_output_key} and "
                 f"{self.node_block_target_key}/{self.edge_block_target_key}."
             )
-        total = self._reduce_component_stats(tuple(component_stats))
+        total = self._reduce_legacy_component_stats(tuple(component_stats))
         return self._finalize_loss(total, state, pred_data)
 
     def _block_ode_endpoint_loss(
@@ -2349,6 +2385,36 @@ class HamiltonianCFM:
         return metric, abs_sum, sq_sum, count
 
     @staticmethod
+    def _legacy_metric_stats(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+        loss_type: str,
+        weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Frozen pre-block-ODE component metric from parent ``e7e5410``."""
+        mask_f = mask.to(device=diff.device, dtype=diff.dtype)
+        count = mask_f.sum().clamp_min(1.0)
+        if weights is None:
+            weights_f = torch.ones_like(diff)
+        else:
+            weights_f = weights.to(device=diff.device, dtype=diff.dtype)
+            weights_f = weights_f.reshape((-1,) + (1,) * (diff.ndim - 1))
+            weights_f = weights_f.expand_as(diff)
+        if loss_type == "mse":
+            numerator = (diff.square() * mask_f * weights_f).sum()
+            metric = numerator / count
+        else:
+            abs_sum = (diff.abs() * mask_f * weights_f).sum()
+            square_sum = (diff.square() * mask_f * weights_f).sum()
+            metric = 0.5 * (
+                abs_sum / count + torch.sqrt(square_sum / count + 1.0e-12)
+            )
+            numerator = metric * count
+        # Match the shared stats tuple shape. The legacy reducer consumes only
+        # component metric, numerator, and clamped component count.
+        return metric, numerator, numerator, count
+
+    @staticmethod
     def _global_metric(
         primary_sum: torch.Tensor,
         square_sum: torch.Tensor,
@@ -2398,6 +2464,38 @@ class HamiltonianCFM:
             square_sum = stats[2] if square_sum is None else square_sum + stats[2]
             count = stats[3] if count is None else count + stats[3]
         return self._global_metric(primary_sum, square_sum, count, self.loss_type)
+
+    def _reduce_legacy_component_stats(
+        self,
+        components: Tuple[
+            Tuple[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                float,
+            ],
+            ...,
+        ],
+    ) -> torch.Tensor:
+        """Reproduce the parent component-first reduction for legacy routes."""
+        if not components:
+            raise ValueError("At least one loss component is required.")
+        if self.component_reduction == "equal_components":
+            total = None
+            for stats, weight in components:
+                weighted = float(weight) * stats[0]
+                total = weighted if total is None else total + weighted
+            return total
+
+        numerator = count = None
+        for stats, weight in components:
+            weighted_numerator = float(weight) * stats[1]
+            weighted_count = float(weight) * stats[3]
+            numerator = (
+                weighted_numerator
+                if numerator is None
+                else numerator + weighted_numerator
+            )
+            count = weighted_count if count is None else count + weighted_count
+        return numerator / count.clamp_min(1.0)
 
     def _finalize_loss(
         self,
@@ -2474,7 +2572,7 @@ class HamiltonianCFM:
             pred, mask = self._project_loss_layout(pred, mask, target)
             node_diff = pred - target
             node_weights = self._time_weight(ctx.node_t)
-            node_stats = self._metric_stats(
+            node_stats = self._legacy_metric_stats(
                 node_diff, mask, self.loss_type, node_weights
             )
             node_loss = node_stats[0]
@@ -2494,7 +2592,7 @@ class HamiltonianCFM:
             pred, mask = self._project_loss_layout(pred, mask, target)
             edge_diff = pred - target
             edge_weights = self._time_weight(ctx.edge_t)
-            edge_stats = self._metric_stats(
+            edge_stats = self._legacy_metric_stats(
                 edge_diff, mask, self.loss_type, edge_weights
             )
             edge_loss = edge_stats[0]
@@ -2512,7 +2610,7 @@ class HamiltonianCFM:
                 "CFM could not compute a loss because model outputs do not contain "
                 f"`{self.node_target_key}` or `{self.edge_target_key}`."
             )
-        total = self._reduce_component_stats(tuple(component_stats))
+        total = self._reduce_legacy_component_stats(tuple(component_stats))
         return self._finalize_loss(total, state, pred_data)
 
     def loss_on_sample(
@@ -2669,6 +2767,7 @@ class HamiltonianCFM:
             model_input = {
                 key: value.clone() if torch.is_tensor(value) else value
                 for key, value in state.items()
+                if key not in self._block_ode_output_only_keys()
             }
             self._restore_block_topology(
                 model_input, topology_sidecar, clone_values=True
@@ -2680,11 +2779,7 @@ class HamiltonianCFM:
                 }
             )
             prediction = model(model_input)
-            if self.node_output_key not in prediction or self.edge_output_key not in prediction:
-                raise KeyError(
-                    "Block-space ODE model must return both endpoint block components "
-                    f"`{self.node_output_key}` and `{self.edge_output_key}`."
-                )
+            self._require_fresh_block_ode_outputs(prediction, step=step + 1)
             merged = state.copy()
             merged.update(prediction)
             self._restore_block_topology(merged, topology_sidecar)

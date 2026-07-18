@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dptb.nnops.flow import HamiltonianCFM, HamiltonianPixelMeanFlow, build_hamiltonian_flow
+from dptb.nnops.flow_context import CFMContext
 from dptb.data import AtomicDataDict
 from dptb.nnops.loss import HamilLossAbs
 from dptb.nnops import trainer as trainer_module
@@ -60,6 +61,132 @@ class _TrainableBlockEndpoint(torch.nn.Module):
         out["node_hamil_blocks"] = self.node_value.expand(3, 2, 2)
         out["edge_hamil_blocks"] = self.edge_value.expand(2, 2, 2)
         return out
+
+
+def _parent_legacy_component(diff):
+    count = torch.tensor(float(diff.numel()), dtype=diff.dtype).clamp_min(1.0)
+    metric = 0.5 * (
+        diff.abs().sum() / count
+        + torch.sqrt(diff.square().sum() / count + 1.0e-12)
+    )
+    return metric, count
+
+
+def _legacy_l1_rmse_loss(output_space, node_diff, edge_diff):
+    flow = HamiltonianCFM(
+        {
+            "enabled": True,
+            "prior": "zero",
+            "output_space": output_space,
+            "validation_ode_steps": [1],
+            "omit_time_scaling": True,
+            "loss_type": "l1_rmse",
+            "component_reduction": "global_elements",
+        },
+        dtype=torch.float64,
+    )
+    node_target = torch.zeros_like(node_diff)
+    edge_target = torch.zeros_like(edge_diff)
+    ctx = CFMContext(
+        t=torch.zeros(1, dtype=torch.float64),
+        node_t=torch.zeros(node_diff.shape[0], dtype=torch.float64),
+        edge_t=torch.zeros(edge_diff.shape[0], dtype=torch.float64),
+        node_base=None,
+        edge_base=None,
+        node_target=node_target,
+        edge_target=edge_target,
+        node_current=None,
+        edge_current=None,
+        node_prior=None,
+        edge_prior=None,
+    )
+    if output_space == "ao_block":
+        pred = {
+            flow.node_output_key: node_diff,
+            flow.edge_output_key: edge_diff,
+        }
+        ref = {
+            flow.node_block_target_key: node_target,
+            flow.edge_block_target_key: edge_target,
+            flow.node_block_shape_key: torch.tensor(
+                [node_diff.shape[-2:]] * node_diff.shape[0]
+            ).reshape(-1, 2),
+            flow.edge_block_shape_key: torch.tensor(
+                [edge_diff.shape[-2:]] * edge_diff.shape[0]
+            ).reshape(-1, 2),
+        }
+    else:
+        pred = {
+            flow.node_target_key: node_diff,
+            flow.edge_target_key: edge_diff,
+        }
+        ref = {
+            flow.node_target_key: node_target,
+            flow.edge_target_key: edge_target,
+        }
+    return flow.loss(pred, ref, ctx)[0]
+
+
+@pytest.mark.parametrize("output_space", ["rme", "ao_block"])
+def test_legacy_l1_rmse_matches_parent_component_reference(output_space):
+    generator = torch.Generator().manual_seed(20260718)
+    if output_space == "ao_block":
+        node_diff = torch.randn((2, 2, 2), dtype=torch.float64, generator=generator)
+        edge_diff = torch.randn((1, 2, 2), dtype=torch.float64, generator=generator)
+    else:
+        node_diff = torch.randn((2, 3), dtype=torch.float64, generator=generator)
+        edge_diff = torch.randn((1, 2), dtype=torch.float64, generator=generator)
+    node_component, node_count = _parent_legacy_component(node_diff)
+    edge_component, edge_count = _parent_legacy_component(edge_diff)
+    expected = (
+        node_component * node_count + edge_component * edge_count
+    ) / (node_count + edge_count).clamp_min(1.0)
+
+    actual = _legacy_l1_rmse_loss(output_space, node_diff, edge_diff)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("output_space", ["rme", "ao_block"])
+@pytest.mark.parametrize(
+    ("node_values", "edge_values", "expected"),
+    [
+        ([1.0, 1.0], [3.0], 1.666666666667),
+        ([0.0, 0.0], [0.0], 5.0e-7),
+    ],
+)
+def test_legacy_l1_rmse_frozen_golden(
+    output_space, node_values, edge_values, expected
+):
+    trailing_shape = (1, 1) if output_space == "ao_block" else (1,)
+    node_diff = torch.tensor(node_values, dtype=torch.float64).reshape(
+        (len(node_values),) + trailing_shape
+    )
+    edge_diff = torch.tensor(edge_values, dtype=torch.float64).reshape(
+        (len(edge_values),) + trailing_shape
+    )
+
+    actual = _legacy_l1_rmse_loss(output_space, node_diff, edge_diff)
+
+    assert actual.item() == pytest.approx(expected, abs=1.0e-12)
+
+
+@pytest.mark.parametrize("output_space", ["rme", "ao_block"])
+def test_legacy_l1_rmse_empty_component_keeps_parent_clamped_count(output_space):
+    trailing_shape = (1, 1) if output_space == "ao_block" else (1,)
+    node_diff = torch.tensor([1.0, 1.0], dtype=torch.float64).reshape(
+        (2,) + trailing_shape
+    )
+    edge_diff = torch.empty((0,) + trailing_shape, dtype=torch.float64)
+    node_component, node_count = _parent_legacy_component(node_diff)
+    edge_component, edge_count = _parent_legacy_component(edge_diff)
+    expected = (
+        node_component * node_count + edge_component * edge_count
+    ) / (node_count + edge_count).clamp_min(1.0)
+
+    actual = _legacy_l1_rmse_loss(output_space, node_diff, edge_diff)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1.0e-12)
 
 
 def test_ao_block_output_space_trains_hb0_endpoint_and_masks_padding():
