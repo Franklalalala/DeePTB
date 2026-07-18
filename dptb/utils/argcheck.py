@@ -180,6 +180,12 @@ def flow_options():
         Argument("node_target_key", str, optional=True, default="node_features"),
         Argument("edge_target_key", str, optional=True, default="edge_features"),
         Argument("output_space", str, optional=True, default="rme"),
+        Argument("block_ode", bool, optional=True, default=False),
+        Argument("target_semantics", str, optional=True, default=""),
+        Argument("prediction_add_h0", bool, optional=True, default=False),
+        Argument("time_conditioning_required", bool, optional=True, default=False),
+        Argument("block_inverse_mode", str, optional=True, default="strict"),
+        Argument("block_inverse_atol", (int, float), optional=True, default=1.0e-10),
         Argument("node_output_key", str, optional=True, default="node_hamil_blocks"),
         Argument("edge_output_key", str, optional=True, default="edge_hamil_blocks"),
         Argument("node_block_target_key", str, optional=True, default="node_delta_hamil_blocks"),
@@ -297,6 +303,86 @@ def flow_options():
         sub_variants=[],
         doc=doc,
     )
+
+
+def validate_block_ode_contract(data):
+    """Cross-check the full model/data contract that a field schema cannot see."""
+    train = dict(data.get("train_options", {}) or {})
+    flow = dict(train.get("flow_options", {}) or {})
+    output_space = str(flow.get("output_space", "rme")).lower().replace("-", "_")
+    requested = bool(flow.get("block_ode", False)) or output_space in {
+        "ao_block_ode",
+        "block_ode",
+        "ao_blocks_ode",
+    }
+    if not requested:
+        return
+    if not bool(flow.get("enabled", False)):
+        raise ValueError("block_ode requires train_options.flow_options.enabled=true")
+    if output_space != "ao_block_ode" or not bool(flow.get("block_ode", False)):
+        raise ValueError(
+            "block_ode is a distinct mode: set block_ode=true and "
+            "output_space='ao_block_ode'; do not reuse the frozen ao_block adapter"
+        )
+    if str(flow.get("mode", "")).lower() != "residual":
+        raise ValueError("block_ode v1 requires flow_options.mode='residual'")
+    if str(flow.get("prior", "")).lower().replace("-", "_") != "zero":
+        raise ValueError(
+            "block_ode v1 requires prior='zero'; TE/Gaussian scale is not persisted"
+        )
+    semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
+    if semantics not in {"absolute_full_h", "residual_dh"}:
+        raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
+    if bool(flow.get("prediction_add_h0", False)):
+        raise ValueError("block_ode requires flow_options.prediction_add_h0=false")
+    if not bool(flow.get("time_conditioning_required", False)):
+        raise ValueError("block_ode requires flow_options.time_conditioning_required=true")
+    if str(flow.get("block_inverse_mode", "strict")).lower() != "strict":
+        raise ValueError("block_ode requires block_inverse_mode='strict'")
+    steps = {int(value) for value in flow.get("validation_ode_steps", [])}
+    if not steps or not steps.issubset({1, 3}):
+        raise ValueError("block_ode validation_ode_steps must be a non-empty subset of [1, 3]")
+
+    model = dict(data.get("model_options", {}) or {})
+    prediction = dict(model.get("prediction", {}) or {})
+    embedding = dict(model.get("embedding", {}) or {})
+    if bool(prediction.get("add_h0", False)):
+        raise ValueError(
+            "block_ode requires model_options.prediction.add_h0=false to prevent double add"
+        )
+    if not bool(embedding.get("use_flow_time_embedding", False)):
+        raise ValueError("block_ode requires embedding.use_flow_time_embedding=true")
+    if not bool(embedding.get("flow_time_condition_edges", False)):
+        raise ValueError("block_ode requires flow-time conditioning on both nodes and edges")
+    if bool(embedding.get("flow_time_allow_missing", True)):
+        raise ValueError("block_ode requires embedding.flow_time_allow_missing=false")
+    if str(embedding.get("flow_time_key", "flow_time")) != str(
+        flow.get("flow_time_key", "flow_time")
+    ):
+        raise ValueError("block_ode flow and embedding flow_time_key values must match")
+    if str(embedding.get("h0_merge_mode", "replace")).lower() != "replace":
+        raise ValueError("block_ode requires embedding.h0_merge_mode='replace'")
+    if not bool(embedding.get("use_h0_node_init", True)) or not bool(
+        embedding.get("use_h0_edge_init", True)
+    ):
+        raise ValueError("block_ode requires both node and edge H0 initialization")
+
+    def _walk_splits(value, path="data_options"):
+        if not isinstance(value, dict):
+            return
+        if bool(value.get("get_Hamiltonian", False)):
+            expected_residual = semantics == "residual_dh"
+            actual_residual = bool(value.get("residual_hamiltonian", False))
+            if actual_residual != expected_residual:
+                raise ValueError(
+                    f"{path}.residual_hamiltonian={actual_residual} conflicts with "
+                    f"block_ode target_semantics={semantics!r}"
+                )
+        for key, child in value.items():
+            if isinstance(child, dict):
+                _walk_splits(child, f"{path}.{key}")
+
+    _walk_splits(data.get("data_options", {}) or {})
 
 
 def self_consistency_options():
@@ -3202,6 +3288,7 @@ def normalize(data):
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
     _validate_p2_prior_full_h_contract(data)
+    validate_block_ode_contract(data)
 
     # add check loss and use wannier:
 

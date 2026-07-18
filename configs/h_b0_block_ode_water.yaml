@@ -1,0 +1,47 @@
+# Overlay for a non-SOC H/O water H-B0 block-state ODE run.
+common_options:
+  basis: {H: 2s1p, O: 3s2p1d}
+  dtype: float32
+  device: cpu
+
+model_options:
+  embedding:
+    method: lem_moe_v3_h0
+    output_route: h_b0
+    use_h0_init: true
+    use_h0_node_init: true
+    use_h0_edge_init: true
+    h0_merge_mode: replace
+    use_flow_time_embedding: true
+    flow_time_condition_edges: true
+    flow_time_key: flow_time
+    flow_time_allow_missing: false
+  prediction:
+    method: block_native
+    block_decoder: expansion_cg
+    blockwise_hamiltonian: true
+    add_h0: false
+    scale_type: no_scale
+
+train_options:
+  flow_options:
+    enabled: true
+    objective: cfm
+    mode: residual
+    prior: zero
+    output_space: ao_block_ode
+    block_ode: true
+    target_semantics: absolute_full_h
+    prediction_add_h0: false
+    time_conditioning_required: true
+    block_inverse_mode: strict
+    block_inverse_atol: 1.0e-10
+    node_block_target_key: node_full_hamil_blocks
+    edge_block_target_key: edge_full_hamil_blocks
+    node_block_shape_key: node_full_hamil_block_shape
+    edge_block_shape_key: edge_full_hamil_block_shape
+    validation_ode_steps: [1, 3]
+
+data_options:
+  train: {get_Hamiltonian: true, get_H0: true, residual_hamiltonian: false}
+  validation: {get_Hamiltonian: true, get_H0: true, residual_hamiltonian: false}

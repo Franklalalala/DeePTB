@@ -63,6 +63,18 @@ def project_block_state(
         raise ValueError("edge_shapes disagrees with mapper/species metadata.")
     if node.shape[0] != node_shapes.shape[0] or edge.shape[0] != edge_shapes.shape[0]:
         raise ValueError("Block row count disagrees with shape metadata.")
+    if node_shapes.numel() and (
+        bool((node_shapes <= 0).any().item())
+        or bool((node_shapes[:, 0] > node.shape[-2]).any().item())
+        or bool((node_shapes[:, 1] > node.shape[-1]).any().item())
+    ):
+        raise ValueError("node_shapes is non-positive or exceeds the node canvas.")
+    if edge_shapes.numel() and (
+        bool((edge_shapes <= 0).any().item())
+        or bool((edge_shapes[:, 0] > edge.shape[-2]).any().item())
+        or bool((edge_shapes[:, 1] > edge.shape[-1]).any().item())
+    ):
+        raise ValueError("edge_shapes is non-positive or exceeds the edge canvas.")
     if node.shape[-2] != node.shape[-1]:
         raise ValueError("Onsite padded canvas must be square.")
     if edge.shape[-2] != edge.shape[-1]:
