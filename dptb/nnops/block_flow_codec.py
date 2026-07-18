@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
@@ -17,6 +21,129 @@ from dptb.data.interfaces.blockwise_tensor import (
     strict_reverse_edge_index,
 )
 from dptb.nn.hamiltonian import E3Hamiltonian
+
+
+@dataclass(frozen=True)
+class _BlockProjectorMetadata:
+    """Validated immutable tensors shared by projector calls for one graph."""
+
+    reverse: torch.Tensor
+    pair_index: torch.Tensor
+    expected_node_shapes: torch.Tensor
+    expected_edge_shapes: torch.Tensor
+    node_mask: torch.Tensor
+    edge_mask: torch.Tensor
+
+
+_PROJECTOR_CACHE_LIMIT = 16
+_PROJECTOR_CACHE: "OrderedDict[Tuple[Any, ...], _BlockProjectorMetadata]" = OrderedDict()
+_PROJECTOR_CACHE_LOCK = threading.Lock()
+_PROJECTOR_TOPOLOGY_KEYS = (
+    "edge_index",
+    "edge_cell_shift",
+    "atomic_numbers",
+    "atom_types",
+    "pos",
+    "batch",
+    "pbc",
+    "edge_type",
+    "edge_types",
+    "cell",
+)
+
+
+def _update_fingerprint(digest: "hashlib._Hash", label: str, value: Any) -> None:
+    """Hash raw metadata without normalizing invalid values into valid ones."""
+
+    digest.update(label.encode("utf-8"))
+    digest.update(b"\0")
+    if torch.is_tensor(value):
+        tensor = value.detach()
+        if tensor.layout != torch.strided:
+            tensor = tensor.to_dense()
+        tensor = tensor.cpu().contiguous()
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    else:
+        digest.update(type(value).__qualname__.encode("utf-8"))
+        digest.update(repr(value).encode("utf-8"))
+    digest.update(b"\xff")
+
+
+def _projector_topology_fingerprint(data: Mapping[str, Any], idp: Any) -> str:
+    """Content-address graph and mapper metadata used by projector guards."""
+
+    digest = hashlib.sha256()
+    for key in _PROJECTOR_TOPOLOGY_KEYS:
+        if key in data:
+            _update_fingerprint(digest, key, data[key])
+        else:
+            digest.update(f"missing:{key}\0".encode("ascii"))
+    for label, value in (
+        ("basis", getattr(idp, "basis", None)),
+        ("chemical_symbol_to_type", getattr(idp, "chemical_symbol_to_type", None)),
+        ("bond_to_type", getattr(idp, "bond_to_type", None)),
+        ("norbs", getattr(idp, "norbs", None)),
+        ("has_soc", getattr(idp, "has_soc", None)),
+        ("reduced_matrix_element", getattr(idp, "reduced_matrix_element", None)),
+    ):
+        _update_fingerprint(digest, f"mapper:{label}", value)
+    return digest.hexdigest()
+
+
+def _clear_projector_metadata_cache() -> None:
+    """Test hook for deterministic cache-hit and invalidation assertions."""
+
+    with _PROJECTOR_CACHE_LOCK:
+        _PROJECTOR_CACHE.clear()
+
+
+def _projector_metadata(
+    data: Mapping[str, Any],
+    idp: Any,
+    *,
+    node: torch.Tensor,
+    edge: torch.Tensor,
+) -> _BlockProjectorMetadata:
+    fingerprint = _projector_topology_fingerprint(data, idp)
+    key = (
+        fingerprint,
+        str(node.device),
+        str(edge.device),
+        tuple(node.shape[-2:]),
+        tuple(edge.shape[-2:]),
+    )
+    with _PROJECTOR_CACHE_LOCK:
+        cached = _PROJECTOR_CACHE.get(key)
+        if cached is not None:
+            _PROJECTOR_CACHE.move_to_end(key)
+            return cached
+
+    # Cache only after every fail-closed topology/species guard succeeds.
+    reverse = strict_reverse_edge_index(data, device=edge.device, idp=idp)
+    expected_node, expected_edge = infer_block_shapes(data, idp)
+    expected_node = expected_node.to(device=node.device, dtype=torch.long)
+    expected_edge = expected_edge.to(device=edge.device, dtype=torch.long)
+    rows = torch.arange(reverse.numel(), device=edge.device, dtype=torch.long)
+    pair_index = rows[rows <= reverse]
+    metadata = _BlockProjectorMetadata(
+        reverse=reverse,
+        pair_index=pair_index,
+        expected_node_shapes=expected_node,
+        expected_edge_shapes=expected_edge,
+        node_mask=block_mask_from_shapes(expected_node, tuple(node.shape[-2:])),
+        edge_mask=block_mask_from_shapes(expected_edge, tuple(edge.shape[-2:])),
+    )
+    with _PROJECTOR_CACHE_LOCK:
+        existing = _PROJECTOR_CACHE.get(key)
+        if existing is not None:
+            _PROJECTOR_CACHE.move_to_end(key)
+            return existing
+        _PROJECTOR_CACHE[key] = metadata
+        while len(_PROJECTOR_CACHE) > _PROJECTOR_CACHE_LIMIT:
+            _PROJECTOR_CACHE.popitem(last=False)
+    return metadata
 
 
 def _require_same_shapes(a: BlockTensorResult, b: BlockTensorResult, *, label: str) -> None:
@@ -52,13 +179,21 @@ def project_block_state(
         raise ValueError("Block ODE state tensors must have shape [N,H,W].")
     if node.is_complex() or edge.is_complex():
         raise NotImplementedError("Block-state ODE v1 supports non-SOC real tensors only.")
-    if not bool(torch.isfinite(node).all().item()) or not bool(torch.isfinite(edge).all().item()):
+    node_finite = torch.isfinite(node).all()
+    edge_finite = torch.isfinite(edge).all()
+    finite = (
+        node_finite.logical_and(edge_finite.to(device=node.device))
+        if node.device != edge.device
+        else node_finite.logical_and(edge_finite)
+    )
+    if not bool(finite.item()):
         raise ValueError("Block ODE state contains NaN or Inf.")
 
-    # Validate raw graph indices/shifts/types before any helper casts them or
-    # uses Python indexing to infer species-dependent shapes.
-    rev = strict_reverse_edge_index(data, device=edge.device, idp=idp)
-    expected_node, expected_edge = infer_block_shapes(data, idp)
+    # Raw graph indices/shifts/types are validated before any state metadata is
+    # trusted.  Successful immutable graph metadata is content-addressed so the
+    # six projector calls in one block-ODE iteration share reverse pairs and
+    # masks without allowing a different (or mutated) graph to hit the cache.
+    metadata = _projector_metadata(data, idp, node=node, edge=edge)
     for label, shapes in (
         ("node", state.node_shapes),
         ("edge", state.edge_shapes),
@@ -73,9 +208,9 @@ def project_block_state(
             raise ValueError(f"{label}_shapes must contain integers.")
     node_shapes = state.node_shapes.to(device=node.device, dtype=torch.long)
     edge_shapes = state.edge_shapes.to(device=edge.device, dtype=torch.long)
-    if not torch.equal(node_shapes, expected_node.to(device=node.device)):
+    if not torch.equal(node_shapes, metadata.expected_node_shapes):
         raise ValueError("node_shapes disagrees with mapper/species metadata.")
-    if not torch.equal(edge_shapes, expected_edge.to(device=edge.device)):
+    if not torch.equal(edge_shapes, metadata.expected_edge_shapes):
         raise ValueError("edge_shapes disagrees with mapper/species metadata.")
     if node.shape[0] != node_shapes.shape[0] or edge.shape[0] != edge_shapes.shape[0]:
         raise ValueError("Block row count disagrees with shape metadata.")
@@ -96,26 +231,26 @@ def project_block_state(
     if edge.shape[-2] != edge.shape[-1]:
         raise ValueError("Reverse-edge projection requires a square padded canvas.")
 
-    node_mask = block_mask_from_shapes(node_shapes, tuple(node.shape[-2:]))
     node_projected = 0.5 * (node + node.transpose(-1, -2))
-    node_projected = torch.where(node_mask, node_projected, torch.zeros_like(node_projected))
+    node_projected = node_projected * metadata.node_mask
+    # Multiplication is the fast padding path; normalize signed padding zero so
+    # the byte representation remains identical to the former torch.where path.
+    node_projected = node_projected.masked_fill(~metadata.node_mask, 0.0)
 
-    edge_mask = block_mask_from_shapes(edge_shapes, tuple(edge.shape[-2:]))
+    pair_index = metadata.pair_index
+    pair_mates = metadata.reverse.index_select(0, pair_index)
+    averaged = 0.5 * (
+        edge.index_select(0, pair_index)
+        + edge.index_select(0, pair_mates).transpose(-1, -2)
+    )
+    direct = averaged * metadata.edge_mask.index_select(0, pair_index)
+    opposite = averaged.transpose(-1, -2) * metadata.edge_mask.index_select(
+        0, pair_mates
+    )
     edge_projected = torch.zeros_like(edge)
-    visited = torch.zeros((edge.shape[0],), dtype=torch.bool, device=edge.device)
-    for e in range(edge.shape[0]):
-        if bool(visited[e].item()):
-            continue
-        mate = int(rev[e].item())
-        averaged = 0.5 * (edge[e] + edge[mate].transpose(-1, -2))
-        edge_projected[e] = torch.where(
-            edge_mask[e], averaged, torch.zeros_like(averaged)
-        )
-        edge_projected[mate] = torch.where(
-            edge_mask[mate], averaged.transpose(-1, -2), torch.zeros_like(averaged)
-        )
-        visited[e] = True
-        visited[mate] = True
+    edge_projected.index_copy_(0, pair_index, direct)
+    edge_projected.index_copy_(0, pair_mates, opposite)
+    edge_projected = edge_projected.masked_fill(~metadata.edge_mask, 0.0)
 
     return BlockTensorResult(
         node_blocks=node_projected,

@@ -13,6 +13,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.hamiltonian import E3Hamiltonian
 from dptb.nn.embedding.late_block_expansion_cg import LateBlockExpansionCGHead
+from dptb.nnops import block_flow_codec as codec_module
 from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
 
 
@@ -93,6 +94,39 @@ def _random_state(idp, data, dtype=torch.float64, requires_grad=False):
     node = torch.randn(4, 3, 3, generator=generator, dtype=dtype, requires_grad=requires_grad)
     edge = torch.randn(4, 3, 3, generator=generator, dtype=dtype, requires_grad=requires_grad)
     return BlockTensorResult(node, edge, node_shapes, edge_shapes)
+
+
+def _scalar_reference_projector(data, idp, state):
+    """Frozen pre-vectorization implementation used as a byte-level lock."""
+
+    reverse = strict_reverse_edge_index(data, device=state.edge_blocks.device, idp=idp)
+    node_mask = block_mask_from_shapes(
+        state.node_shapes, tuple(state.node_blocks.shape[-2:])
+    )
+    edge_mask = block_mask_from_shapes(
+        state.edge_shapes, tuple(state.edge_blocks.shape[-2:])
+    )
+    node = 0.5 * (state.node_blocks + state.node_blocks.transpose(-1, -2))
+    node = torch.where(node_mask, node, torch.zeros_like(node))
+    edge = torch.zeros_like(state.edge_blocks)
+    visited = torch.zeros(reverse.numel(), dtype=torch.bool, device=reverse.device)
+    for index in range(reverse.numel()):
+        if bool(visited[index].item()):
+            continue
+        mate = int(reverse[index].item())
+        averaged = 0.5 * (
+            state.edge_blocks[index]
+            + state.edge_blocks[mate].transpose(-1, -2)
+        )
+        edge[index] = torch.where(
+            edge_mask[index], averaged, torch.zeros_like(averaged)
+        )
+        edge[mate] = torch.where(
+            edge_mask[mate], averaged.transpose(-1, -2), torch.zeros_like(averaged)
+        )
+        visited[index] = True
+        visited[mate] = True
+    return BlockTensorResult(node, edge, state.node_shapes, state.edge_shapes)
 
 
 def test_all_supported_cg_matrices_rank_orthogonality_and_condition_number():
@@ -250,6 +284,56 @@ def test_projector_is_idempotent_and_enforces_all_invariants():
     edge_mask = block_mask_from_shapes(once.edge_shapes, tuple(once.edge_blocks.shape[-2:]))
     assert torch.count_nonzero(once.node_blocks[~node_mask]) == 0
     assert torch.count_nonzero(once.edge_blocks[~edge_mask]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_vectorized_projector_is_bitwise_identical_to_scalar_reference(dtype):
+    idp, data = _mixed_case(dtype)
+    state = _random_state(idp, data, dtype=dtype)
+    expected = _scalar_reference_projector(data, idp, state)
+    actual = project_block_state(data, idp, state)
+    assert torch.equal(
+        actual.node_blocks.contiguous().view(torch.uint8),
+        expected.node_blocks.contiguous().view(torch.uint8),
+    )
+    assert torch.equal(
+        actual.edge_blocks.contiguous().view(torch.uint8),
+        expected.edge_blocks.contiguous().view(torch.uint8),
+    )
+
+
+def test_projector_metadata_cache_is_content_addressed_and_invalidates(monkeypatch):
+    idp, data = _mixed_case()
+    state = _random_state(idp, data)
+    codec_module._clear_projector_metadata_cache()
+    calls = {"reverse": 0, "shapes": 0}
+    original_reverse = codec_module.strict_reverse_edge_index
+    original_shapes = codec_module.infer_block_shapes
+
+    def counted_reverse(*args, **kwargs):
+        calls["reverse"] += 1
+        return original_reverse(*args, **kwargs)
+
+    def counted_shapes(*args, **kwargs):
+        calls["shapes"] += 1
+        return original_shapes(*args, **kwargs)
+
+    monkeypatch.setattr(codec_module, "strict_reverse_edge_index", counted_reverse)
+    monkeypatch.setattr(codec_module, "infer_block_shapes", counted_shapes)
+    project_block_state(data, idp, state)
+    cloned = {
+        key: value.clone() if torch.is_tensor(value) else value
+        for key, value in data.items()
+    }
+    project_block_state(cloned, idp, state)
+    assert calls == {"reverse": 1, "shapes": 1}
+
+    invalid = dict(cloned)
+    invalid["edge_index"] = cloned["edge_index"].clone()
+    invalid["edge_index"][0, 0] = 1
+    with pytest.raises(ValueError):
+        project_block_state(invalid, idp, state)
+    assert calls["reverse"] == 2
 
 
 def test_projector_gradcheck():
