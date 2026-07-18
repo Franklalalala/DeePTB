@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover - standalone tests
         EDGE_H0_KEY = "edge_h0"
         ATOMIC_NUMBERS_KEY = "atomic_numbers"
         ATOM_TYPE_KEY = "atom_types"
-        EDGE_TYPE_KEY = "edge_types"
+        EDGE_TYPE_KEY = "edge_type"
         EDGE_INDEX_KEY = "edge_index"
         EDGE_CELL_SHIFT_KEY = "edge_cell_shift"
 
@@ -284,13 +284,17 @@ def matrix_shape_for_bond(idp: Any, sym_i: str, sym_j: str) -> Tuple[int, int]:
 def infer_block_shapes(data: Mapping[str, Any], idp: Any, *, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
     ensure_spatial_block_mapper(idp)
     symbols = symbols_from_data(data, idp)
-    node_shapes = torch.as_tensor([matrix_shape_for_symbol(idp, s) for s in symbols], dtype=torch.long, device=device)
+    node_shapes = torch.as_tensor(
+        [matrix_shape_for_symbol(idp, s) for s in symbols],
+        dtype=torch.long,
+        device=device,
+    ).reshape(-1, 2)
     edge_index = edge_index_from_data(data).detach().cpu()
     edge_shapes = torch.as_tensor(
         [matrix_shape_for_bond(idp, symbols[int(u)], symbols[int(v)]) for u, v in edge_index.T.tolist()],
         dtype=torch.long,
         device=device,
-    )
+    ).reshape(-1, 2)
     return node_shapes, edge_shapes
 
 
@@ -503,6 +507,7 @@ def strict_reverse_edge_index(
     *,
     device=None,
     shift_atol: float = 1e-7,
+    idp: Any = None,
 ) -> torch.Tensor:
     """Return reverse-edge indices while rejecting ambiguous graph metadata.
 
@@ -510,12 +515,121 @@ def strict_reverse_edge_index(
     fail-closed: cell shifts must be finite integers, every ``(i,j,R)`` key is
     unique, and every directed edge has exactly one reverse partner.
     """
-    edge_index = edge_index_from_data(data).detach().cpu()
-    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
-        raise ValueError(f"edge_index must have shape [2,E], got {tuple(edge_index.shape)}.")
+    raw_edge_index = data_get(data, key("EDGE_INDEX_KEY", "edge_index"), None)
+    if raw_edge_index is None:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    else:
+        raw_edge_index = as_tensor(raw_edge_index).detach().cpu()
+        if raw_edge_index.ndim != 2 or raw_edge_index.shape[0] != 2:
+            raise ValueError(
+                f"edge_index must have shape [2,E], got {tuple(raw_edge_index.shape)}."
+            )
+        if raw_edge_index.dtype == torch.bool or raw_edge_index.is_complex():
+            raise ValueError("edge_index must contain finite integer indices.")
+        if not bool(torch.isfinite(raw_edge_index).all().item()):
+            raise ValueError("edge_index must contain finite integer indices.")
+        if raw_edge_index.is_floating_point() and raw_edge_index.numel() and bool(
+            (raw_edge_index != raw_edge_index.round()).any().item()
+        ):
+            raise ValueError("edge_index contains non-integer values.")
+        edge_index = raw_edge_index.to(dtype=torch.long)
+
     n_edges = int(edge_index.shape[1])
+    node_count_candidates: List[Tuple[str, int]] = []
+    for name, fallback, row_count in (
+        ("ATOMIC_NUMBERS_KEY", "atomic_numbers", False),
+        ("ATOM_TYPE_KEY", "atom_types", False),
+        ("POSITIONS_KEY", "pos", True),
+        ("BATCH_KEY", "batch", False),
+    ):
+        value = data_get(data, key(name, fallback), None)
+        if value is None:
+            continue
+        tensor = as_tensor(value)
+        count = int(tensor.shape[0]) if row_count and tensor.ndim else int(tensor.numel())
+        node_count_candidates.append((fallback, count))
+    if node_count_candidates:
+        n_nodes = node_count_candidates[0][1]
+        inconsistent = [item for item in node_count_candidates if item[1] != n_nodes]
+        if inconsistent:
+            raise ValueError(
+                "Node metadata row counts disagree: "
+                + ", ".join(f"{name}={count}" for name, count in node_count_candidates)
+                + "."
+            )
+    else:
+        n_nodes = None
+    if edge_index.numel() and bool((edge_index < 0).any().item()):
+        raise ValueError("edge_index contains negative atom indices.")
+    if edge_index.numel():
+        if n_nodes is None:
+            raise ValueError(
+                "Cannot validate edge_index bounds without atomic_numbers, atom_types, pos, or batch."
+            )
+        if bool((edge_index >= n_nodes).any().item()):
+            raise ValueError(
+                f"edge_index contains atom indices outside [0,{max(n_nodes - 1, 0)}]."
+            )
+
+    raw_batch = data_get(data, key("BATCH_KEY", "batch"), None)
+    if raw_batch is None:
+        batch = torch.zeros((0 if n_nodes is None else n_nodes,), dtype=torch.long)
+    else:
+        raw_batch = as_tensor(raw_batch).detach().cpu().flatten()
+        if raw_batch.dtype == torch.bool or raw_batch.is_complex():
+            raise ValueError("batch must contain finite non-negative integer graph indices.")
+        if not bool(torch.isfinite(raw_batch).all().item()):
+            raise ValueError("batch must contain finite non-negative integer graph indices.")
+        if raw_batch.is_floating_point() and raw_batch.numel() and bool(
+            (raw_batch != raw_batch.round()).any().item()
+        ):
+            raise ValueError("batch contains non-integer graph indices.")
+        batch = raw_batch.to(dtype=torch.long)
+        if bool((batch < 0).any().item()):
+            raise ValueError("batch contains negative graph indices.")
+    if n_edges and batch.numel():
+        source_batch = batch.index_select(0, edge_index[0])
+        target_batch = batch.index_select(0, edge_index[1])
+        if not torch.equal(source_batch, target_batch):
+            bad = torch.nonzero(source_batch != target_batch, as_tuple=False).flatten()
+            raise ValueError(
+                "Every edge must connect nodes in the same batch graph; "
+                f"cross-graph rows={bad[:8].tolist()} (total={int(bad.numel())})."
+            )
+
+    raw_pbc = data_get(data, key("PBC_KEY", "pbc"), None)
+    pbc = None
+    if raw_pbc is not None:
+        raw_pbc = as_tensor(raw_pbc).detach().cpu()
+        if raw_pbc.is_complex() or not bool(torch.isfinite(raw_pbc).all().item()):
+            raise ValueError("pbc must contain finite boolean/0-1 values.")
+        if raw_pbc.dtype != torch.bool and raw_pbc.numel() and bool(
+            ((raw_pbc != 0) & (raw_pbc != 1)).any().item()
+        ):
+            raise ValueError("pbc must contain boolean/0-1 values.")
+        if raw_pbc.ndim == 1 and raw_pbc.shape[0] == 3:
+            pbc = raw_pbc.to(dtype=torch.bool).reshape(1, 3)
+        elif raw_pbc.ndim == 2 and raw_pbc.shape[1] == 3:
+            pbc = raw_pbc.to(dtype=torch.bool)
+        else:
+            raise ValueError(f"pbc must have shape [3] or [B,3], got {tuple(raw_pbc.shape)}.")
+        if pbc.shape[0] > 1 and batch.numel() and int(batch.max().item()) >= pbc.shape[0]:
+            raise ValueError(
+                f"pbc has {pbc.shape[0]} graph rows but batch contains graph "
+                f"index {int(batch.max().item())}."
+            )
+
     raw_shift = data_get(data, key("EDGE_CELL_SHIFT_KEY", "edge_cell_shift"), None)
     if raw_shift is None:
+        if n_edges and pbc is not None:
+            if pbc.shape[0] == 1:
+                edge_pbc = pbc.expand(n_edges, 3)
+            else:
+                edge_pbc = pbc.index_select(0, batch.index_select(0, edge_index[0]))
+            if bool(edge_pbc.any().item()):
+                raise ValueError(
+                    "Periodic block-ODE graphs with edges require explicit edge_cell_shift."
+                )
         shift = torch.zeros((n_edges, 3), dtype=torch.long)
     else:
         raw = as_tensor(raw_shift).detach().cpu()
@@ -523,14 +637,86 @@ def strict_reverse_edge_index(
             raise ValueError(
                 f"edge_cell_shift must have shape {(n_edges, 3)}, got {tuple(raw.shape)}."
             )
-        if not bool(torch.isfinite(raw).all().item()):
+        if raw.dtype == torch.bool or raw.is_complex() or not bool(
+            torch.isfinite(raw).all().item()
+        ):
             raise ValueError("edge_cell_shift contains NaN or Inf.")
-        rounded = raw.round()
+        rounded = raw.round() if raw.is_floating_point() else raw
         if raw.is_floating_point() and raw.numel() and bool(
             ((raw - rounded).abs().max() > shift_atol).item()
         ):
             raise ValueError("edge_cell_shift must contain integer cell translations.")
+        int64 = torch.iinfo(torch.long)
+        if any(
+            int(value) < int64.min or int(value) > int64.max
+            for value in rounded.reshape(-1).tolist()
+        ):
+            raise ValueError("edge_cell_shift contains values outside the int64 range.")
         shift = rounded.to(dtype=torch.long)
+
+    if shift.numel() and bool((shift != 0).any().item()) and pbc is None:
+        raise ValueError(
+            "Non-zero edge_cell_shift metadata requires explicit pbc axes."
+        )
+    needs_cell = bool(pbc is not None and pbc.any().item()) or bool(
+        shift.numel() and (shift != 0).any().item()
+    )
+    if needs_cell and data_get(data, key("CELL_KEY", "cell"), None) is None:
+        raise ValueError(
+            "Periodic or non-zero edge_cell_shift metadata requires an explicit cell."
+        )
+
+    if n_edges and pbc is not None:
+        if pbc.shape[0] == 1:
+            edge_pbc = pbc.expand(n_edges, 3)
+        else:
+            edge_pbc = pbc.index_select(0, batch.index_select(0, edge_index[0]))
+        invalid_shift = (shift != 0) & (~edge_pbc)
+        if bool(invalid_shift.any().item()):
+            bad = torch.nonzero(invalid_shift.any(dim=1), as_tuple=False).flatten()
+            raise ValueError(
+                "edge_cell_shift must be zero along non-periodic axes; "
+                f"invalid rows={bad[:8].tolist()} (total={int(bad.numel())})."
+            )
+
+    raw_edge_types = data_get(data, key("EDGE_TYPE_KEY", "edge_types"), None)
+    if raw_edge_types is not None:
+        raw_types = as_tensor(raw_edge_types).detach().cpu().flatten()
+        if raw_types.dtype == torch.bool or raw_types.is_complex():
+            raise ValueError("edge_type must contain finite non-negative integers.")
+        if not bool(torch.isfinite(raw_types).all().item()):
+            raise ValueError("edge_type must contain finite non-negative integers.")
+        if raw_types.is_floating_point() and raw_types.numel() and bool(
+            (raw_types != raw_types.round()).any().item()
+        ):
+            raise ValueError("edge_type contains non-integer values.")
+        edge_types = raw_types.to(dtype=torch.long)
+        if edge_types.numel() != n_edges:
+            raise ValueError(
+                f"edge_type has {edge_types.numel()} rows but edge_index has {n_edges} edges."
+            )
+        if bool((edge_types < 0).any().item()):
+            raise ValueError("edge_type contains negative values.")
+        if idp is not None:
+            ensure_spatial_block_mapper(idp)
+            symbols = symbols_from_data(data, idp)
+            bond_to_type = getattr(idp, "bond_to_type", None)
+            if bond_to_type is None:
+                raise KeyError("Mapper lacks bond_to_type for explicit edge_type validation.")
+            expected_types = torch.as_tensor(
+                [
+                    int(bond_to_type[f"{symbols[int(u)]}-{symbols[int(v)]}"])
+                    for u, v in edge_index.T.tolist()
+                ],
+                dtype=torch.long,
+            )
+            if not torch.equal(edge_types, expected_types):
+                bad = torch.nonzero(edge_types != expected_types, as_tuple=False).flatten()
+                preview = bad[:8].tolist()
+                raise ValueError(
+                    "edge_type disagrees with the mapper/species of its edge endpoints; "
+                    f"rows={preview} (total={int(bad.numel())})."
+                )
 
     lookup: Dict[Tuple[int, int, int, int, int], int] = {}
     keys: List[Tuple[int, int, int, int, int]] = []
@@ -704,7 +890,9 @@ def feature_tensors_to_block_tensors(
             pair = (symbols[int(u)], symbols[int(v)])
             by_pair.setdefault(pair, []).append(e)
             edge_shapes_list.append(matrix_shape_for_bond(idp, *pair))
-        edge_shapes = torch.as_tensor(edge_shapes_list, dtype=torch.long, device=device)
+        edge_shapes = torch.as_tensor(
+            edge_shapes_list, dtype=torch.long, device=device
+        ).reshape(-1, 2)
         for (sym_i, sym_j), positions in by_pair.items():
             idx = torch.as_tensor(positions, dtype=torch.long, device=device)
             sub_feat = edge_features.index_select(0, idx)
@@ -871,6 +1059,11 @@ def canonical_block_tensors_to_feature_tensors(
     atol = float(atol)
     if not math.isfinite(atol) or atol < 0:
         raise ValueError("atol must be finite and non-negative.")
+    if mode == "strict" and atol > 2.0e-5:
+        raise ValueError(
+            "strict canonical block inversion caps atol at 2e-5; larger "
+            "values turn image-space certification into silent projection."
+        )
     symbols = symbols_from_data(data, idp)
     inferred_node, inferred_edge = infer_block_shapes(data, idp)
     node_blocks, node_shapes = _validate_inverse_component(
@@ -880,7 +1073,7 @@ def canonical_block_tensors_to_feature_tensors(
         edge_blocks, edge_shapes, inferred_edge, label="edge"
     )
     if edge_blocks is not None:
-        strict_reverse_edge_index(data, device=edge_blocks.device)
+        strict_reverse_edge_index(data, device=edge_blocks.device, idp=idp)
 
     width = int(idp.reduced_matrix_element)
     node_features = None

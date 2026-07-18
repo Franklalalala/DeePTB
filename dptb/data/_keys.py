@@ -90,6 +90,10 @@ EDGE_CUTOFF_KEY: Final[str] = "edge_cutoff"
 LEM_ACTIVE_EDGES_KEY: Final[str] = "_lem_active_edges"
 LEM_CUTOFF_COEFFS_KEY: Final[str] = "_lem_cutoff_coeffs"
 LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY: Final[str] = "_lem_active_edge_split_sizes"
+# Actual graph-edge rows covered by a block-native endpoint prediction.  This
+# is an output contract, not reusable LEM input metadata: block-space flows use
+# it to fail closed when a model only predicted a strict subset of graph edges.
+BLOCK_PRED_ACTIVE_EDGES_KEY: Final[str] = "_block_pred_active_edges"
 # [n_edge, 1] invariant of the radial cutoff envelope for each env edge, allows reuse of cutoff envelopes
 ENV_CUTOFF_KEY: Final[str] = "env_cutoff"
 # [n_edge, 1] invariant of the radial cutoff envelope for each onsitenv edge, allows reuse of cutoff envelopes

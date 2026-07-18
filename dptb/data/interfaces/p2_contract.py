@@ -22,6 +22,10 @@ import torch
 
 P2_SAMPLE_SCHEMA = "deeptb.p2_training_sample/v2"
 DUAL_PRIOR_SAMPLE_SCHEMA = "deeptb.physical_prior_training_sample/v3"
+# Generic raw-block records use a separate schema from P2/P23 caches.  It
+# states only that the authoritative target is the raw ``hamiltonian`` block
+# dictionary; it must not be used to bless independently prepacked targets.
+RAW_HAMILTONIAN_SAMPLE_SCHEMA = "deeptb.raw_hamiltonian_training_sample/v1"
 ABSOLUTE_FULL_H_SEMANTICS = "absolute_full_h"
 H0_RESIDUAL_SEMANTICS = "h0_residual"
 
@@ -393,6 +397,7 @@ __all__ = [
     "P2_RME_FINGERPRINT_KEY",
     "P2_SAMPLE_SCHEMA",
     "P2_SOURCE_FINGERPRINT_KEY",
+    "RAW_HAMILTONIAN_SAMPLE_SCHEMA",
     "P23_BLOCK_FINGERPRINT_KEY",
     "P23_BUNDLE_FINGERPRINT_KEY",
     "P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY",

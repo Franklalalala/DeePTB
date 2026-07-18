@@ -267,6 +267,22 @@ class MultiTrainer(Trainer):
 
         self.distance_ranges = distance_ranges
         self.num_experts = len(distance_ranges)
+        if bool(getattr(getattr(self, "flow_cfm", None), "block_ode", False)):
+            valid_full_graph_range = (
+                self.num_experts == 1
+                and isinstance(distance_ranges[0], (list, tuple))
+                and len(distance_ranges[0]) == 2
+                and not isinstance(distance_ranges[0][0], bool)
+                and isinstance(distance_ranges[0][0], (int, float))
+                and math.isfinite(float(distance_ranges[0][0]))
+                and float(distance_ranges[0][0]) <= 0.0
+            )
+            if not valid_full_graph_range:
+                raise ValueError(
+                    "Block-space ODE v1 cannot use distance-partitioned experts: "
+                    "H-B0 must predict every graph edge. MultiTrainer is allowed "
+                    "only with one full-graph distance range whose lower bound is <= 0."
+                )
 
         self.distributed_expert = bool(distributed_expert)
         self.rank = int(rank)
@@ -3558,14 +3574,46 @@ class MultiTrainer(Trainer):
         batch_for_loss = batch_copy.copy()
         batch_for_loss.update(batch_info)
 
-        with self._tagger.tag(
-            "validation/euler_compatible_loss",
-            it=self.iter,
-            expert=expert_idx,
-            extra=f"steps={int(num_steps)}",
-        ):
-            loss = criterion(sampled, batch_for_loss)
-        metrics = self._snapshot_loss_metrics(criterion)
+        if bool(getattr(self.flow_cfm, "block_ode", False)):
+            # Block-ODE residual sampling returns the physical full-H state,
+            # while its configured criterion target remains dH. Reconstruct
+            # the t=0 flow context and let the flow scorer perform the exact
+            # residual-to-full adaptation once; feeding ``sampled`` directly
+            # to the criterion would count physical H0 as prediction error.
+            num_graphs = self.flow_cfm._num_graphs(batch_copy)
+            sample_node = sampled.get(
+                getattr(self.flow_cfm, "node_output_key", "node_hamil_blocks")
+            )
+            zero_device = (
+                sample_node.device if torch.is_tensor(sample_node) else self._device_obj()
+            )
+            zero_t = torch.zeros(num_graphs, device=zero_device, dtype=self.dtype)
+            _flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                batch_copy,
+                batch_for_loss,
+                t=zero_t,
+            )
+            flow_ref.update(batch_info)
+            with self._tagger.tag(
+                "validation/euler_flow_loss",
+                it=self.iter,
+                expert=expert_idx,
+                extra=f"steps={int(num_steps)}",
+            ):
+                loss, flow_state = self.flow_cfm.loss(sampled, flow_ref, flow_ctx)
+            metrics = self._payload_metrics_from_flow_state(
+                flow_state,
+                prefix="train",
+            )
+        else:
+            with self._tagger.tag(
+                "validation/euler_compatible_loss",
+                it=self.iter,
+                expert=expert_idx,
+                extra=f"steps={int(num_steps)}",
+            ):
+                loss = criterion(sampled, batch_for_loss)
+            metrics = self._snapshot_loss_metrics(criterion)
 
         onsite_weighted_sum = metrics["onsite"] * active_nodes.to(dtype=self.dtype)
         hopping_weighted_sum = metrics["hopping"] * active_edges.to(dtype=self.dtype)

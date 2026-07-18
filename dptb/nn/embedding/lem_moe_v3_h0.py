@@ -247,6 +247,15 @@ class LemMoEV3H0(LemMoEV3):
                     edge_shapes=edge_shapes,
                 ),
             )
+            # The block endpoint canvas is zero-initialized and only rows in
+            # ``active_edges`` receive model predictions.  Keep that coverage
+            # explicit so block-space flows can reject unsupervised/inactive
+            # graph edges instead of treating those zeros as physical output.
+            # This is deliberately separate from the reusable LEM input
+            # metadata cleared below.
+            data[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = (
+                active_edges.detach().to(dtype=torch.long).reshape(-1).clone()
+            )
             data.pop(_keys.LEM_ACTIVE_EDGES_KEY, None)
             data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
             data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)

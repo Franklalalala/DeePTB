@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Tuple, Dict, Any, List, Callable, Union, Optional
+from typing import Tuple, Dict, Any, List, Callable, Union, Optional, Mapping
 
 import torch
 from dptb.utils.tools import download_url, extract_zip
@@ -29,8 +29,10 @@ from dptb.data.interfaces.p2_contract import (
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
+    H0_RESIDUAL_SEMANTICS,
     P2_BUNDLE_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
+    RAW_HAMILTONIAN_SAMPLE_SCHEMA,
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
@@ -117,12 +119,29 @@ _PREPACKED_FULL_H_TARGET_KEYS = (
     AtomicDataDict.EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY,
 )
 
+_PREPACKED_H0_BLOCK_KEYS = (
+    AtomicDataDict.NODE_H0_BLOCKS_KEY,
+    AtomicDataDict.EDGE_H0_BLOCKS_KEY,
+    AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY,
+    AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY,
+)
 
-def assert_absolute_full_h_target_contract(data_dict: Dict[str, Any]) -> None:
+
+def assert_absolute_full_h_target_contract(
+    data_dict: Dict[str, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+    require_h0: bool = False,
+) -> None:
     """Require an explicit, versioned absolute-H target declaration."""
 
-    allowed_schemas = {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}
-    if data_dict.get(SAMPLE_SCHEMA_KEY) not in allowed_schemas:
+    schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+    allowed_schemas = {
+        P2_SAMPLE_SCHEMA,
+        DUAL_PRIOR_SAMPLE_SCHEMA,
+        RAW_HAMILTONIAN_SAMPLE_SCHEMA,
+    }
+    if schema not in allowed_schemas:
         raise ValueError(
             "Full-H supervision requires explicit sample schema "
             f"in {sorted(allowed_schemas)!r}; got "
@@ -153,9 +172,46 @@ def assert_absolute_full_h_target_contract(data_dict: Dict[str, Any]) -> None:
         raise ValueError(
             "dedicated_full_h_blocks target source requires all dedicated target fields."
         )
+    if schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        if source != "raw_hamiltonian":
+            raise ValueError(
+                f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r} requires "
+                "hamiltonian_target_source='raw_hamiltonian'."
+            )
+        if any(present):
+            raise ValueError(
+                "Generic raw-H records must derive the Full-H target from the "
+                "authoritative raw 'hamiltonian' dictionary; independently "
+                "prepacked Full-H target fields are not allowed."
+            )
+        raw_hamiltonian = data_dict.get("hamiltonian")
+        if not isinstance(raw_hamiltonian, Mapping) or not raw_hamiltonian:
+            raise ValueError(
+                "Generic raw-H Full-H supervision requires a non-empty raw "
+                "'hamiltonian' block dictionary."
+            )
+        if require_h0:
+            raw_h0 = data_dict.get(h0_key)
+            if not isinstance(raw_h0, Mapping) or not raw_h0:
+                raise ValueError(
+                    "Generic raw-H block-ODE supervision requires a non-empty "
+                    f"physical-H0 block dictionary at {h0_key!r}."
+                )
+            prepacked_h0 = [
+                key for key in _PREPACKED_H0_BLOCK_KEYS if key in data_dict
+            ]
+            if prepacked_h0:
+                raise ValueError(
+                    "Generic raw-H block-ODE supervision must derive physical-H0 "
+                    f"blocks from {h0_key!r}; prepacked H0 block fields "
+                    f"{prepacked_h0} are not allowed to override that authority."
+                )
     # Historical target fields are never accepted as evidence of absolute H.
     legacy = [key for key in _PREPACKED_HAMILTONIAN_TARGET_KEYS if key in data_dict]
-    if source == "dedicated_full_h_blocks" and legacy:
+    if (
+        source == "dedicated_full_h_blocks"
+        or schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA
+    ) and legacy:
         raise ValueError(
             "Absolute Full-H records must not also expose ambiguous historical "
             f"delta-named targets {legacy}."
@@ -193,6 +249,65 @@ def assert_residual_target_source_is_raw(data_dict: Dict[str, Any]) -> None:
             "absolute-H versus delta-H provenance cannot be inferred safely; "
             "disable residual_hamiltonian for an already-residual dataset or "
             "rebuild the block targets from raw Hamiltonian/H0 dictionaries."
+        )
+    prepacked_h0 = [key for key in _PREPACKED_H0_BLOCK_KEYS if key in data_dict]
+    if prepacked_h0:
+        raise ValueError(
+            "residual_hamiltonian=True must derive physical-H0 blocks from the "
+            "raw H0 dictionary used to form H-H0; prepacked H0 block fields "
+            f"{prepacked_h0} are not allowed to override that authority."
+        )
+
+
+def assert_residual_h_target_contract(
+    data_dict: Dict[str, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+) -> None:
+    """Require a versioned raw-H/raw-H0 declaration for residual supervision."""
+
+    schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+    if schema != RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        raise ValueError(
+            "Residual H-H0 supervision requires explicit sample schema "
+            f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r}; got {schema!r}."
+        )
+    semantics = data_dict.get(TARGET_SEMANTICS_KEY)
+    if semantics != H0_RESIDUAL_SEMANTICS:
+        raise ValueError(
+            "Residual H-H0 supervision requires hamiltonian_target_semantics="
+            f"{H0_RESIDUAL_SEMANTICS!r}; got {semantics!r}."
+        )
+    source = data_dict.get(TARGET_SOURCE_KEY)
+    if source != "raw_hamiltonian":
+        raise ValueError(
+            "Residual H-H0 supervision requires "
+            "hamiltonian_target_source='raw_hamiltonian'; "
+            f"got {source!r}."
+        )
+
+    raw_hamiltonian = data_dict.get("hamiltonian")
+    if not isinstance(raw_hamiltonian, Mapping) or not raw_hamiltonian:
+        raise ValueError(
+            "Residual H-H0 supervision requires a non-empty raw "
+            "'hamiltonian' block dictionary."
+        )
+    raw_h0 = data_dict.get(h0_key)
+    if not isinstance(raw_h0, Mapping) or not raw_h0:
+        raise ValueError(
+            "Residual H-H0 supervision requires a non-empty physical-H0 "
+            f"block dictionary at {h0_key!r}."
+        )
+
+    assert_residual_target_source_is_raw(data_dict)
+    prepacked_full_h = [
+        key for key in _PREPACKED_FULL_H_TARGET_KEYS if key in data_dict
+    ]
+    if prepacked_full_h:
+        raise ValueError(
+            "Generic raw-H residual supervision must derive H-H0 from the raw "
+            "Hamiltonian dictionaries; independently prepacked Full-H target "
+            f"fields {prepacked_full_h} are not allowed."
         )
 
 
@@ -583,6 +698,7 @@ class LMDBDataset(AtomicDataset):
     p2_key = "hamiltonian_p2"
     prefer_precomputed_p2 = True
     require_full_h_target = False
+    require_residual_h_target = False
     expected_p2_source_fingerprint = None
     audit_p2_representations = False
     require_p2_blocks = False
@@ -608,6 +724,7 @@ class LMDBDataset(AtomicDataset):
             p2_key: str = "hamiltonian_p2",
             prefer_precomputed_p2: bool = True,
             require_full_h_target: bool = False,
+            require_residual_h_target: bool = False,
             expected_p2_source_fingerprint: Optional[str] = None,
             audit_p2_representations: bool = False,
             require_p2_blocks: bool = False,
@@ -663,6 +780,7 @@ class LMDBDataset(AtomicDataset):
             )
         self.prefer_precomputed_p2 = bool(prefer_precomputed_p2)
         self.require_full_h_target = bool(require_full_h_target)
+        self.require_residual_h_target = bool(require_residual_h_target)
         self.expected_p2_source_fingerprint = (
             str(expected_p2_source_fingerprint)
             if expected_p2_source_fingerprint not in {None, ""}
@@ -672,6 +790,21 @@ class LMDBDataset(AtomicDataset):
         self.require_p2_blocks = bool(require_p2_blocks)
         if self.require_full_h_target and not self.get_Hamiltonian:
             raise ValueError("require_full_h_target=True requires get_Hamiltonian=True.")
+        if self.require_residual_h_target:
+            if not self.get_Hamiltonian or not self.get_H0:
+                raise ValueError(
+                    "require_residual_h_target=True requires get_Hamiltonian=True "
+                    "and get_H0=True."
+                )
+            if not self.residual_hamiltonian:
+                raise ValueError(
+                    "require_residual_h_target=True requires "
+                    "residual_hamiltonian=True."
+                )
+        if self.require_full_h_target and self.require_residual_h_target:
+            raise ValueError(
+                "Full-H and residual-H target contracts are mutually exclusive."
+            )
         if self.require_p2_blocks and not self.get_P2:
             raise ValueError("require_p2_blocks=True requires get_P2=True.")
         assert not get_Hamiltonian * get_DM, "Hamiltonian and Density Matrix can only loaded one at a time, for which will occupy the same attribute in the AtomicData."
@@ -905,7 +1038,13 @@ class LMDBDataset(AtomicDataset):
             resolve_prior_field_spec(getattr(self, "prior_kind", "p2")),
         )
         if getattr(self, "require_full_h_target", False):
-            assert_absolute_full_h_target_contract(data_dict)
+            assert_absolute_full_h_target_contract(
+                data_dict,
+                h0_key=self.h0_key,
+                require_h0=bool(self.get_H0),
+            )
+        if getattr(self, "require_residual_h_target", False):
+            assert_residual_h_target_contract(data_dict, h0_key=self.h0_key)
         stored_basis_fingerprint = data_dict.get(BASIS_FINGERPRINT_KEY)
         # Historical, non-fingerprinted records need not expose a production
         # OrbitalMapper.  Resolve the mapper fingerprint lazily only when the

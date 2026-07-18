@@ -296,6 +296,9 @@ class DatasetBuilder:
                 prefer_precomputed_p2=kwargs.get("prefer_precomputed_p2", True),
                 require_p2_blocks=kwargs.get("require_p2_blocks", False),
                 require_full_h_target=kwargs.get("require_full_h_target", False),
+                require_residual_h_target=kwargs.get(
+                    "require_residual_h_target", False
+                ),
                 expected_p2_source_fingerprint=kwargs.get(
                     "expected_p2_source_fingerprint", ""
                 ),

@@ -73,7 +73,9 @@ def with_edge_vectors(data: Type, with_lengths: bool = True) -> Type:
             # ^ note that to save time we don't check that the edge_cell_shifts are trivial if no cell is provided; we just assume they are either not present or all zero.
             # -1 gives a batch dim no matter what
             cell = data[_keys.CELL_KEY].view(-1, 3, 3)
-            edge_cell_shift = data[_keys.EDGE_CELL_SHIFT_KEY]
+            edge_cell_shift = data[_keys.EDGE_CELL_SHIFT_KEY].to(
+                device=cell.device, dtype=cell.dtype
+            )
             if cell.shape[0] > 1:
                 batch = data[_keys.BATCH_KEY]
                 # Cell has a batch dimension

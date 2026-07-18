@@ -334,12 +334,49 @@ def validate_block_ode_contract(data):
     semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
     if semantics not in {"absolute_full_h", "residual_dh"}:
         raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
+    target_fields = {
+        "absolute_full_h": {
+            "node_block_target_key": "node_full_hamil_target_blocks",
+            "edge_block_target_key": "edge_full_hamil_target_blocks",
+            "node_block_shape_key": "node_full_hamil_target_block_shape",
+            "edge_block_shape_key": "edge_full_hamil_target_block_shape",
+        },
+        "residual_dh": {
+            "node_block_target_key": "node_delta_hamil_blocks",
+            "edge_block_target_key": "edge_delta_hamil_blocks",
+            "node_block_shape_key": "node_delta_hamil_block_shape",
+            "edge_block_shape_key": "edge_delta_hamil_block_shape",
+        },
+    }[semantics]
+    for option, expected in target_fields.items():
+        actual = flow.get(option)
+        if actual != expected:
+            raise ValueError(
+                f"block_ode target_semantics={semantics!r} requires "
+                f"flow_options.{option}={expected!r}; got {actual!r}"
+            )
     if bool(flow.get("prediction_add_h0", False)):
         raise ValueError("block_ode requires flow_options.prediction_add_h0=false")
     if not bool(flow.get("time_conditioning_required", False)):
         raise ValueError("block_ode requires flow_options.time_conditioning_required=true")
+    if not bool(flow.get("strict_h0", True)):
+        raise ValueError(
+            "block_ode requires flow_options.strict_h0=true; physical H0 may not "
+            "fall back to a zero base"
+        )
     if str(flow.get("block_inverse_mode", "strict")).lower() != "strict":
         raise ValueError("block_ode requires block_inverse_mode='strict'")
+    common = dict(data.get("common_options", {}) or {})
+    configured_dtype = str(common.get("dtype", "float32")).lower().replace(
+        "torch.", ""
+    )
+    inverse_atol_caps = {"float32": 2.0e-5, "float64": 1.0e-10}
+    if configured_dtype not in inverse_atol_caps:
+        raise ValueError(
+            "block_ode requires common_options.dtype='float32' or 'float64'; "
+            f"got {configured_dtype!r}"
+        )
+    maximum_inverse_atol = inverse_atol_caps[configured_dtype]
     raw_steps = flow.get("validation_ode_steps", [])
     if not raw_steps or any(
         isinstance(value, bool) or not isinstance(value, Integral) for value in raw_steps
@@ -353,6 +390,34 @@ def validate_block_ode_contract(data):
         configured_atol = float(configured_atol)
         if not math.isfinite(configured_atol) or configured_atol < 0:
             raise ValueError("block_ode block_inverse_atol must be finite and non-negative")
+        if configured_atol > maximum_inverse_atol:
+            raise ValueError(
+                "block_ode block_inverse_atol exceeds the certified "
+                f"{configured_dtype} maximum {maximum_inverse_atol:.6g}; "
+                f"got {configured_atol:.6g}"
+            )
+
+    if bool(common.get("has_soc", False)):
+        raise ValueError("block_ode v1 is non-SOC only; set common_options.has_soc=false")
+
+    distance_ranges = train.get("distance_ranges", None)
+    if distance_ranges is not None:
+        valid_full_graph_range = (
+            isinstance(distance_ranges, list)
+            and len(distance_ranges) == 1
+            and isinstance(distance_ranges[0], (list, tuple))
+            and len(distance_ranges[0]) == 2
+            and not isinstance(distance_ranges[0][0], bool)
+            and isinstance(distance_ranges[0][0], Number)
+            and math.isfinite(float(distance_ranges[0][0]))
+            and float(distance_ranges[0][0]) <= 0.0
+        )
+        if not valid_full_graph_range:
+            raise ValueError(
+                "block_ode v1 cannot use distance-partitioned experts because "
+                "H-B0 must predict every graph edge; omit distance_ranges or use "
+                "one full-graph range whose lower bound is <= 0"
+            )
 
     model = dict(data.get("model_options", {}) or {})
     prediction = dict(model.get("prediction", {}) or {})
@@ -378,22 +443,55 @@ def validate_block_ode_contract(data):
     ):
         raise ValueError("block_ode requires both node and edge H0 initialization")
 
-    def _walk_splits(value, path="data_options"):
-        if not isinstance(value, dict):
-            return
-        if bool(value.get("get_Hamiltonian", False)):
-            expected_residual = semantics == "residual_dh"
-            actual_residual = bool(value.get("residual_hamiltonian", False))
-            if actual_residual != expected_residual:
-                raise ValueError(
-                    f"{path}.residual_hamiltonian={actual_residual} conflicts with "
-                    f"block_ode target_semantics={semantics!r}"
-                )
-        for key, child in value.items():
-            if isinstance(child, dict):
-                _walk_splits(child, f"{path}.{key}")
-
-    _walk_splits(data.get("data_options", {}) or {})
+    data_options_value = data.get("data_options", {}) or {}
+    if not isinstance(data_options_value.get("train"), dict):
+        raise ValueError("block_ode requires a configured data_options.train split")
+    configured_splits = {
+        split: data_options_value[split]
+        for split in ("train", "validation", "reference", "test")
+        if isinstance(data_options_value.get(split), dict)
+    }
+    expected_residual = semantics == "residual_dh"
+    expected_full_h_target = semantics == "absolute_full_h"
+    for split, split_options in configured_splits.items():
+        path = f"data_options.{split}"
+        dataset_type = str(split_options.get("type", "DefaultDataset"))
+        if dataset_type != "LMDBDataset":
+            raise ValueError(
+                f"{path}.type must be 'LMDBDataset' for block_ode; "
+                "other dataset backends do not implement the physical-H0 and "
+                "versioned AO-block target contract"
+            )
+        if not bool(split_options.get("get_Hamiltonian", False)):
+            raise ValueError(f"{path}.get_Hamiltonian must be true for block_ode")
+        if not bool(split_options.get("get_H0", False)):
+            raise ValueError(
+                f"{path}.get_H0 must be true for block_ode physical-H0 initialization"
+            )
+        actual_residual = bool(split_options.get("residual_hamiltonian", False))
+        if actual_residual != expected_residual:
+            raise ValueError(
+                f"{path}.residual_hamiltonian={actual_residual} conflicts with "
+                f"block_ode target_semantics={semantics!r}"
+            )
+        actual_full_h_target = bool(
+            split_options.get("require_full_h_target", False)
+        )
+        if actual_full_h_target != expected_full_h_target:
+            raise ValueError(
+                f"{path}.require_full_h_target must be "
+                f"{str(expected_full_h_target).lower()} for block_ode "
+                f"target_semantics={semantics!r}"
+            )
+        actual_residual_h_target = bool(
+            split_options.get("require_residual_h_target", False)
+        )
+        if actual_residual_h_target != expected_residual:
+            raise ValueError(
+                f"{path}.require_residual_h_target must be "
+                f"{str(expected_residual).lower()} for block_ode "
+                f"target_semantics={semantics!r}"
+            )
 
 
 def self_consistency_options():
@@ -1243,6 +1341,7 @@ def train_data_sub():
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
@@ -1283,6 +1382,7 @@ def validation_data_sub():
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
@@ -1323,6 +1423,7 @@ def reference_data_sub():
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
@@ -1362,6 +1463,7 @@ def test_data_sub():
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),

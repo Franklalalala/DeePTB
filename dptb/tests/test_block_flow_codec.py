@@ -58,13 +58,14 @@ def _mixed_case(dtype: torch.dtype = torch.float64):
             dtype=dtype,
         ),
         "cell": torch.stack([torch.eye(3, dtype=dtype) * 5.0] * 2),
+        "pbc": torch.tensor([[True, False, False], [False, True, False]]),
         "batch": torch.tensor([0, 0, 1, 1], dtype=torch.long),
         "edge_index": edge_index,
         "edge_cell_shift": torch.tensor(
             [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]], dtype=dtype
         ),
         "atom_types": atom_types,
-        "edge_types": edge_types,
+        "edge_type": edge_types,
     }
     return idp, data
 
@@ -78,7 +79,7 @@ def _canonical_random_rme(idp, data, dtype):
         data["edge_index"].shape[1], idp.reduced_matrix_element, generator=generator, dtype=dtype
     )
     node *= idp.mask_to_nrme[data["atom_types"]].to(dtype=dtype)
-    edge *= idp.mask_to_erme[data["edge_types"]].to(dtype=dtype)
+    edge *= idp.mask_to_erme[data["edge_type"]].to(dtype=dtype)
     # For H-C only the H->C row owns the global s-p canonical slice; reverse
     # rows are the transpose-completion side, hence carry no independent RME.
     edge[1::2] = 0
@@ -115,7 +116,12 @@ def test_inverse_cg_random_and_exhaustive_standard_basis_round_trip_fp64():
         {"Si": ["3s", "3p", "3d"]}, method="e3tb", device="cpu"
     )
     expand = E3Hamiltonian(idp=idp, dtype=torch.float64, decompose=False)
-    contract = E3Hamiltonian(idp=idp, dtype=torch.float64, decompose=True)
+    contract = E3Hamiltonian(
+        idp=idp,
+        dtype=torch.float64,
+        decompose=True,
+        enable_inverse_cg=True,
+    )
     width = idp.reduced_matrix_element
     eye = torch.eye(width, dtype=torch.float64)
     random = torch.randn(width, width, dtype=torch.float64, generator=torch.Generator().manual_seed(7))
@@ -213,6 +219,7 @@ def test_pbc_reverse_metadata_missing_duplicate_and_batched_isolation():
     missing = dict(data)
     missing["edge_index"] = data["edge_index"][:, :3]
     missing["edge_cell_shift"] = data["edge_cell_shift"][:3]
+    missing["edge_type"] = data["edge_type"][:3]
     with pytest.raises(ValueError, match="missing reverse"):
         strict_reverse_edge_index(missing)
 
@@ -220,6 +227,9 @@ def test_pbc_reverse_metadata_missing_duplicate_and_batched_isolation():
     duplicate["edge_index"] = torch.cat([data["edge_index"], data["edge_index"][:, :1]], dim=1)
     duplicate["edge_cell_shift"] = torch.cat(
         [data["edge_cell_shift"], data["edge_cell_shift"][:1]], dim=0
+    )
+    duplicate["edge_type"] = torch.cat(
+        [data["edge_type"], data["edge_type"][:1]], dim=0
     )
     with pytest.raises(ValueError, match="Duplicate directed edge key"):
         strict_reverse_edge_index(duplicate)
@@ -324,7 +334,7 @@ def test_real_h_b0_head_output_projected_block_rme_block_gate():
         "edge_index": torch.tensor([[0], [0]], dtype=torch.long),
         "edge_cell_shift": torch.zeros(1, 3, dtype=torch.float64),
         "atom_types": torch.tensor([atom_type]),
-        "edge_types": torch.tensor([idp.bond_to_type["Si-Si"]]),
+        "edge_type": torch.tensor([idp.bond_to_type["Si-Si"]]),
     }
     shapes = torch.tensor([[4, 4]])
     head_state = BlockTensorResult(

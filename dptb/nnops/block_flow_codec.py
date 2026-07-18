@@ -55,6 +55,9 @@ def project_block_state(
     if not bool(torch.isfinite(node).all().item()) or not bool(torch.isfinite(edge).all().item()):
         raise ValueError("Block ODE state contains NaN or Inf.")
 
+    # Validate raw graph indices/shifts/types before any helper casts them or
+    # uses Python indexing to infer species-dependent shapes.
+    rev = strict_reverse_edge_index(data, device=edge.device, idp=idp)
     expected_node, expected_edge = infer_block_shapes(data, idp)
     for label, shapes in (
         ("node", state.node_shapes),
@@ -97,7 +100,6 @@ def project_block_state(
     node_projected = 0.5 * (node + node.transpose(-1, -2))
     node_projected = torch.where(node_mask, node_projected, torch.zeros_like(node_projected))
 
-    rev = strict_reverse_edge_index(data, device=edge.device)
     edge_mask = block_mask_from_shapes(edge_shapes, tuple(edge.shape[-2:]))
     edge_projected = torch.zeros_like(edge)
     visited = torch.zeros((edge.shape[0],), dtype=torch.bool, device=edge.device)
@@ -153,6 +155,18 @@ class BlockStateCodec:
         )
         if not math.isfinite(self.atol) or self.atol < 0:
             raise ValueError("BlockStateCodec atol must be finite and non-negative.")
+        if inverse_mode == "strict":
+            if dtype not in {torch.float32, torch.float64}:
+                raise TypeError(
+                    "Strict BlockStateCodec requires float32 or float64 for a "
+                    "certified inverse tolerance."
+                )
+            maximum_atol = 1.0e-10 if dtype == torch.float64 else 2.0e-5
+            if self.atol > maximum_atol:
+                raise ValueError(
+                    "Strict BlockStateCodec atol exceeds the certified dtype "
+                    f"maximum {maximum_atol:.6g}: got {self.atol:.6g}."
+                )
         self.target_semantics = target_semantics
         self._expand = E3Hamiltonian(
             idp=idp,
@@ -164,6 +178,7 @@ class BlockStateCodec:
         self._contract = E3Hamiltonian(
             idp=idp,
             decompose=True,
+            enable_inverse_cg=True,
             dtype=dtype,
             device=self.device,
             soc=False,

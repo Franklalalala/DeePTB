@@ -87,6 +87,7 @@ class E3Hamiltonian(torch.nn.Module):
         device: Union[str, torch.device] = torch.device("cpu"),
         rotation: bool = False,
         soc: bool = False,
+        enable_inverse_cg: bool = False,
         # ---- Debug flags ----
         debug: bool = False,
         debug_every: int = 1,
@@ -105,6 +106,9 @@ class E3Hamiltonian(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.soc = soc
+        # HR -> RME inverse-CG is a new, block-codec-only operation.  Keep it
+        # opt-in so every historical decompose=True caller remains unchanged.
+        self.enable_inverse_cg = bool(enable_inverse_cg)
         self.full_soc_prediction = bool(
             kwargs.get("full_soc_prediction", getattr(idp, "full_soc_prediction", False))
         )
@@ -176,6 +180,17 @@ class E3Hamiltonian(torch.nn.Module):
         else:
             assert idp is not None, "Either basis or idp should be provided."
             self.idp = idp
+
+        if self.enable_inverse_cg:
+            if not self.decompose:
+                raise ValueError(
+                    "enable_inverse_cg=True requires decompose=True."
+                )
+            if self.soc or bool(getattr(self.idp, "has_soc", False)):
+                raise NotImplementedError(
+                    "enable_inverse_cg=True supports non-SOC E3Hamiltonian "
+                    "layouts only."
+                )
 
         self.basis = self.idp.basis
         self.soc_complex_doubling = getattr(self.idp, "soc_complex_doubling", True)
@@ -434,6 +449,8 @@ class E3Hamiltonian(torch.nn.Module):
         if not self.decompose:
             # ---------------- EDGE ----------------
             for k_i, opairtype in enumerate(self.idp.orbpairtype_maps.keys()):
+                if n_edge == 0:
+                    break
                 verbose = self._should_debug() and (k_i < self.debug_max_pairtypes)
 
                 l1, l2 = anglrMId[opairtype[0]], anglrMId[opairtype[2]]
@@ -527,44 +544,59 @@ class E3Hamiltonian(torch.nn.Module):
 
         # ---------------- Decompose: HR -> RME ----------------
         else:
-            if self.soc:
+            # The exact inverse added for the non-SOC block-state codec must
+            # not change legacy SOC or non-SOC statistics routes.  In particular,
+            # LMDBDataset.E3statistics and other legacy callers may either set
+            # soc=True explicitly or pass a SOC OrbitalMapper while leaving
+            # the constructor flag at its historical default.  Both layouts
+            # must pass through here unchanged.  SOC inverse-CG is
+            # intentionally outside the codec's supported scope.
+            mapper_has_soc = bool(getattr(self.idp, "has_soc", False))
+            if self.soc and not mapper_has_soc:
                 raise NotImplementedError(
-                    "E3Hamiltonian(decompose=True) currently supports non-SOC "
-                    "real Hamiltonians only."
+                    "E3Hamiltonian(decompose=True, soc=True) received a non-SOC "
+                    "OrbitalMapper; refusing an inconsistent inverse-CG layout."
                 )
-
-            # Mirror the forward pair-type loop exactly.  Each feature slice
-            # currently contains uncoupled/product (HR) components and is
-            # overwritten in-place with coupled RME components.
-            for field, n_rows, label in (
-                (self.edge_field, n_edge, "EDGE"),
-                (self.node_field, n_node, "NODE"),
-            ):
-                if label == "NODE" and self.overlap:
-                    continue
-                for k_i, opairtype in enumerate(self.idp.orbpairtype_maps.keys()):
-                    verbose = self._should_debug() and (k_i < self.debug_max_pairtypes)
-                    l1, l2 = anglrMId[opairtype[0]], anglrMId[opairtype[2]]
-                    n_product = (2 * l1 + 1) * (2 * l2 + 1)
-                    sli = self.idp.orbpairtype_maps[opairtype]
-                    product = data[field][:, sli]
-                    hr = product.reshape(
-                        n_rows, -1, 2 * l1 + 1, 2 * l2 + 1
+            if self.enable_inverse_cg:
+                if self.soc or mapper_has_soc:
+                    raise NotImplementedError(
+                        "enable_inverse_cg=True supports non-SOC E3Hamiltonian "
+                        "layouts only."
                     )
-                    cg_basis = self.cgbasis[opairtype].to(
-                        device=hr.device, dtype=hr.dtype
-                    )
-                    rme2 = _inverse_contract_cg_hr(cg_basis, hr)
-                    flat = rme2.transpose(1, 2).reshape(n_rows, -1)
-                    if flat.shape[1] != product.shape[1]:
-                        raise RuntimeError(
-                            f"{label} {opairtype} inverse CG width mismatch: "
-                            f"got {flat.shape[1]}, expected {product.shape[1]} "
-                            f"(product dimension {n_product})."
+                # Mirror the forward pair-type loop exactly.  Each feature
+                # slice currently contains uncoupled/product (HR) components
+                # and is overwritten in-place with coupled RME components.
+                for field, n_rows, label in (
+                    (self.edge_field, n_edge, "EDGE"),
+                    (self.node_field, n_node, "NODE"),
+                ):
+                    if n_rows == 0:
+                        continue
+                    if label == "NODE" and self.overlap:
+                        continue
+                    for k_i, opairtype in enumerate(self.idp.orbpairtype_maps.keys()):
+                        verbose = self._should_debug() and (k_i < self.debug_max_pairtypes)
+                        l1, l2 = anglrMId[opairtype[0]], anglrMId[opairtype[2]]
+                        n_product = (2 * l1 + 1) * (2 * l2 + 1)
+                        sli = self.idp.orbpairtype_maps[opairtype]
+                        product = data[field][:, sli]
+                        hr = product.reshape(
+                            n_rows, -1, 2 * l1 + 1, 2 * l2 + 1
                         )
-                    data[field][:, sli] = flat
-                    if verbose:
-                        self._tensor_stats(f"[{label}]{opairtype}.RME(inverse)", flat)
+                        cg_basis = self.cgbasis[opairtype].to(
+                            device=hr.device, dtype=hr.dtype
+                        )
+                        rme2 = _inverse_contract_cg_hr(cg_basis, hr)
+                        flat = rme2.transpose(1, 2).reshape(n_rows, -1)
+                        if flat.shape[1] != product.shape[1]:
+                            raise RuntimeError(
+                                f"{label} {opairtype} inverse CG width mismatch: "
+                                f"got {flat.shape[1]}, expected {product.shape[1]} "
+                                f"(product dimension {n_product})."
+                            )
+                        data[field][:, sli] = flat
+                        if verbose:
+                            self._tensor_stats(f"[{label}]{opairtype}.RME(inverse)", flat)
 
         # Legacy SOC onsite param application
         data = self._apply_soc(data, n_node=n_node)
