@@ -1,7 +1,8 @@
 from typing import List, Callable, Dict, Any, Union
 from dargs import dargs, Argument, Variant, ArgumentEncoder
 import logging
-from numbers import Number
+import math
+from numbers import Integral, Number
 
 
 log = logging.getLogger(__name__)
@@ -339,9 +340,19 @@ def validate_block_ode_contract(data):
         raise ValueError("block_ode requires flow_options.time_conditioning_required=true")
     if str(flow.get("block_inverse_mode", "strict")).lower() != "strict":
         raise ValueError("block_ode requires block_inverse_mode='strict'")
-    steps = {int(value) for value in flow.get("validation_ode_steps", [])}
+    raw_steps = flow.get("validation_ode_steps", [])
+    if not raw_steps or any(
+        isinstance(value, bool) or not isinstance(value, Integral) for value in raw_steps
+    ):
+        raise ValueError("block_ode validation_ode_steps must contain integers drawn from [1, 3]")
+    steps = {int(value) for value in raw_steps}
     if not steps or not steps.issubset({1, 3}):
         raise ValueError("block_ode validation_ode_steps must be a non-empty subset of [1, 3]")
+    configured_atol = flow.get("block_inverse_atol", None)
+    if configured_atol is not None:
+        configured_atol = float(configured_atol)
+        if not math.isfinite(configured_atol) or configured_atol < 0:
+            raise ValueError("block_ode block_inverse_atol must be finite and non-negative")
 
     model = dict(data.get("model_options", {}) or {})
     prediction = dict(model.get("prediction", {}) or {})
@@ -1743,6 +1754,7 @@ def slem_h0():
     doc_flow_time_key = "Graph-level flow time key written by train_options.flow_options. Default: `flow_time`."
     doc_flow_time_keys = "Optional list of graph-level time keys to embed and sum, e.g. [`flow_time_t`, `flow_time_r`, `flow_time_h`] for Pixel MeanFlow."
     doc_flow_time_max_positions = "Scale used by the sinusoidal flow-time embedding. Default: `2000`."
+    doc_flow_time_allow_missing = "Whether missing flow time may fall back to flow_time_missing_value. Default: `True`; block-ODE requires `False`."
     doc_flow_time_missing_value = "Fallback normalized time when flow_time is absent. Default: `0.0`."
 
     return slem() + [
@@ -1768,6 +1780,7 @@ def slem_h0():
         Argument("flow_time_key", str, optional=True, default="flow_time", doc=doc_flow_time_key),
         Argument("flow_time_keys", list, optional=True, default=[], doc=doc_flow_time_keys),
         Argument("flow_time_max_positions", int, optional=True, default=2000, doc=doc_flow_time_max_positions),
+        Argument("flow_time_allow_missing", bool, optional=True, default=True, doc=doc_flow_time_allow_missing),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
     ]
 

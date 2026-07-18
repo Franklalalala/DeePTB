@@ -11,6 +11,8 @@ features.
 """
 
 import logging
+import math
+from numbers import Integral
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -92,8 +94,6 @@ class HamiltonianCFM:
         self.block_ode = bool(options.get("block_ode", False))
         if self.output_space in {"block_ode", "ao_blocks_ode"}:
             self.output_space = "ao_block_ode"
-        if self.output_space == "ao_block_ode":
-            self.block_ode = True
         if self.output_space not in {"rme", "ao_block", "ao_block_ode"}:
             raise ValueError(
                 "flow_options.output_space must be 'rme', 'ao_block', or "
@@ -104,6 +104,11 @@ class HamiltonianCFM:
             raise ValueError(
                 "flow_options.block_ode=true is mutually exclusive with the frozen "
                 "ao_block adapter; set output_space='ao_block_ode'."
+            )
+        if self.output_space == "ao_block_ode" and not self.block_ode:
+            raise ValueError(
+                "Block-space ODE is a distinct mode: set flow_options.block_ode=true "
+                "together with output_space='ao_block_ode'."
             )
         if self.output_space == "ao_block_ode" and not self.enabled:
             raise ValueError("output_space='ao_block_ode' requires flow_options.enabled=true.")
@@ -147,6 +152,8 @@ class HamiltonianCFM:
             if configured_block_atol is None
             else configured_block_atol
         )
+        if not math.isfinite(self.block_inverse_atol) or self.block_inverse_atol < 0:
+            raise ValueError("flow_options.block_inverse_atol must be finite and non-negative.")
 
         # Residual CFM is the recommended mode for DeePTB: base = DFT/NextHAM H0.
         self.mode = str(options.get("mode", "residual")).lower()
@@ -313,15 +320,29 @@ class HamiltonianCFM:
         self.endpoint_weight_power = float(options.get("endpoint_weight_power", 0.0))
         self.endpoint_weight_cap = float(options.get("endpoint_weight_cap", 100.0))
         self.omit_time_scaling = bool(options.get("omit_time_scaling", True))
+        raw_validation_steps = options.get("validation_ode_steps", [1, 3])
+        if self.block_ode and (
+            not raw_validation_steps
+            or any(
+                isinstance(value, bool) or not isinstance(value, Integral)
+                for value in raw_validation_steps
+            )
+        ):
+            raise ValueError(
+                "Block-space ODE validation_ode_steps must contain integer steps drawn from [1, 3]."
+            )
         self.validation_ode_steps = tuple(
-            sorted({int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0})
+            sorted({int(v) for v in raw_validation_steps if int(v) > 0})
         )
         if self.output_space == "ao_block" and self.validation_ode_steps != (1,):
             raise ValueError(
                 "flow_options.output_space='ao_block' is a cross-space one-step "
                 "endpoint adapter and requires validation_ode_steps=[1]."
             )
-        if self.block_ode and not set(self.validation_ode_steps).issubset({1, 3}):
+        if self.block_ode and (
+            not self.validation_ode_steps
+            or not set(self.validation_ode_steps).issubset({1, 3})
+        ):
             raise ValueError(
                 "Block-space ODE v1 supports validation_ode_steps drawn from [1, 3]."
             )

@@ -19,6 +19,7 @@ it is a single directed real spatial block per orbital pair.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import torch
@@ -867,8 +868,9 @@ def canonical_block_tensors_to_feature_tensors(
     ensure_non_soc_mapper(idp)
     if mode not in {"strict", "project"}:
         raise ValueError(f"mode must be 'strict' or 'project', got {mode!r}.")
-    if atol < 0:
-        raise ValueError("atol must be non-negative.")
+    atol = float(atol)
+    if not math.isfinite(atol) or atol < 0:
+        raise ValueError("atol must be finite and non-negative.")
     symbols = symbols_from_data(data, idp)
     inferred_node, inferred_edge = infer_block_shapes(data, idp)
     node_blocks, node_shapes = _validate_inverse_component(

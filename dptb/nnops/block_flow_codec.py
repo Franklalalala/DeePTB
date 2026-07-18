@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
@@ -55,6 +56,18 @@ def project_block_state(
         raise ValueError("Block ODE state contains NaN or Inf.")
 
     expected_node, expected_edge = infer_block_shapes(data, idp)
+    for label, shapes in (
+        ("node", state.node_shapes),
+        ("edge", state.edge_shapes),
+    ):
+        if shapes.dtype == torch.bool or shapes.is_complex() or not bool(
+            torch.isfinite(shapes).all().item()
+        ):
+            raise ValueError(f"{label}_shapes must contain finite integers.")
+        if shapes.is_floating_point() and shapes.numel() and bool(
+            ((shapes - shapes.round()).abs().max() > 0).item()
+        ):
+            raise ValueError(f"{label}_shapes must contain integers.")
     node_shapes = state.node_shapes.to(device=node.device, dtype=torch.long)
     edge_shapes = state.edge_shapes.to(device=edge.device, dtype=torch.long)
     if not torch.equal(node_shapes, expected_node.to(device=node.device)):
@@ -138,6 +151,8 @@ class BlockStateCodec:
         self.atol = float(
             atol if atol is not None else (1e-10 if dtype == torch.float64 else 2e-5)
         )
+        if not math.isfinite(self.atol) or self.atol < 0:
+            raise ValueError("BlockStateCodec atol must be finite and non-negative.")
         self.target_semantics = target_semantics
         self._expand = E3Hamiltonian(
             idp=idp,
@@ -158,7 +173,11 @@ class BlockStateCodec:
     def _working_data(
         data: Mapping[str, Any], node: torch.Tensor, edge: torch.Tensor
     ) -> dict[str, Any]:
-        work = dict(data)
+        # E3Hamiltonian is TorchScript-typed as Dict[str, Tensor].  Real
+        # trainer batches also carry PyG collation metadata such as
+        # ``__slices__`` and ``__data_class__``; keep those in the outer
+        # state, but do not feed them through the scripted CG transform.
+        work = {key: value for key, value in data.items() if torch.is_tensor(value)}
         work["node_features"] = node.clone()
         work["edge_features"] = edge.clone()
         return work
