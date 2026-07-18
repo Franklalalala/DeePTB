@@ -203,6 +203,7 @@ class HamiltonianCFM:
         # dense TE/CG priors.
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
+        self._projected_te_prior_names = {"projected_te"}
         self._basis_prior_names = BASIS_ONSITE_NAMES
         self._overlap_huckel_prior_names = OVERLAP_HUCKEL_NAMES
         self._haar_dm_prior_names = HAAR_DM_NAMES
@@ -213,6 +214,7 @@ class HamiltonianCFM:
             "gaussian",
             "residual_gaussian",
             *self._te_prior_names,
+            *self._projected_te_prior_names,
             *self._basis_prior_names,
             *self._overlap_huckel_prior_names,
             *self._haar_dm_prior_names,
@@ -222,7 +224,7 @@ class HamiltonianCFM:
         if self.prior not in allowed_priors:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
-                "use 'zero', 'gaussian', 'residual_gaussian', 'te', "
+                "use 'zero', 'gaussian', 'residual_gaussian', 'te', 'projected_te', "
                 "'basis_onsite', 'overlap_huckel', 'haar_dm', 'dftbsk', 'external', "
                 "'dftb', 'xtb', or 'physical'."
             )
@@ -241,10 +243,11 @@ class HamiltonianCFM:
                 raise ValueError(
                     "Block-space ODE v1 requires mode='residual' so B0 is physical H0."
                 )
-            if self.prior != "zero":
+            if self.prior not in {"zero", *self._projected_te_prior_names}:
                 raise ValueError(
-                    "Block-space ODE v1 requires prior='zero'; TE/Gaussian priors "
-                    "lack a persisted train/sample scale contract."
+                    "Block-space ODE supports only prior='zero' or the explicit "
+                    "prior='projected_te'; generic TE/Gaussian priors do not own "
+                    "the projected block start-state contract."
                 )
             if self.target_semantics not in {"absolute_full_h", "residual_dh"}:
                 raise ValueError(
@@ -345,6 +348,38 @@ class HamiltonianCFM:
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
             raise ValueError("flow_options.te_prior_mode must be 'irrep', 'block', or 'typewise'.")
         self.te_prior_per_graph = bool(options.get("te_prior_per_graph", True))
+        self.te_prior_validation_seed = options.get("te_prior_validation_seed", None)
+        if self.prior in self._projected_te_prior_names:
+            if not self.block_ode:
+                raise ValueError("prior='projected_te' is supported only by block_ode.")
+            if self.te_prior_mode != "irrep":
+                raise ValueError(
+                    "projected_te block_ode requires te_prior_mode='irrep'; "
+                    "typewise mode reads target residual scales and block mode is "
+                    "outside the certified irrepwise prior contract."
+                )
+            scales = {
+                "node_sigma": self.node_sigma,
+                "edge_sigma": self.edge_sigma,
+                "te_prior_sigma": self.te_prior_sigma,
+            }
+            invalid = [
+                name for name, value in scales.items() if not math.isfinite(value) or value <= 0.0
+            ]
+            if invalid:
+                raise ValueError(
+                    "projected_te block_ode requires finite positive scales; "
+                    f"invalid options={invalid}."
+                )
+            if (
+                isinstance(self.te_prior_validation_seed, bool)
+                or not isinstance(self.te_prior_validation_seed, Integral)
+                or self.te_prior_validation_seed < 0
+            ):
+                raise ValueError(
+                    "projected_te block_ode requires an explicit non-negative integer "
+                    "te_prior_validation_seed."
+                )
 
         # Physical prior families each own their option keys (parsed in
         # from_options).  Every family is built once so the external family can
@@ -1857,12 +1892,145 @@ class HamiltonianCFM:
             )
         return projected, residual
 
+    @staticmethod
+    def _clone_block_state(state: BlockTensorResult) -> BlockTensorResult:
+        return BlockTensorResult(
+            state.node_blocks.clone(),
+            state.edge_blocks.clone(),
+            state.node_shapes.clone(),
+            state.edge_shapes.clone(),
+        )
+
+    def _physical_h0_blocks(
+        self,
+        data: AtomicDataDict.Type,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[BlockTensorResult, float]:
+        missing = self._missing_keys(
+            data,
+            (
+                self.node_h0_block_key,
+                self.edge_h0_block_key,
+                self.node_h0_block_shape_key,
+                self.edge_h0_block_shape_key,
+            ),
+        )
+        if missing:
+            raise KeyError(
+                "Block-space ODE requires physical H0 blocks and shapes; "
+                f"missing keys={missing}."
+            )
+        raw_node = self._require_real_finite_tensor(
+            data[self.node_h0_block_key], label="physical H0 node blocks"
+        )
+        return self._block_state_from_fields(
+            data,
+            data,
+            node_key=self.node_h0_block_key,
+            edge_key=self.edge_h0_block_key,
+            node_shape_key=self.node_h0_block_shape_key,
+            edge_shape_key=self.edge_h0_block_shape_key,
+            label="physical H0",
+            device=raw_node.device if device is None else device,
+            dtype=self.dtype if dtype is None else dtype,
+        )
+
+    def _block_initial_state(
+        self,
+        data: AtomicDataDict.Type,
+        h0_blocks: BlockTensorResult,
+        *,
+        prior_seed: Optional[int] = None,
+    ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
+        """Draw one endpoint-independent start state and certify its codec image."""
+        assert self.block_codec is not None
+        node_h0, edge_h0 = self.block_codec.blocks_to_rme(data, h0_blocks)
+        if self.prior == "zero":
+            if prior_seed is not None:
+                raise ValueError("block-space prior_seed requires prior='projected_te'.")
+            return (
+                self._clone_block_state(h0_blocks),
+                torch.zeros_like(node_h0),
+                torch.zeros_like(edge_h0),
+            )
+
+        if self.prior not in self._projected_te_prior_names:
+            raise RuntimeError(f"Unsupported block-space prior {self.prior!r}.")
+
+        def draw() -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
+            prior_data = data.copy()
+            prior_data.pop("expert_node_mask", None)
+            prior_data.pop("expert_edge_mask", None)
+            num_graphs = self._num_graphs(prior_data)
+            node_noise = self._te_prior_like(
+                torch.zeros_like(node_h0),
+                self.node_sigma,
+                data=prior_data,
+                label="node",
+                reference_scale=False,
+                num_graphs=num_graphs,
+            )
+            edge_noise = self._te_prior_like(
+                torch.zeros_like(edge_h0),
+                self.edge_sigma,
+                data=prior_data,
+                label="edge",
+                reference_scale=False,
+                num_graphs=num_graphs,
+            )
+            noise_blocks = self.block_codec.rme_to_blocks(
+                data, node_noise, edge_noise, project=False
+            )
+            start = project_block_state(
+                data,
+                self.idp,
+                BlockTensorResult(
+                    h0_blocks.node_blocks + noise_blocks.node_blocks,
+                    h0_blocks.edge_blocks + noise_blocks.edge_blocks,
+                    h0_blocks.node_shapes,
+                    h0_blocks.edge_shapes,
+                ),
+            )
+            node_start, edge_start = self.block_codec.blocks_to_rme(data, start)
+            roundtrip = self.block_codec.rme_to_blocks(
+                data, node_start, edge_start, project=True
+            )
+            residual = max(
+                self._max_abs(roundtrip.node_blocks - start.node_blocks),
+                self._max_abs(roundtrip.edge_blocks - start.edge_blocks),
+            )
+            if residual > self.block_inverse_atol:
+                raise ValueError(
+                    "Projected TE block start is outside the certified codec image: "
+                    f"max residual={residual:.6g}, atol={self.block_inverse_atol:.6g}."
+                )
+            return start, node_start - node_h0, edge_start - edge_h0
+
+        if prior_seed is None:
+            return draw()
+        if (
+            isinstance(prior_seed, bool)
+            or not isinstance(prior_seed, Integral)
+            or prior_seed < 0
+        ):
+            raise ValueError("block-space prior_seed must be a non-negative integer.")
+        device = h0_blocks.node_blocks.device
+        cuda_devices = (
+            [] if device.type != "cuda" else [device.index or torch.cuda.current_device()]
+        )
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(int(prior_seed))
+            return draw()
+
     def prepare_batch(
         self,
         data: AtomicDataDict.Type,
         ref_data: AtomicDataDict.Type,
         *,
         t: Optional[torch.Tensor] = None,
+        prior_seed: Optional[int] = None,
     ) -> Tuple[AtomicDataDict.Type, AtomicDataDict.Type, CFMContext]:
         """Return a model-input dict with interpolated H_t written to H0 keys."""
         if not self.enabled:
@@ -1941,16 +2109,8 @@ class HamiltonianCFM:
 
         if self.block_ode:
             assert self.block_codec is not None
-            h0_blocks, h0_projection_residual = self._block_state_from_fields(
-                data,
-                data,
-                node_key=self.node_h0_block_key,
-                edge_key=self.edge_h0_block_key,
-                node_shape_key=self.node_h0_block_shape_key,
-                edge_shape_key=self.edge_h0_block_shape_key,
-                label="physical H0",
-                device=device,
-                dtype=dtype,
+            h0_blocks, h0_projection_residual = self._physical_h0_blocks(
+                data, device=device, dtype=dtype
             )
             endpoint, endpoint_projection_residual = self._block_state_from_fields(
                 ref_data,
@@ -1968,6 +2128,9 @@ class HamiltonianCFM:
             # older LMDBs store AO-product gathers under the same key names.
             node_base, edge_base = self.block_codec.blocks_to_rme(data, h0_blocks)
             node_target, edge_target = self.block_codec.blocks_to_rme(data, endpoint)
+            block_start, node_prior, edge_prior = self._block_initial_state(
+                data, h0_blocks, prior_seed=prior_seed
+            )
 
             full_endpoint = self.block_codec.endpoint_to_full(endpoint, h0_blocks)
             full_endpoint = project_block_state(data, self.idp, full_endpoint)
@@ -1977,9 +2140,9 @@ class HamiltonianCFM:
                 data,
                 self.idp,
                 BlockTensorResult(
-                    node_blocks=(1.0 - node_alpha) * h0_blocks.node_blocks
+                    node_blocks=(1.0 - node_alpha) * block_start.node_blocks
                     + node_alpha * full_endpoint.node_blocks,
-                    edge_blocks=(1.0 - edge_alpha) * h0_blocks.edge_blocks
+                    edge_blocks=(1.0 - edge_alpha) * block_start.edge_blocks
                     + edge_alpha * full_endpoint.edge_blocks,
                     node_shapes=h0_blocks.node_shapes,
                     edge_shapes=h0_blocks.edge_shapes,
@@ -2019,8 +2182,8 @@ class HamiltonianCFM:
                 edge_target=edge_target,
                 node_current=node_current,
                 edge_current=edge_current,
-                node_prior=torch.zeros_like(node_target),
-                edge_prior=torch.zeros_like(edge_target),
+                node_prior=node_prior,
+                edge_prior=edge_prior,
                 block_target_semantics=self.target_semantics,
             )
 
@@ -2670,40 +2833,14 @@ class HamiltonianCFM:
         *,
         num_steps: int,
         num_graphs: int,
+        prior_seed: Optional[int] = None,
     ) -> AtomicDataDict.Type:
         """Projected endpoint-blend rollout in full AO-block state space."""
         if self.block_codec is None:
             raise RuntimeError("Block-space ODE codec was not constructed.")
         topology_sidecar = self._snapshot_block_topology(state)
         self._restore_block_topology(state, topology_sidecar)
-        missing_h0_fields = self._missing_keys(
-            state,
-            (
-                self.node_h0_block_key,
-                self.edge_h0_block_key,
-                self.node_h0_block_shape_key,
-                self.edge_h0_block_shape_key,
-            ),
-        )
-        if missing_h0_fields:
-            raise KeyError(
-                "Block-space ODE sampling requires physical H0 blocks and shapes; "
-                f"missing keys={missing_h0_fields}."
-            )
-        raw_node_h0 = self._require_real_finite_tensor(
-            state[self.node_h0_block_key], label="physical H0 node blocks"
-        )
-        h0_blocks, _ = self._block_state_from_fields(
-            state,
-            state,
-            node_key=self.node_h0_block_key,
-            edge_key=self.edge_h0_block_key,
-            node_shape_key=self.node_h0_block_shape_key,
-            edge_shape_key=self.edge_h0_block_shape_key,
-            label="physical H0",
-            device=raw_node_h0.device,
-            dtype=self.dtype,
-        )
+        h0_blocks, _ = self._physical_h0_blocks(state)
         accumulator_dtype = self.dtype
         h0_blocks = BlockTensorResult(
             h0_blocks.node_blocks.to(dtype=accumulator_dtype),
@@ -2711,7 +2848,9 @@ class HamiltonianCFM:
             h0_blocks.node_shapes,
             h0_blocks.edge_shapes,
         )
-        block_current = h0_blocks
+        block_current, _, _ = self._block_initial_state(
+            state, h0_blocks, prior_seed=prior_seed
+        )
         self._drop_block_authority_fields(state)
         output_only_keys = self._block_ode_output_only_keys()
         # LemMoEV3H0 consumes and deletes these input-side accelerators.  Keep
@@ -2837,6 +2976,7 @@ class HamiltonianCFM:
         data: AtomicDataDict.Type,
         *,
         num_steps: int,
+        prior_seed: Optional[int] = None,
     ) -> AtomicDataDict.Type:
         """Euler-integrate the endpoint-parameterized flow from the configured prior."""
         if num_steps < 1:
@@ -2849,7 +2989,10 @@ class HamiltonianCFM:
                 state,
                 num_steps=num_steps,
                 num_graphs=num_graphs,
+                prior_seed=prior_seed,
             )
+        if prior_seed is not None:
+            raise ValueError("prior_seed is supported only by block_ode.")
         node_current = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
         edge_current = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_current is None and edge_current is None:

@@ -47,7 +47,10 @@ train_options:
     edge_block_target_key: edge_full_hamil_target_blocks
     node_block_shape_key: node_full_hamil_target_block_shape
     edge_block_shape_key: edge_full_hamil_target_block_shape
-    validation_ode_steps: [1, 3]
+    validation_ode_steps: [1]
+    log_validation_random_t_loss: false
+    log_validation_t0_loss: false
+    log_validation_flow_euler_loss: false
 
 data_options:
   train: {type: LMDBDataset, get_Hamiltonian: true, get_H0: true, residual_hamiltonian: false, require_full_h_target: true, require_residual_h_target: false}

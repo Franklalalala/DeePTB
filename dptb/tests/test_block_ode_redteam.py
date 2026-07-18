@@ -388,6 +388,18 @@ def test_red_codec_ignores_non_tensor_trainer_batch_metadata():
 def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
     base = _valid_contract()
     assert validate_block_ode_contract(base) is None
+    projected_te = deepcopy(base)
+    projected_te["train_options"]["flow_options"].update(
+        {
+            "prior": "projected_te",
+            "te_prior_mode": "irrep",
+            "node_sigma": 1.0,
+            "edge_sigma": 1.0,
+            "te_prior_sigma": 1.0,
+            "te_prior_validation_seed": 20260719,
+        }
+    )
+    assert validate_block_ode_contract(projected_te) is None
     expected_fields = {
         "absolute_full_h": {
             "node_block_target_key": "node_full_hamil_target_blocks",
@@ -437,7 +449,20 @@ def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
     bad_cases = []
     bad = deepcopy(base)
     bad["train_options"]["flow_options"]["prior"] = "te"
-    bad_cases.append((bad, "prior='zero'"))
+    bad_cases.append((bad, "only prior='zero'.*prior='projected_te'"))
+    for option, value, match in (
+        ("te_prior_mode", "typewise", "requires te_prior_mode='irrep'"),
+        ("node_sigma", 0.0, "finite positive scales"),
+        ("edge_sigma", float("nan"), "finite positive scales"),
+        ("te_prior_sigma", float("inf"), "finite positive scales"),
+        ("te_prior_validation_seed", True, "explicit non-negative integer"),
+    ):
+        bad = deepcopy(projected_te)
+        bad["train_options"]["flow_options"][option] = value
+        bad_cases.append((bad, match))
+    bad = deepcopy(projected_te)
+    bad["train_options"]["flow_options"].pop("te_prior_validation_seed")
+    bad_cases.append((bad, "explicit non-negative integer"))
     bad = deepcopy(base)
     bad["train_options"]["flow_options"]["target_semantics"] = ""
     bad_cases.append((bad, "explicit absolute_full_h/residual_dh"))

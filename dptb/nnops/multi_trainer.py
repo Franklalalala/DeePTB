@@ -3539,6 +3539,7 @@ class MultiTrainer(Trainer):
         range_dis,
         *,
         num_steps: int,
+        prior_seed=None,
     ):
         with self._tagger.tag("validation/prepare_euler_masks", it=self.iter, expert=expert_idx):
             expert_edge_mask, expert_node_mask = self._prepare_expert_masks(
@@ -3552,17 +3553,19 @@ class MultiTrainer(Trainer):
 
         active_nodes = expert_node_mask.sum().detach()
         active_edges = expert_edge_mask.sum().detach()
-
         with self._tagger.tag(
             "validation/flow_sample_euler",
             it=self.iter,
             expert=expert_idx,
             extra=f"steps={int(num_steps)}",
         ):
+            sample_kwargs = {"num_steps": int(num_steps)}
+            if prior_seed is not None:
+                sample_kwargs["prior_seed"] = prior_seed
             sampled = self.flow_cfm.sample(
                 self.model,
                 batch_copy,
-                num_steps=int(num_steps),
+                **sample_kwargs,
             )
 
         sampled["global_step"] = int(self.iter)
@@ -3588,10 +3591,13 @@ class MultiTrainer(Trainer):
                 sample_node.device if torch.is_tensor(sample_node) else self._device_obj()
             )
             zero_t = torch.zeros(num_graphs, device=zero_device, dtype=self.dtype)
+            prepare_kwargs = {"t": zero_t}
+            if prior_seed is not None:
+                prepare_kwargs["prior_seed"] = prior_seed
             _flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
                 batch_copy,
                 batch_for_loss,
-                t=zero_t,
+                **prepare_kwargs,
             )
             flow_ref.update(batch_info)
             with self._tagger.tag(
@@ -3697,6 +3703,12 @@ class MultiTrainer(Trainer):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
                 flow_euler_validation = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
+                validation_prior_seed = (
+                    self.flow_cfm.te_prior_validation_seed + num_batches
+                    if flow_euler_validation
+                    and getattr(self.flow_cfm, "prior", "zero") == "projected_te"
+                    else None
+                )
 
                 if self.distributed_expert:
                     local_idx = self.local_expert_idx
@@ -3710,6 +3722,7 @@ class MultiTrainer(Trainer):
                                 expert_idx=local_idx,
                                 range_dis=self.distance_ranges[local_idx],
                                 num_steps=int(num_steps),
+                                prior_seed=validation_prior_seed,
                             )
                             with self._tagger.tag(
                                 "validation/reduce_euler_metrics_dist",
@@ -3782,6 +3795,7 @@ class MultiTrainer(Trainer):
                                     expert_idx=expert_idx,
                                     range_dis=range_dis,
                                     num_steps=int(num_steps),
+                                    prior_seed=validation_prior_seed,
                                 )
                                 local_pack = local_pack + self._make_step_pack(payload)
                             state = self._validation_euler_state_from_pack(

@@ -160,6 +160,7 @@ def _flow(idp, semantics="absolute_full_h", **updates):
         "block_inverse_mode": "strict",
         "block_inverse_atol": ATOL,
         "validation_ode_steps": [1, 3],
+        "te_prior_validation_seed": 20260719,
         **target_fields,
     }
     options.update(updates)
@@ -280,7 +281,14 @@ def test_multitrainer_residual_euler_validation_scores_full_sample_via_flow():
         tag=lambda *_args, **_kwargs: nullcontext()
     )
     trainer.model = EndpointSequence([delta])
-    trainer.flow_cfm = _flow(idp, semantics="residual_dh")
+    trainer.flow_cfm = _flow(
+        idp,
+        semantics="residual_dh",
+        prior="projected_te",
+        te_prior_mode="irrep",
+        node_sigma=0.25,
+        edge_sigma=0.25,
+    )
     trainer._prepare_expert_masks = lambda batch_dict, *_args: (
         torch.ones(batch_dict[_keys.EDGE_H0_KEY].shape[0], dtype=torch.bool),
         torch.ones(batch_dict[_keys.NODE_H0_KEY].shape[0], dtype=torch.bool),
@@ -293,11 +301,25 @@ def test_multitrainer_residual_euler_validation_scores_full_sample_via_flow():
         expert_idx=0,
         range_dis=(0.0, 1.0),
         num_steps=1,
+        prior_seed=20260719,
     )
 
     assert payload["loss"].item() <= ATOL**2
     assert payload["onsite_l1_sum"].item() <= ATOL
     assert payload["hopping_l1_sum"].item() <= ATOL
+
+    payload_n3 = trainer._build_validation_euler_payload(
+        batch_dict=batch,
+        batch_info={},
+        criterion=WrongSpaceCriterion(),
+        expert_idx=0,
+        range_dis=(0.0, 1.0),
+        num_steps=3,
+        prior_seed=20260719,
+    )
+    assert payload_n3["loss"].item() <= ATOL**2
+    assert torch.equal(trainer.model.inputs[0][0], trainer.model.inputs[1][0])
+    assert torch.equal(trainer.model.inputs[0][1], trainer.model.inputs[1][1])
 
 
 def test_block_ode_reinjects_lem_sidecar_each_step_without_leaking_it():
@@ -568,7 +590,15 @@ def test_same_block_state_at_different_t_is_a_different_model_input():
     "updates,match",
     [
         ({"prediction_add_h0": True}, "add_h0=false"),
-        ({"prior": "te"}, "prior='zero'"),
+        ({"prior": "te"}, "only prior='zero'.*prior='projected_te'"),
+        (
+            {"prior": "projected_te", "te_prior_mode": "typewise"},
+            "requires te_prior_mode='irrep'",
+        ),
+        (
+            {"prior": "projected_te", "te_prior_sigma": 0.0},
+            "finite positive scales",
+        ),
         ({"target_semantics": ""}, "explicit target_semantics"),
         ({"time_conditioning_required": False}, "time_conditioning_required=true"),
         ({"validation_ode_steps": [1, 5]}, r"drawn from \[1, 3\]"),
@@ -611,6 +641,91 @@ def _ref_for(flow, data, codec, h0, endpoint, endpoint_node_rme, endpoint_edge_r
     ref[flow.node_block_shape_key] = endpoint.node_shapes
     ref[flow.edge_block_shape_key] = endpoint.edge_shapes
     return ref
+
+
+def test_projected_te_t0_is_endpoint_independent_and_matches_sampling_start():
+    idp, data, codec, h0 = _case()
+    flow = _flow(
+        idp,
+        prior="projected_te",
+        te_prior_mode="irrep",
+        node_sigma=0.25,
+        edge_sigma=0.25,
+        te_prior_sigma=1.0,
+    )
+    endpoint_a = _scaled_endpoint(
+        codec, data, data[_keys.NODE_H0_KEY], data[_keys.EDGE_H0_KEY], 1.2
+    )
+    endpoint_b = _scaled_endpoint(
+        codec, data, data[_keys.NODE_H0_KEY], data[_keys.EDGE_H0_KEY], 1.8
+    )
+    node_a, edge_a = codec.blocks_to_rme(data, endpoint_a)
+    node_b, edge_b = codec.blocks_to_rme(data, endpoint_b)
+    ref_a = _ref_for(flow, data, codec, h0, endpoint_a, node_a, edge_a)
+    ref_b = _ref_for(flow, data, codec, h0, endpoint_b, node_b, edge_b)
+    zero_t = torch.zeros(1, dtype=torch.float64)
+
+    batch_a, _, ctx_a = flow.prepare_batch(
+        _fresh(data), ref_a, t=zero_t, prior_seed=20260719
+    )
+    batch_b, _, _ = flow.prepare_batch(
+        _fresh(data), ref_b, t=zero_t, prior_seed=20260719
+    )
+    torch.testing.assert_close(batch_a[_keys.NODE_H0_KEY], batch_b[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(batch_a[_keys.EDGE_H0_KEY], batch_b[_keys.EDGE_H0_KEY])
+    assert ctx_a.node_prior is not None and torch.count_nonzero(ctx_a.node_prior) > 0
+    assert ctx_a.edge_prior is not None and torch.count_nonzero(ctx_a.edge_prior) > 0
+
+    model = EndpointSequence([endpoint_a])
+    flow.sample(model, _fresh(data), num_steps=1, prior_seed=20260719)
+    torch.testing.assert_close(model.inputs[0][0], batch_a[_keys.NODE_H0_KEY])
+    torch.testing.assert_close(model.inputs[0][1], batch_a[_keys.EDGE_H0_KEY])
+
+    changed = EndpointSequence([endpoint_a])
+    flow.sample(changed, _fresh(data), num_steps=1, prior_seed=20260720)
+    assert not torch.equal(changed.inputs[0][0], model.inputs[0][0])
+    assert not torch.equal(changed.inputs[0][1], model.inputs[0][1])
+
+
+def test_projected_te_seed_pairs_n1_n3_without_advancing_global_rng(monkeypatch):
+    idp, data, _, h0 = _case()
+    flow = _flow(
+        idp,
+        prior="projected_te",
+        te_prior_mode="irrep",
+        node_sigma=0.25,
+        edge_sigma=0.25,
+    )
+    original = flow._block_initial_state
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(flow, "_block_initial_state", counted)
+    model_n1 = EndpointSequence([h0])
+    model_n3 = EndpointSequence([h0, h0, h0])
+    torch.manual_seed(91)
+    expected_after = torch.randn(4)
+    torch.manual_seed(91)
+    flow.sample(model_n1, _fresh(data), num_steps=1, prior_seed=20260719)
+    flow.sample(model_n3, _fresh(data), num_steps=3, prior_seed=20260719)
+    actual_after = torch.randn(4)
+    assert calls == 2
+    assert torch.equal(actual_after, expected_after)
+    assert torch.equal(model_n1.inputs[0][0], model_n3.inputs[0][0])
+    assert torch.equal(model_n1.inputs[0][1], model_n3.inputs[0][1])
+
+    initial_rme = model_n1.inputs[0]
+    initial_blocks = flow.block_codec.rme_to_blocks(
+        data, initial_rme[0], initial_rme[1], project=True
+    )
+    _assert_state_invariants(data, initial_blocks)
+    round_node, round_edge = flow.block_codec.blocks_to_rme(data, initial_blocks)
+    torch.testing.assert_close(round_node, initial_rme[0], rtol=0.0, atol=ATOL)
+    torch.testing.assert_close(round_edge, initial_rme[1], rtol=0.0, atol=ATOL)
 
 
 def test_prepare_is_block_authoritative_over_legacy_product_sidechannels():

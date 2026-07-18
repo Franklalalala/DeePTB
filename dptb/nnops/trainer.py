@@ -692,6 +692,11 @@ class Trainer(BaseTrainer):
                 batch_for_loss = batch.copy()
                 if self.flow_cfm.enabled:
                     original_batch = batch.copy()
+                    validation_prior_seed = (
+                        self.flow_cfm.te_prior_validation_seed + num_batches
+                        if getattr(self.flow_cfm, "prior", "zero") == "projected_te"
+                        else None
+                    )
                     log_random_t = getattr(self.flow_cfm, "log_validation_random_t_loss", True)
                     log_t0 = getattr(self.flow_cfm, "log_validation_t0_loss", True)
                     log_flow_euler = getattr(
@@ -733,8 +738,11 @@ class Trainer(BaseTrainer):
                         # and score the blockwise criterion so pMF's legacy
                         # validation_* keys stay comparable with no-CFM/CFM.
                         for num_steps in self.flow_cfm.validation_ode_steps:
+                            sample_kwargs = {"num_steps": num_steps}
+                            if validation_prior_seed is not None:
+                                sample_kwargs["prior_seed"] = validation_prior_seed
                             sampled = self.flow_cfm.sample(
-                                self.model, original_batch, num_steps=num_steps
+                                self.model, original_batch, **sample_kwargs
                             )
                             sampled.update(batch_info)
                             legacy_prefix = "validation" if int(num_steps) == 1 else None
@@ -751,8 +759,13 @@ class Trainer(BaseTrainer):
                         num_batches += 1
                         continue
                     if log_random_t:
+                        prepare_kwargs = {}
+                        if validation_prior_seed is not None:
+                            prepare_kwargs["prior_seed"] = validation_prior_seed
                         flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
-                            original_batch, batch_for_loss
+                            original_batch,
+                            batch_for_loss,
+                            **prepare_kwargs,
                         )
                         flow_pred = self.model(flow_batch)
                         random_t_loss, _ = self.flow_cfm.loss(flow_pred, flow_ref, flow_ctx)
@@ -767,8 +780,13 @@ class Trainer(BaseTrainer):
                     t0_ref = None
                     t0_ctx = None
                     if log_t0 or log_flow_euler:
+                        prepare_kwargs = {"t": zero_t}
+                        if validation_prior_seed is not None:
+                            prepare_kwargs["prior_seed"] = validation_prior_seed
                         t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
-                            original_batch, batch_for_loss, t=zero_t
+                            original_batch,
+                            batch_for_loss,
+                            **prepare_kwargs,
                         )
                         if log_t0:
                             t0_pred = self.model(t0_batch)
@@ -780,15 +798,23 @@ class Trainer(BaseTrainer):
                                 + t0_loss.detach()
                             )
                     for num_steps in self.flow_cfm.validation_ode_steps:
+                        sample_kwargs = {"num_steps": num_steps}
+                        if validation_prior_seed is not None:
+                            sample_kwargs["prior_seed"] = validation_prior_seed
                         sampled = self.flow_cfm.sample(
-                            self.model, original_batch, num_steps=num_steps
+                            self.model, original_batch, **sample_kwargs
                         )
                         sampled.update(batch_info)
                         sample_state = None
                         if log_flow_euler:
                             if t0_ref is None or t0_ctx is None:
+                                prepare_kwargs = {"t": zero_t}
+                                if validation_prior_seed is not None:
+                                    prepare_kwargs["prior_seed"] = validation_prior_seed
                                 _t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
-                                    original_batch, batch_for_loss, t=zero_t
+                                    original_batch,
+                                    batch_for_loss,
+                                    **prepare_kwargs,
                                 )
                                 t0_ref.update(batch_info)
                             sample_loss, sample_state = self.flow_cfm.loss_on_sample(

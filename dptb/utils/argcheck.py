@@ -211,6 +211,7 @@ def flow_options():
         Argument("te_prior_sigma", (int, float), optional=True, default=1.0),
         Argument("te_prior_mode", str, optional=True, default="irrep"),
         Argument("te_prior_per_graph", bool, optional=True, default=True),
+        Argument("te_prior_validation_seed", int, optional=True, default=None),
         Argument("prior_node_key", str, optional=True, default=""),
         Argument("prior_edge_key", str, optional=True, default=""),
         Argument("prior_key_prefixes", list, optional=True, default=[]),
@@ -371,10 +372,41 @@ def validate_block_ode_contract(data):
         )
     if str(flow.get("mode", "")).lower() != "residual":
         raise ValueError("block_ode v1 requires flow_options.mode='residual'")
-    if str(flow.get("prior", "")).lower().replace("-", "_") != "zero":
+    prior = str(flow.get("prior", "")).lower().replace("-", "_")
+    if prior not in {"zero", "projected_te"}:
         raise ValueError(
-            "block_ode v1 requires prior='zero'; TE/Gaussian scale is not persisted"
+            "block_ode supports only prior='zero' or explicit prior='projected_te'"
         )
+    if prior == "projected_te":
+        mode = str(flow.get("te_prior_mode", "irrep")).lower().replace("-", "_")
+        if mode != "irrep":
+            raise ValueError(
+                "projected_te block_ode requires te_prior_mode='irrep'; typewise "
+                "mode reads target residual scales"
+            )
+        scales = {
+            "node_sigma": float(flow.get("node_sigma", 1.0)),
+            "edge_sigma": float(flow.get("edge_sigma", 1.0)),
+            "te_prior_sigma": float(flow.get("te_prior_sigma", 1.0)),
+        }
+        invalid = [
+            name for name, value in scales.items() if not math.isfinite(value) or value <= 0.0
+        ]
+        if invalid:
+            raise ValueError(
+                "projected_te block_ode requires finite positive scales; "
+                f"invalid options={invalid}"
+            )
+        validation_seed = flow.get("te_prior_validation_seed", None)
+        if (
+            isinstance(validation_seed, bool)
+            or not isinstance(validation_seed, int)
+            or validation_seed < 0
+        ):
+            raise ValueError(
+                "projected_te block_ode requires an explicit non-negative integer "
+                "te_prior_validation_seed"
+            )
     semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
     if semantics not in {"absolute_full_h", "residual_dh"}:
         raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
