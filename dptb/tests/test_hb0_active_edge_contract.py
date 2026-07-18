@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 from e3nn import o3
 
@@ -100,19 +101,21 @@ def _minimal_hb0_h0_model(idp: OrbitalMapper) -> LemMoEV3H0:
     model.flow_time_conditioner = None
     model.layers = torch.nn.ModuleList()
     model.use_block_native_output = True
+    model.require_full_block_edge_coverage = False
     model.out_edge = SimpleNamespace(max_norb=1)
     model._apply_block_native_output_heads = MethodType(_fake_block_heads, model)
     return model
 
 
-def test_hb0_reports_exact_active_edge_rows_without_changing_block_scatter():
+def _minimal_hb0_case():
     idp = OrbitalMapper({"H": ["1s"]}, method="e3tb", device="cpu")
     idp.get_orbital_maps()
     idp.get_irreps(no_parity=False)
-    model = _minimal_hb0_h0_model(idp)
+    return idp, _minimal_hb0_h0_model(idp)
 
-    active_edges = torch.tensor([0, 1], dtype=torch.long)
-    data = {
+
+def _active_edge_data(idp, active_edges, cutoff_coeffs):
+    return {
         _keys.POSITIONS_KEY: torch.tensor(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32
         ),
@@ -123,16 +126,44 @@ def test_hb0_reports_exact_active_edge_rows_without_changing_block_scatter():
         _keys.PBC_KEY: torch.tensor([True, False, False]),
         _keys.BATCH_KEY: torch.zeros(2, dtype=torch.long),
         _keys.EDGE_CELL_SHIFT_KEY: torch.tensor(
-            [[0, 0, 0], [0, 0, 0], [1, 0, 0], [-1, 0, 0]],
-            dtype=torch.long,
+            [[0, 0, 0], [0, 0, 0], [1, 0, 0], [-1, 0, 0]], dtype=torch.long
         ),
         _keys.ATOM_TYPE_KEY: torch.zeros((2, 1), dtype=torch.long),
         _keys.EDGE_TYPE_KEY: torch.zeros(4, dtype=torch.long),
         _keys.NODE_H0_KEY: torch.zeros((2, idp.reduced_matrix_element)),
         _keys.EDGE_H0_KEY: torch.zeros((4, idp.reduced_matrix_element)),
         _keys.LEM_ACTIVE_EDGES_KEY: active_edges,
-        _keys.LEM_CUTOFF_COEFFS_KEY: torch.ones(4),
+        _keys.LEM_CUTOFF_COEFFS_KEY: cutoff_coeffs,
     }
+
+
+def _two_graph_data(idp, *, split_sizes=None):
+    data = _active_edge_data(idp, torch.arange(4), torch.ones(4))
+    data.update(
+        {
+            _keys.POSITIONS_KEY: torch.zeros((4, 3)),
+            _keys.EDGE_INDEX_KEY: torch.tensor(
+                [[0, 1, 2, 3], [1, 0, 3, 2]], dtype=torch.long
+            ),
+            _keys.CELL_KEY: torch.eye(3).repeat(2, 1, 1),
+            _keys.PBC_KEY: torch.zeros((2, 3), dtype=torch.bool),
+            _keys.EDGE_CELL_SHIFT_KEY: torch.zeros((4, 3), dtype=torch.long),
+            _keys.BATCH_KEY: torch.tensor([0, 0, 1, 1]),
+            _keys.ATOM_TYPE_KEY: torch.zeros((4, 1), dtype=torch.long),
+            _keys.NODE_H0_KEY: torch.zeros((4, idp.reduced_matrix_element)),
+        }
+    )
+    if split_sizes is not None:
+        data[_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY] = torch.as_tensor(split_sizes)
+    return data
+
+
+def test_legacy_hb0_subset_scatter_is_unchanged_when_full_coverage_is_not_required():
+    idp, model = _minimal_hb0_case()
+
+    active_edges = torch.tensor([0, 1], dtype=torch.long)
+    data = _active_edge_data(idp, active_edges, torch.ones(4))
+    data[_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY] = torch.tensor([2])
 
     # Two distinct periodic images, each represented by a complete reverse
     # pair.  This graph is valid under the strict keying used by the codec.
@@ -154,19 +185,66 @@ def test_hb0_reports_exact_active_edge_rows_without_changing_block_scatter():
         atol=0.0,
     )
 
-    reported = output[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY]
-    assert reported.ndim == 1
-    assert reported.dtype == torch.long
-    assert not reported.requires_grad
-    assert torch.equal(reported, torch.tensor([0, 1]))
-
-    # The output coverage is an owned snapshot, not an alias of reusable input
-    # metadata; the latter still follows the existing cleanup contract.
-    active_edges.add_(10)
-    assert torch.equal(reported, torch.tensor([0, 1]))
+    # Reusable input-side acceleration metadata still follows its historical
+    # cleanup contract; no output-side coverage assertion is needed.
     assert _keys.LEM_ACTIVE_EDGES_KEY not in output
     assert _keys.LEM_CUTOFF_COEFFS_KEY not in output
     assert _keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY not in output
+
+
+def test_block_ode_coverage_guard_accepts_only_the_actual_ordered_full_head_rows():
+    idp, model = _minimal_hb0_case()
+    model.require_full_block_edge_coverage = True
+
+    assert model.supports_full_block_edge_coverage is True
+    output = model(_active_edge_data(idp, torch.arange(4), torch.ones(4)))
+    torch.testing.assert_close(
+        output[_keys.EDGE_HAMILTONIAN_KEY],
+        torch.tensor([[[21.0]], [[22.0]], [[23.0]], [[24.0]]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("active_edges", "cutoff_coeffs", "match"),
+    (
+        (torch.tensor([0, 1]), torch.ones(4), "ordered full H-B0"),
+        (torch.tensor([1, 0, 2, 3]), torch.ones(4), "ordered full H-B0"),
+        (torch.tensor([0.9, 1.2, 2.0, 3.0]), torch.ones(4), "integral active-edge"),
+        (torch.arange(4), torch.tensor([1.0, 0.0, 1.0, 1.0]), "strictly positive"),
+        (torch.arange(4), torch.tensor([1.0, float("nan"), 1.0, 1.0]), "strictly positive"),
+        (torch.arange(4), torch.ones(3), "one finite"),
+    ),
+)
+def test_block_ode_coverage_guard_rejects_uncomputed_or_ambiguous_head_rows(
+    active_edges, cutoff_coeffs, match
+):
+    idp, model = _minimal_hb0_case()
+    model.require_full_block_edge_coverage = True
+
+    with pytest.raises(ValueError, match=match):
+        model(_active_edge_data(idp, active_edges, cutoff_coeffs))
+
+
+def test_block_ode_coverage_guard_rejects_stale_graph_split_sizes():
+    idp, model = _minimal_hb0_case()
+    model.require_full_block_edge_coverage = True
+    data = _two_graph_data(idp, split_sizes=[1, 3])
+
+    with pytest.raises(ValueError, match="split sizes must exactly match"):
+        model(data)
+
+
+def test_block_ode_rechecks_cross_graph_edges_after_a_valid_forward():
+    idp, model = _minimal_hb0_case()
+    model.require_full_block_edge_coverage = True
+    model(_two_graph_data(idp, split_sizes=[2, 2]))
+
+    malformed = _two_graph_data(idp, split_sizes=[2, 2])
+    malformed[_keys.EDGE_INDEX_KEY][1, 1] = 2
+    with pytest.raises(ValueError, match="stay within one batch graph"):
+        model(malformed)
 
 
 def test_update_node_keeps_rows_for_nodes_without_active_incident_edges():

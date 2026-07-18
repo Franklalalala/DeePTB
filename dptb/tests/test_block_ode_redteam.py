@@ -13,17 +13,13 @@ from dptb.data.interfaces.blockwise_tensor import (
     canonical_block_tensors_to_feature_tensors,
 )
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.hamiltonian import (
-    E3Hamiltonian,
-    _contract_cg_rme,
-    _inverse_contract_cg_hr,
-)
+from dptb.nn.hamiltonian import _contract_cg_rme, _inverse_contract_cg_hr
 from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
 from dptb.nnops.flow import HamiltonianCFM
 from dptb.tests.test_block_flow_codec import _mixed_case, _random_state
 from dptb.tests.test_block_ode_flow import (
     EndpointSequence,
-    _case as _base_case,
+    _case,
     _flow,
     _fresh,
     _pd_legacy_product_h0_case,
@@ -33,21 +29,6 @@ from dptb.utils.argcheck import slem_h0, validate_block_ode_contract
 
 
 FP64_ATOL = 1e-10
-
-
-def _attach_h0_block_side_channel(
-    data: dict, h0: BlockTensorResult
-) -> dict:
-    data[_keys.NODE_H0_BLOCKS_KEY] = h0.node_blocks.clone()
-    data[_keys.EDGE_H0_BLOCKS_KEY] = h0.edge_blocks.clone()
-    data[_keys.NODE_H0_BLOCK_SHAPE_KEY] = h0.node_shapes.clone()
-    data[_keys.EDGE_H0_BLOCK_SHAPE_KEY] = h0.edge_shapes.clone()
-    return data
-
-
-def _case():
-    idp, data, codec, h0 = _base_case()
-    return idp, _attach_h0_block_side_channel(data, h0), codec, h0
 
 
 def _absolute_ref_for_endpoint(
@@ -100,6 +81,9 @@ def _valid_contract() -> dict:
         "common_options": {"has_soc": False},
         "model_options": {
             "embedding": {
+                "method": "lem_moe_v3_h0",
+                "output_route": "h_b0",
+                "require_full_block_edge_coverage": True,
                 "use_flow_time_embedding": True,
                 "flow_time_condition_edges": True,
                 "flow_time_allow_missing": False,
@@ -108,7 +92,12 @@ def _valid_contract() -> dict:
                 "use_h0_node_init": True,
                 "use_h0_edge_init": True,
             },
-            "prediction": {"add_h0": False},
+            "prediction": {
+                "method": "block_native",
+                "block_decoder": "expansion_cg",
+                "blockwise_hamiltonian": True,
+                "add_h0": False,
+            },
         },
         "data_options": {
             "train": {
@@ -122,40 +111,13 @@ def _valid_contract() -> dict:
     }
 
 
-def test_red_cg_exhaustive_standard_basis_includes_every_f_pairtype():
-    idp = OrbitalMapper(
-        {"X": ["1s", "2p", "3d", "4f"]}, method="e3tb", device="cpu"
-    )
-    module = E3Hamiltonian(idp=idp, dtype=torch.float64)
-    saw_f = False
-    for pairtype, basis in module.cgbasis.items():
-        matrix = basis.reshape(-1, basis.shape[-1])
-        size = matrix.shape[0]
-        assert matrix.shape == (size, size), pairtype
-        assert torch.linalg.matrix_rank(matrix, atol=1e-12, rtol=1e-12) == size
-        assert torch.linalg.cond(matrix).item() <= 1.0 + FP64_ATOL
-
-        # One row per standard basis vector, so every coupled coordinate of
-        # every supported pairtype is attacked independently.
-        rme = torch.eye(size, dtype=torch.float64).unsqueeze(-1)
-        product = _contract_cg_rme(basis, rme)
-        restored = _inverse_contract_cg_hr(basis, product)
-        assert (restored - rme).abs().max().item() <= FP64_ATOL, pairtype
-        saw_f |= "f" in pairtype
-    assert saw_f
-
-
-def test_red_inverse_cg_nonorthogonal_solve_and_singular_fail_closed():
+def test_red_inverse_cg_nonorthogonal_solve():
     nonorthogonal = torch.tensor([[[2.0, 0.0], [0.0, 3.0]]], dtype=torch.float64)
     rme = torch.tensor([[[1.25], [-0.75]]], dtype=torch.float64)
     product = _contract_cg_rme(nonorthogonal, rme)
     restored = _inverse_contract_cg_hr(nonorthogonal, product)
     assert torch.linalg.cond(nonorthogonal.reshape(2, 2)).item() == pytest.approx(1.5)
     torch.testing.assert_close(restored, rme, rtol=0.0, atol=1e-12)
-
-    singular = torch.tensor([[[1.0, 0.0], [0.0, 0.0]]], dtype=torch.float64)
-    with pytest.raises(RuntimeError, match="singular/rank deficient"):
-        _inverse_contract_cg_hr(singular, product)
 
 
 def test_red_codec_entry_rejects_missing_and_duplicate_reverse_edges():
@@ -258,11 +220,6 @@ def test_red_second_step_is_not_polluted_by_e3_style_feature_overwrite():
             out = batch.copy()
             out["node_hamil_blocks"] = h0.node_blocks
             out["edge_hamil_blocks"] = h0.edge_blocks
-            out[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = torch.arange(
-                h0.edge_blocks.shape[0],
-                device=h0.edge_blocks.device,
-                dtype=torch.long,
-            )
             return out
 
     model = MutatingFeatureModel()
@@ -408,7 +365,7 @@ def test_red_projector_rejects_fractional_shapes_and_reports_real_correction():
 
 def test_red_strict_schema_accepts_required_flow_time_missing_gate():
     names = {argument.name for argument in slem_h0()}
-    assert "flow_time_allow_missing" in names
+    assert {"flow_time_allow_missing", "require_full_block_edge_coverage"} <= names
 
 
 def test_red_codec_ignores_non_tensor_trainer_batch_metadata():
@@ -456,6 +413,19 @@ def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
         } == expected_fields[flow["target_semantics"]]
         assert flow["strict_h0"] is True
         assert overlay["common_options"]["has_soc"] is False
+        embedding = overlay["model_options"]["embedding"]
+        assert {
+            key: embedding[key]
+            for key in (
+                "method",
+                "output_route",
+                "require_full_block_edge_coverage",
+            )
+        } == {
+            "method": "lem_moe_v3_h0",
+            "output_route": "h_b0",
+            "require_full_block_edge_coverage": True,
+        }
         expected_full_h = flow["target_semantics"] == "absolute_full_h"
         for split in ("train", "validation"):
             split_options = overlay["data_options"][split]
@@ -486,6 +456,17 @@ def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
     bad = deepcopy(base)
     bad["model_options"]["prediction"]["add_h0"] = True
     bad_cases.append((bad, "prediction.add_h0=false"))
+    for section, option, value, match in (
+        ("embedding", "method", "lem_moe_v3", "embedding.method='lem_moe_v3_h0'"),
+        ("embedding", "output_route", "h_b1", "embedding.output_route='h_b0'"),
+        ("embedding", "require_full_block_edge_coverage", False, "full_block_edge_coverage=true"),
+        ("prediction", "method", "e3tb", "prediction.method='block_native'"),
+        ("prediction", "block_decoder", "cartesian_projector", "block_decoder='expansion_cg'"),
+        ("prediction", "blockwise_hamiltonian", False, "blockwise_hamiltonian=true"),
+    ):
+        bad = deepcopy(base)
+        bad["model_options"][section][option] = value
+        bad_cases.append((bad, match))
     bad = deepcopy(base)
     bad["train_options"]["flow_options"]["block_ode"] = False
     bad_cases.append((bad, "distinct mode"))

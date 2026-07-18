@@ -46,6 +46,7 @@ from dptb.data.interfaces.h0_lmdb_helper import (
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
     H0_RESIDUAL_SEMANTICS,
@@ -54,6 +55,9 @@ from dptb.data.interfaces.p2_contract import (
     P2_RME_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
     P2_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
+    RAW_PHYSICAL_H0_SOURCE,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     SAMPLE_SCHEMA_KEY,
@@ -65,10 +69,10 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_present_row_aligned_fields,
     fingerprint_text_fields,
     mapper_basis_fingerprint,
+    physical_h0_dataset_fingerprint,
+    physical_h0_record_fingerprint,
 )
 from dptb.data.interfaces.p2_table import P2TableAssembler, P2TableStore
-
-
 RY_TO_EV = 13.605698
 SCHEMA = "deeptb.nonsoc_p2_cache/v1"
 RAW_STAGING_IDENTITY_SCHEMA = "deeptb.nonsoc_p2_raw_staging_identity/v1"
@@ -886,6 +890,7 @@ def _raw_split(
                 record[SAMPLE_SCHEMA_KEY] = P2_SAMPLE_SCHEMA
                 record[TARGET_SEMANTICS_KEY] = ABSOLUTE_FULL_H_SEMANTICS
                 record[TARGET_SOURCE_KEY] = "raw_hamiltonian"
+                record[PHYSICAL_H0_SOURCE_KEY] = RAW_PHYSICAL_H0_SOURCE
                 record[P2_SOURCE_FINGERPRINT_KEY] = p2_source_fingerprint
                 txn.put(key, pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL))
             row = _raw_row(record, index=index)
@@ -1234,6 +1239,45 @@ def _require(data: Any, fields: Iterable[str]) -> None:
         raise KeyError(f"Materialized AtomicData is missing fields {missing}.")
 
 
+def _bind_physical_h0_source_fingerprint(
+    env: lmdb.Environment,
+    entries: int,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+) -> str:
+    """Atomically bind one LMDB split to its ordered physical-H0 content."""
+
+    with env.begin(write=True) as txn:
+        records = []
+        for index in range(entries):
+            key = index.to_bytes(length=4, byteorder="big")
+            payload = txn.get(key)
+            if payload is None:
+                raise KeyError(f"Missing physical-H0 output row {index}.")
+            records.append(pickle.loads(payload))
+        if rows is not None and len(rows) != entries:
+            raise ValueError("Physical-H0 output rows and LMDB entries differ.")
+        if rows is not None:
+            for row, record in zip(rows, records):
+                if row.get("case_id") != record.get("case_id"):
+                    raise ValueError("Physical-H0 output row changed case id.")
+        fingerprint = physical_h0_dataset_fingerprint(
+            [physical_h0_record_fingerprint(record) for record in records]
+        )
+        payloads = []
+        for index, record in enumerate(records):
+            key = index.to_bytes(length=4, byteorder="big")
+            record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY] = fingerprint
+            payload = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+            txn.put(key, payload)
+            payloads.append(payload)
+    if rows is not None:
+        for row, record, payload in zip(rows, records, payloads):
+            row["record_sha256"] = hashlib.sha256(payload).hexdigest()
+            row["record_bytes"] = len(payload)
+    return fingerprint
+
+
 def _base_record(
     raw: dict[str, Any],
     data: Any,
@@ -1253,6 +1297,7 @@ def _base_record(
             "p2_hermitian_projection": raw.get("p2_hermitian_projection", {}),
             "sparse_zero_completion": raw.get("sparse_zero_completion", {}),
             SAMPLE_SCHEMA_KEY: P2_SAMPLE_SCHEMA,
+            PHYSICAL_H0_SOURCE_KEY: DEDICATED_PHYSICAL_H0_SOURCE,
             BASIS_FINGERPRINT_KEY: basis_fingerprint,
             P2_SOURCE_FINGERPRINT_KEY: raw[P2_SOURCE_FINGERPRINT_KEY],
         }
@@ -1306,7 +1351,10 @@ def _materialize_split(
             _require(data, required)
 
             full = _base_record(
-                raw, data, index, basis_fingerprint=basis_fingerprint
+                raw,
+                data,
+                index,
+                basis_fingerprint=basis_fingerprint,
             )
             for field in (
                 AtomicDataDict.NODE_FEATURES_KEY,
@@ -1364,7 +1412,10 @@ def _materialize_split(
             )
 
             delta = _base_record(
-                raw, data, index, basis_fingerprint=basis_fingerprint
+                raw,
+                data,
+                index,
+                basis_fingerprint=basis_fingerprint,
             )
             delta[TARGET_SEMANTICS_KEY] = H0_RESIDUAL_SEMANTICS
             delta[TARGET_SOURCE_KEY] = "dedicated_h0_residual_blocks"
@@ -1436,7 +1487,6 @@ def _materialize_split(
                         ),
                     )
                 )
-
             with full_env.begin(write=True) as txn:
                 txn.put(key, pickle.dumps(full, protocol=pickle.HIGHEST_PROTOCOL))
             with delta_env.begin(write=True) as txn:
@@ -1464,6 +1514,14 @@ def _materialize_split(
                 ),
                 flush=True,
             )
+        physical_h0_source_fingerprint = _bind_physical_h0_source_fingerprint(
+            full_env, len(dataset)
+        )
+        delta_h0_source = _bind_physical_h0_source_fingerprint(
+            delta_env, len(dataset)
+        )
+        if delta_h0_source != physical_h0_source_fingerprint:
+            raise RuntimeError("Full-H and H0-delta views changed physical H0 content.")
     finally:
         raw_env.close()
         full_env.close()
@@ -1479,6 +1537,7 @@ def _materialize_split(
         "entries": len(dataset),
         "feature_widths": sorted(feature_widths),
         "max_h0_delta_identity_error": max_identity_error,
+        "physical_h0_source_fingerprint": physical_h0_source_fingerprint,
     }
 
 

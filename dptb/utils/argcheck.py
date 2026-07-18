@@ -272,13 +272,20 @@ def flow_options():
         Argument("physical_prior_jitter_edge_decay", (int, float), optional=True, default=0.0),
         Argument("prior_jitter_sigma", (int, float), optional=True, default=0.0),
         Argument("loss_type", str, optional=True, default="mse"),
-        Argument("node_weight", (int, float), optional=True, default=1.0),
-        Argument("edge_weight", (int, float), optional=True, default=1.0),
+        Argument("node_weight", (int, float), optional=True, default=1.0,
+                 doc="Finite non-negative node loss multiplier. CFM global_elements "
+                     "requires 1.0; use equal_components for node/edge multipliers."),
+        Argument("edge_weight", (int, float), optional=True, default=1.0,
+                 doc="Finite non-negative edge loss multiplier. CFM global_elements "
+                     "requires 1.0; use equal_components for node/edge multipliers."),
         Argument("z_loss_coef", (int, float), optional=True, default=0.0),
         Argument("omit_time_scaling", bool, optional=True, default=True),
         Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
         Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
-        Argument("component_reduction", str, optional=True, default="global_elements"),
+        Argument("component_reduction", str, optional=True, default="global_elements",
+                 doc="global_elements performs one true reduction over all valid elements "
+                     "and is unit-weight-only for CFM; equal_components sums independently "
+                     "reduced node/edge losses and applies node_weight/edge_weight."),
         Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
         Argument("apply_to_reference", bool, optional=True, default=False),
         Argument("log_compatible_loss", bool, optional=True, default=True),
@@ -304,6 +311,43 @@ def flow_options():
         sub_variants=[],
         doc=doc,
     )
+
+
+def validate_flow_loss_contract(data):
+    """Fail early on ambiguous or non-finite flow component weighting."""
+    train = dict(data.get("train_options", {}) or {})
+    flow = dict(train.get("flow_options", {}) or {})
+    node_weight = float(flow.get("node_weight", 1.0))
+    edge_weight = float(flow.get("edge_weight", 1.0))
+    for name, value in (("node_weight", node_weight), ("edge_weight", edge_weight)):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"flow_options.{name} must be finite and non-negative, got {value!r}"
+            )
+    if node_weight == 0.0 and edge_weight == 0.0:
+        raise ValueError("flow_options.node_weight and edge_weight may not both be zero")
+
+    objective = str(flow.get("objective", flow.get("type", "cfm"))).lower().replace(
+        "-", "_"
+    )
+    pixel_meanflow = objective in {
+        "pixel_meanflow",
+        "pixel_mean_flow",
+        "pmf",
+        "meanflow",
+        "mean_flow",
+    }
+    reduction = str(flow.get("component_reduction", "global_elements")).lower()
+    if (
+        reduction == "global_elements"
+        and not pixel_meanflow
+        and (node_weight != 1.0 or edge_weight != 1.0)
+    ):
+        raise ValueError(
+            "flow_options.component_reduction='global_elements' requires "
+            "node_weight=edge_weight=1 for CFM; use equal_components for "
+            "node/edge loss multipliers"
+        )
 
 
 def validate_block_ode_contract(data):
@@ -422,6 +466,20 @@ def validate_block_ode_contract(data):
     model = dict(data.get("model_options", {}) or {})
     prediction = dict(model.get("prediction", {}) or {})
     embedding = dict(model.get("embedding", {}) or {})
+    if str(embedding.get("method", "")).lower() != "lem_moe_v3_h0":
+        raise ValueError("block_ode requires embedding.method='lem_moe_v3_h0'")
+    if str(embedding.get("output_route", "")).lower() != "h_b0":
+        raise ValueError("block_ode requires embedding.output_route='h_b0'")
+    if not bool(embedding.get("require_full_block_edge_coverage", False)):
+        raise ValueError(
+            "block_ode requires embedding.require_full_block_edge_coverage=true"
+        )
+    if str(prediction.get("method", "")).lower() != "block_native":
+        raise ValueError("block_ode requires prediction.method='block_native'")
+    if str(prediction.get("block_decoder", "")).lower() != "expansion_cg":
+        raise ValueError("block_ode requires prediction.block_decoder='expansion_cg'")
+    if not bool(prediction.get("blockwise_hamiltonian", False)):
+        raise ValueError("block_ode requires prediction.blockwise_hamiltonian=true")
     if bool(prediction.get("add_h0", False)):
         raise ValueError(
             "block_ode requires model_options.prediction.add_h0=false to prevent double add"
@@ -1343,6 +1401,7 @@ def train_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1384,6 +1443,7 @@ def validation_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1425,6 +1485,7 @@ def reference_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1465,6 +1526,7 @@ def test_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1858,6 +1920,7 @@ def slem_h0():
     doc_flow_time_max_positions = "Scale used by the sinusoidal flow-time embedding. Default: `2000`."
     doc_flow_time_allow_missing = "Whether missing flow time may fall back to flow_time_missing_value. Default: `True`; block-ODE requires `False`."
     doc_flow_time_missing_value = "Fallback normalized time when flow_time is absent. Default: `0.0`."
+    doc_require_full_block_edge_coverage = "Fail before the H-B0 head unless its actual active rows are the ordered full graph-edge range with finite positive cutoff coefficients. Default: `False`; block-ODE requires `True`."
 
     return slem() + [
         Argument("use_h0_init", bool, optional=True, default=True, doc=doc_use_h0_init),
@@ -1884,6 +1947,8 @@ def slem_h0():
         Argument("flow_time_max_positions", int, optional=True, default=2000, doc=doc_flow_time_max_positions),
         Argument("flow_time_allow_missing", bool, optional=True, default=True, doc=doc_flow_time_allow_missing),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
+        Argument("require_full_block_edge_coverage", bool, optional=True, default=False,
+                 doc=doc_require_full_block_edge_coverage),
     ]
 
 
@@ -2441,6 +2506,14 @@ def _validate_p2_prior_full_h_contract(data):
     for split, split_options in configured_splits.items():
         if not bool(split_options.get("require_full_h_target", False)):
             continue
+        expected_h0_source = str(
+            split_options.get("expected_physical_h0_source_fingerprint", "")
+        ).strip()
+        if expected_h0_source and not _is_sha256_hex(expected_h0_source):
+            raise ValueError(
+                f"data_options.{split}.expected_physical_h0_source_fingerprint "
+                "must be a 64-character SHA256 hex digest."
+            )
         split_loss = loss_options_value.get(split)
         if isinstance(split_loss, dict):
             _require_absolute_target_keys(split, split_loss)
@@ -3403,6 +3476,7 @@ def normalize(data):
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
     _validate_p2_prior_full_h_contract(data)
+    validate_flow_loss_contract(data)
     validate_block_ode_contract(data)
 
     # add check loss and use wannier:

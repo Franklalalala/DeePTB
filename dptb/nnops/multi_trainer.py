@@ -3600,7 +3600,9 @@ class MultiTrainer(Trainer):
                 expert=expert_idx,
                 extra=f"steps={int(num_steps)}",
             ):
-                loss, flow_state = self.flow_cfm.loss(sampled, flow_ref, flow_ctx)
+                loss, flow_state = self.flow_cfm.loss_on_sample(
+                    sampled, flow_ref, flow_ctx
+                )
             metrics = self._payload_metrics_from_flow_state(
                 flow_state,
                 prefix="train",

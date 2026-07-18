@@ -302,6 +302,9 @@ class DatasetBuilder:
                 expected_p2_source_fingerprint=kwargs.get(
                     "expected_p2_source_fingerprint", ""
                 ),
+                expected_physical_h0_source_fingerprint=kwargs.get(
+                    "expected_physical_h0_source_fingerprint", ""
+                ),
                 audit_p2_representations=kwargs.get(
                     "audit_p2_representations", False
                 ),

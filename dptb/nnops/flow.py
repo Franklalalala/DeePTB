@@ -65,6 +65,12 @@ class HamiltonianCFM:
     i.e. optionally weighted endpoint error ``||H_pred - H_ref||^2/(1-t)^2``.
     """
 
+    # Pixel MeanFlow owns a separate component-wise objective and explicitly
+    # opts out below.  CFM's true global element reduction has no unambiguous
+    # component-multiplier interpretation, especially for l1_rmse, so keep it
+    # unit-weight-only and route weighted components through equal_components.
+    allow_nonunit_global_element_weights = False
+
     def __init__(
         self,
         options: Optional[Dict[str, Any]],
@@ -476,6 +482,28 @@ class HamiltonianCFM:
         if self.component_reduction not in {"global_elements", "equal_components"}:
             raise ValueError(
                 "flow_options.component_reduction must be 'global_elements' or 'equal_components'."
+            )
+        for name, value in (
+            ("node_weight", self.node_weight),
+            ("edge_weight", self.edge_weight),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"flow_options.{name} must be finite and non-negative, got {value!r}."
+                )
+        if self.node_weight == 0.0 and self.edge_weight == 0.0:
+            raise ValueError(
+                "flow_options.node_weight and edge_weight may not both be zero."
+            )
+        if (
+            self.component_reduction == "global_elements"
+            and not self.allow_nonunit_global_element_weights
+            and (self.node_weight != 1.0 or self.edge_weight != 1.0)
+        ):
+            raise ValueError(
+                "flow_options.component_reduction='global_elements' requires "
+                "node_weight=edge_weight=1. Use component_reduction="
+                "'equal_components' for node/edge loss multipliers."
             )
 
         self.last_state: Dict[str, torch.Tensor] = {}
@@ -1661,6 +1689,20 @@ class HamiltonianCFM:
             if key in data
         }
 
+    def _drop_block_authority_fields(self, data: AtomicDataDict.Type) -> None:
+        """Keep certified endpoint/H0 block side channels outside model I/O."""
+        for key in (
+            self.node_block_target_key,
+            self.edge_block_target_key,
+            self.node_block_shape_key,
+            self.edge_block_shape_key,
+            self.node_h0_block_key,
+            self.edge_h0_block_key,
+            self.node_h0_block_shape_key,
+            self.edge_h0_block_shape_key,
+        ):
+            data.pop(key, None)
+
     @classmethod
     def _require_matching_block_topology(
         cls,
@@ -1920,6 +1962,11 @@ class HamiltonianCFM:
             ref_data["_block_ode_h0_projection_residual"] = torch.as_tensor(
                 h0_projection_residual, device=device, dtype=dtype
             )
+            # Endpoint/H0 block side channels are flow authority, not model
+            # inputs.  Removing them also breaks the shallow aliases created by
+            # Trainer's input/reference copies, so an in-place model cannot
+            # rewrite the labels used below by ``loss``.
+            self._drop_block_authority_fields(data)
             return data, ref_data, CFMContext(
                 t=t,
                 node_t=node_t,
@@ -2062,66 +2109,6 @@ class HamiltonianCFM:
             cols[None, None, :] < shapes[:, 1, None, None]
         )
 
-    @staticmethod
-    def _require_all_block_edges_active(
-        pred_data: AtomicDataDict.Type,
-        n_edges: int,
-    ) -> torch.Tensor:
-        """Fail closed when H-B0 did not evaluate every graph edge.
-
-        The block-native head writes zeros outside the LEM active set.  Such
-        zeros are not physical endpoints and would erase hoppings at the final
-        endpoint blend, so block-ODE v1 requires full graph-edge coverage.
-        """
-        active_key = getattr(
-            _keys, "BLOCK_PRED_ACTIVE_EDGES_KEY", "_block_pred_active_edges"
-        )
-        raw = pred_data.get(active_key, None)
-        if raw is None:
-            raise KeyError(
-                "Block-space ODE requires the H-B0 actual active-edge "
-                f"side-channel `{active_key}` on every model output."
-            )
-        value = torch.as_tensor(raw)
-        if value.ndim != 1:
-            raise ValueError(
-                f"{active_key} must be a 1-D edge-index tensor, got {tuple(value.shape)}."
-            )
-        if value.dtype == torch.bool or value.is_complex():
-            raise TypeError(
-                f"{active_key} must contain real integer edge indices, not "
-                f"{value.dtype}."
-            )
-        if value.is_floating_point():
-            if not bool(torch.isfinite(value).all().item()):
-                raise ValueError(f"{active_key} contains NaN or Inf.")
-            rounded = value.round()
-            if value.numel() and bool(((value - rounded).abs().max() > 0).item()):
-                raise ValueError(f"{active_key} must contain exact integers.")
-            value = rounded
-        active = value.to(dtype=torch.long).flatten()
-        if active.numel() and bool(((active < 0) | (active >= int(n_edges))).any().item()):
-            raise ValueError(
-                f"{active_key} contains indices outside [0, {int(n_edges)})."
-            )
-        if torch.unique(active).numel() != active.numel():
-            raise ValueError(f"{active_key} contains duplicate edge indices.")
-        expected = torch.arange(int(n_edges), dtype=torch.long, device=active.device)
-        if active.numel() != expected.numel() or not torch.equal(
-            torch.sort(active).values, expected
-        ):
-            covered = torch.zeros(int(n_edges), dtype=torch.bool, device=active.device)
-            if active.numel():
-                covered[active] = True
-            inactive = torch.nonzero(~covered, as_tuple=False).flatten()
-            raise ValueError(
-                "Block-space ODE v1 requires H-B0 coverage of every graph edge; "
-                "inactive edges have no endpoint and would otherwise be silently "
-                f"zeroed. inactive indices={inactive[:16].detach().cpu().tolist()} "
-                f"(total={int(inactive.numel())})."
-            )
-        return active
-
     def _block_endpoint_loss(
         self,
         pred_data: AtomicDataDict.Type,
@@ -2139,7 +2126,7 @@ class HamiltonianCFM:
             "train_flow_t": ctx.t.detach().mean(),
             "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
         }
-        total = total_primary = total_square = total_count = None
+        component_stats = []
 
         for label, pred_key, target_key, shape_key, weight, item_t in (
             (
@@ -2172,56 +2159,30 @@ class HamiltonianCFM:
             mask = self._active_block_mask(pred, ref_data.get(shape_key, None))
             diff = pred - target
             item_weights = None if item_t is None else self._time_weight(item_t)
-            component, primary_sum, square_sum, count = self._metric_stats(
+            stats = self._metric_stats(
                 diff, mask, self.loss_type, item_weights
             )
-            weighted_component = weight * component
-            weighted_primary = weight * primary_sum
-            weighted_square = weight * square_sum
-            weighted_count = weight * count
-            total = weighted_component if total is None else total + weighted_component
-            total_primary = (
-                weighted_primary
-                if total_primary is None
-                else total_primary + weighted_primary
-            )
-            total_square = (
-                weighted_square
-                if total_square is None
-                else total_square + weighted_square
-            )
-            total_count = weighted_count if total_count is None else total_count + weighted_count
+            component = stats[0]
+            component_stats.append((stats, weight))
             state[f"train_flow_{label}_loss"] = component.detach()
             state[f"train_{label}_loss"] = component.detach()
 
-        if total is None:
+        if not component_stats:
             raise KeyError(
                 "AO-block CFM could not compute a loss because outputs/targets do "
                 f"not contain {self.node_output_key}/{self.edge_output_key} and "
                 f"{self.node_block_target_key}/{self.edge_block_target_key}."
             )
-        if self.component_reduction == "global_elements":
-            total = self._global_metric(
-                total_primary, total_square, total_count, self.loss_type
-            )
-
-        mean_max_prob = pred_data.get("mean_max_prob", None)
-        if torch.is_tensor(mean_max_prob):
-            state["mean_max_prob"] = mean_max_prob.detach()
-            if self.router_z_loss_coef > 0.0:
-                total = total + self.router_z_loss_coef * mean_max_prob
-        expert_load_cv = pred_data.get("expert_load_cv", None)
-        if torch.is_tensor(expert_load_cv):
-            state["expert_load_cv"] = expert_load_cv.detach()
-        state["train_flow_loss"] = total.detach()
-        self.last_state = state
-        return total, state
+        total = self._reduce_component_stats(tuple(component_stats))
+        return self._finalize_loss(total, state, pred_data)
 
     def _block_ode_endpoint_loss(
         self,
         pred_data: AtomicDataDict.Type,
         ref_data: AtomicDataDict.Type,
         ctx: CFMContext,
+        *,
+        prediction_is_full_h: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Fail-closed endpoint loss on independent physical block freedoms."""
         if ctx.block_target_semantics != self.target_semantics:
@@ -2245,7 +2206,6 @@ class HamiltonianCFM:
 
         node_pred = pred_data[self.node_output_key]
         edge_pred = pred_data[self.edge_output_key]
-        self._require_all_block_edges_active(pred_data, int(edge_pred.shape[0]))
         node_target = torch.as_tensor(
             ref_data[self.node_block_target_key], device=node_pred.device, dtype=node_pred.dtype
         )
@@ -2277,10 +2237,7 @@ class HamiltonianCFM:
                 f"max residual={target_residual:.6g}, atol={self.block_inverse_atol}."
             )
 
-        sample_is_full = bool(
-            torch.as_tensor(pred_data.get("_block_ode_sample_is_full", False)).item()
-        )
-        if sample_is_full and self.target_semantics == "residual_dh":
+        if prediction_is_full_h and self.target_semantics == "residual_dh":
             if ctx.node_base is None or ctx.edge_base is None:
                 raise ValueError("Residual block sample scoring requires both H0 RME components.")
             h0 = self.block_codec.rme_to_blocks(
@@ -2314,21 +2271,17 @@ class HamiltonianCFM:
         if bool(self_reverse.any().item()):
             edge_mask[self_reverse] &= upper.unsqueeze(0)
 
-        node_component, node_primary, node_square, node_count = self._metric_stats(
+        node_stats = self._metric_stats(
             node_diff, node_mask, self.loss_type, self._time_weight(ctx.node_t)
         )
-        edge_component, edge_primary, edge_square, edge_count = self._metric_stats(
+        edge_stats = self._metric_stats(
             edge_diff, edge_mask, self.loss_type, self._time_weight(ctx.edge_t)
         )
-        if self.component_reduction == "global_elements":
-            total = self._global_metric(
-                self.node_weight * node_primary + self.edge_weight * edge_primary,
-                self.node_weight * node_square + self.edge_weight * edge_square,
-                self.node_weight * node_count + self.edge_weight * edge_count,
-                self.loss_type,
-            )
-        else:
-            total = self.node_weight * node_component + self.edge_weight * edge_component
+        node_component = node_stats[0]
+        edge_component = edge_stats[0]
+        total = self._reduce_component_stats(
+            ((node_stats, self.node_weight), (edge_stats, self.edge_weight))
+        )
 
         state: Dict[str, torch.Tensor] = {
             "train_flow_t": ctx.t.detach().mean(),
@@ -2345,17 +2298,7 @@ class HamiltonianCFM:
                 **self._compatible_clean_stats(edge_diff, edge_mask, "hopping"),
             },
         }
-        mean_max_prob = pred_data.get("mean_max_prob", None)
-        if torch.is_tensor(mean_max_prob):
-            state["mean_max_prob"] = mean_max_prob.detach()
-            if self.router_z_loss_coef > 0.0:
-                total = total + self.router_z_loss_coef * mean_max_prob
-        expert_load_cv = pred_data.get("expert_load_cv", None)
-        if torch.is_tensor(expert_load_cv):
-            state["expert_load_cv"] = expert_load_cv.detach()
-        state["train_flow_loss"] = total.detach()
-        self.last_state = state
-        return total, state
+        return self._finalize_loss(total, state, pred_data)
 
     @staticmethod
     def _safe_exact_rmse(
@@ -2422,6 +2365,59 @@ class HamiltonianCFM:
             )
         return torch.where(count > 0, metric, primary_sum * 0.0)
 
+    def _reduce_component_stats(
+        self,
+        components: Tuple[
+            Tuple[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                float,
+            ],
+            ...,
+        ],
+    ) -> torch.Tensor:
+        """Apply the configured node/edge reduction to raw metric statistics.
+
+        ``global_elements`` is a single reduction over all valid elements and
+        therefore accepts unit component weights only. ``equal_components``
+        keeps the historical sum of independently reduced component metrics,
+        where node/edge weights are explicit outer loss multipliers. Empty
+        components carry zero statistics and contribute zero in either mode.
+        """
+        if not components:
+            raise ValueError("At least one loss component is required.")
+        if self.component_reduction == "equal_components":
+            total = None
+            for stats, weight in components:
+                weighted = float(weight) * stats[0]
+                total = weighted if total is None else total + weighted
+            return total
+
+        primary_sum = square_sum = count = None
+        for stats, _weight in components:
+            primary_sum = stats[1] if primary_sum is None else primary_sum + stats[1]
+            square_sum = stats[2] if square_sum is None else square_sum + stats[2]
+            count = stats[3] if count is None else count + stats[3]
+        return self._global_metric(primary_sum, square_sum, count, self.loss_type)
+
+    def _finalize_loss(
+        self,
+        total: torch.Tensor,
+        state: Dict[str, torch.Tensor],
+        pred_data: AtomicDataDict.Type,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Attach shared router diagnostics and publish the final train loss."""
+        mean_max_prob = pred_data.get("mean_max_prob", None)
+        if torch.is_tensor(mean_max_prob):
+            state["mean_max_prob"] = mean_max_prob.detach()
+            if self.router_z_loss_coef > 0.0:
+                total = total + self.router_z_loss_coef * mean_max_prob
+        expert_load_cv = pred_data.get("expert_load_cv", None)
+        if torch.is_tensor(expert_load_cv):
+            state["expert_load_cv"] = expert_load_cv.detach()
+        state["train_flow_loss"] = total.detach()
+        self.last_state = state
+        return total, state
+
     @staticmethod
     def _compatible_clean_stats(
         diff: torch.Tensor,
@@ -2465,16 +2461,12 @@ class HamiltonianCFM:
             return self._block_ode_endpoint_loss(pred_data, ref_data, ctx)
 
         t_weight = self._time_weight(ctx.t).to(device=ctx.t.device, dtype=ctx.t.dtype)
-        total = None
-        total_primary = None
-        total_square = None
-        total_count = None
+        component_stats = []
         state: Dict[str, torch.Tensor] = {
             "train_flow_t": ctx.t.detach().mean(),
             "train_flow_weight": t_weight.detach().mean(),
         }
 
-        node_loss = None
         if ctx.node_target is not None and self.node_target_key in pred_data:
             pred = pred_data[self.node_target_key]
             target = ref_data[self.node_target_key].to(device=pred.device, dtype=pred.dtype)
@@ -2482,22 +2474,19 @@ class HamiltonianCFM:
             pred, mask = self._project_loss_layout(pred, mask, target)
             node_diff = pred - target
             node_weights = self._time_weight(ctx.node_t)
-            node_loss, node_primary, node_square, node_count = self._metric_stats(
+            node_stats = self._metric_stats(
                 node_diff, mask, self.loss_type, node_weights
             )
+            node_loss = node_stats[0]
             if self.log_train_compatible_loss or self.log_validation_compatible_loss:
                 state.setdefault("_compatible_clean_stats", {}).update(
                     self._compatible_clean_stats(node_diff, mask, "onsite")
                 )
-            total = self.node_weight * node_loss if total is None else total + self.node_weight * node_loss
-            total_primary = self.node_weight * node_primary
-            total_square = self.node_weight * node_square
-            total_count = self.node_weight * node_count
+            component_stats.append((node_stats, self.node_weight))
             node_loss_detached = node_loss.detach()
             state["train_flow_onsite_loss"] = node_loss_detached
             state["train_onsite_loss"] = node_loss_detached
 
-        edge_loss = None
         if ctx.edge_target is not None and self.edge_target_key in pred_data:
             pred = pred_data[self.edge_target_key]
             target = ref_data[self.edge_target_key].to(device=pred.device, dtype=pred.dtype)
@@ -2505,48 +2494,48 @@ class HamiltonianCFM:
             pred, mask = self._project_loss_layout(pred, mask, target)
             edge_diff = pred - target
             edge_weights = self._time_weight(ctx.edge_t)
-            edge_loss, edge_primary, edge_square, edge_count = self._metric_stats(
+            edge_stats = self._metric_stats(
                 edge_diff, mask, self.loss_type, edge_weights
             )
+            edge_loss = edge_stats[0]
             if self.log_train_compatible_loss or self.log_validation_compatible_loss:
                 state.setdefault("_compatible_clean_stats", {}).update(
                     self._compatible_clean_stats(edge_diff, mask, "hopping")
                 )
-            total = self.edge_weight * edge_loss if total is None else total + self.edge_weight * edge_loss
-            if total_primary is None:
-                total_primary = self.edge_weight * edge_primary
-                total_square = self.edge_weight * edge_square
-                total_count = self.edge_weight * edge_count
-            else:
-                total_primary = total_primary + self.edge_weight * edge_primary
-                total_square = total_square + self.edge_weight * edge_square
-                total_count = total_count + self.edge_weight * edge_count
+            component_stats.append((edge_stats, self.edge_weight))
             edge_loss_detached = edge_loss.detach()
             state["train_flow_hopping_loss"] = edge_loss_detached
             state["train_hopping_loss"] = edge_loss_detached
 
-        if total is None:
+        if not component_stats:
             raise KeyError(
                 "CFM could not compute a loss because model outputs do not contain "
                 f"`{self.node_target_key}` or `{self.edge_target_key}`."
             )
-        if self.component_reduction == "global_elements":
-            total = self._global_metric(
-                total_primary, total_square, total_count, self.loss_type
+        total = self._reduce_component_stats(tuple(component_stats))
+        return self._finalize_loss(total, state, pred_data)
+
+    def loss_on_sample(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Score :meth:`sample` output without trusting model-owned metadata.
+
+        Block-space sampling always returns physical Full-H blocks, whereas a
+        residual-dH training endpoint is scored in its configured target space.
+        Keep that distinction in the flow API instead of a writable data-dict
+        flag.  Other CFM output spaces retain their ordinary loss semantics.
+        """
+        if self.block_ode:
+            return self._block_ode_endpoint_loss(
+                pred_data,
+                ref_data,
+                ctx,
+                prediction_is_full_h=True,
             )
-
-        mean_max_prob = pred_data.get("mean_max_prob", None)
-        if torch.is_tensor(mean_max_prob):
-            state["mean_max_prob"] = mean_max_prob.detach()
-            if self.router_z_loss_coef > 0.0:
-                total = total + self.router_z_loss_coef * mean_max_prob
-        expert_load_cv = pred_data.get("expert_load_cv", None)
-        if torch.is_tensor(expert_load_cv):
-            state["expert_load_cv"] = expert_load_cv.detach()
-
-        state["train_flow_loss"] = total.detach()
-        self.last_state = state
-        return total, state
+        return self.loss(pred_data, ref_data, ctx)
 
     # ------------------------------------------------------------------
     # Sampling
@@ -2628,18 +2617,11 @@ class HamiltonianCFM:
             h0_blocks.node_shapes,
             h0_blocks.edge_shapes,
         )
-        lem_metadata_keys = tuple(
-            key
-            for key in (
-                getattr(_keys, "LEM_ACTIVE_EDGES_KEY", "_lem_active_edges"),
-                getattr(_keys, "LEM_CUTOFF_COEFFS_KEY", "_lem_cutoff_coeffs"),
-                getattr(
-                    _keys,
-                    "LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY",
-                    "_lem_active_edge_split_sizes",
-                ),
-            )
-            if isinstance(key, str)
+        self._drop_block_authority_fields(state)
+        lem_metadata_keys = (
+            _keys.LEM_ACTIVE_EDGES_KEY,
+            _keys.LEM_CUTOFF_COEFFS_KEY,
+            _keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY,
         )
         # LemMoEV3H0 consumes and deletes these input-side accelerators.  Keep
         # them outside the mutable rollout state and inject an unchanged copy at
@@ -2703,9 +2685,6 @@ class HamiltonianCFM:
                     "Block-space ODE model must return both endpoint block components "
                     f"`{self.node_output_key}` and `{self.edge_output_key}`."
                 )
-            self._require_all_block_edges_active(
-                prediction, int(block_current.edge_blocks.shape[0])
-            )
             merged = state.copy()
             merged.update(prediction)
             self._restore_block_topology(merged, topology_sidecar)
@@ -2755,9 +2734,6 @@ class HamiltonianCFM:
         state[self.edge_output_key] = block_current.edge_blocks
         state["node_hamil_block_shape"] = block_current.node_shapes
         state["edge_hamil_block_shape"] = block_current.edge_shapes
-        state["_block_ode_sample_is_full"] = torch.ones(
-            (), dtype=torch.bool, device=block_current.node_blocks.device
-        )
         state[self.flow_time_key] = torch.ones(
             num_graphs, device=block_current.node_blocks.device, dtype=accumulator_dtype
         )
@@ -2962,7 +2938,50 @@ def assert_flow_h0_keys_reach_model(flow: Any, model: Any) -> None:
         return
     if not saw_h0_init:
         raise ValueError("Block-space ODE requires an H0InitLayer consuming node+edge RME.")
-    if bool(getattr(model, "block_native_add_h0", False)) or any(
+
+    from dptb.nn.deeptb import NNENV
+    from dptb.nn.embedding.lem_moe_v3_h0 import LemMoEV3H0
+
+    block_embeddings = [
+        module for module in modules if isinstance(module, LemMoEV3H0)
+    ]
+    if len(block_embeddings) != 1:
+        raise ValueError(
+            "Block-space ODE requires exactly one real LemMoEV3H0 embedding; "
+            f"found {len(block_embeddings)}."
+        )
+    block_embedding = block_embeddings[0]
+    if (
+        getattr(block_embedding, "output_route_name", None) != "h_b0"
+        or not bool(getattr(block_embedding, "use_block_native_output", False))
+        or not bool(
+            getattr(block_embedding, "supports_full_block_edge_coverage", False)
+        )
+        or not bool(
+            getattr(block_embedding, "require_full_block_edge_coverage", False)
+        )
+    ):
+        raise ValueError(
+            "Block-space ODE requires the real H-B0 block-native embedding with "
+            "require_full_block_edge_coverage=true."
+        )
+    owners = [
+        module
+        for module in modules
+        if isinstance(module, NNENV)
+        and getattr(module, "embedding", None) is block_embedding
+    ]
+    if (
+        len(owners) != 1
+        or getattr(owners[0], "method", None) != "block_native"
+        or not bool(getattr(owners[0], "blockwise_hamiltonian", False))
+    ):
+        raise ValueError(
+            "Block-space ODE requires one NNENV owner with prediction.method="
+            "'block_native' and prediction.blockwise_hamiltonian=true."
+        )
+
+    if bool(getattr(owners[0], "block_native_add_h0", False)) or any(
         bool(getattr(module, "add_h0", False)) for module in modules
     ):
         raise ValueError(

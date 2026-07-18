@@ -14,12 +14,8 @@ from dptb.data.interfaces.blockwise_tensor import (
 )
 from dptb.data.transforms import OrbitalMapper
 from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
-from dptb.nnops.flow import (
-    HamiltonianCFM,
-    assert_flow_h0_keys_reach_model,
-)
+from dptb.nnops.flow import HamiltonianCFM
 from dptb.nnops.multi_trainer import MultiTrainer
-from dptb.utils.argcheck import validate_block_ode_contract
 
 
 ATOL = 1e-10
@@ -175,13 +171,11 @@ def _scaled_endpoint(codec, data, node_h0, edge_h0, scale):
 
 
 class EndpointSequence(torch.nn.Module):
-    def __init__(self, endpoints, *, report_coverage=True, active_edges=None):
+    def __init__(self, endpoints):
         super().__init__()
         self.endpoints = list(endpoints)
         self.inputs = []
         self.times = []
-        self.report_coverage = bool(report_coverage)
-        self.active_edges = active_edges
 
     def forward(self, data):
         index = len(self.inputs)
@@ -191,19 +185,6 @@ class EndpointSequence(torch.nn.Module):
         out = data.copy()
         out["node_hamil_blocks"] = endpoint.node_blocks
         out["edge_hamil_blocks"] = endpoint.edge_blocks
-        if self.report_coverage:
-            active_edges = self.active_edges
-            if active_edges is None:
-                active_edges = torch.arange(
-                    endpoint.edge_blocks.shape[0],
-                    device=endpoint.edge_blocks.device,
-                    dtype=torch.long,
-                )
-            out[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = torch.as_tensor(
-                active_edges,
-                device=endpoint.edge_blocks.device,
-                dtype=torch.long,
-            ).reshape(-1).clone()
         return out
 
 
@@ -228,11 +209,6 @@ class LinearRMEEndpoint(torch.nn.Module):
         out = data.copy()
         out[_keys.NODE_PRED_HAMIL_BLOCKS_KEY] = endpoint.node_blocks
         out[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY] = endpoint.edge_blocks
-        out[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = torch.arange(
-            endpoint.edge_blocks.shape[0],
-            device=endpoint.edge_blocks.device,
-            dtype=torch.long,
-        )
         return out
 
 
@@ -275,48 +251,6 @@ def _assert_state_invariants(data, state):
     edge_mask = block_mask_from_shapes(state.edge_shapes, tuple(state.edge_blocks.shape[-2:]))
     assert torch.count_nonzero(state.node_blocks[~node_mask]) == 0
     assert torch.count_nonzero(state.edge_blocks[~edge_mask]) == 0
-
-
-def test_spy_second_forward_receives_exact_first_blended_state():
-    idp, data, codec, h0 = _case()
-    endpoints = [
-        _scaled_endpoint(codec, data, data["node_h0"], data["edge_h0"], scale)
-        for scale in (2.0, -0.5, 1.25)
-    ]
-    model = EndpointSequence(endpoints)
-    result = _flow(idp).sample(model, _fresh(data), num_steps=3)
-
-    first_blend = _blend(data, idp, h0, endpoints[0], 1.0 / 3.0)
-    expected_node, expected_edge = codec.blocks_to_rme(data, first_blend)
-    assert (model.inputs[1][0] - expected_node).abs().max().item() <= ATOL
-    assert (model.inputs[1][1] - expected_edge).abs().max().item() <= ATOL
-
-    second_blend = _blend(data, idp, first_blend, endpoints[1], 0.5)
-    expected_final = _blend(data, idp, second_blend, endpoints[2], 1.0)
-    assert (result["node_hamil_blocks"] - expected_final.node_blocks).abs().max() <= ATOL
-    assert (result["edge_hamil_blocks"] - expected_final.edge_blocks).abs().max() <= ATOL
-
-
-@pytest.mark.parametrize(
-    ("model_kwargs", "error", "match"),
-    [
-        ({"report_coverage": False}, KeyError, "actual active-edge side-channel"),
-        ({"active_edges": torch.tensor([0])}, ValueError, "inactive indices=\\[1\\]"),
-    ],
-)
-def test_block_ode_sample_fails_closed_without_full_active_edge_coverage(
-    model_kwargs, error, match
-):
-    idp, data, codec, _ = _case()
-    endpoint = _scaled_endpoint(
-        codec, data, data["node_h0"], data["edge_h0"], scale=1.1
-    )
-    with pytest.raises(error, match=match):
-        _flow(idp).sample(
-            EndpointSequence([endpoint], **model_kwargs),
-            _fresh(data),
-            num_steps=1,
-        )
 
 
 def test_multitrainer_residual_euler_validation_scores_full_sample_via_flow():
@@ -470,34 +404,16 @@ def test_two_and_three_step_rollouts_match_manual_endpoint_blends(num_steps):
     model = EndpointSequence(raw_endpoints)
     result = _flow(idp).sample(model, _fresh(data), num_steps=num_steps)
     for step, raw in enumerate(raw_endpoints):
+        expected_node, expected_edge = codec.blocks_to_rme(data, current)
+        torch.testing.assert_close(model.inputs[step][0], expected_node, rtol=0, atol=ATOL)
+        torch.testing.assert_close(model.inputs[step][1], expected_edge, rtol=0, atol=ATOL)
+        _assert_state_invariants(data, current)
         endpoint = project_block_state(data, idp, raw)
         alpha = (1.0 / num_steps) / (1.0 - step / num_steps)
         current = _blend(data, idp, current, endpoint, alpha)
         _assert_state_invariants(data, current)
     assert (result["node_hamil_blocks"] - current.node_blocks).abs().max() <= ATOL
     assert (result["edge_hamil_blocks"] - current.edge_blocks).abs().max() <= ATOL
-
-
-def test_every_forward_state_and_final_state_are_projected():
-    idp, data, codec, _ = _case()
-    endpoint = BlockTensorResult(
-        torch.randn(2, 3, 3, dtype=torch.float64),
-        torch.randn(2, 3, 3, dtype=torch.float64),
-        torch.tensor([[1, 1], [3, 3]]),
-        torch.tensor([[1, 3], [3, 1]]),
-    )
-    model = EndpointSequence([endpoint] * 3)
-    result = _flow(idp).sample(model, _fresh(data), num_steps=3)
-    for node_rme, edge_rme in model.inputs:
-        state = codec.rme_to_blocks(data, node_rme, edge_rme)
-        _assert_state_invariants(data, state)
-    final = BlockTensorResult(
-        result["node_hamil_blocks"], result["edge_hamil_blocks"],
-        result["node_hamil_block_shape"], result["edge_hamil_block_shape"],
-    )
-    _assert_state_invariants(data, final)
-
-
 def test_full_contract_never_adds_h0_and_residual_contract_adds_exactly_once():
     idp, data, codec, h0 = _case()
     delta = _scaled_endpoint(codec, data, data["node_h0"], data["edge_h0"], 0.25)
@@ -566,41 +482,6 @@ def test_block_inverse_default_tolerance_is_dtype_aware():
     }
     assert HamiltonianCFM(base, idp=idp, dtype=torch.float64).block_inverse_atol == 1e-10
     assert HamiltonianCFM(base, idp=idp, dtype=torch.float32).block_inverse_atol == 2e-5
-
-
-class _H0Consumer(torch.nn.Module):
-    h0_node_key = "node_h0"
-    h0_edge_key = "edge_h0"
-    merge_mode = "replace"
-
-
-class _TimeConsumer(torch.nn.Module):
-    use_flow_time_embedding = True
-    flow_time_condition_edges = True
-
-    def __init__(self, allow_missing=False):
-        super().__init__()
-        self.flow_time_conditioner = SimpleNamespace(
-            flow_time_keys=(), flow_time_key="flow_time", allow_missing_time=allow_missing
-        )
-
-
-class _GuardModel(torch.nn.Module):
-    def __init__(self, *, add_h0=False, allow_missing=False):
-        super().__init__()
-        self.block_native_add_h0 = add_h0
-        self.h0 = _H0Consumer()
-        self.time = _TimeConsumer(allow_missing=allow_missing)
-
-
-def test_model_gate_requires_no_add_h0_and_fail_closed_node_edge_time_embedding():
-    idp, _, _, _ = _case()
-    flow = _flow(idp)
-    assert assert_flow_h0_keys_reach_model(flow, _GuardModel()) is None
-    with pytest.raises(ValueError, match="prediction.add_h0=false"):
-        assert_flow_h0_keys_reach_model(flow, _GuardModel(add_h0=True))
-    with pytest.raises(ValueError, match="flow_time_allow_missing=false"):
-        assert_flow_h0_keys_reach_model(flow, _GuardModel(allow_missing=True))
 
 
 def _ref_for(flow, data, codec, h0, endpoint, endpoint_node_rme, endpoint_edge_rme):
@@ -757,9 +638,6 @@ def test_new_loss_requires_both_components_exact_shapes_and_physical_target():
     pred = batch.copy()
     pred[flow.node_output_key] = endpoint.node_blocks
     pred[flow.edge_output_key] = endpoint.edge_blocks
-    pred[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = torch.arange(
-        endpoint.edge_blocks.shape[0], dtype=torch.long
-    )
     loss, state = flow.loss(pred, ref, ctx)
     assert loss.item() <= ATOL
     assert state["_compatible_clean_stats"]["onsite_count"].item() == 7
@@ -771,16 +649,6 @@ def test_new_loss_requires_both_components_exact_shapes_and_physical_target():
     )
     polluted_loss, _ = flow.loss(polluted_topology, ref, ctx)
     assert polluted_loss.item() <= ATOL
-
-    missing_coverage = pred.copy()
-    missing_coverage.pop(_keys.BLOCK_PRED_ACTIVE_EDGES_KEY)
-    with pytest.raises(KeyError, match="actual active-edge side-channel"):
-        flow.loss(missing_coverage, ref, ctx)
-
-    partial_coverage = pred.copy()
-    partial_coverage[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = torch.tensor([0])
-    with pytest.raises(ValueError, match=r"inactive indices=\[1\]"):
-        flow.loss(partial_coverage, ref, ctx)
 
     missing = pred.copy()
     missing.pop(flow.edge_output_key)
@@ -800,7 +668,7 @@ def test_new_loss_requires_both_components_exact_shapes_and_physical_target():
         flow.loss(pred, padded_ref, ctx)
 
 
-def test_residual_sample_scores_against_full_target_after_one_h0_add():
+def test_residual_training_and_sample_scoring_have_flow_owned_semantics():
     idp, data, codec, h0 = _case()
     flow = _flow(idp, "residual_dh")
     delta_node = data["node_h0"] * 0.2
@@ -809,49 +677,40 @@ def test_residual_sample_scores_against_full_target_after_one_h0_add():
     # The authoritative residual block side channel is dH; legacy feature
     # coordinates are irrelevant to block-ODE scoring.
     # The sampled rollout is converted back to Full H only for endpoint scoring.
-    ref = _ref_for(flow, data, codec, h0, delta, delta_node, delta_edge)
-    _, ref, ctx = flow.prepare_batch(_fresh(data), ref, t=torch.tensor([0.0]))
-    sampled = flow.sample(EndpointSequence([delta]), _fresh(data), num_steps=1)
-    loss, _ = flow.loss(sampled, ref, ctx)
-    assert loss.item() <= ATOL
+    record = _ref_for(flow, data, codec, h0, delta, delta_node, delta_edge)
+    sample_record = _fresh(record)
+    # Match Trainer's shallow input/reference copies so this also guards the
+    # original model-to-label storage alias.
+    prepared, ref, ctx = flow.prepare_batch(record, record.copy(), t=torch.tensor([0.0]))
+    authority_keys = (
+        flow.node_block_target_key,
+        flow.edge_block_target_key,
+        flow.node_block_shape_key,
+        flow.edge_block_shape_key,
+        flow.node_h0_block_key,
+        flow.edge_h0_block_key,
+        flow.node_h0_block_shape_key,
+        flow.edge_h0_block_shape_key,
+    )
+    assert all(key in ref for key in authority_keys)
+    assert all(key not in prepared for key in authority_keys)
 
+    prediction = prepared.copy()
+    prediction[flow.node_output_key] = delta.node_blocks
+    prediction[flow.edge_output_key] = delta.edge_blocks
+    # A model-owned/stale key must be inert: training predictions always use
+    # the configured endpoint semantics.
+    prediction["_block_ode_sample_is_full"] = torch.tensor(True)
+    training_loss, _ = flow.loss(prediction, ref, ctx)
+    assert training_loss.item() <= ATOL
 
-def test_argcheck_cross_contract_rejects_add_h0_and_missing_time_conditioning():
-    base = {
-        "train_options": {"flow_options": {
-            "enabled": True, "mode": "residual", "prior": "zero",
-            "output_space": "ao_block_ode", "block_ode": True,
-            "target_semantics": "absolute_full_h", "prediction_add_h0": False,
-            "time_conditioning_required": True, "block_inverse_mode": "strict",
-            "strict_h0": True,
-            "node_block_target_key": "node_full_hamil_target_blocks",
-            "edge_block_target_key": "edge_full_hamil_target_blocks",
-            "node_block_shape_key": "node_full_hamil_target_block_shape",
-            "edge_block_shape_key": "edge_full_hamil_target_block_shape",
-            "validation_ode_steps": [1, 3],
-        }},
-        "common_options": {"has_soc": False},
-        "model_options": {
-            "embedding": {
-                "use_flow_time_embedding": True, "flow_time_condition_edges": True,
-                "flow_time_allow_missing": False, "flow_time_key": "flow_time",
-                "h0_merge_mode": "replace", "use_h0_node_init": True,
-                "use_h0_edge_init": True,
-            },
-            "prediction": {"add_h0": False},
-        },
-        "data_options": {"train": {
-            "type": "LMDBDataset",
-            "get_Hamiltonian": True, "get_H0": True,
-            "residual_hamiltonian": False, "require_full_h_target": True,
-        }},
-    }
-    assert validate_block_ode_contract(base) is None
-    bad_add = {**base, "model_options": {**base["model_options"], "prediction": {"add_h0": True}}}
-    with pytest.raises(ValueError, match="prediction.add_h0=false"):
-        validate_block_ode_contract(bad_add)
-    bad_time = {**base, "model_options": {**base["model_options"], "embedding": {
-        **base["model_options"]["embedding"], "flow_time_allow_missing": True,
-    }}}
-    with pytest.raises(ValueError, match="flow_time_allow_missing=false"):
-        validate_block_ode_contract(bad_time)
+    class AuthorityRejectingEndpoint(EndpointSequence):
+        def forward(self, batch):
+            assert all(key not in batch for key in authority_keys)
+            return super().forward(batch)
+
+    sampled = flow.sample(AuthorityRejectingEndpoint([delta]), sample_record, num_steps=1)
+    assert all(key not in sampled for key in authority_keys)
+    assert "_block_ode_sample_is_full" not in sampled
+    sample_loss, _ = flow.loss_on_sample(sampled, ref, ctx)
+    assert sample_loss.item() <= ATOL

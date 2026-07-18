@@ -35,12 +35,14 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
     P2_BLOCK_FINGERPRINT_KEY,
     P2_BUNDLE_FINGERPRINT_KEY,
     P2_RME_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
     P2_SAMPLE_SCHEMA,
     P2_SOURCE_FINGERPRINT_KEY,
     P23_BLOCK_FINGERPRINT_KEY,
@@ -48,6 +50,7 @@ from dptb.data.interfaces.p2_contract import (
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
     P23_RME_FINGERPRINT_KEY,
     P23_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     SAMPLE_SCHEMA_KEY,
@@ -58,6 +61,8 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_present_row_aligned_fields,
     fingerprint_text_fields,
     mapper_basis_fingerprint,
+    physical_h0_dataset_fingerprint,
+    physical_h0_record_fingerprint,
 )
 from dptb.data.transforms import OrbitalMapper as ProductionOrbitalMapper
 from dptb.nn.blockwise_hamiltonian import (
@@ -380,7 +385,7 @@ def test_lmdb_raw_full_h_plus_p2_contract_end_to_end(tmp_path):
     )
 
 
-def _compact_p2_record():
+def _compact_p2_record(*, include_h0: bool = False):
     mapper = ProductionOrbitalMapper({"H": "1s"}, method="e3tb", device="cpu")
     basis_fingerprint = mapper_basis_fingerprint(mapper)
     p2_source = hashlib.sha256(b"unit-test-p2-source").hexdigest()
@@ -391,6 +396,7 @@ def _compact_p2_record():
         ),
         _keys.ATOMIC_NUMBERS_KEY: np.asarray([1, 1], dtype=np.int64),
         _keys.PBC_KEY: np.asarray([False, False, False]),
+        "case_id": "h2",
         # Deliberately reversed relative to a typical graph builder order.
         _keys.EDGE_INDEX_KEY: np.asarray([[1, 0], [0, 1]], dtype=np.int64),
         _keys.EDGE_CELL_SHIFT_KEY: np.zeros((2, 3), dtype=np.float32),
@@ -416,13 +422,36 @@ def _compact_p2_record():
         BASIS_FINGERPRINT_KEY: basis_fingerprint,
         P2_SOURCE_FINGERPRINT_KEY: p2_source,
     }
+    if include_h0:
+        record.update(
+            {
+                PHYSICAL_H0_SOURCE_KEY: DEDICATED_PHYSICAL_H0_SOURCE,
+                _keys.NODE_H0_KEY: np.asarray([[0.9], [1.2]], dtype=np.float32),
+                _keys.EDGE_H0_KEY: np.asarray([[0.1], [0.1]], dtype=np.float32),
+                _keys.NODE_H0_BLOCKS_KEY: np.asarray(
+                    [[[0.9]], [[1.2]]], dtype=np.float32
+                ),
+                _keys.EDGE_H0_BLOCKS_KEY: np.asarray(
+                    [[[0.1]], [[0.1]]], dtype=np.float32
+                ),
+                _keys.NODE_H0_BLOCK_SHAPE_KEY: np.ones((2, 2), dtype=np.int64),
+                _keys.EDGE_H0_BLOCK_SHAPE_KEY: np.ones((2, 2), dtype=np.int64),
+            }
+        )
     record[EDGE_GRAPH_FINGERPRINT_KEY] = edge_graph_fingerprint(
         record[_keys.ATOMIC_NUMBERS_KEY],
         record[_keys.EDGE_INDEX_KEY],
         record[_keys.EDGE_CELL_SHIFT_KEY],
         basis_fingerprint=basis_fingerprint,
     )
-    return _refresh_compact_fingerprints(record), p2_source
+    _refresh_compact_fingerprints(record)
+    if include_h0:
+        record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY] = (
+            physical_h0_dataset_fingerprint(
+                [physical_h0_record_fingerprint(record)]
+            )
+        )
+    return record, p2_source
 
 
 def _refresh_compact_fingerprints(record):
@@ -471,8 +500,8 @@ def _refresh_compact_fingerprints(record):
     return record
 
 
-def _compact_dual_prior_record():
-    record, p2_source = _compact_p2_record()
+def _compact_dual_prior_record(*, include_h0: bool = False):
+    record, p2_source = _compact_p2_record(include_h0=include_h0)
     p23_source = hashlib.sha256(b"unit-test-p23-source").hexdigest()
     record.update(
         {
@@ -543,33 +572,16 @@ def _write_single_lmdb(root, prefix, record):
     env.close()
 
 
-def _compact_dataset(root, prefix, p2_source):
-    return DatasetBuilder()(
-        root=str(root),
-        r_max=2.0,
-        er_max=3.0,
-        type="LMDBDataset",
-        prefix=prefix,
-        separator=".",
-        basis={"H": "1s"},
-        get_Hamiltonian=True,
-        get_P2=True,
-        require_p2_blocks=True,
-        require_full_h_target=True,
-        audit_p2_representations=True,
-        expected_p2_source_fingerprint=p2_source,
-        residual_hamiltonian=False,
-    )
-
-
-def _compact_selected_prior_dataset(
+def _compact_dataset(
     root,
     prefix,
     source_fingerprint,
     *,
-    prior_kind,
-    require_blocks,
+    prior_kind="p2",
+    require_blocks=True,
     audit=False,
+    get_h0=False,
+    h0_source="",
 ):
     return DatasetBuilder()(
         root=str(root),
@@ -580,6 +592,7 @@ def _compact_selected_prior_dataset(
         separator=".",
         basis={"H": "1s"},
         get_Hamiltonian=True,
+        get_H0=get_h0,
         get_P2=True,
         prior_kind=prior_kind,
         p2_key=f"hamiltonian_{prior_kind}",
@@ -587,15 +600,80 @@ def _compact_selected_prior_dataset(
         require_full_h_target=True,
         audit_p2_representations=audit,
         expected_p2_source_fingerprint=source_fingerprint,
+        expected_physical_h0_source_fingerprint=h0_source,
         residual_hamiltonian=False,
     )
 
 
+def test_dedicated_h0_commitment_rejects_rehashed_p2_as_h0(tmp_path):
+    record, source = _compact_p2_record(include_h0=True)
+    expected_h0 = record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY]
+    for h0_field, p2_field in (
+        (_keys.NODE_H0_KEY, _keys.NODE_P2_KEY),
+        (_keys.EDGE_H0_KEY, _keys.EDGE_P2_KEY),
+        (_keys.NODE_H0_BLOCKS_KEY, _keys.NODE_P2_BLOCKS_KEY),
+        (_keys.EDGE_H0_BLOCKS_KEY, _keys.EDGE_P2_BLOCKS_KEY),
+        (_keys.NODE_H0_BLOCK_SHAPE_KEY, _keys.NODE_P2_BLOCK_SHAPE_KEY),
+        (_keys.EDGE_H0_BLOCK_SHAPE_KEY, _keys.EDGE_P2_BLOCK_SHAPE_KEY),
+    ):
+        record[h0_field] = record[p2_field].copy()
+    _refresh_compact_fingerprints(record)
+    _write_single_lmdb(tmp_path, "p2-as-h0", record)
+
+    with pytest.raises(ValueError, match="block content does not match"):
+        _compact_dataset(
+            tmp_path,
+            "p2-as-h0",
+            source,
+            get_h0=True,
+            h0_source=expected_h0,
+        ).get(0)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        ("nan", "NaN or infinity"),
+        ("reverse", "reverse-edge Hermiticity mismatch"),
+        ("padding", "non-zero padding"),
+    ),
+)
+def test_dedicated_h0_blocks_are_physically_validated(
+    tmp_path, mutation: str, match: str
+):
+    record, source = _compact_p2_record(include_h0=True)
+    if mutation == "nan":
+        record[_keys.NODE_H0_BLOCKS_KEY][0, 0, 0] = np.nan
+    elif mutation == "reverse":
+        record[_keys.EDGE_H0_BLOCKS_KEY][0, 0, 0] += 0.5
+    else:
+        for field in (_keys.NODE_H0_BLOCKS_KEY, _keys.EDGE_H0_BLOCKS_KEY):
+            original = record[field]
+            record[field] = np.zeros((original.shape[0], 2, 2), dtype=original.dtype)
+            record[field][:, :1, :1] = original
+        record[_keys.NODE_H0_BLOCKS_KEY][0, 0, 1] = 1.0
+    _refresh_compact_fingerprints(record)
+    h0_source = physical_h0_dataset_fingerprint(
+        [physical_h0_record_fingerprint(record)]
+    )
+    record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY] = h0_source
+    _write_single_lmdb(tmp_path, f"invalid-h0-{mutation}", record)
+
+    with pytest.raises(ValueError, match=match):
+        _compact_dataset(
+            tmp_path,
+            f"invalid-h0-{mutation}",
+            source,
+            get_h0=True,
+            h0_source=h0_source,
+        ).get(0)
+
+
 def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):
-    record, p2_source, p23_source = _compact_dual_prior_record()
+    record, p2_source, p23_source = _compact_dual_prior_record(include_h0=True)
     _write_single_lmdb(tmp_path, "dual-prior", record)
 
-    p2_direct = _compact_selected_prior_dataset(
+    p2_direct = _compact_dataset(
         tmp_path,
         "dual-prior",
         p2_source,
@@ -608,18 +686,23 @@ def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):
     assert _keys.NODE_P23_KEY not in p2_direct
     assert _keys.NODE_P2_BLOCKS_KEY not in p2_direct
 
-    direct = _compact_selected_prior_dataset(
+    direct = _compact_dataset(
         tmp_path,
         "dual-prior",
         p23_source,
         prior_kind="p23",
         require_blocks=False,
+        get_h0=True,
+        h0_source=record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY],
     ).get(0)
     torch.testing.assert_close(
         direct[_keys.NODE_P23_KEY], torch.tensor([[2.0], [2.1]])
     )
     torch.testing.assert_close(
         direct[_keys.EDGE_P23_KEY], torch.tensor([[0.4], [0.4]])
+    )
+    torch.testing.assert_close(
+        direct[_keys.NODE_H0_BLOCKS_KEY].flatten(), torch.tensor([0.9, 1.2])
     )
     assert _keys.NODE_P2_KEY not in direct
     assert _keys.EDGE_P2_KEY not in direct
@@ -631,7 +714,7 @@ def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):
     ):
         assert field not in direct
 
-    residual = _compact_selected_prior_dataset(
+    residual = _compact_dataset(
         tmp_path,
         "dual-prior",
         p23_source,
@@ -656,7 +739,7 @@ def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):
     _refresh_dual_prior_fingerprints(wrong_parent)
     _write_single_lmdb(tmp_path, "dual-prior-wrong-parent", wrong_parent)
     with pytest.raises(ValueError, match="parent P2 bundle does not match"):
-        _compact_selected_prior_dataset(
+        _compact_dataset(
             tmp_path,
             "dual-prior-wrong-parent",
             p23_source,
@@ -669,7 +752,7 @@ def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):
     _refresh_dual_prior_fingerprints(wrong_schema)
     _write_single_lmdb(tmp_path, "dual-prior-v2", wrong_schema)
     with pytest.raises(ValueError, match="P23 tensors require explicit sample schema"):
-        _compact_selected_prior_dataset(
+        _compact_dataset(
             tmp_path,
             "dual-prior-v2",
             p23_source,
@@ -683,7 +766,7 @@ def test_runtime_contract_scans_each_immutable_record_once_per_worker(
 ):
     record, _, p23_source = _compact_dual_prior_record()
     _write_single_lmdb(tmp_path, "dual-prior-runtime-cache", record)
-    dataset = _compact_selected_prior_dataset(
+    dataset = _compact_dataset(
         tmp_path,
         "dual-prior-runtime-cache",
         p23_source,
@@ -775,7 +858,7 @@ def test_tampered_first_read_is_never_added_to_runtime_contract_cache(
     record[_keys.NODE_P23_KEY] = record[_keys.NODE_P23_KEY].copy()
     record[_keys.NODE_P23_KEY][0, 0] += 0.25
     _write_single_lmdb(tmp_path, "dual-prior-runtime-tampered", record)
-    dataset = _compact_selected_prior_dataset(
+    dataset = _compact_dataset(
         tmp_path,
         "dual-prior-runtime-tampered",
         p23_source,
@@ -803,9 +886,13 @@ def test_tampered_first_read_is_never_added_to_runtime_contract_cache(
 
 
 def test_compact_p2_contract_preserves_graph_and_audits_cross_representation(tmp_path):
-    record, p2_source = _compact_p2_record()
+    record, p2_source = _compact_p2_record(include_h0=True)
+    h0_source = record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY]
     _write_single_lmdb(tmp_path, "p2-compact-good", record)
-    sample = _compact_dataset(tmp_path, "p2-compact-good", p2_source).get(0)
+    sample = _compact_dataset(
+        tmp_path, "p2-compact-good", p2_source, audit=True,
+        get_h0=True, h0_source=h0_source,
+    ).get(0)
     torch.testing.assert_close(
         sample[_keys.EDGE_INDEX_KEY], torch.tensor([[1, 0], [0, 1]])
     )
@@ -814,14 +901,20 @@ def test_compact_p2_contract_preserves_graph_and_audits_cross_representation(tmp
     del partial[_keys.EDGE_CELL_SHIFT_KEY]
     _write_single_lmdb(tmp_path, "p2-compact-partial", partial)
     with pytest.raises(ValueError, match="both edge_index and edge_cell_shift"):
-        _compact_dataset(tmp_path, "p2-compact-partial", p2_source).get(0)
+        _compact_dataset(
+            tmp_path, "p2-compact-partial", p2_source, audit=True,
+            get_h0=True, h0_source=h0_source,
+        ).get(0)
 
     inconsistent = deepcopy(record)
     inconsistent[_keys.EDGE_P2_BLOCKS_KEY][:] = 0.25
     _refresh_compact_fingerprints(inconsistent)
     _write_single_lmdb(tmp_path, "p2-compact-inconsistent", inconsistent)
     with pytest.raises(ValueError, match="RME/AO representations disagree"):
-        _compact_dataset(tmp_path, "p2-compact-inconsistent", p2_source).get(0)
+        _compact_dataset(
+            tmp_path, "p2-compact-inconsistent", p2_source, audit=True,
+            get_h0=True, h0_source=h0_source,
+        ).get(0)
 
 
 def _prior_model(

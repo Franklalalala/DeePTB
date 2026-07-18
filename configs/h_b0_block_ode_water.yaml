@@ -21,6 +21,7 @@ model_options:
     flow_time_condition_edges: true
     flow_time_key: flow_time
     flow_time_allow_missing: false
+    require_full_block_edge_coverage: true
   prediction:
     method: block_native
     block_decoder: expansion_cg

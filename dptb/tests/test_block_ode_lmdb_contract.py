@@ -9,14 +9,29 @@ import torch
 
 from dptb.data import _keys
 from dptb.data.build import DatasetBuilder
-from dptb.data.dataset.lmdb_dataset import LMDBDataset
+from dptb.data.dataset.lmdb_dataset import (
+    LMDBDataset,
+    assert_absolute_full_h_target_contract,
+)
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
+    BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
+    DUAL_PRIOR_SAMPLE_SCHEMA,
+    EDGE_GRAPH_FINGERPRINT_KEY,
     H0_RESIDUAL_SEMANTICS,
+    P2_SAMPLE_SCHEMA,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
     RAW_HAMILTONIAN_SAMPLE_SCHEMA,
+    RAW_PHYSICAL_H0_SOURCE,
+    ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+    ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     SAMPLE_SCHEMA_KEY,
     TARGET_SEMANTICS_KEY,
     TARGET_SOURCE_KEY,
+    physical_h0_dataset_fingerprint,
+    physical_h0_record_fingerprint,
 )
 
 
@@ -40,6 +55,7 @@ def _raw_h_h0_record() -> dict:
         ),
         _keys.ATOMIC_NUMBERS_KEY: np.asarray([1, 1], dtype=np.int64),
         _keys.PBC_KEY: np.asarray([False, False, False]),
+        "case_id": "h2",
         _keys.EDGE_INDEX_KEY: np.asarray([[0, 1], [1, 0]], dtype=np.int64),
         _keys.EDGE_CELL_SHIFT_KEY: np.zeros((2, 3), dtype=np.float32),
         "hamiltonian": h_blocks,
@@ -48,6 +64,101 @@ def _raw_h_h0_record() -> dict:
         TARGET_SEMANTICS_KEY: ABSOLUTE_FULL_H_SEMANTICS,
         TARGET_SOURCE_KEY: "raw_hamiltonian",
     }
+
+
+def _dedicated_h0_record(schema: str) -> dict:
+    record = _raw_h_h0_record()
+    record.pop("hamiltonian_0")
+    blocks = np.zeros((2, 1, 1), dtype=np.float32)
+    shapes = np.ones((2, 2), dtype=np.int64)
+    record.update(
+        {
+            SAMPLE_SCHEMA_KEY: schema,
+            TARGET_SOURCE_KEY: "dedicated_full_h_blocks",
+            PHYSICAL_H0_SOURCE_KEY: DEDICATED_PHYSICAL_H0_SOURCE,
+            BASIS_FINGERPRINT_KEY: "1" * 64,
+            EDGE_GRAPH_FINGERPRINT_KEY: "2" * 64,
+            ROW_ALIGNED_DATA_FINGERPRINT_KEY: "3" * 64,
+            ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY: "4" * 64,
+            _keys.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY: blocks.copy(),
+            _keys.EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY: blocks.copy(),
+            _keys.NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY: shapes.copy(),
+            _keys.EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY: shapes.copy(),
+            _keys.NODE_H0_BLOCKS_KEY: blocks.copy(),
+            _keys.EDGE_H0_BLOCKS_KEY: blocks.copy(),
+            _keys.NODE_H0_BLOCK_SHAPE_KEY: shapes.copy(),
+            _keys.EDGE_H0_BLOCK_SHAPE_KEY: shapes.copy(),
+        }
+    )
+    record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY] = physical_h0_dataset_fingerprint(
+        [physical_h0_record_fingerprint(record)]
+    )
+    return record
+
+
+@pytest.mark.parametrize("schema", (P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA))
+def test_full_h_h0_authority_accepts_declared_raw_or_dedicated(schema: str):
+    raw = _raw_h_h0_record()
+    raw[SAMPLE_SCHEMA_KEY] = schema
+    raw[PHYSICAL_H0_SOURCE_KEY] = RAW_PHYSICAL_H0_SOURCE
+    assert_absolute_full_h_target_contract(raw, require_h0=True)
+    dedicated = _dedicated_h0_record(schema)
+    assert_absolute_full_h_target_contract(
+        dedicated,
+        require_h0=True,
+        expected_physical_h0_source_fingerprint=dedicated[
+            PHYSICAL_H0_SOURCE_FINGERPRINT_KEY
+        ],
+    )
+
+
+@pytest.mark.parametrize("schema", (P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA))
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        ("undeclared", "physical_h0_source"),
+        ("partial", "bundle is incomplete"),
+        ("dual_authority", "ambiguous dual authority"),
+        ("unbound", "row_aligned_bundle_fingerprint"),
+        ("missing_record_fingerprint", "physical_h0_source_fingerprint"),
+        ("missing_external_fingerprint", "externally trusted"),
+        ("source_mismatch", "does not match"),
+    ),
+)
+def test_dedicated_full_h_h0_authority_is_fail_closed(
+    schema: str, mutation: str, match: str
+):
+    record = _dedicated_h0_record(schema)
+    expected = record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY]
+    if mutation == "undeclared":
+        record.pop(PHYSICAL_H0_SOURCE_KEY)
+    elif mutation == "partial":
+        record.pop(_keys.EDGE_H0_BLOCKS_KEY)
+    elif mutation == "dual_authority":
+        record["hamiltonian_0"] = {"0_0_0_0_0": np.zeros((1, 1))}
+    else:
+        if mutation == "unbound":
+            record.pop(ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY)
+        elif mutation == "missing_record_fingerprint":
+            record.pop(PHYSICAL_H0_SOURCE_FINGERPRINT_KEY)
+        elif mutation == "missing_external_fingerprint":
+            expected = None
+        else:
+            expected = "f" * 64
+
+    with pytest.raises(ValueError, match=match):
+        assert_absolute_full_h_target_contract(
+            record,
+            require_h0=True,
+            expected_physical_h0_source_fingerprint=expected,
+        )
+
+
+@pytest.mark.parametrize("schema", (P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA))
+def test_full_h_h0_authority_is_opt_in_for_legacy_routes(schema: str):
+    record = _dedicated_h0_record(schema)
+    record.pop(PHYSICAL_H0_SOURCE_KEY)
+    assert_absolute_full_h_target_contract(record, require_h0=False)
 
 
 def _dataset_from_record(

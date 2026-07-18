@@ -6,6 +6,7 @@ import torch
 from dptb.data.dataset._base_datasets import AtomicInMemoryDataset
 from dptb.data.dataset.lmdb_dataset import LMDBDataset
 from dptb.data import AtomicDataDict
+from dptb.data.interfaces.blockwise_tensor import BlockTensorResult
 from dptb.data.dataloader import (
     AtomicDataCostEstimator,
     DataLoader,
@@ -779,8 +780,20 @@ def test_lmdb_dataset_h0_raw_conversion_can_override_precomputed_h0(monkeypatch)
         atomicdata[kwargs["node_field"]] = torch.full((2, 3), 1.0)
         atomicdata[kwargs["edge_field"]] = torch.full((4, 3), 2.0)
 
+    def _fake_ordered_blocks(*args, **kwargs):
+        return BlockTensorResult(
+            node_blocks=torch.zeros((2, 1, 1)),
+            edge_blocks=torch.zeros((4, 1, 1)),
+            node_shapes=torch.ones((2, 2), dtype=torch.long),
+            edge_shapes=torch.ones((4, 2), dtype=torch.long),
+        )
+
     monkeypatch.setattr("dptb.data.dataset.lmdb_dataset.AtomicData.from_points", _fake_from_points)
     monkeypatch.setattr("dptb.data.dataset.lmdb_dataset.block_to_feature", _fake_block_to_feature)
+    monkeypatch.setattr(
+        "dptb.data.interfaces.blockwise_tensor.block_dict_to_ordered_tensors",
+        _fake_ordered_blocks,
+    )
 
     out = dataset.get(0)
 

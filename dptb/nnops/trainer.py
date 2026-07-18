@@ -791,7 +791,7 @@ class Trainer(BaseTrainer):
                                     original_batch, batch_for_loss, t=zero_t
                                 )
                                 t0_ref.update(batch_info)
-                            sample_loss, sample_state = self.flow_cfm.loss(
+                            sample_loss, sample_state = self.flow_cfm.loss_on_sample(
                                 sampled, t0_ref, t0_ctx
                             )
                             key = f"validation_flow_euler_{num_steps}_loss"

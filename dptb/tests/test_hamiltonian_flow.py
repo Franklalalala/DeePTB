@@ -721,6 +721,9 @@ class _ValidationPreparedFlow:
     compatible_loss_to_legacy_keys = False
     validation_ode_steps = (1,)
 
+    def __init__(self):
+        self.loss_on_sample_calls = 0
+
     def _num_graphs(self, batch):
         return 1
 
@@ -729,6 +732,10 @@ class _ValidationPreparedFlow:
 
     def loss(self, pred, ref, ctx):
         return torch.tensor(3.0), {"validation_compatible_euler_1_loss": torch.tensor(9.0)}
+
+    def loss_on_sample(self, pred, ref, ctx):
+        self.loss_on_sample_calls += 1
+        return self.loss(pred, ref, ctx)
 
     def sample(self, model, batch, *, num_steps):
         return model(batch)
@@ -877,6 +884,7 @@ def test_validation_compatible_loss_forces_legacy_keys(monkeypatch):
     assert trainer._last_flow_validation_state[
         "validation_compatible_euler_1_loss"
     ].item() == pytest.approx(9.0)
+    assert trainer.flow_cfm.loss_on_sample_calls == 1
 
 
 def test_validation_euler_only_compatible_maps_to_legacy_loss(monkeypatch):

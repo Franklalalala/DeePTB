@@ -50,6 +50,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.data.interfaces.h0_lmdb_helper import _build_context_dataset
 from dptb.data.interfaces.p2_contract import (
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
@@ -63,6 +64,8 @@ from dptb.data.interfaces.p2_contract import (
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
     P23_RME_FINGERPRINT_KEY,
     P23_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     SAMPLE_SCHEMA_KEY,
@@ -92,6 +95,7 @@ if __package__:
     from tools.materialize_nonsoc_p2_cache import (
         MAP_SIZE,
         SCHEMA as P2_CACHE_SCHEMA,
+        _bind_physical_h0_source_fingerprint,
         _load_module,
         _open_read,
         _open_write,
@@ -102,6 +106,7 @@ else:  # pragma: no cover - exercised by the production CLI entrypoint
     from materialize_nonsoc_p2_cache import (  # type: ignore
         MAP_SIZE,
         SCHEMA as P2_CACHE_SCHEMA,
+        _bind_physical_h0_source_fingerprint,
         _load_module,
         _open_read,
         _open_write,
@@ -337,6 +342,12 @@ def _split_contracts(
                 }
             )
         split_meta = manifest_splits[split]
+        if not isinstance(split_meta, Mapping):
+            raise ValueError(f"P2 split {split!r} lacks a mapping contract.")
+        physical_h0_source = require_sha256(
+            split_meta.get("physical_h0_source_fingerprint"),
+            field=f"P2 split {split} physical_h0_source_fingerprint",
+        )
         declared_cases = split_meta.get("cases") if isinstance(split_meta, Mapping) else None
         if isinstance(declared_cases, list) and [str(value) for value in declared_cases] != cases:
             raise ValueError(f"P2 split {split!r} physical shard order differs from manifest cases.")
@@ -408,6 +419,7 @@ def _split_contracts(
             "logical_cases": (
                 split_meta.get("logical_cases") if isinstance(split_meta, Mapping) else None
             ),
+            "physical_h0_source_fingerprint": physical_h0_source,
         }
     missing_wanted = sorted(wanted - found)
     if missing_wanted:
@@ -516,7 +528,9 @@ def _validate_p23_table_audit(
     return dict(payload)
 
 
-def _configure_strict_dataset(dataset: Any, *, kind: str, source: str) -> None:
+def _configure_strict_dataset(
+    dataset: Any, *, kind: str, source: str, h0_source: str
+) -> None:
     spec = resolve_prior_field_spec(kind)
     dataset.get_Hamiltonian = True
     dataset.get_H0 = True
@@ -528,6 +542,7 @@ def _configure_strict_dataset(dataset: Any, *, kind: str, source: str) -> None:
     dataset.prefer_precomputed_p2 = True
     dataset.require_full_h_target = True
     dataset.expected_p2_source_fingerprint = source
+    dataset.expected_physical_h0_source_fingerprint = h0_source
     dataset.audit_p2_representations = True
     dataset.require_p2_blocks = True
 
@@ -544,6 +559,7 @@ def _assert_source_p2_contract(
     idp: Any,
     *,
     expected_p2_source: str,
+    expected_h0_source: str,
 ) -> None:
     if record.get(SAMPLE_SCHEMA_KEY) != P2_SAMPLE_SCHEMA:
         raise ValueError(
@@ -581,7 +597,13 @@ def _assert_source_p2_contract(
         ),
         label="P2 source record",
     )
-    assert_absolute_full_h_target_contract(dict(record))
+    assert_absolute_full_h_target_contract(
+        dict(record),
+        require_h0=True,
+        expected_physical_h0_source_fingerprint=expected_h0_source,
+    )
+    if record[PHYSICAL_H0_SOURCE_KEY] != DEDICATED_PHYSICAL_H0_SOURCE:
+        raise ValueError("Dual-prior cache requires dedicated physical-H0 blocks.")
     if record[TARGET_SOURCE_KEY] != "dedicated_full_h_blocks":
         raise ValueError("Dual-prior cache requires dedicated absolute Full-H blocks.")
     basis = mapper_basis_fingerprint(idp)
@@ -931,6 +953,7 @@ def augment_p2_record_with_p23(
     positions_bohr: np.ndarray,
     cell_bohr: np.ndarray,
     p23_source_fingerprint: str,
+    physical_h0_source_fingerprint: str,
     geometry_provenance: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return one dual-prior record without mutating the qualified P2 source."""
@@ -1082,6 +1105,7 @@ def augment_p2_record_with_p23(
         data,
         idp,
         expected_p23_source=p23_source_fingerprint,
+        expected_h0_source=physical_h0_source_fingerprint,
     )
     return dual, assembly_provenance
 
@@ -1092,6 +1116,7 @@ def _assert_dual_record_contract(
     idp: Any,
     *,
     expected_p23_source: str,
+    expected_h0_source: str,
 ) -> None:
     if record.get(SAMPLE_SCHEMA_KEY) != DUAL_PRIOR_SAMPLE_SCHEMA:
         raise ValueError("Dual prior record lacks schema v3.")
@@ -1114,7 +1139,13 @@ def _assert_dual_record_contract(
         ),
         label="dual-prior record",
     )
-    assert_absolute_full_h_target_contract(dict(record))
+    assert_absolute_full_h_target_contract(
+        dict(record),
+        require_h0=True,
+        expected_physical_h0_source_fingerprint=expected_h0_source,
+    )
+    if record[PHYSICAL_H0_SOURCE_KEY] != DEDICATED_PHYSICAL_H0_SOURCE:
+        raise ValueError("Dual-prior cache requires dedicated physical-H0 blocks.")
     p23_source = require_sha256(
         record[P23_SOURCE_FINGERPRINT_KEY], field=P23_SOURCE_FINGERPRINT_KEY
     )
@@ -1346,6 +1377,7 @@ def _strict_audit_output(
     contracts: Mapping[str, Mapping[str, Any]],
     p2_source: str,
     p23_source: str,
+    h0_sources: Mapping[str, str],
     work_root: Path,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
@@ -1357,7 +1389,12 @@ def _strict_audit_output(
             try:
                 if len(dataset) != int(contract["entries"]):
                     raise ValueError(f"Output audit {split}: dataset length mismatch.")
-                _configure_strict_dataset(dataset, kind=kind, source=source)
+                _configure_strict_dataset(
+                    dataset,
+                    kind=kind,
+                    source=source,
+                    h0_source=h0_sources[split],
+                )
                 for index in range(len(dataset)):
                     dataset.get(index)
                     _heartbeat(
@@ -1529,7 +1566,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_split = full_h_root / split
         output_lmdb = output_split / "data.0000.lmdb"
         dataset, _ = _build_context_dataset(str(input_json), str(source_split))
-        _configure_strict_dataset(dataset, kind="p2", source=p2_source)
+        source_h0 = contract["physical_h0_source_fingerprint"]
+        _configure_strict_dataset(
+            dataset, kind="p2", source=p2_source, h0_source=source_h0
+        )
         if len(dataset) != int(contract["source_total_entries"]):
             _close_dataset(dataset)
             raise ValueError(f"Source dataset {split!r} length changed.")
@@ -1589,6 +1629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     data,
                     dataset.type_mapper,
                     expected_p2_source=p2_source,
+                    expected_h0_source=source_h0,
                 )
                 symbols, positions_bohr, cell_bohr, geometry = _structure_geometry_bohr(
                     record=source_record,
@@ -1605,6 +1646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     positions_bohr=positions_bohr,
                     cell_bohr=cell_bohr,
                     p23_source_fingerprint=p23_source,
+                    physical_h0_source_fingerprint=source_h0,
                     geometry_provenance=geometry,
                 )
                 output_payload = pickle.dumps(
@@ -1667,6 +1709,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                     flush=True,
                 )
+            output_h0 = _bind_physical_h0_source_fingerprint(
+                output_env, len(split_rows), rows=split_rows
+            )
+            manifest["splits"][split][
+                "physical_h0_source_fingerprint"
+            ] = output_h0
+            _write_json(partial_path, manifest)
         finally:
             for env in source_envs.values():
                 env.close()
@@ -1689,6 +1738,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         contracts=contracts,
         p2_source=p2_source,
         p23_source=p23_source,
+        h0_sources={
+            split: manifest["splits"][split][
+                "physical_h0_source_fingerprint"
+            ]
+            for split in contracts
+        },
         work_root=work_root,
     )
     manifest["strict_loader_audit"] = audit

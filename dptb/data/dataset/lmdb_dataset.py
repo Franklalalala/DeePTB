@@ -26,13 +26,17 @@ from dptb.data.interfaces.ham_to_feature import block_to_feature
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
     H0_RESIDUAL_SEMANTICS,
     P2_BUNDLE_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
     RAW_HAMILTONIAN_SAMPLE_SCHEMA,
+    RAW_PHYSICAL_H0_SOURCE,
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
@@ -47,6 +51,8 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_present_row_aligned_fields,
     fingerprint_text_fields,
     mapper_basis_fingerprint,
+    physical_h0_dataset_fingerprint,
+    physical_h0_record_fingerprint,
     require_sha256,
     resolve_prior_field_spec,
 )
@@ -126,12 +132,95 @@ _PREPACKED_H0_BLOCK_KEYS = (
     AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY,
 )
 
+def assert_physical_h0_authority_contract(
+    data_dict: Dict[str, Any],
+    *,
+    schema: str,
+    h0_key: str = "hamiltonian_0",
+    expected_source_fingerprint: Optional[str] = None,
+) -> None:
+    """Require one explicit physical-H0 authority for Full-H supervision."""
+
+    source = data_dict.get(PHYSICAL_H0_SOURCE_KEY)
+    if schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        if source not in {None, RAW_PHYSICAL_H0_SOURCE}:
+            raise ValueError(
+                f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r} fixes physical-H0 authority "
+                f"to {RAW_PHYSICAL_H0_SOURCE!r}; got {source!r}."
+            )
+        source = RAW_PHYSICAL_H0_SOURCE
+    elif source not in {RAW_PHYSICAL_H0_SOURCE, DEDICATED_PHYSICAL_H0_SOURCE}:
+        raise ValueError(
+            "P2/dual Full-H supervision with physical H0 requires explicit "
+            f"{PHYSICAL_H0_SOURCE_KEY}={RAW_PHYSICAL_H0_SOURCE!r} or "
+            f"{DEDICATED_PHYSICAL_H0_SOURCE!r}; got {source!r}."
+        )
+
+    prepacked_h0 = [key for key in _PREPACKED_H0_BLOCK_KEYS if key in data_dict]
+    if source == RAW_PHYSICAL_H0_SOURCE:
+        raw_h0 = data_dict.get(h0_key)
+        if not isinstance(raw_h0, Mapping) or not raw_h0:
+            raise ValueError(
+                "Raw physical-H0 authority requires a non-empty physical-H0 "
+                f"block dictionary at {h0_key!r}."
+            )
+        if prepacked_h0:
+            raise ValueError(
+                "Raw physical-H0 authority must derive H0 blocks from "
+                f"{h0_key!r}; prepacked H0 block fields {prepacked_h0} are "
+                "not allowed to override that authority."
+            )
+        return
+
+    if schema not in {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}:
+        raise ValueError(
+            "Dedicated physical-H0 blocks are supported only by the P2/dual-prior "
+            f"compact schemas; got {schema!r}."
+        )
+    if h0_key in data_dict:
+        raise ValueError(
+            "Dedicated physical-H0 authority must not also expose raw "
+            f"{h0_key!r}; refusing ambiguous dual authority."
+        )
+    missing = [key for key in _PREPACKED_H0_BLOCK_KEYS if data_dict.get(key) is None]
+    if missing:
+        raise ValueError(
+            "Dedicated physical-H0 block bundle is incomplete; "
+            f"missing {missing}."
+        )
+    for field in (
+        BASIS_FINGERPRINT_KEY,
+        EDGE_GRAPH_FINGERPRINT_KEY,
+        ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+        ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+    ):
+        require_sha256(data_dict.get(field), field=field)
+    actual_source = require_sha256(
+        data_dict.get(PHYSICAL_H0_SOURCE_FINGERPRINT_KEY),
+        field=PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    )
+    if expected_source_fingerprint in {None, ""}:
+        raise ValueError(
+            "Dedicated physical-H0 authority requires an externally trusted "
+            "expected_physical_h0_source_fingerprint."
+        )
+    expected_source = require_sha256(
+        expected_source_fingerprint,
+        field="expected_physical_h0_source_fingerprint",
+    )
+    if actual_source != expected_source:
+        raise ValueError(
+            "Dedicated physical-H0 source fingerprint does not match the "
+            "externally trusted cache/source manifest."
+        )
+
 
 def assert_absolute_full_h_target_contract(
     data_dict: Dict[str, Any],
     *,
     h0_key: str = "hamiltonian_0",
     require_h0: bool = False,
+    expected_physical_h0_source_fingerprint: Optional[str] = None,
 ) -> None:
     """Require an explicit, versioned absolute-H target declaration."""
 
@@ -190,22 +279,13 @@ def assert_absolute_full_h_target_contract(
                 "Generic raw-H Full-H supervision requires a non-empty raw "
                 "'hamiltonian' block dictionary."
             )
-        if require_h0:
-            raw_h0 = data_dict.get(h0_key)
-            if not isinstance(raw_h0, Mapping) or not raw_h0:
-                raise ValueError(
-                    "Generic raw-H block-ODE supervision requires a non-empty "
-                    f"physical-H0 block dictionary at {h0_key!r}."
-                )
-            prepacked_h0 = [
-                key for key in _PREPACKED_H0_BLOCK_KEYS if key in data_dict
-            ]
-            if prepacked_h0:
-                raise ValueError(
-                    "Generic raw-H block-ODE supervision must derive physical-H0 "
-                    f"blocks from {h0_key!r}; prepacked H0 block fields "
-                    f"{prepacked_h0} are not allowed to override that authority."
-                )
+    if require_h0:
+        assert_physical_h0_authority_contract(
+            data_dict,
+            schema=schema,
+            h0_key=h0_key,
+            expected_source_fingerprint=expected_physical_h0_source_fingerprint,
+        )
     # Historical target fields are never accepted as evidence of absolute H.
     legacy = [key for key in _PREPACKED_HAMILTONIAN_TARGET_KEYS if key in data_dict]
     if (
@@ -700,6 +780,7 @@ class LMDBDataset(AtomicDataset):
     require_full_h_target = False
     require_residual_h_target = False
     expected_p2_source_fingerprint = None
+    expected_physical_h0_source_fingerprint = None
     audit_p2_representations = False
     require_p2_blocks = False
 
@@ -726,6 +807,7 @@ class LMDBDataset(AtomicDataset):
             require_full_h_target: bool = False,
             require_residual_h_target: bool = False,
             expected_p2_source_fingerprint: Optional[str] = None,
+            expected_physical_h0_source_fingerprint: Optional[str] = None,
             audit_p2_representations: bool = False,
             require_p2_blocks: bool = False,
     ):
@@ -786,6 +868,11 @@ class LMDBDataset(AtomicDataset):
             if expected_p2_source_fingerprint not in {None, ""}
             else None
         )
+        self.expected_physical_h0_source_fingerprint = (
+            str(expected_physical_h0_source_fingerprint)
+            if expected_physical_h0_source_fingerprint not in {None, ""}
+            else None
+        )
         self.audit_p2_representations = bool(audit_p2_representations)
         self.require_p2_blocks = bool(require_p2_blocks)
         if self.require_full_h_target and not self.get_Hamiltonian:
@@ -822,6 +909,7 @@ class LMDBDataset(AtomicDataset):
         # must establish the fail-closed contract for itself before reusing it.
         self._validated_record_contracts = {}
         self._validated_record_contracts_pid = os.getpid()
+        self._validated_physical_h0_dataset = None
         for file in self.info_files.keys():
             lmdb_paths = self.simple_get_lmdb_path(file)
             for lmdb_path in lmdb_paths:
@@ -878,6 +966,7 @@ class LMDBDataset(AtomicDataset):
         state["_lmdb_env_cache"] = {}
         state["_validated_record_contracts"] = {}
         state["_validated_record_contracts_pid"] = None
+        state["_validated_physical_h0_dataset"] = None
         return state
 
     def _record_contract_validation_state(self, idx: int):
@@ -925,6 +1014,44 @@ class LMDBDataset(AtomicDataset):
             logical_file = file_map[raw_idx] if len(file_map) > raw_idx else "<memory>"
             path_identity = (f"logical:{logical_file}:dataset:{id(self)}",)
         return (path_identity, record_idx), cache
+
+    def _assert_dedicated_physical_h0_dataset_fingerprint(self) -> None:
+        """Verify the externally pinned, ordered H0 content once per worker."""
+
+        expected = require_sha256(
+            getattr(self, "expected_physical_h0_source_fingerprint", None),
+            field="expected_physical_h0_source_fingerprint",
+        )
+        cached = getattr(self, "_validated_physical_h0_dataset", None)
+        cache_key = (os.getpid(), expected)
+        if cached == cache_key:
+            return
+
+        record_fingerprints = []
+        for index in range(len(self.index_map)):
+            record = self._load_data_dict(index)
+            if record.get(PHYSICAL_H0_SOURCE_KEY) != DEDICATED_PHYSICAL_H0_SOURCE:
+                raise ValueError(
+                    "A dedicated physical-H0 dataset cannot mix H0 authority modes."
+                )
+            declared = require_sha256(
+                record.get(PHYSICAL_H0_SOURCE_FINGERPRINT_KEY),
+                field=PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+            )
+            if declared != expected:
+                raise ValueError(
+                    "Dedicated physical-H0 source fingerprint differs from the "
+                    "externally trusted split commitment."
+                )
+            record_fingerprints.append(physical_h0_record_fingerprint(record))
+
+        actual = physical_h0_dataset_fingerprint(record_fingerprints)
+        if actual != expected:
+            raise ValueError(
+                "Dedicated physical-H0 block content does not match the externally "
+                "trusted split commitment."
+            )
+        self._validated_physical_h0_dataset = cache_key
 
     def invalidate_dynamic_batch_costs(self) -> None:
         super().invalidate_dynamic_batch_costs()
@@ -1037,11 +1164,23 @@ class LMDBDataset(AtomicDataset):
             "prior_spec",
             resolve_prior_field_spec(getattr(self, "prior_kind", "p2")),
         )
+        dedicated_h0 = (
+            getattr(self, "require_full_h_target", False)
+            and self.get_H0
+            and data_dict.get(PHYSICAL_H0_SOURCE_KEY)
+            == DEDICATED_PHYSICAL_H0_SOURCE
+        )
+        if dedicated_h0:
+            self._assert_dedicated_physical_h0_dataset_fingerprint()
+
         if getattr(self, "require_full_h_target", False):
             assert_absolute_full_h_target_contract(
                 data_dict,
                 h0_key=self.h0_key,
                 require_h0=bool(self.get_H0),
+                expected_physical_h0_source_fingerprint=getattr(
+                    self, "expected_physical_h0_source_fingerprint", None
+                ),
             )
         if getattr(self, "require_residual_h_target", False):
             assert_residual_h_target_contract(data_dict, h0_key=self.h0_key)
@@ -1731,6 +1870,20 @@ class LMDBDataset(AtomicDataset):
                 strict_complete_edges=False,
             )
             attach_block_tensors(atomicdata, target_h0_blocks, prefix="h0")
+
+        if dedicated_h0 and not record_contract_already_validated:
+            from dptb.data.interfaces.blockwise_tensor import validate_packed_non_soc_blocks
+
+            validate_packed_non_soc_blocks(
+                atomicdata,
+                self.type_mapper,
+                atomicdata[AtomicDataDict.NODE_H0_BLOCKS_KEY],
+                atomicdata[AtomicDataDict.EDGE_H0_BLOCKS_KEY],
+                atomicdata[AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY],
+                atomicdata[AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY],
+                label="physical H0",
+                require_symmetric_edges=True,
+            )
 
         if (
             load_prior_blocks

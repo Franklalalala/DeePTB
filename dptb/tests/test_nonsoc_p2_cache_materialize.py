@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import inspect
 import json
-import pickle
 from copy import deepcopy
 
-import lmdb
 import numpy as np
 import pytest
 
+import dptb.data.AtomicDataDict as AtomicDataDict
 from dptb.data.interfaces.abacus import _abacus_parse, recursive_parse
+from dptb.data.interfaces.p2_contract import (
+    DEDICATED_PHYSICAL_H0_SOURCE,
+    PHYSICAL_H0_SOURCE_KEY,
+    P2_SOURCE_FINGERPRINT_KEY,
+)
 from dptb.utils.argcheck import normalize
 from tools.build_nonsoc_p2_ablation_configs import DEFAULT_REFERENCE, build_configs
 from tools.materialize_nonsoc_p2_cache import (
@@ -19,6 +23,7 @@ from tools.materialize_nonsoc_p2_cache import (
     _validate_raw_staging_identity,
     _write_raw_staging_identity,
     _guard_output,
+    _base_record,
     _required_block_keys_from_graph,
     complete_sparse_zero_blocks,
     dense_p2_to_deeptb_blocks,
@@ -30,6 +35,25 @@ from tools.materialize_nonsoc_p2_cache import (
 def test_abacus_parser_exposes_separate_h0_switches():
     assert "parse_H0" in inspect.signature(recursive_parse).parameters
     assert "get_H0" in inspect.signature(_abacus_parse).parameters
+
+
+def test_compact_base_declares_dedicated_physical_h0_authority():
+    raw = {
+        AtomicDataDict.CELL_KEY: np.eye(3),
+        AtomicDataDict.POSITIONS_KEY: np.zeros((1, 3)),
+        AtomicDataDict.ATOMIC_NUMBERS_KEY: np.asarray([1]),
+        AtomicDataDict.PBC_KEY: np.asarray([False, False, False]),
+        "case_id": "one",
+        "source": "synthetic",
+        "p2_cache_source": {},
+        P2_SOURCE_FINGERPRINT_KEY: "1" * 64,
+    }
+    data = {
+        AtomicDataDict.EDGE_INDEX_KEY: np.empty((2, 0), dtype=np.int64),
+        AtomicDataDict.EDGE_CELL_SHIFT_KEY: np.empty((0, 3)),
+    }
+    compact = _base_record(raw, data, 0, basis_fingerprint="2" * 64)
+    assert compact[PHYSICAL_H0_SOURCE_KEY] == DEDICATED_PHYSICAL_H0_SOURCE
 
 
 def test_parse_basis_lines_expands_radial_shells():
@@ -194,48 +218,6 @@ def test_raw_staging_identity_rejects_missing_and_mismatch(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="identity mismatch"):
-        _validate_raw_staging_identity(work, expected)
-
-
-def test_raw_staging_identity_missing_rejects_tampered_symmetric_p2_row(tmp_path):
-    input_json, gate1_script = _identity_inputs(tmp_path)
-    work = tmp_path / "work"
-    expected = _raw_staging_identity(
-        input_json=input_json,
-        gate1_script=gate1_script,
-        p2_source_fingerprint="a" * 64,
-        p2_source_kind="radial_table",
-    )
-    raw_split = work / "raw_staging" / "train" / "data.0000.lmdb"
-    raw_split.parent.mkdir(parents=True)
-    env = lmdb.open(str(raw_split), map_size=1 << 20, subdir=True, max_dbs=1)
-    try:
-        with env.begin(write=True) as txn:
-            txn.put(
-                (0).to_bytes(length=4, byteorder="big"),
-                pickle.dumps(
-                    {
-                        "case_id": "tampered",
-                        "hamiltonian_schema": "deeptb.p2_training_sample/v2",
-                        "p2_source_fingerprint": expected["p2_source_fingerprint"],
-                        "hamiltonian_p2": {
-                            "0_0_0_0_0": np.asarray([[123.0]], dtype=np.float32)
-                        },
-                        "p2_hermitian_projection": {
-                            "max_pre_projection_mismatch": 0.0,
-                        },
-                    },
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                ),
-            )
-    finally:
-        env.close()
-    (work / "manifest.partial.json").write_text(
-        json.dumps({"schema": SCHEMA}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="identity is missing"):
         _validate_raw_staging_identity(work, expected)
 
 

@@ -13,6 +13,7 @@ import dptb.data._keys as _keys
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
@@ -20,6 +21,8 @@ from dptb.data.interfaces.p2_contract import (
     P2_SAMPLE_SCHEMA,
     P23_BUNDLE_FINGERPRINT_KEY,
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     SAMPLE_SCHEMA_KEY,
@@ -30,6 +33,8 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_present_row_aligned_fields,
     fingerprint_text_fields,
     mapper_basis_fingerprint,
+    physical_h0_dataset_fingerprint,
+    physical_h0_record_fingerprint,
 )
 from dptb.data.interfaces.p23_table import P23_VNA_ASSEMBLY_SCHEMA
 from dptb.data.transforms_upper_triangle import OrbitalMapper
@@ -62,6 +67,7 @@ def _minimal_p2_record(mapper: OrbitalMapper) -> dict:
         ),
         _keys.ATOMIC_NUMBERS_KEY: np.asarray([1, 1], dtype=np.int64),
         _keys.PBC_KEY: np.asarray([True, True, True]),
+        "case_id": "h2",
         _keys.EDGE_INDEX_KEY: graph[_keys.EDGE_INDEX_KEY].numpy(),
         _keys.EDGE_CELL_SHIFT_KEY: graph[_keys.EDGE_CELL_SHIFT_KEY].numpy(),
         _keys.NODE_P2_KEY: np.asarray([[1.0], [2.0]], dtype=np.float32),
@@ -70,6 +76,16 @@ def _minimal_p2_record(mapper: OrbitalMapper) -> dict:
         _keys.EDGE_P2_BLOCKS_KEY: np.asarray([[[0.2]], [[0.2]]], dtype=np.float32),
         _keys.NODE_P2_BLOCK_SHAPE_KEY: np.ones((2, 2), dtype=np.int64),
         _keys.EDGE_P2_BLOCK_SHAPE_KEY: np.ones((2, 2), dtype=np.int64),
+        _keys.NODE_H0_KEY: np.asarray([[0.9], [1.8]], dtype=np.float32),
+        _keys.EDGE_H0_KEY: np.asarray([[0.1], [0.1]], dtype=np.float32),
+        _keys.NODE_H0_BLOCKS_KEY: np.asarray(
+            [[[0.9]], [[1.8]]], dtype=np.float32
+        ),
+        _keys.EDGE_H0_BLOCKS_KEY: np.asarray(
+            [[[0.1]], [[0.1]]], dtype=np.float32
+        ),
+        _keys.NODE_H0_BLOCK_SHAPE_KEY: np.ones((2, 2), dtype=np.int64),
+        _keys.EDGE_H0_BLOCK_SHAPE_KEY: np.ones((2, 2), dtype=np.int64),
         _keys.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY: np.asarray(
             [[[1.4]], [[2.4]]], dtype=np.float32
         ),
@@ -81,6 +97,7 @@ def _minimal_p2_record(mapper: OrbitalMapper) -> dict:
         SAMPLE_SCHEMA_KEY: P2_SAMPLE_SCHEMA,
         TARGET_SEMANTICS_KEY: ABSOLUTE_FULL_H_SEMANTICS,
         TARGET_SOURCE_KEY: "dedicated_full_h_blocks",
+        PHYSICAL_H0_SOURCE_KEY: DEDICATED_PHYSICAL_H0_SOURCE,
         BASIS_FINGERPRINT_KEY: basis,
         P2_BUNDLE_FINGERPRINT_KEY: hashlib.sha256(b"qualified-p2-bundle").hexdigest(),
     }
@@ -92,6 +109,9 @@ def _minimal_p2_record(mapper: OrbitalMapper) -> dict:
     )
     record[FULL_H_TARGET_FINGERPRINT_KEY] = fingerprint_fields(
         record, _FULL_H_TARGET_FIELDS
+    )
+    record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY] = physical_h0_dataset_fingerprint(
+        [physical_h0_record_fingerprint(record)]
     )
     return record
 
@@ -303,9 +323,16 @@ def test_resume_identity_allows_only_declared_geometry_tolerance_upgrade():
 def test_single_record_dual_materialization_preserves_p2_and_full_h():
     mapper = OrbitalMapper({"H": ["1s"]}, method="e3tb", device="cpu")
     record = _minimal_p2_record(mapper)
-    original_p2_node = record[_keys.NODE_P2_BLOCKS_KEY].copy()
-    original_p2_edge = record[_keys.EDGE_P2_BLOCKS_KEY].copy()
-    original_target = record[_keys.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY].copy()
+    preserved_fields = (
+        _keys.NODE_P2_BLOCKS_KEY,
+        _keys.EDGE_P2_BLOCKS_KEY,
+        _keys.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY,
+        _keys.NODE_H0_KEY,
+        _keys.EDGE_H0_KEY,
+        _keys.NODE_H0_BLOCKS_KEY,
+        _keys.EDGE_H0_BLOCKS_KEY,
+    )
+    originals = {field: record[field].copy() for field in preserved_fields}
     p23_source = hashlib.sha256(b"p23-table-manifest").hexdigest()
 
     dual, stats = augment_p2_record_with_p23(
@@ -317,15 +344,16 @@ def test_single_record_dual_materialization_preserves_p2_and_full_h():
         positions_bohr=np.asarray([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
         cell_bohr=np.eye(3) * 16.0,
         p23_source_fingerprint=p23_source,
+        physical_h0_source_fingerprint=record[
+            PHYSICAL_H0_SOURCE_FINGERPRINT_KEY
+        ],
         geometry_provenance={"compact_length_unit": "angstrom"},
     )
 
     assert dual[SAMPLE_SCHEMA_KEY] == DUAL_PRIOR_SAMPLE_SCHEMA
-    np.testing.assert_array_equal(dual[_keys.NODE_P2_BLOCKS_KEY], original_p2_node)
-    np.testing.assert_array_equal(dual[_keys.EDGE_P2_BLOCKS_KEY], original_p2_edge)
-    np.testing.assert_array_equal(
-        dual[_keys.NODE_FULL_HAMIL_TARGET_BLOCKS_KEY], original_target
-    )
+    assert dual[PHYSICAL_H0_SOURCE_KEY] == DEDICATED_PHYSICAL_H0_SOURCE
+    for field, original in originals.items():
+        np.testing.assert_array_equal(dual[field], original)
     np.testing.assert_allclose(
         dual[_keys.NODE_P23_BLOCKS_KEY],
         np.asarray([[[1.5]], [[1.75]]], dtype=np.float32),
@@ -361,6 +389,7 @@ def test_single_record_dual_materialization_preserves_p2_and_full_h():
             _graph(),
             mapper,
             expected_p23_source=p23_source,
+            expected_h0_source=dual[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY],
         )
 
 
@@ -394,6 +423,7 @@ def test_aggregate_physical_cases_must_equal_numeric_shard_path_order(tmp_path):
                 "physical_cases": ["case_b", "case_a"],
                 "records": 2,
                 "logical_cases": 2,
+                "physical_h0_source_fingerprint": "1" * 64,
             }
         }
     }
@@ -461,9 +491,10 @@ def test_strict_output_audit_uses_fresh_dataset_per_prior_kind(
         built.append(dataset)
         return dataset, None
 
-    def fake_configure_strict_dataset(dataset, *, kind, source):
+    def fake_configure_strict_dataset(dataset, *, kind, source, h0_source):
         dataset.kind = kind
         dataset.source = source
+        dataset.h0_source = h0_source
 
     def fake_close_dataset(dataset):
         dataset.closed = True
@@ -484,6 +515,7 @@ def test_strict_output_audit_uses_fresh_dataset_per_prior_kind(
             contracts={"train": {"entries": 1}},
             p2_source="2" * 64,
             p23_source="3" * 64,
+            h0_sources={"train": "4" * 64},
             work_root=tmp_path,
         )
 

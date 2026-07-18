@@ -22,6 +22,28 @@ from .flow_time import FlowTimeConditioner
 
 @Embedding.register("lem_moe_v3_h0")
 class LemMoEV3H0(LemMoEV3):
+    supports_full_block_edge_coverage = True
+
+    @staticmethod
+    def _require_integral_metadata(
+        value: Any,
+        *,
+        device: torch.device,
+        label: str,
+    ) -> torch.Tensor:
+        tensor = torch.as_tensor(value, device=device)
+        if tensor.dtype not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError(
+                f"Block-space ODE requires integral {label}; got dtype={tensor.dtype}."
+            )
+        return tensor.reshape(-1)
+
     def __init__(
         self,
         use_h0_init: bool = True,
@@ -45,11 +67,20 @@ class LemMoEV3H0(LemMoEV3):
         flow_time_allow_missing: bool = True,
         flow_time_missing_value: float = 0.0,
         flow_time_key_weights: Any = None,
+        require_full_block_edge_coverage: bool = False,
         env_embed_multiplicity: int = 32,
         **kwargs: Any,
     ):
         super().__init__(env_embed_multiplicity=env_embed_multiplicity, **kwargs)
         self.use_h0_init = use_h0_init
+        self.require_full_block_edge_coverage = bool(require_full_block_edge_coverage)
+        if self.require_full_block_edge_coverage and (
+            not self.use_h0_init or self.output_route_name != "h_b0"
+        ):
+            raise ValueError(
+                "require_full_block_edge_coverage=true is supported only by "
+                "the LemMoEV3H0 H-B0 route with use_h0_init=true."
+            )
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
         self.flow_time_condition_edges = bool(flow_time_condition_edges)
         self._edge_graph_invariant_checked = False
@@ -87,6 +118,64 @@ class LemMoEV3H0(LemMoEV3):
                 device=self.device,
             )
 
+    @staticmethod
+    def _require_ordered_full_block_edge_coverage(
+        edge_index: torch.Tensor,
+        active_edges: torch.Tensor,
+        cutoff_coeffs: torch.Tensor,
+        batch: torch.Tensor,
+        split_sizes: Any,
+        num_systems: int,
+    ) -> None:
+        """Certify the exact rows consumed by the H-B0 head and scatter."""
+        n_edges = int(edge_index.shape[1])
+        active_edges = LemMoEV3H0._require_integral_metadata(
+            active_edges,
+            device=edge_index.device,
+            label="active-edge indices",
+        ).to(dtype=torch.long)
+        expected = torch.arange(n_edges, device=edge_index.device, dtype=torch.long)
+        if not torch.equal(active_edges, expected):
+            raise ValueError(
+                "Block-space ODE requires the ordered full H-B0 active-edge range "
+                f"0..{n_edges - 1}; got {active_edges[:16].detach().cpu().tolist()} "
+                f"(total={int(active_edges.numel())})."
+            )
+
+        cutoff_coeffs = torch.as_tensor(
+            cutoff_coeffs, device=edge_index.device
+        ).reshape(-1)
+        valid = torch.isfinite(cutoff_coeffs) & (cutoff_coeffs > 0)
+        if cutoff_coeffs.numel() != n_edges or not bool(valid.all().item()):
+            invalid = torch.nonzero(~valid, as_tuple=False).flatten()
+            raise ValueError(
+                "Block-space ODE requires one finite, strictly positive H-B0 "
+                f"cutoff coefficient per graph edge; got shape={tuple(cutoff_coeffs.shape)} "
+                f"and invalid indices={invalid[:16].detach().cpu().tolist()}."
+            )
+        edge_batch = batch[edge_index[0]]
+        if not torch.equal(edge_batch, batch[edge_index[1]]):
+            raise ValueError(
+                "Block-space ODE requires every H-B0 edge to stay within one "
+                "batch graph; source and destination graph indices disagree."
+            )
+        if split_sizes is not None:
+            split_sizes = LemMoEV3H0._require_integral_metadata(
+                split_sizes,
+                device=edge_index.device,
+                label="active-edge split sizes",
+            ).to(dtype=torch.long)
+            expected_sizes = torch.bincount(edge_batch, minlength=int(num_systems))
+            if split_sizes.numel() != int(num_systems) or not torch.equal(
+                split_sizes, expected_sizes
+            ):
+                raise ValueError(
+                    "Block-space ODE active-edge split sizes must exactly match "
+                    "the graph ownership of the ordered full edge range; "
+                    f"expected={expected_sizes.detach().cpu().tolist()}, "
+                    f"got={split_sizes.detach().cpu().tolist()}."
+                )
+
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         if not self.use_h0_init:
             return super().forward(data)
@@ -122,6 +211,12 @@ class LemMoEV3H0(LemMoEV3):
         precomputed_active_edges = data.get(_keys.LEM_ACTIVE_EDGES_KEY, None)
         precomputed_cutoff_coeffs = data.get(_keys.LEM_CUTOFF_COEFFS_KEY, None)
         precomputed_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
+        if self.require_full_block_edge_coverage and precomputed_active_edges is not None:
+            precomputed_active_edges = self._require_integral_metadata(
+                precomputed_active_edges,
+                device=edge_index.device,
+                label="active-edge indices",
+            ).to(dtype=torch.long)
         if precomputed_cutoff_coeffs is not None and edge_length.requires_grad:
             raise RuntimeError(
                 "Precomputed LEM cutoff coefficients cannot be used when edge_length requires gradients. "
@@ -138,6 +233,15 @@ class LemMoEV3H0(LemMoEV3):
             precomputed_active_edges,
             precomputed_cutoff_coeffs,
         )
+        if self.require_full_block_edge_coverage:
+            self._require_ordered_full_block_edge_coverage(
+                edge_index,
+                active_edges,
+                cutoff_coeffs,
+                batch,
+                precomputed_split_sizes,
+                int(coeffs.shape[0]),
+            )
         if self.flow_time_conditioner is not None:
             node_features = self.flow_time_conditioner(node_features, data)
             if self.flow_time_condition_edges:
@@ -246,15 +350,6 @@ class LemMoEV3H0(LemMoEV3):
                     node_shapes=node_shapes,
                     edge_shapes=edge_shapes,
                 ),
-            )
-            # The block endpoint canvas is zero-initialized and only rows in
-            # ``active_edges`` receive model predictions.  Keep that coverage
-            # explicit so block-space flows can reject unsupervised/inactive
-            # graph edges instead of treating those zeros as physical output.
-            # This is deliberately separate from the reusable LEM input
-            # metadata cleared below.
-            data[_keys.BLOCK_PRED_ACTIVE_EDGES_KEY] = (
-                active_edges.detach().to(dtype=torch.long).reshape(-1).clone()
             )
             data.pop(_keys.LEM_ACTIVE_EDGES_KEY, None)
             data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
