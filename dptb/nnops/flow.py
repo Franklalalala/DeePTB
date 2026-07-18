@@ -21,6 +21,7 @@ import torch
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.interfaces.blockwise_tensor import (
     BlockTensorResult,
+    attach_prediction_block_tensors,
     block_mask_from_shapes,
     strict_reverse_edge_index,
 )
@@ -54,6 +55,13 @@ _BLOCK_ODE_OUTPUT_ONLY_KEYS = (
     _keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
     _keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
 )
+_LEM_INPUT_SIDECAR_KEYS = (
+    _keys.LEM_ACTIVE_EDGES_KEY,
+    _keys.LEM_CUTOFF_COEFFS_KEY,
+    _keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY,
+)
+_MetricStats = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+_WeightedMetricStats = Tuple[Tuple[_MetricStats, float], ...]
 
 
 class HamiltonianCFM:
@@ -1686,6 +1694,10 @@ class HamiltonianCFM:
         return tuple(dict.fromkeys(keys))
 
     @staticmethod
+    def _missing_keys(data: AtomicDataDict.Type, keys: Tuple[str, ...]) -> list[str]:
+        return [key for key in keys if key not in data]
+
+    @staticmethod
     def _clone_sidecar_value(value: Any) -> Any:
         return value.clone() if torch.is_tensor(value) else copy.deepcopy(value)
 
@@ -1729,11 +1741,9 @@ class HamiltonianCFM:
         *,
         step: int,
     ) -> None:
-        missing = [
-            key
-            for key in (self.node_output_key, self.edge_output_key)
-            if key not in prediction
-        ]
+        missing = self._missing_keys(
+            prediction, (self.node_output_key, self.edge_output_key)
+        )
         if missing:
             raise ValueError(
                 f"Block-space ODE step {step} is missing fresh model output keys={missing}."
@@ -1812,11 +1822,9 @@ class HamiltonianCFM:
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tuple[BlockTensorResult, float]:
-        missing = [
-            key
-            for key in (node_key, edge_key, node_shape_key, edge_shape_key)
-            if key not in field_data
-        ]
+        missing = self._missing_keys(
+            field_data, (node_key, edge_key, node_shape_key, edge_shape_key)
+        )
         if missing:
             raise KeyError(f"Block-space ODE requires {label} blocks and shapes; missing keys={missing}.")
         raw_node = self._require_real_finite_tensor(
@@ -1875,31 +1883,29 @@ class HamiltonianCFM:
         node_target = ref_data.get(self.node_target_key, None)
         edge_target = ref_data.get(self.edge_target_key, None)
         if self.block_ode:
-            missing_endpoint_fields = [
-                key
-                for key in (
+            missing_endpoint_fields = self._missing_keys(
+                ref_data,
+                (
                     self.node_block_target_key,
                     self.edge_block_target_key,
                     self.node_block_shape_key,
                     self.edge_block_shape_key,
-                )
-                if key not in ref_data
-            ]
+                ),
+            )
             if missing_endpoint_fields:
                 raise KeyError(
                     "Block-space ODE requires explicit endpoint blocks and shapes; "
                     f"missing keys={missing_endpoint_fields}."
                 )
-            missing_h0_fields = [
-                key
-                for key in (
+            missing_h0_fields = self._missing_keys(
+                data,
+                (
                     self.node_h0_block_key,
                     self.edge_h0_block_key,
                     self.node_h0_block_shape_key,
                     self.edge_h0_block_shape_key,
-                )
-                if key not in data
-            ]
+                ),
+            )
             if missing_h0_fields:
                 raise KeyError(
                     "Block-space ODE requires physical H0 blocks and shapes; "
@@ -2357,15 +2363,10 @@ class HamiltonianCFM:
         mask: torch.Tensor,
         loss_type: str,
         weights: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mask_f = mask.to(device=diff.device, dtype=diff.dtype)
-        count = mask_f.sum()
-        if weights is None:
-            weights_f = torch.ones_like(diff)
-        else:
-            weights_f = weights.to(device=diff.device, dtype=diff.dtype)
-            weights_f = weights_f.reshape((-1,) + (1,) * (diff.ndim - 1))
-            weights_f = weights_f.expand_as(diff)
+    ) -> _MetricStats:
+        mask_f, weights_f, count = HamiltonianCFM._metric_inputs(
+            diff, mask, weights
+        )
         if loss_type == "mse":
             square_sum = (diff.square() * mask_f * weights_f).sum()
             metric = torch.where(
@@ -2385,21 +2386,34 @@ class HamiltonianCFM:
         return metric, abs_sum, sq_sum, count
 
     @staticmethod
-    def _legacy_metric_stats(
+    def _metric_inputs(
         diff: torch.Tensor,
         mask: torch.Tensor,
-        loss_type: str,
-        weights: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Frozen pre-block-ODE component metric from parent ``e7e5410``."""
+        weights: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Normalize the shared mask, weight, and raw-count metric inputs."""
         mask_f = mask.to(device=diff.device, dtype=diff.dtype)
-        count = mask_f.sum().clamp_min(1.0)
+        count = mask_f.sum()
         if weights is None:
             weights_f = torch.ones_like(diff)
         else:
             weights_f = weights.to(device=diff.device, dtype=diff.dtype)
             weights_f = weights_f.reshape((-1,) + (1,) * (diff.ndim - 1))
             weights_f = weights_f.expand_as(diff)
+        return mask_f, weights_f, count
+
+    @staticmethod
+    def _legacy_metric_stats(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+        loss_type: str,
+        weights: Optional[torch.Tensor] = None,
+    ) -> _MetricStats:
+        """Frozen pre-block-ODE component metric from parent ``e7e5410``."""
+        mask_f, weights_f, count = HamiltonianCFM._metric_inputs(
+            diff, mask, weights
+        )
+        count = count.clamp_min(1.0)
         if loss_type == "mse":
             numerator = (diff.square() * mask_f * weights_f).sum()
             metric = numerator / count
@@ -2433,13 +2447,7 @@ class HamiltonianCFM:
 
     def _reduce_component_stats(
         self,
-        components: Tuple[
-            Tuple[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                float,
-            ],
-            ...,
-        ],
+        components: _WeightedMetricStats,
     ) -> torch.Tensor:
         """Apply the configured node/edge reduction to raw metric statistics.
 
@@ -2452,11 +2460,7 @@ class HamiltonianCFM:
         if not components:
             raise ValueError("At least one loss component is required.")
         if self.component_reduction == "equal_components":
-            total = None
-            for stats, weight in components:
-                weighted = float(weight) * stats[0]
-                total = weighted if total is None else total + weighted
-            return total
+            return self._weighted_component_metric_sum(components)
 
         primary_sum = square_sum = count = None
         for stats, _weight in components:
@@ -2465,25 +2469,25 @@ class HamiltonianCFM:
             count = stats[3] if count is None else count + stats[3]
         return self._global_metric(primary_sum, square_sum, count, self.loss_type)
 
+    @staticmethod
+    def _weighted_component_metric_sum(
+        components: _WeightedMetricStats,
+    ) -> torch.Tensor:
+        total = None
+        for stats, weight in components:
+            weighted = float(weight) * stats[0]
+            total = weighted if total is None else total + weighted
+        return total
+
     def _reduce_legacy_component_stats(
         self,
-        components: Tuple[
-            Tuple[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                float,
-            ],
-            ...,
-        ],
+        components: _WeightedMetricStats,
     ) -> torch.Tensor:
         """Reproduce the parent component-first reduction for legacy routes."""
         if not components:
             raise ValueError("At least one loss component is required.")
         if self.component_reduction == "equal_components":
-            total = None
-            for stats, weight in components:
-                weighted = float(weight) * stats[0]
-                total = weighted if total is None else total + weighted
-            return total
+            return self._weighted_component_metric_sum(components)
 
         numerator = count = None
         for stats, weight in components:
@@ -2672,16 +2676,15 @@ class HamiltonianCFM:
             raise RuntimeError("Block-space ODE codec was not constructed.")
         topology_sidecar = self._snapshot_block_topology(state)
         self._restore_block_topology(state, topology_sidecar)
-        missing_h0_fields = [
-            key
-            for key in (
+        missing_h0_fields = self._missing_keys(
+            state,
+            (
                 self.node_h0_block_key,
                 self.edge_h0_block_key,
                 self.node_h0_block_shape_key,
                 self.edge_h0_block_shape_key,
-            )
-            if key not in state
-        ]
+            ),
+        )
         if missing_h0_fields:
             raise KeyError(
                 "Block-space ODE sampling requires physical H0 blocks and shapes; "
@@ -2701,32 +2704,22 @@ class HamiltonianCFM:
             device=raw_node_h0.device,
             dtype=self.dtype,
         )
-        block_current = h0_blocks
         accumulator_dtype = self.dtype
-        block_current = BlockTensorResult(
-            block_current.node_blocks.to(dtype=accumulator_dtype),
-            block_current.edge_blocks.to(dtype=accumulator_dtype),
-            block_current.node_shapes,
-            block_current.edge_shapes,
-        )
         h0_blocks = BlockTensorResult(
             h0_blocks.node_blocks.to(dtype=accumulator_dtype),
             h0_blocks.edge_blocks.to(dtype=accumulator_dtype),
             h0_blocks.node_shapes,
             h0_blocks.edge_shapes,
         )
+        block_current = h0_blocks
         self._drop_block_authority_fields(state)
-        lem_metadata_keys = (
-            _keys.LEM_ACTIVE_EDGES_KEY,
-            _keys.LEM_CUTOFF_COEFFS_KEY,
-            _keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY,
-        )
+        output_only_keys = self._block_ode_output_only_keys()
         # LemMoEV3H0 consumes and deletes these input-side accelerators.  Keep
         # them outside the mutable rollout state and inject an unchanged copy at
         # every model call so a precomputed active set cannot drift on step 2+.
         lem_sidecar = {
             key: state.pop(key)
-            for key in lem_metadata_keys
+            for key in _LEM_INPUT_SIDECAR_KEYS
             if key in state
         }
         times = torch.linspace(
@@ -2767,7 +2760,7 @@ class HamiltonianCFM:
             model_input = {
                 key: value.clone() if torch.is_tensor(value) else value
                 for key, value in state.items()
-                if key not in self._block_ode_output_only_keys()
+                if key not in output_only_keys
             }
             self._restore_block_topology(
                 model_input, topology_sidecar, clone_values=True
@@ -2783,7 +2776,7 @@ class HamiltonianCFM:
             merged = state.copy()
             merged.update(prediction)
             self._restore_block_topology(merged, topology_sidecar)
-            for key in lem_metadata_keys:
+            for key in _LEM_INPUT_SIDECAR_KEYS:
                 merged.pop(key, None)
             raw_node_endpoint = self._require_real_finite_tensor(
                 prediction[self.node_output_key],
@@ -2825,10 +2818,14 @@ class HamiltonianCFM:
         if self.overwrite_feature_keys:
             state[self.node_target_key] = node_final_rme
             state[self.edge_target_key] = edge_final_rme
-        state[self.node_output_key] = block_current.node_blocks
-        state[self.edge_output_key] = block_current.edge_blocks
-        state["node_hamil_block_shape"] = block_current.node_shapes
-        state["edge_hamil_block_shape"] = block_current.edge_shapes
+        attach_prediction_block_tensors(
+            state,
+            block_current,
+            node_key=self.node_output_key,
+            edge_key=self.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
         state[self.flow_time_key] = torch.ones(
             num_graphs, device=block_current.node_blocks.device, dtype=accumulator_dtype
         )
