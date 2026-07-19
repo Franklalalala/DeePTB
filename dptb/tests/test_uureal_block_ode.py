@@ -4,6 +4,7 @@ import copy
 
 import pytest
 import torch
+from e3nn import o3
 
 from dptb.data import _keys
 from dptb.data.interfaces.blockwise_tensor import (
@@ -12,6 +13,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 )
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.embedding.lem_moe_v3_h0_helpers import DirectUuRealBlockProjector
+from dptb.nn.hamiltonian import E3Hamiltonian
 from dptb.nnops.block_flow_codec import BlockStateCodec
 from dptb.nnops.flow import HamiltonianCFM
 from dptb.utils.argcheck import validate_block_ode_contract
@@ -27,6 +29,32 @@ def _mapper():
     )
     mapper.get_irreps()
     return mapper
+
+
+def _uureal_mapper(basis, *, dtype=torch.float64):
+    mapper = OrbitalMapper(
+        basis,
+        method="e3tb",
+        has_soc=True,
+        nextham_uureal_mask=True,
+        full_soc_prediction=False,
+    )
+    mapper.get_irreps()
+    return mapper
+
+
+def _nonscalar_norm(irreps: o3.Irreps, coords: torch.Tensor) -> torch.Tensor:
+    """L2 norm of every non-``0e`` coordinate of a coupled-RME vector."""
+    pieces = []
+    offset = 0
+    for mul, ir in irreps:
+        width = mul * ir.dim
+        if ir.l != 0:
+            pieces.append(coords[offset:offset + width])
+        offset += width
+    if not pieces:
+        return coords.new_zeros(())
+    return torch.cat(pieces).norm()
 
 
 def _record(mapper):
@@ -99,23 +127,101 @@ def _flow(mapper):
     )
 
 
-def test_mapper_plan_matches_canonical_feature_lineage_and_zero_is_bit_exact():
+def test_direct_projector_inverts_e3hamiltonian_forward_cgbasis():
+    """The AO-block contraction is the exact inverse of E3Hamiltonian forward CG.
+
+    Independent oracle: E3Hamiltonian owns the production RME->block forward CG
+    (``cgbasis[pairtype] = wigner_3j(l1,l2,L)*sqrt(2L+1)``).  Expanding a random
+    coupled-RME vector with that oracle and contracting the resulting AO block
+    with the projector must recover the same RME (in the projector's sorted irrep
+    order) to fp64 machine precision -- proving the projector performs a genuine
+    product->coupled CG decomposition, not a flatten/gather.
+    """
+    mapper = _uureal_mapper({"C": "1p"})
+    irreps_in = mapper.get_irreps().sort()[0].simplify()
+    projector = DirectUuRealBlockProjector(mapper, irreps_in, dtype=torch.float64, device="cpu")
+    atom_types = torch.tensor([[mapper.chemical_symbol_to_type["C"]]])
+    p_slice = mapper.orbital_maps["C"]["1p"]
+
+    oracle = E3Hamiltonian(
+        idp=OrbitalMapper({"C": "1p"}, method="e3tb"),
+        decompose=False,
+        dtype=torch.float64,
+        device="cpu",
+    )
+    cg = oracle.cgbasis["p-p"].to(torch.float64)  # (3, 3, 9) forward CG
+    torch.manual_seed(0)
+    rme = torch.randn(int(mapper.reduced_matrix_element), dtype=torch.float64)
+    forward_block = torch.zeros(1, projector.canvas, projector.canvas, dtype=torch.float64)
+    forward_block[0, p_slice, p_slice] = torch.einsum("ijr,r->ij", cg, rme)
+
+    recovered = projector._contract(forward_block, atom_types, projector.node_plan)[0]
+    expected = rme.index_select(0, projector.sort_index)
+    assert torch.allclose(recovered, expected, atol=1e-10, rtol=0.0)
+
+
+def test_direct_projector_pp_onsite_scalar_has_zero_nonscalar_channels():
+    """Review counterexample: a pure-scalar p-p block has zero non-scalar RME.
+
+    A ``p-p`` onsite block equal to the 3x3 identity is a pure rotational scalar
+    (the ``0e`` trace channel).  A correct inverse-CG must therefore leave every
+    ``1e``/``2e`` coordinate exactly zero.  The pre-fix flatten/gather produced a
+    non-scalar norm of ~1.414 here; the CG contraction produces zero.
+    """
+    mapper = _uureal_mapper({"C": "1p"})
+    irreps_in = mapper.get_irreps().sort()[0].simplify()
+    projector = DirectUuRealBlockProjector(mapper, irreps_in, dtype=torch.float64, device="cpu")
+    atom_types = torch.tensor([[mapper.chemical_symbol_to_type["C"]]])
+    p_slice = mapper.orbital_maps["C"]["1p"]
+
+    block = torch.zeros(1, projector.canvas, projector.canvas, dtype=torch.float64)
+    block[0, p_slice, p_slice] = torch.eye(3, dtype=torch.float64)
+    coupled = projector._contract(block, atom_types, projector.node_plan)[0]
+
+    assert _nonscalar_norm(irreps_in, coupled) <= 1e-10
+    # Non-vacuity: the scalar (trace) channel is genuinely populated.
+    assert coupled.norm() > 1.0
+
+
+def test_direct_projector_is_so3_rotation_covariant():
+    """Rotating the AO block equals rotating the coupled output by Wigner-D.
+
+    Independent oracle: e3nn Wigner-D of the AO shells (``1x0e+1x1o`` canvas) and
+    of the coupled ``irreps_in``.  For a random proper rotation the two paths --
+    contract(D_AO . B . D_AO^T) and D_irreps . contract(B) -- must agree to fp64
+    machine precision.  A flatten/gather over product coordinates fails this.
+    """
+    mapper = _uureal_mapper({"C": "1s1p"})
+    irreps_in = mapper.get_irreps().sort()[0].simplify()
+    projector = DirectUuRealBlockProjector(mapper, irreps_in, dtype=torch.float64, device="cpu")
+    atom_types = torch.tensor([[mapper.chemical_symbol_to_type["C"]]])
+
+    # e3nn's D_from_matrix routes angle intermediates through the *default* dtype,
+    # so fp64 covariance requires a fp64 default (else it caps out near 1e-7).
+    previous_default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        torch.manual_seed(0)
+        rotation = o3.rand_matrix(dtype=torch.float64)  # proper SO(3), machine-eps orthogonal
+        d_ao = o3.Irreps("1x0e+1x1o").D_from_matrix(rotation)  # canvas 4x4
+        d_irreps = irreps_in.D_from_matrix(rotation)
+
+        block = torch.randn(1, projector.canvas, projector.canvas, dtype=torch.float64)
+        rotated = (d_ao @ block[0] @ d_ao.transpose(-1, -2)).unsqueeze(0)
+
+        lhs = projector._contract(rotated, atom_types, projector.node_plan)[0]
+        rhs = d_irreps @ projector._contract(block, atom_types, projector.node_plan)[0]
+        assert torch.allclose(lhs, rhs, atol=1e-10, rtol=0.0)
+    finally:
+        torch.set_default_dtype(previous_default)
+
+
+def test_direct_projector_zero_is_bit_exact():
     mapper = _mapper()
     data = _record(mapper)
     projector = DirectUuRealBlockProjector(
         mapper, mapper.get_irreps().sort()[0].simplify(), dtype=torch.float32, device="cpu"
     )
-    canonical_node, canonical_edge = block_tensors_to_feature_tensors(
-        data,
-        mapper,
-        node_blocks=data["node_delta_hamil_blocks"],
-        edge_blocks=data["edge_delta_hamil_blocks"],
-    )
-    gathered_node = projector._gather(data["node_delta_hamil_blocks"], data["atom_types"], projector.node_plan)
-    gathered_edge = projector._gather(data["edge_delta_hamil_blocks"], data["edge_type"], projector.edge_plan)
-    assert torch.equal(gathered_node, canonical_node.index_select(1, projector.sort_index))
-    assert torch.equal(gathered_edge, canonical_edge.index_select(1, projector.sort_index))
-
     zero = copy.deepcopy(data)
     zero[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = torch.zeros_like(data["node_delta_hamil_blocks"])
     zero[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = torch.zeros_like(data["edge_delta_hamil_blocks"])

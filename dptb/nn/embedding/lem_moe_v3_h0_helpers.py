@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
 from e3nn import o3
-from e3nn.o3 import Linear
+from e3nn.o3 import Linear, wigner_3j
 from torch_runstats.scatter import scatter
 
 from dptb.data import AtomicDataDict, _keys
@@ -18,6 +19,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     mapper_max_norb,
     onsite_feature_slices,
 )
+from dptb.utils.constants import anglrMId
 
 
 # Keep H0 tensors as first-class node/edge fields once the dataset starts
@@ -39,17 +41,81 @@ register_fields(
 log = logging.getLogger(__name__)
 
 
+def _shell_angular_momentum(label: str) -> int:
+    """Return the angular momentum ``l`` of an AO shell label such as ``2p``."""
+    letters = re.findall(r"[A-Za-z]", str(label))
+    if not letters:
+        raise ValueError(f"Cannot parse angular momentum from orbital label {label!r}.")
+    key = letters[-1].lower()
+    if key not in anglrMId:
+        raise ValueError(f"Unsupported AO shell letter {key!r} in label {label!r}.")
+    return int(anglrMId[key])
+
+
+def _build_uureal_cg_change_of_basis(idp, *, dtype, device) -> torch.Tensor:
+    """Fixed AO-product -> coupled-RME change of basis in the raw orbpair layout.
+
+    For every directed orbital-shell pair ``(l1,l2)`` the flattened AO sub-block
+    (product basis, row-major ``i*w+j``) is contracted to coupled reduced matrix
+    elements with the same ``wigner_3j(l1,l2,L)*sqrt(2L+1)`` convention that
+    :class:`~dptb.nn.hamiltonian.E3Hamiltonian` uses for the *forward* RME->block
+    expansion.  The result is one block-diagonal ``[rme, rme]`` matrix ``C`` with
+    ``coupled = C @ product``; because the complete set of coupled angular momenta
+    is an orthonormal basis of the product space, ``C`` is exactly the inverse of
+    that forward expansion.  It is species-independent: the raw orbpair layout is
+    shared by every atom/bond type (per-type validity is handled by the gather
+    plans), so a single shared matrix suffices.
+    """
+    ensure_spatial_block_mapper(idp)
+    rme = int(idp.reduced_matrix_element)
+    change_of_basis = torch.zeros((rme, rme), dtype=dtype, device=device)
+    for pair, feat in idp.orbpair_maps.items():
+        left, _, right = str(pair).partition("-")
+        l1 = _shell_angular_momentum(left)
+        l2 = _shell_angular_momentum(right)
+        h, w = 2 * l1 + 1, 2 * l2 + 1
+        width = int(feat.stop - feat.start)
+        if width != h * w:
+            raise RuntimeError(
+                f"orbpair {pair!r} feature width {width} != AO product dim {h * w}."
+            )
+        cg = torch.cat(
+            [
+                wigner_3j(l1, l2, ell, dtype=dtype, device=device)
+                * float(2 * ell + 1) ** 0.5
+                for ell in range(abs(l1 - l2), l1 + l2 + 1)
+            ],
+            dim=-1,
+        )  # (h, w, n_rme)
+        # coupled[r] = sum_{i,j} cg[i,j,r] * product[i*w + j]
+        block = cg.reshape(h * w, width).transpose(0, 1)  # (n_rme, h*w): [r, i*w+j]
+        change_of_basis[feat.start:feat.stop, feat.start:feat.stop] = block
+    return change_of_basis
+
+
 def _sorted_irrep_coordinate_index(idp, *, device=None) -> tuple[o3.Irreps, torch.Tensor]:
-    """Map mapper/raw orbpair coordinates to H0Init's sorted irrep layout."""
+    """Map raw orbpair coordinates to H0Init's sorted irrep layout.
+
+    Built from first principles so the returned permutation and the returned
+    ``Irreps`` are guaranteed consistent: raw terms are stably sorted by irrep,
+    the sorted term coordinate ranges are concatenated into the gather index, and
+    the same sorted term order defines the (simplified) irreps.  ``raw[index]``
+    therefore transforms exactly as ``sorted_irreps`` -- a prerequisite for the
+    equivariant linear that consumes it.  (Deriving the index from
+    ``Irreps.sort().p`` instead mixes up unequal irreps into shared multiplicity
+    slots for multi-shell bases and breaks rotation covariance.)
+    """
     raw = idp.get_irreps()
-    sorted_result = raw.sort()
     raw_slices = raw.slices()
+    order = sorted(range(len(raw)), key=lambda term: raw[term].ir)
     coordinate_order: list[int] = []
-    for term_index in sorted_result.p:
-        sli = raw_slices[int(term_index)]
+    sorted_terms: list[tuple[int, o3.Irrep]] = []
+    for term_index in order:
+        sli = raw_slices[term_index]
         coordinate_order.extend(range(int(sli.start), int(sli.stop)))
+        sorted_terms.append((int(raw[term_index].mul), raw[term_index].ir))
     index = torch.tensor(coordinate_order, dtype=torch.long, device=device)
-    sorted_irreps = sorted_result.irreps.simplify()
+    sorted_irreps = o3.Irreps(sorted_terms).simplify()
     if index.numel() != int(idp.reduced_matrix_element):
         raise RuntimeError(
             "uu_real mapper irrep permutation width disagrees with reduced_matrix_element: "
@@ -59,12 +125,18 @@ def _sorted_irrep_coordinate_index(idp, *, device=None) -> tuple[o3.Irreps, torc
 
 
 class DirectUuRealBlockProjector(torch.nn.Module):
-    """Bias-free mapper-derived AO-block contraction into hidden irreps.
+    """Bias-free AO-block Clebsch-Gordan contraction into hidden irreps.
 
-    The plans gather only mapper-valid shell coordinates from each padded block,
-    apply the mapper's raw->sorted irrep permutation, and use separate node/edge
-    equivariant linear maps. No canonical block inverse or H0/full-H block
-    materialization occurs in the hot path.
+    Each padded AO block is a *product-basis* tensor.  Per directed orbital-shell
+    pair the plan gathers the mapper-valid ``(2l1+1)(2l2+1)`` sub-block entries,
+    a fixed ``wigner_3j(l1,l2,L)*sqrt(2L+1)`` change of basis contracts them into
+    *coupled* reduced matrix elements (the exact inverse of E3Hamiltonian's
+    forward RME->block expansion), the mapper's raw->sorted irrep permutation is
+    applied, and only then does a separate node/edge equivariant linear mix the
+    multiplicities.  Feeding raw product coordinates straight into the equivariant
+    linear -- as a plain flatten/gather would -- is not rotation covariant; the CG
+    contraction is what restores covariance.  No canonical block inverse or
+    H0/full-H block materialization occurs in the hot path.
     """
 
     def __init__(self, idp, irreps_out, *, dtype, device) -> None:
@@ -80,6 +152,11 @@ class DirectUuRealBlockProjector(torch.nn.Module):
         self.irreps_in = irreps_in
         self.irreps_out = o3.Irreps(irreps_out)
         self.register_buffer("sort_index", sort_index, persistent=True)
+        self.register_buffer(
+            "cg_change_of_basis",
+            _build_uureal_cg_change_of_basis(idp, dtype=dtype, device=device),
+            persistent=True,
+        )
 
         node_plan = torch.full(
             (len(idp.type_names), int(idp.reduced_matrix_element)),
@@ -126,7 +203,10 @@ class DirectUuRealBlockProjector(torch.nn.Module):
             internal_weights=True, biases=False,
         ).to(dtype=dtype, device=device)
 
-    def _gather(self, blocks: torch.Tensor, types: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
+    def _gather_product(
+        self, blocks: torch.Tensor, types: torch.Tensor, plan: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather mapper-valid AO-product entries into the raw orbpair layout."""
         if blocks.ndim != 3 or tuple(blocks.shape[-2:]) != (self.canvas, self.canvas):
             raise ValueError(
                 "uu_real residual blocks must use the mapper canvas "
@@ -135,8 +215,21 @@ class DirectUuRealBlockProjector(torch.nn.Module):
         selected = plan.index_select(0, types.flatten().to(device=plan.device, dtype=torch.long))
         valid = selected >= 0
         raw = blocks.flatten(1).gather(1, selected.clamp_min(0).to(blocks.device))
-        raw = raw * valid.to(device=blocks.device, dtype=blocks.dtype)
-        return raw.index_select(1, self.sort_index.to(blocks.device))
+        return raw * valid.to(device=blocks.device, dtype=blocks.dtype)
+
+    def _contract(self, blocks: torch.Tensor, types: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
+        """AO block -> coupled RME (raw orbpair layout) -> sorted irrep layout.
+
+        Returns the exact input consumed by the equivariant linear, i.e. the
+        coupled reduced matrix elements in the ``irreps_in`` (sorted) coordinate
+        order.  A zero block maps to zero coordinates (the change of basis and the
+        permutation are both linear and bias-free), so bit-level zero
+        preservation is retained.
+        """
+        raw_product = self._gather_product(blocks, types, plan)
+        change_of_basis = self.cg_change_of_basis.to(device=blocks.device, dtype=blocks.dtype)
+        raw_coupled = torch.einsum("kc,nc->nk", change_of_basis, raw_product)
+        return raw_coupled.index_select(1, self.sort_index.to(blocks.device))
 
     def forward(self, data, atom_type, bond_type, active_edges):
         required = (
@@ -155,8 +248,8 @@ class DirectUuRealBlockProjector(torch.nn.Module):
         edge_shapes = torch.as_tensor(data[required[3]], device=edge_blocks.device, dtype=torch.long)
         if not torch.equal(node_shapes, expected_node) or not torch.equal(edge_shapes, expected_edge):
             raise ValueError("uu_real residual block shapes disagree with mapper/species plans.")
-        node_raw = self._gather(node_blocks, atom_type, self.node_plan)
-        edge_raw = self._gather(edge_blocks, bond_type, self.edge_plan)
+        node_raw = self._contract(node_blocks, atom_type, self.node_plan)
+        edge_raw = self._contract(edge_blocks, bond_type, self.edge_plan)
         return self.node_linear(node_raw), self.edge_linear(edge_raw)[active_edges]
 
 
