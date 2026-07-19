@@ -18,6 +18,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     canonical_block_tensors_to_feature_tensors,
     feature_tensors_to_block_tensors,
     infer_block_shapes,
+    is_soc_uureal_mapper,
     strict_reverse_edge_index,
 )
 from dptb.nn.hamiltonian import E3Hamiltonian
@@ -277,7 +278,21 @@ class BlockStateCodec:
         target_semantics: str = "absolute_full_h",
     ) -> None:
         if bool(getattr(idp, "has_soc", False)):
-            raise NotImplementedError("BlockStateCodec v1 does not support SOC mappers.")
+            # Three-way boundary: BlockStateCodec is the *exact_rme* adapter
+            # (block<->RME inverse CG) and stays strictly non-SOC.  Distinguish
+            # the two SOC cases instead of conflating them: a compact uu_real
+            # target is routable through the direct_spatial residual projector,
+            # while a full spinor mapper has no block contract at all.
+            if is_soc_uureal_mapper(idp):
+                raise NotImplementedError(
+                    "BlockStateCodec is the exact non-SOC block<->RME codec; the "
+                    "compact uu_real SOC target uses the direct_spatial residual "
+                    "projector (DirectUuRealBlockProjector), not the exact inverse CG."
+                )
+            raise NotImplementedError(
+                "BlockStateCodec v1 does not support SOC mappers; full spinor "
+                "real/imag channels require a separate block contract."
+            )
         if inverse_mode not in {"strict", "project"}:
             raise ValueError("inverse_mode must be 'strict' or 'project'.")
         if target_semantics not in {"absolute_full_h", "residual_dh"}:

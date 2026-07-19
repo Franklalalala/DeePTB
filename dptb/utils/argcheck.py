@@ -437,15 +437,22 @@ def validate_block_ode_contract(data):
     if uureal_mode and semantics != "residual_dh":
         raise ValueError("uureal_block_ode requires target_semantics='residual_dh'")
     if uureal_mode:
-        expected_mode_options = {
-            "state_space": "residual_ao_block",
-            "block_input_adapter": "direct_cg",
-            "h0_condition_space": "compact_uureal_rme",
+        # These three options are declarative contract markers (validated only;
+        # runtime behavior is driven solely by output_space=uureal_block_ode).
+        # Accept both the F4 canonical names and the authoritative V2 dataset
+        # contract aliases so a config written to either vocabulary validates:
+        #   state_space:       residual_ao_block   <-> nextham_uureal_delta_block
+        #   h0_condition_space: compact_uureal_rme <-> nextham_uureal_rme
+        #   block_input_adapter: direct_cg (shared)
+        accepted_mode_options = {
+            "state_space": ("residual_ao_block", "nextham_uureal_delta_block"),
+            "block_input_adapter": ("direct_cg",),
+            "h0_condition_space": ("compact_uureal_rme", "nextham_uureal_rme"),
         }
-        for option, expected in expected_mode_options.items():
-            if str(flow.get(option, "")).lower().replace("-", "_") != expected:
+        for option, accepted in accepted_mode_options.items():
+            if str(flow.get(option, "")).lower().replace("-", "_") not in accepted:
                 raise ValueError(
-                    f"uureal_block_ode requires flow_options.{option}={expected!r}"
+                    f"uureal_block_ode requires flow_options.{option} in {accepted!r}"
                 )
         if bool(flow.get("block_export_final_full_h", False)):
             raise ValueError(

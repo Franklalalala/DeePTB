@@ -12,6 +12,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 )
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.embedding.lem_moe_v3_h0_helpers import DirectUuRealBlockProjector
+from dptb.nnops.block_flow_codec import BlockStateCodec
 from dptb.nnops.flow import HamiltonianCFM
 from dptb.utils.argcheck import validate_block_ode_contract
 
@@ -272,3 +273,122 @@ def test_argcheck_uureal_exception_is_explicit_and_mutually_bound():
     config["common_options"]["has_soc"] = False
     with pytest.raises(ValueError, match="has_soc=true"):
         validate_block_ode_contract(config)
+
+
+def test_direct_projector_zero_preservation_is_structural_hard_gate():
+    """Bias-free projector guarantees D_0=0 -> exactly zero hidden.
+
+    Elevates the zero-preservation contract to a structural + bit-level hard
+    gate: (1) neither node/edge equivariant linear owns a learnable bias, so the
+    map is a pure ``W.x`` that cannot shift a zero residual; (2) a zero residual
+    yields *exactly* zero hidden (bit-level torch.equal); (3) the packed
+    non-zero residual yields non-zero hidden, so the zero gate is not vacuously
+    satisfied by degenerate weights.
+    """
+    mapper = _mapper()
+    data = _record(mapper)
+    projector = DirectUuRealBlockProjector(
+        mapper, mapper.get_irreps().sort()[0].simplify(), dtype=torch.float32, device="cpu"
+    )
+
+    # (1) structural: no learnable bias parameter on either equivariant linear.
+    assert [n for n, _ in projector.node_linear.named_parameters() if "bias" in n] == []
+    assert [n for n, _ in projector.edge_linear.named_parameters() if "bias" in n] == []
+
+    # (3) non-triviality: the packed (non-zero) residual must move the hidden.
+    live = copy.deepcopy(data)
+    live[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = data["node_delta_hamil_blocks"].clone()
+    live[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = data["edge_delta_hamil_blocks"].clone()
+    live[_keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = data["node_delta_hamil_block_shape"]
+    live[_keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = data["edge_delta_hamil_block_shape"]
+    node_live, edge_live = projector(
+        live, live["atom_types"], live["edge_type"], torch.arange(2)
+    )
+    assert torch.count_nonzero(node_live) > 0
+    assert torch.count_nonzero(edge_live) > 0
+
+    # (2) bit-level zero-preservation: zero residual -> exactly zero hidden.
+    zero = copy.deepcopy(data)
+    zero[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = torch.zeros_like(data["node_delta_hamil_blocks"])
+    zero[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = torch.zeros_like(data["edge_delta_hamil_blocks"])
+    zero[_keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = data["node_delta_hamil_block_shape"]
+    zero[_keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = data["edge_delta_hamil_block_shape"]
+    node_hidden, edge_hidden = projector(
+        zero, zero["atom_types"], zero["edge_type"], torch.arange(2)
+    )
+    assert torch.equal(node_hidden, torch.zeros_like(node_hidden))
+    assert torch.equal(edge_hidden, torch.zeros_like(edge_hidden))
+
+
+def test_argcheck_accepts_v2_contract_aliases():
+    """The authoritative V2 dataset-contract option names validate as aliases.
+
+    state_space=nextham_uureal_delta_block and h0_condition_space=
+    nextham_uureal_rme are the V2 vocabulary for the F4 canonical
+    residual_ao_block / compact_uureal_rme markers; both must validate.
+    """
+    config = {
+        "common_options": {
+            "dtype": "float32", "has_soc": True,
+            "nextham_uureal_mask": True, "full_soc_prediction": False,
+        },
+        "train_options": {
+            "flow_options": {
+                "enabled": True, "mode": "residual", "prior": "zero",
+                "output_space": "uureal_block_ode", "block_ode": True,
+                "state_space": "nextham_uureal_delta_block",
+                "target_semantics": "residual_dh",
+                "block_input_adapter": "direct_cg",
+                "h0_condition_space": "nextham_uureal_rme",
+                "prediction_add_h0": False, "time_conditioning_required": True,
+                "node_block_target_key": "node_delta_hamil_blocks",
+                "edge_block_target_key": "edge_delta_hamil_blocks",
+                "node_block_shape_key": "node_delta_hamil_block_shape",
+                "edge_block_shape_key": "edge_delta_hamil_block_shape",
+                "validation_ode_steps": [1, 3],
+            }
+        },
+        "model_options": {
+            "embedding": {
+                "method": "lem_moe_v3_h0", "output_route": "h_b0",
+                "require_full_block_edge_coverage": True,
+                "use_uureal_residual_block_input": True,
+                "use_flow_time_embedding": True, "flow_time_condition_edges": True,
+                "flow_time_allow_missing": False, "h0_merge_mode": "replace",
+                "use_h0_node_init": True, "use_h0_edge_init": True,
+            },
+            "prediction": {
+                "method": "block_native", "block_decoder": "expansion_cg",
+                "blockwise_hamiltonian": True, "add_h0": False,
+            },
+        },
+        "data_options": {
+            "train": {
+                "type": "LMDBDataset", "get_Hamiltonian": True, "get_H0": True,
+                "residual_hamiltonian": False, "require_full_h_target": False,
+                "require_residual_h_target": False, "require_uureal_block_ode": True,
+            }
+        },
+    }
+    validate_block_ode_contract(config)
+    # A name outside both vocabularies must still fail closed.
+    config["train_options"]["flow_options"]["state_space"] = "not_a_marker"
+    with pytest.raises(ValueError, match="state_space"):
+        validate_block_ode_contract(config)
+
+
+def test_block_state_codec_three_way_distinguishes_uureal_from_full_spinor():
+    """The exact_rme codec routes compact uu_real to direct_spatial, not full spinor.
+
+    Both remain fail-closed, but the messages must be distinct so a compact
+    uu_real misconfiguration is directed to the residual projector while full
+    spinor SOC stays an unconditional rejection (preserving the historical
+    'does not support SOC' boundary).
+    """
+    uureal = _mapper()
+    with pytest.raises(NotImplementedError, match="direct_spatial residual"):
+        BlockStateCodec(uureal, dtype=torch.float64)
+
+    full_spinor = OrbitalMapper({"C": ["2p"]}, method="e3tb", has_soc=True)
+    with pytest.raises(NotImplementedError, match="does not support SOC"):
+        BlockStateCodec(full_spinor, dtype=torch.float64)
