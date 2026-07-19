@@ -3180,9 +3180,23 @@ class HamiltonianCFM:
         ref_data: AtomicDataDict.Type,
         ctx: CFMContext,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Score a physical Full-H rollout with endpoint-compatible reductions."""
+        """Score a rollout with endpoint-compatible reductions."""
         if not self.block_ode:
             raise RuntimeError("compatible_loss_on_sample requires block_ode.")
+        if self.uureal_block_ode:
+            # The compact-uu rollout returns residual-dH blocks, not physical
+            # Full-H, and this mode intentionally has no exact_rme block codec
+            # (block_codec=None).  Scoring it as Full-H both miscounts H0 as
+            # prediction error and crashes on block_codec.rme_to_blocks
+            # (MultiTrainer first validation with validation_ode_steps=[1] +
+            # log_validation_flow_euler_loss=false).  The residual scorer already
+            # applies the same endpoint-compatible reductions.
+            return self._block_ode_endpoint_loss(
+                pred_data,
+                ref_data,
+                ctx,
+                prediction_is_full_h=False,
+            )
         return self._block_ode_endpoint_loss(
             pred_data,
             ref_data,

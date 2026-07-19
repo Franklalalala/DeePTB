@@ -507,6 +507,39 @@ def test_sampler_zero_start_spy_closed_loop_and_manual_blend(steps):
     assert torch.equal(result[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][1])
 
 
+def test_compatible_scorer_scores_uureal_residual_without_block_codec():
+    """Review P1-4 repro: first N=1 validation with euler logging disabled.
+
+    MultiTrainer picks flow.compatible_loss_on_sample when
+    log_validation_flow_euler_loss=false (multi_trainer._validation path).  For
+    uureal_block_ode the rollout returns residual-dH blocks and block_codec is
+    intentionally None, so the pre-fix Full-H scoring path crashed with
+    AttributeError ('NoneType'.rme_to_blocks).  The compatible scorer must
+    route the mode to the residual-dH scorer and agree with loss_on_sample;
+    the Full-H path (block_codec present, non-uureal) is untouched.
+    """
+    mapper = _mapper()
+    data = _record(mapper)
+    flow = _flow(
+        mapper, log_validation_flow_euler_loss=False, validation_ode_steps=[1]
+    )
+    assert flow.block_codec is None
+
+    node = data["node_delta_hamil_blocks"]
+    edge = data["edge_delta_hamil_blocks"]
+    sampled = flow.sample(_EndpointSpy([(node, edge)]), copy.deepcopy(data), num_steps=1)
+
+    # Reconstruct the exact t=0 flow context MultiTrainer builds before scoring.
+    zero_t = torch.zeros(1)
+    _flow_batch, flow_ref, flow_ctx = flow.prepare_batch(
+        copy.deepcopy(data), copy.deepcopy(data), t=zero_t
+    )
+    loss, state = flow.compatible_loss_on_sample(sampled, flow_ref, flow_ctx)
+    assert torch.isfinite(loss)
+    reference_loss, _ = flow.loss_on_sample(sampled, flow_ref, flow_ctx)
+    torch.testing.assert_close(loss, reference_loss, rtol=0.0, atol=0.0)
+
+
 def test_t0_injection_bypasses_t_min_clamp():
     """Review repro: t_min=0.5 + t0_probability=1 must yield exact zeros.
 
