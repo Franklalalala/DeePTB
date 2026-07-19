@@ -1920,8 +1920,6 @@ class HamiltonianCFM:
         expected = {
             "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
             "blockwise_target_mode": "already-delta",
-            "blockwise_source_target_feature_width": keep,
-            "blockwise_source_h0_feature_width": keep,
             "soc_uureal_compact": True,
             "soc_uureal_full_rme": keep * 8,
             "soc_uureal_keep": keep,
@@ -1931,6 +1929,27 @@ class HamiltonianCFM:
             if actual != wanted:
                 raise ValueError(
                     f"uureal_block_ode requires {key}={wanted!r}; got {actual!r}."
+                )
+        # A normal full-SOC->uu_real conversion records the ORIGINAL source width
+        # (e.g. 5832 for a keep=729 compact target).  The contract is that the
+        # *stored* tensors are keep-wide and keep matches the mapper; the recorded
+        # source width must only be a valid integer >= keep (keep==source when the
+        # source was already compact).  Forcing source_width==keep rejected every
+        # genuine converter product.
+        for key in (
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+        ):
+            raw_actual = self._metadata_scalar(data[key])
+            try:
+                actual = int(raw_actual)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"uureal_block_ode requires integer {key}; got {raw_actual!r}."
+                )
+            if actual < keep:
+                raise ValueError(
+                    f"uureal_block_ode requires {key} >= keep={keep}; got {actual}."
                 )
         for key in (self.node_h0_key, self.edge_h0_key):
             value = torch.as_tensor(data[key])

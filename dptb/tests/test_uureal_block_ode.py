@@ -274,6 +274,183 @@ def test_data_gate_fails_closed_per_metadata_field(key, bad):
         _flow(mapper).prepare_batch(copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.5]))
 
 
+def test_flow_gate_accepts_converter_recorded_source_width():
+    """Contract fix: keep < source_width is the NORMAL converter product.
+
+    The official convert_feature_lmdb_to_blockwise.py records the ORIGINAL
+    source feature width (keep*8 for a full-SOC source projected to compact
+    uu_real).  The gate must accept it: the stored tensors are keep-wide and
+    keep matches the mapper; the source width is provenance, not a storage
+    width.  Anything below keep (or non-integer) still fails closed.
+    """
+    mapper = _mapper()
+    keep = int(mapper.reduced_matrix_element)
+    data = _record(mapper)
+    data["blockwise_source_target_feature_width"] = keep * 8
+    data["blockwise_source_h0_feature_width"] = keep * 8
+    _flow(mapper).prepare_batch(copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.5]))
+
+    below = _record(mapper)
+    below["blockwise_source_target_feature_width"] = keep - 1
+    with pytest.raises(ValueError, match="blockwise_source_target_feature_width"):
+        _flow(mapper).prepare_batch(copy.deepcopy(below), copy.deepcopy(below), t=torch.tensor([0.5]))
+
+    non_integer = _record(mapper)
+    non_integer["blockwise_source_h0_feature_width"] = "wide"
+    with pytest.raises(ValueError, match="blockwise_source_h0_feature_width"):
+        _flow(mapper).prepare_batch(
+            copy.deepcopy(non_integer), copy.deepcopy(non_integer), t=torch.tensor([0.5])
+        )
+
+
+def _full_soc_source_record(mapper, full_width: int):
+    """A full-SOC-width feature record shaped like the official converter input."""
+    import numpy as np
+
+    data = _record(mapper)
+    generator = torch.Generator().manual_seed(0)
+    n_nodes = int(data["atomic_numbers"].shape[0])
+    n_edges = int(data["edge_index"].shape[1])
+    record = {
+        "atomic_numbers": data["atomic_numbers"].numpy().astype("int64"),
+        "pos": data["pos"].numpy().astype("float32"),
+        "cell": data["cell"].numpy().astype("float32"),
+        "pbc": data["pbc"].numpy(),
+        "edge_index": data["edge_index"].numpy().astype("int64"),
+        "edge_cell_shift": data["edge_cell_shift"].numpy().astype("float32"),
+        "node_features": torch.randn(n_nodes, full_width, generator=generator).numpy().astype("float32"),
+        "edge_features": torch.randn(n_edges, full_width, generator=generator).numpy().astype("float32"),
+        "node_h0": torch.randn(n_nodes, full_width, generator=generator).numpy().astype("float32"),
+        "edge_h0": torch.randn(n_edges, full_width, generator=generator).numpy().astype("float32"),
+        "hamiltonian_semantics": "delta (H - H0), uu_real",
+        "soc_real_channel_order": np.asarray(
+            ["uu_re", "uu_im", "ud_re", "ud_im", "du_re", "du_im", "dd_re", "dd_im"]
+        ),
+        "full_soc_feature_width": full_width,
+        "idx": 0,
+        "nf": 1,
+    }
+    return record
+
+
+def test_official_converter_product_passes_loader_gate(tmp_path):
+    """converter -> loader chain: keep=16, source=128 must load (review P1-2).
+
+    Runs the official convert_feature_lmdb_to_blockwise.py on a synthetic
+    full-SOC source LMDB (feature width keep*8=128) and loads the genuine
+    product through LMDBDataset with require_uureal_block_ode=True.  The
+    product records blockwise_source_*_feature_width=128 with soc_uureal_keep=16;
+    the pre-fix gate demanded source_width==keep and rejected every real
+    converter product at startup.  A tampered product whose recorded source
+    width falls below keep must still fail closed.
+    """
+    import json
+    import pickle
+    import shutil
+
+    import lmdb
+
+    from dptb.data.dataset.lmdb_dataset import LMDBDataset
+    from tools.convert_feature_lmdb_to_blockwise import convert_root
+
+    mapper = _mapper()
+    keep = int(mapper.reduced_matrix_element)
+    full_width = keep * 8
+    record = _full_soc_source_record(mapper, full_width)
+
+    source_root = tmp_path / "source"
+    (source_root / "data.0000.lmdb").mkdir(parents=True)
+    env = lmdb.open(str(source_root / "data.0000.lmdb"), map_size=1 << 24, subdir=True)
+    with env.begin(write=True) as txn:
+        txn.put((0).to_bytes(4, "big"), pickle.dumps(record, protocol=4))
+    env.sync()
+    env.close()
+
+    input_json = tmp_path / "input.json"
+    input_json.write_text(
+        json.dumps(
+            {
+                "common_options": {
+                    "basis": {"H": "1s", "C": "1s1p"},
+                    "has_soc": True,
+                    "nextham_uureal_mask": True,
+                    "full_soc_prediction": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "blockwise"
+    summary = convert_root(
+        input_root=source_root,
+        output_root=output_root,
+        input_json=input_json,
+        target_mode="already-delta",
+    )
+    assert summary["entries"] == 1
+
+    produced = None
+    env = lmdb.open(
+        str(output_root / "data.0000.lmdb"), readonly=True, lock=False, subdir=True
+    )
+    with env.begin() as txn:
+        produced = pickle.loads(txn.get((0).to_bytes(4, "big")))
+    env.close()
+    # The official product records the ORIGINAL source width, not keep.
+    assert int(produced["blockwise_source_target_feature_width"]) == full_width
+    assert int(produced["blockwise_source_h0_feature_width"]) == full_width
+    assert int(produced["soc_uureal_keep"]) == keep
+
+    info_files = {
+        "data.0000.lmdb": {
+            "r_max": 2.0,
+            "er_max": None,
+            "oer_max": None,
+            "wave_align": False,
+            "train_w_homo_lumo_gap": False,
+            "train_w_eps": False,
+            "train_w_charge": False,
+            "train_dip": False,
+            "train_polar": False,
+        }
+    }
+    dataset = LMDBDataset(
+        root=str(output_root),
+        info_files=info_files,
+        type_mapper=mapper,
+        get_Hamiltonian=True,
+        get_H0=True,
+        prefer_precomputed_h0=True,
+        residual_hamiltonian=False,
+        require_uureal_block_ode=True,
+    )
+    sample = dataset.get(0)
+    assert sample is not None
+
+    # Negative: a recorded source width below keep still fails closed.
+    tampered_root = tmp_path / "tampered"
+    shutil.copytree(output_root, tampered_root)
+    bad = dict(produced)
+    bad["blockwise_source_target_feature_width"] = keep - 1
+    env = lmdb.open(str(tampered_root / "data.0000.lmdb"), map_size=1 << 24, subdir=True)
+    with env.begin(write=True) as txn:
+        txn.put((0).to_bytes(4, "big"), pickle.dumps(bad, protocol=4), overwrite=True)
+    env.sync()
+    env.close()
+    tampered = LMDBDataset(
+        root=str(tampered_root),
+        info_files=info_files,
+        type_mapper=mapper,
+        get_Hamiltonian=True,
+        get_H0=True,
+        prefer_precomputed_h0=True,
+        residual_hamiltonian=False,
+        require_uureal_block_ode=True,
+    )
+    with pytest.raises(ValueError, match="blockwise_source_target_feature_width"):
+        tampered.get(0)
+
+
 def test_data_gate_accepts_identical_collated_metadata_and_rejects_mixed_values():
     mapper = _mapper()
     data = _record(mapper)

@@ -1219,8 +1219,6 @@ class LMDBDataset(AtomicDataset):
             expected = {
                 "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
                 "blockwise_target_mode": "already-delta",
-                "blockwise_source_target_feature_width": keep,
-                "blockwise_source_h0_feature_width": keep,
                 "soc_uureal_compact": True,
                 "soc_uureal_full_rme": keep * 8,
                 "soc_uureal_keep": keep,
@@ -1231,6 +1229,24 @@ class LMDBDataset(AtomicDataset):
                 if actual != wanted:
                     raise ValueError(
                         f"Compact uu_real block record requires {key}={wanted!r}; got {actual!r}."
+                    )
+            # The recorded source widths are the ORIGINAL (pre-conversion) feature
+            # widths; a normal full-SOC->uu_real conversion keeps keep<source
+            # (e.g. keep=729, source=5832). Only require a valid integer >= keep so
+            # the official converter's genuine products load instead of raising.
+            for key in (
+                "blockwise_source_target_feature_width",
+                "blockwise_source_h0_feature_width",
+            ):
+                try:
+                    actual = int(torch.as_tensor(data_dict[key]).item())
+                except (TypeError, ValueError, RuntimeError):
+                    raise ValueError(
+                        f"Compact uu_real block record requires integer {key}; got {data_dict[key]!r}."
+                    )
+                if actual < keep:
+                    raise ValueError(
+                        f"Compact uu_real block record requires {key} >= keep={keep}; got {actual}."
                     )
         stored_basis_fingerprint = data_dict.get(BASIS_FINGERPRINT_KEY)
         # Historical, non-fingerprinted records need not expose a production
