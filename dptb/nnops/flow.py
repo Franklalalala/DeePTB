@@ -1919,7 +1919,12 @@ class HamiltonianCFM:
             )
         return values[0]
 
-    def _require_uureal_block_contract(self, data: AtomicDataDict.Type) -> None:
+    def _require_uureal_block_contract(
+        self,
+        data: AtomicDataDict.Type,
+        *,
+        require_endpoint_labels: bool = True,
+    ) -> None:
         keep = int(self.idp.reduced_matrix_element)
         required = (
             "blockwise_spatial_schema",
@@ -1931,11 +1936,17 @@ class HamiltonianCFM:
             "soc_uureal_keep",
             self.node_h0_key,
             self.edge_h0_key,
-            self.node_block_target_key,
-            self.edge_block_target_key,
-            self.node_block_shape_key,
-            self.edge_block_shape_key,
         )
+        if require_endpoint_labels:
+            # Training/scoring needs the residual endpoint labels; label-free
+            # inference (sampling) starts from D_0=0 with mapper-derived shapes
+            # and never reads them, so it must not demand them.
+            required = required + (
+                self.node_block_target_key,
+                self.edge_block_target_key,
+                self.node_block_shape_key,
+                self.edge_block_shape_key,
+            )
         missing = self._missing_keys(data, required)
         if missing:
             raise KeyError(f"uureal_block_ode data contract missing keys={missing}.")
@@ -3409,7 +3420,7 @@ class HamiltonianCFM:
         num_graphs: int,
     ) -> AtomicDataDict.Type:
         """Roll out the compact-uu residual state D without H0 materialization."""
-        self._require_uureal_block_contract(state)
+        self._require_uureal_block_contract(state, require_endpoint_labels=False)
         topology_sidecar = self._snapshot_block_topology(state)
         self._restore_block_topology(state, topology_sidecar)
         node_shapes, edge_shapes = infer_block_shapes(state, self.idp, device=self.device)

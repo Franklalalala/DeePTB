@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
 
+import numpy as np
 import torch
 
 from dptb.data.interfaces.blockwise_tensor import (
@@ -69,6 +70,20 @@ def _update_fingerprint(digest: "hashlib._Hash", label: str, value: Any) -> None
         digest.update(str(tensor.dtype).encode("ascii"))
         digest.update(repr(tuple(tensor.shape)).encode("ascii"))
         digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    elif isinstance(value, np.ndarray):
+        # repr() of a large ndarray is SUMMARIZED (numpy elides interior
+        # elements past its print threshold), so two different topologies could
+        # share one truncated repr -- a stale-cache collision.  Hash the full
+        # content instead, mirroring the tensor branch (same SHA-256 content-key
+        # scheme as the D1 projector cache).
+        array = np.ascontiguousarray(value)
+        digest.update(b"ndarray")
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(repr(tuple(array.shape)).encode("ascii"))
+        if array.dtype == object:
+            digest.update(repr(array.tolist()).encode("utf-8"))
+        else:
+            digest.update(array.tobytes())
     else:
         digest.update(type(value).__qualname__.encode("utf-8"))
         digest.update(repr(value).encode("utf-8"))

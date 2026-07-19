@@ -707,6 +707,129 @@ def test_argcheck_uureal_exception_is_explicit_and_mutually_bound():
         validate_block_ode_contract(config)
 
 
+def test_sampler_is_label_free(steps=2):
+    """P2: inference must not demand the residual endpoint labels.
+
+    The sampler starts from D_0=0 with mapper-derived shapes and never reads
+    the delta-block label fields (it used to require then immediately delete
+    them, so a label-free record KeyError'd before the model forward).
+    """
+    mapper = _mapper()
+    data = _record(mapper)
+    node = data["node_delta_hamil_blocks"].clone()
+    edge = data["edge_delta_hamil_blocks"].clone()
+    for key in (
+        "node_delta_hamil_blocks",
+        "edge_delta_hamil_blocks",
+        "node_delta_hamil_block_shape",
+        "edge_delta_hamil_block_shape",
+    ):
+        del data[key]
+    endpoints = [(node * (i + 1), edge * (i + 1)) for i in range(steps)]
+    result = _flow(mapper).sample(_EndpointSpy(endpoints), copy.deepcopy(data), num_steps=steps)
+    assert torch.equal(result[_keys.NODE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][0])
+    assert torch.equal(result[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][1])
+    # Training/scoring keeps demanding labels (fail-closed unchanged).
+    with pytest.raises(KeyError, match="delta_hamil"):
+        _flow(mapper).prepare_batch(copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.5]))
+
+
+def test_uureal_residual_block_ode_alias_cannot_bypass_argcheck_interlocks():
+    """P2: the runtime alias must hit the same argcheck interlock set.
+
+    flow.py normalizes output_space='uureal_residual_block_ode' into the mode,
+    but the alias was missing from validate_block_ode_contract's sets: with
+    block_ode omitted the whole contract validation silently returned while the
+    runtime still activated the mode (data/D-state/time interlocks bypassed).
+    """
+    config = {
+        "common_options": {
+            "dtype": "float32", "has_soc": True,
+            "nextham_uureal_mask": True, "full_soc_prediction": False,
+        },
+        "train_options": {
+            "flow_options": {
+                "enabled": True, "mode": "residual", "prior": "zero",
+                "output_space": "uureal_residual_block_ode",
+                "state_space": "residual_ao_block", "target_semantics": "residual_dh",
+                "block_input_adapter": "direct_cg",
+                "h0_condition_space": "compact_uureal_rme",
+                "prediction_add_h0": False, "time_conditioning_required": True,
+                "node_block_target_key": "node_delta_hamil_blocks",
+                "edge_block_target_key": "edge_delta_hamil_blocks",
+                "node_block_shape_key": "node_delta_hamil_block_shape",
+                "edge_block_shape_key": "edge_delta_hamil_block_shape",
+                "validation_ode_steps": [1, 3],
+            }
+        },
+        "model_options": {
+            "embedding": {
+                "method": "lem_moe_v3_h0", "output_route": "h_b0",
+                "require_full_block_edge_coverage": True,
+                "use_uureal_residual_block_input": True,
+                "use_flow_time_embedding": True, "flow_time_condition_edges": True,
+                "flow_time_allow_missing": False, "h0_merge_mode": "replace",
+                "use_h0_node_init": True, "use_h0_edge_init": True,
+            },
+            "prediction": {
+                "method": "block_native", "block_decoder": "expansion_cg",
+                "blockwise_hamiltonian": True, "add_h0": False,
+            },
+        },
+        "data_options": {
+            "train": {
+                "type": "LMDBDataset", "get_Hamiltonian": True, "get_H0": True,
+                "residual_hamiltonian": False, "require_full_h_target": False,
+                "require_residual_h_target": False, "require_uureal_block_ode": True,
+            }
+        },
+    }
+    # block_ode omitted: pre-fix this returned silently (bypass); now the alias
+    # is recognized and the mode discipline binds.
+    with pytest.raises(ValueError, match="output_space"):
+        validate_block_ode_contract(config)
+    # Aliases are sealed at the config boundary exactly like the pre-existing
+    # spatial_* alias: even fully configured they must be spelled canonically.
+    config["train_options"]["flow_options"]["block_ode"] = True
+    with pytest.raises(ValueError, match="output_space"):
+        validate_block_ode_contract(config)
+    # The canonical spelling validates, with the interlocks active: flipping
+    # one interlocked option fails closed.
+    config["train_options"]["flow_options"]["output_space"] = "uureal_block_ode"
+    validate_block_ode_contract(config)
+    config["common_options"]["has_soc"] = False
+    with pytest.raises(ValueError, match="has_soc=true"):
+        validate_block_ode_contract(config)
+
+
+def test_projector_cache_fingerprint_hashes_numpy_content_not_truncated_repr():
+    """P2: large ndarray topology values must be content-hashed.
+
+    numpy summarizes repr() past its print threshold, so two topologies
+    differing only in an elided interior element previously shared one
+    fingerprint (stale-cache collision).
+    """
+    import numpy as np
+
+    from dptb.nnops.block_flow_codec import _projector_topology_fingerprint
+
+    mapper = _mapper()
+    base_shift = np.zeros((1200, 3), dtype=np.float32)
+    variant_shift = base_shift.copy()
+    variant_shift[600, 1] = 1.0  # elided from repr() by numpy summarization
+    assert repr(base_shift) == repr(variant_shift)  # the collision precondition
+
+    base = {"edge_cell_shift": base_shift}
+    variant = {"edge_cell_shift": variant_shift}
+    assert _projector_topology_fingerprint(base, mapper) != _projector_topology_fingerprint(
+        variant, mapper
+    )
+    # Determinism: equal content, fresh copies -> equal fingerprint.
+    assert _projector_topology_fingerprint(base, mapper) == _projector_topology_fingerprint(
+        {"edge_cell_shift": base_shift.copy()}, mapper
+    )
+
+
 def test_direct_projector_zero_preservation_is_structural_hard_gate():
     """Bias-free projector guarantees D_0=0 -> exactly zero hidden.
 

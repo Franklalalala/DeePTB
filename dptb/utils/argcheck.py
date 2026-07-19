@@ -368,13 +368,20 @@ def validate_block_ode_contract(data):
         "ao_blocks_ode",
         "uureal_block_ode",
         "spatial_uureal_residual_block_ode",
+        "uureal_residual_block_ode",
     }
     if not requested:
         return
     if not bool(flow.get("enabled", False)):
         raise ValueError("block_ode requires train_options.flow_options.enabled=true")
+    # Every runtime alias flow.py normalizes to uureal_block_ode MUST appear in
+    # both sets above/below: an alias missing here while block_ode is omitted
+    # slips past this whole contract validation yet still activates the mode at
+    # runtime (interlock bypass).
     uureal_mode = output_space in {
-        "uureal_block_ode", "spatial_uureal_residual_block_ode"
+        "uureal_block_ode",
+        "spatial_uureal_residual_block_ode",
+        "uureal_residual_block_ode",
     }
     expected_output_space = "uureal_block_ode" if uureal_mode else "ao_block_ode"
     if output_space != expected_output_space or not bool(flow.get("block_ode", False)):
