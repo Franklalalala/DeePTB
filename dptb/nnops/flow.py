@@ -25,6 +25,9 @@ from dptb.data.interfaces.blockwise_tensor import (
     attach_prediction_block_tensors,
     block_mask_from_shapes,
     strict_reverse_edge_index,
+    infer_block_shapes,
+    is_soc_uureal_mapper,
+    mapper_max_norb,
 )
 from dptb.nnops import prior_physical
 from dptb.nnops.block_flow_codec import (
@@ -142,24 +145,29 @@ class HamiltonianCFM:
         self.block_ode = bool(options.get("block_ode", False))
         if self.output_space in {"block_ode", "ao_blocks_ode"}:
             self.output_space = "ao_block_ode"
-        if self.output_space not in {"rme", "ao_block", "ao_block_ode"}:
+        if self.output_space in {"spatial_uureal_residual_block_ode", "uureal_residual_block_ode"}:
+            self.output_space = "uureal_block_ode"
+        self.uureal_block_ode = self.output_space == "uureal_block_ode"
+        if self.uureal_block_ode:
+            self.block_ode = True
+        if self.output_space not in {"rme", "ao_block", "ao_block_ode", "uureal_block_ode"}:
             raise ValueError(
                 "flow_options.output_space must be 'rme', 'ao_block', or "
-                "'ao_block_ode', got "
+                "one of the explicit ODE modes 'ao_block_ode'/'uureal_block_ode', got "
                 f"{self.output_space!r}."
             )
-        if self.block_ode and self.output_space != "ao_block_ode":
+        if self.block_ode and self.output_space not in {"ao_block_ode", "uureal_block_ode"}:
             raise ValueError(
                 "flow_options.block_ode=true is mutually exclusive with the frozen "
                 "ao_block adapter; set output_space='ao_block_ode'."
             )
-        if self.output_space == "ao_block_ode" and not self.block_ode:
+        if self.output_space in {"ao_block_ode", "uureal_block_ode"} and not self.block_ode:
             raise ValueError(
                 "Block-space ODE is a distinct mode: set flow_options.block_ode=true "
                 "together with output_space='ao_block_ode'."
             )
-        if self.output_space == "ao_block_ode" and not self.enabled:
-            raise ValueError("output_space='ao_block_ode' requires flow_options.enabled=true.")
+        if self.output_space in {"ao_block_ode", "uureal_block_ode"} and not self.enabled:
+            raise ValueError(f"output_space={self.output_space!r} requires flow_options.enabled=true.")
         self.node_output_key = str(
             options.get("node_output_key", getattr(_keys, "NODE_PRED_HAMIL_BLOCKS_KEY", "node_hamil_blocks"))
         )
@@ -265,7 +273,12 @@ class HamiltonianCFM:
         if self.block_ode:
             if self.idp is None:
                 raise ValueError("Block-space ODE requires an OrbitalMapper idp.")
-            if bool(getattr(self.idp, "has_soc", False)):
+            if self.uureal_block_ode and not is_soc_uureal_mapper(self.idp):
+                raise ValueError(
+                    "uureal_block_ode requires has_soc=true, nextham_uureal_mask=true, "
+                    "and full_soc_prediction=false; it may not masquerade as non-SOC."
+                )
+            if not self.uureal_block_ode and bool(getattr(self.idp, "has_soc", False)):
                 raise NotImplementedError("Block-space ODE v1 supports non-SOC mappers only.")
             if self.dtype not in {torch.float32, torch.float64}:
                 raise TypeError(
@@ -276,7 +289,9 @@ class HamiltonianCFM:
                 raise ValueError(
                     "Block-space ODE v1 requires mode='residual' so B0 is physical H0."
                 )
-            if self.prior not in {"zero", *self._projected_te_prior_names}:
+            if self.uureal_block_ode and self.prior != "zero":
+                raise ValueError("uureal_block_ode requires the exact zero residual prior.")
+            if not self.uureal_block_ode and self.prior not in {"zero", *self._projected_te_prior_names}:
                 raise ValueError(
                     "Block-space ODE supports only prior='zero' or the explicit "
                     "prior='projected_te'; generic TE/Gaussian priors do not own "
@@ -287,6 +302,8 @@ class HamiltonianCFM:
                     "Block-space ODE requires explicit target_semantics="
                     "'absolute_full_h' or 'residual_dh'."
                 )
+            if self.uureal_block_ode and self.target_semantics != "residual_dh":
+                raise ValueError("uureal_block_ode requires target_semantics='residual_dh'.")
             if self.prediction_add_h0:
                 raise ValueError(
                     "Block-space ODE requires prediction.add_h0=false; residual_dh "
@@ -623,7 +640,7 @@ class HamiltonianCFM:
                 atol=self.block_inverse_atol,
                 target_semantics=self.target_semantics,
             )
-            if self.block_ode
+            if self.block_ode and not self.uureal_block_ode
             else None
         )
         if self.enabled:
@@ -1852,6 +1869,85 @@ class HamiltonianCFM:
     def _missing_keys(data: AtomicDataDict.Type, keys: Tuple[str, ...]) -> list[str]:
         return [key for key in keys if key not in data]
 
+    @classmethod
+    def _metadata_scalar(cls, value: Any) -> Any:
+        if torch.is_tensor(value):
+            values = value.detach().cpu().reshape(-1).tolist()
+            if not values or any(item != values[0] for item in values[1:]):
+                raise ValueError(
+                    "uureal_block_ode batched metadata values must be nonempty and identical."
+                )
+            return values[0]
+        if isinstance(value, (list, tuple)):
+            values = [cls._metadata_scalar(item) for item in value]
+            if not values or any(item != values[0] for item in values[1:]):
+                raise ValueError(
+                    "uureal_block_ode batched metadata values must be nonempty and identical."
+                )
+            return values[0]
+        try:
+            import numpy as np
+        except Exception:
+            return value
+        array = np.asarray(value)
+        values = array.reshape(-1).tolist()
+        if not values or any(item != values[0] for item in values[1:]):
+            raise ValueError(
+                "uureal_block_ode batched metadata values must be nonempty and identical."
+            )
+        return values[0]
+
+    def _require_uureal_block_contract(self, data: AtomicDataDict.Type) -> None:
+        keep = int(self.idp.reduced_matrix_element)
+        required = (
+            "blockwise_spatial_schema",
+            "blockwise_target_mode",
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+            "soc_uureal_compact",
+            "soc_uureal_full_rme",
+            "soc_uureal_keep",
+            self.node_h0_key,
+            self.edge_h0_key,
+            self.node_block_target_key,
+            self.edge_block_target_key,
+            self.node_block_shape_key,
+            self.edge_block_shape_key,
+        )
+        missing = self._missing_keys(data, required)
+        if missing:
+            raise KeyError(f"uureal_block_ode data contract missing keys={missing}.")
+        expected = {
+            "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
+            "blockwise_target_mode": "already-delta",
+            "blockwise_source_target_feature_width": keep,
+            "blockwise_source_h0_feature_width": keep,
+            "soc_uureal_compact": True,
+            "soc_uureal_full_rme": keep * 8,
+            "soc_uureal_keep": keep,
+        }
+        for key, wanted in expected.items():
+            actual = self._metadata_scalar(data[key])
+            if actual != wanted:
+                raise ValueError(
+                    f"uureal_block_ode requires {key}={wanted!r}; got {actual!r}."
+                )
+        for key in (self.node_h0_key, self.edge_h0_key):
+            value = torch.as_tensor(data[key])
+            if value.ndim != 2 or value.shape[-1] != keep:
+                raise ValueError(
+                    f"uureal_block_ode requires {key} width {keep}; got {tuple(value.shape)}."
+                )
+            if value.is_complex() or not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"uureal_block_ode requires finite real {key}.")
+
+    @staticmethod
+    def _attach_uureal_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
+        data[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = state.node_blocks
+        data[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = state.edge_blocks
+        data[_keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.node_shapes
+        data[_keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.edge_shapes
+
     @staticmethod
     def _clone_sidecar_value(value: Any) -> Any:
         return value.clone() if torch.is_tensor(value) else copy.deepcopy(value)
@@ -2193,6 +2289,9 @@ class HamiltonianCFM:
         node_target = ref_data.get(self.node_target_key, None)
         edge_target = ref_data.get(self.edge_target_key, None)
         if self.block_ode:
+            if self.uureal_block_ode:
+                self._require_uureal_block_contract(data)
+                self._require_uureal_block_contract(ref_data)
             missing_endpoint_fields = self._missing_keys(
                 ref_data,
                 (
@@ -2207,20 +2306,21 @@ class HamiltonianCFM:
                     "Block-space ODE requires explicit endpoint blocks and shapes; "
                     f"missing keys={missing_endpoint_fields}."
                 )
-            missing_h0_fields = self._missing_keys(
-                data,
-                (
-                    self.node_h0_block_key,
-                    self.edge_h0_block_key,
-                    self.node_h0_block_shape_key,
-                    self.edge_h0_block_shape_key,
-                ),
-            )
-            if missing_h0_fields:
-                raise KeyError(
-                    "Block-space ODE requires physical H0 blocks and shapes; "
-                    f"missing keys={missing_h0_fields}."
+            if not self.uureal_block_ode:
+                missing_h0_fields = self._missing_keys(
+                    data,
+                    (
+                        self.node_h0_block_key,
+                        self.edge_h0_block_key,
+                        self.node_h0_block_shape_key,
+                        self.edge_h0_block_shape_key,
+                    ),
                 )
+                if missing_h0_fields:
+                    raise KeyError(
+                        "Block-space ODE requires physical H0 blocks and shapes; "
+                        f"missing keys={missing_h0_fields}."
+                    )
             like = torch.as_tensor(ref_data[self.node_block_target_key])
             device = like.device
             dtype = self.dtype
@@ -2256,6 +2356,63 @@ class HamiltonianCFM:
             node_count=node_count,
             edge_count=edge_count,
         )
+
+        if self.uureal_block_ode:
+            endpoint, endpoint_projection_residual = self._block_state_from_fields(
+                ref_data,
+                ref_data,
+                node_key=self.node_block_target_key,
+                edge_key=self.edge_block_target_key,
+                node_shape_key=self.node_block_shape_key,
+                edge_shape_key=self.edge_block_shape_key,
+                label="residual_dh endpoint",
+                device=device,
+                dtype=dtype,
+            )
+            node_alpha = node_t.reshape(
+                (-1,) + (1,) * (endpoint.node_blocks.ndim - 1)
+            )
+            edge_alpha = edge_t.reshape(
+                (-1,) + (1,) * (endpoint.edge_blocks.ndim - 1)
+            )
+            current = project_block_state(
+                data,
+                self.idp,
+                BlockTensorResult(
+                    node_alpha * endpoint.node_blocks,
+                    edge_alpha * endpoint.edge_blocks,
+                    endpoint.node_shapes,
+                    endpoint.edge_shapes,
+                ),
+            )
+            if self.detach_interpolated_h0:
+                current = BlockTensorResult(
+                    current.node_blocks.detach(),
+                    current.edge_blocks.detach(),
+                    current.node_shapes,
+                    current.edge_shapes,
+                )
+            self._attach_uureal_residual_state(data, current)
+            data[self.flow_time_key] = t.detach()
+            ref_data[self.flow_time_key] = t.detach()
+            ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+                endpoint_projection_residual, device=device, dtype=dtype
+            )
+            self._drop_block_authority_fields(data)
+            return data, ref_data, CFMContext(
+                t=t,
+                node_t=node_t,
+                edge_t=edge_t,
+                node_base=torch.as_tensor(data[self.node_h0_key]),
+                edge_base=torch.as_tensor(data[self.edge_h0_key]),
+                node_target=None,
+                edge_target=None,
+                node_current=current.node_blocks,
+                edge_current=current.edge_blocks,
+                node_prior=torch.zeros_like(current.node_blocks),
+                edge_prior=torch.zeros_like(current.edge_blocks),
+                block_target_semantics="residual_dh",
+            )
 
         if self.block_ode:
             assert self.block_codec is not None
@@ -2964,6 +3121,15 @@ class HamiltonianCFM:
         flag.  Other CFM output spaces retain their ordinary loss semantics.
         """
         if self.block_ode:
+            if self.uureal_block_ode:
+                # The compact-uu rollout returns residual-dH blocks, not
+                # physical Full-H; score it in its configured residual space.
+                return self._block_ode_endpoint_loss(
+                    pred_data,
+                    ref_data,
+                    ctx,
+                    prediction_is_full_h=False,
+                )
             return self.compatible_loss_on_sample(pred_data, ref_data, ctx)
         return self.loss(pred_data, ref_data, ctx)
 
@@ -3151,6 +3317,99 @@ class HamiltonianCFM:
         )
         return state
 
+    def _sample_uureal_block_ode(
+        self,
+        model: torch.nn.Module,
+        state: AtomicDataDict.Type,
+        *,
+        num_steps: int,
+        num_graphs: int,
+    ) -> AtomicDataDict.Type:
+        """Roll out the compact-uu residual state D without H0 materialization."""
+        self._require_uureal_block_contract(state)
+        topology_sidecar = self._snapshot_block_topology(state)
+        self._restore_block_topology(state, topology_sidecar)
+        node_shapes, edge_shapes = infer_block_shapes(state, self.idp, device=self.device)
+        canvas = mapper_max_norb(self.idp)
+        node_count = int(node_shapes.shape[0])
+        edge_count = int(edge_shapes.shape[0])
+        current = BlockTensorResult(
+            torch.zeros((node_count, canvas, canvas), dtype=self.dtype, device=self.device),
+            torch.zeros((edge_count, canvas, canvas), dtype=self.dtype, device=self.device),
+            node_shapes,
+            edge_shapes,
+        )
+        self._drop_block_authority_fields(state)
+        output_only_keys = self._block_ode_output_only_keys()
+        lem_sidecar = {
+            key: state.pop(key)
+            for key in _LEM_INPUT_SIDECAR_KEYS
+            if key in state
+        }
+        times = torch.linspace(0.0, 1.0, num_steps + 1, device=self.device, dtype=self.dtype)
+        for step in range(num_steps):
+            cur_t, next_t = times[step], times[step + 1]
+            alpha = (next_t - cur_t) / (1.0 - cur_t)
+            self._attach_uureal_residual_state(state, current)
+            state[self.flow_time_key] = torch.full(
+                (num_graphs,), float(cur_t.item()), dtype=self.dtype, device=self.device
+            )
+            model_input = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in state.items()
+                if key not in output_only_keys
+            }
+            self._restore_block_topology(model_input, topology_sidecar, clone_values=True)
+            model_input.update({
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in lem_sidecar.items()
+            })
+            prediction = model(model_input)
+            self._require_fresh_block_ode_outputs(prediction, step=step + 1)
+            merged = state.copy()
+            merged.update(prediction)
+            self._restore_block_topology(merged, topology_sidecar)
+            for key in _LEM_INPUT_SIDECAR_KEYS:
+                merged.pop(key, None)
+            endpoint = BlockTensorResult(
+                self._require_real_finite_tensor(
+                    prediction[self.node_output_key],
+                    label="uureal residual node endpoint",
+                ).to(device=self.device, dtype=self.dtype),
+                self._require_real_finite_tensor(
+                    prediction[self.edge_output_key],
+                    label="uureal residual edge endpoint",
+                ).to(device=self.device, dtype=self.dtype),
+                current.node_shapes,
+                current.edge_shapes,
+            )
+            endpoint = project_block_state(merged, self.idp, endpoint)
+            current = project_block_state(
+                merged,
+                self.idp,
+                BlockTensorResult(
+                    (1.0 - alpha) * current.node_blocks + alpha * endpoint.node_blocks,
+                    (1.0 - alpha) * current.edge_blocks + alpha * endpoint.edge_blocks,
+                    current.node_shapes,
+                    current.edge_shapes,
+                ),
+            )
+            state = merged
+
+        self._attach_uureal_residual_state(state, current)
+        attach_prediction_block_tensors(
+            state,
+            current,
+            node_key=self.node_output_key,
+            edge_key=self.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        state[self.flow_time_key] = torch.ones(
+            num_graphs, device=self.device, dtype=self.dtype
+        )
+        return state
+
     def sample(
         self,
         model: torch.nn.Module,
@@ -3164,6 +3423,12 @@ class HamiltonianCFM:
             raise ValueError("num_steps must be >= 1")
         state = data.copy()
         num_graphs = self._num_graphs(state)
+        if self.uureal_block_ode:
+            if prior_seed is not None:
+                raise ValueError("uureal_block_ode uses an exact zero prior and rejects prior_seed.")
+            return self._sample_uureal_block_ode(
+                model, state, num_steps=num_steps, num_graphs=num_graphs
+            )
         if self.block_ode:
             return self._sample_block_ode(
                 model,

@@ -23,6 +23,7 @@ from ._base_datasets import (
 from dptb.nn.hamiltonian import E3Hamiltonian
 import lmdb
 from dptb.data.interfaces.ham_to_feature import block_to_feature
+from dptb.data.interfaces.blockwise_tensor import is_soc_uureal_mapper
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
@@ -779,6 +780,7 @@ class LMDBDataset(AtomicDataset):
     prefer_precomputed_p2 = True
     require_full_h_target = False
     require_residual_h_target = False
+    require_uureal_block_ode = False
     expected_p2_source_fingerprint = None
     expected_physical_h0_source_fingerprint = None
     audit_p2_representations = False
@@ -806,6 +808,7 @@ class LMDBDataset(AtomicDataset):
             prefer_precomputed_p2: bool = True,
             require_full_h_target: bool = False,
             require_residual_h_target: bool = False,
+            require_uureal_block_ode: bool = False,
             expected_p2_source_fingerprint: Optional[str] = None,
             expected_physical_h0_source_fingerprint: Optional[str] = None,
             audit_p2_representations: bool = False,
@@ -863,6 +866,7 @@ class LMDBDataset(AtomicDataset):
         self.prefer_precomputed_p2 = bool(prefer_precomputed_p2)
         self.require_full_h_target = bool(require_full_h_target)
         self.require_residual_h_target = bool(require_residual_h_target)
+        self.require_uureal_block_ode = bool(require_uureal_block_ode)
         self.expected_p2_source_fingerprint = (
             str(expected_p2_source_fingerprint)
             if expected_p2_source_fingerprint not in {None, ""}
@@ -892,6 +896,19 @@ class LMDBDataset(AtomicDataset):
             raise ValueError(
                 "Full-H and residual-H target contracts are mutually exclusive."
             )
+        if self.require_uureal_block_ode:
+            if not self.get_Hamiltonian or not self.get_H0:
+                raise ValueError(
+                    "require_uureal_block_ode=True requires get_Hamiltonian/get_H0=true."
+                )
+            if self.residual_hamiltonian:
+                raise ValueError(
+                    "Compact uu_real records are already-delta; residual_hamiltonian must stay false."
+                )
+            if not is_soc_uureal_mapper(type_mapper):
+                raise ValueError(
+                    "require_uureal_block_ode=True requires an explicit SOC uu_real mapper."
+                )
         if self.require_p2_blocks and not self.get_P2:
             raise ValueError("require_p2_blocks=True requires get_P2=True.")
         assert not get_Hamiltonian * get_DM, "Hamiltonian and Density Matrix can only loaded one at a time, for which will occupy the same attribute in the AtomicData."
@@ -1184,6 +1201,37 @@ class LMDBDataset(AtomicDataset):
             )
         if getattr(self, "require_residual_h_target", False):
             assert_residual_h_target_contract(data_dict, h0_key=self.h0_key)
+        if getattr(self, "require_uureal_block_ode", False):
+            keep = int(self.type_mapper.reduced_matrix_element)
+            required = (
+                "blockwise_spatial_schema", "blockwise_target_mode",
+                "blockwise_source_target_feature_width", "blockwise_source_h0_feature_width",
+                "soc_uureal_compact", "soc_uureal_full_rme", "soc_uureal_keep",
+                AtomicDataDict.NODE_H0_KEY, AtomicDataDict.EDGE_H0_KEY,
+                AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
+                AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
+                AtomicDataDict.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+                AtomicDataDict.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+            )
+            missing = [key for key in required if key not in data_dict]
+            if missing:
+                raise KeyError(f"Compact uu_real block record missing keys={missing}.")
+            expected = {
+                "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
+                "blockwise_target_mode": "already-delta",
+                "blockwise_source_target_feature_width": keep,
+                "blockwise_source_h0_feature_width": keep,
+                "soc_uureal_compact": True,
+                "soc_uureal_full_rme": keep * 8,
+                "soc_uureal_keep": keep,
+            }
+            for key, wanted in expected.items():
+                actual = data_dict[key]
+                actual = torch.as_tensor(actual).item() if not isinstance(actual, str) else actual
+                if actual != wanted:
+                    raise ValueError(
+                        f"Compact uu_real block record requires {key}={wanted!r}; got {actual!r}."
+                    )
         stored_basis_fingerprint = data_dict.get(BASIS_FINGERPRINT_KEY)
         # Historical, non-fingerprinted records need not expose a production
         # OrbitalMapper.  Resolve the mapper fingerprint lazily only when the
@@ -1811,6 +1859,13 @@ class LMDBDataset(AtomicDataset):
         ):
             if blockwise_key in data_dict:
                 atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
+        if getattr(self, "require_uureal_block_ode", False):
+            for metadata_key in (
+                "blockwise_spatial_schema", "blockwise_target_mode",
+                "blockwise_source_target_feature_width", "blockwise_source_h0_feature_width",
+                "soc_uureal_compact", "soc_uureal_full_rme", "soc_uureal_keep",
+            ):
+                atomicdata[metadata_key] = data_dict[metadata_key]
         if load_prior_blocks:
             for blockwise_key in p2_blockwise_keys:
                 if blockwise_key in data_dict:

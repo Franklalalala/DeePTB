@@ -182,8 +182,12 @@ def flow_options():
         Argument("node_target_key", str, optional=True, default="node_features"),
         Argument("edge_target_key", str, optional=True, default="edge_features"),
         Argument("output_space", str, optional=True, default="rme"),
-        Argument("block_ode", bool, optional=True, default=False),
+        Argument("state_space", str, optional=True, default=""),
         Argument("target_semantics", str, optional=True, default=""),
+        Argument("block_input_adapter", str, optional=True, default=""),
+        Argument("h0_condition_space", str, optional=True, default=""),
+        Argument("block_export_final_full_h", bool, optional=True, default=False),
+        Argument("block_ode", bool, optional=True, default=False),
         Argument("prediction_add_h0", bool, optional=True, default=False),
         Argument("time_conditioning_required", bool, optional=True, default=False),
         Argument("block_inverse_mode", str, optional=True, default="strict"),
@@ -362,12 +366,18 @@ def validate_block_ode_contract(data):
         "ao_block_ode",
         "block_ode",
         "ao_blocks_ode",
+        "uureal_block_ode",
+        "spatial_uureal_residual_block_ode",
     }
     if not requested:
         return
     if not bool(flow.get("enabled", False)):
         raise ValueError("block_ode requires train_options.flow_options.enabled=true")
-    if output_space != "ao_block_ode" or not bool(flow.get("block_ode", False)):
+    uureal_mode = output_space in {
+        "uureal_block_ode", "spatial_uureal_residual_block_ode"
+    }
+    expected_output_space = "uureal_block_ode" if uureal_mode else "ao_block_ode"
+    if output_space != expected_output_space or not bool(flow.get("block_ode", False)):
         raise ValueError(
             "block_ode is a distinct mode: set block_ode=true and "
             "output_space='ao_block_ode'; do not reuse the frozen ao_block adapter"
@@ -375,6 +385,8 @@ def validate_block_ode_contract(data):
     if str(flow.get("mode", "")).lower() != "residual":
         raise ValueError("block_ode v1 requires flow_options.mode='residual'")
     prior = str(flow.get("prior", "")).lower().replace("-", "_")
+    if uureal_mode and prior != "zero":
+        raise ValueError("uureal_block_ode requires prior='zero'")
     if prior not in {"zero", "projected_te"}:
         raise ValueError(
             "block_ode supports only prior='zero' or explicit prior='projected_te'"
@@ -422,6 +434,23 @@ def validate_block_ode_contract(data):
     semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
     if semantics not in {"absolute_full_h", "residual_dh"}:
         raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
+    if uureal_mode and semantics != "residual_dh":
+        raise ValueError("uureal_block_ode requires target_semantics='residual_dh'")
+    if uureal_mode:
+        expected_mode_options = {
+            "state_space": "residual_ao_block",
+            "block_input_adapter": "direct_cg",
+            "h0_condition_space": "compact_uureal_rme",
+        }
+        for option, expected in expected_mode_options.items():
+            if str(flow.get(option, "")).lower().replace("-", "_") != expected:
+                raise ValueError(
+                    f"uureal_block_ode requires flow_options.{option}={expected!r}"
+                )
+        if bool(flow.get("block_export_final_full_h", False)):
+            raise ValueError(
+                "uureal_block_ode keeps full-H export outside the ODE hot path"
+            )
     target_fields = {
         "absolute_full_h": {
             "node_block_target_key": "node_full_hamil_target_blocks",
@@ -517,7 +546,14 @@ def validate_block_ode_contract(data):
                 f"got {configured_atol:.6g}"
             )
 
-    if bool(common.get("has_soc", False)):
+    if uureal_mode:
+        if not bool(common.get("has_soc", False)):
+            raise ValueError("uureal_block_ode requires common_options.has_soc=true")
+        if not bool(common.get("nextham_uureal_mask", False)):
+            raise ValueError("uureal_block_ode requires common_options.nextham_uureal_mask=true")
+        if bool(common.get("full_soc_prediction", False)):
+            raise ValueError("uureal_block_ode requires full_soc_prediction=false")
+    elif bool(common.get("has_soc", False)):
         raise ValueError("block_ode v1 is non-SOC only; set common_options.has_soc=false")
 
     distance_ranges = train.get("distance_ranges", None)
@@ -576,6 +612,10 @@ def validate_block_ode_contract(data):
         embedding.get("use_h0_edge_init", True)
     ):
         raise ValueError("block_ode requires both node and edge H0 initialization")
+    if bool(embedding.get("use_uureal_residual_block_input", False)) != uureal_mode:
+        raise ValueError(
+            "uureal_block_ode and embedding.use_uureal_residual_block_input must be enabled together"
+        )
 
     data_options_value = data.get("data_options", {}) or {}
     if not isinstance(data_options_value.get("train"), dict):
@@ -585,7 +625,7 @@ def validate_block_ode_contract(data):
         for split in ("train", "validation", "reference", "test")
         if isinstance(data_options_value.get(split), dict)
     }
-    expected_residual = semantics == "residual_dh"
+    expected_residual = semantics == "residual_dh" and not uureal_mode
     expected_full_h_target = semantics == "absolute_full_h"
     for split, split_options in configured_splits.items():
         path = f"data_options.{split}"
@@ -625,6 +665,11 @@ def validate_block_ode_contract(data):
                 f"{path}.require_residual_h_target must be "
                 f"{str(expected_residual).lower()} for block_ode "
                 f"target_semantics={semantics!r}"
+            )
+        actual_uureal = bool(split_options.get("require_uureal_block_ode", False))
+        if actual_uureal != uureal_mode:
+            raise ValueError(
+                f"{path}.require_uureal_block_ode must be {str(uureal_mode).lower()}"
             )
 
 
@@ -1476,6 +1521,7 @@ def train_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -1518,6 +1564,7 @@ def validation_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -1560,6 +1607,7 @@ def reference_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -1601,6 +1649,7 @@ def test_data_sub():
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -2013,7 +2062,9 @@ def slem_h0():
                  doc="Permit the H0 input fallback to resolve to the target Hamiltonian/"
                      "features while the module is in training mode. Off by default: "
                      "that fallback is a label leak during training (it is a deliberate "
-                     "surrogate only at inference)."),
+                      "surrogate only at inference)."),
+        Argument("use_uureal_residual_block_input", bool, optional=True, default=False,
+                 doc="Enable the mapper-derived bias-free residual AO-block projector."),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),

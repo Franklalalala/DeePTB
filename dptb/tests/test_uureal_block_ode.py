@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import copy
+
+import pytest
+import torch
+
+from dptb.data import _keys
+from dptb.data.interfaces.blockwise_tensor import (
+    BlockTensorResult,
+    block_tensors_to_feature_tensors,
+)
+from dptb.data.transforms import OrbitalMapper
+from dptb.nn.embedding.lem_moe_v3_h0_helpers import DirectUuRealBlockProjector
+from dptb.nnops.flow import HamiltonianCFM
+from dptb.utils.argcheck import validate_block_ode_contract
+
+
+def _mapper():
+    mapper = OrbitalMapper(
+        {"H": "1s", "C": "1s1p"},
+        method="e3tb",
+        has_soc=True,
+        nextham_uureal_mask=True,
+        full_soc_prediction=False,
+    )
+    mapper.get_irreps()
+    return mapper
+
+
+def _record(mapper):
+    data = {
+        "atomic_numbers": torch.tensor([1, 6]),
+        "atom_types": torch.tensor([[mapper.chemical_symbol_to_type["H"]], [mapper.chemical_symbol_to_type["C"]]]),
+        "edge_index": torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        "edge_cell_shift": torch.zeros(2, 3),
+        "edge_type": torch.tensor([[mapper.bond_to_type["H-C"]], [mapper.bond_to_type["C-H"]]]),
+        "pos": torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        "cell": torch.eye(3) * 8.0,
+        "pbc": torch.tensor([False, False, False]),
+        "batch": torch.zeros(2, dtype=torch.long),
+    }
+    node = torch.zeros(2, 4, 4)
+    node[0, 0, 0] = 0.25
+    c = torch.arange(16, dtype=torch.float32).reshape(4, 4) / 100.0
+    node[1] = 0.5 * (c + c.T)
+    edge = torch.zeros(2, 4, 4)
+    edge[0, :1, :4] = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+    edge[1, :4, :1] = edge[0, :1, :4].T
+    packed = BlockTensorResult(node, edge, torch.tensor([[1, 1], [4, 4]]), torch.tensor([[1, 4], [4, 1]]))
+    node_h0, edge_h0 = block_tensors_to_feature_tensors(
+        data, mapper, node_blocks=node * 0.5, edge_blocks=edge * 0.5
+    )
+    keep = int(mapper.reduced_matrix_element)
+    data.update(
+        {
+            "node_h0": node_h0,
+            "edge_h0": edge_h0,
+            "node_delta_hamil_blocks": packed.node_blocks,
+            "edge_delta_hamil_blocks": packed.edge_blocks,
+            "node_delta_hamil_block_shape": packed.node_shapes,
+            "edge_delta_hamil_block_shape": packed.edge_shapes,
+            "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
+            "blockwise_target_mode": "already-delta",
+            "blockwise_source_target_feature_width": keep,
+            "blockwise_source_h0_feature_width": keep,
+            "soc_uureal_compact": True,
+            "soc_uureal_full_rme": keep * 8,
+            "soc_uureal_keep": keep,
+        }
+    )
+    return data
+
+
+def _flow(mapper):
+    return HamiltonianCFM(
+        {
+            "enabled": True,
+            "mode": "residual",
+            "prior": "zero",
+            "output_space": "uureal_block_ode",
+            "block_ode": True,
+            "state_space": "residual_ao_block",
+            "target_semantics": "residual_dh",
+            "block_input_adapter": "direct_cg",
+            "h0_condition_space": "compact_uureal_rme",
+            "block_export_final_full_h": False,
+            "prediction_add_h0": False,
+            "time_conditioning_required": True,
+            "node_block_target_key": "node_delta_hamil_blocks",
+            "edge_block_target_key": "edge_delta_hamil_blocks",
+            "node_block_shape_key": "node_delta_hamil_block_shape",
+            "edge_block_shape_key": "edge_delta_hamil_block_shape",
+            "validation_ode_steps": [1, 3],
+        },
+        idp=mapper,
+        dtype=torch.float32,
+    )
+
+
+def test_mapper_plan_matches_canonical_feature_lineage_and_zero_is_bit_exact():
+    mapper = _mapper()
+    data = _record(mapper)
+    projector = DirectUuRealBlockProjector(
+        mapper, mapper.get_irreps().sort()[0].simplify(), dtype=torch.float32, device="cpu"
+    )
+    canonical_node, canonical_edge = block_tensors_to_feature_tensors(
+        data,
+        mapper,
+        node_blocks=data["node_delta_hamil_blocks"],
+        edge_blocks=data["edge_delta_hamil_blocks"],
+    )
+    gathered_node = projector._gather(data["node_delta_hamil_blocks"], data["atom_types"], projector.node_plan)
+    gathered_edge = projector._gather(data["edge_delta_hamil_blocks"], data["edge_type"], projector.edge_plan)
+    assert torch.equal(gathered_node, canonical_node.index_select(1, projector.sort_index))
+    assert torch.equal(gathered_edge, canonical_edge.index_select(1, projector.sort_index))
+
+    zero = copy.deepcopy(data)
+    zero[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = torch.zeros_like(data["node_delta_hamil_blocks"])
+    zero[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = torch.zeros_like(data["edge_delta_hamil_blocks"])
+    zero[_keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = data["node_delta_hamil_block_shape"]
+    zero[_keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = data["edge_delta_hamil_block_shape"]
+    node_hidden, edge_hidden = projector(
+        zero, zero["atom_types"], zero["edge_type"], torch.arange(2)
+    )
+    assert torch.count_nonzero(node_hidden) == 0
+    assert torch.count_nonzero(edge_hidden) == 0
+
+
+def test_prepare_is_exact_scalar_bridge_and_does_not_require_h0_blocks():
+    mapper = _mapper()
+    data = _record(mapper)
+    flow = _flow(mapper)
+    model_data, ref, ctx = flow.prepare_batch(
+        copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.25])
+    )
+    assert torch.equal(
+        model_data[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY],
+        0.25 * data["node_delta_hamil_blocks"],
+    )
+    assert torch.equal(
+        model_data[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY],
+        0.25 * data["edge_delta_hamil_blocks"],
+    )
+    assert "node_h0_blocks" not in data and "edge_h0_blocks" not in data
+    assert ctx.block_target_semantics == "residual_dh"
+    assert ref["blockwise_target_mode"] == "already-delta"
+
+
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("blockwise_spatial_schema", "wrong/v0"),
+        ("blockwise_target_mode", "absolute"),
+        ("blockwise_source_target_feature_width", 15),
+        ("blockwise_source_h0_feature_width", 15),
+        ("soc_uureal_compact", False),
+        ("soc_uureal_full_rme", 16),
+        ("soc_uureal_keep", 15),
+    ],
+)
+def test_data_gate_fails_closed_per_metadata_field(key, bad):
+    mapper = _mapper()
+    data = _record(mapper)
+    data[key] = bad
+    with pytest.raises(ValueError, match=key):
+        _flow(mapper).prepare_batch(copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.5]))
+
+
+def test_data_gate_accepts_identical_collated_metadata_and_rejects_mixed_values():
+    mapper = _mapper()
+    data = _record(mapper)
+    data["blockwise_spatial_schema"] = ["deeptb.blockwise_spatial/v1"]
+    data["blockwise_target_mode"] = ["already-delta"]
+    for key in (
+        "blockwise_source_target_feature_width",
+        "blockwise_source_h0_feature_width",
+        "soc_uureal_compact",
+        "soc_uureal_full_rme",
+        "soc_uureal_keep",
+    ):
+        data[key] = torch.as_tensor([data[key]])
+    _flow(mapper).prepare_batch(copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.5]))
+
+    data["blockwise_spatial_schema"] = ["deeptb.blockwise_spatial/v1", "wrong/v0"]
+    with pytest.raises(ValueError, match="batched metadata values"):
+        _flow(mapper).prepare_batch(copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.5]))
+
+
+class _EndpointSpy(torch.nn.Module):
+    def __init__(self, endpoints):
+        super().__init__()
+        self.endpoints = endpoints
+        self.inputs = []
+
+    def forward(self, data):
+        self.inputs.append(
+            (
+                data[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY].clone(),
+                data[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY].clone(),
+            )
+        )
+        node, edge = self.endpoints[len(self.inputs) - 1]
+        out = data.copy()
+        out[_keys.NODE_PRED_HAMIL_BLOCKS_KEY] = node.clone()
+        out[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY] = edge.clone()
+        return out
+
+
+@pytest.mark.parametrize("steps", [1, 2, 3])
+def test_sampler_zero_start_spy_closed_loop_and_manual_blend(steps):
+    mapper = _mapper()
+    data = _record(mapper)
+    node = data["node_delta_hamil_blocks"]
+    edge = data["edge_delta_hamil_blocks"]
+    endpoints = [(node * (i + 1), edge * (i + 1)) for i in range(steps)]
+    model = _EndpointSpy(endpoints)
+    result = _flow(mapper).sample(model, copy.deepcopy(data), num_steps=steps)
+    assert torch.count_nonzero(model.inputs[0][0]) == 0
+    assert torch.count_nonzero(model.inputs[0][1]) == 0
+    if steps >= 2:
+        torch.testing.assert_close(model.inputs[1][0], node / steps, rtol=0.0, atol=1e-8)
+        torch.testing.assert_close(model.inputs[1][1], edge / steps, rtol=0.0, atol=1e-8)
+    assert torch.equal(result[_keys.NODE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][0])
+    assert torch.equal(result[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][1])
+
+
+def test_argcheck_uureal_exception_is_explicit_and_mutually_bound():
+    config = {
+        "common_options": {
+            "dtype": "float32", "has_soc": True,
+            "nextham_uureal_mask": True, "full_soc_prediction": False,
+        },
+        "train_options": {
+            "flow_options": {
+                "enabled": True, "mode": "residual", "prior": "zero",
+                "output_space": "uureal_block_ode", "block_ode": True,
+                "state_space": "residual_ao_block", "target_semantics": "residual_dh",
+                "block_input_adapter": "direct_cg",
+                "h0_condition_space": "compact_uureal_rme",
+                "prediction_add_h0": False, "time_conditioning_required": True,
+                "node_block_target_key": "node_delta_hamil_blocks",
+                "edge_block_target_key": "edge_delta_hamil_blocks",
+                "node_block_shape_key": "node_delta_hamil_block_shape",
+                "edge_block_shape_key": "edge_delta_hamil_block_shape",
+                "validation_ode_steps": [1, 3],
+            }
+        },
+        "model_options": {
+            "embedding": {
+                "method": "lem_moe_v3_h0", "output_route": "h_b0",
+                "require_full_block_edge_coverage": True,
+                "use_uureal_residual_block_input": True,
+                "use_flow_time_embedding": True, "flow_time_condition_edges": True,
+                "flow_time_allow_missing": False, "h0_merge_mode": "replace",
+                "use_h0_node_init": True, "use_h0_edge_init": True,
+            },
+            "prediction": {
+                "method": "block_native", "block_decoder": "expansion_cg",
+                "blockwise_hamiltonian": True, "add_h0": False,
+            },
+        },
+        "data_options": {
+            "train": {
+                "type": "LMDBDataset", "get_Hamiltonian": True, "get_H0": True,
+                "residual_hamiltonian": False, "require_full_h_target": False,
+                "require_residual_h_target": False, "require_uureal_block_ode": True,
+            }
+        },
+    }
+    validate_block_ode_contract(config)
+    config["common_options"]["has_soc"] = False
+    with pytest.raises(ValueError, match="has_soc=true"):
+        validate_block_ode_contract(config)

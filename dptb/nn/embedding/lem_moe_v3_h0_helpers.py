@@ -4,22 +4,160 @@ import logging
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
+from e3nn import o3
 from e3nn.o3 import Linear
 from torch_runstats.scatter import scatter
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicData import register_fields
+from dptb.data.interfaces.blockwise_tensor import (
+    edge_feature_slices,
+    ensure_spatial_block_mapper,
+    infer_block_shapes,
+    is_soc_uureal_mapper,
+    mapper_max_norb,
+    onsite_feature_slices,
+)
 
 
 # Keep H0 tensors as first-class node/edge fields once the dataset starts
 # emitting them. This is a no-op for the current fallback-only workflow.
 register_fields(
-    node_fields=[_keys.NODE_H0_KEY],
-    edge_fields=[_keys.EDGE_H0_KEY],
+    node_fields=[
+        _keys.NODE_H0_KEY,
+        _keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY,
+        _keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+    ],
+    edge_fields=[
+        _keys.EDGE_H0_KEY,
+        _keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY,
+        _keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+    ],
 )
 
 
 log = logging.getLogger(__name__)
+
+
+def _sorted_irrep_coordinate_index(idp, *, device=None) -> tuple[o3.Irreps, torch.Tensor]:
+    """Map mapper/raw orbpair coordinates to H0Init's sorted irrep layout."""
+    raw = idp.get_irreps()
+    sorted_result = raw.sort()
+    raw_slices = raw.slices()
+    coordinate_order: list[int] = []
+    for term_index in sorted_result.p:
+        sli = raw_slices[int(term_index)]
+        coordinate_order.extend(range(int(sli.start), int(sli.stop)))
+    index = torch.tensor(coordinate_order, dtype=torch.long, device=device)
+    sorted_irreps = sorted_result.irreps.simplify()
+    if index.numel() != int(idp.reduced_matrix_element):
+        raise RuntimeError(
+            "uu_real mapper irrep permutation width disagrees with reduced_matrix_element: "
+            f"permutation={index.numel()}, mapper={idp.reduced_matrix_element}."
+        )
+    return sorted_irreps, index
+
+
+class DirectUuRealBlockProjector(torch.nn.Module):
+    """Bias-free mapper-derived AO-block contraction into hidden irreps.
+
+    The plans gather only mapper-valid shell coordinates from each padded block,
+    apply the mapper's raw->sorted irrep permutation, and use separate node/edge
+    equivariant linear maps. No canonical block inverse or H0/full-H block
+    materialization occurs in the hot path.
+    """
+
+    def __init__(self, idp, irreps_out, *, dtype, device) -> None:
+        super().__init__()
+        ensure_spatial_block_mapper(idp)
+        if not is_soc_uureal_mapper(idp):
+            raise ValueError(
+                "DirectUuRealBlockProjector requires the explicit SOC uu_real mapper contract."
+            )
+        self.idp = idp
+        self.canvas = mapper_max_norb(idp)
+        irreps_in, sort_index = _sorted_irrep_coordinate_index(idp, device=device)
+        self.irreps_in = irreps_in
+        self.irreps_out = o3.Irreps(irreps_out)
+        self.register_buffer("sort_index", sort_index, persistent=True)
+
+        node_plan = torch.full(
+            (len(idp.type_names), int(idp.reduced_matrix_element)),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        for symbol, type_index in idp.chemical_symbol_to_type.items():
+            for row, col, feat in onsite_feature_slices(idp, symbol):
+                flat = [
+                    r * self.canvas + c
+                    for r in range(int(row.start), int(row.stop))
+                    for c in range(int(col.start), int(col.stop))
+                ]
+                node_plan[int(type_index), int(feat.start):int(feat.stop)] = torch.tensor(
+                    flat, dtype=torch.long, device=device
+                )
+
+        edge_plan = torch.full(
+            (len(idp.bond_types), int(idp.reduced_matrix_element)),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        for bond, type_index in idp.bond_to_type.items():
+            left, right = bond.split("-")
+            for row, col, feat in edge_feature_slices(idp, left, right):
+                flat = [
+                    r * self.canvas + c
+                    for r in range(int(row.start), int(row.stop))
+                    for c in range(int(col.start), int(col.stop))
+                ]
+                edge_plan[int(type_index), int(feat.start):int(feat.stop)] = torch.tensor(
+                    flat, dtype=torch.long, device=device
+                )
+        self.register_buffer("node_plan", node_plan, persistent=True)
+        self.register_buffer("edge_plan", edge_plan, persistent=True)
+        self.node_linear = Linear(
+            irreps_in, self.irreps_out, shared_weights=True,
+            internal_weights=True, biases=False,
+        ).to(dtype=dtype, device=device)
+        self.edge_linear = Linear(
+            irreps_in, self.irreps_out, shared_weights=True,
+            internal_weights=True, biases=False,
+        ).to(dtype=dtype, device=device)
+
+    def _gather(self, blocks: torch.Tensor, types: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
+        if blocks.ndim != 3 or tuple(blocks.shape[-2:]) != (self.canvas, self.canvas):
+            raise ValueError(
+                "uu_real residual blocks must use the mapper canvas "
+                f"{(self.canvas, self.canvas)}; got {tuple(blocks.shape)}."
+            )
+        selected = plan.index_select(0, types.flatten().to(device=plan.device, dtype=torch.long))
+        valid = selected >= 0
+        raw = blocks.flatten(1).gather(1, selected.clamp_min(0).to(blocks.device))
+        raw = raw * valid.to(device=blocks.device, dtype=blocks.dtype)
+        return raw.index_select(1, self.sort_index.to(blocks.device))
+
+    def forward(self, data, atom_type, bond_type, active_edges):
+        required = (
+            _keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY,
+            _keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY,
+            _keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+            _keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+        )
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise KeyError(f"uureal_block_ode residual projector missing keys={missing}.")
+        node_blocks = data[required[0]]
+        edge_blocks = data[required[1]]
+        expected_node, expected_edge = infer_block_shapes(data, self.idp, device=node_blocks.device)
+        node_shapes = torch.as_tensor(data[required[2]], device=node_blocks.device, dtype=torch.long)
+        edge_shapes = torch.as_tensor(data[required[3]], device=edge_blocks.device, dtype=torch.long)
+        if not torch.equal(node_shapes, expected_node) or not torch.equal(edge_shapes, expected_edge):
+            raise ValueError("uu_real residual block shapes disagree with mapper/species plans.")
+        node_raw = self._gather(node_blocks, atom_type, self.node_plan)
+        edge_raw = self._gather(edge_blocks, bond_type, self.edge_plan)
+        return self.node_linear(node_raw), self.edge_linear(edge_raw)[active_edges]
 
 
 def _take_on_index_device(
@@ -123,6 +261,7 @@ class H0InitLayer(torch.nn.Module):
         fallback_node_key: str = _keys.NODE_FEATURES_KEY,
         fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
         allow_target_fallback_in_training: bool = False,
+        use_uureal_residual_block_input: bool = False,
         merge_mode: str = "replace",
         self_edge_tol: float = 1e-8,
         dtype: Union[str, torch.dtype] = torch.float32,
@@ -148,6 +287,7 @@ class H0InitLayer(torch.nn.Module):
         self.fallback_node_key = fallback_node_key
         self.fallback_edge_key = fallback_edge_key
         self.allow_target_fallback_in_training = allow_target_fallback_in_training
+        self.use_uureal_residual_block_input = bool(use_uureal_residual_block_input)
         self.merge_mode = merge_mode
         self.self_edge_tol = self_edge_tol
         self.dtype = dtype
@@ -167,6 +307,23 @@ class H0InitLayer(torch.nn.Module):
             internal_weights=True,
             biases=True,
         )
+        self.residual_block_projector = (
+            DirectUuRealBlockProjector(
+                self.idp, self.irreps_out, dtype=dtype, device=device
+            )
+            if self.use_uureal_residual_block_input
+            else None
+        )
+        if self.residual_block_projector is not None:
+            if self.h0_irreps != self.residual_block_projector.irreps_in:
+                raise RuntimeError(
+                    "H0Init and uu_real residual projector irrep layouts disagree."
+                )
+            self.register_buffer(
+                "_uureal_h0_sort_index",
+                self.residual_block_projector.sort_index.detach().clone(),
+                persistent=True,
+            )
 
     def _candidate_keys(
         self,
@@ -313,6 +470,8 @@ class H0InitLayer(torch.nn.Module):
             return base_node_features
 
         node_source = self._mask_node_source(node_source, atom_type)
+        if self.use_uureal_residual_block_input:
+            node_source = node_source.index_select(1, self._uureal_h0_sort_index)
         return self._merge_features(base_node_features, self.node_projector(node_source))
 
     def forward(
@@ -360,6 +519,8 @@ class H0InitLayer(torch.nn.Module):
                 )
                 return latents, base_node_features, base_edge_features, cutoff_coeffs, active_edges
             edge_source = self._mask_edge_source(edge_source, bond_type)
+            if self.use_uureal_residual_block_input:
+                edge_source = edge_source.index_select(1, self._uureal_h0_sort_index)
             edge_features_h0 = self.edge_projector(edge_source[active_edges])
             edge_features = self._merge_features(base_edge_features, edge_features_h0)
 
@@ -388,5 +549,12 @@ class H0InitLayer(torch.nn.Module):
             )
         else:
             node_features = self._fallback_node_features(data, atom_type, base_node_features)
+
+        if self.residual_block_projector is not None:
+            residual_node, residual_edge = self.residual_block_projector(
+                data, atom_type, bond_type, active_edges
+            )
+            node_features = node_features + residual_node
+            edge_features = edge_features + residual_edge
 
         return latents, node_features, edge_features, cutoff_coeffs, active_edges

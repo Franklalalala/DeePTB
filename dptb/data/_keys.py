@@ -147,6 +147,13 @@ NODE_PRED_HAMIL_BLOCKS_KEY: Final[str] = "node_hamil_blocks"
 EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY: Final[str] = "edge_hamil_block_shape"
 NODE_PRED_HAMIL_BLOCK_SHAPE_KEY: Final[str] = "node_hamil_block_shape"
 
+# Residual AO-block ODE model inputs. These are distinct from target and
+# prediction authority fields so a model can never consume the clean endpoint.
+EDGE_UUREAL_RESIDUAL_BLOCKS_KEY: Final[str] = "edge_uureal_residual_blocks"
+NODE_UUREAL_RESIDUAL_BLOCKS_KEY: Final[str] = "node_uureal_residual_blocks"
+EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY: Final[str] = "edge_uureal_residual_block_shape"
+NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY: Final[str] = "node_uureal_residual_block_shape"
+
 NODE_FEATURES_KEY: Final[str] = "node_features"
 NODE_ATTRS_KEY: Final[str] = "node_attrs"
 EDGE_TYPE_KEY: Final[str] = "edge_type"
