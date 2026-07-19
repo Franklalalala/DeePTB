@@ -101,30 +101,28 @@ def _record(mapper):
     return data
 
 
-def _flow(mapper):
-    return HamiltonianCFM(
-        {
-            "enabled": True,
-            "mode": "residual",
-            "prior": "zero",
-            "output_space": "uureal_block_ode",
-            "block_ode": True,
-            "state_space": "residual_ao_block",
-            "target_semantics": "residual_dh",
-            "block_input_adapter": "direct_cg",
-            "h0_condition_space": "compact_uureal_rme",
-            "block_export_final_full_h": False,
-            "prediction_add_h0": False,
-            "time_conditioning_required": True,
-            "node_block_target_key": "node_delta_hamil_blocks",
-            "edge_block_target_key": "edge_delta_hamil_blocks",
-            "node_block_shape_key": "node_delta_hamil_block_shape",
-            "edge_block_shape_key": "edge_delta_hamil_block_shape",
-            "validation_ode_steps": [1, 3],
-        },
-        idp=mapper,
-        dtype=torch.float32,
-    )
+def _flow(mapper, **overrides):
+    options = {
+        "enabled": True,
+        "mode": "residual",
+        "prior": "zero",
+        "output_space": "uureal_block_ode",
+        "block_ode": True,
+        "state_space": "residual_ao_block",
+        "target_semantics": "residual_dh",
+        "block_input_adapter": "direct_cg",
+        "h0_condition_space": "compact_uureal_rme",
+        "block_export_final_full_h": False,
+        "prediction_add_h0": False,
+        "time_conditioning_required": True,
+        "node_block_target_key": "node_delta_hamil_blocks",
+        "edge_block_target_key": "edge_delta_hamil_blocks",
+        "node_block_shape_key": "node_delta_hamil_block_shape",
+        "edge_block_shape_key": "edge_delta_hamil_block_shape",
+        "validation_ode_steps": [1, 3],
+    }
+    options.update(overrides)
+    return HamiltonianCFM(options, idp=mapper, dtype=torch.float32)
 
 
 def test_direct_projector_inverts_e3hamiltonian_forward_cgbasis():
@@ -509,6 +507,41 @@ def test_sampler_zero_start_spy_closed_loop_and_manual_blend(steps):
     assert torch.equal(result[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][1])
 
 
+def test_t0_injection_bypasses_t_min_clamp():
+    """Review repro: t_min=0.5 + t0_probability=1 must yield exact zeros.
+
+    t0_probability exists to train the t=0, D=0 inference boundary; before the
+    fix the injected zeros were re-clamped to t_min (0.5), silently deleting
+    the boundary training mass.
+    """
+    mapper = _mapper()
+    flow = _flow(mapper, t_min=0.5, t0_probability=1.0)
+    t = flow._sample_t(num_graphs=64, device=torch.device("cpu"), dtype=torch.float32)
+    assert torch.equal(t, torch.zeros_like(t))
+
+    # Partial injection: zeros survive AND every non-zero sample honours t_min.
+    flow = _flow(mapper, t_min=0.5, t0_probability=0.5)
+    generator = torch.Generator().manual_seed(0)
+    t = flow._sample_t(
+        num_graphs=512, device=torch.device("cpu"), dtype=torch.float32,
+        generator=generator,
+    )
+    zero = t == 0.0
+    assert bool(zero.any()) and bool((~zero).any())
+    assert bool((t[~zero] >= 0.5).all())
+
+
+def test_uureal_t0_probability_defaults_positive_and_rejects_explicit_zero():
+    """uureal_block_ode must guarantee t=0 training mass (review P1-3b)."""
+    mapper = _mapper()
+    assert _flow(mapper).t0_probability == pytest.approx(0.15)
+    assert _flow(mapper, t0_probability=0.25).t0_probability == pytest.approx(0.25)
+    with pytest.raises(ValueError, match="t0_probability"):
+        _flow(mapper, t0_probability=0.0)
+    with pytest.raises(ValueError, match="t0_probability"):
+        _flow(mapper, t0_probability=-0.1)
+
+
 def test_argcheck_uureal_exception_is_explicit_and_mutually_bound():
     config = {
         "common_options": {
@@ -553,6 +586,16 @@ def test_argcheck_uureal_exception_is_explicit_and_mutually_bound():
         },
     }
     validate_block_ode_contract(config)
+
+    # t=0 training-mass interlock: explicit non-positive t0_probability fails
+    # closed; a positive value or omission (runtime default 0.15) validates.
+    config["train_options"]["flow_options"]["t0_probability"] = 0.0
+    with pytest.raises(ValueError, match="t0_probability"):
+        validate_block_ode_contract(config)
+    config["train_options"]["flow_options"]["t0_probability"] = 0.2
+    validate_block_ode_contract(config)
+    del config["train_options"]["flow_options"]["t0_probability"]
+
     config["common_options"]["has_soc"] = False
     with pytest.raises(ValueError, match="has_soc=true"):
         validate_block_ode_contract(config)

@@ -458,6 +458,22 @@ def validate_block_ode_contract(data):
             raise ValueError(
                 "uureal_block_ode keeps full-H export outside the ODE hot path"
             )
+        # The rollout always starts at exactly t=0, D=0; with D_t = t*D1 the
+        # interior schedule alone never trains that boundary.  An explicitly
+        # configured non-positive t0_probability is therefore a
+        # misconfiguration; omitting it lets the runtime default (0.15) apply.
+        t0_probability = flow.get("t0_probability", None)
+        if t0_probability is not None:
+            if (
+                isinstance(t0_probability, bool)
+                or not isinstance(t0_probability, Number)
+                or not math.isfinite(float(t0_probability))
+                or float(t0_probability) <= 0.0
+            ):
+                raise ValueError(
+                    "uureal_block_ode requires t0_probability > 0 (recommended "
+                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass"
+                )
     target_fields = {
         "absolute_full_h": {
             "node_block_target_key": "node_full_hamil_target_blocks",

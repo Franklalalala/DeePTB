@@ -534,7 +534,24 @@ class HamiltonianCFM:
         self.time_sampling = str(options.get("time_sampling", "uniform")).lower()
         self.t_min = float(options.get("t_min", 0.0))
         self.t_max = float(options.get("t_max", 0.999))
-        self.t0_probability = float(options.get("t0_probability", 0.0))
+        if self.uureal_block_ode:
+            # The uu_real rollout ALWAYS starts at exactly t=0, D=0 -- the one
+            # state inference is guaranteed to visit.  With D_t = t*D1 the model
+            # can fit interior times via the D_t/t shortcut without ever
+            # producing a trained answer at the boundary, so a t=0 training mass
+            # is mandatory here.  Default 0.15: enough boundary gradient mass to
+            # anchor the inference start without starving the interior schedule
+            # (inside the recommended 0.1-0.25 band).  Explicit zero/negative is
+            # a misconfiguration and fails closed.
+            self.t0_probability = float(options.get("t0_probability", 0.15))
+            if self.t0_probability <= 0.0:
+                raise ValueError(
+                    "uureal_block_ode requires t0_probability > 0: the rollout "
+                    "starts at t=0, D=0, and that boundary state has no training "
+                    "mass otherwise (recommended range 0.1-0.25)."
+                )
+        else:
+            self.t0_probability = float(options.get("t0_probability", 0.0))
         self.t_eps = float(options.get("t_eps", 1.0e-3))
         self.endpoint_weight_power = float(options.get("endpoint_weight_power", 0.0))
         self.endpoint_weight_cap = float(options.get("endpoint_weight_cap", 100.0))
@@ -753,12 +770,17 @@ class HamiltonianCFM:
             t = lo + (hi - lo) * t
         else:
             raise ValueError(f"Unsupported flow_options.time_sampling={self.time_sampling!r}")
+        t = t.clamp(min=lo, max=hi)
+        # Inject exact-zero times AFTER the [t_min, t_max] clamp: t0_probability
+        # exists precisely to train the t=0 boundary state, so a configured
+        # t_min>0 must not re-clamp the injected zeros away (with t_min=0.5 and
+        # t0_probability=1 every "zero" silently became 0.5 before this fix).
         if self.t0_probability > 0.0:
             use_t0 = torch.rand(
                 num_graphs, device=device, generator=generator
             ) < self.t0_probability
             t = torch.where(use_t0, torch.zeros_like(t), t)
-        return t.clamp(min=lo, max=hi)
+        return t
 
     @staticmethod
     def _num_graphs(data: AtomicDataDict.Type) -> int:
