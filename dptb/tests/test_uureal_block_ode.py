@@ -507,6 +507,79 @@ def test_sampler_zero_start_spy_closed_loop_and_manual_blend(steps):
     assert torch.equal(result[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY], endpoints[-1][1])
 
 
+def test_directed_compatible_metric_coexists_with_canonical_and_matches_hand_reduction():
+    """Review P1-5: historical directed-coordinate metric alongside canonical.
+
+    canonical (train_onsite/hopping_loss): each independent freedom once
+    (onsite upper triangle + one canonical edge per Hermitian pair).
+    compatible_directed (train_compatible_directed_*): every stored directed
+    coordinate -- all valid onsite entries + ALL directed edges -- the same
+    population the historical SOC uu-real RME losses averaged over.  Both are
+    locked here against an independent hand-written reduction on a constructed
+    sample where the two must disagree on hopping (2 directed edges vs 1
+    canonical) and agree on onsite only through their different masks.
+    """
+    from dptb.data.interfaces.blockwise_tensor import (
+        block_mask_from_shapes,
+        strict_reverse_edge_index,
+    )
+
+    mapper = _mapper()
+    data = _record(mapper)
+    flow = _flow(mapper)
+
+    _model_data, ref, ctx = flow.prepare_batch(
+        copy.deepcopy(data), copy.deepcopy(data), t=torch.tensor([0.0])
+    )
+    pred = dict(ref)
+    pred[flow.node_output_key] = 2.0 * torch.as_tensor(ref[flow.node_block_target_key])
+    pred[flow.edge_output_key] = 2.0 * torch.as_tensor(ref[flow.edge_block_target_key])
+    loss, state = flow.loss_on_sample(pred, ref, ctx)
+
+    for key in (
+        "train_compatible_directed_onsite_loss",
+        "train_compatible_directed_hopping_loss",
+        "train_compatible_directed_loss",
+    ):
+        assert key in state, key
+
+    # Independent hand reduction: diff == target blocks (pred = 2*target).
+    node_diff = torch.as_tensor(ref[flow.node_block_target_key], dtype=torch.float32)
+    edge_diff = torch.as_tensor(ref[flow.edge_block_target_key], dtype=torch.float32)
+    node_valid = block_mask_from_shapes(
+        torch.as_tensor(ref[flow.node_block_shape_key]), tuple(node_diff.shape[-2:])
+    )
+    edge_valid = block_mask_from_shapes(
+        torch.as_tensor(ref[flow.edge_block_shape_key]), tuple(edge_diff.shape[-2:])
+    )
+    upper = torch.triu(torch.ones(tuple(node_diff.shape[-2:]), dtype=torch.bool))
+    rev = strict_reverse_edge_index(ref, idp=mapper)
+    canonical_rows = torch.arange(edge_diff.shape[0]) <= rev
+
+    assert flow.loss_type == "mse"  # hand reduction below assumes the default
+
+    def hand_metric(diff, mask):
+        values = diff[mask]
+        return values.square().sum() / float(values.numel())
+
+    canonical_onsite = hand_metric(node_diff, node_valid & upper.unsqueeze(0))
+    canonical_hopping = hand_metric(edge_diff, edge_valid & canonical_rows.view(-1, 1, 1))
+    directed_onsite = hand_metric(node_diff, node_valid)
+    directed_hopping = hand_metric(edge_diff, edge_valid)
+
+    torch.testing.assert_close(state["train_onsite_loss"], canonical_onsite, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(state["train_hopping_loss"], canonical_hopping, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(
+        state["train_compatible_directed_onsite_loss"], directed_onsite, rtol=1e-6, atol=1e-7
+    )
+    torch.testing.assert_close(
+        state["train_compatible_directed_hopping_loss"], directed_hopping, rtol=1e-6, atol=1e-7
+    )
+    # The two reductions genuinely differ on this sample's coordinate counts:
+    # 2 directed edges vs 1 canonical edge (H-C / C-H Hermitian pair).
+    assert int((edge_valid & canonical_rows.view(-1, 1, 1)).sum()) < int(edge_valid.sum())
+
+
 def test_compatible_scorer_scores_uureal_residual_without_block_codec():
     """Review P1-4 repro: first N=1 validation with euler logging disabled.
 

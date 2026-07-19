@@ -2871,6 +2871,34 @@ class HamiltonianCFM:
                 **self._compatible_clean_stats(edge_diff, edge_mask, "hopping"),
             },
         }
+        if self.uureal_block_ode:
+            # Historical-comparison metric (review P1-5).  Two deliberately
+            # coexisting reductions:
+            #   * canonical (`train_*_loss` above): each independent physical
+            #     freedom counted ONCE -- onsite upper triangle plus one
+            #     canonical edge per Hermitian (i,j,R)/(j,i,-R) pair;
+            #   * compatible_directed (`train_compatible_directed_*`): every
+            #     stored directed coordinate counted, i.e. all mapper-valid
+            #     onsite entries and ALL directed edges -- the same population
+            #     the historical SOC uu-real RME losses (H-B0/H-A1 runs)
+            #     averaged over.  Counts differ (~2x) and values differ whenever
+            #     the error is not Hermitian-symmetric, so curves plotted
+            #     against historical runs must use the directed keys.
+            directed_node_stats = self._metric_stats(
+                node_diff, node_valid, self.loss_type, self._time_weight(ctx.node_t)
+            )
+            directed_edge_stats = self._metric_stats(
+                edge_diff, edge_valid, self.loss_type, self._time_weight(ctx.edge_t)
+            )
+            directed_total = self._reduce_component_stats(
+                (
+                    (directed_node_stats, self.node_weight),
+                    (directed_edge_stats, self.edge_weight),
+                )
+            )
+            state["train_compatible_directed_onsite_loss"] = directed_node_stats[0].detach()
+            state["train_compatible_directed_hopping_loss"] = directed_edge_stats[0].detach()
+            state["train_compatible_directed_loss"] = directed_total.detach()
         return self._finalize_loss(total, state, pred_data)
 
     @staticmethod
