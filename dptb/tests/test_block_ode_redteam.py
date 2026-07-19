@@ -400,6 +400,11 @@ def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
         }
     )
     assert validate_block_ode_contract(projected_te) is None
+    max_seed = deepcopy(projected_te)
+    max_seed["train_options"]["flow_options"]["te_prior_validation_seed"] = (
+        1 << 64
+    ) - 1
+    assert validate_block_ode_contract(max_seed) is None
     expected_fields = {
         "absolute_full_h": {
             "node_block_target_key": "node_full_hamil_target_blocks",
@@ -455,14 +460,26 @@ def test_red_argcheck_all_four_hard_gates_and_cross_products_raise():
         ("node_sigma", 0.0, "finite positive scales"),
         ("edge_sigma", float("nan"), "finite positive scales"),
         ("te_prior_sigma", float("inf"), "finite positive scales"),
-        ("te_prior_validation_seed", True, "explicit non-negative integer"),
+        ("node_sigma", True, "finite positive scales"),
+        ("te_prior_validation_seed", True, r"integer.*\[0"),
+        ("te_prior_validation_seed", 1 << 64, r"integer.*\[0"),
     ):
         bad = deepcopy(projected_te)
         bad["train_options"]["flow_options"][option] = value
         bad_cases.append((bad, match))
     bad = deepcopy(projected_te)
     bad["train_options"]["flow_options"].pop("te_prior_validation_seed")
-    bad_cases.append((bad, "explicit non-negative integer"))
+    bad_cases.append((bad, r"integer.*\[0"))
+    for option, value in (
+        ("node_sigma", 1.0e-50),
+        ("node_sigma", 1.0e30),
+    ):
+        bad = deepcopy(projected_te)
+        bad["common_options"]["dtype"] = "float32"
+        bad["train_options"]["flow_options"][option] = value
+        if value > 1.0:
+            bad["train_options"]["flow_options"]["te_prior_sigma"] = value
+        bad_cases.append((bad, "effective scales"))
     bad = deepcopy(base)
     bad["train_options"]["flow_options"]["target_semantics"] = ""
     bad_cases.append((bad, "explicit absolute_full_h/residual_dh"))

@@ -377,6 +377,7 @@ def validate_block_ode_contract(data):
         raise ValueError(
             "block_ode supports only prior='zero' or explicit prior='projected_te'"
         )
+    projected_scales = None
     if prior == "projected_te":
         mode = str(flow.get("te_prior_mode", "irrep")).lower().replace("-", "_")
         if mode != "irrep":
@@ -384,28 +385,37 @@ def validate_block_ode_contract(data):
                 "projected_te block_ode requires te_prior_mode='irrep'; typewise "
                 "mode reads target residual scales"
             )
-        scales = {
-            "node_sigma": float(flow.get("node_sigma", 1.0)),
-            "edge_sigma": float(flow.get("edge_sigma", 1.0)),
-            "te_prior_sigma": float(flow.get("te_prior_sigma", 1.0)),
+        raw_scales = {
+            "node_sigma": flow.get("node_sigma", 1.0),
+            "edge_sigma": flow.get("edge_sigma", 1.0),
+            "te_prior_sigma": flow.get("te_prior_sigma", 1.0),
         }
         invalid = [
-            name for name, value in scales.items() if not math.isfinite(value) or value <= 0.0
+            name
+            for name, value in raw_scales.items()
+            if isinstance(value, bool)
+            or not isinstance(value, Number)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
         ]
         if invalid:
             raise ValueError(
                 "projected_te block_ode requires finite positive scales; "
                 f"invalid options={invalid}"
             )
+        projected_scales = {
+            name: float(value) for name, value in raw_scales.items()
+        }
         validation_seed = flow.get("te_prior_validation_seed", None)
         if (
             isinstance(validation_seed, bool)
             or not isinstance(validation_seed, int)
             or validation_seed < 0
+            or validation_seed > (1 << 64) - 1
         ):
             raise ValueError(
-                "projected_te block_ode requires an explicit non-negative integer "
-                "te_prior_validation_seed"
+                "projected_te block_ode requires an explicit integer "
+                f"te_prior_validation_seed in [0, {(1 << 64) - 1}]"
             )
     semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
     if semantics not in {"absolute_full_h", "residual_dh"}:
@@ -452,6 +462,28 @@ def validate_block_ode_contract(data):
             "block_ode requires common_options.dtype='float32' or 'float64'; "
             f"got {configured_dtype!r}"
         )
+    if projected_scales is not None:
+        representable = {
+            "float32": (2.0 ** -149, (2.0 - 2.0 ** -23) * 2.0 ** 127),
+            "float64": (2.0 ** -1074, (2.0 - 2.0 ** -52) * 2.0 ** 1023),
+        }
+        minimum, maximum = representable[configured_dtype]
+        effective_scales = {
+            "node_sigma*te_prior_sigma": projected_scales["node_sigma"]
+            * projected_scales["te_prior_sigma"],
+            "edge_sigma*te_prior_sigma": projected_scales["edge_sigma"]
+            * projected_scales["te_prior_sigma"],
+        }
+        invalid_effective = [
+            name
+            for name, value in effective_scales.items()
+            if not math.isfinite(value) or not minimum <= abs(value) <= maximum
+        ]
+        if invalid_effective:
+            raise ValueError(
+                "projected_te block_ode effective scales must be finite and "
+                f"non-zero in {configured_dtype}; invalid products={invalid_effective}"
+            )
     maximum_inverse_atol = inverse_atol_caps[configured_dtype]
     raw_steps = flow.get("validation_ode_steps", [])
     if not raw_steps or any(

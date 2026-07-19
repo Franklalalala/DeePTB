@@ -62,6 +62,11 @@ _LEM_INPUT_SIDECAR_KEYS = (
 )
 _MetricStats = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 _WeightedMetricStats = Tuple[Tuple[_MetricStats, float], ...]
+_MAX_TORCH_SEED = (1 << 64) - 1
+_VALIDATION_SEED_STREAMS = {
+    "prior": 0x9E3779B97F4A7C15,
+    "time": 0xD1B54A32D192ED03,
+}
 
 
 class HamiltonianCFM:
@@ -337,10 +342,13 @@ class HamiltonianCFM:
                     f"got {configured_block_keys}."
                 )
 
-        self.node_sigma = float(options.get("node_sigma", 1.0))
-        self.edge_sigma = float(options.get("edge_sigma", 1.0))
+        raw_node_sigma = options.get("node_sigma", 1.0)
+        raw_edge_sigma = options.get("edge_sigma", 1.0)
+        raw_te_prior_sigma = options.get("te_prior_sigma", 1.0)
+        self.node_sigma = float(raw_node_sigma)
+        self.edge_sigma = float(raw_edge_sigma)
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
-        self.te_prior_sigma = float(options.get("te_prior_sigma", 1.0))
+        self.te_prior_sigma = float(raw_te_prior_sigma)
         default_te_prior_mode = "block" if self.prior == "block_te" else "irrep"
         self.te_prior_mode = str(options.get("te_prior_mode", default_te_prior_mode)).lower().replace("-", "_")
         if self.te_prior_mode == "type":
@@ -359,26 +367,45 @@ class HamiltonianCFM:
                     "outside the certified irrepwise prior contract."
                 )
             scales = {
-                "node_sigma": self.node_sigma,
-                "edge_sigma": self.edge_sigma,
-                "te_prior_sigma": self.te_prior_sigma,
+                "node_sigma": raw_node_sigma,
+                "edge_sigma": raw_edge_sigma,
+                "te_prior_sigma": raw_te_prior_sigma,
             }
             invalid = [
-                name for name, value in scales.items() if not math.isfinite(value) or value <= 0.0
+                name
+                for name, value in scales.items()
+                if isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
             ]
             if invalid:
                 raise ValueError(
                     "projected_te block_ode requires finite positive scales; "
                     f"invalid options={invalid}."
                 )
+            effective_scales = {
+                "node_sigma*te_prior_sigma": self.node_sigma * self.te_prior_sigma,
+                "edge_sigma*te_prior_sigma": self.edge_sigma * self.te_prior_sigma,
+            }
+            invalid_effective = []
+            for name, value in effective_scales.items():
+                represented = torch.tensor(value, dtype=self.dtype)
+                if not bool(torch.isfinite(represented).item()) or represented.item() == 0.0:
+                    invalid_effective.append(name)
+            if invalid_effective:
+                raise ValueError(
+                    "projected_te block_ode effective scales must be finite and "
+                    f"non-zero in {self.dtype}; invalid products={invalid_effective}."
+                )
             if (
                 isinstance(self.te_prior_validation_seed, bool)
                 or not isinstance(self.te_prior_validation_seed, Integral)
                 or self.te_prior_validation_seed < 0
+                or self.te_prior_validation_seed > _MAX_TORCH_SEED
             ):
                 raise ValueError(
-                    "projected_te block_ode requires an explicit non-negative integer "
-                    "te_prior_validation_seed."
+                    "projected_te block_ode requires an explicit integer "
+                    f"te_prior_validation_seed in [0, {_MAX_TORCH_SEED}]."
                 )
 
         # Physical prior families each own their option keys (parsed in
@@ -629,27 +656,62 @@ class HamiltonianCFM:
     # ------------------------------------------------------------------
     # Sampling / interpolation
     # ------------------------------------------------------------------
+    def validation_seed(self, batch_index: int, purpose: str) -> int:
+        """Derive a stable fixed-width validation substream seed."""
+        if purpose not in _VALIDATION_SEED_STREAMS:
+            raise ValueError(f"Unknown validation RNG purpose={purpose!r}.")
+        if isinstance(batch_index, bool) or not isinstance(batch_index, Integral) or batch_index < 0:
+            raise ValueError("validation batch_index must be a non-negative integer.")
+        base = int(self.te_prior_validation_seed or 0) & _MAX_TORCH_SEED
+        value = (
+            base
+            ^ _VALIDATION_SEED_STREAMS[purpose]
+            ^ ((int(batch_index) + 1) * 0x94D049BB133111EB)
+        ) & _MAX_TORCH_SEED
+        value ^= value >> 30
+        value = (value * 0xBF58476D1CE4E5B9) & _MAX_TORCH_SEED
+        value ^= value >> 27
+        value = (value * 0x94D049BB133111EB) & _MAX_TORCH_SEED
+        return (value ^ (value >> 31)) & _MAX_TORCH_SEED
+
+    @staticmethod
+    def _seeded_generator(device: torch.device, seed: Optional[int]) -> Optional[torch.Generator]:
+        if seed is None:
+            return None
+        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed <= _MAX_TORCH_SEED:
+            raise ValueError(f"RNG seed must be an integer in [0, {_MAX_TORCH_SEED}].")
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        return generator
+
     def _sample_t(
         self,
         *,
         num_graphs: int,
         device: torch.device,
         dtype: torch.dtype,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         lo = max(0.0, min(self.t_min, 1.0))
         hi = max(lo, min(self.t_max, 1.0 - self.t_eps))
         if self.time_sampling == "uniform":
-            t = lo + (hi - lo) * torch.rand(num_graphs, device=device, dtype=dtype)
+            t = lo + (hi - lo) * torch.rand(
+                num_graphs, device=device, dtype=dtype, generator=generator
+            )
         elif self.time_sampling == "logit_normal":
             mean = float(self.options.get("time_logit_mean", -0.4))
             std = float(self.options.get("time_logit_std", 1.0))
-            raw = torch.randn(num_graphs, device=device, dtype=dtype) * std + mean
+            raw = torch.randn(
+                num_graphs, device=device, dtype=dtype, generator=generator
+            ) * std + mean
             t = torch.sigmoid(raw)
             t = lo + (hi - lo) * t
         else:
             raise ValueError(f"Unsupported flow_options.time_sampling={self.time_sampling!r}")
         if self.t0_probability > 0.0:
-            use_t0 = torch.rand(num_graphs, device=device) < self.t0_probability
+            use_t0 = torch.rand(
+                num_graphs, device=device, generator=generator
+            ) < self.t0_probability
             t = torch.where(use_t0, torch.zeros_like(t), t)
         return t.clamp(min=lo, max=hi)
 
@@ -1450,13 +1512,26 @@ class HamiltonianCFM:
         device: torch.device,
         dtype: torch.dtype,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         if self.te_prior_per_graph and graph_index is not None and graph_index.numel() == row_count:
             if num_graphs is None:
                 num_graphs = int(graph_index.max().detach().item()) + 1 if row_count > 0 else 1
-            radius = torch.randn(num_graphs, 1, device=device, dtype=dtype).index_select(0, graph_index)
+            radius = torch.randn(
+                num_graphs,
+                1,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            ).index_select(0, graph_index)
         else:
-            radius = torch.randn(row_count, 1, device=device, dtype=dtype)
+            radius = torch.randn(
+                row_count,
+                1,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
         return radius * active_dim.sqrt()
 
     def _te_radius_for_prior(
@@ -1468,26 +1543,28 @@ class HamiltonianCFM:
         device: torch.device,
         dtype: torch.dtype,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        try:
-            return self._te_radius(
-                row_count,
-                active_dim,
-                graph_index,
-                device=device,
-                dtype=dtype,
-                num_graphs=num_graphs,
-            )
-        except TypeError as exc:
-            if "num_graphs" not in str(exc):
-                raise
-            return self._te_radius(
-                row_count,
-                active_dim,
-                graph_index,
-                device=device,
-                dtype=dtype,
-            )
+        optional = {"num_graphs": num_graphs}
+        if generator is not None:
+            optional["generator"] = generator
+        while True:
+            try:
+                return self._te_radius(
+                    row_count,
+                    active_dim,
+                    graph_index,
+                    device=device,
+                    dtype=dtype,
+                    **optional,
+                )
+            except TypeError as exc:
+                unsupported = next(
+                    (name for name in optional if name in str(exc)), None
+                )
+                if unsupported is None:
+                    raise
+                optional.pop(unsupported)
 
     def _block_structured_prior_like(
         self,
@@ -1497,11 +1574,16 @@ class HamiltonianCFM:
         label: Optional[str],
         *,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         if like.ndim < 2:
-            return torch.randn_like(like)
+            return torch.randn(
+                like.shape, device=like.device, dtype=like.dtype, generator=generator
+            )
         mask_f = mask.to(device=like.device, dtype=like.dtype)
-        raw = torch.randn_like(like) * mask_f
+        raw = torch.randn(
+            like.shape, device=like.device, dtype=like.dtype, generator=generator
+        ) * mask_f
         norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
         direction = raw / norm
         active_dim = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
@@ -1513,6 +1595,7 @@ class HamiltonianCFM:
             device=like.device,
             dtype=like.dtype,
             num_graphs=num_graphs,
+            generator=generator,
         )
         return direction * radius * mask_f
 
@@ -1574,6 +1657,7 @@ class HamiltonianCFM:
         label: Optional[str] = None,
         reference_scale: bool = True,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         if like.numel() == 0:
             return torch.zeros_like(like)
@@ -1605,13 +1689,20 @@ class HamiltonianCFM:
                 data,
                 label,
                 num_graphs=num_graphs,
+                generator=generator,
             )
         else:
             noise = torch.zeros_like(like)
             graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
             for start, end, _degree in slices:
                 seg_mask = mask[:, start:end].to(device=like.device, dtype=like.dtype)
-                raw = torch.randn(like.shape[0], end - start, device=like.device, dtype=like.dtype)
+                raw = torch.randn(
+                    like.shape[0],
+                    end - start,
+                    device=like.device,
+                    dtype=like.dtype,
+                    generator=generator,
+                )
                 raw = raw * seg_mask
                 norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
                 direction = raw / norm
@@ -1623,6 +1714,7 @@ class HamiltonianCFM:
                     device=like.device,
                     dtype=like.dtype,
                     num_graphs=num_graphs,
+                    generator=generator,
                 )
                 noise[:, start:end] = direction * radius * seg_mask
 
@@ -1959,10 +2051,19 @@ class HamiltonianCFM:
         if self.prior not in self._projected_te_prior_names:
             raise RuntimeError(f"Unsupported block-space prior {self.prior!r}.")
 
-        def draw() -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
-            prior_data = data.copy()
-            prior_data.pop("expert_node_mask", None)
-            prior_data.pop("expert_edge_mask", None)
+        def draw(
+            generator: Optional[torch.Generator],
+        ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
+            prior_data = {
+                key: data[key]
+                for key in (
+                    AtomicDataDict.ATOM_TYPE_KEY,
+                    AtomicDataDict.EDGE_TYPE_KEY,
+                    _keys.BATCH_KEY,
+                    _keys.EDGE_INDEX_KEY,
+                )
+                if key in data
+            }
             num_graphs = self._num_graphs(prior_data)
             node_noise = self._te_prior_like(
                 torch.zeros_like(node_h0),
@@ -1971,6 +2072,7 @@ class HamiltonianCFM:
                 label="node",
                 reference_scale=False,
                 num_graphs=num_graphs,
+                generator=generator,
             )
             edge_noise = self._te_prior_like(
                 torch.zeros_like(edge_h0),
@@ -1979,6 +2081,7 @@ class HamiltonianCFM:
                 label="edge",
                 reference_scale=False,
                 num_graphs=num_graphs,
+                generator=generator,
             )
             noise_blocks = self.block_codec.rme_to_blocks(
                 data, node_noise, edge_noise, project=False
@@ -2009,20 +2112,9 @@ class HamiltonianCFM:
             return start, node_start - node_h0, edge_start - edge_h0
 
         if prior_seed is None:
-            return draw()
-        if (
-            isinstance(prior_seed, bool)
-            or not isinstance(prior_seed, Integral)
-            or prior_seed < 0
-        ):
-            raise ValueError("block-space prior_seed must be a non-negative integer.")
-        device = h0_blocks.node_blocks.device
-        cuda_devices = (
-            [] if device.type != "cuda" else [device.index or torch.cuda.current_device()]
-        )
-        with torch.random.fork_rng(devices=cuda_devices):
-            torch.manual_seed(int(prior_seed))
-            return draw()
+            return draw(None)
+        generator = self._seeded_generator(h0_blocks.node_blocks.device, prior_seed)
+        return draw(generator)
 
     def prepare_batch(
         self,
@@ -2031,6 +2123,7 @@ class HamiltonianCFM:
         *,
         t: Optional[torch.Tensor] = None,
         prior_seed: Optional[int] = None,
+        time_seed: Optional[int] = None,
     ) -> Tuple[AtomicDataDict.Type, AtomicDataDict.Type, CFMContext]:
         """Return a model-input dict with interpolated H_t written to H0 keys."""
         if not self.enabled:
@@ -2097,7 +2190,15 @@ class HamiltonianCFM:
             edge_count = None if edge_target is None else edge_target.shape[0]
         num_graphs = self._num_graphs(data)
         if t is None:
-            t = self._sample_t(num_graphs=num_graphs, device=device, dtype=dtype)
+            time_generator = self._seeded_generator(device, time_seed)
+            sample_kwargs = {
+                "num_graphs": num_graphs,
+                "device": device,
+                "dtype": dtype,
+            }
+            if time_generator is not None:
+                sample_kwargs["generator"] = time_generator
+            t = self._sample_t(**sample_kwargs)
         else:
             t = self._normalize_t(t, num_graphs=num_graphs, device=device, dtype=dtype)
         node_t, edge_t = self._expand_graph_times(
@@ -2794,13 +2895,24 @@ class HamiltonianCFM:
         flag.  Other CFM output spaces retain their ordinary loss semantics.
         """
         if self.block_ode:
-            return self._block_ode_endpoint_loss(
-                pred_data,
-                ref_data,
-                ctx,
-                prediction_is_full_h=True,
-            )
+            return self.compatible_loss_on_sample(pred_data, ref_data, ctx)
         return self.loss(pred_data, ref_data, ctx)
+
+    def compatible_loss_on_sample(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Score a physical Full-H rollout with endpoint-compatible reductions."""
+        if not self.block_ode:
+            raise RuntimeError("compatible_loss_on_sample requires block_ode.")
+        return self._block_ode_endpoint_loss(
+            pred_data,
+            ref_data,
+            ctx,
+            prediction_is_full_h=True,
+        )
 
     # ------------------------------------------------------------------
     # Sampling

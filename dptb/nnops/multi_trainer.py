@@ -698,8 +698,19 @@ class MultiTrainer(Trainer):
             cfg["world_size"] = 1
         return cfg
 
-    def _make_loader_compat(self, dataset, batch_size, shuffle, num_workers, sampler=None, dynamic_batch=None):
+    def _make_loader_compat(
+        self,
+        dataset,
+        batch_size,
+        shuffle,
+        num_workers,
+        sampler=None,
+        dynamic_batch=None,
+        generator=None,
+    ):
         kwargs = {"num_workers": int(num_workers)}
+        if generator is not None:
+            kwargs["generator"] = generator
         if dynamic_batch is not None:
             sampler = None
         if sampler is not None:
@@ -838,6 +849,7 @@ class MultiTrainer(Trainer):
                 shuffle=not self.distributed_expert,
                 num_workers=val_workers,
                 sampler=val_sampler,
+                generator=self.validation_loader_generator,
             )
 
         log.info(
@@ -3600,15 +3612,23 @@ class MultiTrainer(Trainer):
                 **prepare_kwargs,
             )
             flow_ref.update(batch_info)
+            log_flow_euler = bool(
+                getattr(self.flow_cfm, "log_validation_flow_euler_loss", True)
+            )
+            score_sample = (
+                self.flow_cfm.loss_on_sample
+                if log_flow_euler
+                else self.flow_cfm.compatible_loss_on_sample
+            )
             with self._tagger.tag(
-                "validation/euler_flow_loss",
+                "validation/euler_flow_loss"
+                if log_flow_euler
+                else "validation/euler_compatible_loss",
                 it=self.iter,
                 expert=expert_idx,
                 extra=f"steps={int(num_steps)}",
             ):
-                loss, flow_state = self.flow_cfm.loss_on_sample(
-                    sampled, flow_ref, flow_ctx
-                )
+                loss, flow_state = score_sample(sampled, flow_ref, flow_ctx)
             metrics = self._payload_metrics_from_flow_state(
                 flow_state,
                 prefix="train",
@@ -3697,6 +3717,9 @@ class MultiTrainer(Trainer):
             validation_metric_sums: Dict[str, Any] = {}
             num_batches = 0
             self.model.eval()
+            generator = getattr(self, "validation_loader_generator", None)
+            if generator is not None:
+                generator.manual_seed(self.validation_loader_seed)
 
             for batch in self.validation_loader:
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
@@ -3704,7 +3727,7 @@ class MultiTrainer(Trainer):
 
                 flow_euler_validation = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
                 validation_prior_seed = (
-                    self.flow_cfm.te_prior_validation_seed + num_batches
+                    self.flow_cfm.validation_seed(num_batches, "prior")
                     if flow_euler_validation
                     and getattr(self.flow_cfm, "prior", "zero") == "projected_te"
                     else None

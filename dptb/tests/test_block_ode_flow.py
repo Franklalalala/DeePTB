@@ -289,6 +289,12 @@ def test_multitrainer_residual_euler_validation_scores_full_sample_via_flow():
         node_sigma=0.25,
         edge_sigma=0.25,
     )
+    trainer.flow_cfm.log_validation_flow_euler_loss = False
+
+    def forbidden_flow_loss(*_args, **_kwargs):
+        raise AssertionError("endpoint-only validation must not call loss_on_sample")
+
+    trainer.flow_cfm.loss_on_sample = forbidden_flow_loss
     trainer._prepare_expert_masks = lambda batch_dict, *_args: (
         torch.ones(batch_dict[_keys.EDGE_H0_KEY].shape[0], dtype=torch.bool),
         torch.ones(batch_dict[_keys.NODE_H0_KEY].shape[0], dtype=torch.bool),
@@ -410,8 +416,20 @@ def test_n1_is_tolerance_equivalent_to_adapter_for_input_sensitive_endpoint():
 
 
 @pytest.mark.parametrize("num_steps", [2, 3])
-def test_two_and_three_step_rollouts_match_manual_endpoint_blends(num_steps):
-    idp, data, codec, current = _case()
+@pytest.mark.parametrize("prior", ["zero", "projected_te"])
+def test_two_and_three_step_rollouts_match_manual_endpoint_blends(num_steps, prior):
+    idp, data, codec, h0 = _case()
+    flow = _flow(
+        idp,
+        prior=prior,
+        te_prior_mode="irrep",
+        node_sigma=0.25,
+        edge_sigma=0.25,
+    )
+    prior_seed = 20260719 if prior == "projected_te" else None
+    current, _, _ = flow._block_initial_state(
+        _fresh(data), h0, prior_seed=prior_seed
+    )
     raw_endpoints = []
     generator = torch.Generator().manual_seed(100 + num_steps)
     for _ in range(num_steps):
@@ -424,7 +442,9 @@ def test_two_and_three_step_rollouts_match_manual_endpoint_blends(num_steps):
             )
         )
     model = EndpointSequence(raw_endpoints)
-    result = _flow(idp).sample(model, _fresh(data), num_steps=num_steps)
+    result = flow.sample(
+        model, _fresh(data), num_steps=num_steps, prior_seed=prior_seed
+    )
     for step, raw in enumerate(raw_endpoints):
         expected_node, expected_edge = codec.blocks_to_rme(data, current)
         torch.testing.assert_close(model.inputs[step][0], expected_node, rtol=0, atol=ATOL)
@@ -599,6 +619,17 @@ def test_same_block_state_at_different_t_is_a_different_model_input():
             {"prior": "projected_te", "te_prior_sigma": 0.0},
             "finite positive scales",
         ),
+        (
+            {"prior": "projected_te", "node_sigma": True},
+            "finite positive scales",
+        ),
+        (
+            {
+                "prior": "projected_te",
+                "te_prior_validation_seed": 1 << 64,
+            },
+            "validation_seed.*\\[0",
+        ),
         ({"target_semantics": ""}, "explicit target_semantics"),
         ({"time_conditioning_required": False}, "time_conditioning_required=true"),
         ({"validation_ode_steps": [1, 5]}, r"drawn from \[1, 3\]"),
@@ -607,7 +638,42 @@ def test_same_block_state_at_different_t_is_a_different_model_input():
 def test_block_ode_constructor_guards(updates, match):
     idp, _, _, _ = _case()
     with pytest.raises(ValueError, match=match):
-        _flow(idp, **updates)
+        options = _flow(idp).options.copy()
+        options.update(updates)
+        HamiltonianCFM(options, idp=idp, dtype=torch.float64)
+
+
+@pytest.mark.parametrize(
+    "node_sigma,te_prior_sigma", [(1.0e-50, 1.0), (1.0e30, 1.0e30)]
+)
+def test_projected_te_effective_scale_must_be_representable_in_dtype(
+    node_sigma, te_prior_sigma
+):
+    idp, _, _, _ = _case()
+    options = _flow(idp).options.copy()
+    options.update(
+        prior="projected_te",
+        node_sigma=node_sigma,
+        te_prior_sigma=te_prior_sigma,
+    )
+    with pytest.raises(ValueError, match="effective scales"):
+        HamiltonianCFM(options, idp=idp, dtype=torch.float32)
+
+
+def test_projected_te_max_validation_seed_wraps_substreams():
+    idp, _, _, _ = _case()
+    flow = _flow(
+        idp,
+        prior="projected_te",
+        te_prior_validation_seed=(1 << 64) - 1,
+    )
+    seeds = {
+        flow.validation_seed(batch_index, purpose)
+        for batch_index in (0, 1)
+        for purpose in ("prior", "time")
+    }
+    assert len(seeds) == 4
+    assert all(0 <= seed <= (1 << 64) - 1 for seed in seeds)
 
 
 def test_block_inverse_default_tolerance_is_dtype_aware():
@@ -665,11 +731,13 @@ def test_projected_te_t0_is_endpoint_independent_and_matches_sampling_start():
     ref_b = _ref_for(flow, data, codec, h0, endpoint_b, node_b, edge_b)
     zero_t = torch.zeros(1, dtype=torch.float64)
 
+    # Match Trainer's label-bearing shallow-copy path: the prior must remain
+    # endpoint-independent even when target fields are present in ``data``.
     batch_a, _, ctx_a = flow.prepare_batch(
-        _fresh(data), ref_a, t=zero_t, prior_seed=20260719
+        _fresh(ref_a), _fresh(ref_a), t=zero_t, prior_seed=20260719
     )
     batch_b, _, _ = flow.prepare_batch(
-        _fresh(data), ref_b, t=zero_t, prior_seed=20260719
+        _fresh(ref_b), _fresh(ref_b), t=zero_t, prior_seed=20260719
     )
     torch.testing.assert_close(batch_a[_keys.NODE_H0_KEY], batch_b[_keys.NODE_H0_KEY])
     torch.testing.assert_close(batch_a[_keys.EDGE_H0_KEY], batch_b[_keys.EDGE_H0_KEY])
@@ -687,8 +755,8 @@ def test_projected_te_t0_is_endpoint_independent_and_matches_sampling_start():
     assert not torch.equal(changed.inputs[0][1], model.inputs[0][1])
 
 
-def test_projected_te_seed_pairs_n1_n3_without_advancing_global_rng(monkeypatch):
-    idp, data, _, h0 = _case()
+def test_projected_te_seed_pairs_n1_n3_without_advancing_global_rng():
+    idp, data, codec, h0 = _case()
     flow = _flow(
         idp,
         prior="projected_te",
@@ -696,15 +764,6 @@ def test_projected_te_seed_pairs_n1_n3_without_advancing_global_rng(monkeypatch)
         node_sigma=0.25,
         edge_sigma=0.25,
     )
-    original = flow._block_initial_state
-    calls = 0
-
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(flow, "_block_initial_state", counted)
     model_n1 = EndpointSequence([h0])
     model_n3 = EndpointSequence([h0, h0, h0])
     torch.manual_seed(91)
@@ -713,10 +772,56 @@ def test_projected_te_seed_pairs_n1_n3_without_advancing_global_rng(monkeypatch)
     flow.sample(model_n1, _fresh(data), num_steps=1, prior_seed=20260719)
     flow.sample(model_n3, _fresh(data), num_steps=3, prior_seed=20260719)
     actual_after = torch.randn(4)
-    assert calls == 2
     assert torch.equal(actual_after, expected_after)
     assert torch.equal(model_n1.inputs[0][0], model_n3.inputs[0][0])
     assert torch.equal(model_n1.inputs[0][1], model_n3.inputs[0][1])
+
+    if torch.cuda.device_count() > 1:
+        cuda_states = torch.cuda.get_rng_state_all()
+        flow.sample(
+            EndpointSequence([h0]),
+            _fresh(data),
+            num_steps=1,
+            prior_seed=20260719,
+        )
+        assert all(
+            torch.equal(before, after)
+            for before, after in zip(cuda_states, torch.cuda.get_rng_state_all())
+        )
+
+    endpoint = _scaled_endpoint(
+        codec, data, data[_keys.NODE_H0_KEY], data[_keys.EDGE_H0_KEY], 1.2
+    )
+    record = _ref_for(
+        flow,
+        data,
+        codec,
+        h0,
+        endpoint,
+        *codec.blocks_to_rme(data, endpoint),
+    )
+    torch.manual_seed(92)
+    expected_after_prepare = torch.randn(4)
+    torch.manual_seed(92)
+    prepared_a, _, _ = flow.prepare_batch(
+        _fresh(record),
+        _fresh(record),
+        prior_seed=flow.validation_seed(0, "prior"),
+        time_seed=flow.validation_seed(0, "time"),
+    )
+    prepared_b, _, _ = flow.prepare_batch(
+        _fresh(record),
+        _fresh(record),
+        prior_seed=flow.validation_seed(0, "prior"),
+        time_seed=flow.validation_seed(0, "time"),
+    )
+    actual_after_prepare = torch.randn(4)
+    assert torch.equal(actual_after_prepare, expected_after_prepare)
+    assert torch.equal(prepared_a[flow.flow_time_key], prepared_b[flow.flow_time_key])
+    assert torch.equal(prepared_a[_keys.NODE_H0_KEY], prepared_b[_keys.NODE_H0_KEY])
+    assert torch.equal(prepared_a[_keys.EDGE_H0_KEY], prepared_b[_keys.EDGE_H0_KEY])
+    assert flow.validation_seed(0, "prior") != flow.validation_seed(0, "time")
+    assert flow.validation_seed(0, "prior") != flow.validation_seed(1, "prior")
 
     initial_rme = model_n1.inputs[0]
     initial_blocks = flow.block_codec.rme_to_blocks(

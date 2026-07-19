@@ -854,7 +854,7 @@ class _ValidationPreparedFlow:
     def _num_graphs(self, batch):
         return 1
 
-    def prepare_batch(self, batch, ref_batch, t=None):
+    def prepare_batch(self, batch, ref_batch, t=None, time_seed=None):
         return batch.copy(), ref_batch.copy(), object()
 
     def loss(self, pred, ref, ctx):

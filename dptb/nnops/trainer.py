@@ -102,8 +102,16 @@ class Trainer(BaseTrainer):
                                                batch_size=train_options["ref_batch_size"], shuffle=True)
 
         if self.use_validation:
+            self.validation_loader_seed = int(common_options.get("seed", 0)) & (
+                (1 << 64) - 1
+            )
+            self.validation_loader_generator = torch.Generator().manual_seed(
+                self.validation_loader_seed
+            )
             self.validation_loader = DataLoader(dataset=self.validation_datasets,
-                                                batch_size=train_options["val_batch_size"], shuffle=True)
+                                                batch_size=train_options["val_batch_size"],
+                                                shuffle=True,
+                                                generator=self.validation_loader_generator)
 
         loss_idp = self._model_loss_idp()
 
@@ -683,6 +691,9 @@ class Trainer(BaseTrainer):
             flow_metric_sums = {}
             num_batches = 0
             self.model.eval()
+            generator = getattr(self, "validation_loader_generator", None)
+            if generator is not None:
+                generator.manual_seed(self.validation_loader_seed)
             for batch in self.validation_loader:
                 batch = batch.to(self.device)
                 batch_info = {"__slices__": batch.__slices__, "__cumsum__": batch.__cumsum__,
@@ -693,7 +704,7 @@ class Trainer(BaseTrainer):
                 if self.flow_cfm.enabled:
                     original_batch = batch.copy()
                     validation_prior_seed = (
-                        self.flow_cfm.te_prior_validation_seed + num_batches
+                        self.flow_cfm.validation_seed(num_batches, "prior")
                         if getattr(self.flow_cfm, "prior", "zero") == "projected_te"
                         else None
                     )
@@ -762,6 +773,11 @@ class Trainer(BaseTrainer):
                         prepare_kwargs = {}
                         if validation_prior_seed is not None:
                             prepare_kwargs["prior_seed"] = validation_prior_seed
+                        validation_seed = getattr(self.flow_cfm, "validation_seed", None)
+                        if callable(validation_seed):
+                            prepare_kwargs["time_seed"] = validation_seed(
+                                num_batches, "time"
+                            )
                         flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
                             original_batch,
                             batch_for_loss,
