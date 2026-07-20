@@ -61,6 +61,9 @@ def _case():
     data[_keys.EDGE_H0_BLOCK_SHAPE_KEY] = h0_blocks.edge_shapes.clone()
     data["node_features"] = node_h0.clone()
     data["edge_features"] = edge_h0.clone()
+    # Seeded projected_te draws require the stable per-graph record identity
+    # (fixture-only addition; every assertion in this file is unchanged).
+    data[_keys.SAMPLE_UID_KEY] = torch.tensor([1], dtype=torch.long)
     return idp, data, codec, h0_blocks
 
 

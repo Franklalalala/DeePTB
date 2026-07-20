@@ -128,6 +128,8 @@ def _graph(mapper, *, dtype=torch.float64):
         "cell": torch.eye(3, dtype=dtype) * 8.0,
         "pbc": torch.tensor([False, False, False]),
         "batch": torch.zeros(2, dtype=torch.long),
+        # Seeded projected_te draws require the stable per-graph record identity.
+        _keys.SAMPLE_UID_KEY: torch.tensor([1], dtype=torch.long),
     }
 
 
@@ -154,6 +156,8 @@ def _water_graph(mapper, *, dtype=torch.float64):
         "cell": torch.eye(3, dtype=dtype) * 10.0,
         "pbc": torch.tensor([False, False, False]),
         "batch": torch.zeros(3, dtype=torch.long),
+        # Seeded projected_te draws require the stable per-graph record identity.
+        _keys.SAMPLE_UID_KEY: torch.tensor([1], dtype=torch.long),
     }
 
 
@@ -1578,3 +1582,405 @@ def test_sampler_te_h0_constant_and_exactly_once_assembly(steps):
     assert torch.allclose(
         result[flow.flow_time_key], torch.ones_like(result[flow.flow_time_key])
     )
+
+
+# ===========================================================================
+# 10. Round-3 heavy tests (H1-H6): projected_te explicit latent (prior_state),
+#     per-uid seeded substreams, the TA-3 draw belt, and the TA-4 zero-prior
+#     exception ordering.  These exercise the P1 flow.py fix lane.
+# ===========================================================================
+class _LinearEchoModel(torch.nn.Module):
+    """Trivially equivariant model double: endpoint = alpha * spatial-residual state.
+
+    It reads the pure-D spatial residual block state the sampler attaches every
+    step and echoes it (scaled) into the prediction keys.  Because the echo is a
+    per-element scalar multiply in canvas-block space, it commutes with the shared
+    -canvas Wigner-D conjugation ``B -> D B D^T``, so the WHOLE residual sampler
+    pipeline (H0 blocks -> RME conditioning, verbatim D0, endpoint blend, assemble
+    H = H0 + D once) is pathwise equivariant iff the sampler's block bookkeeping is.
+    Contrast :class:`_EndpointSpy`, which returns a FIXED endpoint and so is not
+    itself input-covariant.
+    """
+
+    def __init__(self, alpha):
+        super().__init__()
+        self.alpha = float(alpha)
+
+    def forward(self, data):
+        out = data.copy()
+        out[_keys.NODE_PRED_HAMIL_BLOCKS_KEY] = self.alpha * data[_keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY]
+        out[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY] = self.alpha * data[_keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY]
+        return out
+
+
+def _shared_canvas_wigner_d(rotation):
+    """The shared H:1s / C:1s1p canvas Wigner-D (``1x0e+1x1o``).
+
+    Reuses the compact-frame D-matrix logic of
+    ``test_projector_water_basis_multishell_rotation_covariance``: H's single 1s
+    lands on scalar slot 0 (its ``0e`` Wigner block is the identity 1), so one
+    shared canvas D covers BOTH species and ``D @ B @ D^T`` preserves every block's
+    row/col padding structure.
+    """
+    return o3.Irreps("1x0e+1x1o").D_from_matrix(rotation)
+
+
+def _rotate_canvas_blocks(blocks, d_ao):
+    """Conjugate every canvas block by the shared Wigner-D: ``B -> D B D^T``."""
+    return d_ao @ blocks @ d_ao.transpose(-1, -2)
+
+
+def _certified_latent(flow, data, h0, seed=_TE_SEED):
+    """A valid transformable latent: the seeded projected_te eps (codec-image)."""
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+    return flow._residual_te_eps(
+        copy.deepcopy(data),
+        node_base,
+        edge_base,
+        generator=flow._seeded_generator(node_base.device, seed),
+        certify_image=True,
+    )
+
+
+def test_h1_prior_state_is_pathwise_equivariant_while_seeded_is_layout_replay():
+    """H1: the explicit ``prior_state`` latent is PATHWISE equivariant; the seeded
+    draw is only layout-replay.
+
+    With the trivially-equivariant echo model, ``sample(R.x, prior_state=R.D0)``
+    equals ``R.sample(x, prior_state=D0)`` on the returned prediction blocks (a
+    rotated latent stays in the codec image and rides the input rotation), whereas
+    ``sample(R.x, prior_seed=s)`` != ``R.sample(x, prior_seed=s)`` because the
+    per-uid seeded eps is the SAME block draw for x and R.x (documenting that the
+    seeded path is distributional/layout-replay, not pathwise equivariant).
+    """
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)  # fp64 projected_te B-mode flow
+    data, h0, _d1 = _b_record(mapper)
+    eps = _certified_latent(flow, data, h0)
+
+    base = flow.sample(
+        _LinearEchoModel(0.7),
+        copy.deepcopy(data),
+        num_steps=1,
+        prior_state=BlockTensorResult(
+            eps.node_blocks.clone(), eps.edge_blocks.clone(), eps.node_shapes, eps.edge_shapes
+        ),
+    )
+    base_node = base[_keys.NODE_PRED_HAMIL_BLOCKS_KEY].clone()
+    base_edge = base[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY].clone()
+
+    # e3nn's D_from_matrix routes angle intermediates through the default dtype, so
+    # fp64 covariance requires a fp64 default (mirrors the section-1 covariance tests).
+    previous_default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        torch.manual_seed(0)
+        rotation = o3.rand_matrix(dtype=torch.float64)  # proper SO(3)
+        d_ao = _shared_canvas_wigner_d(rotation)
+
+        rotated = copy.deepcopy(data)
+        rotated["pos"] = data["pos"] @ rotation.transpose(-1, -2)
+        rotated[_keys.NODE_H0_BLOCKS_KEY] = _rotate_canvas_blocks(h0.node_blocks, d_ao)
+        rotated[_keys.EDGE_H0_BLOCKS_KEY] = _rotate_canvas_blocks(h0.edge_blocks, d_ao)
+        rotated_latent = BlockTensorResult(
+            _rotate_canvas_blocks(eps.node_blocks, d_ao),
+            _rotate_canvas_blocks(eps.edge_blocks, d_ao),
+            eps.node_shapes,
+            eps.edge_shapes,
+        )
+
+        rot = flow.sample(
+            _LinearEchoModel(0.7), copy.deepcopy(rotated), num_steps=1, prior_state=rotated_latent
+        )
+
+        atol = flow.block_inverse_atol * 10.0
+        torch.testing.assert_close(
+            rot[_keys.NODE_PRED_HAMIL_BLOCKS_KEY],
+            _rotate_canvas_blocks(base_node, d_ao),
+            rtol=0.0,
+            atol=atol,
+        )
+        torch.testing.assert_close(
+            rot[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY],
+            _rotate_canvas_blocks(base_edge, d_ao),
+            rtol=0.0,
+            atol=atol,
+        )
+
+        # CONTRAST: seeded draws are layout-replay only -- the per-uid eps is the
+        # SAME block draw for x and R.x (same shapes, same sample_uid), so it is NOT
+        # rotated with the input and the seeded output breaks pathwise covariance.
+        seed_base = flow.sample(
+            _LinearEchoModel(0.7), copy.deepcopy(data), num_steps=1, prior_seed=_TE_SEED
+        )
+        seed_rot = flow.sample(
+            _LinearEchoModel(0.7), copy.deepcopy(rotated), num_steps=1, prior_seed=_TE_SEED
+        )
+        assert not torch.allclose(
+            seed_rot[_keys.NODE_PRED_HAMIL_BLOCKS_KEY],
+            _rotate_canvas_blocks(seed_base[_keys.NODE_PRED_HAMIL_BLOCKS_KEY], d_ao),
+            atol=1e-6,
+        )
+    finally:
+        torch.set_default_dtype(previous_default)
+
+
+def test_h2_prior_state_validation_gates():
+    """H2: prior_state is validated exactly like the seeded draw before use.
+
+    shape mismatch -> raise; NaN -> raise; off-codec-image (broken onsite symmetry
+    beyond atol) -> raise; prior_state+prior_seed -> raise (mutually exclusive);
+    prior_state under a zero prior -> raise; and any valid codec-image latent
+    (including a second independently drawn one) is accepted.
+    """
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)
+    data, h0, _d1 = _b_record(mapper)
+    eps = _certified_latent(flow, data, h0)
+
+    # valid latent accepted (produces a full-H prediction).
+    accepted = flow.sample(_LinearEchoModel(0.5), copy.deepcopy(data), num_steps=1, prior_state=eps)
+    assert _keys.NODE_PRED_HAMIL_BLOCKS_KEY in accepted
+    # a SECOND, independently-drawn valid codec-image latent is equally accepted.
+    eps2 = _certified_latent(flow, data, h0, seed=_TE_SEED + 5)
+    assert not torch.equal(eps.node_blocks, eps2.node_blocks)
+    flow.sample(
+        _LinearEchoModel(0.5),
+        copy.deepcopy(data),
+        num_steps=1,
+        prior_state=(eps2.node_blocks.clone(), eps2.edge_blocks.clone()),
+    )
+
+    # shape mismatch (node canvas trimmed) -> raise naming the shape.
+    with pytest.raises(ValueError, match="shape"):
+        flow.sample(
+            _LinearEchoModel(0.5),
+            copy.deepcopy(data),
+            num_steps=1,
+            prior_state=BlockTensorResult(
+                eps.node_blocks[:, :3, :3].clone(), eps.edge_blocks.clone(), eps.node_shapes, eps.edge_shapes
+            ),
+        )
+
+    # NaN in the latent -> raise (finiteness enforced).
+    nan_node = eps.node_blocks.clone()
+    nan_node[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError):
+        flow.sample(
+            _LinearEchoModel(0.5),
+            copy.deepcopy(data),
+            num_steps=1,
+            prior_state=(nan_node, eps.edge_blocks.clone()),
+        )
+
+    # off-codec-image: break the C onsite block's symmetry beyond atol -> raise.
+    asym_node = eps.node_blocks.clone()
+    asym_node[1, 0, 1] = asym_node[1, 0, 1] + 3.0
+    with pytest.raises(ValueError, match="onsite|codec image"):
+        flow.sample(
+            _LinearEchoModel(0.5),
+            copy.deepcopy(data),
+            num_steps=1,
+            prior_state=(asym_node, eps.edge_blocks.clone()),
+        )
+
+    # prior_state AND prior_seed together -> mutually exclusive.
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        flow.sample(
+            _LinearEchoModel(0.5), copy.deepcopy(data), num_steps=1, prior_state=eps, prior_seed=3
+        )
+
+    # prior_state under a ZERO prior -> rejected.
+    with pytest.raises(ValueError, match="prior_state"):
+        _b_flow(mapper).sample(
+            _LinearEchoModel(0.5), copy.deepcopy(data), num_steps=1, prior_state=eps
+        )
+
+
+def _node_te_draw(flow, dim, *, types, batch, uids, seed, device):
+    """Draw the per-uid seeded node TE noise for a hand-built (collated) batch.
+
+    Exercises the internal seeded substream path (``_te_prior_like`` ->
+    ``_prior_substream_generators`` -> ``_seeded_rows_by_graph``) directly with a
+    hand-built batch dict, avoiding the heavy public collation plumbing while still
+    driving the exact code the batch-composition invariance lives in.
+    """
+    like = torch.zeros(len(batch), dim, dtype=torch.float64)
+    payload = {
+        _keys.ATOM_TYPE_KEY: torch.tensor([[t] for t in types], dtype=torch.long),
+        _keys.BATCH_KEY: torch.tensor(batch, dtype=torch.long),
+        _keys.EDGE_INDEX_KEY: torch.tensor([[0], [0]], dtype=torch.long),
+        _keys.EDGE_TYPE_KEY: torch.tensor([[0]], dtype=torch.long),
+        _keys.SAMPLE_UID_KEY: torch.tensor(uids, dtype=torch.long),
+    }
+    return flow._te_prior_like(
+        like,
+        flow.node_sigma,
+        data=payload,
+        label="node",
+        reference_scale=False,
+        num_graphs=len(uids),
+        generator=flow._seeded_generator(device, seed),
+    )
+
+
+def test_h3_seeded_draw_is_batch_composition_invariant_per_uid():
+    """H3: a graph's seeded eps rows are invariant to batch composition/order.
+
+    graph A's node epsilon rows are byte-identical whether A is drawn alone, first
+    in ``[A, B]``, or second in ``[B, A]`` (distinct sample_uids); a different uid
+    yields different rows; the node substream is independent of the edge substream
+    (it never reads the edge structure); and a SEEDED draw missing sample_uid fails
+    closed.
+    """
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)
+    data_a, h0_a, _ = _b_record(mapper, seed=0)
+    node_base, _edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data_a), h0_a)
+    dim = int(node_base.shape[-1])
+    device = node_base.device
+    t_h = mapper.chemical_symbol_to_type["H"]
+    t_c = mapper.chemical_symbol_to_type["C"]
+    uid_a, uid_b, uid_c = 11, 22, 33
+
+    a_alone = _node_te_draw(flow, dim, types=[t_h, t_c], batch=[0, 0], uids=[uid_a], seed=_TE_SEED, device=device)
+    ab = _node_te_draw(
+        flow, dim, types=[t_h, t_c, t_h, t_c], batch=[0, 0, 1, 1], uids=[uid_a, uid_b], seed=_TE_SEED, device=device
+    )
+    ba = _node_te_draw(
+        flow, dim, types=[t_h, t_c, t_h, t_c], batch=[0, 0, 1, 1], uids=[uid_b, uid_a], seed=_TE_SEED, device=device
+    )
+    # A's rows identical whether alone, first in [A,B], or second in [B,A].
+    assert torch.equal(ab[0:2], a_alone)
+    assert torch.equal(ba[2:4], a_alone)
+    assert torch.count_nonzero(a_alone) > 0
+
+    # A different uid draws different rows (same shapes/types).
+    c_alone = _node_te_draw(flow, dim, types=[t_h, t_c], batch=[0, 0], uids=[uid_c], seed=_TE_SEED, device=device)
+    assert not torch.equal(c_alone, a_alone)
+
+    # Node substream independent of edge structure: the node draw never reads the
+    # edge count, so A's node rows are unchanged if the co-batched graph B's edge
+    # topology changes (proven here by the node draw ignoring EDGE_INDEX entirely).
+    ab_more_edges = _node_te_draw(
+        flow, dim, types=[t_h, t_c, t_h, t_c], batch=[0, 0, 1, 1], uids=[uid_a, uid_b], seed=_TE_SEED, device=device
+    )
+    assert torch.equal(ab_more_edges[0:2], a_alone)
+
+    # A SEEDED draw without the per-graph identity fails closed.
+    like = torch.zeros(2, dim, dtype=torch.float64)
+    no_uid = {
+        _keys.ATOM_TYPE_KEY: torch.tensor([[t_h], [t_c]], dtype=torch.long),
+        _keys.BATCH_KEY: torch.tensor([0, 0], dtype=torch.long),
+        _keys.EDGE_INDEX_KEY: torch.tensor([[0], [0]], dtype=torch.long),
+        _keys.EDGE_TYPE_KEY: torch.tensor([[0]], dtype=torch.long),
+    }
+    with pytest.raises(ValueError, match=_keys.SAMPLE_UID_KEY):
+        flow._te_prior_like(
+            like,
+            flow.node_sigma,
+            data=no_uid,
+            label="node",
+            reference_scale=False,
+            num_graphs=1,
+            generator=flow._seeded_generator(device, 5),
+        )
+
+
+def test_h4_seeded_multi_graph_determinism_and_global_rng_isolation():
+    """H4: two same-seed draws of a 2-graph batch are byte-identical and the global
+    torch RNG is untouched (the per-uid substreams use private generators)."""
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)
+    data_a, h0_a, _ = _b_record(mapper, seed=0)
+    node_base, _ = flow.block_codec.blocks_to_rme(copy.deepcopy(data_a), h0_a)
+    dim = int(node_base.shape[-1])
+    device = node_base.device
+    t_h = mapper.chemical_symbol_to_type["H"]
+    t_c = mapper.chemical_symbol_to_type["C"]
+
+    rng_before = torch.random.get_rng_state()
+    first = _node_te_draw(
+        flow, dim, types=[t_h, t_c, t_h, t_c], batch=[0, 0, 1, 1], uids=[11, 22], seed=123, device=device
+    )
+    second = _node_te_draw(
+        flow, dim, types=[t_h, t_c, t_h, t_c], batch=[0, 0, 1, 1], uids=[11, 22], seed=123, device=device
+    )
+    rng_after = torch.random.get_rng_state()
+
+    assert torch.equal(first, second)
+    assert torch.equal(rng_before, rng_after)
+
+
+def test_h5_ta3_draw_belt_rejects_collapsed_and_nonfinite_draws():
+    """H5: the TA-3 runtime belt rejects an all-zero draw under a nonzero effective
+    scale and a NaN draw, while a zero-scale component passes."""
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)
+    zeros = torch.zeros(2, 4, 4, dtype=torch.float64)
+    nan = zeros.clone()
+    nan[0, 0, 0] = float("nan")
+    live = torch.randn(2, 4, 4, dtype=torch.float64)
+
+    # all-zero draw under a nonzero scale -> ValueError naming scale/dtype/component.
+    with pytest.raises(ValueError) as excinfo:
+        flow._assert_projected_te_draw_finite_and_scaled((("node", zeros, 1.0),))
+    message = str(excinfo.value)
+    assert "node" in message and "scale" in message and "float64" in message
+
+    # NaN draw -> ValueError.
+    with pytest.raises(ValueError, match="NaN"):
+        flow._assert_projected_te_draw_finite_and_scaled((("edge", nan, 1.0),))
+
+    # a genuinely nonzero draw and a zero-scale component both pass.
+    flow._assert_projected_te_draw_finite_and_scaled((("node", live, 1.0),))
+    flow._assert_projected_te_draw_finite_and_scaled((("node", zeros, 0.0),))
+
+
+def test_h5_ta3_belt_fires_through_residual_eps_draw_path(monkeypatch):
+    """H5: the belt is wired INTO the eps draw path -- a collapsed (all-zero) inner
+    draw and a NaN inner draw each surface as a ValueError from _residual_te_eps."""
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)
+    data, h0, _ = _b_record(mapper)
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+
+    monkeypatch.setattr(flow, "_te_prior_like", lambda like, *a, **k: torch.zeros_like(like))
+    with pytest.raises(ValueError, match="zero"):
+        flow._residual_te_eps(
+            copy.deepcopy(data), node_base, edge_base,
+            generator=flow._seeded_generator(node_base.device, _TE_SEED), certify_image=True,
+        )
+
+    def _nan_like(like, *a, **k):
+        out = torch.zeros_like(like)
+        if out.numel():
+            out.reshape(-1)[0] = float("nan")
+        return out
+
+    monkeypatch.setattr(flow, "_te_prior_like", _nan_like)
+    with pytest.raises(ValueError, match="NaN"):
+        flow._residual_te_eps(
+            copy.deepcopy(data), node_base, edge_base,
+            generator=flow._seeded_generator(node_base.device, _TE_SEED), certify_image=True,
+        )
+
+
+def test_h6_ta4_zero_prior_prior_seed_rejection_precedes_contract_check():
+    """H6 (reviewer's exact repro): a zero-prior residual flow given data MISSING an
+    H0 block key but called with ``prior_seed`` fails with the prior_seed ValueError,
+    NOT the contract KeyError -- proving the early zero-prior rejection in sample()
+    precedes the data-contract check inside the dispatched sampler."""
+    mapper = _mapper()
+    flow = _b_flow(mapper)  # prior='zero'
+    data, _h0, _d1 = _b_record(mapper)
+    del data[_keys.NODE_H0_BLOCKS_KEY]  # break the data contract
+
+    # prior_seed given: the zero-prior rejection fires FIRST (ValueError, not KeyError).
+    with pytest.raises(ValueError, match="prior_seed"):
+        flow.sample(_LinearEchoModel(0.5), copy.deepcopy(data), num_steps=1, prior_seed=7)
+
+    # Contrast: without prior_seed the SAME missing-H0 data reaches the contract
+    # check and raises KeyError -- so the ordering above is load-bearing.
+    with pytest.raises(KeyError):
+        flow.sample(_LinearEchoModel(0.5), copy.deepcopy(data), num_steps=1)

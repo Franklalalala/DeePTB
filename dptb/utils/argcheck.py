@@ -591,11 +591,17 @@ def validate_block_ode_contract(data):
             f"got {configured_dtype!r}"
         )
     if projected_scales is not None:
-        representable = {
-            "float32": (2.0 ** -149, (2.0 - 2.0 ** -23) * 2.0 ** 127),
-            "float64": (2.0 ** -1074, (2.0 - 2.0 ** -52) * 2.0 ** 1023),
+        # Working interval, NOT the raw representable interval: a scale near the
+        # subnormal floor lets the direction*radius product round to exact zero
+        # (silently reviving the deterministic zero prior), and a scale near
+        # dtype-max overflows once the unbounded Gaussian radius multiplies in.
+        # Lower bound = smallest NORMAL positive value x 2**26 headroom; upper
+        # bound = dtype max / 2**12 radius headroom.
+        working_interval = {
+            "float32": (2.0 ** -100, (2.0 - 2.0 ** -23) * 2.0 ** 115),
+            "float64": (2.0 ** -996, (2.0 - 2.0 ** -52) * 2.0 ** 1011),
         }
-        minimum, maximum = representable[configured_dtype]
+        minimum, maximum = working_interval[configured_dtype]
         effective_scales = {
             "node_sigma*te_prior_sigma": projected_scales["node_sigma"]
             * projected_scales["te_prior_sigma"],
@@ -610,7 +616,10 @@ def validate_block_ode_contract(data):
         if invalid_effective:
             raise ValueError(
                 "projected_te block_ode effective scales must be finite and "
-                f"non-zero in {configured_dtype}; invalid products={invalid_effective}"
+                f"inside the safe {configured_dtype} working interval "
+                f"[{minimum:.3g}, {maximum:.3g}] (subnormal-adjacent scales can "
+                "collapse draws to exact zero; near-max scales can overflow under "
+                f"the Gaussian radius); invalid products={invalid_effective}"
             )
     maximum_inverse_atol = inverse_atol_caps[configured_dtype]
     raw_steps = flow.get("validation_ode_steps", [])
@@ -1633,6 +1642,8 @@ def train_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
@@ -1677,6 +1688,8 @@ def validation_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
@@ -1721,6 +1734,8 @@ def reference_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),
@@ -1764,6 +1779,8 @@ def test_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="hamiltonian_p2", doc="Raw LMDB AO-block dictionary key for the P2 physical prior."),

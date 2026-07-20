@@ -175,3 +175,87 @@ def test_generic_cfm_accepts_zero_default():
     # Omitted -> frozen 0.0 default; explicit 0.0 also fine (generic window 0 <= p < 1).
     assert _generic_flow().t0_probability == pytest.approx(0.0)
     assert _generic_flow(t0_probability=0.0).t0_probability == pytest.approx(0.0)
+
+
+# ===========================================================================
+# H9: projected_te effective-scale working-interval gates (P3 argcheck + flow
+# ctor).  The GATE rejects effective scales node_sigma*te_prior_sigma /
+# edge_sigma*te_prior_sigma that a bare representability check would accept but
+# that collapse to exact zero (subnormal-adjacent) or overflow (near dtype-max)
+# once the unbounded Gaussian radius multiplies in.  Both layers are pinned here.
+# ===========================================================================
+import math as _math_h9
+
+import torch as _torch_h9
+
+from test_residual_ao_block_ode import (  # noqa: E402
+    _b_te_flow as _te_flow,
+    _load_te_config,
+)
+
+_FMAX_FP32 = float(_torch_h9.finfo(_torch_h9.float32).max)
+_FMAX_FP64 = float(_torch_h9.finfo(_torch_h9.float64).max)
+
+# fp32 effective scales OUTSIDE the safe working interval [2**-100, fmax/2**12]:
+#   2**-149 (smallest subnormal) and 2**-120 sit below the min; fmax/2 is above
+#   the max headroom bound (fmax/2**12).
+FP32_OUT_OF_INTERVAL = [2.0 ** -149, 2.0 ** -120, _FMAX_FP32 / 2.0]
+# fp32 effective scales safely inside the working interval.
+FP32_IN_INTERVAL = [1.0, 1e-6, 1e6]
+_SCALE_MATCH = "working interval|effective scale"
+
+
+def _te_config_scale(te_prior_sigma, *, dtype="float32"):
+    """The te-arm yaml with an overridden te_prior_sigma (effective scale ==
+    node_sigma*te_prior_sigma == te_prior_sigma, since node/edge sigma == 1.0)."""
+    cfg = _mutate(
+        _load_te_config(),
+        ("train_options", "flow_options", "te_prior_sigma"),
+        float(te_prior_sigma),
+    )
+    if dtype != "float32":
+        cfg = _mutate(cfg, ("common_options", "dtype"), dtype)
+    return cfg
+
+
+# ---- flow ctor ------------------------------------------------------------
+@pytest.mark.parametrize("scale", FP32_OUT_OF_INTERVAL)
+def test_h9_flow_ctor_rejects_fp32_effective_scale_outside_interval(scale):
+    mapper = _residual_mapper()
+    with pytest.raises(ValueError, match=_SCALE_MATCH):
+        _te_flow(mapper, dtype=_torch_h9.float32, te_prior_sigma=float(scale))
+
+
+@pytest.mark.parametrize("scale", FP32_IN_INTERVAL)
+def test_h9_flow_ctor_accepts_fp32_effective_scale_inside_interval(scale):
+    mapper = _residual_mapper()
+    flow = _te_flow(mapper, dtype=_torch_h9.float32, te_prior_sigma=float(scale))
+    assert flow.te_prior_sigma == pytest.approx(scale)
+
+
+# ---- argcheck -------------------------------------------------------------
+@pytest.mark.parametrize("scale", FP32_OUT_OF_INTERVAL)
+def test_h9_argcheck_rejects_fp32_effective_scale_outside_interval(scale):
+    with pytest.raises(ValueError, match=_SCALE_MATCH):
+        validate_block_ode_contract(_te_config_scale(scale))
+
+
+@pytest.mark.parametrize("scale", FP32_IN_INTERVAL)
+def test_h9_argcheck_accepts_fp32_effective_scale_inside_interval(scale):
+    assert validate_block_ode_contract(_te_config_scale(scale)) is None
+
+
+# ---- fp64 spot-check (both layers) ---------------------------------------
+def test_h9_fp64_working_interval_spot_check_both_layers():
+    """fp64 uses the wider interval [2**-996, fmax/2**12]: a 2**-1040 subnormal-
+    adjacent scale is rejected at BOTH layers, while 1.0 is accepted at both."""
+    mapper = _residual_mapper()
+    with pytest.raises(ValueError, match=_SCALE_MATCH):
+        _te_flow(mapper, dtype=_torch_h9.float64, te_prior_sigma=2.0 ** -1040)
+    assert _te_flow(mapper, dtype=_torch_h9.float64, te_prior_sigma=1.0).te_prior_sigma == pytest.approx(1.0)
+
+    # argcheck fp64: the effective-scale gate fires before the atol cap, so a
+    # below-floor scale is rejected for the working-interval reason even though the
+    # te yaml's fp32 atol would separately be too loose for fp64.
+    with pytest.raises(ValueError, match=_SCALE_MATCH):
+        validate_block_ode_contract(_te_config_scale(2.0 ** -1040, dtype="float64"))

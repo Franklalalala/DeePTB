@@ -75,6 +75,16 @@ _VALIDATION_SEED_STREAMS = {
     "prior": 0x9E3779B97F4A7C15,
     "time": 0xD1B54A32D192ED03,
 }
+# TA-2: per-(graph uid, node-vs-edge) prior substream constants.  A SEEDED prior
+# draw derives one independent generator per graph keyed by its stable
+# ``sample_uid`` and its component so a graph's epsilon is invariant to batch
+# composition/order/sharding.  These extend the splitmix-style ``validation_seed``
+# machinery: the conceptual purpose string is ``"prior:<component>:<uid>"``.
+_PRIOR_COMPONENT_STREAMS = {
+    "node": 0xA0761D6478BD642F,
+    "edge": 0xE7037ED1A0B428DB,
+}
+_PRIOR_UID_MULTIPLIER = 0xD6E8FEB86659FD93
 
 
 def _parse_strict_certification(value: Any) -> Tuple[str, int]:
@@ -462,15 +472,26 @@ class HamiltonianCFM:
                 "node_sigma*te_prior_sigma": self.node_sigma * self.te_prior_sigma,
                 "edge_sigma*te_prior_sigma": self.edge_sigma * self.te_prior_sigma,
             }
+            # Working interval mirror of the argcheck gate: reject scales that a
+            # cast-based representability check would accept but that collapse to
+            # exact zero (subnormal-adjacent) or overflow (near dtype-max) once
+            # the unbounded Gaussian radius multiplies in.
+            working_interval = {
+                torch.float32: (2.0 ** -100, (2.0 - 2.0 ** -23) * 2.0 ** 115),
+                torch.float64: (2.0 ** -996, (2.0 - 2.0 ** -52) * 2.0 ** 1011),
+            }
+            work_min, work_max = working_interval[self.dtype]
             invalid_effective = []
             for name, value in effective_scales.items():
-                represented = torch.tensor(value, dtype=self.dtype)
-                if not bool(torch.isfinite(represented).item()) or represented.item() == 0.0:
+                magnitude = abs(float(value))
+                if not math.isfinite(magnitude) or not work_min <= magnitude <= work_max:
                     invalid_effective.append(name)
             if invalid_effective:
                 raise ValueError(
                     "projected_te block_ode effective scales must be finite and "
-                    f"non-zero in {self.dtype}; invalid products={invalid_effective}."
+                    f"inside the safe {self.dtype} working interval "
+                    f"[{work_min:.3g}, {work_max:.3g}]; invalid products="
+                    f"{invalid_effective}."
                 )
             if (
                 isinstance(self.te_prior_validation_seed, bool)
@@ -803,6 +824,181 @@ class HamiltonianCFM:
         generator = torch.Generator(device=device)
         generator.manual_seed(int(seed))
         return generator
+
+    def _prior_uid_substream_seed(
+        self, base_seed: int, *, uid: int, component: str
+    ) -> int:
+        """Stable per-(graph uid, node/edge) substream seed for SEEDED draws.
+
+        Extends the splitmix-style :meth:`validation_seed` machinery with the
+        conceptual purpose string ``"prior:<component>:<uid>"``: the epsilon a
+        graph receives is a deterministic function of (the base prior seed, the
+        graph's stable ``sample_uid``, and whether this is the node or edge
+        component), and is therefore independent of the graph's position in the
+        batch, the batch size, and sharding.  ``base_seed`` is the initial seed
+        of the caller's :class:`torch.Generator` (``prior_seed``), so a different
+        ``prior_seed`` still redraws the whole batch.
+        """
+        if component not in _PRIOR_COMPONENT_STREAMS:
+            raise ValueError(
+                f"Unknown prior substream component={component!r}; expected 'node' or 'edge'."
+            )
+        value = (
+            (int(base_seed) & _MAX_TORCH_SEED)
+            ^ _VALIDATION_SEED_STREAMS["prior"]
+            ^ _PRIOR_COMPONENT_STREAMS[component]
+            ^ (((int(uid) & _MAX_TORCH_SEED) + 1) * _PRIOR_UID_MULTIPLIER)
+        ) & _MAX_TORCH_SEED
+        value ^= value >> 30
+        value = (value * 0xBF58476D1CE4E5B9) & _MAX_TORCH_SEED
+        value ^= value >> 27
+        value = (value * 0x94D049BB133111EB) & _MAX_TORCH_SEED
+        return (value ^ (value >> 31)) & _MAX_TORCH_SEED
+
+    def _prior_substream_generators(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        *,
+        base_seed: int,
+        num_graphs: int,
+        component: Optional[str],
+        device: torch.device,
+    ) -> list:
+        """One independent :class:`torch.Generator` per graph, keyed by sample_uid.
+
+        Fail-closed: a SEEDED prior draw must be reproducible per graph regardless
+        of batch composition, which is impossible without a stable per-graph
+        identity, so the batch MUST carry ``SAMPLE_UID_KEY`` (a graph-level long
+        field, one value per graph after collation).
+        """
+        uids = None if data is None else data.get(_keys.SAMPLE_UID_KEY, None)
+        if uids is None:
+            raise ValueError(
+                "A SEEDED projected_te prior draw requires the per-graph record "
+                f"identity `{_keys.SAMPLE_UID_KEY}` so a graph's epsilon is "
+                "invariant to batch composition, order, and sharding; it is absent "
+                "from this batch. Emit it from LMDBDataset (see "
+                "AtomicDataDict.SAMPLE_UID_KEY) or, for a hand-built batch, attach a "
+                "synthetic int64 per-graph uid tensor."
+            )
+        uids = torch.as_tensor(uids).detach().reshape(-1).to(dtype=torch.long)
+        if uids.numel() != int(num_graphs):
+            raise ValueError(
+                f"`{_keys.SAMPLE_UID_KEY}` carries {int(uids.numel())} value(s) but "
+                f"the batch has {int(num_graphs)} graph(s); it must hold exactly one "
+                "stable id per graph."
+            )
+        uid_list = uids.tolist()
+        return [
+            self._seeded_generator(
+                device,
+                self._prior_uid_substream_seed(
+                    base_seed, uid=int(u), component=component
+                ),
+            )
+            for u in uid_list
+        ]
+
+    @staticmethod
+    def _graph_row_slices(graph_index: torch.Tensor, num_graphs: int) -> list:
+        """Ascending row positions belonging to each graph (batch-order index)."""
+        return [
+            (graph_index == g).nonzero(as_tuple=False).reshape(-1)
+            for g in range(int(num_graphs))
+        ]
+
+    @staticmethod
+    def _seeded_rows_by_graph(
+        row_count: int,
+        width: int,
+        row_slices: list,
+        generators: list,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Fill ``[row_count, width]`` drawing each graph's rows from its own gen.
+
+        Because a graph's rows are filled from its own uid-seeded generator in
+        ascending position order, the same graph receives the same rows for-row
+        regardless of how many other graphs share the batch or in which order.
+        """
+        out = torch.empty(int(row_count), int(width), device=device, dtype=dtype)
+        if row_count == 0:
+            return out
+        for gen_g, rows_g in zip(generators, row_slices):
+            n = int(rows_g.numel())
+            if n == 0:
+                continue
+            out.index_copy_(
+                0,
+                rows_g.to(device=device),
+                torch.randn(n, int(width), device=device, dtype=dtype, generator=gen_g),
+            )
+        return out
+
+    def _seeded_radius_by_graph(
+        self,
+        row_count: int,
+        active_dim: torch.Tensor,
+        graph_index: torch.Tensor,
+        row_slices: list,
+        generators: list,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Per-uid analogue of :meth:`_te_radius` (one radius stream per graph)."""
+        if self.te_prior_per_graph:
+            radius_per_graph = torch.empty(
+                len(generators), 1, device=device, dtype=dtype
+            )
+            for g, gen_g in enumerate(generators):
+                radius_per_graph[g] = torch.randn(
+                    1, 1, device=device, dtype=dtype, generator=gen_g
+                )
+            radius = radius_per_graph.index_select(0, graph_index.to(device=device))
+        else:
+            radius = torch.empty(int(row_count), 1, device=device, dtype=dtype)
+            for gen_g, rows_g in zip(generators, row_slices):
+                n = int(rows_g.numel())
+                if n == 0:
+                    continue
+                radius.index_copy_(
+                    0,
+                    rows_g.to(device=device),
+                    torch.randn(n, 1, device=device, dtype=dtype, generator=gen_g),
+                )
+        return radius * active_dim.sqrt()
+
+    def _assert_projected_te_draw_finite_and_scaled(self, components) -> None:
+        """TA-3 runtime belt for any projected_te draw, before it is used.
+
+        ``components`` is an iterable of ``(label, tensor, effective_scale)``.  A
+        drawn component must be all-finite, and -- when its configured effective
+        scale is nonzero and it has any elements -- must not be entirely zero (a
+        silent all-masked / subnormal-underflow collapse of the stochastic
+        bridge).  The error names the effective scale, dtype, and component label.
+        """
+        for label, tensor, effective_scale in components:
+            if tensor is None:
+                continue
+            if tensor.numel() and not bool(torch.isfinite(tensor).all().item()):
+                raise ValueError(
+                    f"projected_te {label} draw contains NaN/Inf (effective scale="
+                    f"{float(effective_scale):.6g}, dtype={tensor.dtype}, "
+                    f"component={label})."
+                )
+            if (
+                float(effective_scale) != 0.0
+                and tensor.numel() > 0
+                and not bool(tensor.detach().any().item())
+            ):
+                raise ValueError(
+                    f"projected_te {label} draw is entirely zero despite a nonzero "
+                    f"configured effective scale={float(effective_scale):.6g} "
+                    f"(dtype={tensor.dtype}, component={label})."
+                )
 
     def _sample_t(
         self,
@@ -1700,28 +1896,57 @@ class HamiltonianCFM:
         *,
         num_graphs: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
+        per_graph_generators: Optional[list] = None,
+        row_slices: Optional[list] = None,
+        graph_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # The 1D unstructured fallback carries no per-row graph identity; it is
+        # unreachable for the SEEDED projected_te contract (which always draws
+        # rank>=2 RME rows in irrep mode), so it keeps the single-stream draw.
         if like.ndim < 2:
             return torch.randn(
                 like.shape, device=like.device, dtype=like.dtype, generator=generator
             )
         mask_f = mask.to(device=like.device, dtype=like.dtype)
-        raw = torch.randn(
-            like.shape, device=like.device, dtype=like.dtype, generator=generator
-        ) * mask_f
+        seeded = per_graph_generators is not None
+        if seeded:
+            raw = self._seeded_rows_by_graph(
+                like.shape[0],
+                like.shape[-1],
+                row_slices,
+                per_graph_generators,
+                device=like.device,
+                dtype=like.dtype,
+            ) * mask_f
+        else:
+            raw = torch.randn(
+                like.shape, device=like.device, dtype=like.dtype, generator=generator
+            ) * mask_f
         norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
         direction = raw / norm
         active_dim = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
-        radius = self._te_radius_for_prior(
-            like.shape[0],
-            active_dim,
-            graph_index,
-            device=like.device,
-            dtype=like.dtype,
-            num_graphs=num_graphs,
-            generator=generator,
-        )
+        if graph_index is None:
+            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+        if seeded:
+            radius = self._seeded_radius_by_graph(
+                like.shape[0],
+                active_dim,
+                graph_index,
+                row_slices,
+                per_graph_generators,
+                device=like.device,
+                dtype=like.dtype,
+            )
+        else:
+            radius = self._te_radius_for_prior(
+                like.shape[0],
+                active_dim,
+                graph_index,
+                device=like.device,
+                dtype=like.dtype,
+                num_graphs=num_graphs,
+                generator=generator,
+            )
         return direction * radius * mask_f
 
     def _apply_typewise_residual_scale(
@@ -1806,6 +2031,30 @@ class HamiltonianCFM:
                     "use te_prior_mode='block' for whole-row structured noise."
                 )
 
+        # TA-2: when the draw is SEEDED, replace the single batch-order RNG stream
+        # (whose per-graph output changes with batch composition/order/sharding)
+        # with one independent generator per graph keyed by its stable sample_uid.
+        # ``base_seed`` is the passed generator's initial seed, so node and edge
+        # (distinct component tags) decouple while a different ``prior_seed`` still
+        # redraws the whole batch.  Unseeded (training) draws keep the byte-
+        # identical fast batch path below.
+        seeded = generator is not None
+        per_graph_generators = None
+        row_slices = None
+        graph_index = None
+        if seeded:
+            if num_graphs is None:
+                num_graphs = self._num_graphs(data) if data is not None else 1
+            per_graph_generators = self._prior_substream_generators(
+                data,
+                base_seed=int(generator.initial_seed()),
+                num_graphs=num_graphs,
+                component=label,
+                device=like.device,
+            )
+            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+            row_slices = self._graph_row_slices(graph_index, num_graphs)
+
         if like.ndim < 2 or slices is None:
             slices = ((0, like.shape[-1], -1),) if like.ndim >= 2 else ((0, like.numel(), -1),)
             noise = self._block_structured_prior_like(
@@ -1815,32 +2064,57 @@ class HamiltonianCFM:
                 label,
                 num_graphs=num_graphs,
                 generator=generator,
+                per_graph_generators=per_graph_generators,
+                row_slices=row_slices,
+                graph_index=graph_index,
             )
         else:
             noise = torch.zeros_like(like)
-            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+            if graph_index is None:
+                graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
             for start, end, _degree in slices:
                 seg_mask = mask[:, start:end].to(device=like.device, dtype=like.dtype)
-                raw = torch.randn(
-                    like.shape[0],
-                    end - start,
-                    device=like.device,
-                    dtype=like.dtype,
-                    generator=generator,
-                )
+                if seeded:
+                    raw = self._seeded_rows_by_graph(
+                        like.shape[0],
+                        end - start,
+                        row_slices,
+                        per_graph_generators,
+                        device=like.device,
+                        dtype=like.dtype,
+                    )
+                else:
+                    raw = torch.randn(
+                        like.shape[0],
+                        end - start,
+                        device=like.device,
+                        dtype=like.dtype,
+                        generator=generator,
+                    )
                 raw = raw * seg_mask
                 norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
                 direction = raw / norm
                 active_dim = seg_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                radius = self._te_radius_for_prior(
-                    like.shape[0],
-                    active_dim,
-                    graph_index,
-                    device=like.device,
-                    dtype=like.dtype,
-                    num_graphs=num_graphs,
-                    generator=generator,
-                )
+                if seeded:
+                    radius = self._seeded_radius_by_graph(
+                        like.shape[0],
+                        active_dim,
+                        graph_index,
+                        row_slices,
+                        per_graph_generators,
+                        device=like.device,
+                        dtype=like.dtype,
+                    )
+                else:
+                    radius = self._te_radius_for_prior(
+                        like.shape[0],
+                        active_dim,
+                        graph_index,
+                        device=like.device,
+                        dtype=like.dtype,
+                        num_graphs=num_graphs,
+                        generator=generator,
+                    )
                 noise[:, start:end] = direction * radius * seg_mask
 
         noise = self._apply_typewise_residual_scale(
@@ -2354,7 +2628,22 @@ class HamiltonianCFM:
         prior_seed: Optional[int] = None,
         certify_image: bool = True,
     ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
-        """Draw one endpoint-independent start state and certify its codec image."""
+        """Draw one endpoint-independent start state and certify its codec image.
+
+        Seeded-replay semantics (TA-1/TA-2): a fixed ``prior_seed`` reproduces the
+        SAME start state bitwise only for an identical tensor layout, plus
+        DISTRIBUTIONAL equivariance; the draw is keyed per graph by ``sample_uid``
+        (batch-composition invariant) but is NOT pathwise equivariant under an
+        input rotation/permutation.
+
+        A-mode asymmetry (TA-1a): unlike ``residual_ao_block_ode``, this A-mode
+        start state is the FULL state ``B0 = H0 + eps`` (not a pure residual D0),
+        so an explicit transformable ``prior_state`` latent does NOT drop in
+        trivially here (a caller-supplied full B0 would need its own H0-relative
+        residual bookkeeping and a distinct verbatim-vs-projected contract).  The
+        explicit-latent path is therefore offered only by the residual sampler;
+        A-mode is left seeded-only by design.
+        """
         assert self.block_codec is not None
         node_h0, edge_h0 = self.block_codec.blocks_to_rme(
             data,
@@ -2384,6 +2673,9 @@ class HamiltonianCFM:
                     AtomicDataDict.EDGE_TYPE_KEY,
                     _keys.BATCH_KEY,
                     _keys.EDGE_INDEX_KEY,
+                    # TA-2: the stable per-graph id must ride the restricted prior
+                    # substream data so a SEEDED draw can key per-uid generators.
+                    _keys.SAMPLE_UID_KEY,
                 )
                 if key in data
             }
@@ -2405,6 +2697,15 @@ class HamiltonianCFM:
                 reference_scale=False,
                 num_graphs=num_graphs,
                 generator=generator,
+            )
+            # TA-3: runtime belt on the projected_te draw before it is folded into
+            # the start state -- all-finite, and not silently all-zero for a
+            # component with a nonzero configured effective scale.
+            self._assert_projected_te_draw_finite_and_scaled(
+                (
+                    ("node", node_noise, self.node_sigma * self.te_prior_sigma),
+                    ("edge", edge_noise, self.edge_sigma * self.te_prior_sigma),
+                )
             )
             noise_blocks = self.block_codec.rme_to_blocks(
                 data, node_noise, edge_noise, project=False
@@ -2466,6 +2767,15 @@ class HamiltonianCFM:
         :func:`project_block_state` is an image-preserving projection).  When
         certification is due the epsilon is certified the same way A certifies its
         noisy start -- a repack roundtrip residual bounded by ``block_inverse_atol``.
+
+        Seeded-replay semantics (TA-1/TA-2): a fixed ``generator`` reproduces the
+        SAME epsilon bitwise only for an identical tensor layout, and otherwise
+        only DISTRIBUTIONAL equivariance -- sample(R.x, seed) is drawn from the
+        rotation of sample(x, seed)'s law, not equal to it.  The draw is keyed
+        per graph by ``sample_uid`` (batch-composition invariant) but is NOT
+        pathwise equivariant under an input rotation/permutation; for a
+        transformable latent, pass an explicit ``prior_state`` to the sampler and
+        rotate/permute it alongside the input.
         """
         assert self.block_codec is not None
         prior_data = {
@@ -2475,6 +2785,9 @@ class HamiltonianCFM:
                 AtomicDataDict.EDGE_TYPE_KEY,
                 _keys.BATCH_KEY,
                 _keys.EDGE_INDEX_KEY,
+                # TA-2: the stable per-graph id must ride the restricted prior
+                # substream data so a SEEDED draw can key per-uid generators.
+                _keys.SAMPLE_UID_KEY,
             )
             if key in data
         }
@@ -2501,6 +2814,15 @@ class HamiltonianCFM:
             data, node_noise, edge_noise, project=False
         )
         eps = project_block_state(data, self.idp, noise_blocks)
+        # TA-3: runtime belt on the projected_te draw before it is used as D0 --
+        # all-finite, and not silently all-zero for a component with a nonzero
+        # configured effective scale.
+        self._assert_projected_te_draw_finite_and_scaled(
+            (
+                ("node", eps.node_blocks, self.node_sigma * self.te_prior_sigma),
+                ("edge", eps.edge_blocks, self.edge_sigma * self.te_prior_sigma),
+            )
+        )
         if certify_image:
             node_eps, edge_eps = self.block_codec.blocks_to_rme(
                 data,
@@ -3848,6 +4170,97 @@ class HamiltonianCFM:
         )
         return state
 
+    def _prior_state_as_residual_D0(
+        self,
+        data: AtomicDataDict.Type,
+        prior_state: Any,
+        h0_blocks: BlockTensorResult,
+    ) -> BlockTensorResult:
+        """TA-1: validate a caller-supplied ``prior_state`` and return it as D0.
+
+        ``prior_state`` is the explicit transformable latent: a
+        :class:`BlockTensorResult` or a ``(node_blocks, edge_blocks)`` pair already
+        in the physical-H0 canvas block layout.  It is validated exactly like the
+        seeded draw -- real/finite, shape against the H0 canvas, and codec-image
+        certification (both the onsite/reverse/padding projection residual and the
+        strict CG repack roundtrip, each bounded by ``block_inverse_atol``) -- and
+        returned VERBATIM so a caller can rotate/permute it alongside the input to
+        obtain pathwise equivariance (a rotated/permuted valid latent stays in the
+        codec image, so certification still passes).  The TA-3 all-zero belt is NOT
+        applied: the latent is caller-authoritative, so a deliberate zero start is
+        respected (finiteness is still enforced).
+        """
+        assert self.block_codec is not None
+        if isinstance(prior_state, BlockTensorResult):
+            node_blocks, edge_blocks = prior_state.node_blocks, prior_state.edge_blocks
+        else:
+            try:
+                node_blocks, edge_blocks = prior_state
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "projected_te prior_state must be a BlockTensorResult or a "
+                    "(node_blocks, edge_blocks) pair in the physical-H0 canvas block "
+                    "layout."
+                )
+        node_blocks = self._require_real_finite_tensor(
+            node_blocks, label="projected_te prior_state node blocks"
+        ).to(device=h0_blocks.node_blocks.device, dtype=self.dtype)
+        edge_blocks = self._require_real_finite_tensor(
+            edge_blocks, label="projected_te prior_state edge blocks"
+        ).to(device=h0_blocks.edge_blocks.device, dtype=self.dtype)
+        if tuple(node_blocks.shape) != tuple(h0_blocks.node_blocks.shape):
+            raise ValueError(
+                f"projected_te prior_state node blocks shape {tuple(node_blocks.shape)} "
+                f"!= H0 canvas node shape {tuple(h0_blocks.node_blocks.shape)}."
+            )
+        if tuple(edge_blocks.shape) != tuple(h0_blocks.edge_blocks.shape):
+            raise ValueError(
+                f"projected_te prior_state edge blocks shape {tuple(edge_blocks.shape)} "
+                f"!= H0 canvas edge shape {tuple(h0_blocks.edge_blocks.shape)}."
+            )
+        state_blocks = BlockTensorResult(
+            node_blocks, edge_blocks, h0_blocks.node_shapes, h0_blocks.edge_shapes
+        )
+        projected = project_block_state(data, self.idp, state_blocks)
+        proj_residual = max(
+            self._max_abs(
+                projected.node_blocks - state_blocks.node_blocks,
+                label="prior_state node projection residual",
+            ),
+            self._max_abs(
+                projected.edge_blocks - state_blocks.edge_blocks,
+                label="prior_state edge projection residual",
+            ),
+        )
+        if proj_residual > self.block_inverse_atol:
+            raise ValueError(
+                "projected_te prior_state violates onsite/reverse/padding "
+                "constraints (supply it in the certified H0 canvas layout): max "
+                f"residual={proj_residual:.6g}, atol={self.block_inverse_atol:.6g}."
+            )
+        node_rme, edge_rme = self.block_codec.blocks_to_rme(
+            data, state_blocks, certify_image=True
+        )
+        roundtrip = self.block_codec.rme_to_blocks(
+            data, node_rme, edge_rme, project=True
+        )
+        image_residual = max(
+            self._max_abs(
+                roundtrip.node_blocks - state_blocks.node_blocks,
+                label="prior_state node codec-image residual",
+            ),
+            self._max_abs(
+                roundtrip.edge_blocks - state_blocks.edge_blocks,
+                label="prior_state edge codec-image residual",
+            ),
+        )
+        if image_residual > self.block_inverse_atol:
+            raise ValueError(
+                "projected_te prior_state is outside the certified codec image: "
+                f"max residual={image_residual:.6g}, atol={self.block_inverse_atol:.6g}."
+            )
+        return state_blocks
+
     def _sample_residual_ao_block_ode(
         self,
         model: torch.nn.Module,
@@ -3856,6 +4269,7 @@ class HamiltonianCFM:
         num_steps: int,
         num_graphs: int,
         prior_seed: Optional[int] = None,
+        prior_state: Any = None,
     ) -> AtomicDataDict.Type:
         """Roll out the non-SOC residual state D, then assemble H = H0 + D once."""
         if self.block_codec is None:
@@ -3880,13 +4294,20 @@ class HamiltonianCFM:
             state, h0_blocks, certify_image=True
         )
         if self.prior == "zero":
-            # Zero prior: D0 = 0 exactly (byte-identical to v1).  A prior_seed is
-            # meaningless here and rejected, mirroring _block_initial_state's
-            # zero-prior symmetry.
+            # Zero prior: D0 = 0 exactly (byte-identical to v1).  A prior_seed and
+            # an explicit prior_state are both meaningless here and rejected,
+            # mirroring _block_initial_state's zero-prior symmetry (the top-level
+            # sample() guard rejects them before dispatch; this is defense in depth
+            # for direct callers).
             if prior_seed is not None:
                 raise ValueError(
                     "residual_ao_block_ode with prior='zero' uses an exact zero "
                     "prior and rejects prior_seed."
+                )
+            if prior_state is not None:
+                raise ValueError(
+                    "residual_ao_block_ode with prior='zero' uses an exact zero "
+                    "prior and rejects prior_state."
                 )
             current = BlockTensorResult(
                 torch.zeros_like(h0_blocks.node_blocks),
@@ -3894,6 +4315,16 @@ class HamiltonianCFM:
                 h0_blocks.node_shapes,
                 h0_blocks.edge_shapes,
             )
+        elif prior_state is not None:
+            # TA-1 explicit latent: D0 = prior_state verbatim (validated/certified).
+            # Mutually exclusive with prior_seed -- the caller supplies the state
+            # rather than seeding a draw of it.
+            if prior_seed is not None:
+                raise ValueError(
+                    "residual_ao_block_ode prior_state and prior_seed are mutually "
+                    "exclusive: supply an explicit latent OR seed a draw, not both."
+                )
+            current = self._prior_state_as_residual_D0(state, prior_state, h0_blocks)
         else:
             # projected_te: D0 = eps, drawn deterministically for a given seed and
             # certified in the codec image, matching the training boundary state
@@ -4004,8 +4435,17 @@ class HamiltonianCFM:
         *,
         num_steps: int,
         prior_seed: Optional[int] = None,
+        prior_state: Any = None,
     ) -> AtomicDataDict.Type:
-        """Euler-integrate the endpoint-parameterized flow from the configured prior."""
+        """Euler-integrate the endpoint-parameterized flow from the configured prior.
+
+        ``prior_state`` (TA-1) is the optional explicit transformable latent for
+        ``residual_ao_block_ode`` under ``prior='projected_te'``: a
+        BlockTensorResult or ``(node_blocks, edge_blocks)`` pair in the physical-H0
+        canvas block layout, used as D0 verbatim so a caller can rotate/permute it
+        alongside the input for pathwise equivariance.  It is mutually exclusive
+        with ``prior_seed`` and illegal under a zero prior or in any other mode.
+        """
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
         state = data.copy()
@@ -4013,21 +4453,43 @@ class HamiltonianCFM:
         if self.uureal_block_ode:
             if prior_seed is not None:
                 raise ValueError("uureal_block_ode uses an exact zero prior and rejects prior_seed.")
+            if prior_state is not None:
+                raise ValueError("uureal_block_ode uses an exact zero prior and rejects prior_state.")
             return self._sample_uureal_block_ode(
                 model, state, num_steps=num_steps, num_graphs=num_graphs
             )
         if self.residual_ao_block_ode:
-            # v2: prior='zero' rejects prior_seed inside the sampler (mirroring
-            # _block_initial_state); prior='projected_te' consumes it as the
-            # deterministic D0 = eps seed.  Pass it through either way.
+            # TA-4: fail BEFORE dispatch under the zero prior (exception ordering).
+            # prior='zero' owns an exact zero D0 and rejects both a seed and an
+            # explicit latent; prior='projected_te' consumes prior_seed as the
+            # deterministic D0=eps draw, or prior_state as the verbatim D0.
+            if self.prior == "zero":
+                if prior_seed is not None:
+                    raise ValueError(
+                        "residual_ao_block_ode uses an exact zero prior and rejects prior_seed."
+                    )
+                if prior_state is not None:
+                    raise ValueError(
+                        "residual_ao_block_ode uses an exact zero prior and rejects prior_state."
+                    )
             return self._sample_residual_ao_block_ode(
                 model,
                 state,
                 num_steps=num_steps,
                 num_graphs=num_graphs,
                 prior_seed=prior_seed,
+                prior_state=prior_state,
             )
         if self.block_ode:
+            # A-mode ao_block_ode draws its full start state B0=H0+eps and does not
+            # accept an explicit prior_state (see the asymmetry note on
+            # _block_initial_state); reject it loudly rather than silently ignore.
+            if prior_state is not None:
+                raise ValueError(
+                    "prior_state is supported only by residual_ao_block_ode under "
+                    "prior='projected_te'; the A-mode ao_block_ode sampler draws its "
+                    "start state and does not accept an explicit latent."
+                )
             return self._sample_block_ode(
                 model,
                 state,
@@ -4037,6 +4499,8 @@ class HamiltonianCFM:
             )
         if prior_seed is not None:
             raise ValueError("prior_seed is supported only by block_ode.")
+        if prior_state is not None:
+            raise ValueError("prior_state is supported only by block_ode.")
         node_current = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
         edge_current = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_current is None and edge_current is None:
