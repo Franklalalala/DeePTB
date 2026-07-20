@@ -2615,6 +2615,7 @@ def loss_options():
         Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
         Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
         Argument("log_feature_compatible", bool, optional=True, default=True),
+        Argument("log_feature_compatible_interval", int, optional=True, default=1, doc="Cadence, counted in forward() calls, for the logging-only feature-compatible onsite/hopping metric. The expensive host-sync feature branch fires only when call_index % interval == 0, where call_index is a 0-based per-criterion counter, so the FIRST call always fires (smoke runs and first-batch logs still see the metric). interval=1 (default) reproduces the legacy every-step behavior byte-for-byte; larger values throttle the logging metric only and never change the optimization/gradient loss. Rank-synchronous: every DDP rank calls forward() the same number of times, so the feature branch (which contains collective all-reduces) fires on all ranks or none and cannot deadlock. Must be an int >= 1."),
         Argument("feature_log_no_grad", bool, optional=True, default=True),
         Argument("distributed_log_reduce", bool, optional=True, default=True),
         Argument("expose_component_sums", bool, optional=True, default=True),

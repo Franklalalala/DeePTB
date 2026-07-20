@@ -83,6 +83,7 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         block_reduction: str = "global",
         complex_reduction: str = "modulus",
         log_feature_compatible: bool = True,
+        log_feature_compatible_interval: int = 1,
         feature_log_no_grad: bool = True,
         distributed_log_reduce: bool = True,
         expose_component_sums: bool = True,
@@ -123,6 +124,32 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         self.block_reduction = block_reduction
         self.complex_reduction = complex_reduction
         self.log_feature_compatible = bool(log_feature_compatible)
+        # Cadence (in forward() calls) for the logging-only feature-compatible
+        # metric.  The feature branch is host-sync heavy (cpu()/tolist(), Python
+        # species/pair grouping, and two collective all-reduces); throttling it
+        # to every Nth call is a pure logging optimization that never touches the
+        # optimization/gradient loss.  Fail-closed: int >= 1, and reject bool
+        # (bool is an int subclass in Python, but True/False is never a cadence).
+        if isinstance(log_feature_compatible_interval, bool) or not isinstance(
+            log_feature_compatible_interval, int
+        ):
+            raise ValueError(
+                "log_feature_compatible_interval must be an int >= 1, got "
+                f"{log_feature_compatible_interval!r}."
+            )
+        if log_feature_compatible_interval < 1:
+            raise ValueError(
+                "log_feature_compatible_interval must be >= 1, got "
+                f"{log_feature_compatible_interval}."
+            )
+        self.log_feature_compatible_interval = int(log_feature_compatible_interval)
+        # Monotone, per-criterion-instance forward() counter (0-based; the first
+        # call sees call_index == 0).  DDP rank-synchrony: every rank calls
+        # forward() the same number of times along the same deterministic code
+        # path, so this counter stays identical across ranks.  The feature branch
+        # (which contains collective all-reduces) therefore fires on ALL ranks or
+        # NONE for a given call, and the all-reduce can never deadlock.
+        self._feature_log_calls = 0
         self.feature_log_no_grad = bool(feature_log_no_grad)
         self.distributed_log_reduce = bool(distributed_log_reduce)
         self.expose_component_sums = bool(expose_component_sums)
@@ -268,7 +295,19 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         block_hopping = mae_from_components(block_edge_comp)
         block_global_mae = mae_from_components(block_total_comp)
 
-        need_feature = self.log_feature_compatible or self.optimization in {"feature", "feature_compatible", "compat"}
+        # The interval gates ONLY the logging trigger.  Optimization-mode feature
+        # requirement is preserved exactly and is never throttled: when the
+        # optimization loss itself needs features, need_feature stays True on
+        # every call regardless of the cadence.  With interval == 1,
+        # ``call_index % 1 == 0`` always, so log_feature_due == log_feature_compatible
+        # and need_feature is byte-identical to the legacy every-step behavior.
+        call_index = self._feature_log_calls
+        self._feature_log_calls += 1
+        optimization_needs_feature = self.optimization in {"feature", "feature_compatible", "compat"}
+        log_feature_due = self.log_feature_compatible and (
+            call_index % self.log_feature_compatible_interval == 0
+        )
+        need_feature = log_feature_due or optimization_needs_feature
         if need_feature:
             if self.feature_log_no_grad and self.optimization not in {"feature", "feature_compatible", "compat"}:
                 with torch.no_grad():
