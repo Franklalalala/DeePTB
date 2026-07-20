@@ -572,7 +572,7 @@ class HamiltonianCFM:
             self.t0_probability = float(options.get("t0_probability", 0.15))
             if self.t0_probability <= 0.0:
                 raise ValueError(
-                    "uureal_block_ode requires t0_probability > 0: the rollout "
+                    "uureal_block_ode requires 0 < t0_probability < 1: the rollout "
                     "starts at t=0, D=0, and that boundary state has no training "
                     "mass otherwise (recommended range 0.1-0.25)."
                 )
@@ -584,12 +584,28 @@ class HamiltonianCFM:
             self.t0_probability = float(options.get("t0_probability", 0.15))
             if self.t0_probability <= 0.0:
                 raise ValueError(
-                    "residual_ao_block_ode requires t0_probability > 0: the rollout "
+                    "residual_ao_block_ode requires 0 < t0_probability < 1: the rollout "
                     "starts at t=0, D=0, and that boundary state has no training "
                     "mass otherwise (recommended range 0.1-0.25)."
                 )
         else:
             self.t0_probability = float(options.get("t0_probability", 0.0))
+        # Universal upper bound (all modes).  t0_probability is the Bernoulli mass
+        # of the exact-t=0 boundary injection in ``_sample_t`` (``torch.rand(...) <
+        # p``); p >= 1 makes that comparison always True, sending EVERY sample to
+        # t=0 and silently starving the interior [t_min, t_max] schedule, and a
+        # non-finite p is never a valid probability.  The block-ODE modes require
+        # p > 0 above, so their effective window is 0 < p < 1; the generic CFM
+        # window is 0 <= p < 1.
+        if not math.isfinite(self.t0_probability) or not (
+            0.0 <= self.t0_probability < 1.0
+        ):
+            raise ValueError(
+                "flow_options.t0_probability must be finite and satisfy "
+                "0.0 <= t0_probability < 1.0 (recommended 0.1-0.25): a value >= 1 "
+                "collapses every training time to the t=0 boundary and starves the "
+                f"interior schedule; got {self.t0_probability!r}."
+            )
         self.t_eps = float(options.get("t_eps", 1.0e-3))
         self.endpoint_weight_power = float(options.get("endpoint_weight_power", 0.0))
         self.endpoint_weight_cap = float(options.get("endpoint_weight_cap", 100.0))

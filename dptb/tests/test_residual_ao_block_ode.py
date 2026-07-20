@@ -716,7 +716,11 @@ def test_t0_probability_defaults_positive_and_rejects_explicit_zero():
 def test_t0_injection_bypasses_t_min_clamp():
     """3: t0 injection yields exact zeros and every non-zero sample honours t_min."""
     mapper = _mapper()
-    flow = _b_flow(mapper, t_min=0.5, t0_probability=1.0)
+    # p=1 is now rejected at construction (full boundary collapse is a
+    # misconfiguration); force full injection AFTER construction to keep
+    # exercising the runtime bypass mechanism itself.
+    flow = _b_flow(mapper, t_min=0.5, t0_probability=0.15)
+    flow.t0_probability = 1.0
     t = flow._sample_t(num_graphs=64, device=torch.device("cpu"), dtype=torch.float64)
     assert torch.equal(t, torch.zeros_like(t))
 

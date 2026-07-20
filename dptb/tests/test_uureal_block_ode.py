@@ -621,7 +621,11 @@ def test_t0_injection_bypasses_t_min_clamp():
     the boundary training mass.
     """
     mapper = _mapper()
-    flow = _flow(mapper, t_min=0.5, t0_probability=1.0)
+    # p=1 is now rejected at construction (full boundary collapse is a
+    # misconfiguration); force full injection AFTER construction to keep
+    # exercising the runtime bypass mechanism itself.
+    flow = _flow(mapper, t_min=0.5, t0_probability=0.15)
+    flow.t0_probability = 1.0
     t = flow._sample_t(num_graphs=64, device=torch.device("cpu"), dtype=torch.float32)
     assert torch.equal(t, torch.zeros_like(t))
 

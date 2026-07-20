@@ -488,10 +488,12 @@ def validate_block_ode_contract(data):
                 or not isinstance(t0_probability, Number)
                 or not math.isfinite(float(t0_probability))
                 or float(t0_probability) <= 0.0
+                or float(t0_probability) >= 1.0
             ):
                 raise ValueError(
-                    "uureal_block_ode requires t0_probability > 0 (recommended "
-                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass"
+                    "uureal_block_ode requires 0 < t0_probability < 1 (recommended "
+                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass, "
+                    "and t0_probability >= 1 collapses every training time to t=0"
                 )
     if residual_spatial_mode:
         # Declarative contract markers (validated only; runtime behavior is driven
@@ -527,10 +529,12 @@ def validate_block_ode_contract(data):
                 or not isinstance(t0_probability, Number)
                 or not math.isfinite(float(t0_probability))
                 or float(t0_probability) <= 0.0
+                or float(t0_probability) >= 1.0
             ):
                 raise ValueError(
-                    "residual_ao_block_ode requires t0_probability > 0 (recommended "
-                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass"
+                    "residual_ao_block_ode requires 0 < t0_probability < 1 (recommended "
+                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass, "
+                    "and t0_probability >= 1 collapses every training time to t=0"
                 )
     target_fields = {
         "absolute_full_h": {
