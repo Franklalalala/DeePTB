@@ -302,6 +302,9 @@ class DatasetBuilder:
                 require_uureal_block_ode=kwargs.get(
                     "require_uureal_block_ode", False
                 ),
+                require_residual_from_full_h_target=kwargs.get(
+                    "require_residual_from_full_h_target", False
+                ),
                 expected_p2_source_fingerprint=kwargs.get(
                     "expected_p2_source_fingerprint", ""
                 ),

@@ -392,6 +392,69 @@ def assert_residual_h_target_contract(
         )
 
 
+def assert_residual_from_full_h_target_contract(
+    data_dict: Dict[str, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+) -> None:
+    """Require an absolute-Full-H raw record whose residual dH is materialized online.
+
+    ``residual_ao_block_ode`` reuses the SAME absolute_full_h raw LMDB records as
+    the ao_block_ode Full-H arm (schema deeptb.raw_hamiltonian_training_sample/v1,
+    target semantics absolute_full_h, source raw_hamiltonian), but with
+    residual_hamiltonian=True the loader materializes the residual endpoints
+    D1 = raw H - H0 on the fly.  This is a distinct contract from
+    :func:`assert_residual_h_target_contract`, which demands the h0_residual
+    semantics and would therefore reject these absolute_full_h records; the new
+    opt-in gate certifies the absolute-Full-H declaration instead while still
+    forbidding any prepacked/ambiguous target.
+    """
+
+    schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+    if schema != RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        raise ValueError(
+            "residual-from-Full-H supervision requires explicit sample schema "
+            f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r}; got {schema!r}."
+        )
+    semantics = data_dict.get(TARGET_SEMANTICS_KEY)
+    if semantics != ABSOLUTE_FULL_H_SEMANTICS:
+        raise ValueError(
+            "residual-from-Full-H supervision requires hamiltonian_target_semantics="
+            f"{ABSOLUTE_FULL_H_SEMANTICS!r}; got {semantics!r}."
+        )
+    source = data_dict.get(TARGET_SOURCE_KEY)
+    if source != "raw_hamiltonian":
+        raise ValueError(
+            "residual-from-Full-H supervision requires "
+            "hamiltonian_target_source='raw_hamiltonian'; "
+            f"got {source!r}."
+        )
+
+    raw_hamiltonian = data_dict.get("hamiltonian")
+    if not isinstance(raw_hamiltonian, Mapping) or not raw_hamiltonian:
+        raise ValueError(
+            "residual-from-Full-H supervision requires a non-empty raw "
+            "'hamiltonian' block dictionary."
+        )
+    raw_h0 = data_dict.get(h0_key)
+    if not isinstance(raw_h0, Mapping) or not raw_h0:
+        raise ValueError(
+            "residual-from-Full-H supervision requires a non-empty physical-H0 "
+            f"block dictionary at {h0_key!r}."
+        )
+
+    assert_residual_target_source_is_raw(data_dict)
+    prepacked_full_h = [
+        key for key in _PREPACKED_FULL_H_TARGET_KEYS if key in data_dict
+    ]
+    if prepacked_full_h:
+        raise ValueError(
+            "residual-from-Full-H supervision must derive H-H0 from the raw "
+            "Hamiltonian dictionaries; independently prepacked Full-H target "
+            f"fields {prepacked_full_h} are not allowed."
+        )
+
+
 def build_residual_hamiltonian_target_blocks(
     data_dict: Dict[str, Any],
     blocks: Dict[Any, Any],
@@ -781,6 +844,7 @@ class LMDBDataset(AtomicDataset):
     require_full_h_target = False
     require_residual_h_target = False
     require_uureal_block_ode = False
+    require_residual_from_full_h_target = False
     expected_p2_source_fingerprint = None
     expected_physical_h0_source_fingerprint = None
     audit_p2_representations = False
@@ -809,6 +873,7 @@ class LMDBDataset(AtomicDataset):
             require_full_h_target: bool = False,
             require_residual_h_target: bool = False,
             require_uureal_block_ode: bool = False,
+            require_residual_from_full_h_target: bool = False,
             expected_p2_source_fingerprint: Optional[str] = None,
             expected_physical_h0_source_fingerprint: Optional[str] = None,
             audit_p2_representations: bool = False,
@@ -867,6 +932,9 @@ class LMDBDataset(AtomicDataset):
         self.require_full_h_target = bool(require_full_h_target)
         self.require_residual_h_target = bool(require_residual_h_target)
         self.require_uureal_block_ode = bool(require_uureal_block_ode)
+        self.require_residual_from_full_h_target = bool(
+            require_residual_from_full_h_target
+        )
         self.expected_p2_source_fingerprint = (
             str(expected_p2_source_fingerprint)
             if expected_p2_source_fingerprint not in {None, ""}
@@ -908,6 +976,27 @@ class LMDBDataset(AtomicDataset):
             if not is_soc_uureal_mapper(type_mapper):
                 raise ValueError(
                     "require_uureal_block_ode=True requires an explicit SOC uu_real mapper."
+                )
+        if self.require_residual_from_full_h_target:
+            if not self.get_Hamiltonian or not self.get_H0:
+                raise ValueError(
+                    "require_residual_from_full_h_target=True requires "
+                    "get_Hamiltonian=True and get_H0=True."
+                )
+            if not self.residual_hamiltonian:
+                raise ValueError(
+                    "require_residual_from_full_h_target=True requires "
+                    "residual_hamiltonian=True (the loader materializes D1 = H - H0)."
+                )
+            if (
+                self.require_full_h_target
+                or self.require_residual_h_target
+                or self.require_uureal_block_ode
+            ):
+                raise ValueError(
+                    "require_residual_from_full_h_target is mutually exclusive with "
+                    "require_full_h_target, require_residual_h_target, and "
+                    "require_uureal_block_ode."
                 )
         if self.require_p2_blocks and not self.get_P2:
             raise ValueError("require_p2_blocks=True requires get_P2=True.")
@@ -1201,6 +1290,8 @@ class LMDBDataset(AtomicDataset):
             )
         if getattr(self, "require_residual_h_target", False):
             assert_residual_h_target_contract(data_dict, h0_key=self.h0_key)
+        if getattr(self, "require_residual_from_full_h_target", False):
+            assert_residual_from_full_h_target_contract(data_dict, h0_key=self.h0_key)
         if getattr(self, "require_uureal_block_ode", False):
             keep = int(self.type_mapper.reduced_matrix_element)
             required = (
