@@ -546,6 +546,14 @@ class Trainer(BaseTrainer):
     @staticmethod
     def _accumulate_metric_state(metric_sums, state):
         for key, value in state.items():
+            # A None value marks an omitted/invalid metric for this batch (e.g. a
+            # feature-compatible onsite/hopping metric throttled by
+            # log_feature_compatible_interval): it must contribute neither a
+            # numerator nor a denominator, so skip it entirely rather than
+            # coercing it to 0.0.  Existing callers never pass None, so this is a
+            # no-op for them.
+            if value is None:
+                continue
             if torch.is_tensor(value):
                 value = value.detach()
             metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -890,8 +898,42 @@ class Trainer(BaseTrainer):
         # return it: direct callers and scheduler metrics then see the same
         # no-CFM/CFM-comparable scalar that Validationer reports, matching
         # MultiTrainer.validation semantics. The flow objective stays under
-        # validation_flow_* keys.
-        if "validation_loss" in self._last_flow_validation_state:
-            return self._last_flow_validation_state["validation_loss"]
-        return loss
+        # validation_flow_* keys.  When the legacy key is absent (a legal config
+        # such as validation_ode_steps=[3] with the three log_validation_* flags
+        # disabled writes only validation_compatible_euler_{n}_loss), fail closed
+        # to the smallest-n endpoint-compatible loss instead of the accumulated
+        # ``loss`` (which stays 0.0 when no optimization-loss branch ran and would
+        # otherwise be read by schedulers/best-checkpoint as a perfect score).
+        return self._resolve_validation_return(loss)
+
+    def _resolve_validation_return(self, accumulated_loss):
+        """Fail-closed selection of the scalar ``validation()`` returns.
+
+        Preference order (operates on ``self._last_flow_validation_state``, which
+        ``validation()`` has just rebuilt from this run's metric sums):
+
+        1. the legacy ``validation_loss`` key -- byte-identical to the historical
+           behavior whenever the ``num_steps == 1`` endpoint-compatible pass ran;
+        2. otherwise the endpoint-compatible euler loss with the SMALLEST number
+           of ODE steps (``validation_compatible_euler_{n}_loss``);
+        3. otherwise the accumulated ``loss`` (no compatible metric available).
+        """
+        state = getattr(self, "_last_flow_validation_state", None) or {}
+        if "validation_loss" in state:
+            return state["validation_loss"]
+        prefix = "validation_compatible_euler_"
+        suffix = "_loss"
+        best_n = None
+        best_key = None
+        for key in state:
+            if key.startswith(prefix) and key.endswith(suffix):
+                middle = key[len(prefix):-len(suffix)]
+                if middle.isdigit():
+                    n = int(middle)
+                    if best_n is None or n < best_n:
+                        best_n = n
+                        best_key = key
+        if best_key is not None:
+            return state[best_key]
+        return accumulated_loss
 

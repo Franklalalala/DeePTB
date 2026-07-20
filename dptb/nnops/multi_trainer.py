@@ -1999,9 +1999,17 @@ class MultiTrainer(Trainer):
     def _snapshot_loss_metrics(self, loss_obj) -> Dict[str, Any]:
         loss_module = self._resolve_loss_module(loss_obj)
 
+        # onsite/hopping are marked invalid (None) when the criterion reports them
+        # as None -- e.g. a feature-compatible metric throttled by
+        # log_feature_compatible_interval, or log_feature_compatible=false.  A
+        # *missing* attribute still resolves to 0.0 (getattr default), so only a
+        # present-but-None value is treated as invalid; this keeps every non-gated
+        # snapshot (including interval=1, which never gates) byte-identical while
+        # letting the aggregation drop the gated batch from BOTH numerator and
+        # denominator (see _gated_metric_weighted_sum / _make_step_pack).
         out = {
-            "onsite": self._as_scalar_tensor(getattr(loss_module, "last_onsite_loss", 0.0), default=0.0),
-            "hopping": self._as_scalar_tensor(getattr(loss_module, "last_hopping_loss", 0.0), default=0.0),
+            "onsite": self._as_scalar_tensor(getattr(loss_module, "last_onsite_loss", 0.0), default=0.0, allow_none=True),
+            "hopping": self._as_scalar_tensor(getattr(loss_module, "last_hopping_loss", 0.0), default=0.0, allow_none=True),
             "z_loss": self._as_scalar_tensor(getattr(loss_module, "last_z_loss", None), allow_none=True),
             "expert_load_cv": self._as_scalar_tensor(getattr(loss_module, "expert_load_cv", None), allow_none=True),
         }
@@ -2251,6 +2259,28 @@ class MultiTrainer(Trainer):
             out.update(self._snapshot_loss_metrics(criterion))
         return out
 
+    def _gated_metric_weighted_sum(self, value, active_count):
+        """Weighted (numerator, denominator) pair for one onsite/hopping metric.
+
+        ``value`` is the per-batch metric scalar and ``active_count`` its weight
+        (active nodes for onsite, active edges for hopping).  When ``value`` is
+        None the metric was omitted/throttled this batch (see
+        _snapshot_loss_metrics): both returns are 0, so the aggregation adds
+        NEITHER numerator NOR denominator for this metric on this batch.  When
+        present this is byte-identical to the historical ``value * active_count``
+        numerator with an ``active_count`` denominator; ``active_count`` itself
+        (returned separately as ``active_nodes``/``active_edges`` for telemetry)
+        is never gated.
+        """
+        if torch.is_tensor(active_count):
+            active_f = active_count.to(dtype=self.dtype)
+        else:
+            active_f = torch.zeros((), dtype=self.dtype, device=self.device) + float(active_count)
+        if value is None:
+            zero = torch.zeros((), dtype=self.dtype, device=self.device)
+            return zero, zero
+        return self._as_scalar_tensor(value, default=0.0) * active_f, active_f
+
     def _build_train_payload(
         self, batch_dict, batch_info, expert_idx, range_dis,
         ref_batch_dict=None, ref_batch_info=None, criterion=None, flow_prefix="train"
@@ -2272,8 +2302,15 @@ class MultiTrainer(Trainer):
         active_nodes = main["active_nodes"]
         active_edges = main["active_edges"]
 
-        onsite_weighted_sum = main["onsite"] * active_nodes.to(dtype=self.dtype)
-        hopping_weighted_sum = main["hopping"] * active_edges.to(dtype=self.dtype)
+        # onsite_weight/hopping_weight are the gated denominators for the epoch
+        # onsite/hopping averages: they equal active_nodes/active_edges on a valid
+        # batch and 0 on a throttled batch (main["onsite"]/["hopping"] is None).
+        onsite_weighted_sum, onsite_weight = self._gated_metric_weighted_sum(
+            main["onsite"], active_nodes
+        )
+        hopping_weighted_sum, hopping_weight = self._gated_metric_weighted_sum(
+            main["hopping"], active_edges
+        )
 
         onsite_l1_sum = main["last_onsite_l1_sum"]
         onsite_mse_sum = main["last_onsite_mse_sum"]
@@ -2303,8 +2340,19 @@ class MultiTrainer(Trainer):
             total_loss = total_loss + ref_res["loss"]
             active_nodes = active_nodes + ref_res["active_nodes"]
             active_edges = active_edges + ref_res["active_edges"]
-            onsite_weighted_sum = onsite_weighted_sum + ref_res["onsite"] * ref_res["active_nodes"].to(dtype=self.dtype)
-            hopping_weighted_sum = hopping_weighted_sum + ref_res["hopping"] * ref_res["active_edges"].to(dtype=self.dtype)
+            # The reference criterion call advances its own throttle counter, so
+            # its onsite/hopping metric can be gated independently of the main
+            # batch; gate the reference numerator and denominator together.
+            ref_onsite_weighted_sum, ref_onsite_weight = self._gated_metric_weighted_sum(
+                ref_res["onsite"], ref_res["active_nodes"]
+            )
+            ref_hopping_weighted_sum, ref_hopping_weight = self._gated_metric_weighted_sum(
+                ref_res["hopping"], ref_res["active_edges"]
+            )
+            onsite_weighted_sum = onsite_weighted_sum + ref_onsite_weighted_sum
+            hopping_weighted_sum = hopping_weighted_sum + ref_hopping_weighted_sum
+            onsite_weight = onsite_weight + ref_onsite_weight
+            hopping_weight = hopping_weight + ref_hopping_weight
 
             if onsite_l1_sum is not None and ref_res["last_onsite_l1_sum"] is not None:
                 onsite_l1_sum = onsite_l1_sum + ref_res["last_onsite_l1_sum"]
@@ -2331,6 +2379,8 @@ class MultiTrainer(Trainer):
             "expert_hopping": expert_hopping.detach(),
             "onsite_weighted_sum": onsite_weighted_sum.detach(),
             "hopping_weighted_sum": hopping_weighted_sum.detach(),
+            "onsite_weight": onsite_weight.detach(),
+            "hopping_weight": hopping_weight.detach(),
             "active_nodes": active_nodes.detach(),
             "active_edges": active_edges.detach(),
             "onsite_l1_sum": onsite_l1_sum.detach() if torch.is_tensor(onsite_l1_sum) else None,
@@ -2575,8 +2625,14 @@ class MultiTrainer(Trainer):
         vec[self._P_LOSS_OPT_SUM] = self._as_scalar_tensor(payload.get("loss_detached", 0.0))
         vec[self._P_ONSITE_WEIGHTED_SUM] = self._as_scalar_tensor(payload.get("onsite_weighted_sum", 0.0))
         vec[self._P_HOPPING_WEIGHTED_SUM] = self._as_scalar_tensor(payload.get("hopping_weighted_sum", 0.0))
-        vec[self._P_ACTIVE_NODES_SUM] = self._as_scalar_tensor(payload.get("active_nodes", 0.0))
-        vec[self._P_ACTIVE_EDGES_SUM] = self._as_scalar_tensor(payload.get("active_edges", 0.0))
+        # The active-node/edge pack slots are consumed ONLY as the onsite/hopping
+        # loss denominators (onsite = onsite_weighted_sum / active_nodes_sum,
+        # etc.).  Use the gated weight when the payload carries one so a throttled
+        # batch drops out of the denominator too; fall back to the raw
+        # active_nodes/active_edges for payloads that predate the weight (e.g. the
+        # reduce-mode _run_one_expert_loss result), byte-identical to before.
+        vec[self._P_ACTIVE_NODES_SUM] = self._as_scalar_tensor(payload.get("onsite_weight", payload.get("active_nodes", 0.0)))
+        vec[self._P_ACTIVE_EDGES_SUM] = self._as_scalar_tensor(payload.get("hopping_weight", payload.get("active_edges", 0.0)))
 
         vec[self._P_ONSITE_L1_SUM] = self._as_scalar_tensor(payload.get("onsite_l1_sum", 0.0))
         vec[self._P_ONSITE_MSE_SUM] = self._as_scalar_tensor(payload.get("onsite_mse_sum", 0.0))
@@ -3323,8 +3379,12 @@ class MultiTrainer(Trainer):
 
                     global_onsite_sum += self._to_float_scalar(payload["onsite_weighted_sum"])
                     global_hopping_sum += self._to_float_scalar(payload["hopping_weighted_sum"])
-                    total_active_nodes += self._to_int_scalar(payload["active_nodes"])
-                    total_active_edges += self._to_int_scalar(payload["active_edges"])
+                    # Denominators mirror the pack: use the gated onsite/hopping
+                    # weight (== active count on a valid batch, 0 when throttled)
+                    # so global_onsite = global_onsite_sum / total_active_nodes is
+                    # not diluted by throttled batches.
+                    total_active_nodes += self._to_float_scalar(payload.get("onsite_weight", payload.get("active_nodes")))
+                    total_active_edges += self._to_float_scalar(payload.get("hopping_weight", payload.get("active_edges")))
 
                     for z in payload.get("z_values", []):
                         if z is not None:
@@ -3643,16 +3703,28 @@ class MultiTrainer(Trainer):
                 loss = criterion(sampled, batch_for_loss)
             metrics = self._snapshot_loss_metrics(criterion)
 
-        onsite_weighted_sum = metrics["onsite"] * active_nodes.to(dtype=self.dtype)
-        hopping_weighted_sum = metrics["hopping"] * active_edges.to(dtype=self.dtype)
+        # Gate the onsite/hopping denominator the same way as the training path:
+        # a euler payload scored through the plain criterion snapshot can report a
+        # throttled (None) onsite/hopping metric, which must drop out of both the
+        # numerator and the denominator.  The flow-state branch never yields None,
+        # so this stays byte-identical there.
+        onsite_weighted_sum, onsite_weight = self._gated_metric_weighted_sum(
+            metrics["onsite"], active_nodes
+        )
+        hopping_weighted_sum, hopping_weight = self._gated_metric_weighted_sum(
+            metrics["hopping"], active_edges
+        )
+        zero_scalar = torch.zeros((), dtype=self.dtype, device=self.device)
 
         return {
             "loss": loss,
             "loss_detached": loss.detach() if torch.is_tensor(loss) else loss,
-            "expert_onsite": metrics["onsite"].detach(),
-            "expert_hopping": metrics["hopping"].detach(),
+            "expert_onsite": metrics["onsite"].detach() if torch.is_tensor(metrics["onsite"]) else zero_scalar,
+            "expert_hopping": metrics["hopping"].detach() if torch.is_tensor(metrics["hopping"]) else zero_scalar,
             "onsite_weighted_sum": onsite_weighted_sum.detach(),
             "hopping_weighted_sum": hopping_weighted_sum.detach(),
+            "onsite_weight": onsite_weight.detach(),
+            "hopping_weight": hopping_weight.detach(),
             "active_nodes": active_nodes.detach(),
             "active_edges": active_edges.detach(),
             "onsite_l1_sum": metrics["last_onsite_l1_sum"].detach()

@@ -249,3 +249,195 @@ def test_log_feature_compatible_false_skips_feature_path():
         # optimization/block loss is untouched and always present
         assert crit.last_block_loss is not None
         assert crit.last_opt_loss is not None
+
+
+# ===========================================================================
+# FINDING B: the throttle cadence must not dilute the MultiTrainer epoch
+# onsite/hopping metric.
+#
+# _snapshot_loss_metrics used to coerce a throttled (None) last_onsite_loss /
+# last_hopping_loss to 0.0, and _build_train_payload weighted it by the FULL
+# active node/edge count, so a skipped batch added 0 to the numerator but the
+# full count to the denominator -- averaging 2.0,skip toward 1.0.  The fix marks
+# the snapshot entry invalid (None) and gates BOTH the numerator AND the weight
+# (denominator/count) via _gated_metric_weighted_sum, so a skipped batch drops
+# out of the average entirely; the raw active_nodes/active_edges telemetry stays
+# untouched, and interval=1 (which never throttles) stays byte-identical.
+# ===========================================================================
+from dptb.nnops.multi_trainer import MultiTrainer
+
+
+_ACTIVE_NODES = 4.0
+_ACTIVE_EDGES = 6.0
+_TRUE_METRIC = 2.0
+
+
+def _minimal_multitrainer() -> MultiTrainer:
+    mt = MultiTrainer.__new__(MultiTrainer)
+    mt.dtype = torch.float64
+    mt.device = torch.device("cpu")
+    return mt
+
+
+class _StubCriterion:
+    """Bare loss-module stub exposing only the feature-compatible side effects.
+
+    Mirrors HamilBlockwiseNexTHamLoss's snapshot surface: a firing step exposes
+    last_onsite_loss/last_hopping_loss as tensors, a throttled step leaves them
+    None.  It deliberately has NO last_onsite_l1_sum/last_onsite_count so the
+    only onsite/hopping signal flows through the weighted-sum path FINDING B is
+    about (the l1_sum/count stats path is separately guarded already).
+    """
+
+    def __init__(self, onsite, hopping):
+        self.last_onsite_loss = onsite
+        self.last_hopping_loss = hopping
+        self.last_z_loss = None
+        self.expert_load_cv = None
+
+
+def _payload(mt: MultiTrainer, onsite_val, hopping_val):
+    """Drive the real _snapshot_loss_metrics + _build_train_payload seam.
+
+    Only the model-dependent _run_one_expert_loss is stubbed; the snapshot and
+    the weighted-sum/weight aggregation under test run for real.
+    """
+    stub = _StubCriterion(
+        None if onsite_val is None else torch.tensor(onsite_val, dtype=torch.float64),
+        None if hopping_val is None else torch.tensor(hopping_val, dtype=torch.float64),
+    )
+
+    def _fake_run_one_expert_loss(**kwargs):
+        out = {
+            "loss": torch.zeros((), dtype=torch.float64),
+            "active_nodes": torch.tensor(_ACTIVE_NODES, dtype=torch.float64),
+            "active_edges": torch.tensor(_ACTIVE_EDGES, dtype=torch.float64),
+        }
+        out.update(mt._snapshot_loss_metrics(stub))
+        return out
+
+    mt._run_one_expert_loss = _fake_run_one_expert_loss
+    mt.train_lossfunc = stub
+    return mt._build_train_payload(
+        batch_dict=None, batch_info=None, expert_idx=0, range_dis=None
+    )
+
+
+def _aggregate_onsite_hopping(mt: MultiTrainer, payloads):
+    pack = torch.zeros(MultiTrainer._PACK_LEN, dtype=mt.dtype, device=mt.device)
+    for p in payloads:
+        pack = pack + mt._make_step_pack(p)
+    onsite = (
+        pack[MultiTrainer._P_ONSITE_WEIGHTED_SUM]
+        / pack[MultiTrainer._P_ACTIVE_NODES_SUM].clamp_min(1.0)
+    ).item()
+    hopping = (
+        pack[MultiTrainer._P_HOPPING_WEIGHTED_SUM]
+        / pack[MultiTrainer._P_ACTIVE_EDGES_SUM].clamp_min(1.0)
+    ).item()
+    return onsite, hopping, pack
+
+
+# ---------------------------------------------------------------------------
+# (h) The real criterion under interval=2: snapshot fires then marks None.
+# ---------------------------------------------------------------------------
+def test_snapshot_marks_throttled_metrics_none_with_real_criterion():
+    mt = _minimal_multitrainer()
+    crit = _criterion(log_feature_compatible=True, log_feature_compatible_interval=2)
+
+    crit(_data())  # call 1 fires
+    fired = mt._snapshot_loss_metrics(crit)
+    assert fired["onsite"] is not None and torch.isfinite(fired["onsite"])
+    assert fired["hopping"] is not None and torch.isfinite(fired["hopping"])
+    # the snapshot resolved the same module the criterion wrote to
+    assert torch.equal(fired["onsite"], crit.last_onsite_loss)
+    assert torch.equal(fired["hopping"], crit.last_hopping_loss)
+
+    crit(_data())  # call 2 throttled -> attrs None -> snapshot invalid
+    skipped = mt._snapshot_loss_metrics(crit)
+    assert skipped["onsite"] is None
+    assert skipped["hopping"] is None
+
+
+# ---------------------------------------------------------------------------
+# (i) interval=1 and interval=2 both aggregate to exactly the true metric.
+# ---------------------------------------------------------------------------
+def test_aggregation_not_diluted_by_throttled_batch():
+    mt = _minimal_multitrainer()
+
+    # interval=1 analog: both batches fire.
+    onsite1, hopping1, _ = _aggregate_onsite_hopping(
+        mt, [_payload(mt, _TRUE_METRIC, _TRUE_METRIC), _payload(mt, _TRUE_METRIC, _TRUE_METRIC)]
+    )
+    assert onsite1 == pytest.approx(_TRUE_METRIC)
+    assert hopping1 == pytest.approx(_TRUE_METRIC)
+
+    # interval=2 analog: batch 1 fires, batch 2 throttled.
+    p_fire = _payload(mt, _TRUE_METRIC, _TRUE_METRIC)
+    p_skip = _payload(mt, None, None)
+    onsite2, hopping2, pack2 = _aggregate_onsite_hopping(mt, [p_fire, p_skip])
+
+    # Not diluted toward 1.0 -- identical to interval=1; only the update cadence
+    # differs.
+    assert onsite2 == pytest.approx(_TRUE_METRIC)
+    assert hopping2 == pytest.approx(_TRUE_METRIC)
+
+    # The throttled batch contributes ZERO numerator and ZERO weight (count) ...
+    assert p_skip["onsite_weighted_sum"].item() == 0.0
+    assert p_skip["hopping_weighted_sum"].item() == 0.0
+    assert p_skip["onsite_weight"].item() == 0.0
+    assert p_skip["hopping_weight"].item() == 0.0
+    # ... while its raw active_nodes/active_edges telemetry is untouched.
+    assert p_skip["active_nodes"].item() == pytest.approx(_ACTIVE_NODES)
+    assert p_skip["active_edges"].item() == pytest.approx(_ACTIVE_EDGES)
+
+    # A firing batch's gated weight equals the raw active count (byte-identical
+    # seam for the interval=1 / always-firing case).
+    assert p_fire["onsite_weight"].item() == pytest.approx(_ACTIVE_NODES)
+    assert p_fire["hopping_weight"].item() == pytest.approx(_ACTIVE_EDGES)
+
+    # The aggregated pack denominators hold only the firing batch's count.
+    assert pack2[MultiTrainer._P_ACTIVE_NODES_SUM].item() == pytest.approx(_ACTIVE_NODES)
+    assert pack2[MultiTrainer._P_ACTIVE_EDGES_SUM].item() == pytest.approx(_ACTIVE_EDGES)
+    assert pack2[MultiTrainer._P_ONSITE_WEIGHTED_SUM].item() == pytest.approx(
+        _TRUE_METRIC * _ACTIVE_NODES
+    )
+
+
+# ---------------------------------------------------------------------------
+# (j) Explicit dilution contrast: the pre-fix raw-count denominator WOULD halve
+#     the metric; the gated weight denominator does not.
+# ---------------------------------------------------------------------------
+def test_raw_denominator_would_dilute_but_gated_weight_does_not():
+    mt = _minimal_multitrainer()
+    p_fire = _payload(mt, _TRUE_METRIC, _TRUE_METRIC)
+    p_skip = _payload(mt, None, None)
+
+    numerator = p_fire["onsite_weighted_sum"] + p_skip["onsite_weighted_sum"]
+
+    # Pre-fix behavior: numerator gated to 0 for the skip, but the FULL active
+    # count still counted in the denominator (4 + 4 = 8) -> 8/8*... = 1.0.
+    raw_denominator = p_fire["active_nodes"] + p_skip["active_nodes"]
+    assert (numerator / raw_denominator).item() == pytest.approx(_TRUE_METRIC / 2.0)
+
+    # Fixed behavior: the gated weight denominator (4 + 0 = 4) -> the true metric.
+    gated_denominator = p_fire["onsite_weight"] + p_skip["onsite_weight"]
+    assert (numerator / gated_denominator).item() == pytest.approx(_TRUE_METRIC)
+
+
+# ---------------------------------------------------------------------------
+# (k) The real metric-producing aggregation function agrees.
+# ---------------------------------------------------------------------------
+def test_compute_compatible_state_from_pack_reports_true_metric_when_throttled():
+    mt = _minimal_multitrainer()
+    pack = mt._make_step_pack(_payload(mt, _TRUE_METRIC, _TRUE_METRIC)) + mt._make_step_pack(
+        _payload(mt, None, None)
+    )
+
+    state = mt._compute_compatible_state_from_pack(
+        pack, criterion=_StubCriterion(None, None), prefix="train"
+    )
+
+    assert state is not None
+    assert state["train_onsite_loss"].item() == pytest.approx(_TRUE_METRIC)
+    assert state["train_hopping_loss"].item() == pytest.approx(_TRUE_METRIC)
