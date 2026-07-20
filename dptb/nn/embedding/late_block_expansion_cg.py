@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import warnings
 from typing import Optional, Sequence, Union
 
 import torch
@@ -30,6 +31,38 @@ def _shell_l(shell: str) -> int:
     if len(labels) != 1 or labels[0].lower() not in _ANGULAR_L:
         raise ValueError(f"Unsupported AO shell label {shell!r}.")
     return _ANGULAR_L[labels[0].lower()]
+
+
+def _cpu_autocast_enabled() -> bool:
+    """CPU-autocast state, robust across torch versions.
+
+    ``torch.is_autocast_cpu_enabled`` is the historical predicate (deprecated on
+    current torch in favour of the device-agnostic ``is_autocast_enabled('cpu')``
+    and slated for removal); prefer it when present but silence its
+    ``DeprecationWarning`` so this per-forward guard never spams production logs,
+    and fall back to the device-agnostic form -- guarded because very old builds
+    reject the positional device argument with ``TypeError``.
+    """
+    cpu_check = getattr(torch, "is_autocast_cpu_enabled", None)
+    if cpu_check is not None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return bool(cpu_check())
+    try:
+        return bool(torch.is_autocast_enabled("cpu"))
+    except TypeError:
+        return False
+
+
+def _autocast_is_active() -> bool:
+    """True when any autocast context is active.
+
+    ``torch.is_autocast_enabled()`` (no argument) reports the CUDA / new
+    device-agnostic default flag; CPU autocast is a separate flag handled by
+    ``_cpu_autocast_enabled``.  Either being set means the caller is inside a
+    low-precision autocast region.
+    """
+    return bool(torch.is_autocast_enabled()) or _cpu_autocast_enabled()
 
 
 class LateBlockExpansionCGHead(torch.nn.Module):
@@ -272,8 +305,43 @@ class LateBlockExpansionCGHead(torch.nn.Module):
                 f"Expected last dimension {self.irreps_in.dim}, got "
                 f"{features.shape[-1]}."
             )
-        # Default = fused; ``DPTB_LEGACY_CG_HEAD=1`` selects the reference loop.
+        # -------------------------------------------------------------------
+        # Dispatch (design A.7 / A.8).
+        #
+        # ``DPTB_LEGACY_CG_HEAD=1`` is the OUTERMOST manual override and always
+        # selects the reference loop.
+        #
+        # Otherwise the fused path is the default, but ONLY inside its certified
+        # domain: EAGER execution in fp32 or fp64 -- the only dtypes the block-ODE
+        # contract admits and production uses.  ``_forward_fused`` is bit-compatible
+        # with ``_forward_legacy`` up to floating-point *reassociation* there; the
+        # measured drift is pure roundoff (relative, not absolute -- it scales with
+        # the output magnitude).  Outside that domain the fused reassociation is not
+        # a safe substitute, so we transparently fall back to the per-path loop when
+        # ANY of the following holds:
+        #
+        #   * autocast is active -- under bf16/fp16 autocast the fused grouped
+        #     einsums and the single scatter reduce in a DIFFERENT order than the
+        #     legacy per-path loop, and at low precision that reorder is materially
+        #     divergent, not roundoff.  Both the CUDA/device-agnostic and the CPU
+        #     autocast flags are checked (see ``_autocast_is_active``).
+        #   * the input dtype is neither fp32 nor fp64 -- same low-precision
+        #     reduction-order divergence for an explicitly half/bf16 feature tensor,
+        #     with no autocast context in play.
+        #   * deterministic algorithms are enabled -- the fused head's single
+        #     ``index_add`` scatter writes duplicate destination indices (overlapping
+        #     shell-pair blocks), a documented nondeterministic CUDA reduction
+        #     (atomicAdd).  Under ``use_deterministic_algorithms(True)`` we route to
+        #     the per-path loop, which assembles each block by explicit ``cat`` and
+        #     never scatters onto shared cells.
+        # -------------------------------------------------------------------
         if os.environ.get(_LEGACY_CG_HEAD_ENV) == "1":
+            return self._forward_legacy(features)
+        if (
+            _autocast_is_active()
+            or features.dtype not in (torch.float32, torch.float64)
+            or torch.are_deterministic_algorithms_enabled()
+        ):
             return self._forward_legacy(features)
         return self._forward_fused(features)
 

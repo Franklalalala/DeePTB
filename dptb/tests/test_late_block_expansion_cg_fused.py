@@ -10,24 +10,39 @@ the same floating-point sums in a different order than the reference
 The tolerances below CERTIFY reassociation-only drift (measured fp64 <= ~4e-16 fwd /
 ~6e-14 grad, fp32 <= ~2e-7 fwd / ~2e-5 grad; design A.4).  **A failure above these
 tolerances signals a real semantic divergence, not precision** -- do not "relax" a
-tolerance to make such a failure pass.
+tolerance to make such a failure pass.  The fp32 drift is pure fp32 roundoff, which
+is RELATIVE (it scales with the output magnitude), so fp32 parity is certified with
+rtol + a small atol floor -- a flat absolute atol on unit-scale inputs silently
+overclaims and fails under a 1e-2..1e2 scale sweep (design finding a).
 
-Cases (design A.5):
-  1. forward parity fused-vs-legacy: fp64 tight (1e-12) / fp32 loose (1e-5), water
-     AND crystal bases, both symmetrize modes, node & edge invocation shapes;
-  2. gradient parity on the 5 params AND the scalar-condition input, plus a fp64
-     ``gradcheck`` of the fused backward on a small instance;
+Cases (design A.5 / A.8):
+  1. forward parity fused-vs-legacy: fp64 tight-absolute (1e-12) / fp32 relative
+     (rtol 5e-6), water AND crystal bases, both symmetrize modes, node & edge shapes,
+     plus a weights/inputs scale sweep (1e-2/1/1e2) proving the drift stays relative;
+  2. gradient parity on the 5 params AND the scalar-condition input (fp64 absolute /
+     fp32 relative), plus a fp64 ``gradcheck`` of the fused backward on a small instance;
   3. SO(3) Wigner-D equivariance of the FUSED head via an INDEPENDENT dual-path
      oracle (e3nn D matrices), not the legacy loop;
   4. Hermiticity / symmetrize behaviour;
   5. padding / canvas zero-region invariance (untouched blocks stay bit-zero);
   6. state_dict round-trip: exact 5-tensor inventory + old->new strict=True load;
   7. env-var rollback (``DPTB_LEGACY_CG_HEAD=1``) selects the legacy path;
-  8. group-partition invariant + intra-group Wigner bit-identity.
+  8. group-partition invariant + intra-group Wigner bit-identity;
+  9. certified-domain routing guard (design A.8): forward() falls back to the legacy
+     loop under autocast (CPU bf16 / CUDA fp16), non-fp32/64 input dtype, or
+     ``use_deterministic_algorithms(True)`` -- on CPU AND on the local CUDA GPU.
 """
 from __future__ import annotations
 
 import os
+
+# Enable deterministic cuBLAS BEFORE torch initializes its CUDA BLAS handle, so the
+# CUDA determinism-routing test can execute under use_deterministic_algorithms(True)
+# without tripping the cuBLAS nondeterminism guard.  BOTH the fused and the legacy
+# paths use cuBLAS matmuls (condition_down / dynamic_up Linear layers), so this is
+# required merely to *run* the routing assertion -- it is the routing, not cuBLAS,
+# that this file certifies.  ``setdefault`` respects any value already in the env.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import pytest
 import torch
@@ -57,8 +72,18 @@ STATE_DICT_KEYS = {
 }
 
 # Certified reassociation-only tolerances (design A.4, headroom over measured).
-FWD_ATOL = {torch.float64: 1e-12, torch.float32: 1e-5}
+#
+# fp64 is bit-compatible up to ~4e-16 fwd / ~6e-14 grad, so a tight ABSOLUTE bound is
+# meaningful.  fp32 drift is pure fp32 roundoff, which is RELATIVE -- it scales with
+# the output magnitude -- so fp32 parity is certified with rtol + a small atol floor,
+# not a flat atol (finding a; see test_scale_sweep_relative_drift_stays_fp32_roundoff).
+FWD_ATOL = {torch.float64: 1e-12}          # fp64 absolute (reassociation-only)
+FWD_RTOL_FP32 = 5e-6                        # fp32 relative reassociation drift
+FWD_ATOL_FLOOR_FP32 = 1e-6                  # floor for near-zero canvas cells
 GRAD_ATOL_FP64 = 1e-10
+GRAD_RTOL_FP32 = 5e-6
+GRAD_ATOL_FLOOR_FP32 = 1e-6
+SCALE_SWEEP_REL = 1e-5                      # fp32-roundoff ceiling across a 1e-2..1e2 sweep
 EQUIVARIANCE_ATOL = 1e-10
 
 
@@ -102,6 +127,19 @@ def _max_abs(a, b):
     return float((a - b).abs().max())
 
 
+def _max_rel(fused, legacy):
+    """Relative reassociation drift in max-norm: ``max|fused-legacy| / max|legacy|``.
+
+    Normalising by the output scale makes this invariant to a global rescaling of
+    weights/inputs (unlike the flat absolute drift), which is the whole point of the
+    fp32 scale sweep -- the absolute drift grows with magnitude, the relative does not.
+    """
+    ref = float(legacy.abs().max())
+    if ref == 0.0:
+        return _max_abs(fused, legacy)
+    return _max_abs(fused, legacy) / ref
+
+
 # ===========================================================================
 # A.5 #1 -- forward parity fused vs legacy
 # ===========================================================================
@@ -111,8 +149,9 @@ def _max_abs(a, b):
 @pytest.mark.parametrize("batch_shape", [(7,), (2, 3)])
 def test_forward_parity_fused_matches_legacy(basis, dtype, symmetrize, batch_shape):
     """Node (symmetrize=True) AND edge (symmetrize=False) invocation shapes, both
-    bases, fp64 tight / fp32 loose.  ``batch_shape=(2,3)`` also exercises the
-    multi-dim ``*batch`` reshape/scatter path."""
+    bases, fp64 tight-absolute / fp32 relative (rtol + atol floor).
+    ``batch_shape=(2,3)`` also exercises the multi-dim ``*batch`` reshape/scatter
+    path."""
     head = _build_head(basis, symmetrize=symmetrize, dtype=dtype)
     x = torch.randn(*batch_shape, head.irreps_in.dim, dtype=dtype)
 
@@ -120,12 +159,24 @@ def test_forward_parity_fused_matches_legacy(basis, dtype, symmetrize, batch_sha
     fused = head._forward_fused(x)
 
     assert fused.shape == legacy.shape == (*batch_shape, head.max_norb, head.max_norb)
-    drift = _max_abs(legacy, fused)
-    assert drift <= FWD_ATOL[dtype], (
-        f"forward drift {drift:.3e} exceeds the certified reassociation tolerance "
-        f"{FWD_ATOL[dtype]:.0e} ({dtype}, symmetrize={symmetrize}) -- this is a "
-        f"semantic divergence, not roundoff."
-    )
+    if dtype == torch.float64:
+        drift = _max_abs(legacy, fused)
+        assert drift <= FWD_ATOL[dtype], (
+            f"fp64 forward drift {drift:.3e} exceeds the certified reassociation "
+            f"tolerance {FWD_ATOL[dtype]:.0e} (symmetrize={symmetrize}) -- this is a "
+            f"semantic divergence, not roundoff."
+        )
+    else:
+        # fp32: certify the RELATIVE reassociation drift.  A flat atol would overclaim
+        # -- the absolute drift scales with |output| (finding a).
+        assert torch.allclose(
+            fused, legacy, rtol=FWD_RTOL_FP32, atol=FWD_ATOL_FLOOR_FP32
+        ), (
+            f"fp32 forward parity exceeds rtol={FWD_RTOL_FP32:.0e}/"
+            f"atol={FWD_ATOL_FLOOR_FP32:.0e} (abs={_max_abs(legacy, fused):.3e}, "
+            f"rel={_max_rel(fused, legacy):.3e}, symmetrize={symmetrize}) -- semantic "
+            f"divergence, not roundoff."
+        )
 
 
 def test_forward_parity_covers_G_equals_19_invariant():
@@ -139,17 +190,52 @@ def test_forward_parity_covers_G_equals_19_invariant():
     assert len(crystal._paths) == 122
 
 
+def test_scale_sweep_relative_drift_stays_fp32_roundoff():
+    """Finding (a): the fp32 fused-vs-legacy drift is RELATIVE roundoff, not a flat
+    absolute bound.  Rescaling weights AND inputs by 1e-2 / 1 / 1e2 leaves the
+    relative max-norm drift at fp32-roundoff scale at every scale, while the ABSOLUTE
+    drift grows with the output magnitude (so the old flat atol=1e-5 would falsely
+    fail at 1e2).  This is precisely why fp32 parity is certified with rtol, not atol."""
+    base = _build_head(WATER_BASIS, symmetrize=False, dtype=torch.float32, seed=11)
+    torch.manual_seed(11)
+    base_x = torch.randn(6, base.irreps_in.dim, dtype=torch.float32)
+
+    abs_by_scale = {}
+    for scale in (1e-2, 1.0, 1e2):
+        head = _build_head(WATER_BASIS, symmetrize=False, dtype=torch.float32, seed=11)
+        with torch.no_grad():
+            for param in head.parameters():
+                param.mul_(scale)
+        x = base_x * scale
+        legacy = head._forward_legacy(x)
+        fused = head._forward_fused(x)
+        rel = _max_rel(fused, legacy)
+        abs_by_scale[scale] = _max_abs(legacy, fused)
+        assert rel <= SCALE_SWEEP_REL, (
+            f"scale={scale:g}: relative drift {rel:.3e} exceeds the fp32-roundoff "
+            f"ceiling {SCALE_SWEEP_REL:.0e} (abs={abs_by_scale[scale]:.3e})"
+        )
+
+    # The ABSOLUTE drift does grow with scale: at 1e2 it blows past the naive flat
+    # atol=1e-5 the unit-scale tests used, while at 1e-2 it is far below it -- exactly
+    # the overclaim finding (a) flagged.  (Relative stayed tiny at every scale above.)
+    assert abs_by_scale[1e2] > 1e-5 > abs_by_scale[1e-2]
+
+
 # ===========================================================================
 # A.5 #2 -- gradient parity (params + scalar-condition input) + gradcheck
 # ===========================================================================
 @pytest.mark.parametrize("basis", [WATER_BASIS, CRYSTAL_BASIS])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
 @pytest.mark.parametrize("symmetrize", [False, True])
-def test_gradient_parity_params_and_scalar_condition_input(basis, symmetrize):
+def test_gradient_parity_params_and_scalar_condition_input(basis, dtype, symmetrize):
     """Backprop ``out.pow(2).sum()`` through fused vs legacy; compare grads on all
     five learnable tensors AND on the input (the scalar-condition gradient flows
-    ``features -> index_select -> condition_down -> dynamic_up -> mix``)."""
-    head = _build_head(basis, symmetrize=symmetrize, dtype=torch.float64)
-    x = torch.randn(6, head.irreps_in.dim, dtype=torch.float64)
+    ``features -> index_select -> condition_down -> dynamic_up -> mix``).  fp64
+    tight-absolute; fp32 relative (rtol + atol floor), same reasoning as the forward
+    parity."""
+    head = _build_head(basis, symmetrize=symmetrize, dtype=dtype)
+    x = torch.randn(6, head.irreps_in.dim, dtype=dtype)
 
     def grads(fn):
         xg = x.clone().requires_grad_(True)
@@ -161,10 +247,24 @@ def test_gradient_parity_params_and_scalar_condition_input(basis, symmetrize):
     g_fused, gx_fused = grads(head._forward_fused)
 
     assert set(g_legacy) == STATE_DICT_KEYS
-    for name in g_legacy:
-        drift = _max_abs(g_legacy[name], g_fused[name])
-        assert drift <= GRAD_ATOL_FP64, f"grad[{name}] drift {drift:.3e}"
-    assert _max_abs(gx_legacy, gx_fused) <= GRAD_ATOL_FP64  # scalar-condition input
+    if dtype == torch.float64:
+        for name in g_legacy:
+            drift = _max_abs(g_legacy[name], g_fused[name])
+            assert drift <= GRAD_ATOL_FP64, f"grad[{name}] drift {drift:.3e}"
+        assert _max_abs(gx_legacy, gx_fused) <= GRAD_ATOL_FP64  # scalar-condition input
+    else:
+        for name in g_legacy:
+            assert torch.allclose(
+                g_fused[name], g_legacy[name],
+                rtol=GRAD_RTOL_FP32, atol=GRAD_ATOL_FLOOR_FP32,
+            ), (
+                f"fp32 grad[{name}] parity exceeds rtol={GRAD_RTOL_FP32:.0e}/"
+                f"atol={GRAD_ATOL_FLOOR_FP32:.0e} "
+                f"(abs={_max_abs(g_legacy[name], g_fused[name]):.3e})"
+            )
+        assert torch.allclose(  # scalar-condition input
+            gx_fused, gx_legacy, rtol=GRAD_RTOL_FP32, atol=GRAD_ATOL_FLOOR_FP32
+        )
 
 
 def test_fused_backward_gradcheck_small_instance():
@@ -418,3 +518,118 @@ def test_fused_scatter_index_matches_block_flatten_order():
     head = _build_head(CRYSTAL_BASIS, symmetrize=False, dtype=torch.float64)
     expected = sum(grp[4] * grp[5] * grp[6] for grp in head._fused_groups)
     assert head._fused_scatter_index.numel() == expected
+
+
+# ===========================================================================
+# A.8 -- certified-domain routing guard (controller decision)
+#
+# The fused path is the default ONLY in the certified domain: eager fp32/fp64.
+# Outside it -- autocast, non-fp32/64 input dtype, or
+# ``use_deterministic_algorithms(True)`` -- forward() must transparently route to the
+# bit-compatible legacy loop.  Each routing test proves the dispatch via ``torch.equal``
+# to ``_forward_legacy`` in the SAME context: the fused path would differ by
+# reassociation roundoff, so bit-equality can only mean the guard fired (these are
+# routing proofs, NOT numeric-parity claims -- low precision is exactly where fused and
+# legacy are ALLOWED to diverge).
+# ===========================================================================
+def test_cpu_autocast_bf16_routes_to_legacy():
+    """Inside ``torch.autocast('cpu', bfloat16)``, forward() equals _forward_legacy()
+    bit-for-bit (both run the legacy loop under the same autocast)."""
+    head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float32, seed=15)
+    x = torch.randn(4, head.irreps_in.dim, dtype=torch.float32)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        dispatched = head(x)
+        reference = head._forward_legacy(x)
+    assert torch.equal(dispatched, reference)
+
+
+def test_deterministic_mode_routes_to_legacy_cpu():
+    """Under ``use_deterministic_algorithms(True)`` forward() routes to the per-path
+    loop (which has no duplicate-destination scatter) and equals it exactly.
+    try/finally always restores the global flag."""
+    head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float64, seed=14)
+    x = torch.randn(5, head.irreps_in.dim, dtype=torch.float64)
+    torch.use_deterministic_algorithms(True)
+    try:
+        dispatched = head(x)
+        assert torch.equal(dispatched, head._forward_legacy(x))
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+def test_half_input_routes_to_legacy():
+    """``features.half()`` is outside the certified fp32/fp64 domain, so forward()
+    routes to the legacy loop.
+
+    (a) With an fp32-param head, the mixed Half/Float Linear makes the legacy loop
+        raise -- forward() (routed identically) must raise the SAME error, encoding the
+        actual behavior (not a numeric-parity claim).
+    (b) With a genuine float16 head the legacy loop SUCCEEDS, so forward() must route
+        to it and be bit-identical -- a positive proof of the dtype guard (the fused
+        path would differ by roundoff)."""
+    head32 = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float32, seed=13)
+    x = torch.randn(4, head32.irreps_in.dim, dtype=torch.float32)
+    xh = x.half()
+
+    legacy_exc = None
+    try:
+        head32._forward_legacy(xh)
+    except RuntimeError as exc:
+        legacy_exc = exc
+    assert legacy_exc is not None, "expected legacy to raise on Half input vs fp32 params"
+    with pytest.raises(RuntimeError) as forward_exc:
+        head32(xh)
+    # Routed identically into the legacy loop => identical failure surface.
+    assert type(forward_exc.value) is type(legacy_exc)
+    assert str(forward_exc.value) == str(legacy_exc)
+
+    head16 = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float16, seed=13)
+    assert torch.equal(head16(xh), head16._forward_legacy(xh))
+
+
+# ===========================================================================
+# A.8 (CUDA) -- executed on the local GPU; skipped only when CUDA is unavailable.
+# ===========================================================================
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_fp32_forward_parity_fused_vs_legacy():
+    """fp32 fused-vs-legacy parity on CUDA, certified with the same RELATIVE tolerance
+    (rtol + atol floor) as the CPU fp32 case."""
+    head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float32, seed=17).cuda()
+    x = torch.randn(6, head.irreps_in.dim, dtype=torch.float32, device="cuda")
+    legacy = head._forward_legacy(x)
+    fused = head._forward_fused(x)
+    assert torch.allclose(
+        fused, legacy, rtol=FWD_RTOL_FP32, atol=FWD_ATOL_FLOOR_FP32
+    ), (
+        f"cuda fp32 parity exceeds rtol={FWD_RTOL_FP32:.0e}/atol={FWD_ATOL_FLOOR_FP32:.0e} "
+        f"(abs={_max_abs(legacy, fused):.3e}, rel={_max_rel(fused, legacy):.3e})"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_deterministic_mode_routes_to_legacy():
+    """On CUDA under ``use_deterministic_algorithms(True)`` forward() routes to the
+    legacy loop and equals it, with NO exception.  Both paths share cuBLAS matmuls, so
+    CUBLAS_WORKSPACE_CONFIG (set at import) is what lets the assertion run at all; it is
+    the routing -- proven by ``torch.equal`` -- that this certifies (fused would differ
+    by roundoff)."""
+    head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float32, seed=18).cuda()
+    x = torch.randn(5, head.irreps_in.dim, dtype=torch.float32, device="cuda")
+    torch.use_deterministic_algorithms(True)
+    try:
+        dispatched = head(x)
+        assert torch.equal(dispatched, head._forward_legacy(x))
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_autocast_fp16_routes_to_legacy():
+    """Inside ``torch.autocast('cuda', float16)``, forward() equals _forward_legacy()
+    bit-for-bit -- proves routing under the CUDA/device-agnostic autocast flag."""
+    head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float32, seed=19).cuda()
+    x = torch.randn(4, head.irreps_in.dim, dtype=torch.float32, device="cuda")
+    with torch.autocast("cuda", dtype=torch.float16):
+        dispatched = head(x)
+        reference = head._forward_legacy(x)
+    assert torch.equal(dispatched, reference)
