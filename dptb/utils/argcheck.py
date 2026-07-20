@@ -369,6 +369,7 @@ def validate_block_ode_contract(data):
         "uureal_block_ode",
         "spatial_uureal_residual_block_ode",
         "uureal_residual_block_ode",
+        "residual_ao_block_ode",
     }
     if not requested:
         return
@@ -383,7 +384,14 @@ def validate_block_ode_contract(data):
         "spatial_uureal_residual_block_ode",
         "uureal_residual_block_ode",
     }
-    expected_output_space = "uureal_block_ode" if uureal_mode else "ao_block_ode"
+    # Non-SOC direct-residual mode: canonical spelling only (no runtime aliases).
+    residual_spatial_mode = output_space == "residual_ao_block_ode"
+    if uureal_mode:
+        expected_output_space = "uureal_block_ode"
+    elif residual_spatial_mode:
+        expected_output_space = "residual_ao_block_ode"
+    else:
+        expected_output_space = "ao_block_ode"
     if output_space != expected_output_space or not bool(flow.get("block_ode", False)):
         raise ValueError(
             "block_ode is a distinct mode: set block_ode=true and "
@@ -394,6 +402,8 @@ def validate_block_ode_contract(data):
     prior = str(flow.get("prior", "")).lower().replace("-", "_")
     if uureal_mode and prior != "zero":
         raise ValueError("uureal_block_ode requires prior='zero'")
+    if residual_spatial_mode and prior != "zero":
+        raise ValueError("residual_ao_block_ode requires prior='zero'")
     if prior not in {"zero", "projected_te"}:
         raise ValueError(
             "block_ode supports only prior='zero' or explicit prior='projected_te'"
@@ -443,6 +453,8 @@ def validate_block_ode_contract(data):
         raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
     if uureal_mode and semantics != "residual_dh":
         raise ValueError("uureal_block_ode requires target_semantics='residual_dh'")
+    if residual_spatial_mode and semantics != "residual_dh":
+        raise ValueError("residual_ao_block_ode requires target_semantics='residual_dh'")
     if uureal_mode:
         # These three options are declarative contract markers (validated only;
         # runtime behavior is driven solely by output_space=uureal_block_ode).
@@ -479,6 +491,45 @@ def validate_block_ode_contract(data):
             ):
                 raise ValueError(
                     "uureal_block_ode requires t0_probability > 0 (recommended "
+                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass"
+                )
+    if residual_spatial_mode:
+        # Declarative contract markers (validated only; runtime behavior is driven
+        # solely by output_space=residual_ao_block_ode). The non-SOC direct-residual
+        # mode conditions on the physical H0 RME (spatial_h0_rme), distinct from the
+        # uu_real compact_uureal_rme channel.
+        accepted_mode_options = {
+            "state_space": ("residual_ao_block",),
+            "block_input_adapter": ("direct_cg",),
+            "h0_condition_space": ("spatial_h0_rme",),
+        }
+        for option, accepted in accepted_mode_options.items():
+            if str(flow.get(option, "")).lower().replace("-", "_") not in accepted:
+                raise ValueError(
+                    f"residual_ao_block_ode requires flow_options.{option} in {accepted!r}"
+                )
+        # Unlike uureal_block_ode (which keeps H0 out of its hot path and rejects
+        # this flag), the direct-residual mode assembles the final full H = H0 + D
+        # exactly once outside the ODE and therefore REQUIRES the flag.
+        if not bool(flow.get("block_export_final_full_h", False)):
+            raise ValueError(
+                "residual_ao_block_ode assembles final full H exactly once outside "
+                "the ODE; set block_export_final_full_h=true"
+            )
+        # The rollout always starts at exactly t=0, D=0; with D_t = t*D1 the
+        # interior schedule alone never trains that boundary.  An explicitly
+        # configured non-positive t0_probability is therefore a misconfiguration;
+        # omitting it lets the runtime default (0.15) apply.
+        t0_probability = flow.get("t0_probability", None)
+        if t0_probability is not None:
+            if (
+                isinstance(t0_probability, bool)
+                or not isinstance(t0_probability, Number)
+                or not math.isfinite(float(t0_probability))
+                or float(t0_probability) <= 0.0
+            ):
+                raise ValueError(
+                    "residual_ao_block_ode requires t0_probability > 0 (recommended "
                     "0.1-0.25): the t=0, D=0 inference boundary needs training mass"
                 )
     target_fields = {
@@ -583,6 +634,15 @@ def validate_block_ode_contract(data):
             raise ValueError("uureal_block_ode requires common_options.nextham_uureal_mask=true")
         if bool(common.get("full_soc_prediction", False)):
             raise ValueError("uureal_block_ode requires full_soc_prediction=false")
+    elif residual_spatial_mode:
+        if bool(common.get("has_soc", False)):
+            raise ValueError("residual_ao_block_ode requires common_options.has_soc=false")
+        if bool(common.get("nextham_uureal_mask", False)):
+            raise ValueError(
+                "residual_ao_block_ode requires common_options.nextham_uureal_mask=false"
+            )
+        if bool(common.get("full_soc_prediction", False)):
+            raise ValueError("residual_ao_block_ode requires full_soc_prediction=false")
     elif bool(common.get("has_soc", False)):
         raise ValueError("block_ode v1 is non-SOC only; set common_options.has_soc=false")
 
@@ -646,6 +706,11 @@ def validate_block_ode_contract(data):
         raise ValueError(
             "uureal_block_ode and embedding.use_uureal_residual_block_input must be enabled together"
         )
+    if bool(embedding.get("use_spatial_residual_block_input", False)) != residual_spatial_mode:
+        raise ValueError(
+            "residual_ao_block_ode and embedding.use_spatial_residual_block_input "
+            "must be enabled together"
+        )
 
     data_options_value = data.get("data_options", {}) or {}
     if not isinstance(data_options_value.get("train"), dict):
@@ -657,6 +722,14 @@ def validate_block_ode_contract(data):
     }
     expected_residual = semantics == "residual_dh" and not uureal_mode
     expected_full_h_target = semantics == "absolute_full_h"
+    # require_residual_h_target gates the h0_residual-semantics records; the
+    # residual_spatial mode reads absolute_full_h records and instead opts into
+    # require_residual_from_full_h_target. Decouple both from expected_residual,
+    # which still gates residual_hamiltonian for the generic AND residual_spatial
+    # modes (both materialize D1 = H - H0 on the fly). expected_residual_h_target
+    # is identical to expected_residual for every non-spatial mode.
+    expected_residual_h_target = expected_residual and not residual_spatial_mode
+    expected_residual_from_full_h = residual_spatial_mode
     for split, split_options in configured_splits.items():
         path = f"data_options.{split}"
         dataset_type = str(split_options.get("type", "DefaultDataset"))
@@ -690,10 +763,19 @@ def validate_block_ode_contract(data):
         actual_residual_h_target = bool(
             split_options.get("require_residual_h_target", False)
         )
-        if actual_residual_h_target != expected_residual:
+        if actual_residual_h_target != expected_residual_h_target:
             raise ValueError(
                 f"{path}.require_residual_h_target must be "
-                f"{str(expected_residual).lower()} for block_ode "
+                f"{str(expected_residual_h_target).lower()} for block_ode "
+                f"target_semantics={semantics!r}"
+            )
+        actual_residual_from_full_h = bool(
+            split_options.get("require_residual_from_full_h_target", False)
+        )
+        if actual_residual_from_full_h != expected_residual_from_full_h:
+            raise ValueError(
+                f"{path}.require_residual_from_full_h_target must be "
+                f"{str(expected_residual_from_full_h).lower()} for block_ode "
                 f"target_semantics={semantics!r}"
             )
         actual_uureal = bool(split_options.get("require_uureal_block_ode", False))
@@ -1552,6 +1634,7 @@ def train_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -1595,6 +1678,7 @@ def validation_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -1638,6 +1722,7 @@ def reference_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -1680,6 +1765,7 @@ def test_data_sub():
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
         Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
@@ -2095,6 +2181,8 @@ def slem_h0():
                       "surrogate only at inference)."),
         Argument("use_uureal_residual_block_input", bool, optional=True, default=False,
                  doc="Enable the mapper-derived bias-free residual AO-block projector."),
+        Argument("use_spatial_residual_block_input", bool, optional=True, default=False,
+                 doc="Enable the non-SOC direct-residual (spatial) AO-block projector for residual_ao_block_ode."),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),
