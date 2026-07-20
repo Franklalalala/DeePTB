@@ -1,0 +1,80 @@
+# Third-arm STOCHASTIC-BRIDGE overlay for the non-SOC H/O water direct-residual
+# block-state ODE run (B-te arm).  It is byte-for-byte the B arm
+# (h_b0_block_ode_water_residual.yaml) EXCEPT the prior: instead of the exact
+# zero residual prior it uses the projected_te stochastic bridge.  The zero-prior
+# A/B arms (h_b0_block_ode_water.yaml, h_b0_block_ode_water_residual.yaml) stay the
+# FROZEN comparison; this te arm isolates the mitigation for the deterministic
+# bridge shortcut (D_t = t*D1 with zero prior lets a model fit interior times via
+# D_t/t without ever training the endpoint).  Here D_t = project((1-t)*eps + t*D1)
+# with eps drawn in the certified codec image (no H0 added), so the (1-t)*eps term
+# closes that shortcut.  Consumes the SAME raw LMDB records as the A/B arms with no
+# data remake:
+#   hamiltonian_schema: deeptb.raw_hamiltonian_training_sample/v1
+#   hamiltonian_target_semantics: absolute_full_h
+#   hamiltonian_target_source: raw_hamiltonian
+# The loader materializes residual endpoints D1 = raw hamiltonian - hamiltonian_0
+# on the fly (residual_hamiltonian + require_residual_from_full_h_target).
+common_options:
+  basis: {H: 2s1p, O: 3s2p1d}
+  has_soc: false
+  dtype: float32
+  device: cpu
+
+model_options:
+  embedding:
+    method: lem_moe_v3_h0
+    output_route: h_b0
+    use_h0_init: true
+    use_h0_node_init: true
+    use_h0_edge_init: true
+    h0_merge_mode: replace
+    use_flow_time_embedding: true
+    flow_time_condition_edges: true
+    flow_time_key: flow_time
+    flow_time_allow_missing: false
+    require_full_block_edge_coverage: true
+    use_spatial_residual_block_input: true
+  prediction:
+    method: block_native
+    block_decoder: expansion_cg
+    blockwise_hamiltonian: true
+    add_h0: false
+    scale_type: no_scale
+
+train_options:
+  flow_options:
+    enabled: true
+    objective: cfm
+    mode: residual
+    prior: projected_te
+    te_prior_mode: irrep
+    node_sigma: 1.0
+    edge_sigma: 1.0
+    te_prior_sigma: 1.0
+    te_prior_validation_seed: 20260720
+    output_space: residual_ao_block_ode
+    block_ode: true
+    state_space: residual_ao_block
+    block_input_adapter: direct_cg
+    h0_condition_space: spatial_h0_rme
+    block_export_final_full_h: true
+    target_semantics: residual_dh
+    prediction_add_h0: false
+    time_conditioning_required: true
+    strict_h0: true
+    t0_probability: 0.15
+    block_inverse_mode: strict
+    block_inverse_atol: 2.0e-5  # float32; fp64 certification uses 1.0e-10
+    strict_certification: always  # opt-in example after offline audit: first_batch
+    node_block_target_key: node_delta_hamil_blocks
+    edge_block_target_key: edge_delta_hamil_blocks
+    node_block_shape_key: node_delta_hamil_block_shape
+    edge_block_shape_key: edge_delta_hamil_block_shape
+    validation_ode_steps: [1]
+    log_validation_random_t_loss: false
+    log_validation_t0_loss: false
+    log_validation_flow_euler_loss: false
+
+data_options:
+  train: {type: LMDBDataset, get_Hamiltonian: true, get_H0: true, residual_hamiltonian: true, require_full_h_target: false, require_residual_h_target: false, require_residual_from_full_h_target: true}
+  validation: {type: LMDBDataset, get_Hamiltonian: true, get_H0: true, residual_hamiltonian: true, require_full_h_target: false, require_residual_h_target: false, require_residual_from_full_h_target: true}

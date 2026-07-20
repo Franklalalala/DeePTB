@@ -229,6 +229,28 @@ def _b_flow(mapper, *, dtype=torch.float64, **overrides):
     return HamiltonianCFM(options, idp=mapper, dtype=dtype)
 
 
+_TE_SEED = 20260720
+
+
+def _te_options(seed=_TE_SEED):
+    """Full projected_te option set for the residual stochastic-bridge arm."""
+    return {
+        "prior": "projected_te",
+        "te_prior_mode": "irrep",
+        "node_sigma": 1.0,
+        "edge_sigma": 1.0,
+        "te_prior_sigma": 1.0,
+        "te_prior_validation_seed": seed,
+    }
+
+
+def _b_te_flow(mapper, *, dtype=torch.float64, seed=_TE_SEED, **overrides):
+    """Build a projected_te ``residual_ao_block_ode`` flow (B-te arm, v2)."""
+    options = _te_options(seed)
+    options.update(overrides)
+    return _b_flow(mapper, dtype=dtype, **options)
+
+
 # ===========================================================================
 # 1. CG oracles on the new projector
 # ===========================================================================
@@ -1026,7 +1048,10 @@ REJECTIONS = [
         "node_full_hamil_target_blocks",
         "node_block_target_key",
     ),
-    (("train_options", "flow_options", "prior"), "projected_te", "prior"),
+    # NOTE (v2): prior='projected_te' is NO LONGER a rejection for the residual
+    # mode -- it is an accepted stochastic-bridge arm.  Acceptance and the retained
+    # fail-closed (missing te_prior_validation_seed) are asserted by
+    # test_te_arm_yaml_* below and test_flow_ctor_accepts_projected_te_prior_*.
     (
         ("model_options", "embedding", "use_spatial_residual_block_input"),
         False,
@@ -1066,6 +1091,49 @@ def test_b_arm_hyphenated_alias_normalizes_and_validates():
         "residual-ao-block-ode",
     )
     assert validate_block_ode_contract(cfg) is None
+
+
+def _load_te_config():
+    path = Path("configs") / "h_b0_block_ode_water_residual_te.yaml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_te_arm_yaml_passes_validate_block_ode_contract():
+    """6d (v2): the third-arm projected_te config file validates (acceptance)."""
+    assert validate_block_ode_contract(_load_te_config()) is None
+
+
+def test_te_arm_rejects_missing_validation_seed():
+    """6d (v2): dropping te_prior_validation_seed fails closed (retained gate)."""
+    cfg = copy.deepcopy(_load_te_config())
+    del cfg["train_options"]["flow_options"]["te_prior_validation_seed"]
+    with pytest.raises(ValueError, match="te_prior_validation_seed"):
+        validate_block_ode_contract(cfg)
+
+
+def test_te_arm_is_frozen_b_arm_except_prior_block():
+    """6d (v2): the te arm differs from the frozen B arm ONLY in the prior +
+    the projected_te option block; every other field is byte-identical."""
+    b = _load_b_config()
+    te = _load_te_config()
+    te_only_keys = {
+        "prior",
+        "te_prior_mode",
+        "node_sigma",
+        "edge_sigma",
+        "te_prior_sigma",
+        "te_prior_validation_seed",
+    }
+    b_flow = dict(b["train_options"]["flow_options"])
+    te_flow = dict(te["train_options"]["flow_options"])
+    b_flow.pop("prior", None)
+    for key in te_only_keys:
+        te_flow.pop(key, None)
+    assert b_flow == te_flow
+    # everything outside flow_options is untouched.
+    assert b["common_options"] == te["common_options"]
+    assert b["model_options"] == te["model_options"]
+    assert b["data_options"] == te["data_options"]
 
 
 # ===========================================================================
@@ -1246,10 +1314,28 @@ def test_flow_ctor_rejects_absolute_full_h_semantics():
         _b_flow(_mapper(), target_semantics="absolute_full_h")
 
 
-def test_flow_ctor_rejects_projected_te_prior():
-    """8: residual_ao_block_ode v1 requires the exact zero prior."""
-    with pytest.raises(ValueError, match="prior"):
-        _b_flow(_mapper(), prior="projected_te")
+def test_flow_ctor_accepts_projected_te_prior_with_full_te_options():
+    """8 (v2 lift): residual_ao_block_ode accepts prior='projected_te' with the
+    full shared te options, and still fails closed when te_prior_validation_seed
+    is missing (the mandatory-seed gate is retained, not the whole-prior ban)."""
+    flow = _b_te_flow(_mapper())
+    assert flow.prior == "projected_te"
+    assert flow.residual_ao_block_ode is True
+    assert flow.te_prior_mode == "irrep"
+    assert flow.te_prior_validation_seed == _TE_SEED
+    # fail-closed: projected_te without an explicit validation seed is rejected.
+    with pytest.raises(ValueError, match="te_prior_validation_seed"):
+        _b_flow(
+            _mapper(),
+            prior="projected_te",
+            te_prior_mode="irrep",
+            node_sigma=1.0,
+            edge_sigma=1.0,
+            te_prior_sigma=1.0,
+        )
+    # a generic (non-projected) TE prior is still rejected for the mode.
+    with pytest.raises(ValueError, match="projected_te"):
+        _b_flow(_mapper(), prior="gaussian")
 
 
 def test_flow_ctor_requires_block_export_final_full_h():
@@ -1263,3 +1349,232 @@ def test_flow_ctor_constructs_block_codec_for_residual_mode():
     flow = _b_flow(_mapper())
     assert flow.block_codec is not None
     assert flow.residual_ao_block_ode is True
+
+
+# ===========================================================================
+# 9. projected_te stochastic bridge (v2 lift)
+# ===========================================================================
+def test_residual_te_eps_is_reproducible_and_certifies_in_codec_image():
+    """9c: the internal eps draw is seed-deterministic and certifies in-image.
+
+    Two draws with the same seed are bit-identical (reproducibility), the epsilon
+    is non-trivial, and (certification due) it repacks within block_inverse_atol --
+    i.e. it lies in the certified codec image.  An out-of-image epsilon is
+    impossible by construction (eps = project(rme_to_blocks(noise, project=False))
+    is the linear forward image of an RME vector), so that branch is not mockable
+    here; the in-image assertion is the meaningful check.
+    """
+    mapper = _mapper()
+    data, h0, _d1 = _b_record(mapper)
+    flow = _b_te_flow(mapper)
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+
+    eps1 = flow._residual_te_eps(
+        copy.deepcopy(data),
+        node_base,
+        edge_base,
+        generator=flow._seeded_generator(node_base.device, _TE_SEED),
+        certify_image=True,  # certification is due and must NOT raise
+    )
+    eps2 = flow._residual_te_eps(
+        copy.deepcopy(data),
+        node_base,
+        edge_base,
+        generator=flow._seeded_generator(node_base.device, _TE_SEED),
+        certify_image=True,
+    )
+    assert torch.equal(eps1.node_blocks, eps2.node_blocks)
+    assert torch.equal(eps1.edge_blocks, eps2.edge_blocks)
+    assert torch.count_nonzero(eps1.node_blocks) > 0
+    assert torch.count_nonzero(eps1.edge_blocks) > 0
+
+    # explicit in-image certification: repack roundtrip residual <= atol.
+    node_rme, edge_rme = flow.block_codec.blocks_to_rme(copy.deepcopy(data), eps1)
+    roundtrip = flow.block_codec.rme_to_blocks(
+        copy.deepcopy(data), node_rme, edge_rme, project=True
+    )
+    residual = max(
+        (roundtrip.node_blocks - eps1.node_blocks).abs().max().item(),
+        (roundtrip.edge_blocks - eps1.edge_blocks).abs().max().item(),
+    )
+    assert residual <= flow.block_inverse_atol
+
+
+def test_prepare_batch_projected_te_bridge_identity():
+    """9a: D_t = project((1 - t) * eps + t * D1) with eps reproduced via the
+    flow's own seeded draw path; ctx.node_prior carries the same eps."""
+    mapper = _mapper()
+    data, h0, d1 = _b_record(mapper)
+    flow = _b_te_flow(mapper)
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+
+    # Reproduce eps with the same seed (proven bit-reproducible above).
+    eps = flow._residual_te_eps(
+        copy.deepcopy(data),
+        node_base,
+        edge_base,
+        generator=flow._seeded_generator(node_base.device, _TE_SEED),
+        certify_image=True,
+    )
+
+    t = torch.tensor([0.25], dtype=torch.float64)
+    model_data, _ref, ctx = flow.prepare_batch(
+        copy.deepcopy(data), copy.deepcopy(data), t=t, prior_seed=_TE_SEED
+    )
+
+    # D1 (the delta endpoint) is packer-image, so endpoint == d1 exactly.
+    expected = project_block_state(
+        copy.deepcopy(data),
+        mapper,
+        BlockTensorResult(
+            0.75 * eps.node_blocks + 0.25 * d1.node_blocks,
+            0.75 * eps.edge_blocks + 0.25 * d1.edge_blocks,
+            d1.node_shapes,
+            d1.edge_shapes,
+        ),
+    )
+    torch.testing.assert_close(
+        model_data[_keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY],
+        expected.node_blocks,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        model_data[_keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY],
+        expected.edge_blocks,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    # ctx exposes the drawn epsilon (telemetry) instead of zeros_like.
+    torch.testing.assert_close(ctx.node_prior, eps.node_blocks, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(ctx.edge_prior, eps.edge_blocks, rtol=0.0, atol=1e-12)
+    assert ctx.block_target_semantics == "residual_dh"
+    # the physical H0 RME channel is unchanged by the prior choice.
+    torch.testing.assert_close(
+        torch.as_tensor(model_data[flow.node_h0_key]), node_base, rtol=0.0, atol=1e-10
+    )
+
+
+def test_prepare_batch_projected_te_bridge_is_not_the_t_shortcut():
+    """9a: with a non-zero eps the attached D_t at t=0.25 is NOT 0.25 * D1 (the
+    deterministic bridge shortcut the zero prior leaves open)."""
+    mapper = _mapper()
+    data, _h0, d1 = _b_record(mapper)
+    flow = _b_te_flow(mapper)
+    model_data, _ref, _ctx = flow.prepare_batch(
+        copy.deepcopy(data),
+        copy.deepcopy(data),
+        t=torch.tensor([0.25], dtype=torch.float64),
+        prior_seed=_TE_SEED,
+    )
+    shortcut = 0.25 * d1.node_blocks
+    assert not torch.allclose(
+        model_data[_keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY], shortcut, atol=1e-6
+    )
+
+
+def test_sampler_projected_te_seed_determinism():
+    """9b: same prior_seed => identical D0/output; a different seed => different
+    (nonzero) D0.  With num_steps=1 the endpoint-blend collapses the final state
+    onto D1 regardless of D0, so seed-sensitivity is asserted on the injected D0."""
+    mapper = _mapper()
+    data, _h0, d1 = _b_record(mapper)
+    flow = _b_te_flow(mapper)
+
+    def _run(seed):
+        spy = _EndpointSpy(
+            [(d1.node_blocks.clone(), d1.edge_blocks.clone())],
+            flow.node_h0_key,
+            flow.edge_h0_key,
+        )
+        result = flow.sample(spy, copy.deepcopy(data), num_steps=1, prior_seed=seed)
+        return spy, result
+
+    spy_a, res_a = _run(_TE_SEED)
+    spy_b, res_b = _run(_TE_SEED)
+    spy_c, _res_c = _run(_TE_SEED + 1)
+
+    # same seed => bit-identical injected D0 and bit-identical assembled output.
+    assert torch.equal(spy_a.spatial_inputs[0][0], spy_b.spatial_inputs[0][0])
+    assert torch.equal(spy_a.spatial_inputs[0][1], spy_b.spatial_inputs[0][1])
+    assert torch.equal(
+        res_a[_keys.NODE_PRED_HAMIL_BLOCKS_KEY], res_b[_keys.NODE_PRED_HAMIL_BLOCKS_KEY]
+    )
+    # D0 is the injected epsilon (nonzero), NOT the zero-prior boundary.
+    assert torch.count_nonzero(spy_a.spatial_inputs[0][0]) > 0
+    # different seed => different injected D0.
+    assert not torch.equal(spy_a.spatial_inputs[0][0], spy_c.spatial_inputs[0][0])
+
+
+def test_sampler_zero_prior_byte_identical_and_rejects_prior_seed():
+    """9b: the zero-prior sampler is byte-unchanged (D0 == 0) and a prior_seed is
+    rejected -- the exact-zero symmetry mirrors _block_initial_state."""
+    mapper = _mapper()
+    data, _h0, d1 = _b_record(mapper)
+    flow = _b_flow(mapper)  # prior='zero'
+
+    spy = _EndpointSpy(
+        [(d1.node_blocks.clone(), d1.edge_blocks.clone())],
+        flow.node_h0_key,
+        flow.edge_h0_key,
+    )
+    flow.sample(spy, copy.deepcopy(data), num_steps=1)
+    assert torch.count_nonzero(spy.spatial_inputs[0][0]) == 0
+    assert torch.count_nonzero(spy.spatial_inputs[0][1]) == 0
+
+    with pytest.raises(ValueError, match="prior_seed"):
+        flow.sample(
+            _EndpointSpy(
+                [(d1.node_blocks.clone(), d1.edge_blocks.clone())],
+                flow.node_h0_key,
+                flow.edge_h0_key,
+            ),
+            copy.deepcopy(data),
+            num_steps=1,
+            prior_seed=7,
+        )
+
+
+@pytest.mark.parametrize("steps", [1, 2, 3])
+def test_sampler_te_h0_constant_and_exactly_once_assembly(steps):
+    """9e: under projected_te the H0-constancy and exactly-once assembly locks
+    still hold -- the h0 keys stay the physical H0 RME across the rollout, the
+    injected D0 is the nonzero epsilon, and the final blocks equal H0 + D1 once
+    (the last blend alpha == 1 collapses the accumulated state onto D1)."""
+    mapper = _mapper()
+    data, h0, d1 = _b_record(mapper)
+    flow = _b_te_flow(mapper)
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+
+    endpoints = [(d1.node_blocks.clone(), d1.edge_blocks.clone()) for _ in range(steps)]
+    spy = _EndpointSpy(endpoints, flow.node_h0_key, flow.edge_h0_key)
+    result = flow.sample(spy, copy.deepcopy(data), num_steps=steps, prior_seed=_TE_SEED)
+
+    # projected_te injects a NONZERO D0 (contrast with the zero-prior spy test).
+    assert torch.count_nonzero(spy.spatial_inputs[0][0]) > 0
+
+    # H0-constancy across the rollout (contract-2 rollout lock), prior-independent.
+    for step in range(steps):
+        torch.testing.assert_close(spy.h0_inputs[step][0], node_base, rtol=0.0, atol=1e-12)
+        torch.testing.assert_close(spy.h0_inputs[step][1], edge_base, rtol=0.0, atol=1e-12)
+    assert spy.times[0].reshape(-1)[0].item() == 0.0
+
+    # exactly-once assembly: predicted full-H blocks == H0 + D1 (D_blend == D1).
+    torch.testing.assert_close(
+        result[_keys.NODE_PRED_HAMIL_BLOCKS_KEY],
+        h0.node_blocks + d1.node_blocks,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        result[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY],
+        h0.edge_blocks + d1.edge_blocks,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(result[flow.node_h0_key]), node_base, rtol=0.0, atol=1e-10
+    )
+    assert torch.allclose(
+        result[flow.flow_time_key], torch.ones_like(result[flow.flow_time_key])
+    )

@@ -402,8 +402,10 @@ def validate_block_ode_contract(data):
     prior = str(flow.get("prior", "")).lower().replace("-", "_")
     if uureal_mode and prior != "zero":
         raise ValueError("uureal_block_ode requires prior='zero'")
-    if residual_spatial_mode and prior != "zero":
-        raise ValueError("residual_ao_block_ode requires prior='zero'")
+    if residual_spatial_mode and prior not in {"zero", "projected_te"}:
+        raise ValueError(
+            "residual_ao_block_ode requires prior in {'zero', 'projected_te'}"
+        )
     if prior not in {"zero", "projected_te"}:
         raise ValueError(
             "block_ode supports only prior='zero' or explicit prior='projected_te'"

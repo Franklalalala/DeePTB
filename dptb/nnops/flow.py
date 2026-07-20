@@ -306,8 +306,12 @@ class HamiltonianCFM:
                 )
             if self.uureal_block_ode and self.prior != "zero":
                 raise ValueError("uureal_block_ode requires the exact zero residual prior.")
-            if self.residual_ao_block_ode and self.prior != "zero":
-                raise ValueError("residual_ao_block_ode requires the exact zero residual prior.")
+            # residual_ao_block_ode v2: the direct-residual mode accepts BOTH the
+            # exact zero residual prior AND the projected_te stochastic bridge
+            # (epsilon drawn in the certified codec image, no H0 added).  A
+            # projected_te selection then flows into the shared projected_te option
+            # validation below (te_prior_mode='irrep', finite positive sigmas,
+            # mandatory te_prior_validation_seed).  uureal stays zero-only above.
             if not self.uureal_block_ode and self.prior not in {"zero", *self._projected_te_prior_names}:
                 raise ValueError(
                     "Block-space ODE supports only prior='zero' or the explicit "
@@ -2440,6 +2444,85 @@ class HamiltonianCFM:
         generator = self._seeded_generator(h0_blocks.node_blocks.device, prior_seed)
         return draw(generator)
 
+    def _residual_te_eps(
+        self,
+        data: AtomicDataDict.Type,
+        node_like: torch.Tensor,
+        edge_like: torch.Tensor,
+        *,
+        generator: Optional[torch.Generator],
+        certify_image: bool,
+    ) -> BlockTensorResult:
+        """Draw the projected_te residual epsilon in block space; NO H0 added.
+
+        Mirrors the TE-noise draw of :meth:`_block_initial_state` exactly (same
+        node/edge sigma semantics and the same seeded-generator path) but forms
+        the PURE noise residual ``eps = project(rme_to_blocks(noise, project=False))``
+        instead of A's ``H0 + noise`` start state: the direct-residual mode tracks
+        ``D = H - H0``, so the t=0 boundary of D is the prior noise alone.
+
+        ``eps`` is in the certified codec image by construction (the forward CG map
+        is linear, ``rme_to_blocks(project=False)`` lands on that image, and
+        :func:`project_block_state` is an image-preserving projection).  When
+        certification is due the epsilon is certified the same way A certifies its
+        noisy start -- a repack roundtrip residual bounded by ``block_inverse_atol``.
+        """
+        assert self.block_codec is not None
+        prior_data = {
+            key: data[key]
+            for key in (
+                AtomicDataDict.ATOM_TYPE_KEY,
+                AtomicDataDict.EDGE_TYPE_KEY,
+                _keys.BATCH_KEY,
+                _keys.EDGE_INDEX_KEY,
+            )
+            if key in data
+        }
+        num_graphs = self._num_graphs(prior_data)
+        node_noise = self._te_prior_like(
+            torch.zeros_like(node_like),
+            self.node_sigma,
+            data=prior_data,
+            label="node",
+            reference_scale=False,
+            num_graphs=num_graphs,
+            generator=generator,
+        )
+        edge_noise = self._te_prior_like(
+            torch.zeros_like(edge_like),
+            self.edge_sigma,
+            data=prior_data,
+            label="edge",
+            reference_scale=False,
+            num_graphs=num_graphs,
+            generator=generator,
+        )
+        noise_blocks = self.block_codec.rme_to_blocks(
+            data, node_noise, edge_noise, project=False
+        )
+        eps = project_block_state(data, self.idp, noise_blocks)
+        if certify_image:
+            node_eps, edge_eps = self.block_codec.blocks_to_rme(
+                data,
+                eps,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            roundtrip = self.block_codec.rme_to_blocks(
+                data, node_eps, edge_eps, project=True
+            )
+            residual = max(
+                self._max_abs(roundtrip.node_blocks - eps.node_blocks),
+                self._max_abs(roundtrip.edge_blocks - eps.edge_blocks),
+            )
+            if residual > self.block_inverse_atol:
+                raise ValueError(
+                    "Projected TE residual epsilon is outside the certified codec "
+                    f"image: max residual={residual:.6g}, "
+                    f"atol={self.block_inverse_atol:.6g}."
+                )
+        return eps
+
     def _strict_image_certification_due(self) -> bool:
         """Schedule only the pure repack/residual image-space self-check."""
 
@@ -2637,19 +2720,51 @@ class HamiltonianCFM:
             data[self.edge_h0_key] = edge_base
             node_alpha = node_t.reshape((-1,) + (1,) * (endpoint.node_blocks.ndim - 1))
             edge_alpha = edge_t.reshape((-1,) + (1,) * (endpoint.edge_blocks.ndim - 1))
-            # Zero prior: D_t = t * D1 exactly (no (1 - t) * prior term).  Legacy
-            # feature-key overwrites are intentionally skipped for B: the H0 keys
-            # already expose the physical conditioning channel honestly.
-            D_t = project_block_state(
-                data,
-                self.idp,
-                BlockTensorResult(
-                    node_alpha * endpoint.node_blocks,
-                    edge_alpha * endpoint.edge_blocks,
-                    endpoint.node_shapes,
-                    endpoint.edge_shapes,
-                ),
-            )
+            if self.prior == "zero":
+                # Zero prior: D_t = t * D1 exactly (no (1 - t) * prior term).  Legacy
+                # feature-key overwrites are intentionally skipped for B: the H0 keys
+                # already expose the physical conditioning channel honestly.
+                D_t = project_block_state(
+                    data,
+                    self.idp,
+                    BlockTensorResult(
+                        node_alpha * endpoint.node_blocks,
+                        edge_alpha * endpoint.edge_blocks,
+                        endpoint.node_shapes,
+                        endpoint.edge_shapes,
+                    ),
+                )
+                node_prior_blocks = None
+                edge_prior_blocks = None
+            else:
+                # projected_te stochastic bridge (v2): draw eps in the certified
+                # codec image (NO H0 added), exactly as A draws its TE noise, then
+                # D_t = project((1 - t) * eps + t * D1).  The (1 - t) * eps term
+                # kills the deterministic D_t = t * D1 shortcut the zero prior
+                # leaves open.  prior_seed threads the same seeded-generator path A
+                # uses (None during training => fresh noise; seeded during
+                # deterministic validation).
+                eps = self._residual_te_eps(
+                    data,
+                    node_base,
+                    edge_base,
+                    generator=self._seeded_generator(device, prior_seed),
+                    certify_image=certify_image,
+                )
+                D_t = project_block_state(
+                    data,
+                    self.idp,
+                    BlockTensorResult(
+                        (1.0 - node_alpha) * eps.node_blocks
+                        + node_alpha * endpoint.node_blocks,
+                        (1.0 - edge_alpha) * eps.edge_blocks
+                        + edge_alpha * endpoint.edge_blocks,
+                        endpoint.node_shapes,
+                        endpoint.edge_shapes,
+                    ),
+                )
+                node_prior_blocks = eps.node_blocks
+                edge_prior_blocks = eps.edge_blocks
             if self.detach_interpolated_h0:
                 D_t = BlockTensorResult(
                     D_t.node_blocks.detach(),
@@ -2678,8 +2793,20 @@ class HamiltonianCFM:
                 edge_target=None,
                 node_current=D_t.node_blocks,
                 edge_current=D_t.edge_blocks,
-                node_prior=torch.zeros_like(D_t.node_blocks),
-                edge_prior=torch.zeros_like(D_t.edge_blocks),
+                # Zero prior keeps the exact zeros_like telemetry; projected_te
+                # exposes the drawn epsilon.  CFMContext.node_prior has no runtime
+                # consumer for this mode (the block-ODE loss reads node_current /
+                # node_target only), so this is telemetry-only either way.
+                node_prior=(
+                    torch.zeros_like(D_t.node_blocks)
+                    if node_prior_blocks is None
+                    else node_prior_blocks
+                ),
+                edge_prior=(
+                    torch.zeros_like(D_t.edge_blocks)
+                    if edge_prior_blocks is None
+                    else edge_prior_blocks
+                ),
                 block_target_semantics="residual_dh",
             )
 
@@ -3728,6 +3855,7 @@ class HamiltonianCFM:
         *,
         num_steps: int,
         num_graphs: int,
+        prior_seed: Optional[int] = None,
     ) -> AtomicDataDict.Type:
         """Roll out the non-SOC residual state D, then assemble H = H0 + D once."""
         if self.block_codec is None:
@@ -3751,12 +3879,32 @@ class HamiltonianCFM:
         node_base, edge_base = self.block_codec.blocks_to_rme(
             state, h0_blocks, certify_image=True
         )
-        current = BlockTensorResult(
-            torch.zeros_like(h0_blocks.node_blocks),
-            torch.zeros_like(h0_blocks.edge_blocks),
-            h0_blocks.node_shapes,
-            h0_blocks.edge_shapes,
-        )
+        if self.prior == "zero":
+            # Zero prior: D0 = 0 exactly (byte-identical to v1).  A prior_seed is
+            # meaningless here and rejected, mirroring _block_initial_state's
+            # zero-prior symmetry.
+            if prior_seed is not None:
+                raise ValueError(
+                    "residual_ao_block_ode with prior='zero' uses an exact zero "
+                    "prior and rejects prior_seed."
+                )
+            current = BlockTensorResult(
+                torch.zeros_like(h0_blocks.node_blocks),
+                torch.zeros_like(h0_blocks.edge_blocks),
+                h0_blocks.node_shapes,
+                h0_blocks.edge_shapes,
+            )
+        else:
+            # projected_te: D0 = eps, drawn deterministically for a given seed and
+            # certified in the codec image, matching the training boundary state
+            # D_0 = project(eps) exactly.
+            current = self._residual_te_eps(
+                state,
+                node_base,
+                edge_base,
+                generator=self._seeded_generator(node_base.device, prior_seed),
+                certify_image=True,
+            )
         self._drop_block_authority_fields(state)
         state[self.node_h0_key] = node_base
         state[self.edge_h0_key] = edge_base
@@ -3869,10 +4017,15 @@ class HamiltonianCFM:
                 model, state, num_steps=num_steps, num_graphs=num_graphs
             )
         if self.residual_ao_block_ode:
-            if prior_seed is not None:
-                raise ValueError("residual_ao_block_ode uses an exact zero prior and rejects prior_seed.")
+            # v2: prior='zero' rejects prior_seed inside the sampler (mirroring
+            # _block_initial_state); prior='projected_te' consumes it as the
+            # deterministic D0 = eps seed.  Pass it through either way.
             return self._sample_residual_ao_block_ode(
-                model, state, num_steps=num_steps, num_graphs=num_graphs
+                model,
+                state,
+                num_steps=num_steps,
+                num_graphs=num_graphs,
+                prior_seed=prior_seed,
             )
         if self.block_ode:
             return self._sample_block_ode(
