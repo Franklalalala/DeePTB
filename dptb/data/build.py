@@ -286,6 +286,8 @@ class DatasetBuilder:
                 get_H0=kwargs.get("get_H0", False),
                 get_P2=kwargs.get("get_P2", False),
                 residual_hamiltonian=kwargs.get("residual_hamiltonian", False),
+                residual_shrink_policy=kwargs.get("residual_shrink_policy", "error"),
+                min_residual_shrink=kwargs.get("min_residual_shrink", 1.2),
                 get_overlap=get_overlap,
                 get_DM=get_DM,
                 get_eigenvalues=get_eigenvalues,

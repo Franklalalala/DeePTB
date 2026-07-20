@@ -170,6 +170,13 @@ EDGE_TYPE_KEY: Final[str] = "edge_type"
 NODE_SOC_KEY: Final[str] = "node_soc"
 NODE_SOC_SWITCH_KEY: Final[str] = "node_soc_switch"
 
+# Stable per-graph dataset record identity. A single int64 scalar per graph that
+# packs (shard_id << 32) | row_id, where row_id is the LMDB record key within its
+# shard and shard_id is the shard's stable ordinal in the dataset. It is
+# registered as a graph-level long field so it survives batching/collation as one
+# value per graph. See ``LMDBDataset._compute_sample_uid`` for the packing.
+SAMPLE_UID_KEY: Final[str] = "sample_uid"
+
 PER_ATOM_ENERGY_KEY: Final[str] = "atomic_energy"
 TOTAL_ENERGY_KEY: Final[str] = "total_energy"
 FORCE_KEY: Final[str] = "forces"

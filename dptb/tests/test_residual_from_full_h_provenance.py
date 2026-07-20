@@ -222,3 +222,155 @@ def test_contract_fn_direct_call_rejects_each_marker_minimal_dict(marker, value)
     minimal marker-only dict is rejected by name (converter products fail fast)."""
     with pytest.raises(ValueError, match=marker):
         assert_residual_from_full_h_target_contract({marker: value})
+
+
+# ===========================================================================
+# H7: residual_shrink_policy H0-quality gate (P3).  The frozen source/shape
+# contracts always apply; the magnitude-shrink heuristic is now a configurable
+# policy (error / warn / off) with a tunable min_residual_shrink ratio.
+# ===========================================================================
+import logging
+
+from dptb.data.dataset.lmdb_dataset import build_residual_hamiltonian_target_blocks
+
+
+def _shrink_inputs(h, h0):
+    """A raw (data_dict, blocks) pair with one on-site block: H over H0."""
+    data_dict = {"hamiltonian_0": {"0_0_0_0_0": np.asarray([[h0]], dtype=np.float32)}}
+    blocks = {"0_0_0_0_0": np.asarray([[h]], dtype=np.float32)}
+    return data_dict, blocks
+
+
+def test_h7_shrink_policy_error_raises_on_non_shrinking_record():
+    """error (default): a legit-but-non-shrinking record (H=1, H0=0 -> D=1) fails
+    closed, and the message names the H0-quality policy gate."""
+    data_dict, blocks = _shrink_inputs(1.0, 0.0)
+    with pytest.raises(RuntimeError) as excinfo:
+        build_residual_hamiltonian_target_blocks(data_dict, blocks, shrink_policy="error")
+    message = str(excinfo.value)
+    assert "H0-quality" in message
+    assert "residual_shrink_policy" in message
+
+
+def test_h7_shrink_policy_warn_loads_and_logs_and_keeps_delta(caplog):
+    """warn: the same non-shrinking record LOADS (delta == H - H0 == 1) and logs the
+    diagnostic instead of raising."""
+    data_dict, blocks = _shrink_inputs(1.0, 0.0)
+    with caplog.at_level(logging.WARNING, logger="dptb.data.dataset.lmdb_dataset"):
+        delta = build_residual_hamiltonian_target_blocks(data_dict, blocks, shrink_policy="warn")
+    assert float(delta["0_0_0_0_0"][0, 0]) == pytest.approx(1.0)
+    assert any(
+        "residual_shrink_policy" in rec.getMessage() and rec.levelno == logging.WARNING
+        for rec in caplog.records
+    )
+
+
+def test_h7_shrink_policy_off_loads_silently(caplog):
+    """off: the heuristic is skipped entirely -- loads with no warning."""
+    data_dict, blocks = _shrink_inputs(1.0, 0.0)
+    with caplog.at_level(logging.WARNING, logger="dptb.data.dataset.lmdb_dataset"):
+        delta = build_residual_hamiltonian_target_blocks(data_dict, blocks, shrink_policy="off")
+    assert float(delta["0_0_0_0_0"][0, 0]) == pytest.approx(1.0)
+    assert not any("residual_shrink_policy" in rec.getMessage() for rec in caplog.records)
+
+
+def test_h7_min_residual_shrink_ratio_is_honored():
+    """min_residual_shrink tunes the required ratio: a 1.3x-shrinking record
+    (H=1.3, H0=0.3 -> D=1.0) passes at 1.2 but fails at 2.0."""
+    data_dict, blocks = _shrink_inputs(1.3, 0.3)
+    # passes at the default-ish 1.2 ratio (1.0 * 1.2 < 1.3).
+    delta = build_residual_hamiltonian_target_blocks(
+        data_dict, blocks, shrink_policy="error", min_shrink=1.2
+    )
+    assert float(delta["0_0_0_0_0"][0, 0]) == pytest.approx(1.0)
+    # fails at a stricter 2.0 ratio (1.0 * 2.0 not < 1.3).
+    with pytest.raises(RuntimeError, match="H0-quality"):
+        build_residual_hamiltonian_target_blocks(
+            data_dict, blocks, shrink_policy="error", min_shrink=2.0
+        )
+
+
+def _raw_non_shrinking_record() -> dict:
+    """A raw absolute_full_h record whose H-H0 does NOT shrink (H=1 over H0=0)."""
+    record = _raw_absolute_full_h_record()
+    for key in record["hamiltonian"]:
+        record["hamiltonian"][key] = np.asarray([[1.0]], dtype=np.float32)
+        record["hamiltonian_0"][key] = np.asarray([[0.0]], dtype=np.float32)
+    return record
+
+
+def test_h7_dataset_ctor_arg_reaches_the_shrink_gate(tmp_path):
+    """Wiring: the LMDBDataset residual_shrink_policy ctor arg reaches the loader
+    gate.  A non-shrinking record raises under 'error' and loads under 'off'."""
+    error_ds = _build_dataset(
+        tmp_path,
+        _raw_non_shrinking_record(),
+        name="b-nonshrink-error",
+        residual_hamiltonian=True,
+        require_residual_from_full_h_target=True,
+        residual_shrink_policy="error",
+    )
+    with pytest.raises(RuntimeError, match="H0-quality"):
+        error_ds.get(0)
+
+    off_ds = _build_dataset(
+        tmp_path,
+        _raw_non_shrinking_record(),
+        name="b-nonshrink-off",
+        residual_hamiltonian=True,
+        require_residual_from_full_h_target=True,
+        residual_shrink_policy="off",
+    )
+    sample = off_ds.get(0)
+    torch.testing.assert_close(
+        sample[_keys.NODE_DELTA_HAMIL_BLOCKS_KEY].flatten(), torch.tensor([1.0, 1.0])
+    )
+
+
+# ===========================================================================
+# H8: per-record sample_uid stability (P3).  The loader attaches a stable packed
+# (shard_id<<32)|row_id identity unconditionally; it is content-independent, so a
+# record's uid is stable across re-loads and distinct across records.
+# ===========================================================================
+def _build_two_record_dataset(tmp_path, records, *, name, **kwargs):
+    lmdb_path = tmp_path / f"{name}.lmdb"
+    env = lmdb.open(str(lmdb_path), map_size=1 << 20, subdir=True)
+    try:
+        with env.begin(write=True) as txn:
+            for row_id, record in enumerate(records):
+                txn.put((row_id).to_bytes(4, "big"), pickle.dumps(record))
+    finally:
+        env.close()
+    return DatasetBuilder()(
+        root=str(tmp_path),
+        r_max=2.0,
+        type="LMDBDataset",
+        prefix=name,
+        separator=".",
+        basis={"H": "1s"},
+        get_Hamiltonian=True,
+        get_H0=True,
+        **kwargs,
+    )
+
+
+def test_h8_sample_uid_is_stable_per_record_and_distinct_across_records(tmp_path):
+    rec0 = _raw_absolute_full_h_record()
+    rec1 = _raw_absolute_full_h_record()
+    rec1["case_id"] = "h2-second"
+    dataset = _build_two_record_dataset(tmp_path, [rec0, rec1], name="b-uid-two")
+
+    uid0_first = dataset.get(0)[_keys.SAMPLE_UID_KEY]
+    uid0_second = dataset.get(0)[_keys.SAMPLE_UID_KEY]
+    uid1 = dataset.get(1)[_keys.SAMPLE_UID_KEY]
+
+    # Same record re-loaded -> byte-identical uid (batch/order independent).
+    assert torch.equal(uid0_first, uid0_second)
+    # Different records -> different uids ...
+    assert not torch.equal(uid0_first, uid1)
+    # ... differing only in the low-32 row_id (same shard), consecutive keys.
+    v0 = int(uid0_first.item())
+    v1 = int(uid1.item())
+    assert (v0 >> 32) == (v1 >> 32)  # same packed shard ordinal
+    assert (v1 & 0xFFFFFFFF) == (v0 & 0xFFFFFFFF) + 1
+    assert v0 >= 0 and v1 >= 0  # positive int64 packing

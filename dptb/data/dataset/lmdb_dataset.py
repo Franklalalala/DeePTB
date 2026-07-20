@@ -4,12 +4,15 @@ from typing import Tuple, Dict, Any, List, Callable, Union, Optional, Mapping
 import torch
 from dptb.utils.tools import download_url, extract_zip
 
+import hashlib
+import logging
 import os
 import os.path as osp
 import glob
 from dptb.data import (
     AtomicData,
     AtomicDataDict,
+    register_fields,
     _NODE_FIELDS,
     _EDGE_FIELDS,
     _GRAPH_FIELDS,
@@ -60,6 +63,31 @@ from dptb.data.interfaces.p2_contract import (
 import pickle
 
 
+log = logging.getLogger(__name__)
+
+# Register the stable per-graph record identity as a graph-level long field so it
+# is stacked (never concatenated) during batching and survives collation as one
+# int64 value per graph. Registration is idempotent (set-based) and safe to run
+# at import time. See ``LMDBDataset._compute_sample_uid`` for the packing scheme.
+register_fields(
+    graph_fields=[AtomicDataDict.SAMPLE_UID_KEY],
+    long_fields=[AtomicDataDict.SAMPLE_UID_KEY],
+)
+
+
+def _stable_shard_ordinal(shard_identity: str) -> int:
+    """Deterministic 31-bit shard ordinal for the ``__new__``/no-path-map fallback.
+
+    The normal constructor assigns dense 0..K-1 shard ordinals from the sorted
+    unique realpaths spanned by the dataset (see ``_shard_uid_offsets``). This
+    hash-based fallback is only reached by lightweight fixtures that bypass the
+    path-backed maps; a content hash keeps the ordinal stable across runs and
+    processes (unlike the salted builtin ``hash``).
+    """
+    digest = hashlib.sha1(os.fsencode(shard_identity)).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
 def _parse_lmdb_block_key(key: Any):
     if not isinstance(key, str):
         return None
@@ -79,14 +107,20 @@ def assert_residual_target_shrinks(
     h0_key: str = "hamiltonian_0",
     min_shrink: float = 1.2,
 ) -> None:
-    """Refuse residual targets that do not shrink when H0 is subtracted.
+    """Check the H0-quality shrink heuristic; raise when the target does not shrink.
 
+    This is a configurable H0-quality policy gate, not a provenance proof:
+    magnitude alone proves neither the provenance nor the correctness of H0.
     Some historical LMDBs store an already-residual dH in the Hamiltonian
-    slot (delta-in-H-slot convention, e.g. the 0516 NexTHam crystal sets).
-    Enabling residual_hamiltonian there would double-subtract and inflate
-    the target to H0 scale instead of shrinking it (a genuine full-H set
-    shrinks ~16x on the water QHFlow2 data). Magnitudes are compared over
-    all stored block entries.
+    slot (delta-in-H-slot convention, e.g. the 0516 NexTHam crystal sets);
+    enabling residual_hamiltonian there would double-subtract and inflate the
+    target to H0 scale instead of shrinking it (a genuine full-H set shrinks
+    ~16x on the water QHFlow2 data), which is the leading (but not the only)
+    reason a target fails to shrink. Magnitudes are compared over all stored
+    block entries. The caller
+    (:func:`build_residual_hamiltonian_target_blocks`) decides whether a
+    non-shrinking target errors, warns, or is ignored via
+    ``residual_shrink_policy``; the math here is unchanged.
     """
     def _mean_abs(values) -> float:
         flattened = [
@@ -105,10 +139,14 @@ def assert_residual_target_shrinks(
         raise RuntimeError(
             "residual_hamiltonian=True, but subtracting H0 does not shrink the "
             f"target magnitude (mean|H|={h_mag:.4g} vs mean|H-H0|={d_mag:.4g}, "
-            f"required shrink >= {min_shrink}x). The Hamiltonian slot most "
-            "likely already stores a residual/delta target (delta-in-H-slot "
-            f"convention), or '{h0_key}' is not a valid H0 for it. Refusing to "
-            "double-subtract; disable residual_hamiltonian for this dataset."
+            f"required shrink >= {min_shrink}x). This is a configurable "
+            "H0-quality policy gate (residual_shrink_policy), NOT a provenance "
+            "proof: the magnitude alone proves neither the provenance nor the "
+            "correctness of H0. Hint: the Hamiltonian slot may already store a "
+            "residual/delta target (delta-in-H-slot convention), which would "
+            f"double-subtract, or '{h0_key}' may not be a valid H0 for it. Set "
+            "residual_shrink_policy='warn'/'off' to accept it, or disable "
+            "residual_hamiltonian for this dataset."
         )
 
 
@@ -490,8 +528,24 @@ def build_residual_hamiltonian_target_blocks(
     blocks: Dict[Any, Any],
     *,
     h0_key: str = "hamiltonian_0",
+    shrink_policy: str = "error",
+    min_shrink: float = 1.2,
 ) -> Dict[Any, np.ndarray]:
-    """Build H-H0 targets with fail-closed source and shape validation."""
+    """Build H-H0 targets with fail-closed source and shape validation.
+
+    ``shrink_policy`` splits the H0-quality shrink heuristic from the frozen
+    provenance/shape contracts (which always apply): ``"error"`` (default,
+    byte-identical to the historical behaviour) raises when the target fails
+    to shrink, ``"warn"`` logs the same diagnostics and proceeds, and
+    ``"off"`` skips the heuristic entirely. ``min_shrink`` is the required
+    ratio forwarded to :func:`assert_residual_target_shrinks`.
+    """
+    policy = str(shrink_policy).lower()
+    if policy not in {"error", "warn", "off"}:
+        raise ValueError(
+            "residual_shrink_policy must be 'error', 'warn', or 'off'; "
+            f"got {shrink_policy!r}."
+        )
     assert_residual_target_source_is_raw(data_dict)
 
     h0_blocks = data_dict.get(h0_key, None)
@@ -518,9 +572,23 @@ def build_residual_hamiltonian_target_blocks(
             )
         delta_blocks[key] = h_value - h0_value
 
-    # Validate every accessed record. Residual datasets are opt-in, and the
-    # small extra reduction is preferable to silently accepting a mixed shard.
-    assert_residual_target_shrinks(blocks, delta_blocks, h0_key=h0_key)
+    # H0-quality shrink heuristic. Residual datasets are opt-in; the default
+    # "error" policy keeps the historical fail-closed behaviour, while "warn"/
+    # "off" let a reviewer accept a legitimately non-shrinking H0 without
+    # editing this gate. The frozen source/shape contracts above always apply.
+    if policy != "off":
+        try:
+            assert_residual_target_shrinks(
+                blocks, delta_blocks, h0_key=h0_key, min_shrink=min_shrink
+            )
+        except RuntimeError as shrink_error:
+            if policy != "warn":
+                raise
+            log.warning(
+                "residual_shrink_policy='warn': proceeding despite the "
+                "H0-quality shrink gate. %s",
+                shrink_error,
+            )
     return delta_blocks
 
 
@@ -879,6 +947,8 @@ class LMDBDataset(AtomicDataset):
     expected_physical_h0_source_fingerprint = None
     audit_p2_representations = False
     require_p2_blocks = False
+    residual_shrink_policy = "error"
+    min_residual_shrink = 1.2
 
     def __init__(
             self,
@@ -892,6 +962,8 @@ class LMDBDataset(AtomicDataset):
             get_H0: bool = False,
             get_P2: bool = False,
             residual_hamiltonian: bool = False,
+            residual_shrink_policy: str = "error",
+            min_residual_shrink: float = 1.2,
             get_overlap: bool = False,
             get_DM: bool = False,
             get_eigenvalues: bool = False,
@@ -941,6 +1013,22 @@ class LMDBDataset(AtomicDataset):
             raise ValueError(
                 "residual_hamiltonian=True requires get_Hamiltonian=True; "
                 "otherwise the target switch would be a silent no-op."
+            )
+        # H0-quality shrink heuristic policy (see
+        # build_residual_hamiltonian_target_blocks). The default "error" keeps the
+        # historical fail-closed behaviour byte-for-byte; magnitude alone proves
+        # neither provenance nor correctness, so a reviewer may relax it per split.
+        self.residual_shrink_policy = str(residual_shrink_policy).lower()
+        if self.residual_shrink_policy not in {"error", "warn", "off"}:
+            raise ValueError(
+                "residual_shrink_policy must be 'error', 'warn', or 'off'; "
+                f"got {residual_shrink_policy!r}."
+            )
+        self.min_residual_shrink = float(min_residual_shrink)
+        if not np.isfinite(self.min_residual_shrink) or self.min_residual_shrink <= 0.0:
+            raise ValueError(
+                "min_residual_shrink must be a finite positive float; "
+                f"got {min_residual_shrink!r}."
             )
         self.get_overlap = get_overlap
         self.get_DM = get_DM
@@ -1057,6 +1145,18 @@ class LMDBDataset(AtomicDataset):
                     self._lmdb_path_map += [lmdb_path] * txn.stat()['entries']
                 db_env.close()
 
+        # Stable, batch-composition-independent shard ordinals for sample_uid.
+        # Sorting the unique shard realpaths gives a deterministic 0..K-1 map that
+        # is identical across runs and DataLoader workers, so a record's packed uid
+        # never depends on which shard happened to be enumerated first.
+        unique_shard_realpaths = sorted(
+            {os.path.realpath(path) for path in self._lmdb_path_map}
+        )
+        self._shard_uid_offsets = {
+            realpath: shard_id
+            for shard_id, realpath in enumerate(unique_shard_realpaths)
+        }
+
     def len(self):
         return self.num_graphs
 
@@ -1150,6 +1250,61 @@ class LMDBDataset(AtomicDataset):
             logical_file = file_map[raw_idx] if len(file_map) > raw_idx else "<memory>"
             path_identity = (f"logical:{logical_file}:dataset:{id(self)}",)
         return (path_identity, record_idx), cache
+
+    def _resolve_shard_realpath(self, raw_idx: int) -> str:
+        """Resolve the shard realpath for ``raw_idx`` the way ``_load_data_dict`` does.
+
+        The path-backed ``_lmdb_path_map`` branch is authoritative for normal
+        instances and is independent of any intervening ``_load_data_dict`` call
+        (unlike ``_last_lmdb_record_identity``, which the dedicated-H0 audit loop
+        overwrites). Lightweight ``__new__`` fixtures fall back to the logical
+        file identity.
+        """
+        index_map = getattr(self, "index_map", None)
+        lmdb_paths = getattr(self, "_lmdb_path_map", None)
+        if (
+            lmdb_paths is not None
+            and index_map is not None
+            and len(lmdb_paths) == len(index_map)
+        ):
+            return os.path.realpath(lmdb_paths[raw_idx])
+        if hasattr(self, "file_map") and len(getattr(self, "file_map", ())) > raw_idx:
+            candidates = self.simple_get_lmdb_path(self.file_map[raw_idx])
+            if candidates:
+                return os.path.realpath(candidates[0])
+            return f"logical:{self.file_map[raw_idx]}"
+        return "logical:<memory>"
+
+    def _compute_sample_uid(self, idx: int) -> int:
+        """Return the stable per-graph record identity as a packed int64.
+
+        Packing: ``(shard_id << 32) | (row_id & 0xFFFFFFFF)``.
+
+        * ``row_id`` is the LMDB integer record key within its shard
+          (``index_map[idx]``), i.e. the 4-byte big-endian key used to fetch the
+          record, so ``0 <= row_id < 2**32``.
+        * ``shard_id`` is the shard's dense ordinal in the dataset's sorted unique
+          shard realpaths (``_shard_uid_offsets``); a sha1-based 31-bit ordinal is
+          used only for lightweight ``__new__`` fixtures without a path map.
+
+        The result fits in 63 bits (a positive int64). It is independent of batch
+        composition/DataLoader order and stable across runs and workers, because
+        both the shard ordinal and the row key are deterministic functions of the
+        immutable on-disk dataset.
+        """
+        raw_idx = int(idx)
+        index_map = getattr(self, "index_map", None)
+        if index_map is not None and len(index_map) > raw_idx:
+            row_id = int(index_map[raw_idx])
+        else:
+            row_id = raw_idx
+        shard_realpath = self._resolve_shard_realpath(raw_idx)
+        offsets = getattr(self, "_shard_uid_offsets", None) or {}
+        if shard_realpath in offsets:
+            shard_id = int(offsets[shard_realpath])
+        else:
+            shard_id = _stable_shard_ordinal(shard_realpath)
+        return ((shard_id & 0x7FFFFFFF) << 32) | (row_id & 0xFFFFFFFF)
 
     def _assert_dedicated_physical_h0_dataset_fingerprint(self) -> None:
         """Verify the externally pinned, ordered H0 content once per worker."""
@@ -2025,7 +2180,11 @@ class LMDBDataset(AtomicDataset):
             block_target_source = blocks
             if getattr(self, "residual_hamiltonian", False):
                 block_target_source = build_residual_hamiltonian_target_blocks(
-                    data_dict, blocks, h0_key=self.h0_key
+                    data_dict,
+                    blocks,
+                    h0_key=self.h0_key,
+                    shrink_policy=getattr(self, "residual_shrink_policy", "error"),
+                    min_shrink=getattr(self, "min_residual_shrink", 1.2),
                 )
             target_blocks = block_dict_to_ordered_tensors(
                 atomicdata,
@@ -2260,6 +2419,12 @@ class LMDBDataset(AtomicDataset):
                 canonical_stored_edge,
                 canonical_stored_shift,
             )
+
+        # Attach the stable, batch-composition-independent per-graph record
+        # identity unconditionally (cheap, additive; unknown consumers ignore it).
+        atomicdata[AtomicDataDict.SAMPLE_UID_KEY] = torch.tensor(
+            [self._compute_sample_uid(idx)], dtype=torch.long
+        )
 
         return atomicdata
 
