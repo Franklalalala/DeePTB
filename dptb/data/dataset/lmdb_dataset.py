@@ -1269,9 +1269,16 @@ class LMDBDataset(AtomicDataset):
         ):
             return os.path.realpath(lmdb_paths[raw_idx])
         if hasattr(self, "file_map") and len(getattr(self, "file_map", ())) > raw_idx:
-            candidates = self.simple_get_lmdb_path(self.file_map[raw_idx])
-            if candidates:
-                return os.path.realpath(candidates[0])
+            # Lightweight __new__ fixtures may carry a file_map without the
+            # path-resolution attributes (root, ...); fall back to the logical
+            # identity rather than assuming the full constructor ran.
+            if hasattr(self, "root"):
+                try:
+                    candidates = self.simple_get_lmdb_path(self.file_map[raw_idx])
+                except (AttributeError, TypeError):
+                    candidates = None
+                if candidates:
+                    return os.path.realpath(candidates[0])
             return f"logical:{self.file_map[raw_idx]}"
         return "logical:<memory>"
 
