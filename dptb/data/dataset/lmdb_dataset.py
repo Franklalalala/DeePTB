@@ -410,6 +410,36 @@ def assert_residual_from_full_h_target_contract(
     forbidding any prepacked/ambiguous target.
     """
 
+    # Converter/compact provenance markers must be rejected HERE, at the loader,
+    # BEFORE the residual H-H0 subtraction is materialized.  A record can declare
+    # a valid absolute_full_h target AND carry these uu_real/compact converter
+    # fields at the same time; the flow-side masquerade guard never sees them
+    # because the loader only forwards these metadata keys when
+    # require_uureal_block_ode=True (a require_residual_from_full_h_target load
+    # drops them), so an unguarded masquerade would get H0 double-subtracted into
+    # a wrong delta target.  Certifying an already-converted product as a raw
+    # record therefore has to fail closed at this loader gate.
+    converter_markers = [
+        key
+        for key in (
+            "blockwise_spatial_schema",
+            "blockwise_target_mode",
+            "soc_uureal_compact",
+            "soc_uureal_full_rme",
+            "soc_uureal_keep",
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+        )
+        if key in data_dict
+    ]
+    if converter_markers:
+        raise ValueError(
+            "residual-from-Full-H supervision consumes raw absolute_full_h "
+            "records; a converter product masquerading as a raw record cannot "
+            "feed residual_ao_block_ode. Forbidden converter/compact provenance "
+            f"markers found: {converter_markers}."
+        )
+
     schema = data_dict.get(SAMPLE_SCHEMA_KEY)
     if schema != RAW_HAMILTONIAN_SAMPLE_SCHEMA:
         raise ValueError(
