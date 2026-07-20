@@ -441,3 +441,187 @@ def test_compute_compatible_state_from_pack_reports_true_metric_when_throttled()
     assert state is not None
     assert state["train_onsite_loss"].item() == pytest.approx(_TRUE_METRIC)
     assert state["train_hopping_loss"].item() == pytest.approx(_TRUE_METRIC)
+
+
+# ===========================================================================
+# H10: standard Trainer.validation per-key valid-batch counts (P2 trainer.py).
+#
+# The reviewer's repro: with a throttleable feature-compatible onsite/hopping
+# metric, a non-firing batch reports None (omitted), so dividing the accumulated
+# metric sum by the UNIFORM num_batches would dilute it (2.0 over one firing batch
+# of two -> 1.0).  The fix accumulates a PER-KEY contributing-batch count in
+# _accumulate_metric_state and validation() divides each metric by its own count.
+# This drives the real static accumulator seam and the exact divisor formula from
+# Trainer.validation (trainer.py ~line 929).
+# ===========================================================================
+from dptb.nnops.trainer import Trainer
+
+
+def _resolve_per_key(metric_sums, counts, num_batches):
+    """The exact divisor rule Trainer.validation applies to its metric sums."""
+    divisor = max(num_batches, 1)
+    return {key: value / counts.get(key, divisor) for key, value in metric_sums.items()}
+
+
+def test_h10_two_batch_validation_per_key_count_not_diluted():
+    """interval=2 analog: batch 1 fires (loss 3, onsite 2), batch 2 throttles the
+    onsite metric (None) but still reports loss 3.  validation_loss averages to 3.0
+    (present on both batches) while validation_onsite_loss stays 2.0 (NOT 1.0)."""
+    metric_sums, counts = {}, {}
+    Trainer._accumulate_metric_state(
+        metric_sums,
+        {
+            "validation_loss": torch.tensor(3.0),
+            "validation_onsite_loss": torch.tensor(2.0),
+            "validation_hopping_loss": torch.tensor(2.0),
+        },
+        counts,
+    )
+    Trainer._accumulate_metric_state(
+        metric_sums,
+        {
+            "validation_loss": torch.tensor(3.0),
+            "validation_onsite_loss": None,  # throttled this batch
+            "validation_hopping_loss": None,
+        },
+        counts,
+    )
+    # per-key counts: loss on both batches, onsite/hopping on only the firing one.
+    assert counts["validation_loss"] == 2
+    assert counts["validation_onsite_loss"] == 1
+    assert counts["validation_hopping_loss"] == 1
+
+    resolved = _resolve_per_key(metric_sums, counts, num_batches=2)
+    assert resolved["validation_loss"].item() == pytest.approx(3.0)
+    assert resolved["validation_onsite_loss"].item() == pytest.approx(2.0)
+    assert resolved["validation_hopping_loss"].item() == pytest.approx(2.0)
+
+    # Contrast: the pre-fix uniform num_batches divisor WOULD dilute onsite to 1.0.
+    assert (metric_sums["validation_onsite_loss"] / 2).item() == pytest.approx(1.0)
+
+
+def test_h10_interval_one_twin_is_byte_identical_to_uniform_divisor():
+    """interval=1 analog: every key present on every batch => per-key count ==
+    num_batches, so the per-key divisor is byte-identical to the uniform divisor."""
+    metric_sums, counts = {}, {}
+    for _ in range(2):
+        Trainer._accumulate_metric_state(
+            metric_sums,
+            {"validation_loss": torch.tensor(3.0), "validation_onsite_loss": torch.tensor(2.0)},
+            counts,
+        )
+    per_key = _resolve_per_key(metric_sums, counts, num_batches=2)
+    uniform = {key: value / 2 for key, value in metric_sums.items()}
+    assert set(per_key) == set(uniform)
+    for key in per_key:
+        assert torch.equal(per_key[key], uniform[key])
+
+
+# ===========================================================================
+# H11: MultiTrainer per-expert display metric + fired-step window (P2
+# multi_trainer.py).  Same FINDING B mechanism, now on the expert-display seam:
+# the per-expert onsite/hopping ratio and the display-window average must use the
+# GATED weight (which drops a throttled step) so a throttled batch does not halve
+# the displayed metric.  Raw active_nodes/active_edges telemetry stays untouched.
+# ===========================================================================
+def _expert_run_output(mt, stub, active_nodes, active_edges):
+    """One _run_one_expert_loss result: model-independent loss/active + the real
+    _snapshot_loss_metrics of the stub criterion (onsite/hopping possibly None)."""
+    out = {
+        "loss": torch.zeros((), dtype=torch.float64),
+        "active_nodes": torch.tensor(active_nodes, dtype=torch.float64),
+        "active_edges": torch.tensor(active_edges, dtype=torch.float64),
+    }
+    out.update(mt._snapshot_loss_metrics(stub))
+    return out
+
+
+def _stub(value):
+    return _StubCriterion(
+        None if value is None else torch.tensor(value, dtype=torch.float64),
+        None if value is None else torch.tensor(value, dtype=torch.float64),
+    )
+
+
+def test_h11_expert_display_metric_uses_gated_denominator_across_main_and_ref():
+    """main fires (metric 2, active 4/6) + ref throttled (None, raw active 4/6 but
+    GATED weight 0) => expert_onsite/hopping == 2 (not 1): the gated denominator
+    (4 from main + 0 from ref), not the raw 4+4."""
+    mt = _minimal_multitrainer()
+    mt.distributed_expert = False
+
+    outputs = iter([_expert_run_output(mt, _stub(2.0), 4.0, 6.0),
+                    _expert_run_output(mt, _stub(None), 4.0, 6.0)])
+
+    def _fake_run(**kwargs):
+        return next(outputs)
+
+    mt._run_one_expert_loss = _fake_run
+    mt.train_lossfunc = _stub(2.0)
+    payload = mt._build_train_payload(
+        batch_dict=None, batch_info=None, expert_idx=0, range_dis=None,
+        ref_batch_dict={"stub": True}, ref_batch_info=None,
+    )
+
+    assert payload["expert_onsite"].item() == pytest.approx(2.0)
+    assert payload["expert_hopping"].item() == pytest.approx(2.0)
+    # gated denominators drop the throttled ref (weight 0), not raw 4+4.
+    assert payload["onsite_weight"].item() == pytest.approx(4.0)
+    assert payload["hopping_weight"].item() == pytest.approx(6.0)
+    # raw active telemetry is the FULL main+ref count, untouched by gating.
+    assert payload["active_nodes"].item() == pytest.approx(8.0)
+    assert payload["active_edges"].item() == pytest.approx(12.0)
+
+
+def _init_display_window(mt):
+    mt._display_window_pack_local = torch.zeros((mt._PACK_LEN,), dtype=mt.dtype)
+    mt._display_window_dynamic_batch_pack_local = torch.zeros((mt._DB_PACK_LEN,), dtype=mt.dtype)
+    for attr in (
+        "_display_window_expert_onsite_sum_local",
+        "_display_window_expert_hopping_sum_local",
+        "_display_window_expert_active_nodes_sum_local",
+        "_display_window_expert_active_edges_sum_local",
+        "_display_window_expert_onsite_steps_local",
+        "_display_window_expert_hopping_steps_local",
+    ):
+        setattr(mt, attr, torch.zeros((), dtype=mt.dtype))
+    mt._display_window_last_lr_local = 0.0
+
+
+def _single_expert_payload(mt, value):
+    outputs = iter([_expert_run_output(mt, _stub(value), 4.0, 6.0)])
+
+    def _fake_run(**kwargs):
+        return next(outputs)
+
+    mt._run_one_expert_loss = _fake_run
+    mt.train_lossfunc = _stub(value)
+    return mt._build_train_payload(
+        batch_dict=None, batch_info=None, expert_idx=0, range_dis=None
+    )
+
+
+def test_h11_display_window_expert_metric_averages_only_over_fired_steps():
+    """A window with one firing step (expert 2, gated weight 4) and one throttled
+    step (gated weight 0) reports the window expert metric averaged over the FIRED
+    step count (== 2, not diluted to 1), while the raw active_nodes/active_edges
+    telemetry keeps the plain step-count mean (untouched)."""
+    mt = _minimal_multitrainer()
+    mt.distributed_expert = False
+    _init_display_window(mt)
+
+    mt._update_display_window_local(_single_expert_payload(mt, 2.0), current_local_lr=1e-3)
+    mt._update_display_window_local(_single_expert_payload(mt, None), current_local_lr=1e-3)
+
+    onsite, hopping, _grad, _lr, active_nodes, active_edges = (
+        mt._gather_display_window_expert_metrics()[0]
+    )
+    # Averaged over fired steps (1), not the 2 window steps.
+    assert onsite.item() == pytest.approx(2.0)
+    assert hopping.item() == pytest.approx(2.0)
+    # fired-step counters recorded exactly one contributing step per metric.
+    assert mt._display_window_expert_onsite_steps_local.item() == pytest.approx(1.0)
+    assert mt._display_window_expert_hopping_steps_local.item() == pytest.approx(1.0)
+    # raw active telemetry: mean over BOTH window steps (unchanged by throttling).
+    assert active_nodes.item() == pytest.approx(_ACTIVE_NODES)
+    assert active_edges.item() == pytest.approx(_ACTIVE_EDGES)

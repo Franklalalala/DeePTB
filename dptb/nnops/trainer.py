@@ -544,7 +544,7 @@ class Trainer(BaseTrainer):
         return out
 
     @staticmethod
-    def _accumulate_metric_state(metric_sums, state):
+    def _accumulate_metric_state(metric_sums, state, counts=None):
         for key, value in state.items():
             # A None value marks an omitted/invalid metric for this batch (e.g. a
             # feature-compatible onsite/hopping metric throttled by
@@ -557,6 +557,16 @@ class Trainer(BaseTrainer):
             if torch.is_tensor(value):
                 value = value.detach()
             metric_sums[key] = metric_sums.get(key, 0.0) + value
+            # Per-key valid-batch count: how many batches actually contributed
+            # THIS key.  ``validation()`` divides each metric sum by its own count
+            # so a batch that omitted the key (throttled onsite/hopping metric,
+            # None above) dilutes neither the numerator nor the denominator.  Each
+            # metric key is produced at most once per batch across all
+            # ``validation()`` accumulation sites, so one bump per add == one bump
+            # per contributing batch.  ``counts is None`` for any caller that does
+            # not opt in, leaving them byte-identical.
+            if counts is not None:
+                counts[key] = counts.get(key, 0) + 1
 
     def iteration(self, batch, ref_batch=None):
         '''
@@ -697,6 +707,15 @@ class Trainer(BaseTrainer):
         with torch.no_grad():
             loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
             flow_metric_sums = {}
+            # Per-key valid-batch counts, filled in lock-step with flow_metric_sums
+            # by _accumulate_metric_state.  Keys accumulated only through that helper
+            # (the throttleable feature-compatible onsite/hopping metrics and every
+            # compatible-loss key) are divided by their own count; keys written
+            # directly below (validation_flow_random_t/t0/euler_* losses) are gated
+            # by per-run-constant config flags, so they are present on every batch
+            # or none -- they are absent from this dict and fall back to num_batches
+            # (== their true count), keeping the interval=1 result byte-identical.
+            flow_metric_counts = {}
             num_batches = 0
             self.model.eval()
             generator = getattr(self, "validation_loader_generator", None)
@@ -732,7 +751,7 @@ class Trainer(BaseTrainer):
                                 flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
                                 + random_t_loss.detach()
                             )
-                            self._accumulate_metric_state(flow_metric_sums, random_t_state)
+                            self._accumulate_metric_state(flow_metric_sums, random_t_state, flow_metric_counts)
                         num_graphs = self.flow_cfm._num_graphs(original_batch)
                         zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
                         one_t = torch.ones(num_graphs, device=self.device, dtype=self.dtype)
@@ -752,6 +771,7 @@ class Trainer(BaseTrainer):
                                     old_prefix="validation_one_step",
                                     new_prefix="validation_flow_one_step",
                                 ),
+                                flow_metric_counts,
                             )
                         # Endpoint-compatible validation: euler-sample to t=0
                         # and score the blockwise criterion so pMF's legacy
@@ -774,6 +794,7 @@ class Trainer(BaseTrainer):
                                     prefix=f"validation_compatible_euler_{num_steps}",
                                     legacy_prefix=legacy_prefix,
                                 ),
+                                flow_metric_counts,
                             )
                         num_batches += 1
                         continue
@@ -872,6 +893,7 @@ class Trainer(BaseTrainer):
                         self._accumulate_metric_state(
                             flow_metric_sums,
                             compatible_state,
+                            flow_metric_counts,
                         )
                 else:
                     batch = self.model(batch)
@@ -885,6 +907,7 @@ class Trainer(BaseTrainer):
                             self.validation_lossfunc,
                             prefix="validation",
                         ),
+                        flow_metric_counts,
                     )
                 num_batches += 1
                 if fast: break
@@ -892,7 +915,19 @@ class Trainer(BaseTrainer):
         if not fast:
             loss = loss / divisor
         self._last_flow_validation_state = {
-            key: value / divisor for key, value in flow_metric_sums.items()
+            # Per-key valid-batch count (filled in lock-step with flow_metric_sums
+            # by _accumulate_metric_state): a throttleable feature-compatible metric
+            # omitted by _loss_component_state on a non-firing batch accumulated a
+            # smaller sum, so dividing it by the uniform num_batches would dilute it
+            # (2.0 over one firing batch of two -> 1.0).  Divide each accumulated key
+            # by ITS OWN contributing-batch count instead.  Keys written directly to
+            # flow_metric_sums (validation_flow_random_t/t0/euler_* losses) never
+            # enter flow_metric_counts and fall back to ``divisor``; keys present on
+            # every batch have count == num_batches == divisor, so the fallback and
+            # the per-key path give the identical divisor and interval=1 stays
+            # byte-identical.
+            key: value / flow_metric_counts.get(key, divisor)
+            for key, value in flow_metric_sums.items()
         }
         # When the endpoint-compatible pass produced a legacy validation_loss,
         # return it: direct callers and scheduler metrics then see the same

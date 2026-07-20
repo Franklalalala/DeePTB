@@ -2368,10 +2368,20 @@ class MultiTrainer(Trainer):
             if ref_res["expert_load_cv"] is not None:
                 load_cv_values.append(ref_res["expert_load_cv"])
 
-        active_nodes_safe = active_nodes.to(dtype=self.dtype).clamp_min(1.0)
-        active_edges_safe = active_edges.to(dtype=self.dtype).clamp_min(1.0)
-        expert_onsite = onsite_weighted_sum / active_nodes_safe
-        expert_hopping = hopping_weighted_sum / active_edges_safe
+        # The per-expert display metric must use the SAME gated denominator as the
+        # epoch onsite/hopping averages: onsite_weight/hopping_weight equal the raw
+        # active_nodes/active_edges on a firing batch but drop to 0 when the
+        # feature-compatible onsite/hopping metric is throttled (main["onsite"]/
+        # ["hopping"] None -> _gated_metric_weighted_sum returns 0/0).  Dividing by
+        # the raw active count instead would halve a throttled step's expert metric
+        # (8/8=1 vs the true 8/4=2).  On a firing batch onsite_weight is
+        # byte-identical to active_nodes.to(dtype) (it IS that tensor, summed over
+        # main+ref), so interval=1 is unchanged; clamp_min(1.0) keeps a fully
+        # throttled step at expert_onsite==0 rather than 0/0=nan.
+        onsite_weight_safe = onsite_weight.clamp_min(1.0)
+        hopping_weight_safe = hopping_weight.clamp_min(1.0)
+        expert_onsite = onsite_weighted_sum / onsite_weight_safe
+        expert_hopping = hopping_weighted_sum / hopping_weight_safe
 
         return {
             "loss": total_loss,
@@ -2607,6 +2617,13 @@ class MultiTrainer(Trainer):
         self._display_window_expert_hopping_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_nodes_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_edges_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
+        # Per-metric fired-step counters: how many steps actually contributed the
+        # onsite/hopping expert metric (gated weight > 0).  The window expert
+        # average divides by THESE, not the raw step count, so a throttled step
+        # drops out.  At interval=1 every step fires => fired count == step count
+        # and the displayed mean is byte-identical to the old sum/local_steps.
+        self._display_window_expert_onsite_steps_local = torch.zeros((), dtype=self.dtype, device=dev)
+        self._display_window_expert_hopping_steps_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_last_lr_local = 0.0
         self.dynamic_batch_oom_skipped_since_display = 0
         self._reset_cuda_memory_peak()
@@ -2675,8 +2692,36 @@ class MultiTrainer(Trainer):
     ):
         self._display_window_pack_local += self._make_step_pack(payload)
         self._display_window_dynamic_batch_pack_local += self._make_dynamic_batch_pack(dynamic_batch_state)
-        self._display_window_expert_onsite_sum_local += self._as_scalar_tensor(payload["expert_onsite"], default=0.0)
-        self._display_window_expert_hopping_sum_local += self._as_scalar_tensor(payload["expert_hopping"], default=0.0)
+        # Weight the expert onsite/hopping display metric by each step's effective
+        # gated weight: a step where the metric fired (onsite_weight/hopping_weight
+        # > 0, falling back to the raw active count for pre-weight payloads exactly
+        # as _make_step_pack does) contributes its ratio and a +1 to the fired
+        # counter; a throttled step (gated weight 0) contributes 0 to BOTH -- its
+        # expert_onsite is already 0/1=0, and the explicit *fired keeps that robust.
+        # The raw active_nodes/active_edges telemetry below stays weighted by the
+        # step count (every step), untouched.
+        onsite_fired = (
+            self._as_scalar_tensor(
+                payload.get("onsite_weight", payload.get("active_nodes", 0.0)),
+                default=0.0,
+            )
+            > 0
+        ).to(self.dtype)
+        hopping_fired = (
+            self._as_scalar_tensor(
+                payload.get("hopping_weight", payload.get("active_edges", 0.0)),
+                default=0.0,
+            )
+            > 0
+        ).to(self.dtype)
+        self._display_window_expert_onsite_sum_local += (
+            self._as_scalar_tensor(payload["expert_onsite"], default=0.0) * onsite_fired
+        )
+        self._display_window_expert_hopping_sum_local += (
+            self._as_scalar_tensor(payload["expert_hopping"], default=0.0) * hopping_fired
+        )
+        self._display_window_expert_onsite_steps_local += onsite_fired
+        self._display_window_expert_hopping_steps_local += hopping_fired
         self._display_window_expert_active_nodes_sum_local += self._as_scalar_tensor(payload["active_nodes"], default=0.0)
         self._display_window_expert_active_edges_sum_local += self._as_scalar_tensor(payload["active_edges"], default=0.0)
         self._display_window_last_lr_local = float(current_local_lr)
@@ -2686,10 +2731,18 @@ class MultiTrainer(Trainer):
 
     def _gather_display_window_expert_metrics(self) -> List[torch.Tensor]:
         local_steps = max(float(self._display_window_pack_local[self._P_STEP_COUNT].item()), 1.0)
+        # Divide the onsite/hopping expert sums by their OWN fired-step counts so a
+        # throttled step (which added 0 to the sum) does not dilute the mean.  At
+        # interval=1 every step fires => fired count == local_steps, byte-identical
+        # to the previous sum/local_steps.  clamp_min(1.0) mirrors local_steps'
+        # max(..., 1.0) floor for an all-throttled/empty window.  grad_norm, lr and
+        # the raw active_nodes/active_edges telemetry keep the plain step-count mean.
+        onsite_steps = self._display_window_expert_onsite_steps_local.clamp_min(1.0)
+        hopping_steps = self._display_window_expert_hopping_steps_local.clamp_min(1.0)
 
         local_metric = torch.stack([
-            self._display_window_expert_onsite_sum_local / local_steps,
-            self._display_window_expert_hopping_sum_local / local_steps,
+            self._display_window_expert_onsite_sum_local / onsite_steps,
+            self._display_window_expert_hopping_sum_local / hopping_steps,
             self._display_window_pack_local[self._P_GRAD_NORM_SUM] / local_steps,
             torch.tensor(float(self._display_window_last_lr_local), dtype=self.dtype, device=self.device),
             self._display_window_expert_active_nodes_sum_local / local_steps,
