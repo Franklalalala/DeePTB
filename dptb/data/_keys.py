@@ -154,6 +154,14 @@ NODE_UUREAL_RESIDUAL_BLOCKS_KEY: Final[str] = "node_uureal_residual_blocks"
 EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY: Final[str] = "edge_uureal_residual_block_shape"
 NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY: Final[str] = "node_uureal_residual_block_shape"
 
+# Non-SOC direct-residual (spatial) block ODE model inputs. Same isolation
+# rationale as the uu_real residual keys above, but carried in plain spatial AO
+# blocks so the residual_ao_block_ode mode can never consume the clean endpoint.
+EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY: Final[str] = "edge_spatial_residual_blocks"
+NODE_SPATIAL_RESIDUAL_BLOCKS_KEY: Final[str] = "node_spatial_residual_blocks"
+EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY: Final[str] = "edge_spatial_residual_block_shape"
+NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY: Final[str] = "node_spatial_residual_block_shape"
+
 NODE_FEATURES_KEY: Final[str] = "node_features"
 NODE_ATTRS_KEY: Final[str] = "node_attrs"
 EDGE_TYPE_KEY: Final[str] = "edge_type"

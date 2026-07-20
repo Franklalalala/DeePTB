@@ -13,6 +13,7 @@ from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicData import register_fields
 from dptb.data.interfaces.blockwise_tensor import (
     edge_feature_slices,
+    ensure_non_soc_mapper,
     ensure_spatial_block_mapper,
     infer_block_shapes,
     is_soc_uureal_mapper,
@@ -29,11 +30,15 @@ register_fields(
         _keys.NODE_H0_KEY,
         _keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY,
         _keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+        _keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY,
+        _keys.NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY,
     ],
     edge_fields=[
         _keys.EDGE_H0_KEY,
         _keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY,
         _keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+        _keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY,
+        _keys.EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY,
     ],
 )
 
@@ -253,6 +258,143 @@ class DirectUuRealBlockProjector(torch.nn.Module):
         return self.node_linear(node_raw), self.edge_linear(edge_raw)[active_edges]
 
 
+class DirectSpatialResidualBlockProjector(torch.nn.Module):
+    """Bias-free non-SOC AO-block Clebsch-Gordan contraction into hidden irreps.
+
+    Structural sibling of :class:`DirectUuRealBlockProjector` for the plain
+    non-SOC ``residual_ao_block_ode`` mode.  Each padded AO block is a
+    *product-basis* tensor.  Per directed orbital-shell pair the plan gathers the
+    mapper-valid ``(2l1+1)(2l2+1)`` sub-block entries, a fixed
+    ``wigner_3j(l1,l2,L)*sqrt(2L+1)`` change of basis contracts them into
+    *coupled* reduced matrix elements (the exact inverse of E3Hamiltonian's
+    forward RME->block expansion), the mapper's raw->sorted irrep permutation is
+    applied, and only then does a separate node/edge equivariant linear mix the
+    multiplicities.  Feeding raw product coordinates straight into the equivariant
+    linear -- as a plain flatten/gather would -- is not rotation covariant; the CG
+    contraction is what restores covariance.  No canonical block inverse or
+    H0/full-H block materialization occurs in the hot path.
+    """
+
+    def __init__(self, idp, irreps_out, *, dtype, device) -> None:
+        super().__init__()
+        # This projector is strictly non-SOC.  A reduced SOC uu_real mapper would
+        # pass ensure_spatial_block_mapper, so reject it explicitly (and before
+        # ensure_non_soc_mapper's NotImplementedError) with a ValueError so a
+        # compact-uu contract can never masquerade as spatial residual input.
+        if is_soc_uureal_mapper(idp):
+            raise ValueError(
+                "DirectSpatialResidualBlockProjector consumes plain non-SOC "
+                "records; the SOC uu_real mapper may not masquerade as "
+                "residual_ao_block_ode spatial residual input."
+            )
+        ensure_non_soc_mapper(idp)
+        self.idp = idp
+        self.canvas = mapper_max_norb(idp)
+        irreps_in, sort_index = _sorted_irrep_coordinate_index(idp, device=device)
+        self.irreps_in = irreps_in
+        self.irreps_out = o3.Irreps(irreps_out)
+        self.register_buffer("sort_index", sort_index, persistent=True)
+        self.register_buffer(
+            "cg_change_of_basis",
+            _build_uureal_cg_change_of_basis(idp, dtype=dtype, device=device),
+            persistent=True,
+        )
+
+        node_plan = torch.full(
+            (len(idp.type_names), int(idp.reduced_matrix_element)),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        for symbol, type_index in idp.chemical_symbol_to_type.items():
+            for row, col, feat in onsite_feature_slices(idp, symbol):
+                flat = [
+                    r * self.canvas + c
+                    for r in range(int(row.start), int(row.stop))
+                    for c in range(int(col.start), int(col.stop))
+                ]
+                node_plan[int(type_index), int(feat.start):int(feat.stop)] = torch.tensor(
+                    flat, dtype=torch.long, device=device
+                )
+
+        edge_plan = torch.full(
+            (len(idp.bond_types), int(idp.reduced_matrix_element)),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        for bond, type_index in idp.bond_to_type.items():
+            left, right = bond.split("-")
+            for row, col, feat in edge_feature_slices(idp, left, right):
+                flat = [
+                    r * self.canvas + c
+                    for r in range(int(row.start), int(row.stop))
+                    for c in range(int(col.start), int(col.stop))
+                ]
+                edge_plan[int(type_index), int(feat.start):int(feat.stop)] = torch.tensor(
+                    flat, dtype=torch.long, device=device
+                )
+        self.register_buffer("node_plan", node_plan, persistent=True)
+        self.register_buffer("edge_plan", edge_plan, persistent=True)
+        self.node_linear = Linear(
+            irreps_in, self.irreps_out, shared_weights=True,
+            internal_weights=True, biases=False,
+        ).to(dtype=dtype, device=device)
+        self.edge_linear = Linear(
+            irreps_in, self.irreps_out, shared_weights=True,
+            internal_weights=True, biases=False,
+        ).to(dtype=dtype, device=device)
+
+    def _gather_product(
+        self, blocks: torch.Tensor, types: torch.Tensor, plan: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather mapper-valid AO-product entries into the raw orbpair layout."""
+        if blocks.ndim != 3 or tuple(blocks.shape[-2:]) != (self.canvas, self.canvas):
+            raise ValueError(
+                "spatial residual blocks must use the mapper canvas "
+                f"{(self.canvas, self.canvas)}; got {tuple(blocks.shape)}."
+            )
+        selected = plan.index_select(0, types.flatten().to(device=plan.device, dtype=torch.long))
+        valid = selected >= 0
+        raw = blocks.flatten(1).gather(1, selected.clamp_min(0).to(blocks.device))
+        return raw * valid.to(device=blocks.device, dtype=blocks.dtype)
+
+    def _contract(self, blocks: torch.Tensor, types: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
+        """AO block -> coupled RME (raw orbpair layout) -> sorted irrep layout.
+
+        Returns the exact input consumed by the equivariant linear, i.e. the
+        coupled reduced matrix elements in the ``irreps_in`` (sorted) coordinate
+        order.  A zero block maps to zero coordinates (the change of basis and the
+        permutation are both linear and bias-free), so bit-level zero
+        preservation is retained.
+        """
+        raw_product = self._gather_product(blocks, types, plan)
+        change_of_basis = self.cg_change_of_basis.to(device=blocks.device, dtype=blocks.dtype)
+        raw_coupled = torch.einsum("kc,nc->nk", change_of_basis, raw_product)
+        return raw_coupled.index_select(1, self.sort_index.to(blocks.device))
+
+    def forward(self, data, atom_type, bond_type, active_edges):
+        required = (
+            _keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY,
+            _keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY,
+            _keys.NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY,
+            _keys.EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY,
+        )
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise KeyError(f"residual_ao_block_ode spatial projector missing keys={missing}.")
+        node_blocks = data[required[0]]
+        edge_blocks = data[required[1]]
+        expected_node, expected_edge = infer_block_shapes(data, self.idp, device=node_blocks.device)
+        node_shapes = torch.as_tensor(data[required[2]], device=node_blocks.device, dtype=torch.long)
+        edge_shapes = torch.as_tensor(data[required[3]], device=edge_blocks.device, dtype=torch.long)
+        if not torch.equal(node_shapes, expected_node) or not torch.equal(edge_shapes, expected_edge):
+            raise ValueError("spatial residual block shapes disagree with mapper/species plans.")
+        node_raw = self._contract(node_blocks, atom_type, self.node_plan)
+        edge_raw = self._contract(edge_blocks, bond_type, self.edge_plan)
+        return self.node_linear(node_raw), self.edge_linear(edge_raw)[active_edges]
+
+
 def _take_on_index_device(
     tensor: torch.Tensor,
     index: Union[int, torch.Tensor],
@@ -355,6 +497,7 @@ class H0InitLayer(torch.nn.Module):
         fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
         allow_target_fallback_in_training: bool = False,
         use_uureal_residual_block_input: bool = False,
+        use_spatial_residual_block_input: bool = False,
         merge_mode: str = "replace",
         self_edge_tol: float = 1e-8,
         dtype: Union[str, torch.dtype] = torch.float32,
@@ -365,6 +508,13 @@ class H0InitLayer(torch.nn.Module):
             raise ValueError(f"Unsupported h0_node_mode={h0_node_mode!r}")
         if merge_mode not in {"replace", "add"}:
             raise ValueError(f"Unsupported merge_mode={merge_mode!r}")
+        if use_uureal_residual_block_input and use_spatial_residual_block_input:
+            raise ValueError(
+                "use_uureal_residual_block_input and "
+                "use_spatial_residual_block_input are mutually exclusive: the SOC "
+                "uu_real and non-SOC spatial residual projectors consume "
+                "different block contracts."
+            )
 
         self.base_init = base_init
         self.idp = base_init.idp
@@ -381,6 +531,7 @@ class H0InitLayer(torch.nn.Module):
         self.fallback_edge_key = fallback_edge_key
         self.allow_target_fallback_in_training = allow_target_fallback_in_training
         self.use_uureal_residual_block_input = bool(use_uureal_residual_block_input)
+        self.use_spatial_residual_block_input = bool(use_spatial_residual_block_input)
         self.merge_mode = merge_mode
         self.self_edge_tol = self_edge_tol
         self.dtype = dtype
@@ -417,6 +568,18 @@ class H0InitLayer(torch.nn.Module):
                 self.residual_block_projector.sort_index.detach().clone(),
                 persistent=True,
             )
+        # Non-SOC spatial residual projector: a SEPARATE conditioning channel for
+        # residual_ao_block_ode.  Unlike the uu_real path it never rewrites the H0
+        # source layout (the H0 channel keeps its raw layout as in the frozen
+        # ao_block_ode mode), so no _uureal_h0_sort_index / H0 index_select is
+        # registered here; the projector owns its own irrep consistency guard.
+        self.spatial_residual_block_projector = (
+            DirectSpatialResidualBlockProjector(
+                self.idp, self.irreps_out, dtype=dtype, device=device
+            )
+            if self.use_spatial_residual_block_input
+            else None
+        )
 
     def _candidate_keys(
         self,
@@ -649,5 +812,12 @@ class H0InitLayer(torch.nn.Module):
             )
             node_features = node_features + residual_node
             edge_features = edge_features + residual_edge
+
+        if self.spatial_residual_block_projector is not None:
+            spatial_residual_node, spatial_residual_edge = self.spatial_residual_block_projector(
+                data, atom_type, bond_type, active_edges
+            )
+            node_features = node_features + spatial_residual_node
+            edge_features = edge_features + spatial_residual_edge
 
         return latents, node_features, edge_features, cutoff_coeffs, active_edges
