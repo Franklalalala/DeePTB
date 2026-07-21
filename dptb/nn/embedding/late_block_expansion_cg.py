@@ -29,29 +29,37 @@ _ANGULAR_L = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
 # floating-point reduction (grouped batched einsums + one scatter instead of the
 # per-path accumulation), and fp addition is non-associative, so fused output
 # equals the legacy order only up to reassociation -- NOT elementwise-tight.
-# Absent cancellation the drift is pure roundoff (fp64 <= ~4e-16, fp32 <=
-# ~2e-7); under fp32 cancellation with independent per-tensor scales the
-# relative elementwise drift can exceed any tight rtol (external review:
-# seed-1135 at 15.6x over rtol=5e-6; ~34/5000 random seeds), while BOTH paths
-# stay equally close to the fp64 truth -- a consistency property, not an
-# accuracy loss (see the cancellation characterization tests).  The project
-# accepts reassociation-level training-trajectory divergence in exchange for
-# ~4-5x on the head itself / ~-3.2% wall-clock per training iteration, the same
-# class of nondeterminism as cudnn autotune.  Runs that need bit-continuity
-# with pre-fusion history must set the rollback switch.
+# Absent cancellation the drift is pure roundoff (fp64 <= ~4e-16, fp32 <= ~2e-7).
+# Under fp32 CANCELLATION with independent per-tensor scales the two paths evaluate
+# the SAME real expression under different reduction orders, so there is NO
+# guaranteed elementwise accuracy ordering between them: the relative drift can
+# exceed any tight rtol, and EITHER path may sit further from the fp64 truth than
+# the other (a constructed seed-1135-style cancellation case puts the fused output
+# ~2-3 orders of magnitude further from truth than legacy -- see the cancellation
+# characterization test).  What holds is the weaker REASSOCIATION property: in the
+# tested non-cancellation regime both paths stay within the certified tolerance of
+# each other and of the fp64 truth.  The project accepts this reassociation-level
+# training-trajectory divergence -- the same class of nondeterminism as cudnn
+# autotune -- in exchange for a substantial head speedup (external benchmark, NOT
+# reproduced by the in-tree test suite: ~4-5x on the head, ~-3.2% wall-clock per
+# training iteration).  Runs that need bit-continuity with pre-fusion history must
+# set the rollback switch.
 #
 # The certified domain is fp32/fp64 EAGER only -- autocast, low-precision input
 # dtype, and deterministic mode always fall back to legacy regardless of any
 # switch (see ``forward``).
 #
-# Both switches are read per forward call so production can flip them without a
-# rebuild or checkpoint change.  Only the literal string ``"1"`` activates a
-# switch (unset / ``"0"`` / ``"true"`` / ``""`` are ignored):
+# The rollback switch is read per forward call so production can flip it without a
+# rebuild or checkpoint change.  Only the literal string ``"1"`` activates it
+# (unset / ``"0"`` / ``"true"`` / ``""`` are ignored):
 #   * ``DPTB_LEGACY_CG_HEAD=1`` -- absolute override; forces the reference loop
-#     (bit-continuity with pre-fusion history / emergency rollback).
-#   * ``DPTB_FUSED_CG_HEAD=1``  -- redundant affirmation of the fused default,
-#     kept accepted so configs written against the interim opt-in scheme stay
-#     valid; it never overrides the certified-domain guards.
+#     (bit-continuity with pre-fusion history / emergency rollback).  This is the
+#     ONLY environment switch ``forward`` reads.
+#   * ``DPTB_FUSED_CG_HEAD`` -- accepted (does not error) for compatibility with
+#     configs written against the interim fused-opt-in scheme, but it is NOT read
+#     and has NO runtime effect: fused is already the default in the certified
+#     domain, so the name is inert.  ``_FUSED_CG_HEAD_ENV`` is retained only to
+#     document that reserved name.
 _LEGACY_CG_HEAD_ENV = "DPTB_LEGACY_CG_HEAD"
 _FUSED_CG_HEAD_ENV = "DPTB_FUSED_CG_HEAD"
 
@@ -362,11 +370,13 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         #           CUDA reduction (atomicAdd).  Under ``use_deterministic_algorithms(
         #           True)`` we route to the per-path loop, which assembles each block by
         #           explicit ``cat`` and never scatters onto shared cells.
-        #   (c) DEFAULT -> fused.  The reassociated path (~4-5x head / ~-3.2%
-        #       iter) is the accepted production default; its output equals the
-        #       legacy loop only up to fp reassociation -- NOT elementwise-tight
-        #       under cancellation (see the module comment).  ``DPTB_FUSED_CG_HEAD=1``
-        #       is accepted as a redundant affirmation of this default.
+        #   (c) DEFAULT -> fused.  The reassociated path is the accepted production
+        #       default (external benchmark, not reproduced in-tree: ~4-5x head /
+        #       ~-3.2% iter); its output equals the legacy loop only up to fp
+        #       reassociation -- NOT elementwise-tight under cancellation, and under
+        #       cancellation neither path is guaranteed closer to the fp64 truth
+        #       (see the module comment).  ``DPTB_FUSED_CG_HEAD`` is NOT read here
+        #       (fused is already the default); the name is inert.
         # -------------------------------------------------------------------
         if os.environ.get(_LEGACY_CG_HEAD_ENV) == "1":
             return self._forward_legacy(features)
@@ -381,16 +391,18 @@ class LateBlockExpansionCGHead(torch.nn.Module):
     def _forward_fused(self, features: torch.Tensor) -> torch.Tensor:
         """Grouped batched-einsum forward + a single scatter (design A.2).
 
-        OPT-IN performance path (``DPTB_FUSED_CG_HEAD=1``); the DEFAULT forward is
-        ``_forward_legacy`` (controller decision: COMPATIBILITY-FIRST).  Equivalent
-        to the legacy loop only up to floating-point REASSOCIATION -- the grouped
-        einsums + single scatter reduce in a different order.  Absent cancellation the
-        drift is pure roundoff (fp64 <= ~4e-16, fp32 <= ~2e-7; design A.4); but under
-        fp32 cancellation with independent per-tensor scales the relative elementwise
-        drift can exceed any tight rtol, so this path does NOT claim elementwise parity
-        with the legacy accumulation order.  A failure above the certified
-        reassociation tolerances (in the non-cancellation regime the parity tests
-        exercise) signals a real semantic divergence, not precision.
+        The PERFORMANCE-DEFAULT forward path inside the certified eager fp32/fp64
+        domain (project decision 2026-07-20); ``_forward_legacy`` is the rollback and
+        reduction-order oracle, NOT the default.  Equivalent to the legacy loop only
+        up to floating-point REASSOCIATION -- the grouped einsums + single scatter
+        reduce in a different order.  Absent cancellation the drift is pure roundoff
+        (fp64 <= ~4e-16, fp32 <= ~2e-7; design A.4); under fp32 cancellation with
+        independent per-tensor scales the relative elementwise drift can exceed any
+        tight rtol and NEITHER path is guaranteed closer to the fp64 truth, so this
+        path does NOT claim elementwise parity with the legacy accumulation order.  A
+        failure above the certified reassociation tolerances (in the non-cancellation
+        regime the parity tests exercise) signals a real semantic divergence, not
+        precision.
         """
         condition = features.index_select(-1, self._scalar_indices)
         invariant = torch.nn.functional.silu(self.condition_down(condition))
@@ -441,9 +453,11 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         return output
 
     def _forward_legacy(self, features: torch.Tensor) -> torch.Tensor:
-        """Reference per-path loop -- the DEFAULT forward path (controller decision:
-        COMPATIBILITY-FIRST) and the reduction-order-stable oracle the fused
-        equivalence tests compare against (design A.7)."""
+        """Reference per-path loop -- the reduction-order-stable ORACLE the fused
+        equivalence tests compare against and the ROLLBACK path, NOT the default
+        (design A.7).  ``forward`` routes here only under ``DPTB_LEGACY_CG_HEAD=1`` or
+        outside the certified eager fp32/fp64 domain (autocast, low-precision dtype,
+        deterministic mode); the fused path is the default otherwise."""
         condition = features.index_select(-1, self._scalar_indices)
         invariant = torch.nn.functional.silu(self.condition_down(condition))
         dynamic_weights = self.dynamic_up(invariant)

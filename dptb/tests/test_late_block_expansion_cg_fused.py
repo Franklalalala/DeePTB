@@ -1,8 +1,9 @@
 """Equivalence matrix for the fused ``LateBlockExpansionCGHead`` (design A.5).
 
-The fused path (``_forward_fused``, an OPT-IN perf mode selected by
-``DPTB_FUSED_CG_HEAD=1``; the DEFAULT forward is the legacy loop -- controller
-decision COMPATIBILITY-FIRST) collapses the legacy per-path Python loop into ``G``
+The fused path (``_forward_fused``, the PERFORMANCE-DEFAULT forward inside the
+certified eager fp32/fp64 domain; ``_forward_legacy`` is the rollback/oracle, and
+the inert ``DPTB_FUSED_CG_HEAD`` name is NOT read -- fused is already the default)
+collapses the legacy per-path Python loop into ``G``
 grouped batched einsums plus a single ``index_add`` scatter.  It is a
 numerical-ASSOCIATION change only: the batched einsums and the scatter reassociate
 the same floating-point sums in a different order than the reference
@@ -29,8 +30,8 @@ Cases (design A.5 / A.8):
   4. Hermiticity / symmetrize behaviour;
   5. padding / canvas zero-region invariance (untouched blocks stay bit-zero);
   6. state_dict round-trip: exact 5-tensor inventory + old->new strict=True load;
-  7. env-var dispatch: default (no env) => legacy; ``DPTB_FUSED_CG_HEAD=1`` => fused;
-     ``DPTB_LEGACY_CG_HEAD=1`` overrides the fused opt-in => legacy;
+  7. env-var dispatch: default (no env) => fused (certified domain);
+     ``DPTB_LEGACY_CG_HEAD=1`` overrides to legacy; ``DPTB_FUSED_CG_HEAD`` is inert;
   8. group-partition invariant + intra-group Wigner bit-identity;
   9. certified-domain routing guard (design A.8): forward() falls back to the legacy
      loop under autocast (CPU bf16 / CUDA fp16), non-fp32/64 input dtype, or
@@ -147,14 +148,14 @@ def _max_rel(fused, legacy):
 
 @pytest.fixture
 def fused_opt_in(monkeypatch):
-    """Opt IN to the fused path for a dispatch test.
+    """Set the (now inert) ``DPTB_FUSED_CG_HEAD`` affirmation for a dispatch test.
 
-    Controller decision COMPATIBILITY-FIRST flipped the DEFAULT forward to the legacy
-    loop, so a routing test that expects legacy would now pass TRIVIALLY on the default.
-    Setting ``DPTB_FUSED_CG_HEAD=1`` makes the fused path the thing the head WOULD run,
-    so a subsequent ``torch.equal`` to ``_forward_legacy`` proves the certified-domain
-    guard (or the legacy override) actually fired -- not merely the default.  Returns
-    ``monkeypatch`` so a test can additionally toggle ``DPTB_LEGACY_CG_HEAD``.
+    Fused is the PERFORMANCE-DEFAULT forward in the certified eager fp32/fp64 domain,
+    so a routing test does not need any env to make fused the would-run path.  This
+    fixture sets ``DPTB_FUSED_CG_HEAD=1`` -- a reserved name ``forward`` does NOT read
+    (see the module comment) -- to assert it does NOT disturb the fused default; a
+    test that then toggles ``DPTB_LEGACY_CG_HEAD`` or a certified-domain guard proves
+    the override/guard actually fired.  Returns ``monkeypatch`` for that toggling.
     """
     monkeypatch.setenv(_FUSED_CG_HEAD_ENV, "1")
     return monkeypatch
@@ -459,8 +460,9 @@ def test_old_checkpoint_loads_strict_true_and_reproduces_forward():
 # ===========================================================================
 @pytest.mark.parametrize("basis", [WATER_BASIS, CRYSTAL_BASIS])
 def test_env_var_rollback_selects_legacy_path(basis, monkeypatch):
-    """With the fused path opted IN, ``DPTB_LEGACY_CG_HEAD=1`` still overrides it back
-    to the legacy loop; removing the legacy override leaves the fused opt-in active."""
+    """``DPTB_LEGACY_CG_HEAD=1`` overrides the fused default back to the legacy loop;
+    removing the legacy override leaves the fused default active (the inert
+    ``DPTB_FUSED_CG_HEAD`` affirmation does not change either outcome)."""
     head = _build_head(basis, symmetrize=True, dtype=torch.float64, seed=8)
     x = torch.randn(5, head.irreps_in.dim, dtype=torch.float64)
 
@@ -479,11 +481,11 @@ def test_env_var_rollback_selects_legacy_path(basis, monkeypatch):
 
 
 def test_env_var_non_one_values_keep_fused(monkeypatch):
-    """Only the literal string "1" activates the legacy override: with the fused path
-    opted in, non-"1" values of ``DPTB_LEGACY_CG_HEAD`` leave the fused path selected."""
+    """Only the literal string "1" activates the legacy override: non-"1" values of
+    ``DPTB_LEGACY_CG_HEAD`` leave the fused default path selected."""
     head = _build_head(WATER_BASIS, symmetrize=False, dtype=torch.float64, seed=8)
     x = torch.randn(3, head.irreps_in.dim, dtype=torch.float64)
-    monkeypatch.setenv(_FUSED_CG_HEAD_ENV, "1")  # opt in to fused
+    monkeypatch.setenv(_FUSED_CG_HEAD_ENV, "1")  # inert affirmation; fused is default
     for value in ("0", "true", "yes", ""):
         monkeypatch.setenv(_LEGACY_CG_HEAD_ENV, value)
         assert torch.equal(head(x), head._forward_fused(x))
@@ -492,7 +494,7 @@ def test_env_var_non_one_values_keep_fused(monkeypatch):
 def test_default_dispatch_is_fused(monkeypatch):
     """Project decision PERFORMANCE-DEFAULT: with NO env override set, forward()
     routes to the fused grouped-einsum path inside the certified eager fp32/fp64
-    domain (precedence (c)); ``DPTB_FUSED_CG_HEAD=1`` is a redundant affirmation."""
+    domain (precedence (c)); ``DPTB_FUSED_CG_HEAD=1`` is inert (not read)."""
     monkeypatch.delenv(_LEGACY_CG_HEAD_ENV, raising=False)
     monkeypatch.delenv(_FUSED_CG_HEAD_ENV, raising=False)
     head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float64, seed=21)
@@ -504,7 +506,7 @@ def test_default_dispatch_is_fused(monkeypatch):
 
 def test_legacy_env_overrides_fused_default(monkeypatch):
     """Precedence (a) > (c): ``DPTB_LEGACY_CG_HEAD=1`` forces the legacy loop even
-    when the (now redundant) fused affirmation ``DPTB_FUSED_CG_HEAD=1`` is also set."""
+    when the inert ``DPTB_FUSED_CG_HEAD=1`` affirmation is also set."""
     head = _build_head(WATER_BASIS, symmetrize=True, dtype=torch.float64, seed=22)
     x = torch.randn(4, head.irreps_in.dim, dtype=torch.float64)
     monkeypatch.setenv(_FUSED_CG_HEAD_ENV, "1")
@@ -571,19 +573,20 @@ def test_fused_scatter_index_matches_block_flatten_order():
 
 
 # ===========================================================================
-# A.8 -- certified-domain routing guard (controller decision)
+# A.8 -- certified-domain routing guard (project decision)
 #
-# The fused path is an OPT-IN available ONLY in the certified domain: eager fp32/fp64.
+# The fused path is the DEFAULT ONLY inside the certified domain: eager fp32/fp64.
 # Outside it -- autocast, non-fp32/64 input dtype, or
 # ``use_deterministic_algorithms(True)`` -- forward() must transparently route to the
-# bit-compatible legacy loop EVEN WHEN the fused path is opted in.  Each routing test
-# therefore sets ``DPTB_FUSED_CG_HEAD=1`` (fixture ``fused_opt_in``) so the fused path
-# is what forward() WOULD otherwise run, then proves the guard forces legacy anyway via
-# ``torch.equal`` to ``_forward_legacy`` in the SAME context: the fused path would differ
-# by reassociation roundoff, so bit-equality can only mean the guard fired (these are
-# routing proofs, NOT numeric-parity claims -- low precision is exactly where fused and
-# legacy are ALLOWED to diverge).  Without the opt-in these would pass trivially now that
-# the DEFAULT is legacy, so the fixture is what keeps them load-bearing.
+# bit-compatible legacy loop.  Each routing test proves the guard forces legacy via
+# ``torch.equal`` to ``_forward_legacy`` in the SAME context: because fused is the
+# in-domain default, if the guard did NOT fire forward() would run the fused path,
+# which differs from legacy by reassociation roundoff, so bit-equality can only mean
+# the guard fired (these are routing proofs, NOT numeric-parity claims -- low
+# precision is exactly where fused and legacy are ALLOWED to diverge).  These tests
+# are load-bearing on the fused DEFAULT alone; the ``fused_opt_in`` fixture also sets
+# the inert ``DPTB_FUSED_CG_HEAD`` to assert that reserved name never disturbs the
+# guard.
 # ===========================================================================
 def test_cpu_autocast_bf16_routes_to_legacy(fused_opt_in):
     """Inside ``torch.autocast('cpu', bfloat16)``, forward() equals _forward_legacy()
@@ -777,6 +780,37 @@ def test_h12_reassociation_cancellation_exceeds_envelope_but_both_stay_accurate(
     assert ref > 0.0
     assert (legacy.double() - truth).abs().max().item() / ref <= 1e-3
     assert (fused.double() - truth).abs().max().item() / ref <= 1e-3
+
+
+def test_h12b_cancellation_paths_have_no_guaranteed_accuracy_ordering():
+    """H12b (FINDING F -- honest accuracy claim): at a cancellation the fused and legacy
+    fp32 outputs are NOT 'equally close' to the fp64 truth.  They sit at DIFFERENT
+    distances from truth and neither path has a universal elementwise ordering over the
+    other; both merely stay within the loose reassociation tolerance.  This pins the
+    claim the docs were overstating (they used to say the paths stay 'equally close to
+    the fp64 truth').  Reuses the deterministically-found cancellation case."""
+    found = _first_cancellation_case()
+    assert found is not None, (
+        "no reassociation-cancellation case found across the scanned (seed, "
+        "symmetrize) grid -- the reassociation regime changed; investigate before "
+        "adjusting any tolerance"
+    )
+    _seed, symmetrize, _head, x, legacy, fused = found
+    truth = _fp64_truth_of(_head, x, symmetrize)
+    ref = float(truth.abs().max())
+    assert ref > 0.0
+
+    legacy_err = (legacy.double() - truth).abs()
+    fused_err = (fused.double() - truth).abs()
+    # At the cell of largest fused-vs-legacy divergence the two paths sit at DIFFERENT
+    # distances from the truth (not "equally close") -- non-degenerate because
+    # fused != legacy there and the truth is a single value.
+    j = int((fused.double() - legacy.double()).abs().argmax())
+    assert legacy_err.flatten()[j].item() != fused_err.flatten()[j].item()
+    # Neither path is asserted closer than the other; both merely within the loose
+    # (documented, NOT tight) reassociation envelope of the truth.
+    assert legacy_err.max().item() / ref <= 1e-3
+    assert fused_err.max().item() / ref <= 1e-3
 
 
 @pytest.mark.parametrize("placement", ["static_weights", "dynamic_up", "input"])
