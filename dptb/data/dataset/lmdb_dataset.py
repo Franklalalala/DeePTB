@@ -1240,7 +1240,23 @@ class LMDBDataset(AtomicDataset):
                         os.path.realpath(lmdb_path),
                         int(self.index_map[int(idx)]),
                     )
-                    return pickle.loads(serialized)
+                    try:
+                        return pickle.loads(serialized)
+                    except ModuleNotFoundError as exc:
+                        # NumPy 2 pickles refer to numpy._core while this
+                        # environment uses NumPy 1.x. Install aliases only
+                        # when that exact compatibility failure is observed;
+                        # importing NumPy before Torch can destabilize CUDA
+                        # extension initialization in some deployments.
+                        if not (exc.name or "").startswith("numpy._core"):
+                            raise
+                        import sys
+                        import numpy as np
+
+                        sys.modules.setdefault("numpy._core", np.core)
+                        sys.modules.setdefault("numpy._core.numeric", np.core.numeric)
+                        sys.modules.setdefault("numpy._core.multiarray", np.core.multiarray)
+                        return pickle.loads(serialized)
         raise IndexError(f"LMDB entry {self.index_map[int(idx)]} not found for dataset index {idx}")
 
     def get_dynamic_batch_cost_parts(self, idx: int) -> Dict[str, int]:
