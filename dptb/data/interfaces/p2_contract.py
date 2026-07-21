@@ -22,12 +22,20 @@ import torch
 
 P2_SAMPLE_SCHEMA = "deeptb.p2_training_sample/v2"
 DUAL_PRIOR_SAMPLE_SCHEMA = "deeptb.physical_prior_training_sample/v3"
+# Generic raw-block records use a separate schema from P2/P23 caches.  It
+# states only that the authoritative target is the raw ``hamiltonian`` block
+# dictionary; it must not be used to bless independently prepacked targets.
+RAW_HAMILTONIAN_SAMPLE_SCHEMA = "deeptb.raw_hamiltonian_training_sample/v1"
 ABSOLUTE_FULL_H_SEMANTICS = "absolute_full_h"
 H0_RESIDUAL_SEMANTICS = "h0_residual"
 
 SAMPLE_SCHEMA_KEY = "hamiltonian_schema"
 TARGET_SEMANTICS_KEY = "hamiltonian_target_semantics"
 TARGET_SOURCE_KEY = "hamiltonian_target_source"
+PHYSICAL_H0_SOURCE_KEY = "physical_h0_source"
+PHYSICAL_H0_SOURCE_FINGERPRINT_KEY = "physical_h0_source_fingerprint"
+RAW_PHYSICAL_H0_SOURCE = "raw_hamiltonian_0"
+DEDICATED_PHYSICAL_H0_SOURCE = "dedicated_h0_blocks"
 BASIS_FINGERPRINT_KEY = "basis_fingerprint"
 EDGE_GRAPH_FINGERPRINT_KEY = "edge_graph_fingerprint"
 P2_SOURCE_FINGERPRINT_KEY = "p2_source_fingerprint"
@@ -42,6 +50,13 @@ P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY = "p23_parent_p2_bundle_fingerprint"
 FULL_H_TARGET_FINGERPRINT_KEY = "full_h_target_fingerprint"
 ROW_ALIGNED_DATA_FINGERPRINT_KEY = "row_aligned_data_fingerprint"
 ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY = "row_aligned_bundle_fingerprint"
+
+PHYSICAL_H0_BLOCK_FIELDS = (
+    "node_h0_blocks",
+    "edge_h0_blocks",
+    "node_h0_block_shape",
+    "edge_h0_block_shape",
+)
 
 # Ordered once for schema v2.  The row-data digest covers every tensor that is
 # interpreted by atom/edge row rather than merely checking its row count.  The
@@ -336,6 +351,37 @@ def fingerprint_present_row_aligned_fields(mapping: Mapping[str, Any]) -> str:
     return fingerprint_fields(mapping, fields)
 
 
+def physical_h0_record_fingerprint(mapping: Mapping[str, Any]) -> str:
+    """Bind one dedicated physical-H0 block bundle to its case, basis, and graph."""
+
+    case_id = str(mapping.get("case_id", "")).strip()
+    if not case_id:
+        raise ValueError("Dedicated physical-H0 records require a non-empty case_id.")
+    digest = hashlib.sha256()
+    digest.update(b"deeptb.physical_h0_record/v1\0")
+    digest.update(case_id.encode("utf-8"))
+    digest.update(b"\0")
+    for field in (BASIS_FINGERPRINT_KEY, EDGE_GRAPH_FINGERPRINT_KEY):
+        digest.update(require_sha256(mapping.get(field), field=field).encode("ascii"))
+        digest.update(b"\0")
+    digest.update(fingerprint_fields(mapping, PHYSICAL_H0_BLOCK_FIELDS).encode("ascii"))
+    return digest.hexdigest()
+
+
+def physical_h0_dataset_fingerprint(record_fingerprints: Sequence[str]) -> str:
+    """Commit to the ordered physical-H0 content of one configured data split."""
+
+    if not record_fingerprints:
+        raise ValueError("Cannot fingerprint an empty physical-H0 dataset.")
+    digest = hashlib.sha256()
+    digest.update(b"deeptb.physical_h0_dataset/v1\0")
+    for index, value in enumerate(record_fingerprints):
+        digest.update(index.to_bytes(8, byteorder="big", signed=False))
+        digest.update(require_sha256(value, field="physical-H0 record fingerprint").encode("ascii"))
+    digest.update(len(record_fingerprints).to_bytes(8, byteorder="big", signed=False))
+    return digest.hexdigest()
+
+
 def mapper_basis_fingerprint(idp: Any) -> str:
     """Fingerprint the exact non-SOC OrbitalMapper basis contract."""
 
@@ -490,6 +536,12 @@ __all__ = [
     "P2_RME_FINGERPRINT_KEY",
     "P2_SAMPLE_SCHEMA",
     "P2_SOURCE_FINGERPRINT_KEY",
+    "PHYSICAL_H0_SOURCE_FINGERPRINT_KEY",
+    "PHYSICAL_H0_SOURCE_KEY",
+    "PHYSICAL_H0_BLOCK_FIELDS",
+    "RAW_PHYSICAL_H0_SOURCE",
+    "DEDICATED_PHYSICAL_H0_SOURCE",
+    "RAW_HAMILTONIAN_SAMPLE_SCHEMA",
     "P23_BLOCK_FINGERPRINT_KEY",
     "P23_BUNDLE_FINGERPRINT_KEY",
     "P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY",
@@ -512,6 +564,8 @@ __all__ = [
     "fingerprint_present_row_aligned_fields",
     "fingerprint_text_fields",
     "mapper_basis_fingerprint",
+    "physical_h0_dataset_fingerprint",
+    "physical_h0_record_fingerprint",
     "require_sha256",
     "resolve_prior_field_spec",
     "resolve_prior_field_spec_from_raw_key",

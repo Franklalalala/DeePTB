@@ -43,6 +43,27 @@ class Objective:
     def __init__(self, trainer):
         self._t = trainer
 
+    def gated_metric_weighted_sum(self, value, active_count):
+        """Return a metric numerator and its jointly-gated denominator.
+
+        ``last_onsite_loss`` / ``last_hopping_loss`` are intentionally ``None``
+        on cadence-throttled batches.  Such a batch must contribute neither a
+        zero-valued numerator nor its active-count denominator; otherwise the
+        reported epoch metric is diluted.  Raw active counts remain available
+        separately for telemetry.
+        """
+        t = self._t
+        if torch.is_tensor(active_count):
+            active_f = active_count.to(device=t.device, dtype=t.dtype)
+        else:
+            active_f = torch.tensor(
+                float(active_count), device=t.device, dtype=t.dtype
+            )
+        if value is None:
+            zero = torch.zeros((), device=t.device, dtype=t.dtype)
+            return zero, zero
+        return t._as_scalar_tensor(value, default=0.0) * active_f, active_f
+
     def run(
         self,
         *,
@@ -111,8 +132,12 @@ class Objective:
         active_nodes = main["active_nodes"]
         active_edges = main["active_edges"]
 
-        onsite_weighted_sum = main["onsite"] * active_nodes.to(dtype=t.dtype)
-        hopping_weighted_sum = main["hopping"] * active_edges.to(dtype=t.dtype)
+        onsite_weighted_sum, onsite_weight = self.gated_metric_weighted_sum(
+            main["onsite"], active_nodes
+        )
+        hopping_weighted_sum, hopping_weight = self.gated_metric_weighted_sum(
+            main["hopping"], active_edges
+        )
 
         onsite_l1_sum = main["last_onsite_l1_sum"]
         onsite_mse_sum = main["last_onsite_mse_sum"]
@@ -149,10 +174,8 @@ class Objective:
             # endpoint triplet. Reference metrics can be reported separately
             # by a future dedicated namespace.
 
-        active_nodes_safe = active_nodes.to(dtype=t.dtype).clamp_min(1.0)
-        active_edges_safe = active_edges.to(dtype=t.dtype).clamp_min(1.0)
-        expert_onsite = onsite_weighted_sum / active_nodes_safe
-        expert_hopping = hopping_weighted_sum / active_edges_safe
+        expert_onsite = onsite_weighted_sum / onsite_weight.clamp_min(1.0)
+        expert_hopping = hopping_weighted_sum / hopping_weight.clamp_min(1.0)
 
         return {
             "loss": total_loss,
@@ -160,6 +183,10 @@ class Objective:
             "expert_hopping": expert_hopping.detach(),
             "onsite_weighted_sum": onsite_weighted_sum.detach(),
             "hopping_weighted_sum": hopping_weighted_sum.detach(),
+            # These are metric denominators, not raw telemetry.  They equal the
+            # active counts on a contributing batch and zero on a throttled one.
+            "onsite_weight": onsite_weight.detach(),
+            "hopping_weight": hopping_weight.detach(),
             "active_nodes": active_nodes.detach(),
             "active_edges": active_edges.detach(),
             "onsite_l1_sum": onsite_l1_sum.detach() if torch.is_tensor(onsite_l1_sum) else None,

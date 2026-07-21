@@ -2121,6 +2121,7 @@ class UpdateNode(torch.nn.Module):
                 weighted_message,
                 active_edge_center,
                 dim=0,
+                dim_size=node_features.shape[0],
             )
         else:
             node_scalars = node_in[:, :self.irreps_in[0].dim]

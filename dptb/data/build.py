@@ -286,6 +286,8 @@ class DatasetBuilder:
                 get_H0=kwargs.get("get_H0", False),
                 get_prior=kwargs.get("get_prior", kwargs.get("get_P2", False)),
                 residual_hamiltonian=kwargs.get("residual_hamiltonian", False),
+                residual_shrink_policy=kwargs.get("residual_shrink_policy", "error"),
+                min_residual_shrink=kwargs.get("min_residual_shrink", 1.2),
                 get_overlap=get_overlap,
                 get_DM=get_DM,
                 get_eigenvalues=get_eigenvalues,
@@ -303,9 +305,21 @@ class DatasetBuilder:
                     "require_prior_blocks", kwargs.get("require_p2_blocks", False)
                 ),
                 require_full_h_target=kwargs.get("require_full_h_target", False),
+                require_residual_h_target=kwargs.get(
+                    "require_residual_h_target", False
+                ),
+                require_uureal_block_ode=kwargs.get(
+                    "require_uureal_block_ode", False
+                ),
+                require_residual_from_full_h_target=kwargs.get(
+                    "require_residual_from_full_h_target", False
+                ),
                 expected_prior_source_fingerprint=kwargs.get(
                     "expected_prior_source_fingerprint",
                     kwargs.get("expected_p2_source_fingerprint", ""),
+                ),
+                expected_physical_h0_source_fingerprint=kwargs.get(
+                    "expected_physical_h0_source_fingerprint", ""
                 ),
                 audit_prior_representations=kwargs.get(
                     "audit_prior_representations",
@@ -422,4 +436,3 @@ class DatasetBuilder:
 # at the same time the previous way to use  build_dataset is still available. like build_dataset(...).
 
 build_dataset = DatasetBuilder()
-

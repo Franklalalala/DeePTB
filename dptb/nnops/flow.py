@@ -10,14 +10,32 @@ used by QHFlow/QHFlow2, but is adapted to DeePTB/NextHAM-style physical H0
 features.
 """
 
+import copy
 import logging
+import math
+import re
+from numbers import Integral
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from dptb.configuration import canonicalize_flow_options
 from dptb.data import AtomicDataDict, _keys
+from dptb.data.interfaces.blockwise_tensor import (
+    BlockTensorResult,
+    attach_prediction_block_tensors,
+    block_mask_from_shapes,
+    strict_reverse_edge_index,
+    infer_block_shapes,
+    is_soc_uureal_mapper,
+    mapper_max_norb,
+)
 from dptb.nnops import prior_physical
+from dptb.nnops.block_flow_codec import (
+    BlockStateCodec,
+    _FLOW_PROJECTED_STATE_TOKEN,
+    project_block_state,
+)
 from dptb.nnops.flow_context import CFMContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
@@ -40,6 +58,51 @@ from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 log = logging.getLogger(__name__)
 
 
+_BLOCK_ODE_OUTPUT_ONLY_KEYS = (
+    _keys.NODE_PRED_HAMIL_BLOCKS_KEY,
+    _keys.EDGE_PRED_HAMIL_BLOCKS_KEY,
+    _keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+    _keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+)
+_LEM_INPUT_SIDECAR_KEYS = (
+    _keys.LEM_ACTIVE_EDGES_KEY,
+    _keys.LEM_CUTOFF_COEFFS_KEY,
+    _keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY,
+)
+_MetricStats = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+_WeightedMetricStats = Tuple[Tuple[_MetricStats, float], ...]
+_MAX_TORCH_SEED = (1 << 64) - 1
+_VALIDATION_SEED_STREAMS = {
+    "prior": 0x9E3779B97F4A7C15,
+    "time": 0xD1B54A32D192ED03,
+}
+# TA-2: per-(graph uid, node-vs-edge) prior substream constants.  A SEEDED prior
+# draw derives one independent generator per graph keyed by its stable
+# ``sample_uid`` and its component so a graph's epsilon is invariant to batch
+# composition/order/sharding.  These extend the splitmix-style ``validation_seed``
+# machinery: the conceptual purpose string is ``"prior:<component>:<uid>"``.
+_PRIOR_COMPONENT_STREAMS = {
+    "node": 0xA0761D6478BD642F,
+    "edge": 0xE7037ED1A0B428DB,
+}
+_PRIOR_UID_MULTIPLIER = 0xD6E8FEB86659FD93
+
+
+def _parse_strict_certification(value: Any) -> Tuple[str, int]:
+    cadence = str(value).strip().lower()
+    if cadence == "always":
+        return cadence, 1
+    if cadence == "first_batch":
+        return cadence, 0
+    match = re.fullmatch(r"every_n\(([1-9][0-9]*)\)", cadence)
+    if match is not None:
+        return "every_n", int(match.group(1))
+    raise ValueError(
+        "flow_options.strict_certification must be 'always', 'first_batch', "
+        "or 'every_n(N)' with N >= 1."
+    )
+
+
 class HamiltonianCFM:
     """Trainer-side residual conditional flow matching helper.
 
@@ -56,6 +119,12 @@ class HamiltonianCFM:
 
     i.e. optionally weighted endpoint error ``||H_pred - H_ref||^2/(1-t)^2``.
     """
+
+    # Pixel MeanFlow owns a separate component-wise objective and explicitly
+    # opts out below.  CFM's true global element reduction has no unambiguous
+    # component-multiplier interpretation, especially for l1_rmse, so keep it
+    # unit-weight-only and route weighted components through equal_components.
+    allow_nonunit_global_element_weights = False
 
     def __init__(
         self,
@@ -81,6 +150,116 @@ class HamiltonianCFM:
         self.node_target_key = str(options.get("node_target_key", _keys.NODE_FEATURES_KEY))
         self.edge_target_key = str(options.get("edge_target_key", _keys.EDGE_FEATURES_KEY))
         self.flow_time_key = str(options.get("flow_time_key", "flow_time"))
+        self.output_space = str(options.get("output_space", "rme")).lower().replace("-", "_")
+        if self.output_space in {"block", "ao", "ao_blocks"}:
+            self.output_space = "ao_block"
+        self.block_ode = bool(options.get("block_ode", False))
+        if self.output_space in {"block_ode", "ao_blocks_ode"}:
+            self.output_space = "ao_block_ode"
+        if self.output_space in {"spatial_uureal_residual_block_ode", "uureal_residual_block_ode"}:
+            self.output_space = "uureal_block_ode"
+        self.uureal_block_ode = self.output_space == "uureal_block_ode"
+        if self.uureal_block_ode:
+            self.block_ode = True
+        # Non-SOC direct-residual block ODE. No normalization aliases: the only
+        # accepted spelling is the canonical name (hyphens already normalized to
+        # underscores above), so a near-miss alias fails the whitelist below.
+        self.residual_ao_block_ode = self.output_space == "residual_ao_block_ode"
+        if self.residual_ao_block_ode:
+            self.block_ode = True
+        if self.output_space not in {"rme", "ao_block", "ao_block_ode", "uureal_block_ode", "residual_ao_block_ode"}:
+            raise ValueError(
+                "flow_options.output_space must be 'rme', 'ao_block', or "
+                "one of the explicit ODE modes 'ao_block_ode'/'uureal_block_ode'/"
+                "'residual_ao_block_ode', got "
+                f"{self.output_space!r}."
+            )
+        if self.block_ode and self.output_space not in {"ao_block_ode", "uureal_block_ode", "residual_ao_block_ode"}:
+            raise ValueError(
+                "flow_options.block_ode=true is mutually exclusive with the frozen "
+                "ao_block adapter; set output_space='ao_block_ode'."
+            )
+        if self.output_space in {"ao_block_ode", "uureal_block_ode", "residual_ao_block_ode"} and not self.block_ode:
+            raise ValueError(
+                "Block-space ODE is a distinct mode: set flow_options.block_ode=true "
+                "together with output_space='ao_block_ode'."
+            )
+        if self.output_space in {"ao_block_ode", "uureal_block_ode", "residual_ao_block_ode"} and not self.enabled:
+            raise ValueError(f"output_space={self.output_space!r} requires flow_options.enabled=true.")
+        self.node_output_key = str(
+            options.get("node_output_key", getattr(_keys, "NODE_PRED_HAMIL_BLOCKS_KEY", "node_hamil_blocks"))
+        )
+        self.edge_output_key = str(
+            options.get("edge_output_key", getattr(_keys, "EDGE_PRED_HAMIL_BLOCKS_KEY", "edge_hamil_blocks"))
+        )
+        self.node_block_target_key = str(
+            options.get(
+                "node_block_target_key",
+                getattr(_keys, "NODE_DELTA_HAMIL_BLOCKS_KEY", "node_delta_hamil_blocks"),
+            )
+        )
+        self.edge_block_target_key = str(
+            options.get(
+                "edge_block_target_key",
+                getattr(_keys, "EDGE_DELTA_HAMIL_BLOCKS_KEY", "edge_delta_hamil_blocks"),
+            )
+        )
+        self.node_block_shape_key = str(
+            options.get(
+                "node_block_shape_key",
+                getattr(_keys, "NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY", "node_delta_hamil_block_shape"),
+            )
+        )
+        self.edge_block_shape_key = str(
+            options.get(
+                "edge_block_shape_key",
+                getattr(_keys, "EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY", "edge_delta_hamil_block_shape"),
+            )
+        )
+        # Physical B0 is block-authoritative.  Legacy node_h0/edge_h0 feature
+        # tensors have existed in more than one convention (AO-product and
+        # coupled RME), so block ODE must never infer its start state from them.
+        self.node_h0_block_key = getattr(_keys, "NODE_H0_BLOCKS_KEY", "node_h0_blocks")
+        self.edge_h0_block_key = getattr(_keys, "EDGE_H0_BLOCKS_KEY", "edge_h0_blocks")
+        self.node_h0_block_shape_key = getattr(
+            _keys, "NODE_H0_BLOCK_SHAPE_KEY", "node_h0_block_shape"
+        )
+        self.edge_h0_block_shape_key = getattr(
+            _keys, "EDGE_H0_BLOCK_SHAPE_KEY", "edge_h0_block_shape"
+        )
+        self.target_semantics = str(options.get("target_semantics", "")).lower().replace("-", "_")
+        self.prediction_add_h0 = bool(options.get("prediction_add_h0", False))
+        self.time_conditioning_required = bool(options.get("time_conditioning_required", False))
+        self.block_inverse_mode = str(options.get("block_inverse_mode", "strict")).lower()
+        configured_block_atol = options.get("block_inverse_atol", None)
+        self.block_inverse_atol = float(
+            (1e-10 if self.dtype == torch.float64 else 2e-5)
+            if configured_block_atol is None
+            else configured_block_atol
+        )
+        if not math.isfinite(self.block_inverse_atol) or self.block_inverse_atol < 0:
+            raise ValueError("flow_options.block_inverse_atol must be finite and non-negative.")
+        # ``canonicalize_flow_options`` folds the legacy strict_h0 and
+        # warn_missing_h0 booleans into this single policy.  Establish the
+        # compatibility views before the block-ODE guards below so those guards
+        # cannot accidentally observe a removed legacy key's default value.
+        self.missing_h0_policy = str(
+            options.get("missing_h0_policy", "error")
+        ).lower()
+        if self.missing_h0_policy not in {"error", "warn_zero", "zero"}:
+            raise ValueError(
+                "flow_options.missing_h0_policy must be 'error', 'warn_zero', or 'zero'."
+            )
+        self.strict_h0 = self.missing_h0_policy == "error"
+        self.warn_missing_h0 = self.missing_h0_policy == "warn_zero"
+        self.strict_certification = str(
+            options.get("strict_certification", "always")
+        ).strip().lower()
+        (
+            self._strict_certification_mode,
+            self._strict_certification_period,
+        ) = _parse_strict_certification(self.strict_certification)
+        self._strict_certification_batches = 0
 
         # Residual CFM is the recommended mode for DeePTB: base = DFT/NextHAM H0.
         self.mode = str(options.get("mode", "residual")).lower()
@@ -95,6 +274,7 @@ class HamiltonianCFM:
         # dense TE/CG priors.
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
+        self._projected_te_prior_names = {"projected_te"}
         self._basis_prior_names = BASIS_ONSITE_NAMES
         self._overlap_huckel_prior_names = OVERLAP_HUCKEL_NAMES
         self._haar_dm_prior_names = HAAR_DM_NAMES
@@ -105,6 +285,7 @@ class HamiltonianCFM:
             "gaussian",
             "residual_gaussian",
             *self._te_prior_names,
+            *self._projected_te_prior_names,
             *self._basis_prior_names,
             *self._overlap_huckel_prior_names,
             *self._haar_dm_prior_names,
@@ -114,15 +295,158 @@ class HamiltonianCFM:
         if self.prior not in allowed_priors:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
-                "use 'zero', 'gaussian', 'residual_gaussian', 'te', "
+                "use 'zero', 'gaussian', 'residual_gaussian', 'te', 'projected_te', "
                 "'basis_onsite', 'overlap_huckel', 'haar_dm', 'dftbsk', 'external', "
                 "'dftb', 'xtb', or 'physical'."
             )
 
-        self.node_sigma = float(options.get("node_sigma", 1.0))
-        self.edge_sigma = float(options.get("edge_sigma", 1.0))
+        if self.block_ode:
+            if self.idp is None:
+                raise ValueError("Block-space ODE requires an OrbitalMapper idp.")
+            if self.uureal_block_ode and not is_soc_uureal_mapper(self.idp):
+                raise ValueError(
+                    "uureal_block_ode requires has_soc=true, nextham_uureal_mask=true, "
+                    "and full_soc_prediction=false; it may not masquerade as non-SOC."
+                )
+            if self.residual_ao_block_ode and is_soc_uureal_mapper(self.idp):
+                # Reject the reduced-SOC uu_real mapper explicitly (and before the
+                # generic non-uureal SOC NotImplementedError below) so a compact-uu
+                # contract can never activate the non-SOC direct-residual mode.
+                raise ValueError(
+                    "residual_ao_block_ode requires a plain non-SOC mapper; it may "
+                    "not masquerade as uu-real."
+                )
+            if not self.uureal_block_ode and bool(getattr(self.idp, "has_soc", False)):
+                raise NotImplementedError("Block-space ODE v1 supports non-SOC mappers only.")
+            if self.dtype not in {torch.float32, torch.float64}:
+                raise TypeError(
+                    "Block-space ODE v1 requires float32 or float64 so its strict "
+                    "inverse tolerance has a certified dtype contract."
+                )
+            if self.mode != "residual":
+                raise ValueError(
+                    "Block-space ODE v1 requires mode='residual' so B0 is physical H0."
+                )
+            if self.uureal_block_ode and self.prior != "zero":
+                raise ValueError("uureal_block_ode requires the exact zero residual prior.")
+            # residual_ao_block_ode v2: the direct-residual mode accepts BOTH the
+            # exact zero residual prior AND the projected_te stochastic bridge
+            # (epsilon drawn in the certified codec image, no H0 added).  A
+            # projected_te selection then flows into the shared projected_te option
+            # validation below (te_prior_mode='irrep', finite positive sigmas,
+            # mandatory te_prior_validation_seed).  uureal stays zero-only above.
+            if not self.uureal_block_ode and self.prior not in {"zero", *self._projected_te_prior_names}:
+                raise ValueError(
+                    "Block-space ODE supports only prior='zero' or the explicit "
+                    "prior='projected_te'; generic TE/Gaussian priors do not own "
+                    "the projected block start-state contract."
+                )
+            if self.target_semantics not in {"absolute_full_h", "residual_dh"}:
+                raise ValueError(
+                    "Block-space ODE requires explicit target_semantics="
+                    "'absolute_full_h' or 'residual_dh'."
+                )
+            if self.uureal_block_ode and self.target_semantics != "residual_dh":
+                raise ValueError("uureal_block_ode requires target_semantics='residual_dh'.")
+            if self.residual_ao_block_ode and self.target_semantics != "residual_dh":
+                raise ValueError("residual_ao_block_ode requires target_semantics='residual_dh'.")
+            if self.residual_ao_block_ode and not bool(
+                options.get("block_export_final_full_h", False)
+            ):
+                raise ValueError(
+                    "residual_ao_block_ode assembles final full H exactly once "
+                    "outside the ODE; set block_export_final_full_h=true."
+                )
+            if self.prediction_add_h0:
+                raise ValueError(
+                    "Block-space ODE requires prediction.add_h0=false; residual_dh "
+                    "endpoints are adapted by BlockStateCodec exactly once."
+                )
+            if not self.time_conditioning_required:
+                raise ValueError(
+                    "Block-space ODE requires time_conditioning_required=true and "
+                    "a fail-closed node+edge flow-time embedding."
+                )
+            if self.block_inverse_mode != "strict":
+                raise ValueError("Block-space ODE production inverse must use mode='strict'.")
+            if not self.strict_h0:
+                raise ValueError(
+                    "Block-space ODE requires strict_h0=true; physical H0 is the "
+                    "mandatory B0 state and may not fall back to zeros."
+                )
+            maximum_atol = 1.0e-10 if self.dtype == torch.float64 else 2.0e-5
+            if self.block_inverse_atol > maximum_atol:
+                raise ValueError(
+                    "Block-space ODE strict inverse tolerance exceeds the certified "
+                    f"{self.dtype} maximum {maximum_atol:.6g}: "
+                    f"got {self.block_inverse_atol:.6g}."
+                )
+            if self.target_semantics == "absolute_full_h":
+                expected_block_keys = (
+                    getattr(
+                        _keys,
+                        "NODE_FULL_HAMIL_TARGET_BLOCKS_KEY",
+                        "node_full_hamil_target_blocks",
+                    ),
+                    getattr(
+                        _keys,
+                        "EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY",
+                        "edge_full_hamil_target_blocks",
+                    ),
+                    getattr(
+                        _keys,
+                        "NODE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY",
+                        "node_full_hamil_target_block_shape",
+                    ),
+                    getattr(
+                        _keys,
+                        "EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY",
+                        "edge_full_hamil_target_block_shape",
+                    ),
+                )
+            else:
+                expected_block_keys = (
+                    getattr(
+                        _keys,
+                        "NODE_DELTA_HAMIL_BLOCKS_KEY",
+                        "node_delta_hamil_blocks",
+                    ),
+                    getattr(
+                        _keys,
+                        "EDGE_DELTA_HAMIL_BLOCKS_KEY",
+                        "edge_delta_hamil_blocks",
+                    ),
+                    getattr(
+                        _keys,
+                        "NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY",
+                        "node_delta_hamil_block_shape",
+                    ),
+                    getattr(
+                        _keys,
+                        "EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY",
+                        "edge_delta_hamil_block_shape",
+                    ),
+                )
+            configured_block_keys = (
+                self.node_block_target_key,
+                self.edge_block_target_key,
+                self.node_block_shape_key,
+                self.edge_block_shape_key,
+            )
+            if configured_block_keys != expected_block_keys:
+                raise ValueError(
+                    "Block-space ODE target keys do not match target_semantics="
+                    f"{self.target_semantics!r}: expected {expected_block_keys}, "
+                    f"got {configured_block_keys}."
+                )
+
+        raw_node_sigma = options.get("node_sigma", 1.0)
+        raw_edge_sigma = options.get("edge_sigma", 1.0)
+        raw_te_prior_sigma = options.get("te_prior_sigma", 1.0)
+        self.node_sigma = float(raw_node_sigma)
+        self.edge_sigma = float(raw_edge_sigma)
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
-        self.te_prior_sigma = float(options.get("te_prior_sigma", 1.0))
+        self.te_prior_sigma = float(raw_te_prior_sigma)
         default_te_prior_mode = "block" if self.prior == "block_te" else "irrep"
         self.te_prior_mode = str(options.get("te_prior_mode", "auto")).lower().replace("-", "_")
         if self.te_prior_mode == "auto":
@@ -132,6 +456,68 @@ class HamiltonianCFM:
         if self.te_prior_mode not in {"irrep", "block", "typewise"}:
             raise ValueError("flow_options.te_prior_mode must be 'irrep', 'block', or 'typewise'.")
         self.te_prior_per_graph = bool(options.get("te_prior_per_graph", True))
+        self.te_prior_validation_seed = options.get("te_prior_validation_seed", None)
+        if self.prior in self._projected_te_prior_names:
+            if not self.block_ode:
+                raise ValueError("prior='projected_te' is supported only by block_ode.")
+            if self.te_prior_mode != "irrep":
+                raise ValueError(
+                    "projected_te block_ode requires te_prior_mode='irrep'; "
+                    "typewise mode reads target residual scales and block mode is "
+                    "outside the certified irrepwise prior contract."
+                )
+            scales = {
+                "node_sigma": raw_node_sigma,
+                "edge_sigma": raw_edge_sigma,
+                "te_prior_sigma": raw_te_prior_sigma,
+            }
+            invalid = [
+                name
+                for name, value in scales.items()
+                if isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ]
+            if invalid:
+                raise ValueError(
+                    "projected_te block_ode requires finite positive scales; "
+                    f"invalid options={invalid}."
+                )
+            effective_scales = {
+                "node_sigma*te_prior_sigma": self.node_sigma * self.te_prior_sigma,
+                "edge_sigma*te_prior_sigma": self.edge_sigma * self.te_prior_sigma,
+            }
+            # Working interval mirror of the argcheck gate: reject scales that a
+            # cast-based representability check would accept but that collapse to
+            # exact zero (subnormal-adjacent) or overflow (near dtype-max) once
+            # the unbounded Gaussian radius multiplies in.
+            working_interval = {
+                torch.float32: (2.0 ** -100, (2.0 - 2.0 ** -23) * 2.0 ** 115),
+                torch.float64: (2.0 ** -996, (2.0 - 2.0 ** -52) * 2.0 ** 1011),
+            }
+            work_min, work_max = working_interval[self.dtype]
+            invalid_effective = []
+            for name, value in effective_scales.items():
+                magnitude = abs(float(value))
+                if not math.isfinite(magnitude) or not work_min <= magnitude <= work_max:
+                    invalid_effective.append(name)
+            if invalid_effective:
+                raise ValueError(
+                    "projected_te block_ode effective scales must be finite and "
+                    f"inside the safe {self.dtype} working interval "
+                    f"[{work_min:.3g}, {work_max:.3g}]; invalid products="
+                    f"{invalid_effective}."
+                )
+            if (
+                isinstance(self.te_prior_validation_seed, bool)
+                or not isinstance(self.te_prior_validation_seed, Integral)
+                or self.te_prior_validation_seed < 0
+                or self.te_prior_validation_seed > _MAX_TORCH_SEED
+            ):
+                raise ValueError(
+                    "projected_te block_ode requires an explicit integer "
+                    f"te_prior_validation_seed in [0, {_MAX_TORCH_SEED}]."
+                )
 
         # Physical prior families each own their option keys (parsed in
         # from_options).  Every family is built once so the external family can
@@ -214,17 +600,85 @@ class HamiltonianCFM:
         self.time_sampling = str(options.get("time_sampling", "uniform")).lower()
         self.t_min = float(options.get("t_min", 0.0))
         self.t_max = float(options.get("t_max", 0.999))
-        self.t0_probability = float(options.get("t0_probability", 0.0))
+        if self.uureal_block_ode:
+            # The uu_real rollout ALWAYS starts at exactly t=0, D=0 -- the one
+            # state inference is guaranteed to visit.  With D_t = t*D1 the model
+            # can fit interior times via the D_t/t shortcut without ever
+            # producing a trained answer at the boundary, so a t=0 training mass
+            # is mandatory here.  Default 0.15: enough boundary gradient mass to
+            # anchor the inference start without starving the interior schedule
+            # (inside the recommended 0.1-0.25 band).  Explicit zero/negative is
+            # a misconfiguration and fails closed.
+            self.t0_probability = float(options.get("t0_probability", 0.15))
+            if self.t0_probability <= 0.0:
+                raise ValueError(
+                    "uureal_block_ode requires 0 < t0_probability < 1: the rollout "
+                    "starts at t=0, D=0, and that boundary state has no training "
+                    "mass otherwise (recommended range 0.1-0.25)."
+                )
+        elif self.residual_ao_block_ode:
+            # Same D_t = t*D1 boundary reasoning as uureal_block_ode: the direct
+            # residual rollout always starts at exactly t=0, D=0, so a t=0 training
+            # mass is mandatory here too. Default 0.15; explicit zero/negative is a
+            # misconfiguration and fails closed.
+            self.t0_probability = float(options.get("t0_probability", 0.15))
+            if self.t0_probability <= 0.0:
+                raise ValueError(
+                    "residual_ao_block_ode requires 0 < t0_probability < 1: the rollout "
+                    "starts at t=0, D=0, and that boundary state has no training "
+                    "mass otherwise (recommended range 0.1-0.25)."
+                )
+        else:
+            self.t0_probability = float(options.get("t0_probability", 0.0))
+        # Universal upper bound (all modes).  t0_probability is the Bernoulli mass
+        # of the exact-t=0 boundary injection in ``_sample_t`` (``torch.rand(...) <
+        # p``); p >= 1 makes that comparison always True, sending EVERY sample to
+        # t=0 and silently starving the interior [t_min, t_max] schedule, and a
+        # non-finite p is never a valid probability.  The block-ODE modes require
+        # p > 0 above, so their effective window is 0 < p < 1; the generic CFM
+        # window is 0 <= p < 1.
+        if not math.isfinite(self.t0_probability) or not (
+            0.0 <= self.t0_probability < 1.0
+        ):
+            raise ValueError(
+                "flow_options.t0_probability must be finite and satisfy "
+                "0.0 <= t0_probability < 1.0 (recommended 0.1-0.25): a value >= 1 "
+                "collapses every training time to the t=0 boundary and starves the "
+                f"interior schedule; got {self.t0_probability!r}."
+            )
         self.t_eps = float(options.get("t_eps", 1.0e-3))
         self.endpoint_weight_power = float(options.get("endpoint_weight_power", 0.0))
         self.endpoint_weight_cap = float(options.get("endpoint_weight_cap", 100.0))
+        raw_validation_steps = options.get("validation_ode_steps", [1, 3])
+        if self.block_ode and (
+            not raw_validation_steps
+            or any(
+                isinstance(value, bool) or not isinstance(value, Integral)
+                for value in raw_validation_steps
+            )
+        ):
+            raise ValueError(
+                "Block-space ODE validation_ode_steps must contain integer steps drawn from [1, 3]."
+            )
         validation_ode_steps = {
-            int(v) for v in options.get("validation_ode_steps", [1, 3]) if int(v) > 0
+            int(v) for v in raw_validation_steps if int(v) > 0
         }
         # Euler-1 is the route-independent endpoint baseline. Additional steps
         # are diagnostics; configuration may not disable the common curve.
         validation_ode_steps.add(1)
         self.validation_ode_steps = tuple(sorted(validation_ode_steps))
+        if self.output_space == "ao_block" and self.validation_ode_steps != (1,):
+            raise ValueError(
+                "flow_options.output_space='ao_block' is a cross-space one-step "
+                "endpoint adapter and requires validation_ode_steps=[1]."
+            )
+        if self.block_ode and (
+            not self.validation_ode_steps
+            or not set(self.validation_ode_steps).issubset({1, 3})
+        ):
+            raise ValueError(
+                "Block-space ODE v1 supports validation_ode_steps drawn from [1, 3]."
+            )
         self.apply_to_reference = bool(options.get("apply_to_reference", False))
         self.validation_flow_metrics = frozenset(
             str(value).lower().replace("-", "_")
@@ -252,28 +706,55 @@ class HamiltonianCFM:
         # Safety switches.
         self.overwrite_feature_keys = bool(options.get("overwrite_feature_keys", True))
         self.detach_interpolated_h0 = bool(options.get("detach_interpolated_h0", True))
-        self.missing_h0_policy = str(options.get("missing_h0_policy", "error")).lower()
-        if self.missing_h0_policy not in {"error", "warn_zero", "zero"}:
-            raise ValueError(
-                "flow_options.missing_h0_policy must be 'error', 'warn_zero', or 'zero'."
-            )
-        # Read-only compatibility views for downstream code that inspected the
-        # old booleans. New configuration uses missing_h0_policy exclusively.
-        self.strict_h0 = self.missing_h0_policy == "error"
-        self.warn_missing_h0 = self.missing_h0_policy == "warn_zero"
         self.component_reduction = str(options.get("component_reduction", "global_elements")).lower()
         if self.component_reduction not in {"global_elements", "equal_components"}:
             raise ValueError(
                 "flow_options.component_reduction must be 'global_elements' or 'equal_components'."
             )
+        for name, value in (
+            ("node_weight", self.node_weight),
+            ("edge_weight", self.edge_weight),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"flow_options.{name} must be finite and non-negative, got {value!r}."
+                )
+        if self.node_weight == 0.0 and self.edge_weight == 0.0:
+            raise ValueError(
+                "flow_options.node_weight and edge_weight may not both be zero."
+            )
+        if (
+            self.component_reduction == "global_elements"
+            and not self.allow_nonunit_global_element_weights
+            and (self.node_weight != 1.0 or self.edge_weight != 1.0)
+        ):
+            raise ValueError(
+                "flow_options.component_reduction='global_elements' requires "
+                "node_weight=edge_weight=1. Use component_reduction="
+                "'equal_components' for node/edge loss multipliers."
+            )
 
         self.last_state: Dict[str, torch.Tensor] = {}
         self._te_irrep_slices_cache: Dict[int, Optional[Tuple[Tuple[int, int, int], ...]]] = {}
+        self.block_codec = (
+            BlockStateCodec(
+                self.idp,
+                dtype=self.dtype,
+                device=self.device,
+                inverse_mode=self.block_inverse_mode,
+                atol=self.block_inverse_atol,
+                target_semantics=self.target_semantics,
+            )
+            if self.block_ode and not self.uureal_block_ode
+            else None
+        )
         if self.enabled:
             log.info(
-                "Hamiltonian CFM enabled: mode=%s prior=%s t=[%.3g, %.3g] t0_prob=%.3g loss=%s",
+                "Hamiltonian CFM enabled: mode=%s prior=%s output_space=%s "
+                "t=[%.3g, %.3g] t0_prob=%.3g loss=%s",
                 self.mode,
                 self.prior,
+                self.output_space,
                 self.t_min,
                 self.t_max,
                 self.t0_probability,
@@ -325,29 +806,265 @@ class HamiltonianCFM:
     # ------------------------------------------------------------------
     # Sampling / interpolation
     # ------------------------------------------------------------------
+    def validation_seed(self, batch_index: int, purpose: str) -> int:
+        """Derive a stable fixed-width validation substream seed."""
+        if purpose not in _VALIDATION_SEED_STREAMS:
+            raise ValueError(f"Unknown validation RNG purpose={purpose!r}.")
+        if isinstance(batch_index, bool) or not isinstance(batch_index, Integral) or batch_index < 0:
+            raise ValueError("validation batch_index must be a non-negative integer.")
+        base = int(self.te_prior_validation_seed or 0) & _MAX_TORCH_SEED
+        value = (
+            base
+            ^ _VALIDATION_SEED_STREAMS[purpose]
+            ^ ((int(batch_index) + 1) * 0x94D049BB133111EB)
+        ) & _MAX_TORCH_SEED
+        value ^= value >> 30
+        value = (value * 0xBF58476D1CE4E5B9) & _MAX_TORCH_SEED
+        value ^= value >> 27
+        value = (value * 0x94D049BB133111EB) & _MAX_TORCH_SEED
+        return (value ^ (value >> 31)) & _MAX_TORCH_SEED
+
+    def validation_prior_base_seed(self) -> int:
+        """Batch-index-INDEPENDENT base seed for SEEDED validation prior draws.
+
+        The per-(sample_uid, node|edge) substream (see
+        :meth:`_prior_uid_substream_seed`) already gives every graph an epsilon
+        that is invariant to batch composition, order, and sharding.  The prior
+        base seed the validation caller threads into that substream must therefore
+        NOT depend on the batch position -- otherwise a record's epsilon changes
+        when it moves between validation batches (a smaller batch size, a
+        resharded/reordered loader, an inserted record), re-introducing exactly
+        the batch-composition dependence the substream was built to remove.
+
+        :meth:`validation_seed` deliberately mixes ``batch_index`` into its output
+        (so successive draws decorrelate); this canonicalises the prior stream at
+        the fixed point ``batch_index == 0``, so the base seed is a pure function
+        of ``te_prior_validation_seed`` and the ``"prior"`` stream tag alone.  The
+        time stream (``validation_seed(..., "time")``) is a separate axis and is
+        intentionally left batch-indexed.
+        """
+        return self.validation_seed(0, "prior")
+
+    @staticmethod
+    def _seeded_generator(device: torch.device, seed: Optional[int]) -> Optional[torch.Generator]:
+        if seed is None:
+            return None
+        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed <= _MAX_TORCH_SEED:
+            raise ValueError(f"RNG seed must be an integer in [0, {_MAX_TORCH_SEED}].")
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        return generator
+
+    def _prior_uid_substream_seed(
+        self, base_seed: int, *, uid: int, component: str
+    ) -> int:
+        """Stable per-(graph uid, node/edge) substream seed for SEEDED draws.
+
+        Extends the splitmix-style :meth:`validation_seed` machinery with the
+        conceptual purpose string ``"prior:<component>:<uid>"``: the epsilon a
+        graph receives is a deterministic function of (the base prior seed, the
+        graph's stable ``sample_uid``, and whether this is the node or edge
+        component), and is therefore independent of the graph's position in the
+        batch, the batch size, and sharding.  ``base_seed`` is the initial seed
+        of the caller's :class:`torch.Generator` (``prior_seed``), so a different
+        ``prior_seed`` still redraws the whole batch.
+        """
+        if component not in _PRIOR_COMPONENT_STREAMS:
+            raise ValueError(
+                f"Unknown prior substream component={component!r}; expected 'node' or 'edge'."
+            )
+        value = (
+            (int(base_seed) & _MAX_TORCH_SEED)
+            ^ _VALIDATION_SEED_STREAMS["prior"]
+            ^ _PRIOR_COMPONENT_STREAMS[component]
+            ^ (((int(uid) & _MAX_TORCH_SEED) + 1) * _PRIOR_UID_MULTIPLIER)
+        ) & _MAX_TORCH_SEED
+        value ^= value >> 30
+        value = (value * 0xBF58476D1CE4E5B9) & _MAX_TORCH_SEED
+        value ^= value >> 27
+        value = (value * 0x94D049BB133111EB) & _MAX_TORCH_SEED
+        return (value ^ (value >> 31)) & _MAX_TORCH_SEED
+
+    def _prior_substream_generators(
+        self,
+        data: Optional[AtomicDataDict.Type],
+        *,
+        base_seed: int,
+        num_graphs: int,
+        component: Optional[str],
+        device: torch.device,
+    ) -> list:
+        """One independent :class:`torch.Generator` per graph, keyed by sample_uid.
+
+        Fail-closed: a SEEDED prior draw must be reproducible per graph regardless
+        of batch composition, which is impossible without a stable per-graph
+        identity, so the batch MUST carry ``SAMPLE_UID_KEY`` (a graph-level long
+        field, one value per graph after collation).
+        """
+        uids = None if data is None else data.get(_keys.SAMPLE_UID_KEY, None)
+        if uids is None:
+            raise ValueError(
+                "A SEEDED projected_te prior draw requires the per-graph record "
+                f"identity `{_keys.SAMPLE_UID_KEY}` so a graph's epsilon is "
+                "invariant to batch composition, order, and sharding; it is absent "
+                "from this batch. Emit it from LMDBDataset (see "
+                "AtomicDataDict.SAMPLE_UID_KEY) or, for a hand-built batch, attach a "
+                "synthetic int64 per-graph uid tensor."
+            )
+        uids = torch.as_tensor(uids).detach().reshape(-1).to(dtype=torch.long)
+        if uids.numel() != int(num_graphs):
+            raise ValueError(
+                f"`{_keys.SAMPLE_UID_KEY}` carries {int(uids.numel())} value(s) but "
+                f"the batch has {int(num_graphs)} graph(s); it must hold exactly one "
+                "stable id per graph."
+            )
+        uid_list = uids.tolist()
+        return [
+            self._seeded_generator(
+                device,
+                self._prior_uid_substream_seed(
+                    base_seed, uid=int(u), component=component
+                ),
+            )
+            for u in uid_list
+        ]
+
+    @staticmethod
+    def _graph_row_slices(graph_index: torch.Tensor, num_graphs: int) -> list:
+        """Ascending row positions belonging to each graph (batch-order index)."""
+        return [
+            (graph_index == g).nonzero(as_tuple=False).reshape(-1)
+            for g in range(int(num_graphs))
+        ]
+
+    @staticmethod
+    def _seeded_rows_by_graph(
+        row_count: int,
+        width: int,
+        row_slices: list,
+        generators: list,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Fill ``[row_count, width]`` drawing each graph's rows from its own gen.
+
+        Because a graph's rows are filled from its own uid-seeded generator in
+        ascending position order, the same graph receives the same rows for-row
+        regardless of how many other graphs share the batch or in which order.
+        """
+        out = torch.empty(int(row_count), int(width), device=device, dtype=dtype)
+        if row_count == 0:
+            return out
+        for gen_g, rows_g in zip(generators, row_slices):
+            n = int(rows_g.numel())
+            if n == 0:
+                continue
+            out.index_copy_(
+                0,
+                rows_g.to(device=device),
+                torch.randn(n, int(width), device=device, dtype=dtype, generator=gen_g),
+            )
+        return out
+
+    def _seeded_radius_by_graph(
+        self,
+        row_count: int,
+        active_dim: torch.Tensor,
+        graph_index: torch.Tensor,
+        row_slices: list,
+        generators: list,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Per-uid analogue of :meth:`_te_radius` (one radius stream per graph)."""
+        if self.te_prior_per_graph:
+            radius_per_graph = torch.empty(
+                len(generators), 1, device=device, dtype=dtype
+            )
+            for g, gen_g in enumerate(generators):
+                radius_per_graph[g] = torch.randn(
+                    1, 1, device=device, dtype=dtype, generator=gen_g
+                )
+            radius = radius_per_graph.index_select(0, graph_index.to(device=device))
+        else:
+            radius = torch.empty(int(row_count), 1, device=device, dtype=dtype)
+            for gen_g, rows_g in zip(generators, row_slices):
+                n = int(rows_g.numel())
+                if n == 0:
+                    continue
+                radius.index_copy_(
+                    0,
+                    rows_g.to(device=device),
+                    torch.randn(n, 1, device=device, dtype=dtype, generator=gen_g),
+                )
+        return radius * active_dim.sqrt()
+
+    def _assert_projected_te_draw_finite_and_scaled(self, components) -> None:
+        """TA-3 runtime belt for any projected_te draw, before it is used.
+
+        ``components`` is an iterable of ``(label, tensor, effective_scale)``.  A
+        drawn component must be all-finite, and -- when its configured effective
+        scale is nonzero and it has any elements -- must not be entirely zero (a
+        silent all-masked / subnormal-underflow collapse of the stochastic
+        bridge).  The error names the effective scale, dtype, and component label.
+        """
+        for label, tensor, effective_scale in components:
+            if tensor is None:
+                continue
+            if tensor.numel() and not bool(torch.isfinite(tensor).all().item()):
+                raise ValueError(
+                    f"projected_te {label} draw contains NaN/Inf (effective scale="
+                    f"{float(effective_scale):.6g}, dtype={tensor.dtype}, "
+                    f"component={label})."
+                )
+            if (
+                float(effective_scale) != 0.0
+                and tensor.numel() > 0
+                and not bool(tensor.detach().any().item())
+            ):
+                raise ValueError(
+                    f"projected_te {label} draw is entirely zero despite a nonzero "
+                    f"configured effective scale={float(effective_scale):.6g} "
+                    f"(dtype={tensor.dtype}, component={label})."
+                )
+
     def _sample_t(
         self,
         *,
         num_graphs: int,
         device: torch.device,
         dtype: torch.dtype,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         lo = max(0.0, min(self.t_min, 1.0))
         hi = max(lo, min(self.t_max, 1.0 - self.t_eps))
         if self.time_sampling == "uniform":
-            t = lo + (hi - lo) * torch.rand(num_graphs, device=device, dtype=dtype)
+            t = lo + (hi - lo) * torch.rand(
+                num_graphs, device=device, dtype=dtype, generator=generator
+            )
         elif self.time_sampling == "logit_normal":
             mean = float(self.options.get("time_logit_mean", -0.4))
             std = float(self.options.get("time_logit_std", 1.0))
-            raw = torch.randn(num_graphs, device=device, dtype=dtype) * std + mean
+            raw = torch.randn(
+                num_graphs, device=device, dtype=dtype, generator=generator
+            ) * std + mean
             t = torch.sigmoid(raw)
             t = lo + (hi - lo) * t
         else:
             raise ValueError(f"Unsupported flow_options.time_sampling={self.time_sampling!r}")
+        t = t.clamp(min=lo, max=hi)
+        # Inject exact-zero times AFTER the [t_min, t_max] clamp: t0_probability
+        # exists precisely to train the t=0 boundary state, so a configured
+        # t_min>0 must not re-clamp the injected zeros away (with t_min=0.5 and
+        # t0_probability=1 every "zero" silently became 0.5 before this fix).
         if self.t0_probability > 0.0:
-            use_t0 = torch.rand(num_graphs, device=device) < self.t0_probability
+            use_t0 = torch.rand(
+                num_graphs, device=device, generator=generator
+            ) < self.t0_probability
             t = torch.where(use_t0, torch.zeros_like(t), t)
-        return t.clamp(min=lo, max=hi)
+        return t
 
     @staticmethod
     def _num_graphs(data: AtomicDataDict.Type) -> int:
@@ -1146,13 +1863,26 @@ class HamiltonianCFM:
         device: torch.device,
         dtype: torch.dtype,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         if self.te_prior_per_graph and graph_index is not None and graph_index.numel() == row_count:
             if num_graphs is None:
                 num_graphs = int(graph_index.max().detach().item()) + 1 if row_count > 0 else 1
-            radius = torch.randn(num_graphs, 1, device=device, dtype=dtype).index_select(0, graph_index)
+            radius = torch.randn(
+                num_graphs,
+                1,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            ).index_select(0, graph_index)
         else:
-            radius = torch.randn(row_count, 1, device=device, dtype=dtype)
+            radius = torch.randn(
+                row_count,
+                1,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
         return radius * active_dim.sqrt()
 
     def _te_radius_for_prior(
@@ -1164,26 +1894,28 @@ class HamiltonianCFM:
         device: torch.device,
         dtype: torch.dtype,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        try:
-            return self._te_radius(
-                row_count,
-                active_dim,
-                graph_index,
-                device=device,
-                dtype=dtype,
-                num_graphs=num_graphs,
-            )
-        except TypeError as exc:
-            if "num_graphs" not in str(exc):
-                raise
-            return self._te_radius(
-                row_count,
-                active_dim,
-                graph_index,
-                device=device,
-                dtype=dtype,
-            )
+        optional = {"num_graphs": num_graphs}
+        if generator is not None:
+            optional["generator"] = generator
+        while True:
+            try:
+                return self._te_radius(
+                    row_count,
+                    active_dim,
+                    graph_index,
+                    device=device,
+                    dtype=dtype,
+                    **optional,
+                )
+            except TypeError as exc:
+                unsupported = next(
+                    (name for name in optional if name in str(exc)), None
+                )
+                if unsupported is None:
+                    raise
+                optional.pop(unsupported)
 
     def _block_structured_prior_like(
         self,
@@ -1193,23 +1925,58 @@ class HamiltonianCFM:
         label: Optional[str],
         *,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
+        per_graph_generators: Optional[list] = None,
+        row_slices: Optional[list] = None,
+        graph_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # The 1D unstructured fallback carries no per-row graph identity; it is
+        # unreachable for the SEEDED projected_te contract (which always draws
+        # rank>=2 RME rows in irrep mode), so it keeps the single-stream draw.
         if like.ndim < 2:
-            return torch.randn_like(like)
+            return torch.randn(
+                like.shape, device=like.device, dtype=like.dtype, generator=generator
+            )
         mask_f = mask.to(device=like.device, dtype=like.dtype)
-        raw = torch.randn_like(like) * mask_f
+        seeded = per_graph_generators is not None
+        if seeded:
+            raw = self._seeded_rows_by_graph(
+                like.shape[0],
+                like.shape[-1],
+                row_slices,
+                per_graph_generators,
+                device=like.device,
+                dtype=like.dtype,
+            ) * mask_f
+        else:
+            raw = torch.randn(
+                like.shape, device=like.device, dtype=like.dtype, generator=generator
+            ) * mask_f
         norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
         direction = raw / norm
         active_dim = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
-        radius = self._te_radius_for_prior(
-            like.shape[0],
-            active_dim,
-            graph_index,
-            device=like.device,
-            dtype=like.dtype,
-            num_graphs=num_graphs,
-        )
+        if graph_index is None:
+            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+        if seeded:
+            radius = self._seeded_radius_by_graph(
+                like.shape[0],
+                active_dim,
+                graph_index,
+                row_slices,
+                per_graph_generators,
+                device=like.device,
+                dtype=like.dtype,
+            )
+        else:
+            radius = self._te_radius_for_prior(
+                like.shape[0],
+                active_dim,
+                graph_index,
+                device=like.device,
+                dtype=like.dtype,
+                num_graphs=num_graphs,
+                generator=generator,
+            )
         return direction * radius * mask_f
 
     def _apply_typewise_residual_scale(
@@ -1270,6 +2037,7 @@ class HamiltonianCFM:
         label: Optional[str] = None,
         reference_scale: bool = True,
         num_graphs: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         if like.numel() == 0:
             return torch.zeros_like(like)
@@ -1293,6 +2061,30 @@ class HamiltonianCFM:
                     "use te_prior_mode='block' for whole-row structured noise."
                 )
 
+        # TA-2: when the draw is SEEDED, replace the single batch-order RNG stream
+        # (whose per-graph output changes with batch composition/order/sharding)
+        # with one independent generator per graph keyed by its stable sample_uid.
+        # ``base_seed`` is the passed generator's initial seed, so node and edge
+        # (distinct component tags) decouple while a different ``prior_seed`` still
+        # redraws the whole batch.  Unseeded (training) draws keep the byte-
+        # identical fast batch path below.
+        seeded = generator is not None
+        per_graph_generators = None
+        row_slices = None
+        graph_index = None
+        if seeded:
+            if num_graphs is None:
+                num_graphs = self._num_graphs(data) if data is not None else 1
+            per_graph_generators = self._prior_substream_generators(
+                data,
+                base_seed=int(generator.initial_seed()),
+                num_graphs=num_graphs,
+                component=label,
+                device=like.device,
+            )
+            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+            row_slices = self._graph_row_slices(graph_index, num_graphs)
+
         if like.ndim < 2 or slices is None:
             slices = ((0, like.shape[-1], -1),) if like.ndim >= 2 else ((0, like.numel(), -1),)
             noise = self._block_structured_prior_like(
@@ -1301,25 +2093,58 @@ class HamiltonianCFM:
                 data,
                 label,
                 num_graphs=num_graphs,
+                generator=generator,
+                per_graph_generators=per_graph_generators,
+                row_slices=row_slices,
+                graph_index=graph_index,
             )
         else:
             noise = torch.zeros_like(like)
-            graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
+            if graph_index is None:
+                graph_index = self._row_graph_index(data, like.shape[0], label, like.device)
             for start, end, _degree in slices:
                 seg_mask = mask[:, start:end].to(device=like.device, dtype=like.dtype)
-                raw = torch.randn(like.shape[0], end - start, device=like.device, dtype=like.dtype)
+                if seeded:
+                    raw = self._seeded_rows_by_graph(
+                        like.shape[0],
+                        end - start,
+                        row_slices,
+                        per_graph_generators,
+                        device=like.device,
+                        dtype=like.dtype,
+                    )
+                else:
+                    raw = torch.randn(
+                        like.shape[0],
+                        end - start,
+                        device=like.device,
+                        dtype=like.dtype,
+                        generator=generator,
+                    )
                 raw = raw * seg_mask
                 norm = raw.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1.0e-8)
                 direction = raw / norm
                 active_dim = seg_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                radius = self._te_radius_for_prior(
-                    like.shape[0],
-                    active_dim,
-                    graph_index,
-                    device=like.device,
-                    dtype=like.dtype,
-                    num_graphs=num_graphs,
-                )
+                if seeded:
+                    radius = self._seeded_radius_by_graph(
+                        like.shape[0],
+                        active_dim,
+                        graph_index,
+                        row_slices,
+                        per_graph_generators,
+                        device=like.device,
+                        dtype=like.dtype,
+                    )
+                else:
+                    radius = self._te_radius_for_prior(
+                        like.shape[0],
+                        active_dim,
+                        graph_index,
+                        device=like.device,
+                        dtype=like.dtype,
+                        num_graphs=num_graphs,
+                        generator=generator,
+                    )
                 noise[:, start:end] = direction * radius * seg_mask
 
         noise = self._apply_typewise_residual_scale(
@@ -1381,12 +2206,693 @@ class HamiltonianCFM:
         scale = residual.detach().std().clamp_min(self.residual_sigma_floor)
         return torch.randn_like(residual) * scale * sigma
 
+    @staticmethod
+    def _require_real_finite_tensor(value: Any, *, label: str) -> torch.Tensor:
+        tensor = torch.as_tensor(value)
+        if tensor.is_complex():
+            raise ValueError(f"{label} must be real for non-SOC block-space ODE.")
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise ValueError(f"{label} contains NaN or Inf.")
+        return tensor
+
+    @staticmethod
+    def _block_primary_topology_keys() -> Tuple[str, ...]:
+        """Primary graph metadata defining AO row identity and reverse pairs."""
+        names = (
+            ("EDGE_INDEX_KEY", "edge_index"),
+            ("EDGE_CELL_SHIFT_KEY", "edge_cell_shift"),
+            ("ATOMIC_NUMBERS_KEY", "atomic_numbers"),
+            ("ATOM_TYPE_KEY", "atom_types"),
+            ("POSITIONS_KEY", "pos"),
+            ("BATCH_KEY", "batch"),
+            ("PBC_KEY", "pbc"),
+            ("EDGE_TYPE_KEY", "edge_type"),
+            ("CELL_KEY", "cell"),
+        )
+        keys = [str(getattr(_keys, name, fallback)) for name, fallback in names]
+        # Some legacy/raw dictionaries use the plural spelling even though the
+        # canonical AtomicData key is singular.
+        keys.append("edge_types")
+        return tuple(dict.fromkeys(keys))
+
+    @classmethod
+    def _block_topology_keys(cls) -> Tuple[str, ...]:
+        """Graph metadata a model output may never redefine during block ODE."""
+        names = (
+            # Derived geometry is topology-dependent too.  If it was absent on
+            # entry, discard a model-returned value so the next step recomputes
+            # it from the immutable primary graph instead of trusting stale data.
+            ("EDGE_VECTORS_KEY", "edge_vectors"),
+            ("EDGE_LENGTH_KEY", "edge_lengths"),
+        )
+        keys = list(cls._block_primary_topology_keys())
+        keys.extend(str(getattr(_keys, name, fallback)) for name, fallback in names)
+        return tuple(dict.fromkeys(keys))
+
+    @staticmethod
+    def _missing_keys(data: AtomicDataDict.Type, keys: Tuple[str, ...]) -> list[str]:
+        return [key for key in keys if key not in data]
+
+    @classmethod
+    def _metadata_scalar(cls, value: Any) -> Any:
+        if torch.is_tensor(value):
+            values = value.detach().cpu().reshape(-1).tolist()
+            if not values or any(item != values[0] for item in values[1:]):
+                raise ValueError(
+                    "uureal_block_ode batched metadata values must be nonempty and identical."
+                )
+            return values[0]
+        if isinstance(value, (list, tuple)):
+            values = [cls._metadata_scalar(item) for item in value]
+            if not values or any(item != values[0] for item in values[1:]):
+                raise ValueError(
+                    "uureal_block_ode batched metadata values must be nonempty and identical."
+                )
+            return values[0]
+        try:
+            import numpy as np
+        except Exception:
+            return value
+        array = np.asarray(value)
+        values = array.reshape(-1).tolist()
+        if not values or any(item != values[0] for item in values[1:]):
+            raise ValueError(
+                "uureal_block_ode batched metadata values must be nonempty and identical."
+            )
+        return values[0]
+
+    def _require_uureal_block_contract(
+        self,
+        data: AtomicDataDict.Type,
+        *,
+        require_endpoint_labels: bool = True,
+    ) -> None:
+        keep = int(self.idp.reduced_matrix_element)
+        required = (
+            "blockwise_spatial_schema",
+            "blockwise_target_mode",
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+            "soc_uureal_compact",
+            "soc_uureal_full_rme",
+            "soc_uureal_keep",
+            self.node_h0_key,
+            self.edge_h0_key,
+        )
+        if require_endpoint_labels:
+            # Training/scoring needs the residual endpoint labels; label-free
+            # inference (sampling) starts from D_0=0 with mapper-derived shapes
+            # and never reads them, so it must not demand them.
+            required = required + (
+                self.node_block_target_key,
+                self.edge_block_target_key,
+                self.node_block_shape_key,
+                self.edge_block_shape_key,
+            )
+        missing = self._missing_keys(data, required)
+        if missing:
+            raise KeyError(f"uureal_block_ode data contract missing keys={missing}.")
+        expected = {
+            "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
+            "blockwise_target_mode": "already-delta",
+            "soc_uureal_compact": True,
+            "soc_uureal_full_rme": keep * 8,
+            "soc_uureal_keep": keep,
+        }
+        for key, wanted in expected.items():
+            actual = self._metadata_scalar(data[key])
+            if actual != wanted:
+                raise ValueError(
+                    f"uureal_block_ode requires {key}={wanted!r}; got {actual!r}."
+                )
+        # A normal full-SOC->uu_real conversion records the ORIGINAL source width
+        # (e.g. 5832 for a keep=729 compact target).  The contract is that the
+        # *stored* tensors are keep-wide and keep matches the mapper; the recorded
+        # source width must only be a valid integer >= keep (keep==source when the
+        # source was already compact).  Forcing source_width==keep rejected every
+        # genuine converter product.
+        for key in (
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+        ):
+            raw_actual = self._metadata_scalar(data[key])
+            try:
+                actual = int(raw_actual)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"uureal_block_ode requires integer {key}; got {raw_actual!r}."
+                )
+            if actual < keep:
+                raise ValueError(
+                    f"uureal_block_ode requires {key} >= keep={keep}; got {actual}."
+                )
+        for key in (self.node_h0_key, self.edge_h0_key):
+            value = torch.as_tensor(data[key])
+            if value.ndim != 2 or value.shape[-1] != keep:
+                raise ValueError(
+                    f"uureal_block_ode requires {key} width {keep}; got {tuple(value.shape)}."
+                )
+            if value.is_complex() or not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"uureal_block_ode requires finite real {key}.")
+
+    @staticmethod
+    def _attach_uureal_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
+        data[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = state.node_blocks
+        data[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = state.edge_blocks
+        data[_keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.node_shapes
+        data[_keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.edge_shapes
+
+    def _require_spatial_residual_block_contract(
+        self,
+        data: AtomicDataDict.Type,
+        *,
+        require_endpoint_labels: bool = True,
+    ) -> None:
+        """Fail-closed non-SOC direct-residual block contract.
+
+        ``residual_ao_block_ode`` consumes plain non-SOC raw records: the physical
+        H0 AO blocks (+ shapes) are always required, while the delta endpoint
+        labels are required only for training/scoring.  Label-free sampling starts
+        from D_0=0 with mapper-derived shapes and never reads them, so it must not
+        demand them.  Mapper non-SOC-ness is a ctor check, not a per-batch one.
+        """
+        required = (
+            self.node_h0_block_key,
+            self.edge_h0_block_key,
+            self.node_h0_block_shape_key,
+            self.edge_h0_block_shape_key,
+        )
+        if require_endpoint_labels:
+            required = required + (
+                self.node_block_target_key,
+                self.edge_block_target_key,
+                self.node_block_shape_key,
+                self.edge_block_shape_key,
+            )
+        missing = self._missing_keys(data, required)
+        if missing:
+            raise KeyError(f"residual_ao_block_ode data contract missing keys={missing}.")
+        for key in (self.node_h0_block_key, self.edge_h0_block_key):
+            self._require_real_finite_tensor(
+                data[key], label=f"residual_ao_block_ode {key}"
+            )
+        if require_endpoint_labels:
+            for key in (self.node_block_target_key, self.edge_block_target_key):
+                self._require_real_finite_tensor(
+                    data[key], label=f"residual_ao_block_ode {key}"
+                )
+        # A raw non-SOC record must never carry compact uu_real metadata: those
+        # markers belong to uureal_block_ode and would signal a converter product
+        # masquerading as a plain spatial record.
+        forbidden_metadata = [
+            key
+            for key in (
+                "soc_uureal_compact",
+                "soc_uureal_full_rme",
+                "soc_uureal_keep",
+                "blockwise_spatial_schema",
+                "blockwise_target_mode",
+            )
+            if key in data
+        ]
+        if forbidden_metadata:
+            raise ValueError(
+                "residual_ao_block_ode consumes raw non-SOC records; uu-real "
+                f"compact metadata is forbidden (found {forbidden_metadata})."
+            )
+        # Nor the reduced-SOC delta state keys, which would silently redirect the
+        # conditioning channel away from the spatial residual projector.
+        forbidden_state = [
+            key
+            for key in (
+                _keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY,
+                _keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY,
+                _keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+                _keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
+            )
+            if key in data
+        ]
+        if forbidden_state:
+            raise ValueError(
+                "residual_ao_block_ode consumes raw non-SOC records; uu-real "
+                f"residual state keys are forbidden (found {forbidden_state})."
+            )
+
+    @staticmethod
+    def _attach_spatial_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
+        data[_keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY] = state.node_blocks
+        data[_keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY] = state.edge_blocks
+        data[_keys.NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.node_shapes
+        data[_keys.EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.edge_shapes
+
+    @staticmethod
+    def _clone_sidecar_value(value: Any) -> Any:
+        return value.clone() if torch.is_tensor(value) else copy.deepcopy(value)
+
+    @classmethod
+    def _snapshot_block_topology(cls, data: AtomicDataDict.Type) -> Dict[str, Any]:
+        return {
+            key: cls._clone_sidecar_value(data[key])
+            for key in cls._block_topology_keys()
+            if key in data
+        }
+
+    def _drop_block_authority_fields(self, data: AtomicDataDict.Type) -> None:
+        """Keep certified endpoint/H0 block side channels outside model I/O."""
+        for key in (
+            self.node_block_target_key,
+            self.edge_block_target_key,
+            self.node_block_shape_key,
+            self.edge_block_shape_key,
+            self.node_h0_block_key,
+            self.edge_h0_block_key,
+            self.node_h0_block_shape_key,
+            self.edge_h0_block_shape_key,
+        ):
+            data.pop(key, None)
+
+    def _block_ode_output_only_keys(self) -> Tuple[str, ...]:
+        """Model outputs that must never be recycled as the next step's input."""
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.node_output_key,
+                    self.edge_output_key,
+                    *_BLOCK_ODE_OUTPUT_ONLY_KEYS,
+                )
+            )
+        )
+
+    def _require_fresh_block_ode_outputs(
+        self,
+        prediction: AtomicDataDict.Type,
+        *,
+        step: int,
+    ) -> None:
+        missing = self._missing_keys(
+            prediction, (self.node_output_key, self.edge_output_key)
+        )
+        if missing:
+            raise ValueError(
+                f"Block-space ODE step {step} is missing fresh model output keys={missing}."
+            )
+
+    @classmethod
+    def _require_matching_block_topology(
+        cls,
+        data_topology: Dict[str, Any],
+        ref_topology: Dict[str, Any],
+    ) -> None:
+        for key in cls._block_primary_topology_keys():
+            in_data = key in data_topology
+            in_ref = key in ref_topology
+            if in_data != in_ref:
+                raise ValueError(
+                    "Block-space ODE data/ref topology mismatch: "
+                    f"key {key!r} is present in only one dictionary."
+                )
+            if not in_data:
+                continue
+            left = data_topology[key]
+            right = ref_topology[key]
+            if torch.is_tensor(left) or torch.is_tensor(right):
+                try:
+                    left_t = torch.as_tensor(left).detach().cpu()
+                    right_t = torch.as_tensor(right).detach().cpu()
+                except Exception as exc:
+                    raise ValueError(
+                        f"Block-space ODE cannot compare data/ref topology key {key!r}."
+                    ) from exc
+                equal = left_t.shape == right_t.shape and torch.equal(left_t, right_t)
+            else:
+                try:
+                    equal = bool(left == right)
+                except Exception:
+                    equal = False
+            if not equal:
+                raise ValueError(
+                    "Block-space ODE data/ref topology mismatch at "
+                    f"key {key!r}; row-aligned H0/endpoint blocks cannot be mixed."
+                )
+
+    @classmethod
+    def _restore_block_topology(
+        cls,
+        data: AtomicDataDict.Type,
+        snapshot: Dict[str, Any],
+        *,
+        clone_values: bool = False,
+    ) -> None:
+        for key in cls._block_topology_keys():
+            if key in snapshot:
+                value = snapshot[key]
+                data[key] = cls._clone_sidecar_value(value) if clone_values else value
+            else:
+                data.pop(key, None)
+
+    @classmethod
+    def _max_abs(cls, value: torch.Tensor, *, label: str = "residual") -> float:
+        value = cls._require_real_finite_tensor(value, label=label)
+        if value.numel() == 0:
+            return 0.0
+        return float(value.detach().abs().max().item())
+
+    def _block_state_from_fields(
+        self,
+        field_data: AtomicDataDict.Type,
+        topology_data: AtomicDataDict.Type,
+        *,
+        node_key: str,
+        edge_key: str,
+        node_shape_key: str,
+        edge_shape_key: str,
+        label: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[BlockTensorResult, float]:
+        missing = self._missing_keys(
+            field_data, (node_key, edge_key, node_shape_key, edge_shape_key)
+        )
+        if missing:
+            raise KeyError(f"Block-space ODE requires {label} blocks and shapes; missing keys={missing}.")
+        raw_node = self._require_real_finite_tensor(
+            field_data[node_key], label=f"{label} node blocks"
+        )
+        raw_edge = self._require_real_finite_tensor(
+            field_data[edge_key], label=f"{label} edge blocks"
+        )
+        raw = BlockTensorResult(
+            node_blocks=raw_node.to(device=device, dtype=dtype),
+            edge_blocks=raw_edge.to(device=device, dtype=dtype),
+            node_shapes=torch.as_tensor(field_data[node_shape_key], device=device),
+            edge_shapes=torch.as_tensor(field_data[edge_shape_key], device=device),
+        )
+        projected = project_block_state(topology_data, self.idp, raw)
+        residual = max(
+            self._max_abs(
+                projected.node_blocks - raw.node_blocks,
+                label=f"{label} node projection residual",
+            ),
+            self._max_abs(
+                projected.edge_blocks - raw.edge_blocks,
+                label=f"{label} edge projection residual",
+            ),
+        )
+        if residual > self.block_inverse_atol:
+            raise ValueError(
+                f"Block-space ODE {label} violates onsite/reverse/padding constraints: "
+                f"max residual={residual:.6g}, atol={self.block_inverse_atol:.6g}."
+            )
+        return projected, residual
+
+    @staticmethod
+    def _clone_block_state(state: BlockTensorResult) -> BlockTensorResult:
+        return BlockTensorResult(
+            state.node_blocks.clone(),
+            state.edge_blocks.clone(),
+            state.node_shapes.clone(),
+            state.edge_shapes.clone(),
+        )
+
+    def _physical_h0_blocks(
+        self,
+        data: AtomicDataDict.Type,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[BlockTensorResult, float]:
+        missing = self._missing_keys(
+            data,
+            (
+                self.node_h0_block_key,
+                self.edge_h0_block_key,
+                self.node_h0_block_shape_key,
+                self.edge_h0_block_shape_key,
+            ),
+        )
+        if missing:
+            raise KeyError(
+                "Block-space ODE requires physical H0 blocks and shapes; "
+                f"missing keys={missing}."
+            )
+        raw_node = self._require_real_finite_tensor(
+            data[self.node_h0_block_key], label="physical H0 node blocks"
+        )
+        return self._block_state_from_fields(
+            data,
+            data,
+            node_key=self.node_h0_block_key,
+            edge_key=self.edge_h0_block_key,
+            node_shape_key=self.node_h0_block_shape_key,
+            edge_shape_key=self.edge_h0_block_shape_key,
+            label="physical H0",
+            device=raw_node.device if device is None else device,
+            dtype=self.dtype if dtype is None else dtype,
+        )
+
+    def _block_initial_state(
+        self,
+        data: AtomicDataDict.Type,
+        h0_blocks: BlockTensorResult,
+        *,
+        prior_seed: Optional[int] = None,
+        certify_image: bool = True,
+    ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
+        """Draw one endpoint-independent start state and certify its codec image.
+
+        Seeded-replay semantics (TA-1/TA-2): a fixed ``prior_seed`` reproduces the
+        SAME start state bitwise only for an identical tensor layout, plus
+        DISTRIBUTIONAL equivariance; the draw is keyed per graph by ``sample_uid``
+        (batch-composition invariant) but is NOT pathwise equivariant under an
+        input rotation/permutation.
+
+        A-mode asymmetry (TA-1a): unlike ``residual_ao_block_ode``, this A-mode
+        start state is the FULL state ``B0 = H0 + eps`` (not a pure residual D0),
+        so an explicit transformable ``prior_state`` latent does NOT drop in
+        trivially here (a caller-supplied full B0 would need its own H0-relative
+        residual bookkeeping and a distinct verbatim-vs-projected contract).  The
+        explicit-latent path is therefore offered only by the residual sampler;
+        A-mode is left seeded-only by design.
+        """
+        assert self.block_codec is not None
+        node_h0, edge_h0 = self.block_codec.blocks_to_rme(
+            data,
+            h0_blocks,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
+        if self.prior == "zero":
+            if prior_seed is not None:
+                raise ValueError("block-space prior_seed requires prior='projected_te'.")
+            return (
+                self._clone_block_state(h0_blocks),
+                torch.zeros_like(node_h0),
+                torch.zeros_like(edge_h0),
+            )
+
+        if self.prior not in self._projected_te_prior_names:
+            raise RuntimeError(f"Unsupported block-space prior {self.prior!r}.")
+
+        def draw(
+            generator: Optional[torch.Generator],
+        ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
+            prior_data = {
+                key: data[key]
+                for key in (
+                    AtomicDataDict.ATOM_TYPE_KEY,
+                    AtomicDataDict.EDGE_TYPE_KEY,
+                    _keys.BATCH_KEY,
+                    _keys.EDGE_INDEX_KEY,
+                    # TA-2: the stable per-graph id must ride the restricted prior
+                    # substream data so a SEEDED draw can key per-uid generators.
+                    _keys.SAMPLE_UID_KEY,
+                )
+                if key in data
+            }
+            num_graphs = self._num_graphs(prior_data)
+            node_noise = self._te_prior_like(
+                torch.zeros_like(node_h0),
+                self.node_sigma,
+                data=prior_data,
+                label="node",
+                reference_scale=False,
+                num_graphs=num_graphs,
+                generator=generator,
+            )
+            edge_noise = self._te_prior_like(
+                torch.zeros_like(edge_h0),
+                self.edge_sigma,
+                data=prior_data,
+                label="edge",
+                reference_scale=False,
+                num_graphs=num_graphs,
+                generator=generator,
+            )
+            # TA-3: runtime belt on the projected_te draw before it is folded into
+            # the start state -- all-finite, and not silently all-zero for a
+            # component with a nonzero configured effective scale.
+            self._assert_projected_te_draw_finite_and_scaled(
+                (
+                    ("node", node_noise, self.node_sigma * self.te_prior_sigma),
+                    ("edge", edge_noise, self.edge_sigma * self.te_prior_sigma),
+                )
+            )
+            noise_blocks = self.block_codec.rme_to_blocks(
+                data, node_noise, edge_noise, project=False
+            )
+            start = project_block_state(
+                data,
+                self.idp,
+                BlockTensorResult(
+                    h0_blocks.node_blocks + noise_blocks.node_blocks,
+                    h0_blocks.edge_blocks + noise_blocks.edge_blocks,
+                    h0_blocks.node_shapes,
+                    h0_blocks.edge_shapes,
+                ),
+            )
+            node_start, edge_start = self.block_codec.blocks_to_rme(
+                data,
+                start,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            roundtrip = self.block_codec.rme_to_blocks(
+                data, node_start, edge_start, project=True
+            )
+            residual = max(
+                self._max_abs(roundtrip.node_blocks - start.node_blocks),
+                self._max_abs(roundtrip.edge_blocks - start.edge_blocks),
+            )
+            if residual > self.block_inverse_atol:
+                raise ValueError(
+                    "Projected TE block start is outside the certified codec image: "
+                    f"max residual={residual:.6g}, atol={self.block_inverse_atol:.6g}."
+                )
+            return start, node_start - node_h0, edge_start - edge_h0
+
+        if prior_seed is None:
+            return draw(None)
+        generator = self._seeded_generator(h0_blocks.node_blocks.device, prior_seed)
+        return draw(generator)
+
+    def _residual_te_eps(
+        self,
+        data: AtomicDataDict.Type,
+        node_like: torch.Tensor,
+        edge_like: torch.Tensor,
+        *,
+        generator: Optional[torch.Generator],
+        certify_image: bool,
+    ) -> BlockTensorResult:
+        """Draw the projected_te residual epsilon in block space; NO H0 added.
+
+        Mirrors the TE-noise draw of :meth:`_block_initial_state` exactly (same
+        node/edge sigma semantics and the same seeded-generator path) but forms
+        the PURE noise residual ``eps = project(rme_to_blocks(noise, project=False))``
+        instead of A's ``H0 + noise`` start state: the direct-residual mode tracks
+        ``D = H - H0``, so the t=0 boundary of D is the prior noise alone.
+
+        ``eps`` is in the certified codec image by construction (the forward CG map
+        is linear, ``rme_to_blocks(project=False)`` lands on that image, and
+        :func:`project_block_state` is an image-preserving projection).  When
+        certification is due the epsilon is certified the same way A certifies its
+        noisy start -- a repack roundtrip residual bounded by ``block_inverse_atol``.
+
+        Seeded-replay semantics (TA-1/TA-2): a fixed ``generator`` reproduces the
+        SAME epsilon bitwise only for an identical tensor layout, and otherwise
+        only DISTRIBUTIONAL equivariance -- sample(R.x, seed) is drawn from the
+        rotation of sample(x, seed)'s law, not equal to it.  The draw is keyed
+        per graph by ``sample_uid`` (batch-composition invariant) but is NOT
+        pathwise equivariant under an input rotation/permutation; for a
+        transformable latent, pass an explicit ``prior_state`` to the sampler and
+        rotate/permute it alongside the input.
+        """
+        assert self.block_codec is not None
+        prior_data = {
+            key: data[key]
+            for key in (
+                AtomicDataDict.ATOM_TYPE_KEY,
+                AtomicDataDict.EDGE_TYPE_KEY,
+                _keys.BATCH_KEY,
+                _keys.EDGE_INDEX_KEY,
+                # TA-2: the stable per-graph id must ride the restricted prior
+                # substream data so a SEEDED draw can key per-uid generators.
+                _keys.SAMPLE_UID_KEY,
+            )
+            if key in data
+        }
+        num_graphs = self._num_graphs(prior_data)
+        node_noise = self._te_prior_like(
+            torch.zeros_like(node_like),
+            self.node_sigma,
+            data=prior_data,
+            label="node",
+            reference_scale=False,
+            num_graphs=num_graphs,
+            generator=generator,
+        )
+        edge_noise = self._te_prior_like(
+            torch.zeros_like(edge_like),
+            self.edge_sigma,
+            data=prior_data,
+            label="edge",
+            reference_scale=False,
+            num_graphs=num_graphs,
+            generator=generator,
+        )
+        noise_blocks = self.block_codec.rme_to_blocks(
+            data, node_noise, edge_noise, project=False
+        )
+        eps = project_block_state(data, self.idp, noise_blocks)
+        # TA-3: runtime belt on the projected_te draw before it is used as D0 --
+        # all-finite, and not silently all-zero for a component with a nonzero
+        # configured effective scale.
+        self._assert_projected_te_draw_finite_and_scaled(
+            (
+                ("node", eps.node_blocks, self.node_sigma * self.te_prior_sigma),
+                ("edge", eps.edge_blocks, self.edge_sigma * self.te_prior_sigma),
+            )
+        )
+        if certify_image:
+            node_eps, edge_eps = self.block_codec.blocks_to_rme(
+                data,
+                eps,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            roundtrip = self.block_codec.rme_to_blocks(
+                data, node_eps, edge_eps, project=True
+            )
+            residual = max(
+                self._max_abs(roundtrip.node_blocks - eps.node_blocks),
+                self._max_abs(roundtrip.edge_blocks - eps.edge_blocks),
+            )
+            if residual > self.block_inverse_atol:
+                raise ValueError(
+                    "Projected TE residual epsilon is outside the certified codec "
+                    f"image: max residual={residual:.6g}, "
+                    f"atol={self.block_inverse_atol:.6g}."
+                )
+        return eps
+
+    def _strict_image_certification_due(self) -> bool:
+        """Schedule only the pure repack/residual image-space self-check."""
+
+        batch = self._strict_certification_batches
+        if self._strict_certification_mode == "always":
+            return True
+        if self._strict_certification_mode == "first_batch":
+            return batch == 0
+        return batch % self._strict_certification_period == 0
+
     def prepare_batch(
         self,
         data: AtomicDataDict.Type,
         ref_data: AtomicDataDict.Type,
         *,
         t: Optional[torch.Tensor] = None,
+        prior_seed: Optional[int] = None,
+        time_seed: Optional[int] = None,
     ) -> Tuple[AtomicDataDict.Type, AtomicDataDict.Type, CFMContext]:
         """Return a model-input dict with interpolated H_t written to H0 keys."""
         if not self.enabled:
@@ -1394,29 +2900,367 @@ class HamiltonianCFM:
 
         data = data.copy()
         ref_data = ref_data.copy()
+        if self.block_ode:
+            # The model receives ``data`` while loss-time physical projection
+            # uses ``ref_data``.  Break shallow tensor aliases up front so an
+            # in-place model mutation cannot rewrite the reference topology.
+            data_topology = self._snapshot_block_topology(data)
+            ref_topology = self._snapshot_block_topology(ref_data)
+            self._require_matching_block_topology(data_topology, ref_topology)
+            self._restore_block_topology(data, data_topology)
+            self._restore_block_topology(ref_data, ref_topology)
 
         node_target = ref_data.get(self.node_target_key, None)
         edge_target = ref_data.get(self.edge_target_key, None)
-        if node_target is None and edge_target is None:
-            raise KeyError(
-                "CFM requires node and/or edge Hamiltonian targets in ref_data; "
-                f"looked for `{self.node_target_key}` and `{self.edge_target_key}`."
+        if self.block_ode:
+            if self.uureal_block_ode:
+                self._require_uureal_block_contract(data)
+                self._require_uureal_block_contract(ref_data)
+            missing_endpoint_fields = self._missing_keys(
+                ref_data,
+                (
+                    self.node_block_target_key,
+                    self.edge_block_target_key,
+                    self.node_block_shape_key,
+                    self.edge_block_shape_key,
+                ),
             )
-
-        like = node_target if node_target is not None else edge_target
-        device = like.device
-        dtype = like.dtype if torch.is_floating_point(like) else self.dtype
+            if missing_endpoint_fields:
+                raise KeyError(
+                    "Block-space ODE requires explicit endpoint blocks and shapes; "
+                    f"missing keys={missing_endpoint_fields}."
+                )
+            if not self.uureal_block_ode:
+                missing_h0_fields = self._missing_keys(
+                    data,
+                    (
+                        self.node_h0_block_key,
+                        self.edge_h0_block_key,
+                        self.node_h0_block_shape_key,
+                        self.edge_h0_block_shape_key,
+                    ),
+                )
+                if missing_h0_fields:
+                    raise KeyError(
+                        "Block-space ODE requires physical H0 blocks and shapes; "
+                        f"missing keys={missing_h0_fields}."
+                    )
+            like = torch.as_tensor(ref_data[self.node_block_target_key])
+            device = like.device
+            dtype = self.dtype
+            node_count = int(torch.as_tensor(ref_data[self.node_block_target_key]).shape[0])
+            edge_count = int(torch.as_tensor(ref_data[self.edge_block_target_key]).shape[0])
+        else:
+            if node_target is None and edge_target is None:
+                raise KeyError(
+                    "CFM requires node and/or edge Hamiltonian targets in ref_data; "
+                    f"looked for `{self.node_target_key}` and `{self.edge_target_key}`."
+                )
+            like = node_target if node_target is not None else edge_target
+            device = like.device
+            dtype = like.dtype if torch.is_floating_point(like) else self.dtype
+            node_count = None if node_target is None else node_target.shape[0]
+            edge_count = None if edge_target is None else edge_target.shape[0]
         num_graphs = self._num_graphs(data)
         if t is None:
-            t = self._sample_t(num_graphs=num_graphs, device=device, dtype=dtype)
+            time_generator = self._seeded_generator(device, time_seed)
+            sample_kwargs = {
+                "num_graphs": num_graphs,
+                "device": device,
+                "dtype": dtype,
+            }
+            if time_generator is not None:
+                sample_kwargs["generator"] = time_generator
+            t = self._sample_t(**sample_kwargs)
         else:
             t = self._normalize_t(t, num_graphs=num_graphs, device=device, dtype=dtype)
         node_t, edge_t = self._expand_graph_times(
             data,
             t,
-            node_count=None if node_target is None else node_target.shape[0],
-            edge_count=None if edge_target is None else edge_target.shape[0],
+            node_count=node_count,
+            edge_count=edge_count,
         )
+
+        if self.uureal_block_ode:
+            endpoint, endpoint_projection_residual = self._block_state_from_fields(
+                ref_data,
+                ref_data,
+                node_key=self.node_block_target_key,
+                edge_key=self.edge_block_target_key,
+                node_shape_key=self.node_block_shape_key,
+                edge_shape_key=self.edge_block_shape_key,
+                label="residual_dh endpoint",
+                device=device,
+                dtype=dtype,
+            )
+            node_alpha = node_t.reshape(
+                (-1,) + (1,) * (endpoint.node_blocks.ndim - 1)
+            )
+            edge_alpha = edge_t.reshape(
+                (-1,) + (1,) * (endpoint.edge_blocks.ndim - 1)
+            )
+            current = project_block_state(
+                data,
+                self.idp,
+                BlockTensorResult(
+                    node_alpha * endpoint.node_blocks,
+                    edge_alpha * endpoint.edge_blocks,
+                    endpoint.node_shapes,
+                    endpoint.edge_shapes,
+                ),
+            )
+            if self.detach_interpolated_h0:
+                current = BlockTensorResult(
+                    current.node_blocks.detach(),
+                    current.edge_blocks.detach(),
+                    current.node_shapes,
+                    current.edge_shapes,
+                )
+            self._attach_uureal_residual_state(data, current)
+            data[self.flow_time_key] = t.detach()
+            ref_data[self.flow_time_key] = t.detach()
+            ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+                endpoint_projection_residual, device=device, dtype=dtype
+            )
+            self._drop_block_authority_fields(data)
+            return data, ref_data, CFMContext(
+                t=t,
+                node_t=node_t,
+                edge_t=edge_t,
+                node_base=torch.as_tensor(data[self.node_h0_key]),
+                edge_base=torch.as_tensor(data[self.edge_h0_key]),
+                node_target=None,
+                edge_target=None,
+                node_current=current.node_blocks,
+                edge_current=current.edge_blocks,
+                node_prior=torch.zeros_like(current.node_blocks),
+                edge_prior=torch.zeros_like(current.edge_blocks),
+                block_target_semantics="residual_dh",
+            )
+
+        if self.residual_ao_block_ode:
+            assert self.block_codec is not None
+            self._require_spatial_residual_block_contract(data)
+            self._require_spatial_residual_block_contract(ref_data)
+            certify_image = self._strict_image_certification_due()
+            h0_blocks, h0_projection_residual = self._physical_h0_blocks(
+                data, device=device, dtype=dtype
+            )
+            endpoint, endpoint_projection_residual = self._block_state_from_fields(
+                ref_data,
+                ref_data,
+                node_key=self.node_block_target_key,
+                edge_key=self.edge_block_target_key,
+                node_shape_key=self.node_block_shape_key,
+                edge_shape_key=self.edge_block_shape_key,
+                label="residual_dh endpoint",
+                device=device,
+                dtype=dtype,
+            )
+            # Physical H0 RME is the CONSTANT conditioning channel: written to the
+            # H0 keys exactly once and never interpolated.  The pure residual state
+            # D travels in the spatial residual block keys instead.  This is the
+            # deliberate divergence from the generic ao_block_ode branch below,
+            # whose H0 keys carry the interpolated state RME.
+            node_base, edge_base = self.block_codec.blocks_to_rme(
+                data,
+                h0_blocks,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            data[self.node_h0_key] = node_base
+            data[self.edge_h0_key] = edge_base
+            node_alpha = node_t.reshape((-1,) + (1,) * (endpoint.node_blocks.ndim - 1))
+            edge_alpha = edge_t.reshape((-1,) + (1,) * (endpoint.edge_blocks.ndim - 1))
+            if self.prior == "zero":
+                # Zero prior: D_t = t * D1 exactly (no (1 - t) * prior term).  Legacy
+                # feature-key overwrites are intentionally skipped for B: the H0 keys
+                # already expose the physical conditioning channel honestly.
+                D_t = project_block_state(
+                    data,
+                    self.idp,
+                    BlockTensorResult(
+                        node_alpha * endpoint.node_blocks,
+                        edge_alpha * endpoint.edge_blocks,
+                        endpoint.node_shapes,
+                        endpoint.edge_shapes,
+                    ),
+                )
+                node_prior_blocks = None
+                edge_prior_blocks = None
+            else:
+                # projected_te stochastic bridge (v2): draw eps in the certified
+                # codec image (NO H0 added), exactly as A draws its TE noise, then
+                # D_t = project((1 - t) * eps + t * D1).  The (1 - t) * eps term
+                # kills the deterministic D_t = t * D1 shortcut the zero prior
+                # leaves open.  prior_seed threads the same seeded-generator path A
+                # uses (None during training => fresh noise; seeded during
+                # deterministic validation).
+                eps = self._residual_te_eps(
+                    data,
+                    node_base,
+                    edge_base,
+                    generator=self._seeded_generator(device, prior_seed),
+                    certify_image=certify_image,
+                )
+                D_t = project_block_state(
+                    data,
+                    self.idp,
+                    BlockTensorResult(
+                        (1.0 - node_alpha) * eps.node_blocks
+                        + node_alpha * endpoint.node_blocks,
+                        (1.0 - edge_alpha) * eps.edge_blocks
+                        + edge_alpha * endpoint.edge_blocks,
+                        endpoint.node_shapes,
+                        endpoint.edge_shapes,
+                    ),
+                )
+                node_prior_blocks = eps.node_blocks
+                edge_prior_blocks = eps.edge_blocks
+            if self.detach_interpolated_h0:
+                D_t = BlockTensorResult(
+                    D_t.node_blocks.detach(),
+                    D_t.edge_blocks.detach(),
+                    D_t.node_shapes,
+                    D_t.edge_shapes,
+                )
+            self._attach_spatial_residual_state(data, D_t)
+            data[self.flow_time_key] = t.detach()
+            ref_data[self.flow_time_key] = t.detach()
+            ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+                endpoint_projection_residual, device=device, dtype=dtype
+            )
+            ref_data["_block_ode_h0_projection_residual"] = torch.as_tensor(
+                h0_projection_residual, device=device, dtype=dtype
+            )
+            self._drop_block_authority_fields(data)
+            self._strict_certification_batches += 1
+            return data, ref_data, CFMContext(
+                t=t,
+                node_t=node_t,
+                edge_t=edge_t,
+                node_base=node_base,
+                edge_base=edge_base,
+                node_target=None,
+                edge_target=None,
+                node_current=D_t.node_blocks,
+                edge_current=D_t.edge_blocks,
+                # Zero prior keeps the exact zeros_like telemetry; projected_te
+                # exposes the drawn epsilon.  CFMContext.node_prior has no runtime
+                # consumer for this mode (the block-ODE loss reads node_current /
+                # node_target only), so this is telemetry-only either way.
+                node_prior=(
+                    torch.zeros_like(D_t.node_blocks)
+                    if node_prior_blocks is None
+                    else node_prior_blocks
+                ),
+                edge_prior=(
+                    torch.zeros_like(D_t.edge_blocks)
+                    if edge_prior_blocks is None
+                    else edge_prior_blocks
+                ),
+                block_target_semantics="residual_dh",
+            )
+
+        if self.block_ode:
+            assert self.block_codec is not None
+            certify_image = self._strict_image_certification_due()
+            h0_blocks, h0_projection_residual = self._physical_h0_blocks(
+                data, device=device, dtype=dtype
+            )
+            endpoint, endpoint_projection_residual = self._block_state_from_fields(
+                ref_data,
+                ref_data,
+                node_key=self.node_block_target_key,
+                edge_key=self.edge_block_target_key,
+                node_shape_key=self.node_block_shape_key,
+                edge_shape_key=self.edge_block_shape_key,
+                label=f"{self.target_semantics} endpoint",
+                device=device,
+                dtype=dtype,
+            )
+            # Coupled RME is generated only from certified blocks.  Legacy main
+            # and H0 feature side channels are intentionally ignored because
+            # older LMDBs store AO-product gathers under the same key names.
+            node_base, edge_base = self.block_codec.blocks_to_rme(
+                data,
+                h0_blocks,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            node_target, edge_target = self.block_codec.blocks_to_rme(
+                data,
+                endpoint,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            block_start, node_prior, edge_prior = self._block_initial_state(
+                data,
+                h0_blocks,
+                prior_seed=prior_seed,
+                certify_image=certify_image,
+            )
+
+            full_endpoint = self.block_codec.endpoint_to_full(endpoint, h0_blocks)
+            full_endpoint = project_block_state(data, self.idp, full_endpoint)
+            node_alpha = node_t.reshape((-1,) + (1,) * (full_endpoint.node_blocks.ndim - 1))
+            edge_alpha = edge_t.reshape((-1,) + (1,) * (full_endpoint.edge_blocks.ndim - 1))
+            block_current = project_block_state(
+                data,
+                self.idp,
+                BlockTensorResult(
+                    node_blocks=(1.0 - node_alpha) * block_start.node_blocks
+                    + node_alpha * full_endpoint.node_blocks,
+                    edge_blocks=(1.0 - edge_alpha) * block_start.edge_blocks
+                    + edge_alpha * full_endpoint.edge_blocks,
+                    node_shapes=h0_blocks.node_shapes,
+                    edge_shapes=h0_blocks.edge_shapes,
+                ),
+            )
+            node_current, edge_current = self.block_codec.blocks_to_rme(
+                data,
+                block_current,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            if self.detach_interpolated_h0:
+                node_current = node_current.detach()
+                edge_current = edge_current.detach()
+            data[self.node_h0_key] = node_current
+            data[self.edge_h0_key] = edge_current
+            if self.overwrite_feature_keys:
+                data[self.node_target_key] = node_current
+                data[self.edge_target_key] = edge_current
+            data[self.flow_time_key] = t.detach()
+            ref_data[self.flow_time_key] = t.detach()
+            ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+                endpoint_projection_residual, device=device, dtype=dtype
+            )
+            ref_data["_block_ode_h0_projection_residual"] = torch.as_tensor(
+                h0_projection_residual, device=device, dtype=dtype
+            )
+            # Endpoint/H0 block side channels are flow authority, not model
+            # inputs.  Removing them also breaks the shallow aliases created by
+            # Trainer's input/reference copies, so an in-place model cannot
+            # rewrite the labels used below by ``loss``.
+            self._drop_block_authority_fields(data)
+            # Advance only after all unconditional contract gates and any due
+            # certification pass; a failed batch remains due on retry.
+            self._strict_certification_batches += 1
+            return data, ref_data, CFMContext(
+                t=t,
+                node_t=node_t,
+                edge_t=edge_t,
+                node_base=node_base,
+                edge_base=edge_base,
+                node_target=node_target,
+                edge_target=edge_target,
+                node_current=node_current,
+                edge_current=edge_current,
+                node_prior=node_prior,
+                edge_prior=edge_prior,
+                block_target_semantics=self.target_semantics,
+            )
 
         node_base = edge_base = node_current = edge_current = None
         node_prior = edge_prior = None
@@ -1482,6 +3326,7 @@ class HamiltonianCFM:
             edge_current=edge_current,
             node_prior=node_prior,
             edge_prior=edge_prior,
+            block_target_semantics=self.target_semantics if self.block_ode else None,
         )
 
     # ------------------------------------------------------------------
@@ -1521,29 +3366,431 @@ class HamiltonianCFM:
         return pred, mask
 
     @staticmethod
+    def _active_block_mask(
+        blocks: torch.Tensor,
+        shapes: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if blocks.ndim != 3:
+            raise ValueError(
+                "AO-block flow expects [n_item, max_norb, max_norb] tensors; "
+                f"got shape={tuple(blocks.shape)}."
+            )
+        if shapes is None:
+            return torch.ones_like(blocks, dtype=torch.bool)
+        shapes = torch.as_tensor(shapes, device=blocks.device, dtype=torch.long)
+        if shapes.ndim != 2 or shapes.shape != (blocks.shape[0], 2):
+            raise ValueError(
+                "AO-block shape metadata must be [n_item, 2]; "
+                f"got shape={tuple(shapes.shape)} for blocks={tuple(blocks.shape)}."
+            )
+        rows = torch.arange(blocks.shape[-2], device=blocks.device)
+        cols = torch.arange(blocks.shape[-1], device=blocks.device)
+        return (rows[None, :, None] < shapes[:, 0, None, None]) & (
+            cols[None, None, :] < shapes[:, 1, None, None]
+        )
+
+    def _block_endpoint_loss(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """One-step endpoint loss for an H-B0 direct AO-block decoder.
+
+        Interpolation and time conditioning remain in RME/H0 feature space, while
+        the endpoint is supervised in AO-block space.  This is deliberately
+        restricted to one-step validation: it is a cross-space endpoint adapter,
+        not a same-coordinate multi-step ODE.
+        """
+        state: Dict[str, torch.Tensor] = {
+            "train_flow_t": ctx.t.detach().mean(),
+            "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
+        }
+        component_stats = []
+
+        for label, pred_key, target_key, shape_key, weight, item_t in (
+            (
+                "onsite",
+                self.node_output_key,
+                self.node_block_target_key,
+                self.node_block_shape_key,
+                self.node_weight,
+                ctx.node_t,
+            ),
+            (
+                "hopping",
+                self.edge_output_key,
+                self.edge_block_target_key,
+                self.edge_block_shape_key,
+                self.edge_weight,
+                ctx.edge_t,
+            ),
+        ):
+            pred = pred_data.get(pred_key, None)
+            target = ref_data.get(target_key, None)
+            if pred is None or target is None:
+                continue
+            target = torch.as_tensor(target, device=pred.device, dtype=pred.dtype)
+            if pred.shape != target.shape:
+                raise ValueError(
+                    f"AO-block flow {label} prediction/target mismatch: "
+                    f"{pred_key}={tuple(pred.shape)} vs {target_key}={tuple(target.shape)}."
+                )
+            mask = self._active_block_mask(pred, ref_data.get(shape_key, None))
+            diff = pred - target
+            item_weights = None if item_t is None else self._time_weight(item_t)
+            stats = self._legacy_metric_stats(
+                diff, mask, self.loss_type, item_weights
+            )
+            component = stats[0]
+            component_stats.append((stats, weight))
+            state[f"train_flow_{label}_loss"] = component.detach()
+            state[f"train_{label}_loss"] = component.detach()
+
+        if not component_stats:
+            raise KeyError(
+                "AO-block CFM could not compute a loss because outputs/targets do "
+                f"not contain {self.node_output_key}/{self.edge_output_key} and "
+                f"{self.node_block_target_key}/{self.edge_block_target_key}."
+            )
+        total = self._reduce_legacy_component_stats(tuple(component_stats))
+        return self._finalize_loss(total, state, pred_data)
+
+    def _block_ode_endpoint_loss(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+        *,
+        prediction_is_full_h: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Fail-closed endpoint loss on independent physical block freedoms."""
+        if ctx.block_target_semantics != self.target_semantics:
+            raise ValueError(
+                "Block-space ODE target semantics changed between prepare_batch and loss."
+            )
+        missing = [
+            key
+            for key in (
+                self.node_output_key,
+                self.edge_output_key,
+                self.node_block_target_key,
+                self.edge_block_target_key,
+                self.node_block_shape_key,
+                self.edge_block_shape_key,
+            )
+            if key not in (pred_data if key in {self.node_output_key, self.edge_output_key} else ref_data)
+        ]
+        if missing:
+            raise KeyError(f"Block-space ODE endpoint loss is missing required keys={missing}.")
+
+        node_pred = pred_data[self.node_output_key]
+        edge_pred = pred_data[self.edge_output_key]
+        node_target = torch.as_tensor(
+            ref_data[self.node_block_target_key], device=node_pred.device, dtype=node_pred.dtype
+        )
+        edge_target = torch.as_tensor(
+            ref_data[self.edge_block_target_key], device=edge_pred.device, dtype=edge_pred.dtype
+        )
+        if node_pred.shape != node_target.shape or edge_pred.shape != edge_target.shape:
+            raise ValueError(
+                "Block-space ODE prediction/target canvas mismatch: "
+                f"node {tuple(node_pred.shape)} vs {tuple(node_target.shape)}, "
+                f"edge {tuple(edge_pred.shape)} vs {tuple(edge_target.shape)}."
+            )
+        node_shapes = torch.as_tensor(ref_data[self.node_block_shape_key], device=node_pred.device)
+        edge_shapes = torch.as_tensor(ref_data[self.edge_block_shape_key], device=edge_pred.device)
+        pred_state = BlockTensorResult(node_pred, edge_pred, node_shapes, edge_shapes)
+        target_state = BlockTensorResult(node_target, edge_target, node_shapes, edge_shapes)
+
+        # Model outputs are predictions, not graph authority.  Pairing and
+        # species shapes must come from the independently preserved reference
+        # topology or a returned/stale PBC shift can redefine Hermitian mates.
+        target_projected = project_block_state(ref_data, self.idp, target_state)
+        target_residual = max(
+            self._max_abs(target_projected.node_blocks - node_target),
+            self._max_abs(target_projected.edge_blocks - edge_target),
+        )
+        if target_residual > self.block_inverse_atol:
+            raise ValueError(
+                "Block-space ODE target violates onsite/reverse/padding constraints: "
+                f"max residual={target_residual:.6g}, atol={self.block_inverse_atol}."
+            )
+
+        if prediction_is_full_h and self.target_semantics == "residual_dh":
+            if ctx.node_base is None or ctx.edge_base is None:
+                raise ValueError("Residual block sample scoring requires both H0 RME components.")
+            h0 = self.block_codec.rme_to_blocks(
+                ref_data, ctx.node_base, ctx.edge_base, project=True
+            )
+            target_state = self.block_codec.endpoint_to_full(target_projected, h0)
+            target_projected = project_block_state(ref_data, self.idp, target_state)
+
+        pred_projected = project_block_state(ref_data, self.idp, pred_state)
+        node_diff = pred_projected.node_blocks - target_projected.node_blocks
+        edge_diff = pred_projected.edge_blocks - target_projected.edge_blocks
+
+        node_valid = block_mask_from_shapes(
+            pred_projected.node_shapes, tuple(node_diff.shape[-2:])
+        )
+        upper = torch.triu(
+            torch.ones(tuple(node_diff.shape[-2:]), dtype=torch.bool, device=node_diff.device)
+        )
+        node_mask = node_valid & upper.unsqueeze(0)
+
+        edge_valid = block_mask_from_shapes(
+            pred_projected.edge_shapes, tuple(edge_diff.shape[-2:])
+        )
+        rev = strict_reverse_edge_index(
+            ref_data, device=edge_diff.device, idp=self.idp
+        )
+        rows = torch.arange(edge_diff.shape[0], device=edge_diff.device)
+        canonical_rows = rows <= rev
+        edge_mask = edge_valid & canonical_rows.view(-1, 1, 1)
+        self_reverse = rows == rev
+        if bool(self_reverse.any().item()):
+            edge_mask[self_reverse] &= upper.unsqueeze(0)
+
+        node_stats = self._metric_stats(
+            node_diff, node_mask, self.loss_type, self._time_weight(ctx.node_t)
+        )
+        edge_stats = self._metric_stats(
+            edge_diff, edge_mask, self.loss_type, self._time_weight(ctx.edge_t)
+        )
+        node_component = node_stats[0]
+        edge_component = edge_stats[0]
+        total = self._reduce_component_stats(
+            ((node_stats, self.node_weight), (edge_stats, self.edge_weight))
+        )
+
+        # NOTE: the flow objective publishes its endpoint node/edge metric ONLY under
+        # the flow namespace (train_flow_onsite_loss/train_flow_hopping_loss).  It does
+        # NOT alias it into the bare train_onsite_loss/train_hopping_loss: those legacy
+        # tags carry feature-compatible semantics and are written solely by the
+        # compatible pass (Trainer._compatible_loss_state*, legacy_prefix), so the two
+        # namespaces never mix under one tag.  (Previously the flow value was aliased
+        # here; the compatible pass then overwrote it every step, but if that pass were
+        # ever throttled/absent the flow value would leak under the compatible tag.)
+        state: Dict[str, torch.Tensor] = {
+            "train_flow_t": ctx.t.detach().mean(),
+            "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
+            "train_flow_onsite_loss": node_component.detach(),
+            "train_flow_hopping_loss": edge_component.detach(),
+            "block_ode_target_projection_residual": torch.as_tensor(
+                target_residual, device=total.device, dtype=total.dtype
+            ),
+            "_compatible_clean_stats": {
+                **self._compatible_clean_stats(node_diff, node_mask, "onsite"),
+                **self._compatible_clean_stats(edge_diff, edge_mask, "hopping"),
+            },
+        }
+        if self.uureal_block_ode:
+            # Historical-comparison metric (review P1-5).  Two deliberately
+            # coexisting reductions:
+            #   * canonical (`train_flow_*_loss` above): each independent physical
+            #     freedom counted ONCE -- onsite upper triangle plus one
+            #     canonical edge per Hermitian (i,j,R)/(j,i,-R) pair;
+            #   * compatible_directed (`train_compatible_directed_*`): every
+            #     stored directed coordinate counted, i.e. all mapper-valid
+            #     onsite entries and ALL directed edges -- the same population
+            #     the historical SOC uu-real RME losses (H-B0/H-A1 runs)
+            #     averaged over.  Counts differ (~2x) and values differ whenever
+            #     the error is not Hermitian-symmetric, so curves plotted
+            #     against historical runs must use the directed keys.
+            directed_node_stats = self._metric_stats(
+                node_diff, node_valid, self.loss_type, self._time_weight(ctx.node_t)
+            )
+            directed_edge_stats = self._metric_stats(
+                edge_diff, edge_valid, self.loss_type, self._time_weight(ctx.edge_t)
+            )
+            directed_total = self._reduce_component_stats(
+                (
+                    (directed_node_stats, self.node_weight),
+                    (directed_edge_stats, self.edge_weight),
+                )
+            )
+            state["train_compatible_directed_onsite_loss"] = directed_node_stats[0].detach()
+            state["train_compatible_directed_hopping_loss"] = directed_edge_stats[0].detach()
+            state["train_compatible_directed_loss"] = directed_total.detach()
+        return self._finalize_loss(total, state, pred_data)
+
+    @staticmethod
+    def _safe_exact_rmse(
+        square_sum: torch.Tensor,
+        safe_count: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a finite-gradient RMSE that is exactly zero at zero error."""
+        mean_square = square_sum / safe_count
+        positive = mean_square > 0
+        sqrt_input = torch.where(
+            positive,
+            mean_square,
+            torch.ones_like(mean_square),
+        )
+        return torch.where(positive, torch.sqrt(sqrt_input), mean_square)
+
+    @staticmethod
     def _metric_stats(
         diff: torch.Tensor,
         mask: torch.Tensor,
         loss_type: str,
         weights: Optional[torch.Tensor] = None,
+    ) -> _MetricStats:
+        mask_f, weights_f, count = HamiltonianCFM._metric_inputs(
+            diff, mask, weights
+        )
+        if loss_type == "mse":
+            square_sum = (diff.square() * mask_f * weights_f).sum()
+            metric = torch.where(
+                count > 0,
+                square_sum / count.clamp_min(1.0),
+                square_sum * 0.0,
+            )
+            return metric, square_sum, square_sum, count
+        abs_sum = (diff.abs() * mask_f * weights_f).sum()
+        sq_sum = (diff.square() * mask_f * weights_f).sum()
+        safe_count = count.clamp_min(1.0)
+        metric = 0.5 * (
+            abs_sum / safe_count
+            + HamiltonianCFM._safe_exact_rmse(sq_sum, safe_count)
+        )
+        metric = torch.where(count > 0, metric, abs_sum * 0.0)
+        return metric, abs_sum, sq_sum, count
+
+    @staticmethod
+    def _metric_inputs(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+        weights: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Normalize the shared mask, weight, and raw-count metric inputs."""
         mask_f = mask.to(device=diff.device, dtype=diff.dtype)
-        count = mask_f.sum().clamp_min(1.0)
+        count = mask_f.sum()
         if weights is None:
             weights_f = torch.ones_like(diff)
         else:
             weights_f = weights.to(device=diff.device, dtype=diff.dtype)
             weights_f = weights_f.reshape((-1,) + (1,) * (diff.ndim - 1))
             weights_f = weights_f.expand_as(diff)
+        return mask_f, weights_f, count
+
+    @staticmethod
+    def _legacy_metric_stats(
+        diff: torch.Tensor,
+        mask: torch.Tensor,
+        loss_type: str,
+        weights: Optional[torch.Tensor] = None,
+    ) -> _MetricStats:
+        """Frozen pre-block-ODE component metric from parent ``e7e5410``."""
+        mask_f, weights_f, count = HamiltonianCFM._metric_inputs(
+            diff, mask, weights
+        )
+        count = count.clamp_min(1.0)
         if loss_type == "mse":
             numerator = (diff.square() * mask_f * weights_f).sum()
-            return numerator / count, numerator, count
-        abs_sum = (diff.abs() * mask_f * weights_f).sum()
-        sq_sum = (diff.square() * mask_f * weights_f).sum()
-        l1 = abs_sum / count
-        rmse = torch.sqrt(sq_sum / count + 1e-12)
-        metric = 0.5 * (l1 + rmse)
-        return metric, metric * count, count
+            metric = numerator / count
+        else:
+            abs_sum = (diff.abs() * mask_f * weights_f).sum()
+            square_sum = (diff.square() * mask_f * weights_f).sum()
+            metric = 0.5 * (
+                abs_sum / count + torch.sqrt(square_sum / count + 1.0e-12)
+            )
+            numerator = metric * count
+        # Match the shared stats tuple shape. The legacy reducer consumes only
+        # component metric, numerator, and clamped component count.
+        return metric, numerator, numerator, count
+
+    @staticmethod
+    def _global_metric(
+        primary_sum: torch.Tensor,
+        square_sum: torch.Tensor,
+        count: torch.Tensor,
+        loss_type: str,
+    ) -> torch.Tensor:
+        safe_count = count.clamp_min(1.0)
+        if loss_type == "mse":
+            metric = primary_sum / safe_count
+        else:
+            metric = 0.5 * (
+                primary_sum / safe_count
+                + HamiltonianCFM._safe_exact_rmse(square_sum, safe_count)
+            )
+        return torch.where(count > 0, metric, primary_sum * 0.0)
+
+    def _reduce_component_stats(
+        self,
+        components: _WeightedMetricStats,
+    ) -> torch.Tensor:
+        """Apply the configured node/edge reduction to raw metric statistics.
+
+        ``global_elements`` is a single reduction over all valid elements and
+        therefore accepts unit component weights only. ``equal_components``
+        keeps the historical sum of independently reduced component metrics,
+        where node/edge weights are explicit outer loss multipliers. Empty
+        components carry zero statistics and contribute zero in either mode.
+        """
+        if not components:
+            raise ValueError("At least one loss component is required.")
+        if self.component_reduction == "equal_components":
+            return self._weighted_component_metric_sum(components)
+
+        primary_sum = square_sum = count = None
+        for stats, _weight in components:
+            primary_sum = stats[1] if primary_sum is None else primary_sum + stats[1]
+            square_sum = stats[2] if square_sum is None else square_sum + stats[2]
+            count = stats[3] if count is None else count + stats[3]
+        return self._global_metric(primary_sum, square_sum, count, self.loss_type)
+
+    @staticmethod
+    def _weighted_component_metric_sum(
+        components: _WeightedMetricStats,
+    ) -> torch.Tensor:
+        total = None
+        for stats, weight in components:
+            weighted = float(weight) * stats[0]
+            total = weighted if total is None else total + weighted
+        return total
+
+    def _reduce_legacy_component_stats(
+        self,
+        components: _WeightedMetricStats,
+    ) -> torch.Tensor:
+        """Reproduce the parent component-first reduction for legacy routes."""
+        if not components:
+            raise ValueError("At least one loss component is required.")
+        if self.component_reduction == "equal_components":
+            return self._weighted_component_metric_sum(components)
+
+        numerator = count = None
+        for stats, weight in components:
+            weighted_numerator = float(weight) * stats[1]
+            weighted_count = float(weight) * stats[3]
+            numerator = (
+                weighted_numerator
+                if numerator is None
+                else numerator + weighted_numerator
+            )
+            count = weighted_count if count is None else count + weighted_count
+        return numerator / count.clamp_min(1.0)
+
+    def _finalize_loss(
+        self,
+        total: torch.Tensor,
+        state: Dict[str, torch.Tensor],
+        pred_data: AtomicDataDict.Type,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Attach shared router diagnostics and publish the final train loss."""
+        mean_max_prob = pred_data.get("mean_max_prob", None)
+        if torch.is_tensor(mean_max_prob):
+            state["mean_max_prob"] = mean_max_prob.detach()
+            if self.router_z_loss_coef > 0.0:
+                total = total + self.router_z_loss_coef * mean_max_prob
+        expert_load_cv = pred_data.get("expert_load_cv", None)
+        if torch.is_tensor(expert_load_cv):
+            state["expert_load_cv"] = expert_load_cv.detach()
+        state["train_flow_loss"] = total.detach()
+        self.last_state = state
+        return total, state
 
     @staticmethod
     def _compatible_clean_stats(
@@ -1613,16 +3860,18 @@ class HamiltonianCFM:
         if not self.enabled:
             raise RuntimeError("HamiltonianCFM.loss called while disabled")
 
+        if self.output_space == "ao_block":
+            return self._block_endpoint_loss(pred_data, ref_data, ctx)
+        if self.block_ode:
+            return self._block_ode_endpoint_loss(pred_data, ref_data, ctx)
+
         t_weight = self._time_weight(ctx.t).to(device=ctx.t.device, dtype=ctx.t.dtype)
-        total = None
-        total_numerator = None
-        total_count = None
+        component_stats = []
         state: Dict[str, torch.Tensor] = {
             "train_flow_t": ctx.t.detach().mean(),
             "train_flow_weight": t_weight.detach().mean(),
         }
 
-        node_loss = None
         if ctx.node_target is not None and self.node_target_key in pred_data:
             pred = pred_data[self.node_target_key]
             target = ref_data[self.node_target_key].to(device=pred.device, dtype=pred.dtype)
@@ -1630,9 +3879,10 @@ class HamiltonianCFM:
             pred, mask = self._project_loss_layout(pred, mask, target)
             node_diff = pred - target
             node_weights = self._time_weight(ctx.node_t)
-            node_loss, node_numerator, node_count = self._metric_stats(
+            node_stats = self._legacy_metric_stats(
                 node_diff, mask, self.loss_type, node_weights
             )
+            node_loss = node_stats[0]
             if self.log_train_compatible_loss or self.log_validation_compatible_loss:
                 self._merge_compatible_clean_stats(
                     state,
@@ -1646,14 +3896,11 @@ class HamiltonianCFM:
                         ),
                     )
                 )
-            total = self.node_weight * node_loss if total is None else total + self.node_weight * node_loss
-            total_numerator = self.node_weight * node_numerator
-            total_count = self.node_weight * node_count
-            node_loss_detached = node_loss.detach()
-            state["train_flow_onsite_loss"] = node_loss_detached
-            state["train_onsite_loss"] = node_loss_detached
+            component_stats.append((node_stats, self.node_weight))
+            # Flow namespace only; the bare train_onsite_loss is compatible-only (see
+            # the block-ODE endpoint loss note above).
+            state["train_flow_onsite_loss"] = node_loss.detach()
 
-        edge_loss = None
         if ctx.edge_target is not None and self.edge_target_key in pred_data:
             pred = pred_data[self.edge_target_key]
             target = ref_data[self.edge_target_key].to(device=pred.device, dtype=pred.dtype)
@@ -1661,9 +3908,10 @@ class HamiltonianCFM:
             pred, mask = self._project_loss_layout(pred, mask, target)
             edge_diff = pred - target
             edge_weights = self._time_weight(ctx.edge_t)
-            edge_loss, edge_numerator, edge_count = self._metric_stats(
+            edge_stats = self._legacy_metric_stats(
                 edge_diff, mask, self.loss_type, edge_weights
             )
+            edge_loss = edge_stats[0]
             if self.log_train_compatible_loss or self.log_validation_compatible_loss:
                 self._merge_compatible_clean_stats(
                     state,
@@ -1677,37 +3925,73 @@ class HamiltonianCFM:
                         ),
                     )
                 )
-            total = self.edge_weight * edge_loss if total is None else total + self.edge_weight * edge_loss
-            if total_numerator is None:
-                total_numerator = self.edge_weight * edge_numerator
-                total_count = self.edge_weight * edge_count
-            else:
-                total_numerator = total_numerator + self.edge_weight * edge_numerator
-                total_count = total_count + self.edge_weight * edge_count
-            edge_loss_detached = edge_loss.detach()
-            state["train_flow_hopping_loss"] = edge_loss_detached
-            state["train_hopping_loss"] = edge_loss_detached
+            component_stats.append((edge_stats, self.edge_weight))
+            # Flow namespace only; the bare train_hopping_loss is compatible-only.
+            state["train_flow_hopping_loss"] = edge_loss.detach()
 
-        if total is None:
+        if not component_stats:
             raise KeyError(
                 "CFM could not compute a loss because model outputs do not contain "
                 f"`{self.node_target_key}` or `{self.edge_target_key}`."
             )
-        if self.component_reduction == "global_elements":
-            total = total_numerator / total_count.clamp_min(1.0)
+        total = self._reduce_legacy_component_stats(tuple(component_stats))
+        return self._finalize_loss(total, state, pred_data)
 
-        mean_max_prob = pred_data.get("mean_max_prob", None)
-        if torch.is_tensor(mean_max_prob):
-            state["mean_max_prob"] = mean_max_prob.detach()
-            if self.router_z_loss_coef > 0.0:
-                total = total + self.router_z_loss_coef * mean_max_prob
-        expert_load_cv = pred_data.get("expert_load_cv", None)
-        if torch.is_tensor(expert_load_cv):
-            state["expert_load_cv"] = expert_load_cv.detach()
+    def loss_on_sample(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Score :meth:`sample` output without trusting model-owned metadata.
 
-        state["train_flow_loss"] = total.detach()
-        self.last_state = state
-        return total, state
+        Block-space sampling always returns physical Full-H blocks, whereas a
+        residual-dH training endpoint is scored in its configured target space.
+        Keep that distinction in the flow API instead of a writable data-dict
+        flag.  Other CFM output spaces retain their ordinary loss semantics.
+        """
+        if self.block_ode:
+            if self.uureal_block_ode:
+                # The compact-uu rollout returns residual-dH blocks, not
+                # physical Full-H; score it in its configured residual space.
+                return self._block_ode_endpoint_loss(
+                    pred_data,
+                    ref_data,
+                    ctx,
+                    prediction_is_full_h=False,
+                )
+            return self.compatible_loss_on_sample(pred_data, ref_data, ctx)
+        return self.loss(pred_data, ref_data, ctx)
+
+    def compatible_loss_on_sample(
+        self,
+        pred_data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        ctx: CFMContext,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Score a rollout with endpoint-compatible reductions."""
+        if not self.block_ode:
+            raise RuntimeError("compatible_loss_on_sample requires block_ode.")
+        if self.uureal_block_ode:
+            # The compact-uu rollout returns residual-dH blocks, not physical
+            # Full-H, and this mode intentionally has no exact_rme block codec
+            # (block_codec=None).  Scoring it as Full-H both miscounts H0 as
+            # prediction error and crashes on block_codec.rme_to_blocks
+            # (MultiTrainer first validation with validation_ode_steps=[1] +
+            # log_validation_flow_euler_loss=false).  The residual scorer already
+            # applies the same endpoint-compatible reductions.
+            return self._block_ode_endpoint_loss(
+                pred_data,
+                ref_data,
+                ctx,
+                prediction_is_full_h=False,
+            )
+        return self._block_ode_endpoint_loss(
+            pred_data,
+            ref_data,
+            ctx,
+            prediction_is_full_h=True,
+        )
 
     # ------------------------------------------------------------------
     # Sampling
@@ -1733,17 +4017,574 @@ class HamiltonianCFM:
             return None if feature is None else torch.zeros_like(feature)
         return base
 
+    def _sample_block_ode(
+        self,
+        model: torch.nn.Module,
+        state: AtomicDataDict.Type,
+        *,
+        num_steps: int,
+        num_graphs: int,
+        prior_seed: Optional[int] = None,
+    ) -> AtomicDataDict.Type:
+        """Projected endpoint-blend rollout in full AO-block state space."""
+        if self.block_codec is None:
+            raise RuntimeError("Block-space ODE codec was not constructed.")
+        topology_sidecar = self._snapshot_block_topology(state)
+        self._restore_block_topology(state, topology_sidecar)
+        h0_blocks, _ = self._physical_h0_blocks(state)
+        accumulator_dtype = self.dtype
+        h0_blocks = BlockTensorResult(
+            h0_blocks.node_blocks.to(dtype=accumulator_dtype),
+            h0_blocks.edge_blocks.to(dtype=accumulator_dtype),
+            h0_blocks.node_shapes,
+            h0_blocks.edge_shapes,
+        )
+        block_current, _, _ = self._block_initial_state(
+            state, h0_blocks, prior_seed=prior_seed
+        )
+        self._drop_block_authority_fields(state)
+        output_only_keys = self._block_ode_output_only_keys()
+        # LemMoEV3H0 consumes and deletes these input-side accelerators.  Keep
+        # them outside the mutable rollout state and inject an unchanged copy at
+        # every model call so a precomputed active set cannot drift on step 2+.
+        lem_sidecar = {
+            key: state.pop(key)
+            for key in _LEM_INPUT_SIDECAR_KEYS
+            if key in state
+        }
+        times = torch.linspace(
+            0.0,
+            1.0,
+            num_steps + 1,
+            device=block_current.node_blocks.device,
+            dtype=accumulator_dtype,
+        )
+
+        for step in range(num_steps):
+            cur_t = times[step]
+            next_t = times[step + 1]
+            if not bool((cur_t < 1.0).item()):
+                raise RuntimeError("Block-space ODE must never evaluate the model at t=1.")
+            denom = 1.0 - cur_t
+            alpha = (next_t - cur_t) / denom
+            if not bool(((alpha > 0.0) & (alpha <= 1.0)).item()):
+                raise RuntimeError(
+                    f"Invalid block-space ODE blend alpha={float(alpha.item())}."
+                )
+
+            node_rme, edge_rme = self.block_codec.blocks_to_rme(state, block_current)
+            state[self.node_h0_key] = node_rme.clone()
+            state[self.edge_h0_key] = edge_rme.clone()
+            if self.overwrite_feature_keys:
+                state[self.node_target_key] = node_rme.clone()
+                state[self.edge_target_key] = edge_rme.clone()
+            state[self.flow_time_key] = torch.full(
+                (num_graphs,),
+                float(cur_t.item()),
+                device=block_current.node_blocks.device,
+                dtype=accumulator_dtype,
+            )
+            # Supported DeePTB modules mutate the dictionary and may use
+            # in-place tensor operations.  Give each ODE step owned tensor
+            # storage so those writes cannot alias the persistent rollout state.
+            model_input = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in state.items()
+                if key not in output_only_keys
+            }
+            self._restore_block_topology(
+                model_input, topology_sidecar, clone_values=True
+            )
+            model_input.update(
+                {
+                    key: value.clone() if torch.is_tensor(value) else value
+                    for key, value in lem_sidecar.items()
+                }
+            )
+            prediction = model(model_input)
+            self._require_fresh_block_ode_outputs(prediction, step=step + 1)
+            merged = state.copy()
+            merged.update(prediction)
+            self._restore_block_topology(merged, topology_sidecar)
+            for key in _LEM_INPUT_SIDECAR_KEYS:
+                merged.pop(key, None)
+            raw_node_endpoint = self._require_real_finite_tensor(
+                prediction[self.node_output_key],
+                label="block-space ODE node endpoint prediction",
+            )
+            raw_edge_endpoint = self._require_real_finite_tensor(
+                prediction[self.edge_output_key],
+                label="block-space ODE edge endpoint prediction",
+            )
+            endpoint = BlockTensorResult(
+                raw_node_endpoint.to(
+                    device=block_current.node_blocks.device, dtype=accumulator_dtype
+                ),
+                raw_edge_endpoint.to(
+                    device=block_current.edge_blocks.device, dtype=accumulator_dtype
+                ),
+                block_current.node_shapes,
+                block_current.edge_shapes,
+            )
+            full_endpoint = self.block_codec.endpoint_to_full(endpoint, h0_blocks)
+            full_endpoint = project_block_state(merged, self.idp, full_endpoint)
+            block_current = project_block_state(
+                merged,
+                self.idp,
+                BlockTensorResult(
+                    (1.0 - alpha) * block_current.node_blocks
+                    + alpha * full_endpoint.node_blocks,
+                    (1.0 - alpha) * block_current.edge_blocks
+                    + alpha * full_endpoint.edge_blocks,
+                    block_current.node_shapes,
+                    block_current.edge_shapes,
+                ),
+            )
+            state = merged
+
+        node_final_rme, edge_final_rme = self.block_codec.blocks_to_rme(state, block_current)
+        state[self.node_h0_key] = node_final_rme
+        state[self.edge_h0_key] = edge_final_rme
+        if self.overwrite_feature_keys:
+            state[self.node_target_key] = node_final_rme
+            state[self.edge_target_key] = edge_final_rme
+        attach_prediction_block_tensors(
+            state,
+            block_current,
+            node_key=self.node_output_key,
+            edge_key=self.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        state[self.flow_time_key] = torch.ones(
+            num_graphs, device=block_current.node_blocks.device, dtype=accumulator_dtype
+        )
+        return state
+
+    def _sample_uureal_block_ode(
+        self,
+        model: torch.nn.Module,
+        state: AtomicDataDict.Type,
+        *,
+        num_steps: int,
+        num_graphs: int,
+    ) -> AtomicDataDict.Type:
+        """Roll out the compact-uu residual state D without H0 materialization."""
+        self._require_uureal_block_contract(state, require_endpoint_labels=False)
+        topology_sidecar = self._snapshot_block_topology(state)
+        self._restore_block_topology(state, topology_sidecar)
+        node_shapes, edge_shapes = infer_block_shapes(state, self.idp, device=self.device)
+        canvas = mapper_max_norb(self.idp)
+        node_count = int(node_shapes.shape[0])
+        edge_count = int(edge_shapes.shape[0])
+        current = BlockTensorResult(
+            torch.zeros((node_count, canvas, canvas), dtype=self.dtype, device=self.device),
+            torch.zeros((edge_count, canvas, canvas), dtype=self.dtype, device=self.device),
+            node_shapes,
+            edge_shapes,
+        )
+        self._drop_block_authority_fields(state)
+        output_only_keys = self._block_ode_output_only_keys()
+        lem_sidecar = {
+            key: state.pop(key)
+            for key in _LEM_INPUT_SIDECAR_KEYS
+            if key in state
+        }
+        times = torch.linspace(0.0, 1.0, num_steps + 1, device=self.device, dtype=self.dtype)
+        for step in range(num_steps):
+            cur_t, next_t = times[step], times[step + 1]
+            alpha = (next_t - cur_t) / (1.0 - cur_t)
+            self._attach_uureal_residual_state(state, current)
+            state[self.flow_time_key] = torch.full(
+                (num_graphs,), float(cur_t.item()), dtype=self.dtype, device=self.device
+            )
+            model_input = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in state.items()
+                if key not in output_only_keys
+            }
+            self._restore_block_topology(model_input, topology_sidecar, clone_values=True)
+            model_input.update({
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in lem_sidecar.items()
+            })
+            prediction = model(model_input)
+            self._require_fresh_block_ode_outputs(prediction, step=step + 1)
+            merged = state.copy()
+            merged.update(prediction)
+            self._restore_block_topology(merged, topology_sidecar)
+            for key in _LEM_INPUT_SIDECAR_KEYS:
+                merged.pop(key, None)
+            endpoint = BlockTensorResult(
+                self._require_real_finite_tensor(
+                    prediction[self.node_output_key],
+                    label="uureal residual node endpoint",
+                ).to(device=self.device, dtype=self.dtype),
+                self._require_real_finite_tensor(
+                    prediction[self.edge_output_key],
+                    label="uureal residual edge endpoint",
+                ).to(device=self.device, dtype=self.dtype),
+                current.node_shapes,
+                current.edge_shapes,
+            )
+            endpoint = project_block_state(merged, self.idp, endpoint)
+            current = project_block_state(
+                merged,
+                self.idp,
+                BlockTensorResult(
+                    (1.0 - alpha) * current.node_blocks + alpha * endpoint.node_blocks,
+                    (1.0 - alpha) * current.edge_blocks + alpha * endpoint.edge_blocks,
+                    current.node_shapes,
+                    current.edge_shapes,
+                ),
+            )
+            state = merged
+
+        self._attach_uureal_residual_state(state, current)
+        attach_prediction_block_tensors(
+            state,
+            current,
+            node_key=self.node_output_key,
+            edge_key=self.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        state[self.flow_time_key] = torch.ones(
+            num_graphs, device=self.device, dtype=self.dtype
+        )
+        return state
+
+    def _prior_state_as_residual_D0(
+        self,
+        data: AtomicDataDict.Type,
+        prior_state: Any,
+        h0_blocks: BlockTensorResult,
+    ) -> BlockTensorResult:
+        """TA-1: validate a caller-supplied ``prior_state`` and return it as D0.
+
+        ``prior_state`` is the explicit transformable latent: a
+        :class:`BlockTensorResult` or a ``(node_blocks, edge_blocks)`` pair already
+        in the physical-H0 canvas block layout.  It is validated exactly like the
+        seeded draw -- real/finite, shape against the H0 canvas, and codec-image
+        certification (both the onsite/reverse/padding projection residual and the
+        strict CG repack roundtrip, each bounded by ``block_inverse_atol``) -- and
+        returned VERBATIM so a caller can rotate/permute it alongside the input to
+        obtain pathwise equivariance (a rotated/permuted valid latent stays in the
+        codec image, so certification still passes).  The TA-3 all-zero belt is NOT
+        applied: the latent is caller-authoritative, so a deliberate zero start is
+        respected (finiteness is still enforced).
+        """
+        assert self.block_codec is not None
+        if isinstance(prior_state, BlockTensorResult):
+            node_blocks, edge_blocks = prior_state.node_blocks, prior_state.edge_blocks
+        else:
+            try:
+                node_blocks, edge_blocks = prior_state
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "projected_te prior_state must be a BlockTensorResult or a "
+                    "(node_blocks, edge_blocks) pair in the physical-H0 canvas block "
+                    "layout."
+                )
+        node_blocks = self._require_real_finite_tensor(
+            node_blocks, label="projected_te prior_state node blocks"
+        ).to(device=h0_blocks.node_blocks.device, dtype=self.dtype)
+        edge_blocks = self._require_real_finite_tensor(
+            edge_blocks, label="projected_te prior_state edge blocks"
+        ).to(device=h0_blocks.edge_blocks.device, dtype=self.dtype)
+        if tuple(node_blocks.shape) != tuple(h0_blocks.node_blocks.shape):
+            raise ValueError(
+                f"projected_te prior_state node blocks shape {tuple(node_blocks.shape)} "
+                f"!= H0 canvas node shape {tuple(h0_blocks.node_blocks.shape)}."
+            )
+        if tuple(edge_blocks.shape) != tuple(h0_blocks.edge_blocks.shape):
+            raise ValueError(
+                f"projected_te prior_state edge blocks shape {tuple(edge_blocks.shape)} "
+                f"!= H0 canvas edge shape {tuple(h0_blocks.edge_blocks.shape)}."
+            )
+        state_blocks = BlockTensorResult(
+            node_blocks, edge_blocks, h0_blocks.node_shapes, h0_blocks.edge_shapes
+        )
+        projected = project_block_state(data, self.idp, state_blocks)
+        proj_residual = max(
+            self._max_abs(
+                projected.node_blocks - state_blocks.node_blocks,
+                label="prior_state node projection residual",
+            ),
+            self._max_abs(
+                projected.edge_blocks - state_blocks.edge_blocks,
+                label="prior_state edge projection residual",
+            ),
+        )
+        if proj_residual > self.block_inverse_atol:
+            raise ValueError(
+                "projected_te prior_state violates onsite/reverse/padding "
+                "constraints (supply it in the certified H0 canvas layout): max "
+                f"residual={proj_residual:.6g}, atol={self.block_inverse_atol:.6g}."
+            )
+        node_rme, edge_rme = self.block_codec.blocks_to_rme(
+            data, state_blocks, certify_image=True
+        )
+        roundtrip = self.block_codec.rme_to_blocks(
+            data, node_rme, edge_rme, project=True
+        )
+        image_residual = max(
+            self._max_abs(
+                roundtrip.node_blocks - state_blocks.node_blocks,
+                label="prior_state node codec-image residual",
+            ),
+            self._max_abs(
+                roundtrip.edge_blocks - state_blocks.edge_blocks,
+                label="prior_state edge codec-image residual",
+            ),
+        )
+        if image_residual > self.block_inverse_atol:
+            raise ValueError(
+                "projected_te prior_state is outside the certified codec image: "
+                f"max residual={image_residual:.6g}, atol={self.block_inverse_atol:.6g}."
+            )
+        return state_blocks
+
+    def _sample_residual_ao_block_ode(
+        self,
+        model: torch.nn.Module,
+        state: AtomicDataDict.Type,
+        *,
+        num_steps: int,
+        num_graphs: int,
+        prior_seed: Optional[int] = None,
+        prior_state: Any = None,
+    ) -> AtomicDataDict.Type:
+        """Roll out the non-SOC residual state D, then assemble H = H0 + D once."""
+        if self.block_codec is None:
+            raise RuntimeError("Block-space ODE codec was not constructed.")
+        self._require_spatial_residual_block_contract(
+            state, require_endpoint_labels=False
+        )
+        topology_sidecar = self._snapshot_block_topology(state)
+        self._restore_block_topology(state, topology_sidecar)
+        h0_blocks, _ = self._physical_h0_blocks(state)
+        h0_blocks = BlockTensorResult(
+            h0_blocks.node_blocks.to(dtype=self.dtype),
+            h0_blocks.edge_blocks.to(dtype=self.dtype),
+            h0_blocks.node_shapes,
+            h0_blocks.edge_shapes,
+        )
+        # Physical H0 RME is derived ONCE from the certified H0 blocks and written
+        # to the H0 keys as the constant conditioning channel (contract-(2) rollout
+        # lock): the model sees the SAME physical H0 RME at every step, while only
+        # the residual state D advances (carried in the spatial residual keys).
+        node_base, edge_base = self.block_codec.blocks_to_rme(
+            state, h0_blocks, certify_image=True
+        )
+        if self.prior == "zero":
+            # Zero prior: D0 = 0 exactly (byte-identical to v1).  A prior_seed and
+            # an explicit prior_state are both meaningless here and rejected,
+            # mirroring _block_initial_state's zero-prior symmetry (the top-level
+            # sample() guard rejects them before dispatch; this is defense in depth
+            # for direct callers).
+            if prior_seed is not None:
+                raise ValueError(
+                    "residual_ao_block_ode with prior='zero' uses an exact zero "
+                    "prior and rejects prior_seed."
+                )
+            if prior_state is not None:
+                raise ValueError(
+                    "residual_ao_block_ode with prior='zero' uses an exact zero "
+                    "prior and rejects prior_state."
+                )
+            current = BlockTensorResult(
+                torch.zeros_like(h0_blocks.node_blocks),
+                torch.zeros_like(h0_blocks.edge_blocks),
+                h0_blocks.node_shapes,
+                h0_blocks.edge_shapes,
+            )
+        elif prior_state is not None:
+            # TA-1 explicit latent: D0 = prior_state verbatim (validated/certified).
+            # Mutually exclusive with prior_seed -- the caller supplies the state
+            # rather than seeding a draw of it.
+            if prior_seed is not None:
+                raise ValueError(
+                    "residual_ao_block_ode prior_state and prior_seed are mutually "
+                    "exclusive: supply an explicit latent OR seed a draw, not both."
+                )
+            current = self._prior_state_as_residual_D0(state, prior_state, h0_blocks)
+        else:
+            # projected_te: D0 = eps, drawn deterministically for a given seed and
+            # certified in the codec image, matching the training boundary state
+            # D_0 = project(eps) exactly.
+            current = self._residual_te_eps(
+                state,
+                node_base,
+                edge_base,
+                generator=self._seeded_generator(node_base.device, prior_seed),
+                certify_image=True,
+            )
+        self._drop_block_authority_fields(state)
+        state[self.node_h0_key] = node_base
+        state[self.edge_h0_key] = edge_base
+        output_only_keys = self._block_ode_output_only_keys()
+        lem_sidecar = {
+            key: state.pop(key)
+            for key in _LEM_INPUT_SIDECAR_KEYS
+            if key in state
+        }
+        times = torch.linspace(0.0, 1.0, num_steps + 1, device=self.device, dtype=self.dtype)
+        for step in range(num_steps):
+            cur_t, next_t = times[step], times[step + 1]
+            alpha = (next_t - cur_t) / (1.0 - cur_t)
+            self._attach_spatial_residual_state(state, current)
+            # Re-assert the constant channel every step: a model that echoed a
+            # mutated H0 key back through ``merged`` must not drift contract (2).
+            state[self.node_h0_key] = node_base
+            state[self.edge_h0_key] = edge_base
+            state[self.flow_time_key] = torch.full(
+                (num_graphs,), float(cur_t.item()), dtype=self.dtype, device=self.device
+            )
+            model_input = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in state.items()
+                if key not in output_only_keys
+            }
+            self._restore_block_topology(model_input, topology_sidecar, clone_values=True)
+            model_input.update({
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in lem_sidecar.items()
+            })
+            prediction = model(model_input)
+            self._require_fresh_block_ode_outputs(prediction, step=step + 1)
+            merged = state.copy()
+            merged.update(prediction)
+            self._restore_block_topology(merged, topology_sidecar)
+            for key in _LEM_INPUT_SIDECAR_KEYS:
+                merged.pop(key, None)
+            endpoint = BlockTensorResult(
+                self._require_real_finite_tensor(
+                    prediction[self.node_output_key],
+                    label="spatial residual node endpoint",
+                ).to(device=self.device, dtype=self.dtype),
+                self._require_real_finite_tensor(
+                    prediction[self.edge_output_key],
+                    label="spatial residual edge endpoint",
+                ).to(device=self.device, dtype=self.dtype),
+                current.node_shapes,
+                current.edge_shapes,
+            )
+            endpoint = project_block_state(merged, self.idp, endpoint)
+            current = project_block_state(
+                merged,
+                self.idp,
+                BlockTensorResult(
+                    (1.0 - alpha) * current.node_blocks + alpha * endpoint.node_blocks,
+                    (1.0 - alpha) * current.edge_blocks + alpha * endpoint.edge_blocks,
+                    current.node_shapes,
+                    current.edge_shapes,
+                ),
+            )
+            state = merged
+
+        # Assemble the full Hamiltonian H = H0 + D exactly ONCE, outside the ODE.
+        self._attach_spatial_residual_state(state, current)
+        full = project_block_state(
+            state,
+            self.idp,
+            BlockTensorResult(
+                h0_blocks.node_blocks + current.node_blocks,
+                h0_blocks.edge_blocks + current.edge_blocks,
+                h0_blocks.node_shapes,
+                h0_blocks.edge_shapes,
+            ),
+        )
+        attach_prediction_block_tensors(
+            state,
+            full,
+            node_key=self.node_output_key,
+            edge_key=self.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        # H0 keys stay PHYSICAL H0 RME (deliberate divergence from the generic
+        # ao_block_ode sampler, which overwrites them with the final state RME).
+        state[self.node_h0_key] = node_base
+        state[self.edge_h0_key] = edge_base
+        state[self.flow_time_key] = torch.ones(
+            num_graphs, device=self.device, dtype=self.dtype
+        )
+        return state
+
     def sample(
         self,
         model: torch.nn.Module,
         data: AtomicDataDict.Type,
         *,
         num_steps: int,
+        prior_seed: Optional[int] = None,
+        prior_state: Any = None,
     ) -> AtomicDataDict.Type:
-        """Euler-integrate the endpoint-parameterized flow from the configured prior."""
+        """Euler-integrate the endpoint-parameterized flow from the configured prior.
+
+        ``prior_state`` (TA-1) is the optional explicit transformable latent for
+        ``residual_ao_block_ode`` under ``prior='projected_te'``: a
+        BlockTensorResult or ``(node_blocks, edge_blocks)`` pair in the physical-H0
+        canvas block layout, used as D0 verbatim so a caller can rotate/permute it
+        alongside the input for pathwise equivariance.  It is mutually exclusive
+        with ``prior_seed`` and illegal under a zero prior or in any other mode.
+        """
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
         state = data.copy()
+        num_graphs = self._num_graphs(state)
+        if self.uureal_block_ode:
+            if prior_seed is not None:
+                raise ValueError("uureal_block_ode uses an exact zero prior and rejects prior_seed.")
+            if prior_state is not None:
+                raise ValueError("uureal_block_ode uses an exact zero prior and rejects prior_state.")
+            return self._sample_uureal_block_ode(
+                model, state, num_steps=num_steps, num_graphs=num_graphs
+            )
+        if self.residual_ao_block_ode:
+            # TA-4: fail BEFORE dispatch under the zero prior (exception ordering).
+            # prior='zero' owns an exact zero D0 and rejects both a seed and an
+            # explicit latent; prior='projected_te' consumes prior_seed as the
+            # deterministic D0=eps draw, or prior_state as the verbatim D0.
+            if self.prior == "zero":
+                if prior_seed is not None:
+                    raise ValueError(
+                        "residual_ao_block_ode uses an exact zero prior and rejects prior_seed."
+                    )
+                if prior_state is not None:
+                    raise ValueError(
+                        "residual_ao_block_ode uses an exact zero prior and rejects prior_state."
+                    )
+            return self._sample_residual_ao_block_ode(
+                model,
+                state,
+                num_steps=num_steps,
+                num_graphs=num_graphs,
+                prior_seed=prior_seed,
+                prior_state=prior_state,
+            )
+        if self.block_ode:
+            # A-mode ao_block_ode draws its full start state B0=H0+eps and does not
+            # accept an explicit prior_state (see the asymmetry note on
+            # _block_initial_state); reject it loudly rather than silently ignore.
+            if prior_state is not None:
+                raise ValueError(
+                    "prior_state is supported only by residual_ao_block_ode under "
+                    "prior='projected_te'; the A-mode ao_block_ode sampler draws its "
+                    "start state and does not accept an explicit latent."
+                )
+            return self._sample_block_ode(
+                model,
+                state,
+                num_steps=num_steps,
+                num_graphs=num_graphs,
+                prior_seed=prior_seed,
+            )
+        if prior_seed is not None:
+            raise ValueError("prior_seed is supported only by block_ode.")
+        if prior_state is not None:
+            raise ValueError("prior_state is supported only by block_ode.")
         node_current = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
         edge_current = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_current is None and edge_current is None:
@@ -1776,7 +4617,29 @@ class HamiltonianCFM:
                 )
 
         like = node_current if node_current is not None else edge_current
-        num_graphs = self._num_graphs(state)
+        if self.output_space == "ao_block":
+            if num_steps != 1:
+                raise ValueError(
+                    "AO-block CFM is a cross-space endpoint adapter and supports "
+                    "only num_steps=1."
+                )
+            if node_current is not None:
+                state[self.node_h0_key] = node_current
+                if self.overwrite_feature_keys:
+                    state[self.node_target_key] = node_current
+            if edge_current is not None:
+                state[self.edge_h0_key] = edge_current
+                if self.overwrite_feature_keys:
+                    state[self.edge_target_key] = edge_current
+            state[self.flow_time_key] = torch.zeros(
+                num_graphs, device=like.device, dtype=like.dtype
+            )
+            prediction = model(state)
+            prediction[self.flow_time_key] = torch.ones(
+                num_graphs, device=like.device, dtype=like.dtype
+            )
+            return prediction
+
         dt = 1.0 / float(num_steps)
         for step in range(num_steps):
             cur_t = float(step) * dt
@@ -1828,6 +4691,19 @@ def build_hamiltonian_flow(
 ) -> HamiltonianCFM:
     options = canonicalize_flow_options(options)
     objective = str(options.get("objective", "cfm")).lower()
+    block_ode_requested = bool(options.get("block_ode", False)) or str(
+        options.get("output_space", "")
+    ).lower().replace("-", "_") in {
+        "ao_block_ode",
+        "block_ode",
+        "ao_blocks_ode",
+        "uureal_block_ode",
+        "spatial_uureal_residual_block_ode",
+        "uureal_residual_block_ode",
+        "residual_ao_block_ode",
+    }
+    if block_ode_requested and objective not in {"cfm", "flow_matching", "flow"}:
+        raise ValueError("Block-space ODE v1 supports only the CFM endpoint objective.")
     if objective in {"pixel_meanflow", "pixel_mean_flow", "pmf", "meanflow", "mean_flow"}:
         from dptb.nnops.flow_meanflow import HamiltonianPixelMeanFlow
 
@@ -1865,9 +4741,10 @@ def assert_flow_h0_keys_reach_model(flow: Any, model: Any) -> None:
     if not callable(modules_iter):
         return
 
+    modules = list(modules_iter())
     saw_h0_init = False
     mismatches = set()
-    for module in modules_iter():
+    for module in modules:
         emb_node_key = getattr(module, "h0_node_key", None)
         emb_edge_key = getattr(module, "h0_edge_key", None)
         if not (isinstance(emb_node_key, str) and isinstance(emb_edge_key, str)):
@@ -1878,23 +4755,112 @@ def assert_flow_h0_keys_reach_model(flow: Any, model: Any) -> None:
         if flow_edge_key is not None and emb_edge_key != flow_edge_key:
             mismatches.add(("edge", flow_edge_key, emb_edge_key))
 
-    if not (saw_h0_init and mismatches):
-        return
+    if saw_h0_init and mismatches:
+        detail = "; ".join(
+            f"{side}: train_options.flow_options.{side}_h0_key={fk!r} but "
+            f"model_options.embedding.h0_{side}_key={ek!r}"
+            for side, fk, ek in sorted(mismatches)
+        )
+        raise ValueError(
+            "Flow prior is silently deactivated: the interpolated H0 state is "
+            "written to keys the model's H0-init embedding never reads, so the flow "
+            "base/prior difference cannot reach the network. "
+            f"{detail}. Point model_options.embedding.h0_node_key/h0_edge_key at the "
+            "same keys as train_options.flow_options.node_h0_key/edge_h0_key "
+            "(e.g. node_physical_h0 / edge_physical_h0), or align the flow keys to "
+            "the embedding keys. See configs/physical_h0_flow_overlay.yaml."
+        )
 
-    detail = "; ".join(
-        f"{side}: train_options.flow_options.{side}_h0_key={fk!r} but "
-        f"model_options.embedding.h0_{side}_key={ek!r}"
-        for side, fk, ek in sorted(mismatches)
-    )
-    raise ValueError(
-        "Flow prior is silently deactivated: the interpolated H0 state is "
-        "written to keys the model's H0-init embedding never reads, so the flow "
-        "base/prior difference cannot reach the network. "
-        f"{detail}. Point model_options.embedding.h0_node_key/h0_edge_key at the "
-        "same keys as train_options.flow_options.node_h0_key/edge_h0_key "
-        "(e.g. node_physical_h0 / edge_physical_h0), or align the flow keys to "
-        "the embedding keys. See configs/physical_h0_flow_overlay.yaml."
-    )
+    if not getattr(flow, "block_ode", False):
+        return
+    if not saw_h0_init:
+        raise ValueError("Block-space ODE requires an H0InitLayer consuming node+edge RME.")
+
+    from dptb.nn.deeptb import NNENV
+    from dptb.nn.embedding.lem_moe_v3_h0 import LemMoEV3H0
+
+    block_embeddings = [
+        module for module in modules if isinstance(module, LemMoEV3H0)
+    ]
+    if len(block_embeddings) != 1:
+        raise ValueError(
+            "Block-space ODE requires exactly one real LemMoEV3H0 embedding; "
+            f"found {len(block_embeddings)}."
+        )
+    block_embedding = block_embeddings[0]
+    if (
+        getattr(block_embedding, "output_route_name", None) != "h_b0"
+        or not bool(getattr(block_embedding, "use_block_native_output", False))
+        or not bool(
+            getattr(block_embedding, "supports_full_block_edge_coverage", False)
+        )
+        or not bool(
+            getattr(block_embedding, "require_full_block_edge_coverage", False)
+        )
+    ):
+        raise ValueError(
+            "Block-space ODE requires the real H-B0 block-native embedding with "
+            "require_full_block_edge_coverage=true."
+        )
+    owners = [
+        module
+        for module in modules
+        if isinstance(module, NNENV)
+        and getattr(module, "embedding", None) is block_embedding
+    ]
+    if (
+        len(owners) != 1
+        or getattr(owners[0], "method", None) != "block_native"
+        or not bool(getattr(owners[0], "blockwise_hamiltonian", False))
+    ):
+        raise ValueError(
+            "Block-space ODE requires one NNENV owner with prediction.method="
+            "'block_native' and prediction.blockwise_hamiltonian=true."
+        )
+
+    if bool(getattr(owners[0], "block_native_add_h0", False)) or any(
+        bool(getattr(module, "add_h0", False)) for module in modules
+    ):
+        raise ValueError(
+            "Block-space ODE requires model prediction.add_h0=false; the codec owns "
+            "the single residual endpoint add-back."
+        )
+
+    conditioners = []
+    for module in modules:
+        if not bool(getattr(module, "use_flow_time_embedding", False)):
+            continue
+        conditioner = getattr(module, "flow_time_conditioner", None)
+        if conditioner is not None:
+            conditioners.append((module, conditioner))
+    valid_conditioner = False
+    for module, conditioner in conditioners:
+        keys = tuple(getattr(conditioner, "flow_time_keys", ()) or ())
+        key_matches = (
+            flow.flow_time_key in keys
+            if keys
+            else getattr(conditioner, "flow_time_key", None) == flow.flow_time_key
+        )
+        if (
+            key_matches
+            and bool(getattr(module, "flow_time_condition_edges", False))
+            and not bool(getattr(conditioner, "allow_missing_time", True))
+        ):
+            valid_conditioner = True
+            break
+    if not valid_conditioner:
+        raise ValueError(
+            "Block-space ODE requires explicit node+edge flow-time conditioning "
+            f"on key {flow.flow_time_key!r} with flow_time_allow_missing=false."
+        )
+
+    merge_modes = [
+        getattr(module, "merge_mode", None)
+        for module in modules
+        if isinstance(getattr(module, "h0_node_key", None), str)
+    ]
+    if not merge_modes or any(mode != "replace" for mode in merge_modes):
+        raise ValueError("Block-space ODE requires H0InitLayer h0_merge_mode='replace'.")
 
 
 def assert_model_in_loss_endpoint_metric_space(
@@ -2056,12 +5022,13 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
         for num_steps in ode_steps:
             fields.append(f"validation_flow_euler_{num_steps}_loss")
     # Euler-1 compatible metrics are exposed through the canonical non-CFM
-    # train/validation fields. Keep only extra-step endpoint diagnostics here
-    # to avoid duplicate TensorBoard curves.
+    # train/validation fields.  Block ODE additionally keeps the explicit
+    # Euler-1 aliases for continuity with its certified endpoint telemetry;
+    # ordinary CFM/MeanFlow avoids the duplicate TensorBoard curves.
     log_validation_compatible = True
     if log_validation_compatible:
         for num_steps in ode_steps:
-            if num_steps == 1:
+            if num_steps == 1 and not bool(getattr(flow, "block_ode", False)):
                 continue
             fields.extend(
                 [

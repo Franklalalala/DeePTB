@@ -19,6 +19,7 @@ it is a single directed real spatial block per orbital pair.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import torch
@@ -38,7 +39,7 @@ except Exception:  # pragma: no cover - standalone tests
         EDGE_H0_KEY = "edge_h0"
         ATOMIC_NUMBERS_KEY = "atomic_numbers"
         ATOM_TYPE_KEY = "atom_types"
-        EDGE_TYPE_KEY = "edge_types"
+        EDGE_TYPE_KEY = "edge_type"
         EDGE_INDEX_KEY = "edge_index"
         EDGE_CELL_SHIFT_KEY = "edge_cell_shift"
 
@@ -95,6 +96,18 @@ class BlockTensorResult:
     edge_blocks: Optional[torch.Tensor]
     node_shapes: Optional[torch.Tensor]
     edge_shapes: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class FeatureTensorResult:
+    """Canonical block gather plus its explicit image-space projection."""
+
+    node_features: Optional[torch.Tensor]
+    edge_features: Optional[torch.Tensor]
+    node_projection_residual: Optional[torch.Tensor]
+    edge_projection_residual: Optional[torch.Tensor]
+    projected_node_blocks: Optional[torch.Tensor]
+    projected_edge_blocks: Optional[torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -271,13 +284,17 @@ def matrix_shape_for_bond(idp: Any, sym_i: str, sym_j: str) -> Tuple[int, int]:
 def infer_block_shapes(data: Mapping[str, Any], idp: Any, *, device=None) -> Tuple[torch.Tensor, torch.Tensor]:
     ensure_spatial_block_mapper(idp)
     symbols = symbols_from_data(data, idp)
-    node_shapes = torch.as_tensor([matrix_shape_for_symbol(idp, s) for s in symbols], dtype=torch.long, device=device)
+    node_shapes = torch.as_tensor(
+        [matrix_shape_for_symbol(idp, s) for s in symbols],
+        dtype=torch.long,
+        device=device,
+    ).reshape(-1, 2)
     edge_index = edge_index_from_data(data).detach().cpu()
     edge_shapes = torch.as_tensor(
         [matrix_shape_for_bond(idp, symbols[int(u)], symbols[int(v)]) for u, v in edge_index.T.tolist()],
         dtype=torch.long,
         device=device,
-    )
+    ).reshape(-1, 2)
     return node_shapes, edge_shapes
 
 
@@ -485,6 +502,261 @@ def reverse_edge_index(data: Mapping[str, Any], *, device=None) -> torch.Tensor:
     return torch.as_tensor(rev, dtype=torch.long, device=device)
 
 
+def strict_reverse_edge_index(
+    data: Mapping[str, Any],
+    *,
+    device=None,
+    shift_atol: float = 1e-7,
+    idp: Any = None,
+) -> torch.Tensor:
+    """Return reverse-edge indices while rejecting ambiguous graph metadata.
+
+    Unlike the legacy completion helper, this block-ODE entry point is
+    fail-closed: cell shifts must be finite integers, every ``(i,j,R)`` key is
+    unique, and every directed edge has exactly one reverse partner.
+    """
+    raw_edge_index = data_get(data, key("EDGE_INDEX_KEY", "edge_index"), None)
+    if raw_edge_index is None:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    else:
+        raw_edge_index = as_tensor(raw_edge_index).detach().cpu()
+        if raw_edge_index.ndim != 2 or raw_edge_index.shape[0] != 2:
+            raise ValueError(
+                f"edge_index must have shape [2,E], got {tuple(raw_edge_index.shape)}."
+            )
+        if raw_edge_index.dtype == torch.bool or raw_edge_index.is_complex():
+            raise ValueError("edge_index must contain finite integer indices.")
+        if not bool(torch.isfinite(raw_edge_index).all().item()):
+            raise ValueError("edge_index must contain finite integer indices.")
+        if raw_edge_index.is_floating_point() and raw_edge_index.numel() and bool(
+            (raw_edge_index != raw_edge_index.round()).any().item()
+        ):
+            raise ValueError("edge_index contains non-integer values.")
+        edge_index = raw_edge_index.to(dtype=torch.long)
+
+    n_edges = int(edge_index.shape[1])
+    node_count_candidates: List[Tuple[str, int]] = []
+    for name, fallback, row_count in (
+        ("ATOMIC_NUMBERS_KEY", "atomic_numbers", False),
+        ("ATOM_TYPE_KEY", "atom_types", False),
+        ("POSITIONS_KEY", "pos", True),
+        ("BATCH_KEY", "batch", False),
+    ):
+        value = data_get(data, key(name, fallback), None)
+        if value is None:
+            continue
+        tensor = as_tensor(value)
+        count = int(tensor.shape[0]) if row_count and tensor.ndim else int(tensor.numel())
+        node_count_candidates.append((fallback, count))
+    if node_count_candidates:
+        n_nodes = node_count_candidates[0][1]
+        inconsistent = [item for item in node_count_candidates if item[1] != n_nodes]
+        if inconsistent:
+            raise ValueError(
+                "Node metadata row counts disagree: "
+                + ", ".join(f"{name}={count}" for name, count in node_count_candidates)
+                + "."
+            )
+    else:
+        n_nodes = None
+    if edge_index.numel() and bool((edge_index < 0).any().item()):
+        raise ValueError("edge_index contains negative atom indices.")
+    if edge_index.numel():
+        if n_nodes is None:
+            raise ValueError(
+                "Cannot validate edge_index bounds without atomic_numbers, atom_types, pos, or batch."
+            )
+        if bool((edge_index >= n_nodes).any().item()):
+            raise ValueError(
+                f"edge_index contains atom indices outside [0,{max(n_nodes - 1, 0)}]."
+            )
+
+    raw_batch = data_get(data, key("BATCH_KEY", "batch"), None)
+    if raw_batch is None:
+        batch = torch.zeros((0 if n_nodes is None else n_nodes,), dtype=torch.long)
+    else:
+        raw_batch = as_tensor(raw_batch).detach().cpu().flatten()
+        if raw_batch.dtype == torch.bool or raw_batch.is_complex():
+            raise ValueError("batch must contain finite non-negative integer graph indices.")
+        if not bool(torch.isfinite(raw_batch).all().item()):
+            raise ValueError("batch must contain finite non-negative integer graph indices.")
+        if raw_batch.is_floating_point() and raw_batch.numel() and bool(
+            (raw_batch != raw_batch.round()).any().item()
+        ):
+            raise ValueError("batch contains non-integer graph indices.")
+        batch = raw_batch.to(dtype=torch.long)
+        if bool((batch < 0).any().item()):
+            raise ValueError("batch contains negative graph indices.")
+    if n_edges and batch.numel():
+        source_batch = batch.index_select(0, edge_index[0])
+        target_batch = batch.index_select(0, edge_index[1])
+        if not torch.equal(source_batch, target_batch):
+            bad = torch.nonzero(source_batch != target_batch, as_tuple=False).flatten()
+            raise ValueError(
+                "Every edge must connect nodes in the same batch graph; "
+                f"cross-graph rows={bad[:8].tolist()} (total={int(bad.numel())})."
+            )
+
+    raw_pbc = data_get(data, key("PBC_KEY", "pbc"), None)
+    pbc = None
+    if raw_pbc is not None:
+        raw_pbc = as_tensor(raw_pbc).detach().cpu()
+        if raw_pbc.is_complex() or not bool(torch.isfinite(raw_pbc).all().item()):
+            raise ValueError("pbc must contain finite boolean/0-1 values.")
+        if raw_pbc.dtype != torch.bool and raw_pbc.numel() and bool(
+            ((raw_pbc != 0) & (raw_pbc != 1)).any().item()
+        ):
+            raise ValueError("pbc must contain boolean/0-1 values.")
+        if raw_pbc.ndim == 1 and raw_pbc.shape[0] == 3:
+            pbc = raw_pbc.to(dtype=torch.bool).reshape(1, 3)
+        elif raw_pbc.ndim == 2 and raw_pbc.shape[1] == 3:
+            pbc = raw_pbc.to(dtype=torch.bool)
+        else:
+            raise ValueError(f"pbc must have shape [3] or [B,3], got {tuple(raw_pbc.shape)}.")
+        if pbc.shape[0] != 1 and (
+            pbc.shape[0] == 0
+            or (batch.numel() and int(batch.max().item()) >= pbc.shape[0])
+        ):
+            max_batch = None if not batch.numel() else int(batch.max().item())
+            raise ValueError(
+                f"pbc has {pbc.shape[0]} graph rows but batch contains graph "
+                f"index {max_batch}."
+            )
+
+    raw_shift = data_get(data, key("EDGE_CELL_SHIFT_KEY", "edge_cell_shift"), None)
+    if raw_shift is None:
+        if n_edges and pbc is not None:
+            if pbc.shape[0] == 1:
+                edge_pbc = pbc.expand(n_edges, 3)
+            else:
+                edge_pbc = pbc.index_select(0, batch.index_select(0, edge_index[0]))
+            if bool(edge_pbc.any().item()):
+                raise ValueError(
+                    "Periodic block-ODE graphs with edges require explicit edge_cell_shift."
+                )
+        shift = torch.zeros((n_edges, 3), dtype=torch.long)
+    else:
+        raw = as_tensor(raw_shift).detach().cpu()
+        if raw.shape != (n_edges, 3):
+            raise ValueError(
+                f"edge_cell_shift must have shape {(n_edges, 3)}, got {tuple(raw.shape)}."
+            )
+        if raw.dtype == torch.bool or raw.is_complex() or not bool(
+            torch.isfinite(raw).all().item()
+        ):
+            raise ValueError("edge_cell_shift contains NaN or Inf.")
+        rounded = raw.round() if raw.is_floating_point() else raw
+        if raw.is_floating_point() and raw.numel() and bool(
+            ((raw - rounded).abs().max() > shift_atol).item()
+        ):
+            raise ValueError("edge_cell_shift must contain integer cell translations.")
+        int64 = torch.iinfo(torch.long)
+        if any(
+            int(value) < int64.min or int(value) > int64.max
+            for value in rounded.reshape(-1).tolist()
+        ):
+            raise ValueError("edge_cell_shift contains values outside the int64 range.")
+        shift = rounded.to(dtype=torch.long)
+
+    if shift.numel() and bool((shift != 0).any().item()) and pbc is None:
+        raise ValueError(
+            "Non-zero edge_cell_shift metadata requires explicit pbc axes."
+        )
+    needs_cell = bool(pbc is not None and pbc.any().item()) or bool(
+        shift.numel() and (shift != 0).any().item()
+    )
+    if needs_cell and data_get(data, key("CELL_KEY", "cell"), None) is None:
+        raise ValueError(
+            "Periodic or non-zero edge_cell_shift metadata requires an explicit cell."
+        )
+
+    if n_edges and pbc is not None:
+        if pbc.shape[0] == 1:
+            edge_pbc = pbc.expand(n_edges, 3)
+        else:
+            edge_pbc = pbc.index_select(0, batch.index_select(0, edge_index[0]))
+        invalid_shift = (shift != 0) & (~edge_pbc)
+        if bool(invalid_shift.any().item()):
+            bad = torch.nonzero(invalid_shift.any(dim=1), as_tuple=False).flatten()
+            raise ValueError(
+                "edge_cell_shift must be zero along non-periodic axes; "
+                f"invalid rows={bad[:8].tolist()} (total={int(bad.numel())})."
+            )
+
+    raw_edge_types = data_get(data, key("EDGE_TYPE_KEY", "edge_types"), None)
+    if raw_edge_types is not None:
+        raw_types = as_tensor(raw_edge_types).detach().cpu().flatten()
+        if raw_types.dtype == torch.bool or raw_types.is_complex():
+            raise ValueError("edge_type must contain finite non-negative integers.")
+        if not bool(torch.isfinite(raw_types).all().item()):
+            raise ValueError("edge_type must contain finite non-negative integers.")
+        if raw_types.is_floating_point() and raw_types.numel() and bool(
+            (raw_types != raw_types.round()).any().item()
+        ):
+            raise ValueError("edge_type contains non-integer values.")
+        edge_types = raw_types.to(dtype=torch.long)
+        if edge_types.numel() != n_edges:
+            raise ValueError(
+                f"edge_type has {edge_types.numel()} rows but edge_index has {n_edges} edges."
+            )
+        if bool((edge_types < 0).any().item()):
+            raise ValueError("edge_type contains negative values.")
+        if idp is not None:
+            ensure_spatial_block_mapper(idp)
+            symbols = symbols_from_data(data, idp)
+            bond_to_type = getattr(idp, "bond_to_type", None)
+            if bond_to_type is None:
+                raise KeyError("Mapper lacks bond_to_type for explicit edge_type validation.")
+            expected_types = torch.as_tensor(
+                [
+                    int(bond_to_type[f"{symbols[int(u)]}-{symbols[int(v)]}"])
+                    for u, v in edge_index.T.tolist()
+                ],
+                dtype=torch.long,
+            )
+            if not torch.equal(edge_types, expected_types):
+                bad = torch.nonzero(edge_types != expected_types, as_tuple=False).flatten()
+                preview = bad[:8].tolist()
+                raise ValueError(
+                    "edge_type disagrees with the mapper/species of its edge endpoints; "
+                    f"rows={preview} (total={int(bad.numel())})."
+                )
+
+    lookup: Dict[Tuple[int, int, int, int, int], int] = {}
+    keys: List[Tuple[int, int, int, int, int]] = []
+    for e, (u, v) in enumerate(edge_index.T.tolist()):
+        r0, r1, r2 = [int(x) for x in shift[e].tolist()]
+        edge_key = (int(u), int(v), r0, r1, r2)
+        if edge_key in lookup:
+            raise ValueError(
+                f"Duplicate directed edge key {edge_key} at rows "
+                f"{lookup[edge_key]} and {e}."
+            )
+        lookup[edge_key] = e
+        keys.append(edge_key)
+
+    rev: List[int] = []
+    missing: List[int] = []
+    for e, (u, v, r0, r1, r2) in enumerate(keys):
+        mate = lookup.get((v, u, -r0, -r1, -r2))
+        if mate is None:
+            missing.append(e)
+            rev.append(-1)
+        else:
+            rev.append(int(mate))
+    if missing:
+        raise ValueError(
+            "Every block-ODE edge needs (j,i,-R); missing reverse rows for "
+            f"indices {missing[:8]} (total={len(missing)})."
+        )
+    rev_tensor = torch.as_tensor(rev, dtype=torch.long, device=device)
+    if rev_tensor.numel():
+        rows = torch.arange(n_edges, dtype=torch.long, device=rev_tensor.device)
+        if not torch.equal(rev_tensor.index_select(0, rev_tensor), rows):
+            raise RuntimeError("Reverse-edge relation is not an involution.")
+    return rev_tensor
+
+
 def edge_direct_feature_mask(
     data: Mapping[str, Any],
     idp: Any,
@@ -622,7 +894,9 @@ def feature_tensors_to_block_tensors(
             pair = (symbols[int(u)], symbols[int(v)])
             by_pair.setdefault(pair, []).append(e)
             edge_shapes_list.append(matrix_shape_for_bond(idp, *pair))
-        edge_shapes = torch.as_tensor(edge_shapes_list, dtype=torch.long, device=device)
+        edge_shapes = torch.as_tensor(
+            edge_shapes_list, dtype=torch.long, device=device
+        ).reshape(-1, 2)
         for (sym_i, sym_j), positions in by_pair.items():
             idx = torch.as_tensor(positions, dtype=torch.long, device=device)
             sub_feat = edge_features.index_select(0, idx)
@@ -638,6 +912,63 @@ def feature_tensors_to_block_tensors(
             )
 
     return BlockTensorResult(node_blocks, edge_blocks, node_shapes, edge_shapes)
+
+
+def _validate_inverse_component(
+    blocks: Optional[torch.Tensor],
+    shapes: Optional[torch.Tensor],
+    inferred_shapes: torch.Tensor,
+    *,
+    label: str,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if blocks is None:
+        if shapes is not None:
+            raise ValueError(f"{label}_shapes was supplied without {label}_blocks.")
+        return None, None
+    blocks = as_tensor(blocks)
+    if blocks.ndim != 3:
+        raise ValueError(f"{label}_blocks must have shape [N,H,W], got {tuple(blocks.shape)}.")
+    if blocks.is_complex():
+        raise NotImplementedError("Block-space inverse currently supports non-SOC real tensors only.")
+    if not bool(torch.isfinite(blocks).all().item()):
+        raise ValueError(f"{label}_blocks contains NaN or Inf.")
+    if shapes is None:
+        raise KeyError(f"{label}_shapes is required for fail-closed block inversion.")
+    raw_shapes = as_tensor(shapes, device=blocks.device)
+    if raw_shapes.ndim != 2 or raw_shapes.shape[1] != 2:
+        raise ValueError(f"{label}_shapes must have shape [N,2], got {tuple(raw_shapes.shape)}.")
+    if raw_shapes.is_floating_point() and raw_shapes.numel() and bool(
+        ((raw_shapes - raw_shapes.round()).abs().max() > 0).item()
+    ):
+        raise ValueError(f"{label}_shapes must contain integers.")
+    checked_shapes = raw_shapes.to(dtype=torch.long)
+    expected = inferred_shapes.to(device=blocks.device, dtype=torch.long)
+    if blocks.shape[0] != expected.shape[0] or checked_shapes.shape != expected.shape:
+        raise ValueError(
+            f"{label} row count mismatch: blocks={blocks.shape[0]}, "
+            f"shapes={checked_shapes.shape[0]}, expected={expected.shape[0]}."
+        )
+    if not torch.equal(checked_shapes, expected):
+        raise ValueError(
+            f"{label}_shapes does not match mapper/species-derived shapes: "
+            f"got={checked_shapes.detach().cpu().tolist()}, expected={expected.detach().cpu().tolist()}."
+        )
+    if checked_shapes.numel():
+        if bool((checked_shapes <= 0).any().item()):
+            raise ValueError(f"{label}_shapes must be strictly positive.")
+        if bool((checked_shapes[:, 0] > blocks.shape[-2]).any().item()) or bool(
+            (checked_shapes[:, 1] > blocks.shape[-1]).any().item()
+        ):
+            raise ValueError(f"{label}_shapes exceeds the padded block canvas.")
+    return blocks, checked_shapes
+
+
+def _row_max_abs(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    if value.shape[0] == 0:
+        return torch.zeros((0,), dtype=value.dtype, device=value.device)
+    return value.abs().flatten(1).amax(dim=1)
 
 
 def block_tensors_to_feature_tensors(
@@ -705,6 +1036,143 @@ def block_tensors_to_feature_tensors(
                 edge_features[index[:, None], columns[None, :]] = part
 
     return node_features, edge_features
+
+
+def canonical_block_tensors_to_feature_tensors(
+    data: Mapping[str, Any],
+    idp: Any,
+    *,
+    node_blocks: Optional[torch.Tensor] = None,
+    edge_blocks: Optional[torch.Tensor] = None,
+    node_shapes: Optional[torch.Tensor] = None,
+    edge_shapes: Optional[torch.Tensor] = None,
+    mode: str = "strict",
+    atol: float = 1e-10,
+    certify_image: bool = True,
+    _expected_node_shapes: Optional[torch.Tensor] = None,
+    _expected_edge_shapes: Optional[torch.Tensor] = None,
+    _reverse_validated: bool = False,
+) -> FeatureTensorResult:
+    """Canonical-gather inverse of :func:`feature_tensors_to_block_tensors`.
+
+    The gather reads only the first/canonical write side of duplicated onsite
+    shell pairs and directed hopping pairs.  Repacking the gathered product
+    features gives the explicit image-space projection used for residual
+    diagnostics.  ``strict`` rejects any off-image value, including padding;
+    ``project`` returns the projection and per-row residual without hiding it.
+    """
+    ensure_non_soc_mapper(idp)
+    if mode not in {"strict", "project"}:
+        raise ValueError(f"mode must be 'strict' or 'project', got {mode!r}.")
+    atol = float(atol)
+    if not math.isfinite(atol) or atol < 0:
+        raise ValueError("atol must be finite and non-negative.")
+    if mode == "strict" and atol > 2.0e-5:
+        raise ValueError(
+            "strict canonical block inversion caps atol at 2e-5; larger "
+            "values turn image-space certification into silent projection."
+        )
+    symbols = symbols_from_data(data, idp)
+    if _expected_node_shapes is None or _expected_edge_shapes is None:
+        inferred_node, inferred_edge = infer_block_shapes(data, idp)
+    else:
+        inferred_node = _expected_node_shapes
+        inferred_edge = _expected_edge_shapes
+    node_blocks, node_shapes = _validate_inverse_component(
+        node_blocks, node_shapes, inferred_node, label="node"
+    )
+    edge_blocks, edge_shapes = _validate_inverse_component(
+        edge_blocks, edge_shapes, inferred_edge, label="edge"
+    )
+    if edge_blocks is not None and not _reverse_validated:
+        strict_reverse_edge_index(data, device=edge_blocks.device, idp=idp)
+
+    width = int(idp.reduced_matrix_element)
+    node_features = None
+    if node_blocks is not None:
+        node_features = torch.zeros(
+            (node_blocks.shape[0], width), dtype=node_blocks.dtype, device=node_blocks.device
+        )
+        by_symbol: Dict[str, List[int]] = {}
+        for i, symbol in enumerate(symbols):
+            by_symbol.setdefault(symbol, []).append(i)
+        for symbol, positions in by_symbol.items():
+            idx = torch.as_tensor(positions, dtype=torch.long, device=node_blocks.device)
+            sub = node_blocks.index_select(0, idx)
+            gathered = torch.zeros(
+                (idx.numel(), width), dtype=node_blocks.dtype, device=node_blocks.device
+            )
+            for row, col, feat in onsite_feature_slices(idp, symbol):
+                gathered[:, feat] = sub[:, row, col].reshape(idx.numel(), -1)
+            node_features.index_copy_(0, idx, gathered)
+
+    edge_features = None
+    if edge_blocks is not None:
+        edge_index = edge_index_from_data(data).detach().cpu()
+        edge_features = torch.zeros(
+            (edge_blocks.shape[0], width), dtype=edge_blocks.dtype, device=edge_blocks.device
+        )
+        by_pair: Dict[Tuple[str, str], List[int]] = {}
+        for e, (u, v) in enumerate(edge_index.T.tolist()):
+            by_pair.setdefault((symbols[int(u)], symbols[int(v)]), []).append(e)
+        for (sym_i, sym_j), positions in by_pair.items():
+            idx = torch.as_tensor(positions, dtype=torch.long, device=edge_blocks.device)
+            sub = edge_blocks.index_select(0, idx)
+            gathered = torch.zeros(
+                (idx.numel(), width), dtype=edge_blocks.dtype, device=edge_blocks.device
+            )
+            for row, col, feat in edge_feature_slices(idp, sym_i, sym_j):
+                gathered[:, feat] = sub[:, row, col].reshape(idx.numel(), -1)
+            edge_features.index_copy_(0, idx, gathered)
+
+    if not certify_image:
+        # Shape/dtype/finite/species/reverse-edge contract gates above remain
+        # unconditional.  Only the pure canonical-image self-check is skipped
+        # under HamiltonianCFM's explicitly scheduled certification cadence.
+        return FeatureTensorResult(
+            node_features=node_features,
+            edge_features=edge_features,
+            node_projection_residual=None,
+            edge_projection_residual=None,
+            projected_node_blocks=None,
+            projected_edge_blocks=None,
+        )
+
+    repacked = feature_tensors_to_block_tensors(
+        data,
+        idp,
+        node_features=node_features,
+        edge_features=edge_features,
+        node_pad_shape=None if node_blocks is None else tuple(node_blocks.shape[-2:]),
+        edge_pad_shape=None if edge_blocks is None else tuple(edge_blocks.shape[-2:]),
+        symmetrize_onsite=True,
+        complete_edges=True,
+        strict_complete_edges=edge_blocks is not None,
+    )
+    node_delta = None if node_blocks is None else node_blocks - repacked.node_blocks
+    edge_delta = None if edge_blocks is None else edge_blocks - repacked.edge_blocks
+    node_residual = _row_max_abs(node_delta)
+    edge_residual = _row_max_abs(edge_delta)
+    if mode == "strict":
+        offenders: List[str] = []
+        if node_residual is not None and node_residual.numel() and bool((node_residual > atol).any().item()):
+            offenders.append(f"node max={node_residual.max().item():.6g}")
+        if edge_residual is not None and edge_residual.numel() and bool((edge_residual > atol).any().item()):
+            offenders.append(f"edge max={edge_residual.max().item():.6g}")
+        if offenders:
+            raise ValueError(
+                "Block tensor is outside the canonical packer image at "
+                f"atol={atol}: " + ", ".join(offenders)
+            )
+
+    return FeatureTensorResult(
+        node_features=node_features,
+        edge_features=edge_features,
+        node_projection_residual=node_residual,
+        edge_projection_residual=edge_residual,
+        projected_node_blocks=repacked.node_blocks,
+        projected_edge_blocks=repacked.edge_blocks,
+    )
 
 
 def _to_block_tensor(value: Any, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:

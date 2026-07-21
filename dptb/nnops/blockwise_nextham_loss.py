@@ -87,6 +87,7 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         block_reduction: str = "global",
         complex_reduction: str = "modulus",
         log_feature_compatible: bool = False,
+        log_feature_compatible_interval: int = 1,
         feature_log_no_grad: bool = True,
         distributed_log_reduce: bool = False,
         expose_component_sums: bool = True,
@@ -133,6 +134,42 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
             or self.optimization in {"feature", "feature_compatible", "compat"}
             else "block"
         )
+        # Cadence (in forward() calls) for the logging-only feature-compatible
+        # metric.  The feature branch is host-sync heavy (cpu()/tolist(), Python
+        # species/pair grouping, and two collective all-reduces); throttling it
+        # to every Nth call is a pure logging optimization that never touches the
+        # optimization/gradient loss.  Fail-closed: int >= 1, and reject bool
+        # (bool is an int subclass in Python, but True/False is never a cadence).
+        if isinstance(log_feature_compatible_interval, bool) or not isinstance(
+            log_feature_compatible_interval, int
+        ):
+            raise ValueError(
+                "log_feature_compatible_interval must be an int >= 1, got "
+                f"{log_feature_compatible_interval!r}."
+            )
+        if log_feature_compatible_interval < 1:
+            raise ValueError(
+                "log_feature_compatible_interval must be >= 1, got "
+                f"{log_feature_compatible_interval}."
+            )
+        self.log_feature_compatible_interval = int(log_feature_compatible_interval)
+        # When feature-compatible telemetry is logging-only and throttled, the
+        # canonical RME endpoint is intentionally absent on non-firing calls.
+        # Trainer/MultiTrainer use this marker to preserve an explicit sparse
+        # triplet (all three values None) instead of relabelling the block
+        # optimization loss as an RME endpoint.
+        self.sparse_endpoint_metrics = bool(
+            self.log_feature_compatible
+            and self.log_feature_compatible_interval > 1
+            and self.optimization not in {"feature", "feature_compatible", "compat"}
+        )
+        # Monotone, per-criterion-instance forward() counter (0-based; the first
+        # call sees call_index == 0).  DDP rank-synchrony: every rank calls
+        # forward() the same number of times along the same deterministic code
+        # path, so this counter stays identical across ranks.  The feature branch
+        # (which contains collective all-reduces) therefore fires on ALL ranks or
+        # NONE for a given call, and the all-reduce can never deadlock.
+        self._feature_log_calls = 0
         self.feature_log_no_grad = bool(feature_log_no_grad)
         self.distributed_log_reduce = bool(distributed_log_reduce)
         self.expose_component_sums = bool(expose_component_sums)
@@ -341,7 +378,19 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         block_endpoint = 0.5 * (block_onsite + block_hopping)
         block_global_mae = mae_from_components(block_total_comp)
 
-        need_feature = self.log_feature_compatible or self.optimization in {"feature", "feature_compatible", "compat"}
+        # The interval gates ONLY the logging trigger.  Optimization-mode feature
+        # requirement is preserved exactly and is never throttled: when the
+        # optimization loss itself needs features, need_feature stays True on
+        # every call regardless of the cadence.  With interval == 1,
+        # ``call_index % 1 == 0`` always, so log_feature_due == log_feature_compatible
+        # and need_feature is byte-identical to the legacy every-step behavior.
+        call_index = self._feature_log_calls
+        self._feature_log_calls += 1
+        optimization_needs_feature = self.optimization in {"feature", "feature_compatible", "compat"}
+        log_feature_due = self.log_feature_compatible and (
+            call_index % self.log_feature_compatible_interval == 0
+        )
+        need_feature = log_feature_due or optimization_needs_feature
         if need_feature:
             if self.feature_log_no_grad and self.optimization not in {"feature", "feature_compatible", "compat"}:
                 with torch.no_grad():
@@ -387,7 +436,25 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
             self.last_hopping_mse_sum = feature_edge_comp.square_sum.detach()
             self.last_hopping_count = feature_edge_comp.count.detach()
             self.last_feature_count = feature_total_comp.count.detach() if feature_total_comp is not None else None
+        elif self.log_feature_compatible:
+            # A cadence-skipped compatible metric must be absent, not silently
+            # replaced by an AO-block metric under an RME-labelled criterion.
+            # Block-native telemetry remains available through last_block_*.
+            self.last_feature_compat_loss = None
+            self.last_endpoint_loss = None
+            self.last_endpoint_metric_space = self.endpoint_metric_space
+            self.last_onsite_loss = None
+            self.last_hopping_loss = None
+            self.last_onsite_l1_sum = None
+            self.last_onsite_mse_sum = None
+            self.last_onsite_count = None
+            self.last_hopping_l1_sum = None
+            self.last_hopping_mse_sum = None
+            self.last_hopping_count = None
+            self.last_feature_count = None
         else:
+            # Preserve the refactored 0715 contract when compatible logging is
+            # disabled: the canonical endpoint is the AO-block L1+RMSE triplet.
             self.last_feature_compat_loss = None
             self.last_endpoint_loss = block_endpoint.detach()
             self.last_endpoint_metric_space = "block"

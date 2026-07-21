@@ -306,6 +306,22 @@ class MultiTrainer(Trainer):
 
         self.distance_ranges = distance_ranges
         self.num_experts = len(distance_ranges)
+        if bool(getattr(getattr(self, "flow_cfm", None), "block_ode", False)):
+            valid_full_graph_range = (
+                self.num_experts == 1
+                and isinstance(distance_ranges[0], (list, tuple))
+                and len(distance_ranges[0]) == 2
+                and not isinstance(distance_ranges[0][0], bool)
+                and isinstance(distance_ranges[0][0], (int, float))
+                and math.isfinite(float(distance_ranges[0][0]))
+                and float(distance_ranges[0][0]) <= 0.0
+            )
+            if not valid_full_graph_range:
+                raise ValueError(
+                    "Block-space ODE v1 cannot use distance-partitioned experts: "
+                    "H-B0 must predict every graph edge. MultiTrainer is allowed "
+                    "only with one full-graph distance range whose lower bound is <= 0."
+                )
 
         self.distributed_expert = bool(distributed_expert)
         self.rank = int(rank)
@@ -722,8 +738,19 @@ class MultiTrainer(Trainer):
             cfg["world_size"] = 1
         return cfg
 
-    def _make_loader_compat(self, dataset, batch_size, shuffle, num_workers, sampler=None, dynamic_batch=None):
+    def _make_loader_compat(
+        self,
+        dataset,
+        batch_size,
+        shuffle,
+        num_workers,
+        sampler=None,
+        dynamic_batch=None,
+        generator=None,
+    ):
         kwargs = {"num_workers": int(num_workers)}
+        if generator is not None:
+            kwargs["generator"] = generator
         if dynamic_batch is not None:
             sampler = None
         if sampler is not None:
@@ -862,6 +889,7 @@ class MultiTrainer(Trainer):
                 shuffle=not self.distributed_expert,
                 num_workers=val_workers,
                 sampler=val_sampler,
+                generator=self.validation_loader_generator,
             )
 
         log.info(
@@ -2011,9 +2039,17 @@ class MultiTrainer(Trainer):
     def _snapshot_loss_metrics(self, loss_obj) -> Dict[str, Any]:
         loss_module = self._resolve_loss_module(loss_obj)
 
+        # onsite/hopping are marked invalid (None) when the criterion reports them
+        # as None -- e.g. a feature-compatible metric throttled by
+        # log_feature_compatible_interval, or log_feature_compatible=false.  A
+        # *missing* attribute still resolves to 0.0 (getattr default), so only a
+        # present-but-None value is treated as invalid; this keeps every non-gated
+        # snapshot (including interval=1, which never gates) byte-identical while
+        # letting the aggregation drop the gated batch from BOTH numerator and
+        # denominator (see _gated_metric_weighted_sum / _make_step_pack).
         out = {
-            "onsite": self._as_scalar_tensor(getattr(loss_module, "last_onsite_loss", 0.0), default=0.0),
-            "hopping": self._as_scalar_tensor(getattr(loss_module, "last_hopping_loss", 0.0), default=0.0),
+            "onsite": self._as_scalar_tensor(getattr(loss_module, "last_onsite_loss", 0.0), default=0.0, allow_none=True),
+            "hopping": self._as_scalar_tensor(getattr(loss_module, "last_hopping_loss", 0.0), default=0.0, allow_none=True),
             "z_loss": self._as_scalar_tensor(getattr(loss_module, "last_z_loss", None), allow_none=True),
             "expert_load_cv": self._as_scalar_tensor(getattr(loss_module, "expert_load_cv", None), allow_none=True),
         }
@@ -2038,11 +2074,26 @@ class MultiTrainer(Trainer):
                 out[key] = value
         return out
 
-    def _flow_state_scalar(self, state: Dict[str, Any], *names, default=0.0, allow_none=False):
+    def _flow_state_scalar(
+        self,
+        state: Dict[str, Any],
+        *names,
+        default=0.0,
+        allow_none=False,
+        missing_is_none=True,
+    ):
         for name in names:
-            if name in state and state[name] is not None:
+            if name not in state:
+                continue
+            if state[name] is None and allow_none:
+                return None
+            if state[name] is not None:
                 return self._as_scalar_tensor(state[name], default=default, allow_none=allow_none)
-        return self._as_scalar_tensor(None, default=default, allow_none=allow_none)
+        return self._as_scalar_tensor(
+            None,
+            default=default,
+            allow_none=bool(allow_none and missing_is_none),
+        )
 
     def _payload_metrics_from_flow_state(
         self,
@@ -2060,12 +2111,16 @@ class MultiTrainer(Trainer):
                 f"{prefix}_compatible_onsite_loss",
                 f"{prefix}_onsite_loss",
                 default=0.0,
+                allow_none=True,
+                missing_is_none=False,
             ),
             "hopping": self._flow_state_scalar(
                 state,
                 f"{prefix}_compatible_hopping_loss",
                 f"{prefix}_hopping_loss",
                 default=0.0,
+                allow_none=True,
+                missing_is_none=False,
             ),
             "z_loss": self._flow_state_scalar(
                 state,
@@ -2197,6 +2252,10 @@ class MultiTrainer(Trainer):
             capture_metrics=capture_metrics,
         )
 
+    def _gated_metric_weighted_sum(self, value, active_count):
+        """Compatibility seam delegated to the typed objective."""
+        return self._objective.gated_metric_weighted_sum(value, active_count)
+
     def _build_train_payload(
         self, batch_dict, batch_info, expert_idx, range_dis,
         ref_batch_dict=None, ref_batch_info=None, criterion=None, flow_prefix="train"
@@ -2283,6 +2342,13 @@ class MultiTrainer(Trainer):
         self._display_window_expert_hopping_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_nodes_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_expert_active_edges_sum_local = torch.zeros((), dtype=self.dtype, device=dev)
+        # Per-metric fired-step counters: how many steps actually contributed the
+        # onsite/hopping expert metric (gated weight > 0).  The window expert
+        # average divides by THESE, not the raw step count, so a throttled step
+        # drops out.  At interval=1 every step fires => fired count == step count
+        # and the displayed mean is byte-identical to the old sum/local_steps.
+        self._display_window_expert_onsite_steps_local = torch.zeros((), dtype=self.dtype, device=dev)
+        self._display_window_expert_hopping_steps_local = torch.zeros((), dtype=self.dtype, device=dev)
         self._display_window_last_lr_local = 0.0
         self.dynamic_batch_oom_skipped_since_display = 0
         self._reset_cuda_memory_peak()
@@ -2299,13 +2365,20 @@ class MultiTrainer(Trainer):
 
     def _make_step_pack(self, payload: Dict[str, Any]) -> torch.Tensor:
         # Build the typed pack with named fields; ``to_tensor`` reproduces the
-        # exact legacy ``_P_*`` slot layout on the wire (byte-identical).
+        # exact legacy ``_P_*`` slot layout on the wire.  The historical active
+        # node/edge slots are the onsite/hopping denominators; prefer the gated
+        # weights so a cadence-throttled metric contributes 0/0, while older
+        # payloads retain the raw-active fallback.
         pack = MetricPack(
             loss_opt_sum=self._as_scalar_tensor(payload.get("loss_detached", 0.0)),
             onsite_weighted_sum=self._as_scalar_tensor(payload.get("onsite_weighted_sum", 0.0)),
             hopping_weighted_sum=self._as_scalar_tensor(payload.get("hopping_weighted_sum", 0.0)),
-            active_nodes_sum=self._as_scalar_tensor(payload.get("active_nodes", 0.0)),
-            active_edges_sum=self._as_scalar_tensor(payload.get("active_edges", 0.0)),
+            active_nodes_sum=self._as_scalar_tensor(
+                payload.get("onsite_weight", payload.get("active_nodes", 0.0))
+            ),
+            active_edges_sum=self._as_scalar_tensor(
+                payload.get("hopping_weight", payload.get("active_edges", 0.0))
+            ),
             onsite_l1_sum=self._as_scalar_tensor(payload.get("onsite_l1_sum", 0.0)),
             onsite_mse_sum=self._as_scalar_tensor(payload.get("onsite_mse_sum", 0.0)),
             onsite_cnt_sum=self._as_scalar_tensor(payload.get("onsite_cnt", 0.0)),
@@ -2348,8 +2421,36 @@ class MultiTrainer(Trainer):
     ):
         self._display_window_pack_local += self._make_step_pack(payload)
         self._display_window_dynamic_batch_pack_local += self._make_dynamic_batch_pack(dynamic_batch_state)
-        self._display_window_expert_onsite_sum_local += self._as_scalar_tensor(payload["expert_onsite"], default=0.0)
-        self._display_window_expert_hopping_sum_local += self._as_scalar_tensor(payload["expert_hopping"], default=0.0)
+        # Weight the expert onsite/hopping display metric by each step's effective
+        # gated weight: a step where the metric fired (onsite_weight/hopping_weight
+        # > 0, falling back to the raw active count for pre-weight payloads exactly
+        # as _make_step_pack does) contributes its ratio and a +1 to the fired
+        # counter; a throttled step (gated weight 0) contributes 0 to BOTH -- its
+        # expert_onsite is already 0/1=0, and the explicit *fired keeps that robust.
+        # The raw active_nodes/active_edges telemetry below stays weighted by the
+        # step count (every step), untouched.
+        onsite_fired = (
+            self._as_scalar_tensor(
+                payload.get("onsite_weight", payload.get("active_nodes", 0.0)),
+                default=0.0,
+            )
+            > 0
+        ).to(self.dtype)
+        hopping_fired = (
+            self._as_scalar_tensor(
+                payload.get("hopping_weight", payload.get("active_edges", 0.0)),
+                default=0.0,
+            )
+            > 0
+        ).to(self.dtype)
+        self._display_window_expert_onsite_sum_local += (
+            self._as_scalar_tensor(payload["expert_onsite"], default=0.0) * onsite_fired
+        )
+        self._display_window_expert_hopping_sum_local += (
+            self._as_scalar_tensor(payload["expert_hopping"], default=0.0) * hopping_fired
+        )
+        self._display_window_expert_onsite_steps_local += onsite_fired
+        self._display_window_expert_hopping_steps_local += hopping_fired
         self._display_window_expert_active_nodes_sum_local += self._as_scalar_tensor(payload["active_nodes"], default=0.0)
         self._display_window_expert_active_edges_sum_local += self._as_scalar_tensor(payload["active_edges"], default=0.0)
         self._display_window_last_lr_local = float(current_local_lr)
@@ -2387,12 +2488,18 @@ class MultiTrainer(Trainer):
     def _gather_display_window_expert_metrics(self) -> List[torch.Tensor]:
         local_pack = MetricPack.from_tensor(self._display_window_pack_local)
         local_steps = max(float(local_pack.step_count.item()), 1.0)
+        onsite_steps = self._display_window_expert_onsite_steps_local.clamp_min(1.0)
+        hopping_steps = self._display_window_expert_hopping_steps_local.clamp_min(1.0)
 
         # ExpertDisplayMetric.to_tensor reproduces the bare 6-slot gather layout
         # exactly (slot 2 == grad_norm is written but never read downstream).
+        # The expert metrics use their local fired-step counts so throttled ticks
+        # do not dilute them; raw activity and grad-norm telemetry keep the full
+        # display-window step denominator.  Cross-rank pooling deliberately
+        # retains the fixed 6-slot/equal-rank contract from 0715-refactor.
         local_metric = ExpertDisplayMetric(
-            expert_onsite=self._display_window_expert_onsite_sum_local / local_steps,
-            expert_hopping=self._display_window_expert_hopping_sum_local / local_steps,
+            expert_onsite=self._display_window_expert_onsite_sum_local / onsite_steps,
+            expert_hopping=self._display_window_expert_hopping_sum_local / hopping_steps,
             grad_norm=local_pack.grad_norm_sum / local_steps,
             lr=torch.tensor(float(self._display_window_last_lr_local), dtype=self.dtype, device=self.device),
             active_nodes=self._display_window_expert_active_nodes_sum_local / local_steps,
@@ -2406,6 +2513,37 @@ class MultiTrainer(Trainer):
         self._all_gather_(gathered, local_metric, name="dist/all_gather(display_window_expert_metrics)")
         return gathered
 
+    def _gather_display_window_expert_fired_counts(self) -> List[torch.Tensor]:
+        """Gather the two sparse-metric counts without widening the 6-slot ABI."""
+
+        local_steps = MetricPack.from_tensor(
+            self._display_window_pack_local
+        ).step_count
+        local_counts = torch.stack(
+            (
+                getattr(
+                    self,
+                    "_display_window_expert_onsite_steps_local",
+                    local_steps,
+                ),
+                getattr(
+                    self,
+                    "_display_window_expert_hopping_steps_local",
+                    local_steps,
+                ),
+            )
+        ).to(dtype=self.dtype, device=self.device)
+        if not self._dist_ready():
+            return [local_counts]
+
+        gathered = [torch.zeros_like(local_counts) for _ in range(self.world_size)]
+        self._all_gather_(
+            gathered,
+            local_counts,
+            name="dist/all_gather(display_window_expert_fired_counts)",
+        )
+        return gathered
+
     def _flush_display_window(self, time_idx: int) -> Optional[Dict[str, Any]]:
         if not self._has_pending_display_window():
             return None
@@ -2417,6 +2555,7 @@ class MultiTrainer(Trainer):
             self._all_reduce_(reduced_pack, name="dist/all_reduce(display_window_metrics_packed)")
             self._all_reduce_(reduced_dynamic_pack, name="dist/all_reduce(display_window_dynamic_batch_packed)")
             gathered = self._gather_display_window_expert_metrics()
+            gathered_fired_counts = self._gather_display_window_expert_fired_counts()
 
         reduced_mp = MetricPack.from_tensor(reduced_pack)
         reduced_db = DynamicBatchStat.from_tensor(reduced_dynamic_pack)
@@ -2446,6 +2585,7 @@ class MultiTrainer(Trainer):
             dtype=self.dtype,
             device=self.device,
             time_idx=time_idx,
+            gathered_fired_counts=gathered_fired_counts,
         )
 
         self._add_optimizer_diagnostics_to_state(state)
@@ -2920,8 +3060,12 @@ class MultiTrainer(Trainer):
 
                     global_onsite_sum += self._to_float_scalar(payload["onsite_weighted_sum"])
                     global_hopping_sum += self._to_float_scalar(payload["hopping_weighted_sum"])
-                    total_active_nodes += self._to_int_scalar(payload["active_nodes"])
-                    total_active_edges += self._to_int_scalar(payload["active_edges"])
+                    # Denominators mirror the pack: use the gated onsite/hopping
+                    # weight (== active count on a valid batch, 0 when throttled)
+                    # so global_onsite = global_onsite_sum / total_active_nodes is
+                    # not diluted by throttled batches.
+                    total_active_nodes += self._to_float_scalar(payload.get("onsite_weight", payload.get("active_nodes")))
+                    total_active_edges += self._to_float_scalar(payload.get("hopping_weight", payload.get("active_edges")))
 
                     for z in payload.get("z_values", []):
                         if z is not None:
@@ -3160,7 +3304,8 @@ class MultiTrainer(Trainer):
                 prefix="validation",
                 route="MultiTrainer full-forward validation",
             )
-        return endpoint_state["validation_loss"]
+        endpoint_loss = endpoint_state["validation_loss"]
+        return endpoint_loss if endpoint_loss is not None else optimization_loss.detach()
 
     def _build_validation_euler_payload(
         self,
@@ -3171,6 +3316,7 @@ class MultiTrainer(Trainer):
         range_dis,
         *,
         num_steps: int,
+        prior_seed=None,
     ):
         with self._tagger.tag("validation/prepare_euler_masks", it=self.iter, expert=expert_idx):
             expert_edge_mask, expert_node_mask = self._prepare_expert_masks(
@@ -3184,17 +3330,19 @@ class MultiTrainer(Trainer):
 
         active_nodes = expert_node_mask.sum().detach()
         active_edges = expert_edge_mask.sum().detach()
-
         with self._tagger.tag(
             "validation/flow_sample_euler",
             it=self.iter,
             expert=expert_idx,
             extra=f"steps={int(num_steps)}",
         ):
+            sample_kwargs = {"num_steps": int(num_steps)}
+            if prior_seed is not None:
+                sample_kwargs["prior_seed"] = prior_seed
             sampled = self.flow_cfm.sample(
                 self.model,
                 batch_copy,
-                num_steps=int(num_steps),
+                **sample_kwargs,
             )
 
         sampled["global_step"] = int(self.iter)
@@ -3206,25 +3354,96 @@ class MultiTrainer(Trainer):
         batch_for_loss = batch_copy.copy()
         batch_for_loss.update(batch_info)
 
-        with self._tagger.tag(
-            "validation/euler_compatible_loss",
-            it=self.iter,
-            expert=expert_idx,
-            extra=f"steps={int(num_steps)}",
-        ):
-            loss = criterion(sampled, batch_for_loss)
-        metrics = self._snapshot_loss_metrics(criterion)
+        if bool(getattr(self.flow_cfm, "block_ode", False)):
+            # Block-ODE residual sampling returns the physical full-H state,
+            # while its configured criterion target remains dH. Reconstruct
+            # the t=0 flow context and let the flow scorer perform the exact
+            # residual-to-full adaptation once; feeding ``sampled`` directly
+            # to the criterion would count physical H0 as prediction error.
+            num_graphs = self.flow_cfm._num_graphs(batch_copy)
+            sample_node = sampled.get(
+                getattr(self.flow_cfm, "node_output_key", "node_hamil_blocks")
+            )
+            zero_device = (
+                sample_node.device if torch.is_tensor(sample_node) else self._device_obj()
+            )
+            zero_t = torch.zeros(num_graphs, device=zero_device, dtype=self.dtype)
+            prepare_kwargs = {"t": zero_t}
+            if prior_seed is not None:
+                prepare_kwargs["prior_seed"] = prior_seed
+            _flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
+                batch_copy,
+                batch_for_loss,
+                **prepare_kwargs,
+            )
+            flow_ref.update(batch_info)
+            log_flow_euler = self._validation_flow_metric_enabled(
+                self.flow_cfm, "trajectory"
+            )
+            score_sample = (
+                self.flow_cfm.loss_on_sample
+                if log_flow_euler
+                else self.flow_cfm.compatible_loss_on_sample
+            )
+            with self._tagger.tag(
+                "validation/euler_flow_loss"
+                if log_flow_euler
+                else "validation/euler_compatible_loss",
+                it=self.iter,
+                expert=expert_idx,
+                extra=f"steps={int(num_steps)}",
+            ):
+                loss, flow_state = score_sample(sampled, flow_ref, flow_ctx)
+            compatible_state = Trainer._compatible_loss_state_from_flow_stats(
+                criterion,
+                flow_state,
+                source_prefix="train",
+                prefix="train_compatible",
+                legacy_prefix="train",
+                global_step=getattr(self, "iter", None),
+            )
+            if compatible_state is None:
+                raise RuntimeError(
+                    "Block-ODE validation scoring could not reconstruct the "
+                    "criterion-compatible endpoint triplet from flow-owned stats."
+                )
+            flow_state.update(compatible_state)
+            metrics = self._payload_metrics_from_flow_state(
+                flow_state,
+                prefix="train",
+            )
+        else:
+            with self._tagger.tag(
+                "validation/euler_compatible_loss",
+                it=self.iter,
+                expert=expert_idx,
+                extra=f"steps={int(num_steps)}",
+            ):
+                loss = criterion(sampled, batch_for_loss)
+            metrics = self._snapshot_loss_metrics(criterion)
 
-        onsite_weighted_sum = metrics["onsite"] * active_nodes.to(dtype=self.dtype)
-        hopping_weighted_sum = metrics["hopping"] * active_edges.to(dtype=self.dtype)
+        # Gate the onsite/hopping denominator the same way as the training path:
+        # a euler payload scored through the plain criterion snapshot can report a
+        # throttled (None) onsite/hopping metric, which must drop out of both the
+        # numerator and the denominator.  The flow-state branch never yields None,
+        # so this stays byte-identical there.
+        onsite_weighted_sum, onsite_weight = self._gated_metric_weighted_sum(
+            metrics["onsite"], active_nodes
+        )
+        hopping_weighted_sum, hopping_weight = self._gated_metric_weighted_sum(
+            metrics["hopping"], active_edges
+        )
+        zero_scalar = torch.zeros((), dtype=self.dtype, device=self.device)
 
         return {
             "loss": loss,
             "loss_detached": loss.detach() if torch.is_tensor(loss) else loss,
-            "expert_onsite": metrics["onsite"].detach(),
-            "expert_hopping": metrics["hopping"].detach(),
+            "expert_onsite": metrics["onsite"].detach() if torch.is_tensor(metrics["onsite"]) else zero_scalar,
+            "expert_hopping": metrics["hopping"].detach() if torch.is_tensor(metrics["hopping"]) else zero_scalar,
             "onsite_weighted_sum": onsite_weighted_sum.detach(),
             "hopping_weighted_sum": hopping_weighted_sum.detach(),
+            "onsite_weight": onsite_weight.detach(),
+            "hopping_weight": hopping_weight.detach(),
             "active_nodes": active_nodes.detach(),
             "active_edges": active_edges.detach(),
             "onsite_l1_sum": metrics["last_onsite_l1_sum"].detach()
@@ -3261,6 +3480,14 @@ class MultiTrainer(Trainer):
         num_steps: int,
     ) -> Dict[str, torch.Tensor]:
         state: Dict[str, torch.Tensor] = {}
+        if (
+            bool(getattr(self.flow_cfm, "block_ode", False))
+            and self._validation_flow_metric_enabled(self.flow_cfm, "trajectory")
+        ):
+            mp = MetricPack.from_tensor(pack)
+            state[f"validation_flow_euler_{int(num_steps)}_loss"] = (
+                mp.loss_opt_sum / mp.step_count.clamp_min(1.0)
+            ).detach()
         compatible_prefix = f"validation_compatible_euler_{int(num_steps)}"
         compatible_state = self._compute_compatible_state_from_pack(
             pack,
@@ -3287,19 +3514,43 @@ class MultiTrainer(Trainer):
         with torch.no_grad():
             total_loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
             validation_metric_sums: Dict[str, Any] = {}
+            # Per-key valid-batch counts (mirrors Trainer.validation): a metric that
+            # is None/omitted on a batch -- a throttled feature-compatible
+            # onsite/hopping, an empty distance range -- must contribute to NEITHER
+            # its numerator NOR its own denominator, instead of being diluted by a
+            # flat ``/num_batches``.  Every accumulation routes through ``_accumulate``
+            # so the count stays in lock-step with the sum; at interval=1 each key is
+            # present every batch (count == num_batches) so the reported value is
+            # byte-identical to the previous ``/num_batches``.
+            validation_metric_counts: Dict[str, Any] = {}
+
+            def _accumulate(state):
+                self._accumulate_metric_state(
+                    validation_metric_sums, state, validation_metric_counts
+                )
+
             num_batches = 0
             self.model.eval()
+            generator = getattr(self, "validation_loader_generator", None)
+            if generator is not None:
+                generator.manual_seed(self.validation_loader_seed)
 
             for batch in self.validation_loader:
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
                 flow_euler_validation = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
+                validation_prior_seed = (
+                    self._validation_prior_seed(self.flow_cfm)
+                    if flow_euler_validation
+                    else None
+                )
 
                 if self.distributed_expert:
                     local_idx = self.local_expert_idx
                     if flow_euler_validation:
                         loss_i = None
+                        sampled_loss_fallback = None
                         for num_steps in self.flow_cfm.validation_ode_steps:
                             payload = self._build_validation_euler_payload(
                                 batch_dict=batch_dict,
@@ -3308,6 +3559,7 @@ class MultiTrainer(Trainer):
                                 expert_idx=local_idx,
                                 range_dis=self.distance_ranges[local_idx],
                                 num_steps=int(num_steps),
+                                prior_seed=validation_prior_seed,
                             )
                             with self._tagger.tag(
                                 "validation/reduce_euler_metrics_dist",
@@ -3319,12 +3571,18 @@ class MultiTrainer(Trainer):
                                     reduced_pack,
                                     name=f"dist/all_reduce(validation_euler_{int(num_steps)}_metrics_packed)",
                                 )
+                            reduced_mp = MetricPack.from_tensor(reduced_pack)
+                            if sampled_loss_fallback is None:
+                                sampled_loss_fallback = (
+                                    reduced_mp.loss_opt_sum
+                                    / reduced_mp.step_count.clamp_min(1.0)
+                                ).detach()
                             state = self._validation_euler_state_from_pack(
                                 reduced_pack,
                                 self.validation_lossfunc,
                                 num_steps=int(num_steps),
                             )
-                            self._accumulate_metric_state(validation_metric_sums, state)
+                            _accumulate(state)
                             if loss_i is None:
                                 loss_i = state.get(
                                     "validation_loss",
@@ -3334,7 +3592,11 @@ class MultiTrainer(Trainer):
                                     ),
                                 )
                         if loss_i is None:
-                            loss_i = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
+                            if sampled_loss_fallback is None:
+                                raise RuntimeError(
+                                    "Flow validation produced no Euler payload or endpoint metric."
+                                )
+                            loss_i = sampled_loss_fallback
                     else:
                         payload = self._build_train_payload(
                             batch_dict=batch_dict,
@@ -3358,18 +3620,18 @@ class MultiTrainer(Trainer):
                         if loss_i is None:
                             loss_i = MetricPack.from_tensor(reduced_pack).loss_opt_sum.detach() / max(self.world_size, 1)
 
-                        self._accumulate_metric_state(
-                            validation_metric_sums,
+                        _accumulate(
                             self._pack_component_state(
                                 reduced_pack,
                                 prefix="validation",
                                 criterion=self.validation_lossfunc,
-                            ),
+                            )
                         )
 
                 else:
                     if flow_euler_validation:
                         loss_i = None
+                        sampled_loss_fallback = None
                         for num_steps in self.flow_cfm.validation_ode_steps:
                             local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
                             for expert_idx, range_dis in enumerate(self.distance_ranges):
@@ -3380,14 +3642,21 @@ class MultiTrainer(Trainer):
                                     expert_idx=expert_idx,
                                     range_dis=range_dis,
                                     num_steps=int(num_steps),
+                                    prior_seed=validation_prior_seed,
                                 )
                                 local_pack = local_pack + self._make_step_pack(payload)
+                            local_mp = MetricPack.from_tensor(local_pack)
+                            if sampled_loss_fallback is None:
+                                sampled_loss_fallback = (
+                                    local_mp.loss_opt_sum
+                                    / local_mp.step_count.clamp_min(1.0)
+                                ).detach()
                             state = self._validation_euler_state_from_pack(
                                 local_pack,
                                 self.validation_lossfunc,
                                 num_steps=int(num_steps),
                             )
-                            self._accumulate_metric_state(validation_metric_sums, state)
+                            _accumulate(state)
                             if loss_i is None:
                                 loss_i = state.get(
                                     "validation_loss",
@@ -3397,8 +3666,12 @@ class MultiTrainer(Trainer):
                                     ),
                                 )
                         if loss_i is None:
-                            loss_i = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
-                    elif self.endpoint_loss_mode == "reduce":
+                            if sampled_loss_fallback is None:
+                                raise RuntimeError(
+                                    "Flow validation produced no Euler payload or endpoint metric."
+                                )
+                            loss_i = sampled_loss_fallback
+                    elif getattr(self, "endpoint_loss_mode", "stitch") == "reduce":
                         payloads = []
                         local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
                         for expert_idx, range_dis in enumerate(self.distance_ranges):
@@ -3430,46 +3703,50 @@ class MultiTrainer(Trainer):
                             if bool(getattr(getattr(self, "flow_cfm", None), "enabled", False)):
                                 local_mp = MetricPack.from_tensor(local_pack)
                                 loss_i = local_mp.loss_opt_sum.detach() / local_mp.step_count.clamp_min(1.0)
-                                self._accumulate_metric_state(
-                                    validation_metric_sums,
+                                _accumulate(
                                     self._pack_component_state(
                                         local_pack,
                                         prefix="validation",
                                         criterion=self.validation_lossfunc,
-                                    ),
+                                    )
                                 )
                             else:
                                 with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
                                     loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
-                                    if Trainer._supports_endpoint_triplet(self.validation_lossfunc):
-                                        fallback_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
-                                        self._accumulate_metric_state(
-                                            validation_metric_sums,
+                                    if Trainer._supports_endpoint_triplet(
+                                        self.validation_lossfunc
+                                    ):
+                                        fallback_metrics = self._snapshot_loss_metrics(
+                                            self.validation_lossfunc
+                                        )
+                                        _accumulate(
                                             {
                                                 "validation_onsite_loss": fallback_metrics["onsite"],
                                                 "validation_hopping_loss": fallback_metrics["hopping"],
-                                            },
+                                            }
                                         )
                         else:
-                            self._accumulate_metric_state(
-                                validation_metric_sums,
+                            _accumulate(
                                 self._pack_component_state(
                                     local_pack,
                                     prefix="validation",
                                     criterion=self.validation_lossfunc,
-                                ),
+                                )
                             )
                     else:
                         with self._tagger.tag("validation/full_forward_stitched", it=self.iter):
                             loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
-                        if Trainer._supports_endpoint_triplet(self.validation_lossfunc):
-                            full_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
-                            self._accumulate_metric_state(
-                                validation_metric_sums,
+                        if Trainer._supports_endpoint_triplet(
+                            self.validation_lossfunc
+                        ):
+                            full_metrics = self._snapshot_loss_metrics(
+                                self.validation_lossfunc
+                            )
+                            _accumulate(
                                 {
                                     "validation_onsite_loss": full_metrics["onsite"],
                                     "validation_hopping_loss": full_metrics["hopping"],
-                                },
+                                }
                             )
 
                 total_loss = total_loss + loss_i.detach()
@@ -3480,9 +3757,12 @@ class MultiTrainer(Trainer):
 
         if not fast:
             total_loss = total_loss / len(self.validation_loader)
-        divisor = max(num_batches, 1)
+        # Each key by its OWN contributing-batch count (fallback to num_batches for
+        # any key not routed through _accumulate); a throttled/omitted metric thus
+        # dilutes neither the numerator nor the denominator.
         self._last_flow_validation_state = {
-            key: value / divisor for key, value in validation_metric_sums.items()
+            key: value / max(validation_metric_counts.get(key, num_batches), 1)
+            for key, value in validation_metric_sums.items()
         }
 
         return total_loss

@@ -232,6 +232,18 @@ def test_component_state_active_fallback_when_compatible_none():
     assert out["train_hopping_loss"].item() == pytest.approx(4.0)
 
 
+def test_component_state_omits_cadence_skipped_zero_over_zero_pack():
+    out = MetricReducer.component_state_from_pack(
+        _pack(loss_opt_sum=3.0, step_count=1.0),
+        loss_module=_plain_loss(),
+        supports_triplet=True,
+        dtype=DTYPE,
+        device=DEVICE,
+        prefix="train",
+    )
+    assert out == {}
+
+
 # --------------------------------------------------------------------------
 # stitched_loss_reduce
 # --------------------------------------------------------------------------
@@ -346,3 +358,39 @@ def test_display_state_includes_dynamic_batch_and_oom():
     # supports_triplet False -> no per-expert onsite/hopping tags
     assert "expert_0_onsite" not in state
     assert "expert_0_lr" in state
+
+
+def test_display_state_pools_sparse_expert_metrics_by_fired_count():
+    reduced_pack = _pack(loss_opt_sum=2.0, step_count=2.0)
+    reduced_db = _db_pack()
+    gathered = [
+        ExpertDisplayMetric(
+            expert_onsite=10.0, expert_hopping=8.0, grad_norm=0.0,
+            lr=0.1, active_nodes=4.0, active_edges=6.0,
+        ).to_tensor(dtype=DTYPE, device=DEVICE),
+        ExpertDisplayMetric(
+            expert_onsite=1.0, expert_hopping=2.0, grad_norm=0.0,
+            lr=0.1, active_nodes=4.0, active_edges=6.0,
+        ).to_tensor(dtype=DTYPE, device=DEVICE),
+    ]
+    fired = [torch.tensor([1.0, 0.0]), torch.tensor([9.0, 4.0])]
+
+    state = MetricReducer.display_state_from_packs(
+        reduced_pack,
+        reduced_db,
+        gathered,
+        total_steps=2.0,
+        num_experts=1,
+        rank_to_expert_idx=lambda _rank: 0,
+        train_loss_module=_plain_loss(),
+        supports_triplet=True,
+        dtype=DTYPE,
+        device=DEVICE,
+        time_idx=2,
+        gathered_fired_counts=fired,
+    )
+
+    assert state["expert_0_onsite"] == pytest.approx(1.9)
+    # Rank 0 did not fire hopping, so only rank 1 contributes.
+    assert state["expert_0_hopping"] == pytest.approx(2.0)
+    assert ExpertDisplayMetric.LENGTH == 6

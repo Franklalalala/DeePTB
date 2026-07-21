@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 import warnings
 
@@ -185,15 +186,41 @@ def _normalized_name(value: Any) -> str:
     return str(value).strip().lower().replace("-", "_")
 
 
+def _require_bool(value: Any, *, option_name: str) -> bool:
+    """Reject truthy strings/numbers before legacy aliases bypass dargs."""
+
+    if not isinstance(value, bool):
+        raise TypeError(f"{option_name} must be a boolean.")
+    return value
+
+
+def _require_string(value: Any, *, option_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{option_name} must be a string.")
+    return value
+
+
 def _scope_from_legacy(
     *,
     enabled: Optional[bool],
     node: Optional[bool],
     edge: Optional[bool],
 ) -> str:
-    master = True if enabled is None else bool(enabled)
-    use_node = True if node is None else bool(node)
-    use_edge = True if edge is None else bool(edge)
+    master = (
+        True
+        if enabled is None
+        else _require_bool(enabled, option_name="legacy init enabled flag")
+    )
+    use_node = (
+        True
+        if node is None
+        else _require_bool(node, option_name="legacy node init flag")
+    )
+    use_edge = (
+        True
+        if edge is None
+        else _require_bool(edge, option_name="legacy edge init flag")
+    )
     if not master:
         return "none"
     if use_node and use_edge:
@@ -222,7 +249,11 @@ def resolve_init_scope(
 
     legacy_present = any(value is not None for value in (enabled, node, edge))
     legacy_scope = _scope_from_legacy(enabled=enabled, node=node, edge=edge)
-    resolved = legacy_scope if scope is None else _normalized_name(scope)
+    resolved = (
+        legacy_scope
+        if scope is None
+        else _normalized_name(_require_string(scope, option_name=option_name))
+    )
     aliases = {
         "all": "both",
         "off": "none",
@@ -271,7 +302,10 @@ def _flow_meanflow_subtree(
         "compatible_loss_to_legacy_keys",
     ):
         if dead_flag in meanflow:
-            meanflow.pop(dead_flag)
+            _require_bool(
+                meanflow.pop(dead_flag),
+                option_name=f"flow_options.meanflow.{dead_flag}",
+            )
             changes.append(_AliasHit(f"meanflow.{dead_flag}", "always_on", rv))
 
     top_profile = out.pop("meanflow_profile", _MISSING)
@@ -284,9 +318,25 @@ def _flow_meanflow_subtree(
         changes.append(_AliasHit("meanflow_profile", "meanflow.profile", rv))
     aggressive_values = []
     if "meanflow_aggressive" in out:
-        aggressive_values.append(("meanflow_aggressive", bool(out.pop("meanflow_aggressive"))))
+        aggressive_values.append(
+            (
+                "meanflow_aggressive",
+                _require_bool(
+                    out.pop("meanflow_aggressive"),
+                    option_name="flow_options.meanflow_aggressive",
+                ),
+            )
+        )
     if "aggressive" in meanflow:
-        aggressive_values.append(("meanflow.aggressive", bool(meanflow.pop("aggressive"))))
+        aggressive_values.append(
+            (
+                "meanflow.aggressive",
+                _require_bool(
+                    meanflow.pop("aggressive"),
+                    option_name="flow_options.meanflow.aggressive",
+                ),
+            )
+        )
     if len({value for _name, value in aggressive_values}) > 1:
         raise ValueError(
             "Conflicting flow_options.meanflow_aggressive and "
@@ -307,8 +357,18 @@ def _flow_missing_h0_policy(
     strict = out.pop("strict_h0", _MISSING)
     warn_missing = out.pop("warn_missing_h0", _MISSING)
     if strict is not _MISSING or warn_missing is not _MISSING:
-        strict_value = True if strict is _MISSING else bool(strict)
-        warn_value = True if warn_missing is _MISSING else bool(warn_missing)
+        strict_value = (
+            True
+            if strict is _MISSING
+            else _require_bool(strict, option_name="flow_options.strict_h0")
+        )
+        warn_value = (
+            True
+            if warn_missing is _MISSING
+            else _require_bool(
+                warn_missing, option_name="flow_options.warn_missing_h0"
+            )
+        )
         legacy_policy = "error" if strict_value else "warn_zero" if warn_value else "zero"
         if "missing_h0_policy" in out and _normalized_name(out["missing_h0_policy"]) != legacy_policy:
             raise ValueError(
@@ -320,13 +380,49 @@ def _flow_missing_h0_policy(
         if warn_missing is not _MISSING:
             changes.append(_AliasHit("warn_missing_h0", "missing_h0_policy", rv))
     if "missing_h0_policy" in out:
-        policy = _normalized_name(out["missing_h0_policy"])
+        policy = _normalized_name(
+            _require_string(
+                out["missing_h0_policy"],
+                option_name="flow_options.missing_h0_policy",
+            )
+        )
         policy = {"warn": "warn_zero", "silent_zero": "zero"}.get(policy, policy)
         if policy not in {"error", "warn_zero", "zero"}:
             raise ValueError(
                 "flow_options.missing_h0_policy must be 'error', 'warn_zero', or 'zero'."
             )
         out["missing_h0_policy"] = policy
+
+
+def _flow_prediction_reconstruction_marker(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
+    """Remove the feature-branch duplicate of prediction.reconstruction.
+
+    ``prediction_add_h0`` was only a declarative block-ODE marker and was
+    required to be false.  Keeping it in dargs would create a second source of
+    truth beside ``model_options.prediction.reconstruction``.  Accept the only
+    historically valid value as a deprecated no-op and reject true instead of
+    guessing at a cross-tree reconstruction change.
+    """
+
+    if "prediction_add_h0" not in out:
+        return
+    value = out.pop("prediction_add_h0")
+    if not isinstance(value, bool):
+        raise TypeError("flow_options.prediction_add_h0 must be a boolean.")
+    if value:
+        raise ValueError(
+            "flow_options.prediction_add_h0=true is not a valid canonical "
+            "route; set model_options.prediction.reconstruction explicitly."
+        )
+    changes.append(
+        _AliasHit(
+            "prediction_add_h0",
+            "model_options.prediction.reconstruction='direct'",
+            rv,
+        )
+    )
 
 
 def _flow_validation_metrics(
@@ -338,6 +434,10 @@ def _flow_validation_metrics(
     if configured_metrics is not _MISSING:
         if not isinstance(configured_metrics, (list, tuple, set)):
             raise TypeError("flow_options.validation_flow_metrics must be a list.")
+        if any(not isinstance(value, str) for value in configured_metrics):
+            raise TypeError(
+                "flow_options.validation_flow_metrics must contain strings."
+            )
         normalized_metrics = {
             metric_aliases.get(_normalized_name(value), _normalized_name(value))
             for value in configured_metrics
@@ -356,11 +456,12 @@ def _flow_validation_metrics(
         "log_validation_t0_loss": "one_step",
         "log_validation_flow_euler_loss": "trajectory",
     }
-    present_legacy_metrics = {
-        metric: bool(out.pop(flag))
-        for flag, metric in legacy_metric_flags.items()
-        if flag in out
-    }
+    present_legacy_metrics = {}
+    for flag, metric in legacy_metric_flags.items():
+        if flag in out:
+            present_legacy_metrics[metric] = _require_bool(
+                out.pop(flag), option_name=f"flow_options.{flag}"
+            )
     if present_legacy_metrics:
         legacy_metrics = {
             metric
@@ -386,7 +487,52 @@ def _flow_validation_ode_steps(
     out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
 ) -> None:
     if "validation_ode_steps" in out:
-        steps = {int(value) for value in out["validation_ode_steps"] if int(value) > 0}
+        raw_steps = out["validation_ode_steps"]
+        if not isinstance(raw_steps, (list, tuple, set)):
+            raise TypeError("flow_options.validation_ode_steps must be a list.")
+        if not raw_steps:
+            block_ode = out.get("block_ode", False)
+            if "block_ode" in out:
+                block_ode = _require_bool(
+                    block_ode, option_name="flow_options.block_ode"
+                )
+            output_space = out.get("output_space", "")
+            normalized_output_space = (
+                _normalized_name(output_space)
+                if isinstance(output_space, str)
+                else ""
+            )
+            block_output_spaces = {
+                "ao_block_ode",
+                "block_ode",
+                "ao_blocks_ode",
+                "uureal_block_ode",
+                "spatial_uureal_residual_block_ode",
+                "uureal_residual_block_ode",
+                "residual_ao_block_ode",
+            }
+            # Preserve an explicit empty list only for a requested block ODE so
+            # its cross-tree contract can reject the malformed production
+            # configuration.  Generic flows retain the 0715 invariant that
+            # canonicalization always inserts the Euler-1 endpoint.
+            out["validation_ode_steps"] = (
+                []
+                if block_ode or normalized_output_space in block_output_spaces
+                else [1]
+            )
+            return
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral)
+            for value in raw_steps
+        ):
+            raise ValueError(
+                "flow_options.validation_ode_steps must contain positive integers."
+            )
+        if any(value <= 0 for value in raw_steps):
+            raise ValueError(
+                "flow_options.validation_ode_steps must contain positive integers."
+            )
+        steps = {int(value) for value in raw_steps}
         steps.add(1)
         out["validation_ode_steps"] = sorted(steps)
 
@@ -395,7 +541,10 @@ def _flow_omit_time_scaling(
     out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
 ) -> None:
     if "omit_time_scaling" in out:
-        omit = bool(out.pop("omit_time_scaling"))
+        omit = _require_bool(
+            out.pop("omit_time_scaling"),
+            option_name="flow_options.omit_time_scaling",
+        )
         if omit:
             # This reproduces the legacy short-circuit exactly, including when
             # endpoint_weight_power was configured to a non-zero value.
@@ -416,19 +565,36 @@ def _flow_dead_top_flags(
         "compatible_loss_to_legacy_keys",
     ):
         if dead_flag in out:
-            out.pop(dead_flag)
+            _require_bool(
+                out.pop(dead_flag), option_name=f"flow_options.{dead_flag}"
+            )
             changes.append(_AliasHit(dead_flag, "always_on", rv))
 
 
 def _flow_final_normalize(
     out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
 ) -> None:
-    if "objective" in out:
-        out["objective"] = _normalized_name(out["objective"])
-    if "prior" in out and isinstance(out["prior"], str):
-        out["prior"] = _normalized_name(out["prior"])
-    if "te_prior_mode" in out:
-        out["te_prior_mode"] = _normalized_name(out["te_prior_mode"])
+    # Normalize every route-bearing enum before dargs injects defaults.  The
+    # block-ODE validator and runtime must see one spelling (not a mix of
+    # hyphenated and underscored values), while semantic aliases such as
+    # uureal_residual_block_ode remain distinct and are rejected at the strict
+    # contract boundary rather than silently redirected.
+    for key in (
+        "objective",
+        "mode",
+        "prior",
+        "te_prior_mode",
+        "output_space",
+        "state_space",
+        "target_semantics",
+        "block_input_adapter",
+        "h0_condition_space",
+        "block_inverse_mode",
+        "strict_certification",
+        "component_reduction",
+    ):
+        if key in out and isinstance(out[key], str):
+            out[key] = _normalized_name(out[key])
 
 
 # Ordered registry for ``flow_options``.  Order is load-bearing: pixel_meanflow
@@ -443,6 +609,7 @@ _FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
     _Rename("physical_prior_jitter_sigma", ("prior_jitter_sigma",)),
     _Transform(_flow_meanflow_subtree),
     _Transform(_flow_missing_h0_policy),
+    _Transform(_flow_prediction_reconstruction_marker),
     _Transform(_flow_validation_metrics),
     _Transform(_flow_validation_ode_steps),
     _Transform(_flow_omit_time_scaling),
@@ -487,7 +654,9 @@ def _canonicalize_endpoint_loss_mode(
     canonical_mode = options.get("endpoint_loss_mode", _MISSING)
 
     def _validate(value: Any) -> str:
-        mode = _normalized_name(value)
+        mode = _normalized_name(
+            _require_string(value, option_name="train_options.endpoint_loss_mode")
+        )
         if mode not in {"reduce", "full_forward"}:
             raise ValueError(
                 "train_options.endpoint_loss_mode must be 'reduce' or "
@@ -500,12 +669,17 @@ def _canonicalize_endpoint_loss_mode(
 
     legacy_effective = _MISSING
     if legacy_enabled is not _MISSING or legacy_mode is not _MISSING:
+        if legacy_enabled is not _MISSING:
+            legacy_enabled = _require_bool(
+                legacy_enabled,
+                option_name="train_options.log_single_model_compatible_loss",
+            )
         normalized_legacy_mode = (
             "reduce" if legacy_mode is _MISSING else _validate(legacy_mode)
         )
         legacy_effective = (
             normalized_legacy_mode
-            if legacy_enabled is _MISSING or bool(legacy_enabled)
+            if legacy_enabled is _MISSING or legacy_enabled
             else "full_forward"
         )
         if canonical_mode is not _MISSING and canonical_mode != legacy_effective:
@@ -705,7 +879,12 @@ def _embedding_prior(
         changes.append(_AliasHit(old, f"soft_edge_memory.{new}", rv))
     if memory or "soft_edge_memory" in out:
         out["soft_edge_memory"] = memory
-    if scope == "none" and bool(memory.get("enabled", True)):
+    memory_enabled = memory.get("enabled", True)
+    if "enabled" in memory:
+        memory_enabled = _require_bool(
+            memory_enabled, option_name="embedding.soft_edge_memory.enabled"
+        )
+    if scope == "none" and memory_enabled:
         raise ValueError(
             "embedding.soft_edge_memory.enabled=true requires "
             "prior_init_scope != 'none'."
@@ -752,12 +931,26 @@ def resolve_reconstruction_mode(
     add_h0: Optional[bool] = None,
     add_prior: Optional[bool] = None,
 ) -> str:
-    legacy_h0 = bool(add_h0) if add_h0 is not None else False
-    legacy_prior = bool(add_prior) if add_prior is not None else False
+    legacy_h0 = (
+        _require_bool(add_h0, option_name="prediction.add_h0")
+        if add_h0 is not None
+        else False
+    )
+    legacy_prior = (
+        _require_bool(add_prior, option_name="prediction.add_prior")
+        if add_prior is not None
+        else False
+    )
     if legacy_h0 and legacy_prior:
         raise ValueError("prediction.add_h0 and prediction.add_prior are mutually exclusive.")
     legacy_mode = "h0_residual" if legacy_h0 else "prior_residual" if legacy_prior else "direct"
-    resolved = legacy_mode if mode is None else _normalized_name(mode)
+    resolved = (
+        legacy_mode
+        if mode is None
+        else _normalized_name(
+            _require_string(mode, option_name="prediction.reconstruction")
+        )
+    )
     resolved = _RECONSTRUCTION_ALIASES.get(resolved, resolved)
     if resolved not in {"direct", "h0_residual", "prior_residual"}:
         raise ValueError(

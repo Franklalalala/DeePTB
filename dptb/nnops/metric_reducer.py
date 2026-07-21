@@ -186,6 +186,15 @@ class MetricReducer:
             }
 
         mp = MetricPack.from_tensor(pack)
+        if (
+            float(mp.active_nodes_sum.item()) <= 0.0
+            and float(mp.active_edges_sum.item()) <= 0.0
+            and float(mp.onsite_weighted_sum.item()) == 0.0
+            and float(mp.hopping_weighted_sum.item()) == 0.0
+        ):
+            # A cadence-skipped pack carries 0/0 for both components. Preserve
+            # absence instead of publishing a valid-looking zero metric.
+            return {}
         onsite_cnt = mp.active_nodes_sum.to(dtype=dtype).clamp_min(1.0)
         hopping_cnt = mp.active_edges_sum.to(dtype=dtype).clamp_min(1.0)
         return {
@@ -310,6 +319,7 @@ class MetricReducer:
         dtype,
         device,
         time_idx: int,
+        gathered_fired_counts: Optional[List[torch.Tensor]] = None,
     ) -> Dict[str, Any]:
         """Assemble the display-window ``state`` dict from reduced/gathered packs.
 
@@ -363,9 +373,30 @@ class MetricReducer:
             })
 
         expert_metrics: Dict[int, List[torch.Tensor]] = {}
+        expert_fired_counts: Dict[int, List[torch.Tensor]] = {}
         for rank_idx, vec in enumerate(gathered):
             expert_idx = rank_to_expert_idx(rank_idx)
             expert_metrics.setdefault(expert_idx, []).append(vec)
+            if gathered_fired_counts is not None:
+                if rank_idx >= len(gathered_fired_counts):
+                    raise ValueError(
+                        "Expert fired-count sidecar must have one entry per gathered rank."
+                    )
+                counts = gathered_fired_counts[rank_idx]
+                if counts.numel() != 2:
+                    raise ValueError(
+                        "Expert fired-count sidecar entries must contain exactly "
+                        "[onsite_count, hopping_count]."
+                    )
+                expert_fired_counts.setdefault(expert_idx, []).append(counts.reshape(2))
+
+        if (
+            gathered_fired_counts is not None
+            and len(gathered_fired_counts) != len(gathered)
+        ):
+            raise ValueError(
+                "Expert fired-count sidecar must have one entry per gathered rank."
+            )
 
         for expert_idx in range(num_experts):
             vecs = expert_metrics.get(expert_idx, [])
@@ -374,8 +405,29 @@ class MetricReducer:
             stacked = torch.stack(vecs)
             mean_metric = ExpertDisplayMetric.from_tensor(stacked.mean(dim=0))
             if supports_triplet:
-                state[f"expert_{expert_idx}_onsite"] = float(mean_metric.expert_onsite.item())
-                state[f"expert_{expert_idx}_hopping"] = float(mean_metric.expert_hopping.item())
+                onsite_value = mean_metric.expert_onsite
+                hopping_value = mean_metric.expert_hopping
+                count_vecs = expert_fired_counts.get(expert_idx, [])
+                if count_vecs:
+                    counts = torch.stack(count_vecs).to(
+                        dtype=stacked.dtype, device=stacked.device
+                    )
+                    onsite_count = counts[:, 0].sum()
+                    hopping_count = counts[:, 1].sum()
+                    onsite_value = torch.where(
+                        onsite_count > 0,
+                        (stacked[:, 0] * counts[:, 0]).sum()
+                        / onsite_count.clamp_min(1.0),
+                        stacked[:, 0].new_zeros(()),
+                    )
+                    hopping_value = torch.where(
+                        hopping_count > 0,
+                        (stacked[:, 1] * counts[:, 1]).sum()
+                        / hopping_count.clamp_min(1.0),
+                        stacked[:, 1].new_zeros(()),
+                    )
+                state[f"expert_{expert_idx}_onsite"] = float(onsite_value.item())
+                state[f"expert_{expert_idx}_hopping"] = float(hopping_value.item())
             state[f"expert_{expert_idx}_lr"] = float(mean_metric.lr.item())
             state[f"expert_{expert_idx}_active_nodes"] = float(mean_metric.active_nodes.item())
             state[f"expert_{expert_idx}_active_edges"] = float(mean_metric.active_edges.item())

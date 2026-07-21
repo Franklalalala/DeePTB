@@ -90,6 +90,14 @@ class _PackMixin:
 class MetricPack(_PackMixin):
     """The 17-slot per-step training metric pack (legacy ``_P_*`` layout).
 
+    ``active_nodes_sum`` and ``active_edges_sum`` retain their historical wire
+    names and positions, but are the denominators paired with
+    ``onsite_weighted_sum`` / ``hopping_weighted_sum``.  For payloads carrying
+    cadence-gated metrics they therefore serialize ``onsite_weight`` /
+    ``hopping_weight`` (zero when that metric was omitted), while raw active
+    node/edge telemetry stays in :class:`ExpertDisplayMetric`.  This fixes the
+    averaging semantics without widening or reordering the 17-slot protocol.
+
     Slot indices (must match ``MultiTrainer._P_*``)::
 
         0  loss_opt_sum          9  hopping_mse_sum

@@ -177,6 +177,16 @@ STRUCTURAL_FIELDS = frozenset(
         # multi-expert smoke). keep_first is both correct and safe.
         "node_attrs",
         "edge_attrs",
+        # Residual AO-block tensors are also model inputs.  They deliberately
+        # live under node_/edge_ names so they collate with the graph, but an
+        # ensemble must not masked_replace them after an expert forward: doing
+        # so can change another expert's input and mutate tensors retained by
+        # autograd.  Shape companions already take the *_block_shape metadata
+        # path below and are keep_first as well.
+        "node_uureal_residual_blocks",
+        "edge_uureal_residual_blocks",
+        "node_spatial_residual_blocks",
+        "edge_spatial_residual_blocks",
     }
 )
 

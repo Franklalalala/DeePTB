@@ -107,11 +107,11 @@ def test_global_element_reduction_does_not_equal_weight_node_and_edge_components
     assert loss.item() == pytest.approx(7.0)
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
-    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
 
 
-def test_cfm_writes_default_legacy_train_tags_and_router_stats():
+def test_cfm_writes_flow_namespaced_train_tags_and_router_stats():
     flow = HamiltonianCFM(
         {
             "enabled": True,
@@ -132,8 +132,8 @@ def test_cfm_writes_default_legacy_train_tags_and_router_stats():
 
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
-    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
     assert state["mean_max_prob"].item() == pytest.approx(0.75)
     assert state["expert_load_cv"].item() == pytest.approx(0.25)
 

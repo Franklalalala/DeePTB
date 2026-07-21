@@ -44,12 +44,15 @@ import torch
 from dptb.data import AtomicData, AtomicDataDict
 from dptb.data.interfaces.p2_contract import (
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
     P2_BUNDLE_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
+    RAW_HAMILTONIAN_SAMPLE_SCHEMA,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     ROW_ALIGNED_FIELD_CANDIDATES,
@@ -97,6 +100,9 @@ class SampleContext:
     prefer_precomputed_prior: bool
     residual_hamiltonian: bool
     require_full_h_target: bool
+    require_uureal_block_ode: bool
+    residual_shrink_policy: str
+    min_residual_shrink: float
     require_prior_blocks: bool
     audit_prior_representations: bool
     expected_prior_source_fingerprint: Optional[str]
@@ -164,6 +170,7 @@ class SampleContext:
     uses_pre_h0: bool
     uses_p2: bool
     load_prior_blocks: bool
+    dedicated_h0: bool
 
     # --- derived graph flags ---------------------------------------------
     stored_edge_index: Any
@@ -206,8 +213,54 @@ class RecordSchemaValidator:
         Returns ``(basis_fingerprint, stored_basis_fingerprint)`` for reuse by
         the downstream graph/prior fingerprint checks.
         """
+        sample_schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+        if (
+            sample_schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA
+            and getattr(dataset, "get_prior", False)
+        ):
+            raise ValueError(
+                "Generic raw-H records cannot also supply a P2/P23 dataset "
+                "prior. Use the versioned P2/dual-prior sample schema so prior "
+                "source and parent provenance remain fail-closed."
+            )
+
+        dedicated_h0 = bool(
+            getattr(dataset, "require_full_h_target", False)
+            and dataset.get_H0
+            and data_dict.get(PHYSICAL_H0_SOURCE_KEY)
+            == DEDICATED_PHYSICAL_H0_SOURCE
+        )
+        if dedicated_h0:
+            dataset._assert_dedicated_physical_h0_dataset_fingerprint()
+
         if getattr(dataset, "require_full_h_target", False):
-            _host.assert_absolute_full_h_target_contract(data_dict)
+            _host.assert_absolute_full_h_target_contract(
+                data_dict,
+                h0_key=dataset.h0_key,
+                # RAW_HAMILTONIAN_SAMPLE_SCHEMA is the block-ODE raw-H/H0
+                # authority. Historical P2 schemas keep their 0715 opt-in
+                # behavior unless they explicitly declare a physical-H0 source.
+                require_h0=bool(
+                    dataset.get_H0
+                    and (
+                        sample_schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA
+                        or PHYSICAL_H0_SOURCE_KEY in data_dict
+                    )
+                ),
+                expected_physical_h0_source_fingerprint=getattr(
+                    dataset, "expected_physical_h0_source_fingerprint", None
+                ),
+            )
+        if getattr(dataset, "require_residual_h_target", False):
+            _host.assert_residual_h_target_contract(
+                data_dict, h0_key=dataset.h0_key
+            )
+        if getattr(dataset, "require_residual_from_full_h_target", False):
+            _host.assert_residual_from_full_h_target_contract(
+                data_dict, h0_key=dataset.h0_key
+            )
+        if getattr(dataset, "require_uureal_block_ode", False):
+            self._validate_uureal_block_ode(dataset, data_dict)
         stored_basis_fingerprint = data_dict.get(BASIS_FINGERPRINT_KEY)
         # Historical, non-fingerprinted records need not expose a production
         # OrbitalMapper.  Resolve the mapper fingerprint lazily only when the
@@ -230,6 +283,70 @@ class RecordSchemaValidator:
                     f"mapper={basis_fingerprint}."
                 )
         return basis_fingerprint, stored_basis_fingerprint
+
+    @staticmethod
+    def _validate_uureal_block_ode(dataset: Any, data_dict: Dict[str, Any]) -> None:
+        """Fail closed on incomplete or mislabeled compact uu_real records."""
+
+        keep = int(dataset.type_mapper.reduced_matrix_element)
+        required = (
+            "blockwise_spatial_schema",
+            "blockwise_target_mode",
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+            "soc_uureal_compact",
+            "soc_uureal_full_rme",
+            "soc_uureal_keep",
+            AtomicDataDict.NODE_H0_KEY,
+            AtomicDataDict.EDGE_H0_KEY,
+            AtomicDataDict.NODE_DELTA_HAMIL_BLOCKS_KEY,
+            AtomicDataDict.EDGE_DELTA_HAMIL_BLOCKS_KEY,
+            AtomicDataDict.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+            AtomicDataDict.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        missing = [key for key in required if key not in data_dict]
+        if missing:
+            raise KeyError(f"Compact uu_real block record missing keys={missing}.")
+
+        expected = {
+            "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
+            "blockwise_target_mode": "already-delta",
+            "soc_uureal_compact": True,
+            "soc_uureal_full_rme": keep * 8,
+            "soc_uureal_keep": keep,
+        }
+        for key, wanted in expected.items():
+            actual = data_dict[key]
+            actual = (
+                torch.as_tensor(actual).item()
+                if not isinstance(actual, str)
+                else actual
+            )
+            if actual != wanted:
+                raise ValueError(
+                    "Compact uu_real block record requires "
+                    f"{key}={wanted!r}; got {actual!r}."
+                )
+
+        # Converter metadata records the original feature widths.  A normal
+        # full-SOC -> uu_real conversion therefore has source_width > keep;
+        # already-compact input has source_width == keep.
+        for key in (
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+        ):
+            try:
+                actual = int(torch.as_tensor(data_dict[key]).item())
+            except (TypeError, ValueError, RuntimeError):
+                raise ValueError(
+                    "Compact uu_real block record requires integer "
+                    f"{key}; got {data_dict[key]!r}."
+                )
+            if actual < keep:
+                raise ValueError(
+                    f"Compact uu_real block record requires {key} >= "
+                    f"keep={keep}; got {actual}."
+                )
 
     def mark_validated(self, ctx: SampleContext, graph: GraphState) -> None:
         # Mark only after every applicable graph/row/prior/target fingerprint
@@ -607,6 +724,17 @@ class TargetDecoder:
         ):
             if blockwise_key in data_dict:
                 atomicdata[blockwise_key] = torch.as_tensor(data_dict[blockwise_key])
+        if ctx.require_uureal_block_ode:
+            for metadata_key in (
+                "blockwise_spatial_schema",
+                "blockwise_target_mode",
+                "blockwise_source_target_feature_width",
+                "blockwise_source_h0_feature_width",
+                "soc_uureal_compact",
+                "soc_uureal_full_rme",
+                "soc_uureal_keep",
+            ):
+                atomicdata[metadata_key] = data_dict[metadata_key]
         if ctx.load_prior_blocks:
             for blockwise_key in ctx.p2_blockwise_keys:
                 if blockwise_key in data_dict:
@@ -629,7 +757,11 @@ class TargetDecoder:
             block_target_source = ctx.blocks
             if ctx.residual_hamiltonian:
                 block_target_source = _host.build_residual_hamiltonian_target_blocks(
-                    data_dict, ctx.blocks, h0_key=ctx.h0_key
+                    data_dict,
+                    ctx.blocks,
+                    h0_key=ctx.h0_key,
+                    shrink_policy=ctx.residual_shrink_policy,
+                    min_shrink=ctx.min_residual_shrink,
                 )
             target_blocks = block_dict_to_ordered_tensors(
                 atomicdata,
@@ -666,6 +798,20 @@ class TargetDecoder:
                 strict_complete_edges=False,
             )
             attach_block_tensors(atomicdata, target_h0_blocks, prefix="h0")
+
+        if ctx.dedicated_h0 and not ctx.record_contract_already_validated:
+            from dptb.data.interfaces.blockwise_tensor import validate_packed_non_soc_blocks
+
+            validate_packed_non_soc_blocks(
+                atomicdata,
+                ctx.type_mapper,
+                atomicdata[AtomicDataDict.NODE_H0_BLOCKS_KEY],
+                atomicdata[AtomicDataDict.EDGE_H0_BLOCKS_KEY],
+                atomicdata[AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY],
+                atomicdata[AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY],
+                label="physical H0",
+                require_symmetric_edges=True,
+            )
 
         if (
             ctx.load_prior_blocks
@@ -1006,6 +1152,9 @@ def build_sample_context(
     prefer_precomputed_prior = dataset.prefer_precomputed_prior
     residual_hamiltonian = getattr(dataset, "residual_hamiltonian", False)
     require_full_h_target = getattr(dataset, "require_full_h_target", False)
+    require_uureal_block_ode = getattr(dataset, "require_uureal_block_ode", False)
+    residual_shrink_policy = getattr(dataset, "residual_shrink_policy", "error")
+    min_residual_shrink = getattr(dataset, "min_residual_shrink", 1.2)
     require_prior_blocks = getattr(dataset, "require_prior_blocks", False)
     audit_prior_representations = getattr(dataset, "audit_prior_representations", False)
     expected_prior_source_fingerprint = getattr(
@@ -1167,6 +1316,12 @@ def build_sample_context(
         get_prior
         and (require_prior_blocks or audit_prior_representations)
     )
+    dedicated_h0 = bool(
+        require_full_h_target
+        and get_H0
+        and data_dict.get(PHYSICAL_H0_SOURCE_KEY)
+        == DEDICATED_PHYSICAL_H0_SOURCE
+    )
 
     mapper_p2_irreps = getattr(
         getattr(dataset, "type_mapper", None), "orbpair_irreps", None
@@ -1192,6 +1347,9 @@ def build_sample_context(
         prefer_precomputed_prior=prefer_precomputed_prior,
         residual_hamiltonian=residual_hamiltonian,
         require_full_h_target=require_full_h_target,
+        require_uureal_block_ode=require_uureal_block_ode,
+        residual_shrink_policy=residual_shrink_policy,
+        min_residual_shrink=min_residual_shrink,
         require_prior_blocks=require_prior_blocks,
         audit_prior_representations=audit_prior_representations,
         expected_prior_source_fingerprint=expected_prior_source_fingerprint,
@@ -1237,6 +1395,7 @@ def build_sample_context(
         uses_pre_h0=uses_pre_h0,
         uses_p2=uses_p2,
         load_prior_blocks=load_prior_blocks,
+        dedicated_h0=dedicated_h0,
         stored_edge_index=stored_edge_index,
         stored_edge_shift=stored_edge_shift,
         has_stored_edge_graph=has_stored_edge_graph,
@@ -1278,6 +1437,12 @@ class RecordPipeline:
         self.prior_decoder.validate_blocks(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.validate_full_h(ctx, atomicdata)
         self.schema_validator.mark_validated(ctx, graph)
+
+        # Attach a stable, composition-independent per-graph record identity for
+        # deterministic seeded prior streams.
+        atomicdata[AtomicDataDict.SAMPLE_UID_KEY] = torch.tensor(
+            [dataset._compute_sample_uid(idx)], dtype=torch.long
+        )
 
         return atomicdata
 

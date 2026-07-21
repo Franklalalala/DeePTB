@@ -68,6 +68,49 @@ def _migrate_plain_tensor_state(module, fn):
                 module.cdtype = float2comlex(module.dtype)
 
 
+def _inverse_contract_cg_hr(
+    cg_basis: torch.Tensor,
+    hr: torch.Tensor,
+    *,
+    orthogonality_atol: float = 1e-10,
+) -> torch.Tensor:
+    """Invert one complete non-SOC CG block without using a pseudo-inverse.
+
+    ``cg_basis`` stores the square change-of-basis matrix as ``[m1,m2,rme]``
+    and ``hr`` is ``[rows,chunks,m1,m2]``.  The e3nn normalization used by
+    DeePTB is orthogonal for a complete set of coupled angular momenta, so the
+    normal path is a transpose contraction.  A full-rank non-orthogonal basis
+    is still inverted exactly with ``torch.linalg.solve``; a rectangular or
+    rank-deficient basis is a hard error rather than something to hide with a
+    pseudo-inverse.
+    """
+    matrix = cg_basis.reshape(-1, cg_basis.shape[-1]).to(
+        device=hr.device, dtype=hr.dtype
+    )
+    if matrix.shape[0] != matrix.shape[1]:
+        raise RuntimeError(
+            "CG inverse requires a square complete basis, got "
+            f"shape={tuple(matrix.shape)}."
+        )
+    identity = torch.eye(matrix.shape[0], dtype=matrix.dtype, device=matrix.device)
+    ctc_error = (matrix.transpose(0, 1) @ matrix - identity).abs().max()
+    cct_error = (matrix @ matrix.transpose(0, 1) - identity).abs().max()
+    if bool((torch.maximum(ctc_error, cct_error) <= orthogonality_atol).item()):
+        return torch.einsum("ncij,ijr->nrc", hr, matrix.reshape_as(cg_basis))
+
+    # ``matrix @ rme = product`` for every row/chunk.  solve() both proves
+    # nonsingularity and keeps the inverse differentiable.
+    rhs = hr.reshape(-1, matrix.shape[0]).transpose(0, 1)
+    try:
+        solved = torch.linalg.solve(matrix, rhs).transpose(0, 1)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "CG basis is not orthogonal and is singular/rank deficient; "
+            "refusing a pseudo-inverse."
+        ) from exc
+    return solved.reshape(hr.shape[0], hr.shape[1], matrix.shape[1]).transpose(1, 2)
+
+
 class E3Hamiltonian(torch.nn.Module):
     def __init__(
         self,
@@ -81,6 +124,7 @@ class E3Hamiltonian(torch.nn.Module):
         device: Union[str, torch.device] = torch.device("cpu"),
         rotation: bool = False,
         soc: bool = False,
+        enable_inverse_cg: bool = False,
         # ---- Debug flags ----
         debug: bool = False,
         debug_every: int = 1,
@@ -99,6 +143,9 @@ class E3Hamiltonian(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.soc = soc
+        # HR -> RME inverse-CG is a new, block-codec-only operation.  Keep it
+        # opt-in so every historical decompose=True caller remains unchanged.
+        self.enable_inverse_cg = bool(enable_inverse_cg)
         self.full_soc_prediction = bool(
             kwargs.get("full_soc_prediction", getattr(idp, "full_soc_prediction", False))
         )
@@ -170,6 +217,17 @@ class E3Hamiltonian(torch.nn.Module):
         else:
             assert idp is not None, "Either basis or idp should be provided."
             self.idp = idp
+
+        if self.enable_inverse_cg:
+            if not self.decompose:
+                raise ValueError(
+                    "enable_inverse_cg=True requires decompose=True."
+                )
+            if self.soc or bool(getattr(self.idp, "has_soc", False)):
+                raise NotImplementedError(
+                    "enable_inverse_cg=True supports non-SOC E3Hamiltonian "
+                    "layouts only."
+                )
 
         self.basis = self.idp.basis
         self.soc_complex_doubling = getattr(self.idp, "soc_complex_doubling", True)
@@ -435,6 +493,8 @@ class E3Hamiltonian(torch.nn.Module):
         if not self.decompose:
             # ---------------- EDGE ----------------
             for k_i, opairtype in enumerate(self.idp.orbpairtype_maps.keys()):
+                if n_edge == 0:
+                    break
                 verbose = self._should_debug() and (k_i < self.debug_max_pairtypes)
 
                 l1, l2 = anglrMId[opairtype[0]], anglrMId[opairtype[2]]
@@ -528,9 +588,59 @@ class E3Hamiltonian(torch.nn.Module):
 
         # ---------------- Decompose: HR -> RME ----------------
         else:
-            if self._should_debug():
-                self._dbg("[DBG] decompose=True branch not implemented here.")
-            pass
+            # The exact inverse added for the non-SOC block-state codec must
+            # not change legacy SOC or non-SOC statistics routes.  In particular,
+            # LMDBDataset.E3statistics and other legacy callers may either set
+            # soc=True explicitly or pass a SOC OrbitalMapper while leaving
+            # the constructor flag at its historical default.  Both layouts
+            # must pass through here unchanged.  SOC inverse-CG is
+            # intentionally outside the codec's supported scope.
+            mapper_has_soc = bool(getattr(self.idp, "has_soc", False))
+            if self.soc and not mapper_has_soc:
+                raise NotImplementedError(
+                    "E3Hamiltonian(decompose=True, soc=True) received a non-SOC "
+                    "OrbitalMapper; refusing an inconsistent inverse-CG layout."
+                )
+            if self.enable_inverse_cg:
+                if self.soc or mapper_has_soc:
+                    raise NotImplementedError(
+                        "enable_inverse_cg=True supports non-SOC E3Hamiltonian "
+                        "layouts only."
+                    )
+                # Mirror the forward pair-type loop exactly.  Each feature
+                # slice currently contains uncoupled/product (HR) components
+                # and is overwritten in-place with coupled RME components.
+                for field, n_rows, label in (
+                    (self.edge_field, n_edge, "EDGE"),
+                    (self.node_field, n_node, "NODE"),
+                ):
+                    if n_rows == 0:
+                        continue
+                    if label == "NODE" and self.overlap:
+                        continue
+                    for k_i, opairtype in enumerate(self.idp.orbpairtype_maps.keys()):
+                        verbose = self._should_debug() and (k_i < self.debug_max_pairtypes)
+                        l1, l2 = anglrMId[opairtype[0]], anglrMId[opairtype[2]]
+                        n_product = (2 * l1 + 1) * (2 * l2 + 1)
+                        sli = self.idp.orbpairtype_maps[opairtype]
+                        product = data[field][:, sli]
+                        hr = product.reshape(
+                            n_rows, -1, 2 * l1 + 1, 2 * l2 + 1
+                        )
+                        cg_basis = self.cgbasis[opairtype].to(
+                            device=hr.device, dtype=hr.dtype
+                        )
+                        rme2 = _inverse_contract_cg_hr(cg_basis, hr)
+                        flat = rme2.transpose(1, 2).reshape(n_rows, -1)
+                        if flat.shape[1] != product.shape[1]:
+                            raise RuntimeError(
+                                f"{label} {opairtype} inverse CG width mismatch: "
+                                f"got {flat.shape[1]}, expected {product.shape[1]} "
+                                f"(product dimension {n_product})."
+                            )
+                        data[field][:, sli] = flat
+                        if verbose:
+                            self._tensor_stats(f"[{label}]{opairtype}.RME(inverse)", flat)
 
         # Legacy SOC onsite param application
         data = self._apply_soc(data, n_node=n_node)

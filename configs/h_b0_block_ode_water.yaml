@@ -1,0 +1,53 @@
+# Overlay for a non-SOC H/O water H-B0 block-state ODE run.
+# Raw LMDB records must declare:
+#   hamiltonian_schema: deeptb.raw_hamiltonian_training_sample/v1
+#   hamiltonian_target_semantics: absolute_full_h
+#   hamiltonian_target_source: raw_hamiltonian
+common_options:
+  basis: {H: 2s1p, O: 3s2p1d}
+  has_soc: false
+  dtype: float32
+  device: cpu
+
+model_options:
+  embedding:
+    method: lem_moe_v3_h0
+    output_route: h_b0
+    h0_init_scope: both
+    h0_merge_mode: replace
+    use_flow_time_embedding: true
+    flow_time_condition_edges: true
+    flow_time_key: flow_time
+    flow_time_allow_missing: false
+    require_full_block_edge_coverage: true
+  prediction:
+    method: block_native
+    block_decoder: expansion_cg
+    blockwise_hamiltonian: true
+    reconstruction: direct
+    scale_type: no_scale
+
+train_options:
+  flow_options:
+    enabled: true
+    objective: cfm
+    mode: residual
+    prior: zero
+    output_space: ao_block_ode
+    block_ode: true
+    target_semantics: absolute_full_h
+    time_conditioning_required: true
+    missing_h0_policy: error
+    block_inverse_mode: strict
+    block_inverse_atol: 2.0e-5  # float32; fp64 certification uses 1.0e-10
+    strict_certification: always  # opt-in example after offline audit: first_batch
+    node_block_target_key: node_full_hamil_target_blocks
+    edge_block_target_key: edge_full_hamil_target_blocks
+    node_block_shape_key: node_full_hamil_target_block_shape
+    edge_block_shape_key: edge_full_hamil_target_block_shape
+    validation_ode_steps: [1]
+    validation_flow_metrics: []
+
+data_options:
+  train: {type: LMDBDataset, get_Hamiltonian: true, get_H0: true, residual_hamiltonian: false, require_full_h_target: true, require_residual_h_target: false}
+  validation: {type: LMDBDataset, get_Hamiltonian: true, get_H0: true, residual_hamiltonian: false, require_full_h_target: true, require_residual_h_target: false}

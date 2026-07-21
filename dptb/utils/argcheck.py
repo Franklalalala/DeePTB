@@ -1,7 +1,9 @@
 from typing import List, Callable, Dict, Any, Union
 from dargs import dargs, Argument, Variant, ArgumentEncoder
 import logging
-from numbers import Number
+import math
+import re
+from numbers import Integral, Number
 
 from dptb.configuration import canonicalize_training_config
 
@@ -181,6 +183,23 @@ def flow_options():
         Argument("edge_h0_key", str, optional=True, default="edge_h0"),
         Argument("node_target_key", str, optional=True, default="node_features"),
         Argument("edge_target_key", str, optional=True, default="edge_features"),
+        Argument("output_space", str, optional=True, default="rme"),
+        Argument("state_space", str, optional=True, default=""),
+        Argument("target_semantics", str, optional=True, default=""),
+        Argument("block_input_adapter", str, optional=True, default=""),
+        Argument("h0_condition_space", str, optional=True, default=""),
+        Argument("block_export_final_full_h", bool, optional=True, default=False),
+        Argument("block_ode", bool, optional=True, default=False),
+        Argument("time_conditioning_required", bool, optional=True, default=False),
+        Argument("block_inverse_mode", str, optional=True, default="strict"),
+        Argument("block_inverse_atol", [int, float, None], optional=True, default=None),
+        Argument("strict_certification", str, optional=True, default="always"),
+        Argument("node_output_key", str, optional=True, default="node_hamil_blocks"),
+        Argument("edge_output_key", str, optional=True, default="edge_hamil_blocks"),
+        Argument("node_block_target_key", str, optional=True, default="node_delta_hamil_blocks"),
+        Argument("edge_block_target_key", str, optional=True, default="edge_delta_hamil_blocks"),
+        Argument("node_block_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
+        Argument("edge_block_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
         Argument("flow_time_r_key", str, optional=True, default="flow_time_r"),
         Argument("flow_time_t_key", str, optional=True, default="flow_time_t"),
@@ -199,6 +218,7 @@ def flow_options():
         Argument("te_prior_sigma", (int, float), optional=True, default=1.0),
         Argument("te_prior_mode", str, optional=True, default="auto"),
         Argument("te_prior_per_graph", bool, optional=True, default=True),
+        Argument("te_prior_validation_seed", int, optional=True, default=None),
         Argument("prior_node_key", str, optional=True, default=""),
         Argument("prior_edge_key", str, optional=True, default=""),
         Argument("prior_key_prefixes", list, optional=True, default=[]),
@@ -254,12 +274,19 @@ def flow_options():
         Argument("physical_prior_jitter_reference_scale", bool, optional=True, default=True),
         Argument("physical_prior_jitter_edge_decay", (int, float), optional=True, default=0.0),
         Argument("loss_type", str, optional=True, default="mse"),
-        Argument("node_weight", (int, float), optional=True, default=1.0),
-        Argument("edge_weight", (int, float), optional=True, default=1.0),
+        Argument("node_weight", (int, float), optional=True, default=1.0,
+                 doc="Finite non-negative node loss multiplier. CFM global_elements "
+                     "requires 1.0; use equal_components for node/edge multipliers."),
+        Argument("edge_weight", (int, float), optional=True, default=1.0,
+                 doc="Finite non-negative edge loss multiplier. CFM global_elements "
+                     "requires 1.0; use equal_components for node/edge multipliers."),
         Argument("z_loss_coef", (int, float), optional=True, default=0.0),
         Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
         Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
-        Argument("component_reduction", str, optional=True, default="global_elements"),
+        Argument("component_reduction", str, optional=True, default="global_elements",
+                 doc="global_elements performs one true reduction over all valid elements "
+                     "and is unit-weight-only for CFM; equal_components sums independently "
+                     "reduced node/edge losses and applies node_weight/edge_weight."),
         Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
         Argument("apply_to_reference", bool, optional=True, default=False),
         Argument(
@@ -290,6 +317,508 @@ def flow_options():
         sub_variants=[],
         doc=doc,
     )
+
+
+def validate_flow_loss_contract(data):
+    """Fail early on ambiguous or non-finite flow component weighting."""
+    # Direct callers (tests and downstream launchers) deserve the same
+    # pre-schema alias semantics as normalize().  This is idempotent for an
+    # already-normalized configuration and keeps every subsequent check on the
+    # 0715 canonical vocabulary.
+    data = canonicalize_training_config(data, warn_deprecated=False)
+    train = dict(data.get("train_options", {}) or {})
+    flow = dict(train.get("flow_options", {}) or {})
+    node_weight = float(flow.get("node_weight", 1.0))
+    edge_weight = float(flow.get("edge_weight", 1.0))
+    for name, value in (("node_weight", node_weight), ("edge_weight", edge_weight)):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"flow_options.{name} must be finite and non-negative, got {value!r}"
+            )
+    if node_weight == 0.0 and edge_weight == 0.0:
+        raise ValueError("flow_options.node_weight and edge_weight may not both be zero")
+
+    objective = str(flow.get("objective", flow.get("type", "cfm"))).lower().replace(
+        "-", "_"
+    )
+    pixel_meanflow = objective in {
+        "pixel_meanflow",
+        "pixel_mean_flow",
+        "pmf",
+        "meanflow",
+        "mean_flow",
+    }
+    reduction = str(flow.get("component_reduction", "global_elements")).lower()
+    if (
+        reduction == "global_elements"
+        and not pixel_meanflow
+        and (node_weight != 1.0 or edge_weight != 1.0)
+    ):
+        raise ValueError(
+            "flow_options.component_reduction='global_elements' requires "
+            "node_weight=edge_weight=1 for CFM; use equal_components for "
+            "node/edge loss multipliers"
+        )
+
+
+def validate_block_ode_contract(data):
+    """Cross-check the full model/data contract that a field schema cannot see."""
+    # normalize() already performs this pass before dargs.  Repeat it here so
+    # the public validator cannot be bypassed by calling it directly with
+    # deprecated aliases (strict_h0, add_h0, use_h0_* or hyphenated enums).
+    data = canonicalize_training_config(data, warn_deprecated=False)
+    train = dict(data.get("train_options", {}) or {})
+    flow = dict(train.get("flow_options", {}) or {})
+    output_space = str(flow.get("output_space", "rme")).lower().replace("-", "_")
+    requested = bool(flow.get("block_ode", False)) or output_space in {
+        "ao_block_ode",
+        "block_ode",
+        "ao_blocks_ode",
+        "uureal_block_ode",
+        "spatial_uureal_residual_block_ode",
+        "uureal_residual_block_ode",
+        "residual_ao_block_ode",
+    }
+    if not requested:
+        return
+    if not bool(flow.get("enabled", False)):
+        raise ValueError("block_ode requires train_options.flow_options.enabled=true")
+    # Every runtime alias flow.py normalizes to uureal_block_ode MUST appear in
+    # both sets above/below: an alias missing here while block_ode is omitted
+    # slips past this whole contract validation yet still activates the mode at
+    # runtime (interlock bypass).
+    uureal_mode = output_space in {
+        "uureal_block_ode",
+        "spatial_uureal_residual_block_ode",
+        "uureal_residual_block_ode",
+    }
+    # Non-SOC direct-residual mode: canonical spelling only (no runtime aliases).
+    residual_spatial_mode = output_space == "residual_ao_block_ode"
+    if uureal_mode:
+        expected_output_space = "uureal_block_ode"
+    elif residual_spatial_mode:
+        expected_output_space = "residual_ao_block_ode"
+    else:
+        expected_output_space = "ao_block_ode"
+    if output_space != expected_output_space or not bool(flow.get("block_ode", False)):
+        raise ValueError(
+            "block_ode is a distinct mode: set block_ode=true and "
+            "output_space='ao_block_ode'; do not reuse the frozen ao_block adapter"
+        )
+    if str(flow.get("mode", "")).lower() != "residual":
+        raise ValueError("block_ode v1 requires flow_options.mode='residual'")
+    prior = str(flow.get("prior", "")).lower().replace("-", "_")
+    if uureal_mode and prior != "zero":
+        raise ValueError("uureal_block_ode requires prior='zero'")
+    if residual_spatial_mode and prior not in {"zero", "projected_te"}:
+        raise ValueError(
+            "residual_ao_block_ode requires prior in {'zero', 'projected_te'}"
+        )
+    if prior not in {"zero", "projected_te"}:
+        raise ValueError(
+            "block_ode supports only prior='zero' or explicit prior='projected_te'"
+        )
+    projected_scales = None
+    if prior == "projected_te":
+        # Do not let the general-flow schema default (auto) or an implicit
+        # validator default select the block prior.  This route must declare
+        # both the irrep sampler and its deterministic validation substream.
+        mode = str(flow.get("te_prior_mode", "")).lower().replace("-", "_")
+        if mode != "irrep":
+            raise ValueError(
+                "projected_te block_ode requires explicit te_prior_mode='irrep'; "
+                "typewise/auto modes can read target residual scales"
+            )
+        raw_scales = {
+            "node_sigma": flow.get("node_sigma", 1.0),
+            "edge_sigma": flow.get("edge_sigma", 1.0),
+            "te_prior_sigma": flow.get("te_prior_sigma", 1.0),
+        }
+        invalid = [
+            name
+            for name, value in raw_scales.items()
+            if isinstance(value, bool)
+            or not isinstance(value, Number)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ]
+        if invalid:
+            raise ValueError(
+                "projected_te block_ode requires finite positive scales; "
+                f"invalid options={invalid}"
+            )
+        projected_scales = {
+            name: float(value) for name, value in raw_scales.items()
+        }
+        validation_seed = flow.get("te_prior_validation_seed", None)
+        if (
+            isinstance(validation_seed, bool)
+            or not isinstance(validation_seed, int)
+            or validation_seed < 0
+            or validation_seed > (1 << 64) - 1
+        ):
+            raise ValueError(
+                "projected_te block_ode requires an explicit integer "
+                f"te_prior_validation_seed in [0, {(1 << 64) - 1}]"
+            )
+    semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
+    if semantics not in {"absolute_full_h", "residual_dh"}:
+        raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
+    if uureal_mode and semantics != "residual_dh":
+        raise ValueError("uureal_block_ode requires target_semantics='residual_dh'")
+    if residual_spatial_mode and semantics != "residual_dh":
+        raise ValueError("residual_ao_block_ode requires target_semantics='residual_dh'")
+    if uureal_mode:
+        # These three options are declarative contract markers (validated only;
+        # runtime behavior is driven solely by output_space=uureal_block_ode).
+        # Accept both the F4 canonical names and the authoritative V2 dataset
+        # contract aliases so a config written to either vocabulary validates:
+        #   state_space:       residual_ao_block   <-> nextham_uureal_delta_block
+        #   h0_condition_space: compact_uureal_rme <-> nextham_uureal_rme
+        #   block_input_adapter: direct_cg (shared)
+        accepted_mode_options = {
+            "state_space": ("residual_ao_block", "nextham_uureal_delta_block"),
+            "block_input_adapter": ("direct_cg",),
+            "h0_condition_space": ("compact_uureal_rme", "nextham_uureal_rme"),
+        }
+        for option, accepted in accepted_mode_options.items():
+            if str(flow.get(option, "")).lower().replace("-", "_") not in accepted:
+                raise ValueError(
+                    f"uureal_block_ode requires flow_options.{option} in {accepted!r}"
+                )
+        if bool(flow.get("block_export_final_full_h", False)):
+            raise ValueError(
+                "uureal_block_ode keeps full-H export outside the ODE hot path"
+            )
+        # The rollout always starts at exactly t=0, D=0; with D_t = t*D1 the
+        # interior schedule alone never trains that boundary.  An explicitly
+        # configured non-positive t0_probability is therefore a
+        # misconfiguration; omitting it lets the runtime default (0.15) apply.
+        t0_probability = flow.get("t0_probability", None)
+        if t0_probability is not None:
+            if (
+                isinstance(t0_probability, bool)
+                or not isinstance(t0_probability, Number)
+                or not math.isfinite(float(t0_probability))
+                or float(t0_probability) <= 0.0
+                or float(t0_probability) >= 1.0
+            ):
+                raise ValueError(
+                    "uureal_block_ode requires 0 < t0_probability < 1 (recommended "
+                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass, "
+                    "and t0_probability >= 1 collapses every training time to t=0"
+                )
+    if residual_spatial_mode:
+        # Declarative contract markers (validated only; runtime behavior is driven
+        # solely by output_space=residual_ao_block_ode). The non-SOC direct-residual
+        # mode conditions on the physical H0 RME (spatial_h0_rme), distinct from the
+        # uu_real compact_uureal_rme channel.
+        accepted_mode_options = {
+            "state_space": ("residual_ao_block",),
+            "block_input_adapter": ("direct_cg",),
+            "h0_condition_space": ("spatial_h0_rme",),
+        }
+        for option, accepted in accepted_mode_options.items():
+            if str(flow.get(option, "")).lower().replace("-", "_") not in accepted:
+                raise ValueError(
+                    f"residual_ao_block_ode requires flow_options.{option} in {accepted!r}"
+                )
+        # Unlike uureal_block_ode (which keeps H0 out of its hot path and rejects
+        # this flag), the direct-residual mode assembles the final full H = H0 + D
+        # exactly once outside the ODE and therefore REQUIRES the flag.
+        if not bool(flow.get("block_export_final_full_h", False)):
+            raise ValueError(
+                "residual_ao_block_ode assembles final full H exactly once outside "
+                "the ODE; set block_export_final_full_h=true"
+            )
+        # The rollout always starts at exactly t=0, D=0; with D_t = t*D1 the
+        # interior schedule alone never trains that boundary.  An explicitly
+        # configured non-positive t0_probability is therefore a misconfiguration;
+        # omitting it lets the runtime default (0.15) apply.
+        t0_probability = flow.get("t0_probability", None)
+        if t0_probability is not None:
+            if (
+                isinstance(t0_probability, bool)
+                or not isinstance(t0_probability, Number)
+                or not math.isfinite(float(t0_probability))
+                or float(t0_probability) <= 0.0
+                or float(t0_probability) >= 1.0
+            ):
+                raise ValueError(
+                    "residual_ao_block_ode requires 0 < t0_probability < 1 (recommended "
+                    "0.1-0.25): the t=0, D=0 inference boundary needs training mass, "
+                    "and t0_probability >= 1 collapses every training time to t=0"
+                )
+    target_fields = {
+        "absolute_full_h": {
+            "node_block_target_key": "node_full_hamil_target_blocks",
+            "edge_block_target_key": "edge_full_hamil_target_blocks",
+            "node_block_shape_key": "node_full_hamil_target_block_shape",
+            "edge_block_shape_key": "edge_full_hamil_target_block_shape",
+        },
+        "residual_dh": {
+            "node_block_target_key": "node_delta_hamil_blocks",
+            "edge_block_target_key": "edge_delta_hamil_blocks",
+            "node_block_shape_key": "node_delta_hamil_block_shape",
+            "edge_block_shape_key": "edge_delta_hamil_block_shape",
+        },
+    }[semantics]
+    for option, expected in target_fields.items():
+        actual = flow.get(option)
+        if actual != expected:
+            raise ValueError(
+                f"block_ode target_semantics={semantics!r} requires "
+                f"flow_options.{option}={expected!r}; got {actual!r}"
+            )
+    if not bool(flow.get("time_conditioning_required", False)):
+        raise ValueError("block_ode requires flow_options.time_conditioning_required=true")
+    missing_h0_policy = str(flow.get("missing_h0_policy", "error")).lower().replace(
+        "-", "_"
+    )
+    if missing_h0_policy != "error":
+        raise ValueError(
+            "block_ode requires flow_options.missing_h0_policy='error' "
+            "(legacy strict_h0=true); physical H0 may not fall back to a zero base"
+        )
+    if str(flow.get("block_inverse_mode", "strict")).lower() != "strict":
+        raise ValueError("block_ode requires block_inverse_mode='strict'")
+    strict_certification = str(
+        flow.get("strict_certification", "always")
+    ).strip().lower()
+    if strict_certification not in {"always", "first_batch"} and re.fullmatch(
+        r"every_n\(([1-9][0-9]*)\)", strict_certification
+    ) is None:
+        raise ValueError(
+            "block_ode strict_certification must be 'always', 'first_batch', "
+            "or 'every_n(N)' with N >= 1"
+        )
+    common = dict(data.get("common_options", {}) or {})
+    configured_dtype = str(common.get("dtype", "float32")).lower().replace(
+        "torch.", ""
+    )
+    inverse_atol_caps = {"float32": 2.0e-5, "float64": 1.0e-10}
+    if configured_dtype not in inverse_atol_caps:
+        raise ValueError(
+            "block_ode requires common_options.dtype='float32' or 'float64'; "
+            f"got {configured_dtype!r}"
+        )
+    if projected_scales is not None:
+        # Working interval, NOT the raw representable interval: a scale near the
+        # subnormal floor lets the direction*radius product round to exact zero
+        # (silently reviving the deterministic zero prior), and a scale near
+        # dtype-max overflows once the unbounded Gaussian radius multiplies in.
+        # Lower bound = smallest NORMAL positive value x 2**26 headroom; upper
+        # bound = dtype max / 2**12 radius headroom.
+        working_interval = {
+            "float32": (2.0 ** -100, (2.0 - 2.0 ** -23) * 2.0 ** 115),
+            "float64": (2.0 ** -996, (2.0 - 2.0 ** -52) * 2.0 ** 1011),
+        }
+        minimum, maximum = working_interval[configured_dtype]
+        effective_scales = {
+            "node_sigma*te_prior_sigma": projected_scales["node_sigma"]
+            * projected_scales["te_prior_sigma"],
+            "edge_sigma*te_prior_sigma": projected_scales["edge_sigma"]
+            * projected_scales["te_prior_sigma"],
+        }
+        invalid_effective = [
+            name
+            for name, value in effective_scales.items()
+            if not math.isfinite(value) or not minimum <= abs(value) <= maximum
+        ]
+        if invalid_effective:
+            raise ValueError(
+                "projected_te block_ode effective scales must be finite and "
+                f"inside the safe {configured_dtype} working interval "
+                f"[{minimum:.3g}, {maximum:.3g}] (subnormal-adjacent scales can "
+                "collapse draws to exact zero; near-max scales can overflow under "
+                f"the Gaussian radius); invalid products={invalid_effective}"
+            )
+    maximum_inverse_atol = inverse_atol_caps[configured_dtype]
+    raw_steps = flow.get("validation_ode_steps", [])
+    if not raw_steps or any(
+        isinstance(value, bool) or not isinstance(value, Integral) for value in raw_steps
+    ):
+        raise ValueError("block_ode validation_ode_steps must contain integers drawn from [1, 3]")
+    steps = {int(value) for value in raw_steps}
+    if not steps or not steps.issubset({1, 3}):
+        raise ValueError("block_ode validation_ode_steps must be a non-empty subset of [1, 3]")
+    configured_atol = flow.get("block_inverse_atol", None)
+    if configured_atol is not None:
+        configured_atol = float(configured_atol)
+        if not math.isfinite(configured_atol) or configured_atol < 0:
+            raise ValueError("block_ode block_inverse_atol must be finite and non-negative")
+        if configured_atol > maximum_inverse_atol:
+            raise ValueError(
+                "block_ode block_inverse_atol exceeds the certified "
+                f"{configured_dtype} maximum {maximum_inverse_atol:.6g}; "
+                f"got {configured_atol:.6g}"
+            )
+
+    if uureal_mode:
+        if not bool(common.get("has_soc", False)):
+            raise ValueError("uureal_block_ode requires common_options.has_soc=true")
+        if not bool(common.get("nextham_uureal_mask", False)):
+            raise ValueError("uureal_block_ode requires common_options.nextham_uureal_mask=true")
+        if bool(common.get("full_soc_prediction", False)):
+            raise ValueError("uureal_block_ode requires full_soc_prediction=false")
+    elif residual_spatial_mode:
+        if bool(common.get("has_soc", False)):
+            raise ValueError("residual_ao_block_ode requires common_options.has_soc=false")
+        if bool(common.get("nextham_uureal_mask", False)):
+            raise ValueError(
+                "residual_ao_block_ode requires common_options.nextham_uureal_mask=false"
+            )
+        if bool(common.get("full_soc_prediction", False)):
+            raise ValueError("residual_ao_block_ode requires full_soc_prediction=false")
+    elif bool(common.get("has_soc", False)):
+        raise ValueError("block_ode v1 is non-SOC only; set common_options.has_soc=false")
+
+    distance_ranges = train.get("distance_ranges", None)
+    if distance_ranges is not None:
+        valid_full_graph_range = (
+            isinstance(distance_ranges, list)
+            and len(distance_ranges) == 1
+            and isinstance(distance_ranges[0], (list, tuple))
+            and len(distance_ranges[0]) == 2
+            and not isinstance(distance_ranges[0][0], bool)
+            and isinstance(distance_ranges[0][0], Number)
+            and math.isfinite(float(distance_ranges[0][0]))
+            and float(distance_ranges[0][0]) <= 0.0
+        )
+        if not valid_full_graph_range:
+            raise ValueError(
+                "block_ode v1 cannot use distance-partitioned experts because "
+                "H-B0 must predict every graph edge; omit distance_ranges or use "
+                "one full-graph range whose lower bound is <= 0"
+            )
+
+    model = dict(data.get("model_options", {}) or {})
+    prediction = dict(model.get("prediction", {}) or {})
+    embedding = dict(model.get("embedding", {}) or {})
+    if str(embedding.get("method", "")).lower() != "lem_moe_v3_h0":
+        raise ValueError("block_ode requires embedding.method='lem_moe_v3_h0'")
+    if str(embedding.get("output_route", "")).lower() != "h_b0":
+        raise ValueError("block_ode requires embedding.output_route='h_b0'")
+    if not bool(embedding.get("require_full_block_edge_coverage", False)):
+        raise ValueError(
+            "block_ode requires embedding.require_full_block_edge_coverage=true"
+        )
+    if str(prediction.get("method", "")).lower() != "block_native":
+        raise ValueError("block_ode requires prediction.method='block_native'")
+    if str(prediction.get("block_decoder", "")).lower() != "expansion_cg":
+        raise ValueError("block_ode requires prediction.block_decoder='expansion_cg'")
+    if not bool(prediction.get("blockwise_hamiltonian", False)):
+        raise ValueError("block_ode requires prediction.blockwise_hamiltonian=true")
+    reconstruction = str(prediction.get("reconstruction", "direct")).lower().replace(
+        "-", "_"
+    )
+    if reconstruction != "direct":
+        raise ValueError(
+            "block_ode requires model_options.prediction.reconstruction='direct' "
+            "(legacy model_options.prediction.add_h0=false) to prevent double "
+            "reconstruction"
+        )
+    if not bool(embedding.get("use_flow_time_embedding", False)):
+        raise ValueError("block_ode requires embedding.use_flow_time_embedding=true")
+    if not bool(embedding.get("flow_time_condition_edges", False)):
+        raise ValueError("block_ode requires flow-time conditioning on both nodes and edges")
+    if bool(embedding.get("flow_time_allow_missing", True)):
+        raise ValueError("block_ode requires embedding.flow_time_allow_missing=false")
+    if str(embedding.get("flow_time_key", "flow_time")) != str(
+        flow.get("flow_time_key", "flow_time")
+    ):
+        raise ValueError("block_ode flow and embedding flow_time_key values must match")
+    if str(embedding.get("h0_merge_mode", "replace")).lower() != "replace":
+        raise ValueError("block_ode requires embedding.h0_merge_mode='replace'")
+    h0_init_scope = str(embedding.get("h0_init_scope", "both")).lower().replace(
+        "-", "_"
+    )
+    if h0_init_scope != "both":
+        raise ValueError(
+            "block_ode requires embedding.h0_init_scope='both' for both node and "
+            "edge H0 initialization"
+        )
+    if bool(embedding.get("use_uureal_residual_block_input", False)) != uureal_mode:
+        raise ValueError(
+            "uureal_block_ode and embedding.use_uureal_residual_block_input must be enabled together"
+        )
+    if bool(embedding.get("use_spatial_residual_block_input", False)) != residual_spatial_mode:
+        raise ValueError(
+            "residual_ao_block_ode and embedding.use_spatial_residual_block_input "
+            "must be enabled together"
+        )
+
+    data_options_value = data.get("data_options", {}) or {}
+    if not isinstance(data_options_value.get("train"), dict):
+        raise ValueError("block_ode requires a configured data_options.train split")
+    configured_splits = {
+        split: data_options_value[split]
+        for split in ("train", "validation", "reference", "test")
+        if isinstance(data_options_value.get(split), dict)
+    }
+    expected_residual = semantics == "residual_dh" and not uureal_mode
+    expected_full_h_target = semantics == "absolute_full_h"
+    # require_residual_h_target gates the h0_residual-semantics records; the
+    # residual_spatial mode reads absolute_full_h records and instead opts into
+    # require_residual_from_full_h_target. Decouple both from expected_residual,
+    # which still gates residual_hamiltonian for the generic AND residual_spatial
+    # modes (both materialize D1 = H - H0 on the fly). expected_residual_h_target
+    # is identical to expected_residual for every non-spatial mode.
+    expected_residual_h_target = expected_residual and not residual_spatial_mode
+    expected_residual_from_full_h = residual_spatial_mode
+    for split, split_options in configured_splits.items():
+        path = f"data_options.{split}"
+        dataset_type = str(split_options.get("type", "DefaultDataset"))
+        if dataset_type != "LMDBDataset":
+            raise ValueError(
+                f"{path}.type must be 'LMDBDataset' for block_ode; "
+                "other dataset backends do not implement the physical-H0 and "
+                "versioned AO-block target contract"
+            )
+        if not bool(split_options.get("get_Hamiltonian", False)):
+            raise ValueError(f"{path}.get_Hamiltonian must be true for block_ode")
+        if not bool(split_options.get("get_H0", False)):
+            raise ValueError(
+                f"{path}.get_H0 must be true for block_ode physical-H0 initialization"
+            )
+        actual_residual = bool(split_options.get("residual_hamiltonian", False))
+        if actual_residual != expected_residual:
+            raise ValueError(
+                f"{path}.residual_hamiltonian={actual_residual} conflicts with "
+                f"block_ode target_semantics={semantics!r}"
+            )
+        actual_full_h_target = bool(
+            split_options.get("require_full_h_target", False)
+        )
+        if actual_full_h_target != expected_full_h_target:
+            raise ValueError(
+                f"{path}.require_full_h_target must be "
+                f"{str(expected_full_h_target).lower()} for block_ode "
+                f"target_semantics={semantics!r}"
+            )
+        actual_residual_h_target = bool(
+            split_options.get("require_residual_h_target", False)
+        )
+        if actual_residual_h_target != expected_residual_h_target:
+            raise ValueError(
+                f"{path}.require_residual_h_target must be "
+                f"{str(expected_residual_h_target).lower()} for block_ode "
+                f"target_semantics={semantics!r}"
+            )
+        actual_residual_from_full_h = bool(
+            split_options.get("require_residual_from_full_h_target", False)
+        )
+        if actual_residual_from_full_h != expected_residual_from_full_h:
+            raise ValueError(
+                f"{path}.require_residual_from_full_h_target must be "
+                f"{str(expected_residual_from_full_h).lower()} for block_ode "
+                f"target_semantics={semantics!r}"
+            )
+        actual_uureal = bool(split_options.get("require_uureal_block_ode", False))
+        if actual_uureal != uureal_mode:
+            raise ValueError(
+                f"{path}.require_uureal_block_ode must be {str(uureal_mode).lower()}"
+            )
 
 
 def self_consistency_options():
@@ -1293,12 +1822,18 @@ def train_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1333,12 +1868,18 @@ def validation_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1373,12 +1914,18 @@ def reference_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1412,12 +1959,18 @@ def test_data_sub():
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
+        Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
+        Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
         Argument("h0_key", str, optional=True, default="hamiltonian_0", doc=doc_h0_key),
         Argument("prefer_precomputed_h0", bool, optional=True, default=True, doc=doc_precomputed_h0),
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
+        Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
+        Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
         Argument("expected_p2_source_fingerprint", str, optional=True, default="", doc="Optional SHA256 lock for the P2 table/source provenance."),
+        Argument("expected_physical_h0_source_fingerprint", str, optional=True, default="", doc="Externally trusted SHA256 lock for a dedicated physical-H0 source manifest."),
         Argument("allow_unbound_prior_source_fingerprint", bool, optional=True, default=False, doc="Development-only escape hatch for synthetic prior-conditioned Full-H configs that intentionally omit expected_p2_source_fingerprint. Production configs must keep this false."),
         Argument("audit_p2_representations", bool, optional=True, default=False, doc="Reconstruct P2 AO blocks from stored RME and compare at dataset ingest (audit/smoke only)."),
         Argument("require_p2_blocks", bool, optional=True, default=False, doc="Require P2 AO block/shape fields for prior-plus-correction reconstruction."),
@@ -1807,7 +2360,9 @@ def slem_h0():
     doc_flow_time_key = "Graph-level flow time key written by train_options.flow_options. Default: `flow_time`."
     doc_flow_time_keys = "Optional list of graph-level time keys to embed and sum, e.g. [`flow_time_t`, `flow_time_r`, `flow_time_h`] for Pixel MeanFlow."
     doc_flow_time_max_positions = "Scale used by the sinusoidal flow-time embedding. Default: `2000`."
+    doc_flow_time_allow_missing = "Whether missing flow time may fall back to flow_time_missing_value. Default: `True`; block-ODE requires `False`."
     doc_flow_time_missing_value = "Fallback normalized time when flow_time is absent. Default: `0.0`."
+    doc_require_full_block_edge_coverage = "Fail before the H-B0 head unless its actual active rows are the ordered full graph-edge range with finite positive cutoff coefficients. Default: `False`; block-ODE requires `True`."
 
     return slem() + [
         Argument("h0_init_scope", str, optional=True, default="both", doc=doc_h0_init_scope),
@@ -1821,7 +2376,11 @@ def slem_h0():
                  doc="Permit the H0 input fallback to resolve to the target Hamiltonian/"
                      "features while the module is in training mode. Off by default: "
                      "that fallback is a label leak during training (it is a deliberate "
-                     "surrogate only at inference)."),
+                      "surrogate only at inference)."),
+        Argument("use_uureal_residual_block_input", bool, optional=True, default=False,
+                 doc="Enable the mapper-derived bias-free residual AO-block projector."),
+        Argument("use_spatial_residual_block_input", bool, optional=True, default=False,
+                 doc="Enable the non-SOC direct-residual (spatial) AO-block projector for residual_ao_block_ode."),
         Argument("h0_merge_mode", str, optional=True, default="replace", doc=doc_h0_merge_mode),
         Argument("h0_self_edge_tol", float, optional=True, default=1e-8, doc=doc_h0_self_edge_tol),
         Argument("use_flow_time_embedding", bool, optional=True, default=False, doc=doc_use_flow_time_embedding),
@@ -1829,7 +2388,10 @@ def slem_h0():
         Argument("flow_time_key", str, optional=True, default="flow_time", doc=doc_flow_time_key),
         Argument("flow_time_keys", list, optional=True, default=[], doc=doc_flow_time_keys),
         Argument("flow_time_max_positions", int, optional=True, default=2000, doc=doc_flow_time_max_positions),
+        Argument("flow_time_allow_missing", bool, optional=True, default=True, doc=doc_flow_time_allow_missing),
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
+        Argument("require_full_block_edge_coverage", bool, optional=True, default=False,
+                 doc=doc_require_full_block_edge_coverage),
     ]
 
 
@@ -2280,6 +2842,7 @@ def loss_options():
         Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
         Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
         Argument("log_feature_compatible", bool, optional=True, default=False, doc="Expensive opt-in: report exact old-RME-compatible endpoint metrics instead of native AO-block metrics. Enable selectively (for example validation only), not on every block-native train step."),
+        Argument("log_feature_compatible_interval", int, optional=True, default=1, doc="Cadence, counted in forward() calls, for the logging-only feature-compatible onsite/hopping metric. The expensive host-sync feature branch fires only when call_index % interval == 0, where call_index is a 0-based per-criterion counter, so the FIRST call always fires (smoke runs and first-batch logs still see the metric). interval=1 (default) reproduces the legacy every-step behavior byte-for-byte; larger values throttle the logging metric only and never change the optimization/gradient loss. Rank-synchronous: every DDP rank calls forward() the same number of times, so the feature branch (which contains collective all-reduces) fires on all ranks or none and cannot deadlock. Must be an int >= 1."),
         Argument("feature_log_no_grad", bool, optional=True, default=True),
         Argument("distributed_log_reduce", bool, optional=True, default=False),
         Argument("expose_component_sums", bool, optional=True, default=True),
@@ -2408,6 +2971,14 @@ def _validate_p2_prior_full_h_contract(data):
     for split, split_options in configured_splits.items():
         if not bool(split_options.get("require_full_h_target", False)):
             continue
+        expected_h0_source = str(
+            split_options.get("expected_physical_h0_source_fingerprint", "")
+        ).strip()
+        if expected_h0_source and not _is_sha256_hex(expected_h0_source):
+            raise ValueError(
+                f"data_options.{split}.expected_physical_h0_source_fingerprint "
+                "must be a 64-character SHA256 hex digest."
+            )
         split_loss = loss_options_value.get(split)
         if isinstance(split_loss, dict):
             _require_absolute_target_keys(split, split_loss)
@@ -3373,6 +3944,8 @@ def normalize(data):
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
     _validate_p2_prior_full_h_contract(data)
+    validate_flow_loss_contract(data)
+    validate_block_ode_contract(data)
 
     # add check loss and use wannier:
 
@@ -3432,4 +4005,3 @@ def normalize_skf2nnsk(data):
     base.check_value(data, strict=True)
 
     return data
-

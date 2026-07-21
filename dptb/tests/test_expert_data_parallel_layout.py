@@ -262,11 +262,14 @@ def test_multi_trainer_uses_sharded_loaders_and_same_expert_grad_sync():
 def test_expert_dp_loader_fallback_never_drops_sampler():
     text = _read_repo_text("dptb/nnops/multi_trainer.py")
     make_loader = _method_source(text, "_make_loader_compat")
+    rebuild_loaders = _method_source(text, "_maybe_rebuild_loaders_in_multi_trainer")
 
     assert 'if sampler is not None:' in make_loader
     assert 'trial_kwargs = [kw for kw in trial_kwargs if "sampler" in kw]' in make_loader
     assert '"refusing to fall back to an unsharded loader."' in make_loader
     assert "raise RuntimeError(" in make_loader
+    assert 'kwargs["generator"] = generator' in make_loader
+    assert "generator=self.validation_loader_generator" in rebuild_loaders
 
 
 def test_multi_trainer_sets_sampler_epoch_each_epoch():

@@ -33,6 +33,7 @@ class CFMContext:
     edge_current: Optional[torch.Tensor]
     node_prior: Optional[torch.Tensor]
     edge_prior: Optional[torch.Tensor]
+    block_target_semantics: Optional[str] = None
 
 
 @dataclass

@@ -30,6 +30,10 @@ class HamiltonianPixelMeanFlow(HamiltonianCFM):
     """
 
     model_in_loss = True
+    # MeanFlow aggregates node/edge objectives component-wise and therefore
+    # retains their explicit outer multipliers even though the inherited
+    # component_reduction option defaults to ``global_elements``.
+    allow_nonunit_global_element_weights = True
 
     def __init__(
         self,

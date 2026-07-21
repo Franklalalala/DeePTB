@@ -1,15 +1,18 @@
 import numpy as np
-from typing import Tuple, Dict, Any, List, Callable, Union, Optional
+from typing import Tuple, Dict, Any, List, Callable, Union, Optional, Mapping
 
 import torch
 from dptb.utils.tools import download_url, extract_zip
 
+import hashlib
+import logging
 import os
 import os.path as osp
 import glob
 from dptb.data import (
     AtomicData,
     AtomicDataDict,
+    register_fields,
     _NODE_FIELDS,
     _EDGE_FIELDS,
     _GRAPH_FIELDS,
@@ -23,14 +26,21 @@ from ._base_datasets import (
 from dptb.nn.hamiltonian import E3Hamiltonian
 import lmdb
 from dptb.data.interfaces.ham_to_feature import block_to_feature
+from dptb.data.interfaces.blockwise_tensor import is_soc_uureal_mapper
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
     BASIS_FINGERPRINT_KEY,
+    DEDICATED_PHYSICAL_H0_SOURCE,
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
+    H0_RESIDUAL_SEMANTICS,
     P2_BUNDLE_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
+    RAW_HAMILTONIAN_SAMPLE_SCHEMA,
+    RAW_PHYSICAL_H0_SOURCE,
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
@@ -45,10 +55,41 @@ from dptb.data.interfaces.p2_contract import (
     fingerprint_present_row_aligned_fields,
     fingerprint_text_fields,
     mapper_basis_fingerprint,
+    physical_h0_dataset_fingerprint,
+    physical_h0_record_fingerprint,
     require_sha256,
     resolve_prior_field_spec,
 )
 import pickle
+
+
+log = logging.getLogger(__name__)
+
+# Register the stable per-graph record identity as a graph-level long field so it
+# is stacked (never concatenated) during batching and survives collation as one
+# int64 value per graph. Registration is idempotent (set-based) and safe to run
+# at import time. See ``LMDBDataset._compute_sample_uid`` for the packing scheme.
+register_fields(
+    graph_fields=[AtomicDataDict.SAMPLE_UID_KEY],
+    long_fields=[AtomicDataDict.SAMPLE_UID_KEY],
+)
+
+
+def _stable_shard_ordinal(shard_identity: str) -> int:
+    """Composition-independent 31-bit shard ordinal from a content-stable hash.
+
+    A record's ``sample_uid`` packs this ordinal with the LMDB row key.  Because it
+    hashes the shard identity (its realpath) ALONE -- not the shard's position in
+    whatever set of shards a given dataset happens to load -- the same physical
+    shard maps to the same ordinal across single- vs multi-shard datasets, rank-
+    local shard subsets, and concatenations.  sha1 keeps it stable across runs and
+    worker processes (unlike the per-process-salted builtin ``hash``).  The
+    constructor detects the astronomically unlikely 31-bit collision between two
+    distinct realpaths and fails closed (see ``_shard_uid_offsets``).  The same
+    hash also serves the lightweight ``__new__``/no-path-map fixtures.
+    """
+    digest = hashlib.sha1(os.fsencode(shard_identity)).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
 def _parse_lmdb_block_key(key: Any):
@@ -70,14 +111,20 @@ def assert_residual_target_shrinks(
     h0_key: str = "hamiltonian_0",
     min_shrink: float = 1.2,
 ) -> None:
-    """Refuse residual targets that do not shrink when H0 is subtracted.
+    """Check the H0-quality shrink heuristic; raise when the target does not shrink.
 
+    This is a configurable H0-quality policy gate, not a provenance proof:
+    magnitude alone proves neither the provenance nor the correctness of H0.
     Some historical LMDBs store an already-residual dH in the Hamiltonian
-    slot (delta-in-H-slot convention, e.g. the 0516 NexTHam crystal sets).
-    Enabling residual_hamiltonian there would double-subtract and inflate
-    the target to H0 scale instead of shrinking it (a genuine full-H set
-    shrinks ~16x on the water QHFlow2 data). Magnitudes are compared over
-    all stored block entries.
+    slot (delta-in-H-slot convention, e.g. the 0516 NexTHam crystal sets);
+    enabling residual_hamiltonian there would double-subtract and inflate the
+    target to H0 scale instead of shrinking it (a genuine full-H set shrinks
+    ~16x on the water QHFlow2 data), which is the leading (but not the only)
+    reason a target fails to shrink. Magnitudes are compared over all stored
+    block entries. The caller
+    (:func:`build_residual_hamiltonian_target_blocks`) decides whether a
+    non-shrinking target errors, warns, or is ignored via
+    ``residual_shrink_policy``; the math here is unchanged.
     """
     def _mean_abs(values) -> float:
         flattened = [
@@ -96,10 +143,14 @@ def assert_residual_target_shrinks(
         raise RuntimeError(
             "residual_hamiltonian=True, but subtracting H0 does not shrink the "
             f"target magnitude (mean|H|={h_mag:.4g} vs mean|H-H0|={d_mag:.4g}, "
-            f"required shrink >= {min_shrink}x). The Hamiltonian slot most "
-            "likely already stores a residual/delta target (delta-in-H-slot "
-            f"convention), or '{h0_key}' is not a valid H0 for it. Refusing to "
-            "double-subtract; disable residual_hamiltonian for this dataset."
+            f"required shrink >= {min_shrink}x). This is a configurable "
+            "H0-quality policy gate (residual_shrink_policy), NOT a provenance "
+            "proof: the magnitude alone proves neither the provenance nor the "
+            "correctness of H0. Hint: the Hamiltonian slot may already store a "
+            "residual/delta target (delta-in-H-slot convention), which would "
+            f"double-subtract, or '{h0_key}' may not be a valid H0 for it. Set "
+            "residual_shrink_policy='warn'/'off' to accept it, or disable "
+            "residual_hamiltonian for this dataset."
         )
 
 
@@ -117,12 +168,112 @@ _PREPACKED_FULL_H_TARGET_KEYS = (
     AtomicDataDict.EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY,
 )
 
+_PREPACKED_H0_BLOCK_KEYS = (
+    AtomicDataDict.NODE_H0_BLOCKS_KEY,
+    AtomicDataDict.EDGE_H0_BLOCKS_KEY,
+    AtomicDataDict.NODE_H0_BLOCK_SHAPE_KEY,
+    AtomicDataDict.EDGE_H0_BLOCK_SHAPE_KEY,
+)
 
-def assert_absolute_full_h_target_contract(data_dict: Dict[str, Any]) -> None:
+def assert_physical_h0_authority_contract(
+    data_dict: Dict[str, Any],
+    *,
+    schema: str,
+    h0_key: str = "hamiltonian_0",
+    expected_source_fingerprint: Optional[str] = None,
+) -> None:
+    """Require one explicit physical-H0 authority for Full-H supervision."""
+
+    source = data_dict.get(PHYSICAL_H0_SOURCE_KEY)
+    if schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        if source not in {None, RAW_PHYSICAL_H0_SOURCE}:
+            raise ValueError(
+                f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r} fixes physical-H0 authority "
+                f"to {RAW_PHYSICAL_H0_SOURCE!r}; got {source!r}."
+            )
+        source = RAW_PHYSICAL_H0_SOURCE
+    elif source not in {RAW_PHYSICAL_H0_SOURCE, DEDICATED_PHYSICAL_H0_SOURCE}:
+        raise ValueError(
+            "P2/dual Full-H supervision with physical H0 requires explicit "
+            f"{PHYSICAL_H0_SOURCE_KEY}={RAW_PHYSICAL_H0_SOURCE!r} or "
+            f"{DEDICATED_PHYSICAL_H0_SOURCE!r}; got {source!r}."
+        )
+
+    prepacked_h0 = [key for key in _PREPACKED_H0_BLOCK_KEYS if key in data_dict]
+    if source == RAW_PHYSICAL_H0_SOURCE:
+        raw_h0 = data_dict.get(h0_key)
+        if not isinstance(raw_h0, Mapping) or not raw_h0:
+            raise ValueError(
+                "Raw physical-H0 authority requires a non-empty physical-H0 "
+                f"block dictionary at {h0_key!r}."
+            )
+        if prepacked_h0:
+            raise ValueError(
+                "Raw physical-H0 authority must derive H0 blocks from "
+                f"{h0_key!r}; prepacked H0 block fields {prepacked_h0} are "
+                "not allowed to override that authority."
+            )
+        return
+
+    if schema not in {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}:
+        raise ValueError(
+            "Dedicated physical-H0 blocks are supported only by the P2/dual-prior "
+            f"compact schemas; got {schema!r}."
+        )
+    if h0_key in data_dict:
+        raise ValueError(
+            "Dedicated physical-H0 authority must not also expose raw "
+            f"{h0_key!r}; refusing ambiguous dual authority."
+        )
+    missing = [key for key in _PREPACKED_H0_BLOCK_KEYS if data_dict.get(key) is None]
+    if missing:
+        raise ValueError(
+            "Dedicated physical-H0 block bundle is incomplete; "
+            f"missing {missing}."
+        )
+    for field in (
+        BASIS_FINGERPRINT_KEY,
+        EDGE_GRAPH_FINGERPRINT_KEY,
+        ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+        ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+    ):
+        require_sha256(data_dict.get(field), field=field)
+    actual_source = require_sha256(
+        data_dict.get(PHYSICAL_H0_SOURCE_FINGERPRINT_KEY),
+        field=PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    )
+    if expected_source_fingerprint in {None, ""}:
+        raise ValueError(
+            "Dedicated physical-H0 authority requires an externally trusted "
+            "expected_physical_h0_source_fingerprint."
+        )
+    expected_source = require_sha256(
+        expected_source_fingerprint,
+        field="expected_physical_h0_source_fingerprint",
+    )
+    if actual_source != expected_source:
+        raise ValueError(
+            "Dedicated physical-H0 source fingerprint does not match the "
+            "externally trusted cache/source manifest."
+        )
+
+
+def assert_absolute_full_h_target_contract(
+    data_dict: Dict[str, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+    require_h0: bool = False,
+    expected_physical_h0_source_fingerprint: Optional[str] = None,
+) -> None:
     """Require an explicit, versioned absolute-H target declaration."""
 
-    allowed_schemas = {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}
-    if data_dict.get(SAMPLE_SCHEMA_KEY) not in allowed_schemas:
+    schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+    allowed_schemas = {
+        P2_SAMPLE_SCHEMA,
+        DUAL_PRIOR_SAMPLE_SCHEMA,
+        RAW_HAMILTONIAN_SAMPLE_SCHEMA,
+    }
+    if schema not in allowed_schemas:
         raise ValueError(
             "Full-H supervision requires explicit sample schema "
             f"in {sorted(allowed_schemas)!r}; got "
@@ -153,9 +304,37 @@ def assert_absolute_full_h_target_contract(data_dict: Dict[str, Any]) -> None:
         raise ValueError(
             "dedicated_full_h_blocks target source requires all dedicated target fields."
         )
+    if schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        if source != "raw_hamiltonian":
+            raise ValueError(
+                f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r} requires "
+                "hamiltonian_target_source='raw_hamiltonian'."
+            )
+        if any(present):
+            raise ValueError(
+                "Generic raw-H records must derive the Full-H target from the "
+                "authoritative raw 'hamiltonian' dictionary; independently "
+                "prepacked Full-H target fields are not allowed."
+            )
+        raw_hamiltonian = data_dict.get("hamiltonian")
+        if not isinstance(raw_hamiltonian, Mapping) or not raw_hamiltonian:
+            raise ValueError(
+                "Generic raw-H Full-H supervision requires a non-empty raw "
+                "'hamiltonian' block dictionary."
+            )
+    if require_h0:
+        assert_physical_h0_authority_contract(
+            data_dict,
+            schema=schema,
+            h0_key=h0_key,
+            expected_source_fingerprint=expected_physical_h0_source_fingerprint,
+        )
     # Historical target fields are never accepted as evidence of absolute H.
     legacy = [key for key in _PREPACKED_HAMILTONIAN_TARGET_KEYS if key in data_dict]
-    if source == "dedicated_full_h_blocks" and legacy:
+    if (
+        source == "dedicated_full_h_blocks"
+        or schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA
+    ) and legacy:
         raise ValueError(
             "Absolute Full-H records must not also expose ambiguous historical "
             f"delta-named targets {legacy}."
@@ -194,6 +373,158 @@ def assert_residual_target_source_is_raw(data_dict: Dict[str, Any]) -> None:
             "disable residual_hamiltonian for an already-residual dataset or "
             "rebuild the block targets from raw Hamiltonian/H0 dictionaries."
         )
+    prepacked_h0 = [key for key in _PREPACKED_H0_BLOCK_KEYS if key in data_dict]
+    if prepacked_h0:
+        raise ValueError(
+            "residual_hamiltonian=True must derive physical-H0 blocks from the "
+            "raw H0 dictionary used to form H-H0; prepacked H0 block fields "
+            f"{prepacked_h0} are not allowed to override that authority."
+        )
+
+
+def assert_residual_h_target_contract(
+    data_dict: Dict[str, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+) -> None:
+    """Require a versioned raw-H/raw-H0 declaration for residual supervision."""
+
+    schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+    if schema != RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        raise ValueError(
+            "Residual H-H0 supervision requires explicit sample schema "
+            f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r}; got {schema!r}."
+        )
+    semantics = data_dict.get(TARGET_SEMANTICS_KEY)
+    if semantics != H0_RESIDUAL_SEMANTICS:
+        raise ValueError(
+            "Residual H-H0 supervision requires hamiltonian_target_semantics="
+            f"{H0_RESIDUAL_SEMANTICS!r}; got {semantics!r}."
+        )
+    source = data_dict.get(TARGET_SOURCE_KEY)
+    if source != "raw_hamiltonian":
+        raise ValueError(
+            "Residual H-H0 supervision requires "
+            "hamiltonian_target_source='raw_hamiltonian'; "
+            f"got {source!r}."
+        )
+
+    raw_hamiltonian = data_dict.get("hamiltonian")
+    if not isinstance(raw_hamiltonian, Mapping) or not raw_hamiltonian:
+        raise ValueError(
+            "Residual H-H0 supervision requires a non-empty raw "
+            "'hamiltonian' block dictionary."
+        )
+    raw_h0 = data_dict.get(h0_key)
+    if not isinstance(raw_h0, Mapping) or not raw_h0:
+        raise ValueError(
+            "Residual H-H0 supervision requires a non-empty physical-H0 "
+            f"block dictionary at {h0_key!r}."
+        )
+
+    assert_residual_target_source_is_raw(data_dict)
+    prepacked_full_h = [
+        key for key in _PREPACKED_FULL_H_TARGET_KEYS if key in data_dict
+    ]
+    if prepacked_full_h:
+        raise ValueError(
+            "Generic raw-H residual supervision must derive H-H0 from the raw "
+            "Hamiltonian dictionaries; independently prepacked Full-H target "
+            f"fields {prepacked_full_h} are not allowed."
+        )
+
+
+def assert_residual_from_full_h_target_contract(
+    data_dict: Dict[str, Any],
+    *,
+    h0_key: str = "hamiltonian_0",
+) -> None:
+    """Require an absolute-Full-H raw record whose residual dH is materialized online.
+
+    ``residual_ao_block_ode`` reuses the SAME absolute_full_h raw LMDB records as
+    the ao_block_ode Full-H arm (schema deeptb.raw_hamiltonian_training_sample/v1,
+    target semantics absolute_full_h, source raw_hamiltonian), but with
+    residual_hamiltonian=True the loader materializes the residual endpoints
+    D1 = raw H - H0 on the fly.  This is a distinct contract from
+    :func:`assert_residual_h_target_contract`, which demands the h0_residual
+    semantics and would therefore reject these absolute_full_h records; the new
+    opt-in gate certifies the absolute-Full-H declaration instead while still
+    forbidding any prepacked/ambiguous target.
+    """
+
+    # Converter/compact provenance markers must be rejected HERE, at the loader,
+    # BEFORE the residual H-H0 subtraction is materialized.  A record can declare
+    # a valid absolute_full_h target AND carry these uu_real/compact converter
+    # fields at the same time; the flow-side masquerade guard never sees them
+    # because the loader only forwards these metadata keys when
+    # require_uureal_block_ode=True (a require_residual_from_full_h_target load
+    # drops them), so an unguarded masquerade would get H0 double-subtracted into
+    # a wrong delta target.  Certifying an already-converted product as a raw
+    # record therefore has to fail closed at this loader gate.
+    converter_markers = [
+        key
+        for key in (
+            "blockwise_spatial_schema",
+            "blockwise_target_mode",
+            "soc_uureal_compact",
+            "soc_uureal_full_rme",
+            "soc_uureal_keep",
+            "blockwise_source_target_feature_width",
+            "blockwise_source_h0_feature_width",
+        )
+        if key in data_dict
+    ]
+    if converter_markers:
+        raise ValueError(
+            "residual-from-Full-H supervision consumes raw absolute_full_h "
+            "records; a converter product masquerading as a raw record cannot "
+            "feed residual_ao_block_ode. Forbidden converter/compact provenance "
+            f"markers found: {converter_markers}."
+        )
+
+    schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+    if schema != RAW_HAMILTONIAN_SAMPLE_SCHEMA:
+        raise ValueError(
+            "residual-from-Full-H supervision requires explicit sample schema "
+            f"{RAW_HAMILTONIAN_SAMPLE_SCHEMA!r}; got {schema!r}."
+        )
+    semantics = data_dict.get(TARGET_SEMANTICS_KEY)
+    if semantics != ABSOLUTE_FULL_H_SEMANTICS:
+        raise ValueError(
+            "residual-from-Full-H supervision requires hamiltonian_target_semantics="
+            f"{ABSOLUTE_FULL_H_SEMANTICS!r}; got {semantics!r}."
+        )
+    source = data_dict.get(TARGET_SOURCE_KEY)
+    if source != "raw_hamiltonian":
+        raise ValueError(
+            "residual-from-Full-H supervision requires "
+            "hamiltonian_target_source='raw_hamiltonian'; "
+            f"got {source!r}."
+        )
+
+    raw_hamiltonian = data_dict.get("hamiltonian")
+    if not isinstance(raw_hamiltonian, Mapping) or not raw_hamiltonian:
+        raise ValueError(
+            "residual-from-Full-H supervision requires a non-empty raw "
+            "'hamiltonian' block dictionary."
+        )
+    raw_h0 = data_dict.get(h0_key)
+    if not isinstance(raw_h0, Mapping) or not raw_h0:
+        raise ValueError(
+            "residual-from-Full-H supervision requires a non-empty physical-H0 "
+            f"block dictionary at {h0_key!r}."
+        )
+
+    assert_residual_target_source_is_raw(data_dict)
+    prepacked_full_h = [
+        key for key in _PREPACKED_FULL_H_TARGET_KEYS if key in data_dict
+    ]
+    if prepacked_full_h:
+        raise ValueError(
+            "residual-from-Full-H supervision must derive H-H0 from the raw "
+            "Hamiltonian dictionaries; independently prepacked Full-H target "
+            f"fields {prepacked_full_h} are not allowed."
+        )
 
 
 def build_residual_hamiltonian_target_blocks(
@@ -201,8 +532,24 @@ def build_residual_hamiltonian_target_blocks(
     blocks: Dict[Any, Any],
     *,
     h0_key: str = "hamiltonian_0",
+    shrink_policy: str = "error",
+    min_shrink: float = 1.2,
 ) -> Dict[Any, np.ndarray]:
-    """Build H-H0 targets with fail-closed source and shape validation."""
+    """Build H-H0 targets with fail-closed source and shape validation.
+
+    ``shrink_policy`` splits the H0-quality shrink heuristic from the frozen
+    provenance/shape contracts (which always apply): ``"error"`` (default,
+    byte-identical to the historical behaviour) raises when the target fails
+    to shrink, ``"warn"`` logs the same diagnostics and proceeds, and
+    ``"off"`` skips the heuristic entirely. ``min_shrink`` is the required
+    ratio forwarded to :func:`assert_residual_target_shrinks`.
+    """
+    policy = str(shrink_policy).lower()
+    if policy not in {"error", "warn", "off"}:
+        raise ValueError(
+            "residual_shrink_policy must be 'error', 'warn', or 'off'; "
+            f"got {shrink_policy!r}."
+        )
     assert_residual_target_source_is_raw(data_dict)
 
     h0_blocks = data_dict.get(h0_key, None)
@@ -229,9 +576,23 @@ def build_residual_hamiltonian_target_blocks(
             )
         delta_blocks[key] = h_value - h0_value
 
-    # Validate every accessed record. Residual datasets are opt-in, and the
-    # small extra reduction is preferable to silently accepting a mixed shard.
-    assert_residual_target_shrinks(blocks, delta_blocks, h0_key=h0_key)
+    # H0-quality shrink heuristic. Residual datasets are opt-in; the default
+    # "error" policy keeps the historical fail-closed behaviour, while "warn"/
+    # "off" let a reviewer accept a legitimately non-shrinking H0 without
+    # editing this gate. The frozen source/shape contracts above always apply.
+    if policy != "off":
+        try:
+            assert_residual_target_shrinks(
+                blocks, delta_blocks, h0_key=h0_key, min_shrink=min_shrink
+            )
+        except RuntimeError as shrink_error:
+            if policy != "warn":
+                raise
+            log.warning(
+                "residual_shrink_policy='warn': proceeding despite the "
+                "H0-quality shrink gate. %s",
+                shrink_error,
+            )
     return delta_blocks
 
 
@@ -608,9 +969,15 @@ class LMDBDataset(AtomicDataset):
     prior_raw_key = "hamiltonian_p2"
     prefer_precomputed_prior = True
     require_full_h_target = False
+    require_residual_h_target = False
+    require_uureal_block_ode = False
+    require_residual_from_full_h_target = False
     expected_prior_source_fingerprint = None
+    expected_physical_h0_source_fingerprint = None
     audit_prior_representations = False
     require_prior_blocks = False
+    residual_shrink_policy = "error"
+    min_residual_shrink = 1.2
 
     # --- Deprecated P2-named public attribute aliases -------------------------
     # Read/write properties forward the historical attribute names to the
@@ -676,6 +1043,8 @@ class LMDBDataset(AtomicDataset):
             get_H0: bool = False,
             get_prior: Optional[bool] = None,
             residual_hamiltonian: bool = False,
+            residual_shrink_policy: str = "error",
+            min_residual_shrink: float = 1.2,
             get_overlap: bool = False,
             get_DM: bool = False,
             get_eigenvalues: bool = False,
@@ -685,7 +1054,11 @@ class LMDBDataset(AtomicDataset):
             prior_raw_key: Optional[str] = None,
             prefer_precomputed_prior: Optional[bool] = None,
             require_full_h_target: bool = False,
+            require_residual_h_target: bool = False,
+            require_uureal_block_ode: bool = False,
+            require_residual_from_full_h_target: bool = False,
             expected_prior_source_fingerprint: Optional[str] = None,
+            expected_physical_h0_source_fingerprint: Optional[str] = None,
             audit_prior_representations: Optional[bool] = None,
             require_prior_blocks: Optional[bool] = None,
             *,
@@ -758,6 +1131,22 @@ class LMDBDataset(AtomicDataset):
                 "residual_hamiltonian=True requires get_Hamiltonian=True; "
                 "otherwise the target switch would be a silent no-op."
             )
+        # H0-quality shrink heuristic policy (see
+        # build_residual_hamiltonian_target_blocks). The default "error" keeps the
+        # historical fail-closed behaviour byte-for-byte; magnitude alone proves
+        # neither provenance nor correctness, so a reviewer may relax it per split.
+        self.residual_shrink_policy = str(residual_shrink_policy).lower()
+        if self.residual_shrink_policy not in {"error", "warn", "off"}:
+            raise ValueError(
+                "residual_shrink_policy must be 'error', 'warn', or 'off'; "
+                f"got {residual_shrink_policy!r}."
+            )
+        self.min_residual_shrink = float(min_residual_shrink)
+        if not np.isfinite(self.min_residual_shrink) or self.min_residual_shrink <= 0.0:
+            raise ValueError(
+                "min_residual_shrink must be a finite positive float; "
+                f"got {min_residual_shrink!r}."
+            )
         self.get_overlap = get_overlap
         self.get_DM = get_DM
         self.get_eigenvalues = get_eigenvalues
@@ -782,15 +1171,76 @@ class LMDBDataset(AtomicDataset):
             )
         self.prefer_precomputed_prior = bool(prefer_precomputed_prior)
         self.require_full_h_target = bool(require_full_h_target)
+        self.require_residual_h_target = bool(require_residual_h_target)
+        self.require_uureal_block_ode = bool(require_uureal_block_ode)
+        self.require_residual_from_full_h_target = bool(
+            require_residual_from_full_h_target
+        )
         self.expected_prior_source_fingerprint = (
             str(expected_prior_source_fingerprint)
             if expected_prior_source_fingerprint not in {None, ""}
+            else None
+        )
+        self.expected_physical_h0_source_fingerprint = (
+            str(expected_physical_h0_source_fingerprint)
+            if expected_physical_h0_source_fingerprint not in {None, ""}
             else None
         )
         self.audit_prior_representations = bool(audit_prior_representations)
         self.require_prior_blocks = bool(require_prior_blocks)
         if self.require_full_h_target and not self.get_Hamiltonian:
             raise ValueError("require_full_h_target=True requires get_Hamiltonian=True.")
+        if self.require_residual_h_target:
+            if not self.get_Hamiltonian or not self.get_H0:
+                raise ValueError(
+                    "require_residual_h_target=True requires get_Hamiltonian=True "
+                    "and get_H0=True."
+                )
+            if not self.residual_hamiltonian:
+                raise ValueError(
+                    "require_residual_h_target=True requires "
+                    "residual_hamiltonian=True."
+                )
+        if self.require_full_h_target and self.require_residual_h_target:
+            raise ValueError(
+                "Full-H and residual-H target contracts are mutually exclusive."
+            )
+        if self.require_uureal_block_ode:
+            if not self.get_Hamiltonian or not self.get_H0:
+                raise ValueError(
+                    "require_uureal_block_ode=True requires get_Hamiltonian/get_H0=true."
+                )
+            if self.residual_hamiltonian:
+                raise ValueError(
+                    "Compact uu_real records are already-delta; "
+                    "residual_hamiltonian must stay false."
+                )
+            if not is_soc_uureal_mapper(type_mapper):
+                raise ValueError(
+                    "require_uureal_block_ode=True requires an explicit SOC "
+                    "uu_real mapper."
+                )
+        if self.require_residual_from_full_h_target:
+            if not self.get_Hamiltonian or not self.get_H0:
+                raise ValueError(
+                    "require_residual_from_full_h_target=True requires "
+                    "get_Hamiltonian=True and get_H0=True."
+                )
+            if not self.residual_hamiltonian:
+                raise ValueError(
+                    "require_residual_from_full_h_target=True requires "
+                    "residual_hamiltonian=True (the loader materializes D1 = H - H0)."
+                )
+            if (
+                self.require_full_h_target
+                or self.require_residual_h_target
+                or self.require_uureal_block_ode
+            ):
+                raise ValueError(
+                    "require_residual_from_full_h_target is mutually exclusive with "
+                    "require_full_h_target, require_residual_h_target, and "
+                    "require_uureal_block_ode."
+                )
         if self.require_prior_blocks and not self.get_prior:
             raise ValueError("require_prior_blocks=True requires get_prior=True.")
         assert not get_Hamiltonian * get_DM, "Hamiltonian and Density Matrix can only loaded one at a time, for which will occupy the same attribute in the AtomicData."
@@ -808,6 +1258,7 @@ class LMDBDataset(AtomicDataset):
         # must establish the fail-closed contract for itself before reusing it.
         self._validated_record_contracts = {}
         self._validated_record_contracts_pid = os.getpid()
+        self._validated_physical_h0_dataset = None
         for file in self.info_files.keys():
             lmdb_paths = self.simple_get_lmdb_path(file)
             for lmdb_path in lmdb_paths:
@@ -818,6 +1269,36 @@ class LMDBDataset(AtomicDataset):
                     self.index_map += list(range(txn.stat()['entries']))
                     self._lmdb_path_map += [lmdb_path] * txn.stat()['entries']
                 db_env.close()
+
+        # Composition-INDEPENDENT shard identities for sample_uid.  The shard
+        # ordinal must be a function of the shard ALONE, not of which other shards
+        # happen to be co-loaded -- otherwise the same physical record's packed uid
+        # (and thus its SEEDED prior epsilon) changes when the dataset composition
+        # changes: single-shard debug vs multi-shard production, an added/removed
+        # shard, a rank-local shard subset, or a ConcatDataset.  A content-stable
+        # hash of the shard realpath (``_stable_shard_ordinal``) gives that; the
+        # dense 0..K-1 ordinal it replaces did not (a shard's position in the sorted
+        # set moved with the set).  Distinct realpaths must not alias in the 31-bit
+        # ordinal space, so a collision fails closed here rather than silently
+        # correlating two shards' per-record identities and prior noise.
+        unique_shard_realpaths = sorted(
+            {os.path.realpath(path) for path in self._lmdb_path_map}
+        )
+        self._shard_uid_offsets = {}
+        ordinal_owner = {}
+        for realpath in unique_shard_realpaths:
+            ordinal = _stable_shard_ordinal(realpath)
+            clash = ordinal_owner.get(ordinal)
+            if clash is not None and clash != realpath:
+                raise ValueError(
+                    "sample_uid shard-ordinal collision: "
+                    f"{clash!r} and {realpath!r} both hash to the 31-bit shard "
+                    f"ordinal {ordinal}, so two distinct shards would share a "
+                    "per-record identity (and SEEDED prior substream). Rename or "
+                    "relocate one shard so their realpaths differ."
+                )
+            ordinal_owner[ordinal] = realpath
+            self._shard_uid_offsets[realpath] = ordinal
 
     def len(self):
         return self.num_graphs
@@ -864,6 +1345,7 @@ class LMDBDataset(AtomicDataset):
         state["_lmdb_env_cache"] = {}
         state["_validated_record_contracts"] = {}
         state["_validated_record_contracts_pid"] = None
+        state["_validated_physical_h0_dataset"] = None
         # Drop the process-local dynamic-batch cost cache so it is not pickled
         # into DataLoader worker processes (stale/oversized across a fork) (BUG 6).
         state["_dynamic_batch_cost_parts_cache"] = None
@@ -914,6 +1396,107 @@ class LMDBDataset(AtomicDataset):
             logical_file = file_map[raw_idx] if len(file_map) > raw_idx else "<memory>"
             path_identity = (f"logical:{logical_file}:dataset:{id(self)}",)
         return (path_identity, record_idx), cache
+
+    def _resolve_shard_realpath(self, raw_idx: int) -> str:
+        """Resolve the shard realpath for ``raw_idx`` the way ``_load_data_dict`` does.
+
+        The path-backed ``_lmdb_path_map`` branch is authoritative for normal
+        instances and is independent of any intervening ``_load_data_dict`` call
+        (unlike ``_last_lmdb_record_identity``, which the dedicated-H0 audit loop
+        overwrites). Lightweight ``__new__`` fixtures fall back to the logical
+        file identity.
+        """
+        index_map = getattr(self, "index_map", None)
+        lmdb_paths = getattr(self, "_lmdb_path_map", None)
+        if (
+            lmdb_paths is not None
+            and index_map is not None
+            and len(lmdb_paths) == len(index_map)
+        ):
+            return os.path.realpath(lmdb_paths[raw_idx])
+        if hasattr(self, "file_map") and len(getattr(self, "file_map", ())) > raw_idx:
+            # Lightweight __new__ fixtures may carry a file_map without the
+            # path-resolution attributes (root, ...); fall back to the logical
+            # identity rather than assuming the full constructor ran.
+            if hasattr(self, "root"):
+                try:
+                    candidates = self.simple_get_lmdb_path(self.file_map[raw_idx])
+                except (AttributeError, TypeError):
+                    candidates = None
+                if candidates:
+                    return os.path.realpath(candidates[0])
+            return f"logical:{self.file_map[raw_idx]}"
+        return "logical:<memory>"
+
+    def _compute_sample_uid(self, idx: int) -> int:
+        """Return the stable per-graph record identity as a packed int64.
+
+        Packing: ``(shard_id << 32) | (row_id & 0xFFFFFFFF)``.
+
+        * ``row_id`` is the LMDB integer record key within its shard
+          (``index_map[idx]``), i.e. the 4-byte big-endian key used to fetch the
+          record, so ``0 <= row_id < 2**32``.
+        * ``shard_id`` is a content-stable 31-bit hash of the shard's realpath
+          (``_stable_shard_ordinal``, cached in ``_shard_uid_offsets``) -- a
+          function of the shard ALONE, not of the dataset's shard set.
+
+        The result fits in 63 bits (a positive int64). It is independent of batch
+        composition/DataLoader order AND of which other shards are co-loaded,
+        because both the shard ordinal (a hash of the shard's own realpath) and the
+        row key are deterministic functions of the immutable on-disk record -- not
+        of the enclosing dataset's shard set.
+        """
+        raw_idx = int(idx)
+        index_map = getattr(self, "index_map", None)
+        if index_map is not None and len(index_map) > raw_idx:
+            row_id = int(index_map[raw_idx])
+        else:
+            row_id = raw_idx
+        shard_realpath = self._resolve_shard_realpath(raw_idx)
+        offsets = getattr(self, "_shard_uid_offsets", None) or {}
+        if shard_realpath in offsets:
+            shard_id = int(offsets[shard_realpath])
+        else:
+            shard_id = _stable_shard_ordinal(shard_realpath)
+        return ((shard_id & 0x7FFFFFFF) << 32) | (row_id & 0xFFFFFFFF)
+
+    def _assert_dedicated_physical_h0_dataset_fingerprint(self) -> None:
+        """Verify the externally pinned, ordered H0 content once per worker."""
+
+        expected = require_sha256(
+            getattr(self, "expected_physical_h0_source_fingerprint", None),
+            field="expected_physical_h0_source_fingerprint",
+        )
+        cached = getattr(self, "_validated_physical_h0_dataset", None)
+        cache_key = (os.getpid(), expected)
+        if cached == cache_key:
+            return
+
+        record_fingerprints = []
+        for index in range(len(self.index_map)):
+            record = self._load_data_dict(index)
+            if record.get(PHYSICAL_H0_SOURCE_KEY) != DEDICATED_PHYSICAL_H0_SOURCE:
+                raise ValueError(
+                    "A dedicated physical-H0 dataset cannot mix H0 authority modes."
+                )
+            declared = require_sha256(
+                record.get(PHYSICAL_H0_SOURCE_FINGERPRINT_KEY),
+                field=PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+            )
+            if declared != expected:
+                raise ValueError(
+                    "Dedicated physical-H0 source fingerprint differs from the "
+                    "externally trusted split commitment."
+                )
+            record_fingerprints.append(physical_h0_record_fingerprint(record))
+
+        actual = physical_h0_dataset_fingerprint(record_fingerprints)
+        if actual != expected:
+            raise ValueError(
+                "Dedicated physical-H0 block content does not match the externally "
+                "trusted split commitment."
+            )
+        self._validated_physical_h0_dataset = cache_key
 
     def invalidate_dynamic_batch_costs(self) -> None:
         super().invalidate_dynamic_batch_costs()

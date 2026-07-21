@@ -121,8 +121,16 @@ class Trainer(BaseTrainer):
                                                batch_size=train_options["ref_batch_size"], shuffle=True)
 
         if self.use_validation:
+            self.validation_loader_seed = int(common_options.get("seed", 0)) & (
+                (1 << 64) - 1
+            )
+            self.validation_loader_generator = torch.Generator().manual_seed(
+                self.validation_loader_seed
+            )
             self.validation_loader = DataLoader(dataset=self.validation_datasets,
-                                                batch_size=train_options["val_batch_size"], shuffle=True)
+                                                batch_size=train_options["val_batch_size"],
+                                                shuffle=True,
+                                                generator=self.validation_loader_generator)
 
         loss_idp = self._model_loss_idp()
 
@@ -519,6 +527,21 @@ class Trainer(BaseTrainer):
         endpoint_loss = getattr(loss_obj, "last_endpoint_loss", None)
         if endpoint_loss is None:
             endpoint_loss = getattr(loss_obj, "last_feature_compat_loss", None)
+        if endpoint_loss is None and bool(
+            getattr(loss_obj, "sparse_endpoint_metrics", False)
+        ):
+            if not torch.is_tensor(optimization_loss):
+                optimization_loss = torch.as_tensor(optimization_loss)
+            # Keep the triplet structurally explicit so the fail-closed route
+            # check still distinguishes a cadence omission from a criterion
+            # that never implemented endpoint metrics. Accumulators skip None
+            # per key, while the optimization loss remains independently named.
+            return {
+                f"{prefix}_loss": None,
+                f"{prefix}_onsite_loss": None,
+                f"{prefix}_hopping_loss": None,
+                f"{prefix}_loss_opt": optimization_loss.detach(),
+            }
         has_distinct_objective = endpoint_loss is not None
         if endpoint_loss is None:
             endpoint_loss = optimization_loss
@@ -540,7 +563,7 @@ class Trainer(BaseTrainer):
             f"{prefix}_onsite_loss",
             f"{prefix}_hopping_loss",
         )
-        missing = [key for key in required if key not in state]
+        missing = list(required) if state is None else [key for key in required if key not in state]
         if missing:
             raise RuntimeError(
                 f"{route} must expose the non-CFM-compatible endpoint triplet; "
@@ -721,11 +744,104 @@ class Trainer(BaseTrainer):
         return out
 
     @staticmethod
-    def _accumulate_metric_state(metric_sums, state):
+    def _validation_flow_metric_enabled(flow, name):
+        """Read the canonical validation metric set, with mock compatibility.
+
+        Production flows are configured through ``validation_flow_metrics``.
+        The legacy boolean attributes remain only as a fallback for older test
+        doubles and wrappers that have not adopted the canonical set yet.
+        """
+        canonical = getattr(flow, "validation_flow_metrics", None)
+        if canonical is not None:
+            normalized = {
+                str(value).lower().replace("-", "_") for value in canonical
+            }
+            return str(name).lower().replace("-", "_") in normalized
+        legacy_attr = {
+            "random_t": "log_validation_random_t_loss",
+            "one_step": "log_validation_t0_loss",
+            "trajectory": "log_validation_flow_euler_loss",
+        }[name]
+        return bool(getattr(flow, legacy_attr, True))
+
+    @staticmethod
+    def _validation_prior_seed(flow):
+        """Return the batch-independent projected-TE validation seed, if used."""
+        if getattr(flow, "prior", "zero") != "projected_te":
+            return None
+        base_seed = getattr(flow, "validation_prior_base_seed", None)
+        if callable(base_seed):
+            return base_seed()
+        # Compatibility for wrappers built against the pre-fc1099e API.  The
+        # fixed batch index is essential: per-sample UID substreams provide the
+        # actual decorrelation and must not inherit loader position.
+        validation_seed = getattr(flow, "validation_seed", None)
+        if callable(validation_seed):
+            return validation_seed(0, "prior")
+        return None
+
+    def _score_block_ode_validation_sample(
+        self,
+        sampled,
+        original_batch,
+        batch_for_loss,
+        batch_info,
+        *,
+        prior_seed=None,
+        trajectory=False,
+    ):
+        """Score a block-ODE rollout in the flow-owned physical target space.
+
+        Residual block-ODE sampling may return physical Full-H while the ordinary
+        criterion still targets dH.  Rebuild the t=0 flow context and delegate the
+        conversion/scoring decision to the flow; directly calling the criterion
+        here would count H0 as prediction error.
+        """
+        flow = self.flow_cfm
+        num_graphs = flow._num_graphs(original_batch)
+        sample_node = sampled.get(
+            getattr(flow, "node_output_key", "node_hamil_blocks")
+        )
+        zero_device = (
+            sample_node.device if torch.is_tensor(sample_node) else self.device
+        )
+        zero_t = torch.zeros(num_graphs, device=zero_device, dtype=self.dtype)
+        prepare_kwargs = {"t": zero_t}
+        if prior_seed is not None:
+            prepare_kwargs["prior_seed"] = prior_seed
+        _flow_batch, flow_ref, flow_ctx = flow.prepare_batch(
+            original_batch,
+            batch_for_loss,
+            **prepare_kwargs,
+        )
+        flow_ref.update(batch_info)
+        scorer = flow.loss_on_sample if trajectory else flow.compatible_loss_on_sample
+        return scorer(sampled, flow_ref, flow_ctx)
+
+    @staticmethod
+    def _accumulate_metric_state(metric_sums, state, counts=None):
         for key, value in state.items():
+            # A None value marks an omitted/invalid metric for this batch (e.g. a
+            # feature-compatible onsite/hopping metric throttled by
+            # log_feature_compatible_interval): it must contribute neither a
+            # numerator nor a denominator, so skip it entirely rather than
+            # coercing it to 0.0.  Existing callers never pass None, so this is a
+            # no-op for them.
+            if value is None:
+                continue
             if torch.is_tensor(value):
                 value = value.detach()
             metric_sums[key] = metric_sums.get(key, 0.0) + value
+            # Per-key valid-batch count: how many batches actually contributed
+            # THIS key.  ``validation()`` divides each metric sum by its own count
+            # so a batch that omitted the key (throttled onsite/hopping metric,
+            # None above) dilutes neither the numerator nor the denominator.  Each
+            # metric key is produced at most once per batch across all
+            # ``validation()`` accumulation sites, so one bump per add == one bump
+            # per contributing batch.  ``counts is None`` for any caller that does
+            # not opt in, leaving them byte-identical.
+            if counts is not None:
+                counts[key] = counts.get(key, 0) + 1
 
     def iteration(self, batch, ref_batch=None):
         '''
@@ -1118,8 +1234,20 @@ class Trainer(BaseTrainer):
         with torch.no_grad():
             loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
             flow_metric_sums = {}
+            # Per-key valid-batch counts, filled in lock-step with flow_metric_sums
+            # by _accumulate_metric_state.  Keys accumulated only through that helper
+            # (the throttleable feature-compatible onsite/hopping metrics and every
+            # compatible-loss key) are divided by their own count; keys written
+            # directly below (validation_flow_random_t/t0/euler_* losses) are gated
+            # by per-run-constant config flags, so they are present on every batch
+            # or none -- they are absent from this dict and fall back to num_batches
+            # (== their true count), keeping the interval=1 result byte-identical.
+            flow_metric_counts = {}
             num_batches = 0
             self.model.eval()
+            generator = getattr(self, "validation_loader_generator", None)
+            if generator is not None:
+                generator.manual_seed(self.validation_loader_seed)
             for batch in self.validation_loader:
                 batch = batch.to(self.device)
                 batch_info = {"__slices__": batch.__slices__, "__cumsum__": batch.__cumsum__,
@@ -1129,10 +1257,17 @@ class Trainer(BaseTrainer):
                 batch_for_loss = batch.copy()
                 if self.flow_cfm.enabled:
                     original_batch = batch.copy()
-                    log_random_t = getattr(self.flow_cfm, "log_validation_random_t_loss", True)
-                    log_t0 = getattr(self.flow_cfm, "log_validation_t0_loss", True)
-                    log_flow_euler = getattr(
-                        self.flow_cfm, "log_validation_flow_euler_loss", True
+                    validation_prior_seed = self._validation_prior_seed(
+                        self.flow_cfm
+                    )
+                    log_random_t = self._validation_flow_metric_enabled(
+                        self.flow_cfm, "random_t"
+                    )
+                    log_t0 = self._validation_flow_metric_enabled(
+                        self.flow_cfm, "one_step"
+                    )
+                    log_flow_euler = self._validation_flow_metric_enabled(
+                        self.flow_cfm, "trajectory"
                     )
                     if getattr(self.flow_cfm, "model_in_loss", False):
                         batch_for_loss.update(batch_info)
@@ -1145,7 +1280,7 @@ class Trainer(BaseTrainer):
                                 flow_metric_sums.get("validation_flow_random_t_loss", 0.0)
                                 + random_t_loss.detach()
                             )
-                            self._accumulate_metric_state(flow_metric_sums, random_t_state)
+                            self._accumulate_metric_state(flow_metric_sums, random_t_state, flow_metric_counts)
                         num_graphs = self.flow_cfm._num_graphs(original_batch)
                         zero_t = torch.zeros(num_graphs, device=self.device, dtype=self.dtype)
                         one_t = torch.ones(num_graphs, device=self.device, dtype=self.dtype)
@@ -1165,23 +1300,57 @@ class Trainer(BaseTrainer):
                                     old_prefix="validation_one_step",
                                     new_prefix="validation_flow_one_step",
                                 ),
+                                flow_metric_counts,
                             )
                         # Endpoint-compatible validation: euler-sample to t=0
                         # and score the blockwise criterion so pMF's legacy
                         # validation_* keys stay comparable with no-CFM/CFM.
                         for num_steps in self.flow_cfm.validation_ode_steps:
+                            sample_kwargs = {"num_steps": num_steps}
+                            if validation_prior_seed is not None:
+                                sample_kwargs["prior_seed"] = validation_prior_seed
                             sampled = self.flow_cfm.sample(
-                                self.model, original_batch, num_steps=num_steps
+                                self.model, original_batch, **sample_kwargs
                             )
                             sampled.update(batch_info)
                             legacy_prefix = "validation" if int(num_steps) == 1 else None
-                            compatible_state = self._compatible_loss_state(
-                                self.validation_lossfunc,
-                                sampled,
-                                batch_for_loss,
-                                prefix=f"validation_compatible_euler_{num_steps}",
-                                legacy_prefix=legacy_prefix,
-                            )
+                            if bool(getattr(self.flow_cfm, "block_ode", False)):
+                                sample_loss, sample_state = (
+                                    self._score_block_ode_validation_sample(
+                                        sampled,
+                                        original_batch,
+                                        batch_for_loss,
+                                        batch_info,
+                                        prior_seed=validation_prior_seed,
+                                        trajectory=log_flow_euler,
+                                    )
+                                )
+                                if log_flow_euler:
+                                    self._accumulate_metric_state(
+                                        flow_metric_sums,
+                                        {
+                                            f"validation_flow_euler_{num_steps}_loss": sample_loss
+                                        },
+                                        flow_metric_counts,
+                                    )
+                                compatible_state = (
+                                    self._compatible_loss_state_from_flow_stats(
+                                        self.validation_lossfunc,
+                                        sample_state,
+                                        source_prefix="train",
+                                        prefix=f"validation_compatible_euler_{num_steps}",
+                                        legacy_prefix=legacy_prefix,
+                                        global_step=getattr(self, "iter", None),
+                                    )
+                                )
+                            else:
+                                compatible_state = self._compatible_loss_state(
+                                    self.validation_lossfunc,
+                                    sampled,
+                                    batch_for_loss,
+                                    prefix=f"validation_compatible_euler_{num_steps}",
+                                    legacy_prefix=legacy_prefix,
+                                )
                             if int(num_steps) == 1:
                                 self._require_endpoint_triplet(
                                     compatible_state,
@@ -1191,12 +1360,23 @@ class Trainer(BaseTrainer):
                             self._accumulate_metric_state(
                                 flow_metric_sums,
                                 compatible_state,
+                                flow_metric_counts,
                             )
                         num_batches += 1
                         continue
                     if log_random_t:
+                        prepare_kwargs = {}
+                        if validation_prior_seed is not None:
+                            prepare_kwargs["prior_seed"] = validation_prior_seed
+                        validation_seed = getattr(self.flow_cfm, "validation_seed", None)
+                        if callable(validation_seed):
+                            prepare_kwargs["time_seed"] = validation_seed(
+                                num_batches, "time"
+                            )
                         flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
-                            original_batch, batch_for_loss
+                            original_batch,
+                            batch_for_loss,
+                            **prepare_kwargs,
                         )
                         flow_pred = self.model(flow_batch)
                         random_t_loss, _ = self.flow_cfm.loss(flow_pred, flow_ref, flow_ctx)
@@ -1211,8 +1391,13 @@ class Trainer(BaseTrainer):
                     t0_ref = None
                     t0_ctx = None
                     if log_t0 or log_flow_euler:
+                        prepare_kwargs = {"t": zero_t}
+                        if validation_prior_seed is not None:
+                            prepare_kwargs["prior_seed"] = validation_prior_seed
                         t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
-                            original_batch, batch_for_loss, t=zero_t
+                            original_batch,
+                            batch_for_loss,
+                            **prepare_kwargs,
                         )
                         if log_t0:
                             t0_pred = self.model(t0_batch)
@@ -1224,23 +1409,59 @@ class Trainer(BaseTrainer):
                                 + t0_loss.detach()
                             )
                     for num_steps in self.flow_cfm.validation_ode_steps:
+                        sample_kwargs = {"num_steps": num_steps}
+                        if validation_prior_seed is not None:
+                            sample_kwargs["prior_seed"] = validation_prior_seed
                         sampled = self.flow_cfm.sample(
-                            self.model, original_batch, num_steps=num_steps
+                            self.model, original_batch, **sample_kwargs
                         )
                         sampled.update(batch_info)
                         sample_state = None
-                        if log_flow_euler:
+                        block_ode = bool(getattr(self.flow_cfm, "block_ode", False))
+                        if block_ode:
+                            sample_loss, sample_state = (
+                                self._score_block_ode_validation_sample(
+                                    sampled,
+                                    original_batch,
+                                    batch_for_loss,
+                                    batch_info,
+                                    prior_seed=validation_prior_seed,
+                                    trajectory=log_flow_euler,
+                                )
+                            )
+                            if log_flow_euler:
+                                self._accumulate_metric_state(
+                                    flow_metric_sums,
+                                    {
+                                        f"validation_flow_euler_{num_steps}_loss": sample_loss
+                                    },
+                                    flow_metric_counts,
+                                )
+                        elif log_flow_euler:
                             if t0_ref is None or t0_ctx is None:
+                                prepare_kwargs = {"t": zero_t}
+                                if validation_prior_seed is not None:
+                                    prepare_kwargs["prior_seed"] = validation_prior_seed
                                 _t0_batch, t0_ref, t0_ctx = self.flow_cfm.prepare_batch(
-                                    original_batch, batch_for_loss, t=zero_t
+                                    original_batch,
+                                    batch_for_loss,
+                                    **prepare_kwargs,
                                 )
                                 t0_ref.update(batch_info)
-                            sample_loss, sample_state = self.flow_cfm.loss(
+                            sample_scorer = getattr(
+                                self.flow_cfm,
+                                "loss_on_sample",
+                                self.flow_cfm.loss,
+                            )
+                            sample_loss, sample_state = sample_scorer(
                                 sampled, t0_ref, t0_ctx
                             )
-                            key = f"validation_flow_euler_{num_steps}_loss"
-                            flow_metric_sums[key] = (
-                                flow_metric_sums.get(key, 0.0) + sample_loss.detach()
+                            self._accumulate_metric_state(
+                                flow_metric_sums,
+                                {
+                                    f"validation_flow_euler_{num_steps}_loss": sample_loss
+                                },
+                                flow_metric_counts,
                             )
                         legacy_prefix = "validation" if int(num_steps) == 1 else None
                         compatible_state = None
@@ -1248,12 +1469,12 @@ class Trainer(BaseTrainer):
                             compatible_state = self._compatible_loss_state_from_flow_stats(
                                 self.validation_lossfunc,
                                 sample_state,
-                                source_prefix=f"validation_compatible_euler_{num_steps}",
+                                source_prefix="train",
                                 prefix=f"validation_compatible_euler_{num_steps}",
                                 legacy_prefix=legacy_prefix,
                                 global_step=getattr(self, "iter", None),
                             )
-                        if compatible_state is None:
+                        if compatible_state is None and not block_ode:
                             compatible_ref = t0_ref if t0_ref is not None else batch_for_loss.copy()
                             compatible_ref.update(batch_info)
                             compatible_state = self._compatible_loss_state(
@@ -1272,6 +1493,7 @@ class Trainer(BaseTrainer):
                         self._accumulate_metric_state(
                             flow_metric_sums,
                             compatible_state,
+                            flow_metric_counts,
                         )
                 else:
                     batch = self.model(batch)
@@ -1289,10 +1511,16 @@ class Trainer(BaseTrainer):
                             prefix="validation",
                             route="Non-CFM validation",
                         )
-                    loss += endpoint_state["validation_loss"]
+                    endpoint_loss = endpoint_state["validation_loss"]
+                    loss += (
+                        endpoint_loss
+                        if endpoint_loss is not None
+                        else batch_loss.detach()
+                    )
                     self._accumulate_metric_state(
                         flow_metric_sums,
                         endpoint_state,
+                        flow_metric_counts,
                     )
                 num_batches += 1
                 if fast: break
@@ -1300,14 +1528,60 @@ class Trainer(BaseTrainer):
         if not fast:
             loss = loss / divisor
         self._last_flow_validation_state = {
-            key: value / divisor for key, value in flow_metric_sums.items()
+            # Per-key valid-batch count (filled in lock-step with flow_metric_sums
+            # by _accumulate_metric_state): a throttleable feature-compatible metric
+            # omitted by _loss_component_state on a non-firing batch accumulated a
+            # smaller sum, so dividing it by the uniform num_batches would dilute it
+            # (2.0 over one firing batch of two -> 1.0).  Divide each accumulated key
+            # by ITS OWN contributing-batch count instead.  Keys written directly to
+            # flow_metric_sums (validation_flow_random_t/t0/euler_* losses) never
+            # enter flow_metric_counts and fall back to ``divisor``; keys present on
+            # every batch have count == num_batches == divisor, so the fallback and
+            # the per-key path give the identical divisor and interval=1 stays
+            # byte-identical.
+            key: value / flow_metric_counts.get(key, divisor)
+            for key, value in flow_metric_sums.items()
         }
         # When the endpoint-compatible pass produced a legacy validation_loss,
         # return it: direct callers and scheduler metrics then see the same
         # no-CFM/CFM-comparable scalar that Validationer reports, matching
         # MultiTrainer.validation semantics. The flow objective stays under
-        # validation_flow_* keys.
-        if "validation_loss" in self._last_flow_validation_state:
-            return self._last_flow_validation_state["validation_loss"]
-        return loss
+        # validation_flow_* keys.  When the legacy key is absent (a legal config
+        # such as validation_ode_steps=[3] with the three log_validation_* flags
+        # disabled writes only validation_compatible_euler_{n}_loss), fail closed
+        # to the smallest-n endpoint-compatible loss instead of the accumulated
+        # ``loss`` (which stays 0.0 when no optimization-loss branch ran and would
+        # otherwise be read by schedulers/best-checkpoint as a perfect score).
+        return self._resolve_validation_return(loss)
+
+    def _resolve_validation_return(self, accumulated_loss):
+        """Fail-closed selection of the scalar ``validation()`` returns.
+
+        Preference order (operates on ``self._last_flow_validation_state``, which
+        ``validation()`` has just rebuilt from this run's metric sums):
+
+        1. the legacy ``validation_loss`` key -- byte-identical to the historical
+           behavior whenever the ``num_steps == 1`` endpoint-compatible pass ran;
+        2. otherwise the endpoint-compatible euler loss with the SMALLEST number
+           of ODE steps (``validation_compatible_euler_{n}_loss``);
+        3. otherwise the accumulated ``loss`` (no compatible metric available).
+        """
+        state = getattr(self, "_last_flow_validation_state", None) or {}
+        if "validation_loss" in state:
+            return state["validation_loss"]
+        prefix = "validation_compatible_euler_"
+        suffix = "_loss"
+        best_n = None
+        best_key = None
+        for key in state:
+            if key.startswith(prefix) and key.endswith(suffix):
+                middle = key[len(prefix):-len(suffix)]
+                if middle.isdigit():
+                    n = int(middle)
+                    if best_n is None or n < best_n:
+                        best_n = n
+                        best_key = key
+        if best_key is not None:
+            return state[best_key]
+        return accumulated_loss
 
