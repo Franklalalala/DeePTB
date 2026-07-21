@@ -6,6 +6,12 @@ import re
 from numbers import Integral, Number
 
 from dptb.configuration import canonicalize_training_config
+# Dependency-free (no torch, no dptb.data): dptb.data's package __init__
+# imports dptb.utils.argcheck (via dptb.data.build), so importing anything
+# from dptb.nnops.blockwise_nextham_loss or dptb.nnops.loss here would be a
+# circular import.  See dptb/nnops/blockwise_metric_space.py's module
+# docstring for the full explanation.
+from dptb.nnops.blockwise_metric_space import endpoint_metric_space_for_options
 
 
 log = logging.getLogger(__name__)
@@ -365,6 +371,61 @@ def validate_flow_loss_contract(data):
         )
 
 
+# loss_options.<split>.method values that instantiate HamilBlockwiseNexTHamLoss
+# (dptb/nnops/blockwise_nextham_loss.py registers the same class under both
+# names) and therefore expose an ``endpoint_metric_space``.
+_BLOCKWISE_NEXTHAM_LOSS_METHODS = frozenset({"hamil_blockwise_nextham", "hamil_block_abs"})
+
+
+def _validate_block_ode_loss_endpoint_metric_space(data):
+    """block_ode flows only ever publish block-space endpoint statistics.
+
+    ``HamilBlockwiseNexTHamLoss`` declares ``endpoint_metric_space="rme"`` (not
+    "block") whenever ``log_feature_compatible=true`` or ``optimization`` is
+    ``feature``/``feature_compatible``/``compat`` (see
+    ``endpoint_metric_space_for_options``, the single source of truth shared
+    with the loss module).  A block-ODE flow's runtime stats are always in
+    "block" space, and ``Trainer`` explicitly refuses the direct-criterion
+    recompute fallback for block_ode (``and not block_ode`` guards in
+    ``_loss_on_batch``/the validation loop), so a "block"/"rme" mismatch is not
+    a soft warning: ``compatible_state`` comes back ``None`` and the one-step
+    validation endpoint-triplet construction raises.  Catch it here, at
+    configuration time, instead of at the first validation step.
+
+    This is schema-legal and was even the documented way to opt into
+    cross-representation comparison (see docs/advanced/pixel_meanflow.md), so
+    dargs' per-field schema cannot reject it -- only this cross-tree check,
+    which sees both flow_options.block_ode and loss_options together, can.
+    """
+
+    loss_options_value = dict(data.get("train_options", {}).get("loss_options", {}) or {})
+    for split in ("train", "validation"):
+        split_loss = loss_options_value.get(split)
+        if not isinstance(split_loss, dict):
+            continue
+        if split_loss.get("method") not in _BLOCKWISE_NEXTHAM_LOSS_METHODS:
+            continue
+        metric_space = endpoint_metric_space_for_options(
+            log_feature_compatible=split_loss.get("log_feature_compatible", False),
+            optimization=split_loss.get("optimization", "block_mae"),
+        )
+        if metric_space != "block":
+            raise ValueError(
+                f"train_options.loss_options.{split} configures a blockwise "
+                f"Hamiltonian loss (method={split_loss.get('method')!r}) whose "
+                f"endpoint_metric_space would be {metric_space!r}, not 'block' "
+                "(log_feature_compatible=true or optimization in "
+                "{'feature', 'feature_compatible', 'compat'}). block_ode flows "
+                "only publish block-space endpoint statistics and validation "
+                "refuses to fall back to a direct criterion recompute for "
+                "block_ode, so this combination crashes at the first "
+                "validation step. Set "
+                f"train_options.loss_options.{split}.log_feature_compatible=false "
+                "and use a block-space optimization (block_mae, "
+                "block_l1_rmse, or block_mae_mse), or disable block_ode."
+            )
+
+
 def validate_block_ode_contract(data):
     """Cross-check the full model/data contract that a field schema cannot see."""
     # normalize() already performs this pass before dargs.  Repeat it here so
@@ -387,6 +448,7 @@ def validate_block_ode_contract(data):
         return
     if not bool(flow.get("enabled", False)):
         raise ValueError("block_ode requires train_options.flow_options.enabled=true")
+    _validate_block_ode_loss_endpoint_metric_space(data)
     # Every runtime alias flow.py normalizes to uureal_block_ode MUST appear in
     # both sets above/below: an alias missing here while block_ode is omitted
     # slips past this whole contract validation yet still activates the mode at
@@ -2904,7 +2966,7 @@ def loss_options():
         Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, block_mae_mse, feature_compatible."),
         Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
         Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
-        Argument("log_feature_compatible", bool, optional=True, default=False, doc="Expensive opt-in: report exact old-RME-compatible endpoint metrics instead of native AO-block metrics. Enable selectively (for example validation only), not on every block-native train step."),
+        Argument("log_feature_compatible", bool, optional=True, default=False, doc="Expensive opt-in: report exact old-RME-compatible endpoint metrics instead of native AO-block metrics. Enable selectively (for example validation only), not on every block-native train step. Forbidden under block_ode (any output_space in ao_block_ode/uureal_block_ode/residual_ao_block_ode): block-ODE flows only publish block-space endpoint statistics, so a criterion that logs 'rme' here is rejected at configuration time by validate_block_ode_contract."),
         Argument("log_feature_compatible_interval", int, optional=True, default=1, doc="Cadence, counted in forward() calls, for the logging-only feature-compatible onsite/hopping metric. The expensive host-sync feature branch fires only when call_index % interval == 0, where call_index is a 0-based per-criterion counter, so the FIRST call always fires (smoke runs and first-batch logs still see the metric). interval=1 (default) reproduces the legacy every-step behavior byte-for-byte; larger values throttle the logging metric only and never change the optimization/gradient loss. Rank-synchronous: every DDP rank calls forward() the same number of times, so the feature branch (which contains collective all-reduces) fires on all ranks or none and cannot deadlock. Must be an int >= 1."),
         Argument("feature_log_no_grad", bool, optional=True, default=True),
         Argument("distributed_log_reduce", bool, optional=True, default=False),

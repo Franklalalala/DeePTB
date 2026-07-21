@@ -53,6 +53,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     mae_from_components,
     maybe_all_reduce_components,
 )
+from dptb.nnops.blockwise_metric_space import endpoint_metric_space_for_options
 
 
 def _get(data: Mapping[str, Any], key: str, default=None):
@@ -128,11 +129,9 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         self.block_reduction = block_reduction
         self.complex_reduction = complex_reduction
         self.log_feature_compatible = bool(log_feature_compatible)
-        self.endpoint_metric_space = (
-            "rme"
-            if self.log_feature_compatible
-            or self.optimization in {"feature", "feature_compatible", "compat"}
-            else "block"
+        self.endpoint_metric_space = endpoint_metric_space_for_options(
+            log_feature_compatible=self.log_feature_compatible,
+            optimization=self.optimization,
         )
         # Cadence (in forward() calls) for the logging-only feature-compatible
         # metric.  The feature branch is host-sync heavy (cpu()/tolist(), Python
@@ -227,11 +226,9 @@ class HamilBlockwiseNexTHamLoss(nn.Module):
         onsite_loss = l1_rmse_from_components(onsite, eps=self.eps)
         hopping_loss = l1_rmse_from_components(hopping, eps=self.eps)
         total_loss = 0.5 * (onsite_loss + hopping_loss)
-        metric_space = (
-            "rme"
-            if self.log_feature_compatible
-            or self.optimization in {"feature", "feature_compatible", "compat"}
-            else "block"
+        metric_space = endpoint_metric_space_for_options(
+            log_feature_compatible=self.log_feature_compatible,
+            optimization=self.optimization,
         )
 
         self.last_onsite_l1_sum = onsite_l1_sum.detach()

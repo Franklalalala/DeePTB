@@ -143,6 +143,21 @@ RME-compatible slice reduction. That slice walk does not materialize a full RME
 tensor, but it launches many small GPU reductions; prefer enabling it only on a
 separate validation loss when cross-representation comparison is essential.
 
+**This selective-enable advice does not apply under block-ODE flows**
+(`flow_options.block_ode=true`, i.e. `output_space` in `ao_block_ode` /
+`uureal_block_ode` / `residual_ao_block_ode`). Those flows only ever publish
+`block`-space endpoint statistics, and validation refuses to fall back to a
+direct criterion recompute for `block_ode`. A blockwise criterion with
+`log_feature_compatible=true` (or `optimization` in `feature` /
+`feature_compatible` / `compat`) on *either* the train or the validation
+split makes `endpoint_metric_space != 'block'`, which is a guaranteed crash
+at the first "one-step" validation batch, not a soft warning. This
+combination is schema-legal (dargs cannot see `flow_options` and
+`loss_options` together) but is rejected at configuration time by
+`validate_block_ode_contract`; keep block-ODE criteria on a block-space
+`optimization` (`block_mae`, `block_l1_rmse`, or `block_mae_mse`) with
+`log_feature_compatible=false` on every configured split.
+
 Pixel MeanFlow is a model-in-loss route: its training endpoint statistics are
 reduced directly from `flow_options.node_target_key` and `edge_target_key`.
 Consequently, a block-native training criterion (`endpoint_metric_space=block`)
