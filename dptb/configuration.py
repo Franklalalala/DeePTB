@@ -584,6 +584,7 @@ def _flow_final_normalize(
         "mode",
         "prior",
         "te_prior_mode",
+        "tied_irrep_mode",
         "output_space",
         "state_space",
         "target_semantics",

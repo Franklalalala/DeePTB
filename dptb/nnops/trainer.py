@@ -766,8 +766,10 @@ class Trainer(BaseTrainer):
 
     @staticmethod
     def _validation_prior_seed(flow):
-        """Return the batch-independent projected-TE validation seed, if used."""
-        if getattr(flow, "prior", "zero") != "projected_te":
+        """Return the batch-independent stochastic-prior validation seed, if used."""
+        prior = getattr(flow, "prior", "zero")
+        stochastic_priors = {"projected_te", "tied_irrep_gaussian"}
+        if prior not in stochastic_priors:
             return None
         base_seed = getattr(flow, "validation_prior_base_seed", None)
         if callable(base_seed):
