@@ -218,6 +218,10 @@ def flow_options():
         Argument("te_prior_mode", str, optional=True, default="irrep"),
         Argument("te_prior_per_graph", bool, optional=True, default=True),
         Argument("te_prior_validation_seed", int, optional=True, default=None),
+        Argument("tied_irrep_sigma", (int, float), optional=True, default=1.0),
+        Argument("tied_irrep_mode", str, optional=True, default=""),
+        Argument("tied_irrep_irreps", str, optional=True, default="3x0e + 2x1e + 1x2e"),
+        Argument("tied_irrep_validation_seed", int, optional=True, default=None),
         Argument("prior_node_key", str, optional=True, default=""),
         Argument("prior_edge_key", str, optional=True, default=""),
         Argument("prior_key_prefixes", list, optional=True, default=[]),
@@ -402,15 +406,21 @@ def validate_block_ode_contract(data):
     prior = str(flow.get("prior", "")).lower().replace("-", "_")
     if uureal_mode and prior != "zero":
         raise ValueError("uureal_block_ode requires prior='zero'")
-    if residual_spatial_mode and prior not in {"zero", "projected_te"}:
+    if residual_spatial_mode and prior not in {
+        "zero",
+        "projected_te",
+        "tied_irrep_gaussian",
+    }:
         raise ValueError(
-            "residual_ao_block_ode requires prior in {'zero', 'projected_te'}"
+            "residual_ao_block_ode supports only prior='zero', "
+            "prior='projected_te', or prior='tied_irrep_gaussian'"
         )
-    if prior not in {"zero", "projected_te"}:
+    if not residual_spatial_mode and prior not in {"zero", "projected_te"}:
         raise ValueError(
             "block_ode supports only prior='zero' or explicit prior='projected_te'"
         )
     projected_scales = None
+    tied_irrep_scales = None
     if prior == "projected_te":
         mode = str(flow.get("te_prior_mode", "irrep")).lower().replace("-", "_")
         if mode != "irrep":
@@ -449,6 +459,53 @@ def validate_block_ode_contract(data):
             raise ValueError(
                 "projected_te block_ode requires an explicit integer "
                 f"te_prior_validation_seed in [0, {(1 << 64) - 1}]"
+            )
+    if prior == "tied_irrep_gaussian":
+        mode = str(flow.get("tied_irrep_mode", "")).lower().replace("-", "_")
+        if mode != "so3_tied":
+            raise ValueError(
+                "tied_irrep_gaussian requires tied_irrep_mode='so3_tied'"
+            )
+        canonical_irreps = "3x0e + 2x1e + 1x2e"
+        configured_irreps = str(flow.get("tied_irrep_irreps", ""))
+        if re.sub(r"\s+", "", configured_irreps) != re.sub(
+            r"\s+", "", canonical_irreps
+        ):
+            raise ValueError(
+                "tied_irrep_gaussian currently supports exactly "
+                f"tied_irrep_irreps={canonical_irreps!r}"
+            )
+        raw_scales = {
+            "node_sigma": flow.get("node_sigma", 1.0),
+            "edge_sigma": flow.get("edge_sigma", 1.0),
+            "tied_irrep_sigma": flow.get("tied_irrep_sigma", 1.0),
+        }
+        invalid = [
+            name
+            for name, value in raw_scales.items()
+            if isinstance(value, bool)
+            or not isinstance(value, Number)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ]
+        if invalid:
+            raise ValueError(
+                "tied_irrep_gaussian requires finite positive scales; "
+                f"invalid options={invalid}"
+            )
+        tied_irrep_scales = {
+            name: float(value) for name, value in raw_scales.items()
+        }
+        validation_seed = flow.get("tied_irrep_validation_seed", None)
+        if (
+            isinstance(validation_seed, bool)
+            or not isinstance(validation_seed, int)
+            or validation_seed < 0
+            or validation_seed > (1 << 64) - 1
+        ):
+            raise ValueError(
+                "tied_irrep_gaussian requires an explicit integer "
+                f"tied_irrep_validation_seed in [0, {(1 << 64) - 1}]"
             )
     semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
     if semantics not in {"absolute_full_h", "residual_dh"}:
@@ -610,6 +667,28 @@ def validate_block_ode_contract(data):
         if invalid_effective:
             raise ValueError(
                 "projected_te block_ode effective scales must be finite and "
+                f"non-zero in {configured_dtype}; invalid products={invalid_effective}"
+            )
+    if tied_irrep_scales is not None:
+        representable = {
+            "float32": (2.0 ** -149, (2.0 - 2.0 ** -23) * 2.0 ** 127),
+            "float64": (2.0 ** -1074, (2.0 - 2.0 ** -52) * 2.0 ** 1023),
+        }
+        minimum, maximum = representable[configured_dtype]
+        effective_scales = {
+            "node_sigma*tied_irrep_sigma": tied_irrep_scales["node_sigma"]
+            * tied_irrep_scales["tied_irrep_sigma"],
+            "edge_sigma*tied_irrep_sigma": tied_irrep_scales["edge_sigma"]
+            * tied_irrep_scales["tied_irrep_sigma"],
+        }
+        invalid_effective = [
+            name
+            for name, value in effective_scales.items()
+            if not math.isfinite(value) or not minimum <= abs(value) <= maximum
+        ]
+        if invalid_effective:
+            raise ValueError(
+                "tied_irrep_gaussian effective scales must be finite and "
                 f"non-zero in {configured_dtype}; invalid products={invalid_effective}"
             )
     maximum_inverse_atol = inverse_atol_caps[configured_dtype]

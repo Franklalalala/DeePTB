@@ -1,0 +1,79 @@
+# Multiplicity-tied Gaussian overlay for the non-SOC H/O water
+# direct-residual block-state ODE run. It is the residual zero-prior arm
+# with only the start-state prior changed.
+common_options:
+  basis: {H: 2s1p, O: 3s2p1d}
+  has_soc: false
+  dtype: float32
+  device: cpu
+
+model_options:
+  embedding:
+    method: lem_moe_v3_h0
+    output_route: h_b0
+    h0_init_scope: both
+    h0_merge_mode: replace
+    use_flow_time_embedding: true
+    flow_time_condition_edges: true
+    flow_time_key: flow_time
+    flow_time_allow_missing: false
+    require_full_block_edge_coverage: true
+    use_spatial_residual_block_input: true
+  prediction:
+    method: block_native
+    block_decoder: expansion_cg
+    blockwise_hamiltonian: true
+    reconstruction: direct
+    scale_type: no_scale
+
+train_options:
+  flow_options:
+    enabled: true
+    objective: cfm
+    mode: residual
+    prior: tied_irrep_gaussian
+    tied_irrep_mode: so3_tied
+    tied_irrep_irreps: "3x0e + 2x1e + 1x2e"
+    node_sigma: 1.0
+    edge_sigma: 1.0
+    tied_irrep_sigma: 1.0
+    tied_irrep_validation_seed: 20260721
+    output_space: residual_ao_block_ode
+    block_ode: true
+    state_space: residual_ao_block
+    block_input_adapter: direct_cg
+    h0_condition_space: spatial_h0_rme
+    block_export_final_full_h: true
+    target_semantics: residual_dh
+    time_conditioning_required: true
+    strict_h0: true
+    t0_probability: 0.15
+    block_inverse_mode: strict
+    block_inverse_atol: 2.0e-5
+    strict_certification: always
+    node_block_target_key: node_delta_hamil_blocks
+    edge_block_target_key: edge_delta_hamil_blocks
+    node_block_shape_key: node_delta_hamil_block_shape
+    edge_block_shape_key: edge_delta_hamil_block_shape
+    validation_ode_steps: [1]
+    log_validation_random_t_loss: false
+    log_validation_t0_loss: false
+    log_validation_flow_euler_loss: false
+
+data_options:
+  train:
+    type: LMDBDataset
+    get_Hamiltonian: true
+    get_H0: true
+    residual_hamiltonian: true
+    require_full_h_target: false
+    require_residual_h_target: false
+    require_residual_from_full_h_target: true
+  validation:
+    type: LMDBDataset
+    get_Hamiltonian: true
+    get_H0: true
+    residual_hamiltonian: true
+    require_full_h_target: false
+    require_residual_h_target: false
+    require_residual_from_full_h_target: true

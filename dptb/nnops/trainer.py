@@ -713,7 +713,8 @@ class Trainer(BaseTrainer):
                     original_batch = batch.copy()
                     validation_prior_seed = (
                         self.flow_cfm.validation_seed(num_batches, "prior")
-                        if getattr(self.flow_cfm, "prior", "zero") == "projected_te"
+                        if getattr(self.flow_cfm, "prior", "zero")
+                        in {"projected_te", "tied_irrep_gaussian"}
                         else None
                     )
                     log_random_t = getattr(self.flow_cfm, "log_validation_random_t_loss", True)

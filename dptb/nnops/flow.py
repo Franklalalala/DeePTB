@@ -52,6 +52,15 @@ from dptb.nnops.flow_priors import (
     HAAR_DM_NAMES,
     OVERLAP_HUCKEL_NAMES,
 )
+from dptb.nnops.tied_irrep_gaussian_prior import (
+    TIED_IRREP_CANONICAL_IRREPS,
+    TIED_IRREP_GAUSSIAN_PRIOR,
+    draw_standard_tied_irrep_latent,
+    effective_tied_irrep_latent,
+    fill_tied_irrep_rme,
+    normalize_tied_irrep_mode,
+    validate_tied_irrep_options,
+)
 from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 
 log = logging.getLogger(__name__)
@@ -252,6 +261,7 @@ class HamiltonianCFM:
         self.prior = str(options.get("prior", "zero")).lower().replace("-", "_")
         self._te_prior_names = {"te", "structured_te", "block_te", "te_like"}
         self._projected_te_prior_names = {"projected_te"}
+        self._tied_irrep_gaussian_prior_names = {TIED_IRREP_GAUSSIAN_PRIOR}
         self._basis_prior_names = BASIS_ONSITE_NAMES
         self._overlap_huckel_prior_names = OVERLAP_HUCKEL_NAMES
         self._haar_dm_prior_names = HAAR_DM_NAMES
@@ -263,6 +273,7 @@ class HamiltonianCFM:
             "residual_gaussian",
             *self._te_prior_names,
             *self._projected_te_prior_names,
+            *self._tied_irrep_gaussian_prior_names,
             *self._basis_prior_names,
             *self._overlap_huckel_prior_names,
             *self._haar_dm_prior_names,
@@ -272,7 +283,8 @@ class HamiltonianCFM:
         if self.prior not in allowed_priors:
             raise ValueError(
                 f"Unsupported flow_options.prior={self.prior!r}; "
-                "use 'zero', 'gaussian', 'residual_gaussian', 'te', 'projected_te', "
+                "use 'zero', 'gaussian', 'residual_gaussian', 'te', "
+                "'projected_te', 'tied_irrep_gaussian', "
                 "'basis_onsite', 'overlap_huckel', 'haar_dm', 'dftbsk', 'external', "
                 "'dftb', 'xtb', or 'physical'."
             )
@@ -306,13 +318,23 @@ class HamiltonianCFM:
                 )
             if self.uureal_block_ode and self.prior != "zero":
                 raise ValueError("uureal_block_ode requires the exact zero residual prior.")
-            # residual_ao_block_ode v2: the direct-residual mode accepts BOTH the
-            # exact zero residual prior AND the projected_te stochastic bridge
-            # (epsilon drawn in the certified codec image, no H0 added).  A
-            # projected_te selection then flows into the shared projected_te option
-            # validation below (te_prior_mode='irrep', finite positive sigmas,
-            # mandatory te_prior_validation_seed).  uureal stays zero-only above.
-            if not self.uureal_block_ode and self.prior not in {"zero", *self._projected_te_prior_names}:
+            if self.residual_ao_block_ode:
+                allowed_residual_priors = {
+                    "zero",
+                    *self._projected_te_prior_names,
+                    *self._tied_irrep_gaussian_prior_names,
+                }
+                if self.prior not in allowed_residual_priors:
+                    raise ValueError(
+                        "residual_ao_block_ode supports only prior='zero', "
+                        "prior='projected_te', or "
+                        "prior='tied_irrep_gaussian'; generic TE/Gaussian priors "
+                        "do not own the projected block start-state contract."
+                    )
+            elif (
+                not self.uureal_block_ode
+                and self.prior not in {"zero", *self._projected_te_prior_names}
+            ):
                 raise ValueError(
                     "Block-space ODE supports only prior='zero' or the explicit "
                     "prior='projected_te'; generic TE/Gaussian priors do not own "
@@ -420,10 +442,21 @@ class HamiltonianCFM:
         raw_node_sigma = options.get("node_sigma", 1.0)
         raw_edge_sigma = options.get("edge_sigma", 1.0)
         raw_te_prior_sigma = options.get("te_prior_sigma", 1.0)
+        raw_tied_irrep_sigma = options.get("tied_irrep_sigma", 1.0)
         self.node_sigma = float(raw_node_sigma)
         self.edge_sigma = float(raw_edge_sigma)
         self.residual_sigma_floor = float(options.get("residual_sigma_floor", 1.0e-6))
         self.te_prior_sigma = float(raw_te_prior_sigma)
+        self.tied_irrep_sigma = float(raw_tied_irrep_sigma)
+        self.tied_irrep_mode = normalize_tied_irrep_mode(
+            options.get("tied_irrep_mode", "")
+        )
+        self.tied_irrep_irreps = str(
+            options.get("tied_irrep_irreps", TIED_IRREP_CANONICAL_IRREPS)
+        )
+        self.tied_irrep_validation_seed = options.get(
+            "tied_irrep_validation_seed", None
+        )
         default_te_prior_mode = "block" if self.prior == "block_te" else "irrep"
         self.te_prior_mode = str(options.get("te_prior_mode", default_te_prior_mode)).lower().replace("-", "_")
         if self.te_prior_mode == "type":
@@ -432,6 +465,7 @@ class HamiltonianCFM:
             raise ValueError("flow_options.te_prior_mode must be 'irrep', 'block', or 'typewise'.")
         self.te_prior_per_graph = bool(options.get("te_prior_per_graph", True))
         self.te_prior_validation_seed = options.get("te_prior_validation_seed", None)
+        self.prior_validation_seed = self.te_prior_validation_seed
         if self.prior in self._projected_te_prior_names:
             if not self.block_ode:
                 raise ValueError("prior='projected_te' is supported only by block_ode.")
@@ -482,6 +516,73 @@ class HamiltonianCFM:
                     "projected_te block_ode requires an explicit integer "
                     f"te_prior_validation_seed in [0, {_MAX_TORCH_SEED}]."
                 )
+        if self.prior in self._tied_irrep_gaussian_prior_names:
+            if not self.residual_ao_block_ode:
+                raise ValueError(
+                    "prior='tied_irrep_gaussian' is supported only by "
+                    "residual_ao_block_ode."
+                )
+            validate_tied_irrep_options(
+                mode=options.get("tied_irrep_mode", ""),
+                irreps=self.tied_irrep_irreps,
+            )
+            scales = {
+                "node_sigma": raw_node_sigma,
+                "edge_sigma": raw_edge_sigma,
+                "tied_irrep_sigma": raw_tied_irrep_sigma,
+            }
+            invalid = [
+                name
+                for name, value in scales.items()
+                if isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ]
+            if invalid:
+                raise ValueError(
+                    "tied_irrep_gaussian requires finite positive scales; "
+                    f"invalid options={invalid}."
+                )
+            effective_scales = {
+                "node_sigma*tied_irrep_sigma": self.node_sigma
+                * self.tied_irrep_sigma,
+                "edge_sigma*tied_irrep_sigma": self.edge_sigma
+                * self.tied_irrep_sigma,
+            }
+            invalid_effective = []
+            for name, value in effective_scales.items():
+                represented = torch.tensor(value, dtype=self.dtype)
+                if (
+                    not bool(torch.isfinite(represented).item())
+                    or represented.item() == 0.0
+                ):
+                    invalid_effective.append(name)
+            if invalid_effective:
+                raise ValueError(
+                    "tied_irrep_gaussian effective scales must be finite and "
+                    f"non-zero in {self.dtype}; invalid products={invalid_effective}."
+                )
+            seed = self.tied_irrep_validation_seed
+            if (
+                isinstance(seed, bool)
+                or not isinstance(seed, Integral)
+                or seed < 0
+                or seed > _MAX_TORCH_SEED
+            ):
+                raise ValueError(
+                    "tied_irrep_gaussian requires an explicit integer "
+                    f"tied_irrep_validation_seed in [0, {_MAX_TORCH_SEED}]."
+                )
+            self.prior_validation_seed = seed
+            log.info(
+                "tied_irrep_gaussian prior enabled: mode=%s irreps=%s "
+                "effective_node_sigma=%.6g effective_edge_sigma=%.6g "
+                "latent_component_variances={L0:3,L1:2,L2:1}",
+                self.tied_irrep_mode,
+                self.tied_irrep_irreps,
+                self.node_sigma * self.tied_irrep_sigma,
+                self.edge_sigma * self.tied_irrep_sigma,
+            )
 
         # Physical prior families each own their option keys (parsed in
         # from_options).  Every family is built once so the external family can
@@ -782,7 +883,7 @@ class HamiltonianCFM:
             raise ValueError(f"Unknown validation RNG purpose={purpose!r}.")
         if isinstance(batch_index, bool) or not isinstance(batch_index, Integral) or batch_index < 0:
             raise ValueError("validation batch_index must be a non-negative integer.")
-        base = int(self.te_prior_validation_seed or 0) & _MAX_TORCH_SEED
+        base = int(self.prior_validation_seed or 0) & _MAX_TORCH_SEED
         value = (
             base
             ^ _VALIDATION_SEED_STREAMS[purpose]
@@ -1854,6 +1955,48 @@ class HamiltonianCFM:
         )
         return noise * (float(sigma) * self.te_prior_sigma)
 
+    def _tied_irrep_gaussian_prior_like(
+        self,
+        like: torch.Tensor,
+        sigma: float,
+        *,
+        data: Optional[AtomicDataDict.Type] = None,
+        label: Optional[str] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw one independent multiplicity-tied total-L field per RME row."""
+        if like.numel() == 0:
+            return torch.zeros_like(like)
+        if like.ndim < 2:
+            raise ValueError(
+                "tied_irrep_gaussian requires DeePTB RME feature rows with rank >= 2."
+            )
+        validate_tied_irrep_options(
+            mode=self.tied_irrep_mode,
+            irreps=self.tied_irrep_irreps,
+        )
+        slices = self._te_irrep_slices(like.shape[-1])
+        if slices is None:
+            raise ValueError(
+                "tied_irrep_gaussian requires idp.orbpair_irreps raw feature "
+                f"spans to match {label or 'unknown'} feature_dim={like.shape[-1]}."
+            )
+        mask = self._prior_mask(data, like, label)
+        standard_latent = draw_standard_tied_irrep_latent(
+            like.shape[0],
+            device=like.device,
+            dtype=like.dtype,
+            generator=generator,
+        )
+        effective_latent = effective_tied_irrep_latent(standard_latent)
+        return fill_tied_irrep_rme(
+            like,
+            slices,
+            mask,
+            effective_latent,
+            sigma=float(sigma) * self.tied_irrep_sigma,
+        )
+
     def _prior_like(
         self,
         residual: torch.Tensor,
@@ -2523,6 +2666,94 @@ class HamiltonianCFM:
                 )
         return eps
 
+    def _residual_tied_irrep_gaussian_eps(
+        self,
+        data: AtomicDataDict.Type,
+        node_like: torch.Tensor,
+        edge_like: torch.Tensor,
+        *,
+        generator: Optional[torch.Generator],
+        certify_image: bool,
+    ) -> BlockTensorResult:
+        """Draw the multiplicity-tied total-L residual epsilon; no H0 is added."""
+        assert self.block_codec is not None
+        prior_data = {
+            key: data[key]
+            for key in (
+                AtomicDataDict.ATOM_TYPE_KEY,
+                AtomicDataDict.EDGE_TYPE_KEY,
+                _keys.BATCH_KEY,
+                _keys.EDGE_INDEX_KEY,
+            )
+            if key in data
+        }
+        node_noise = self._tied_irrep_gaussian_prior_like(
+            torch.zeros_like(node_like),
+            self.node_sigma,
+            data=prior_data,
+            label="node",
+            generator=generator,
+        )
+        edge_noise = self._tied_irrep_gaussian_prior_like(
+            torch.zeros_like(edge_like),
+            self.edge_sigma,
+            data=prior_data,
+            label="edge",
+            generator=generator,
+        )
+        noise_blocks = self.block_codec.rme_to_blocks(
+            data, node_noise, edge_noise, project=False
+        )
+        eps = project_block_state(data, self.idp, noise_blocks)
+        if certify_image:
+            node_eps, edge_eps = self.block_codec.blocks_to_rme(
+                data,
+                eps,
+                certify_image=certify_image,
+                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+            )
+            roundtrip = self.block_codec.rme_to_blocks(
+                data, node_eps, edge_eps, project=True
+            )
+            residual = max(
+                self._max_abs(roundtrip.node_blocks - eps.node_blocks),
+                self._max_abs(roundtrip.edge_blocks - eps.edge_blocks),
+            )
+            if residual > self.block_inverse_atol:
+                raise ValueError(
+                    "tied_irrep_gaussian residual epsilon is outside the "
+                    "certified codec image: max residual="
+                    f"{residual:.6g}, atol={self.block_inverse_atol:.6g}."
+                )
+        return eps
+
+    def _residual_stochastic_eps(
+        self,
+        data: AtomicDataDict.Type,
+        node_like: torch.Tensor,
+        edge_like: torch.Tensor,
+        *,
+        generator: Optional[torch.Generator],
+        certify_image: bool,
+    ) -> BlockTensorResult:
+        if self.prior in self._projected_te_prior_names:
+            return self._residual_te_eps(
+                data,
+                node_like,
+                edge_like,
+                generator=generator,
+                certify_image=certify_image,
+            )
+        if self.prior in self._tied_irrep_gaussian_prior_names:
+            return self._residual_tied_irrep_gaussian_eps(
+                data,
+                node_like,
+                edge_like,
+                generator=generator,
+                certify_image=certify_image,
+            )
+        raise RuntimeError(f"Unsupported residual stochastic prior {self.prior!r}.")
+
     def _strict_image_certification_due(self) -> bool:
         """Schedule only the pure repack/residual image-space self-check."""
 
@@ -2737,14 +2968,14 @@ class HamiltonianCFM:
                 node_prior_blocks = None
                 edge_prior_blocks = None
             else:
-                # projected_te stochastic bridge (v2): draw eps in the certified
-                # codec image (NO H0 added), exactly as A draws its TE noise, then
+                # Stochastic residual bridge: draw eps in the certified codec
+                # image (no H0 added), then
                 # D_t = project((1 - t) * eps + t * D1).  The (1 - t) * eps term
                 # kills the deterministic D_t = t * D1 shortcut the zero prior
                 # leaves open.  prior_seed threads the same seeded-generator path A
                 # uses (None during training => fresh noise; seeded during
                 # deterministic validation).
-                eps = self._residual_te_eps(
+                eps = self._residual_stochastic_eps(
                     data,
                     node_base,
                     edge_base,
@@ -3895,10 +4126,10 @@ class HamiltonianCFM:
                 h0_blocks.edge_shapes,
             )
         else:
-            # projected_te: D0 = eps, drawn deterministically for a given seed and
+            # Stochastic residual prior: D0 = eps, drawn deterministically for a given seed and
             # certified in the codec image, matching the training boundary state
             # D_0 = project(eps) exactly.
-            current = self._residual_te_eps(
+            current = self._residual_stochastic_eps(
                 state,
                 node_base,
                 edge_base,
@@ -4018,7 +4249,7 @@ class HamiltonianCFM:
             )
         if self.residual_ao_block_ode:
             # v2: prior='zero' rejects prior_seed inside the sampler (mirroring
-            # _block_initial_state); prior='projected_te' consumes it as the
+            # _block_initial_state); stochastic residual priors consume it as the
             # deterministic D0 = eps seed.  Pass it through either way.
             return self._sample_residual_ao_block_ode(
                 model,
