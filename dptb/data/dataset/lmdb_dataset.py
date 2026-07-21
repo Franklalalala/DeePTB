@@ -76,13 +76,17 @@ register_fields(
 
 
 def _stable_shard_ordinal(shard_identity: str) -> int:
-    """Deterministic 31-bit shard ordinal for the ``__new__``/no-path-map fallback.
+    """Composition-independent 31-bit shard ordinal from a content-stable hash.
 
-    The normal constructor assigns dense 0..K-1 shard ordinals from the sorted
-    unique realpaths spanned by the dataset (see ``_shard_uid_offsets``). This
-    hash-based fallback is only reached by lightweight fixtures that bypass the
-    path-backed maps; a content hash keeps the ordinal stable across runs and
-    processes (unlike the salted builtin ``hash``).
+    A record's ``sample_uid`` packs this ordinal with the LMDB row key.  Because it
+    hashes the shard identity (its realpath) ALONE -- not the shard's position in
+    whatever set of shards a given dataset happens to load -- the same physical
+    shard maps to the same ordinal across single- vs multi-shard datasets, rank-
+    local shard subsets, and concatenations.  sha1 keeps it stable across runs and
+    worker processes (unlike the per-process-salted builtin ``hash``).  The
+    constructor detects the astronomically unlikely 31-bit collision between two
+    distinct realpaths and fails closed (see ``_shard_uid_offsets``).  The same
+    hash also serves the lightweight ``__new__``/no-path-map fixtures.
     """
     digest = hashlib.sha1(os.fsencode(shard_identity)).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
@@ -1145,17 +1149,35 @@ class LMDBDataset(AtomicDataset):
                     self._lmdb_path_map += [lmdb_path] * txn.stat()['entries']
                 db_env.close()
 
-        # Stable, batch-composition-independent shard ordinals for sample_uid.
-        # Sorting the unique shard realpaths gives a deterministic 0..K-1 map that
-        # is identical across runs and DataLoader workers, so a record's packed uid
-        # never depends on which shard happened to be enumerated first.
+        # Composition-INDEPENDENT shard identities for sample_uid.  The shard
+        # ordinal must be a function of the shard ALONE, not of which other shards
+        # happen to be co-loaded -- otherwise the same physical record's packed uid
+        # (and thus its SEEDED prior epsilon) changes when the dataset composition
+        # changes: single-shard debug vs multi-shard production, an added/removed
+        # shard, a rank-local shard subset, or a ConcatDataset.  A content-stable
+        # hash of the shard realpath (``_stable_shard_ordinal``) gives that; the
+        # dense 0..K-1 ordinal it replaces did not (a shard's position in the sorted
+        # set moved with the set).  Distinct realpaths must not alias in the 31-bit
+        # ordinal space, so a collision fails closed here rather than silently
+        # correlating two shards' per-record identities and prior noise.
         unique_shard_realpaths = sorted(
             {os.path.realpath(path) for path in self._lmdb_path_map}
         )
-        self._shard_uid_offsets = {
-            realpath: shard_id
-            for shard_id, realpath in enumerate(unique_shard_realpaths)
-        }
+        self._shard_uid_offsets = {}
+        ordinal_owner = {}
+        for realpath in unique_shard_realpaths:
+            ordinal = _stable_shard_ordinal(realpath)
+            clash = ordinal_owner.get(ordinal)
+            if clash is not None and clash != realpath:
+                raise ValueError(
+                    "sample_uid shard-ordinal collision: "
+                    f"{clash!r} and {realpath!r} both hash to the 31-bit shard "
+                    f"ordinal {ordinal}, so two distinct shards would share a "
+                    "per-record identity (and SEEDED prior substream). Rename or "
+                    "relocate one shard so their realpaths differ."
+                )
+            ordinal_owner[ordinal] = realpath
+            self._shard_uid_offsets[realpath] = ordinal
 
     def len(self):
         return self.num_graphs
@@ -1290,14 +1312,15 @@ class LMDBDataset(AtomicDataset):
         * ``row_id`` is the LMDB integer record key within its shard
           (``index_map[idx]``), i.e. the 4-byte big-endian key used to fetch the
           record, so ``0 <= row_id < 2**32``.
-        * ``shard_id`` is the shard's dense ordinal in the dataset's sorted unique
-          shard realpaths (``_shard_uid_offsets``); a sha1-based 31-bit ordinal is
-          used only for lightweight ``__new__`` fixtures without a path map.
+        * ``shard_id`` is a content-stable 31-bit hash of the shard's realpath
+          (``_stable_shard_ordinal``, cached in ``_shard_uid_offsets``) -- a
+          function of the shard ALONE, not of the dataset's shard set.
 
         The result fits in 63 bits (a positive int64). It is independent of batch
-        composition/DataLoader order and stable across runs and workers, because
-        both the shard ordinal and the row key are deterministic functions of the
-        immutable on-disk dataset.
+        composition/DataLoader order AND of which other shards are co-loaded,
+        because both the shard ordinal (a hash of the shard's own realpath) and the
+        row key are deterministic functions of the immutable on-disk record -- not
+        of the enclosing dataset's shard set.
         """
         raw_idx = int(idx)
         index_map = getattr(self, "index_map", None)

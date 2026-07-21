@@ -30,6 +30,7 @@ import torch
 from dptb.data import _keys
 from dptb.data.build import DatasetBuilder
 from dptb.data.dataset.lmdb_dataset import (
+    _stable_shard_ordinal,
     assert_residual_from_full_h_target_contract,
 )
 from dptb.data.interfaces.p2_contract import (
@@ -374,3 +375,40 @@ def test_h8_sample_uid_is_stable_per_record_and_distinct_across_records(tmp_path
     assert (v0 >> 32) == (v1 >> 32)  # same packed shard ordinal
     assert (v1 & 0xFFFFFFFF) == (v0 & 0xFFFFFFFF) + 1
     assert v0 >= 0 and v1 >= 0  # positive int64 packing
+
+
+def test_h8b_sample_uid_is_composition_independent_and_collision_free(tmp_path):
+    """H8b: a record's uid is a function of its shard's realpath + row ALONE.
+
+    Regression for the dense-ordinal scheme, under which a shard's ordinal was its
+    sorted position in whatever set of shards a dataset happened to load, so (a) the
+    same physical shard changed uid between single- and multi-shard datasets and
+    (b) two independent single-shard datasets both took ordinal 0 and aliased row N
+    to the same uid (and hence the same SEEDED prior substream).  The identity is
+    now ``(hash(realpath) << 32) | row``.
+    """
+    rec = _raw_absolute_full_h_record()
+    dir_a = tmp_path / "A"
+    dir_b = tmp_path / "B"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    # Two DISTINCT single-shard datasets, each with a record at row 0.  Under the
+    # old dense ordinal both shards were ordinal 0, so row 0 collided to uid 0.
+    ds_a = _build_two_record_dataset(dir_a, [rec], name="shard-a")
+    ds_b = _build_two_record_dataset(dir_b, [rec], name="shard-b")
+    uid_a0 = int(ds_a.get(0)[_keys.SAMPLE_UID_KEY].item())
+    uid_b0 = int(ds_b.get(0)[_keys.SAMPLE_UID_KEY].item())
+    assert uid_a0 != uid_b0                   # no cross-dataset collision ...
+    assert (uid_a0 >> 32) != (uid_b0 >> 32)   # ... because their shard ids differ
+
+    # The shard id is the content-stable hash of the shard's OWN realpath -- not a
+    # dense position (which would be 0 for a lone shard), so it is invariant to
+    # which other shards a dataset co-loads.
+    realpath_a = ds_a._resolve_shard_realpath(0)
+    assert (uid_a0 >> 32) == _stable_shard_ordinal(realpath_a)
+    assert (uid_a0 & 0xFFFFFFFF) == 0  # row 0
+
+    # Reloading the SAME physical shard reproduces the SAME uid.
+    ds_a_again = _build_two_record_dataset(dir_a, [rec], name="shard-a")
+    assert int(ds_a_again.get(0)[_keys.SAMPLE_UID_KEY].item()) == uid_a0
