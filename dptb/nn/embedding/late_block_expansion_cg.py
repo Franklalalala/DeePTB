@@ -19,13 +19,25 @@ from e3nn import o3
 
 _ANGULAR_L = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
 
-# Forward-dispatch switches (design A.7 / A.8; project decision 2026-07-20:
-# PERFORMANCE-DEFAULT).  The DEFAULT forward path inside the certified eager
-# fp32/fp64 domain is the fused grouped-einsum implementation
-# (``_forward_fused``); the reference per-path loop (``_forward_legacy``) remains
-# in-tree as the reduction-order-stable oracle and rollback path.
+# Forward-dispatch switches (design A.7 / A.8; superseded by project decision
+# 2026-07-22 P1-3: COMPATIBILITY-DEFAULT).  The DEFAULT forward path is the
+# reference per-path loop (``_forward_legacy``): fixed Python-order accumulation,
+# bit-stable with every pre-fusion (0715-refactor) checkpoint/config.  The fused
+# grouped-einsum implementation (``_forward_fused``) is an opt-in performance path
+# selected per module instance via the ``cg_head_impl`` constructor argument (the
+# config field of the same name on the ``late_block_expansion_cg`` / h_b0 output
+# route); it is never chosen implicitly.
 #
-# The explicitly accepted trade-off: the fused path REASSOCIATES the
+# History: 2026-07-20 shipped fused as the silent default -- no config flag, no
+# checkpoint metadata, rollback only via a process env var.  2026-07-22 (P1-3)
+# reverted the default to legacy because that silent flip changed the numerical
+# path under UNCHANGED config/checkpoints: an old (0715-refactor) checkpoint
+# resumed on this module took a different floating-point route with no way to
+# detect it from the checkpoint or config alone.  Reaching the old numerics now
+# requires nothing (it IS the default again); reaching fused requires an
+# explicit, config-recorded opt-in.
+#
+# The accepted trade-off when fused IS selected: it REASSOCIATES the
 # floating-point reduction (grouped batched einsums + one scatter instead of the
 # per-path accumulation), and fp addition is non-associative, so fused output
 # equals the legacy order only up to reassociation -- NOT elementwise-tight.
@@ -38,30 +50,41 @@ _ANGULAR_L = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
 # ~2-3 orders of magnitude further from truth than legacy -- see the cancellation
 # characterization test).  What holds is the weaker REASSOCIATION property: in the
 # tested non-cancellation regime both paths stay within the certified tolerance of
-# each other and of the fp64 truth.  The project accepts this reassociation-level
-# training-trajectory divergence -- the same class of nondeterminism as cudnn
-# autotune -- in exchange for a substantial head speedup (external benchmark, NOT
-# reproduced by the in-tree test suite: ~4-5x on the head, ~-3.2% wall-clock per
-# training iteration).  Runs that need bit-continuity with pre-fusion history must
-# set the rollback switch.
+# each other and of the fp64 truth.  A run that opts in to fused accepts this
+# reassociation-level training-trajectory divergence -- the same class of
+# nondeterminism as cudnn autotune -- in exchange for a substantial head speedup
+# (external benchmark, NOT reproduced by the in-tree test suite: ~4-5x on the head,
+# ~-3.2% wall-clock per training iteration).  Fresh (non-resumed) runs that do not
+# need bit-continuity with pre-fusion history are the intended fused audience.
 #
 # The certified domain is fp32/fp64 EAGER only -- autocast, low-precision input
-# dtype, and deterministic mode always fall back to legacy regardless of any
-# switch (see ``forward``).
+# dtype, and deterministic mode always fall back to legacy regardless of the
+# ``cg_head_impl`` selection or any env switch (see ``forward``).
 #
-# The rollback switch is read per forward call so production can flip it without a
-# rebuild or checkpoint change.  Only the literal string ``"1"`` activates it
-# (unset / ``"0"`` / ``"true"`` / ``""`` are ignored):
-#   * ``DPTB_LEGACY_CG_HEAD=1`` -- absolute override; forces the reference loop
-#     (bit-continuity with pre-fusion history / emergency rollback).  This is the
-#     ONLY environment switch ``forward`` reads.
-#   * ``DPTB_FUSED_CG_HEAD`` -- accepted (does not error) for compatibility with
-#     configs written against the interim fused-opt-in scheme, but it is NOT read
-#     and has NO runtime effect: fused is already the default in the certified
-#     domain, so the name is inert.  ``_FUSED_CG_HEAD_ENV`` is retained only to
-#     document that reserved name.
+# Dispatch precedence inside ``forward``, highest first:
+#   (a) ``DPTB_LEGACY_CG_HEAD=1`` -- absolute manual override; forces the
+#       reference loop (emergency rollback).  Only the literal string ``"1"``
+#       activates it (unset / ``"0"`` / ``"true"`` / ``""`` are ignored).  This is
+#       the ONLY environment switch ``forward`` reads.
+#   (b) certified-domain guard -- forces legacy under autocast, a non-fp32/64
+#       input dtype, or ``use_deterministic_algorithms(True)``, regardless of (c).
+#   (c) ``self.cg_head_impl == "fused"`` (constructor / config opt-in) -- fused.
+#   (d) DEFAULT -- legacy.
+#
+# ``DPTB_FUSED_CG_HEAD`` is accepted (does not error) for compatibility with
+# configs/scripts written against the interim env-var-opt-in scheme, but it is NOT
+# read and has NO runtime effect: the opt-in mechanism is the ``cg_head_impl``
+# config field, not an environment variable.  ``_FUSED_CG_HEAD_ENV`` is retained
+# only to document that reserved name.
 _LEGACY_CG_HEAD_ENV = "DPTB_LEGACY_CG_HEAD"
 _FUSED_CG_HEAD_ENV = "DPTB_FUSED_CG_HEAD"
+
+# ``cg_head_impl`` config/constructor choices (P1-3).  ``LEGACY`` is the default in
+# both this module's constructor and the ``argcheck`` schema, so an omitted field
+# reproduces the pre-fusion (0715-refactor) numerics unconditionally.
+_CG_HEAD_IMPL_LEGACY = "legacy"
+_CG_HEAD_IMPL_FUSED = "fused"
+_CG_HEAD_IMPL_CHOICES = (_CG_HEAD_IMPL_LEGACY, _CG_HEAD_IMPL_FUSED)
 
 
 def _shell_l(shell: str) -> int:
@@ -123,6 +146,7 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         condition: str = "scalar_0e",
         dtype: Optional[torch.dtype] = None,
         device: Optional[Union[str, torch.device]] = None,
+        cg_head_impl: str = _CG_HEAD_IMPL_LEGACY,
     ) -> None:
         super().__init__()
         self.irreps_in = o3.Irreps(irreps_in)
@@ -131,6 +155,7 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         self.rank = int(rank)
         self.dynamic_init = float(init)
         self.condition = str(condition).strip().lower()
+        self.cg_head_impl = str(cg_head_impl).strip().lower()
 
         if not self.full_basis:
             raise ValueError("full_basis must contain at least one AO shell.")
@@ -142,6 +167,11 @@ class LateBlockExpansionCGHead(torch.nn.Module):
             raise ValueError(
                 "late_block_expansion_cg supports only condition='scalar_0e', "
                 f"got {condition!r}."
+            )
+        if self.cg_head_impl not in _CG_HEAD_IMPL_CHOICES:
+            raise ValueError(
+                f"cg_head_impl must be one of {_CG_HEAD_IMPL_CHOICES}, got "
+                f"{cg_head_impl!r}."
             )
 
         factory_kwargs = {}
@@ -344,17 +374,18 @@ class LateBlockExpansionCGHead(torch.nn.Module):
                 f"{features.shape[-1]}."
             )
         # -------------------------------------------------------------------
-        # Dispatch (design A.7 / A.8; project decision: PERFORMANCE-DEFAULT).
-        # The fused grouped-einsum path is the DEFAULT inside the certified
-        # domain; the reference per-path loop remains the rollback oracle.
-        # Precedence, highest first:
+        # Dispatch (design A.7 / A.8; project decision 2026-07-22 P1-3:
+        # COMPATIBILITY-DEFAULT).  The reference per-path loop is the DEFAULT;
+        # the fused grouped-einsum path is an explicit opt-in via
+        # ``self.cg_head_impl`` (see the module-level comment for the full
+        # rationale).  Precedence, highest first:
         #
         #   (a) ``DPTB_LEGACY_CG_HEAD=1`` -> legacy.  Absolute manual override
         #       (bit-continuity with pre-fusion history / emergency rollback).
         #   (b) certified-domain guard -> legacy.  The fused reassociation is only a
         #       safe substitute in EAGER fp32/fp64 -- the only dtypes the block-ODE
         #       contract admits and production uses.  Outside that domain we ALWAYS
-        #       fall back to the per-path loop, regardless of the fused opt-in, when
+        #       fall back to the per-path loop, regardless of ``cg_head_impl``, when
         #       ANY of the following holds:
         #         * autocast is active -- under bf16/fp16 autocast the fused grouped
         #           einsums and the single scatter reduce in a DIFFERENT order than
@@ -370,13 +401,15 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         #           CUDA reduction (atomicAdd).  Under ``use_deterministic_algorithms(
         #           True)`` we route to the per-path loop, which assembles each block by
         #           explicit ``cat`` and never scatters onto shared cells.
-        #   (c) DEFAULT -> fused.  The reassociated path is the accepted production
-        #       default (external benchmark, not reproduced in-tree: ~4-5x head /
-        #       ~-3.2% iter); its output equals the legacy loop only up to fp
+        #   (c) ``self.cg_head_impl == "fused"`` -> fused.  Explicit constructor/
+        #       config opt-in (external benchmark, not reproduced in-tree: ~4-5x
+        #       head / ~-3.2% iter); its output equals the legacy loop only up to fp
         #       reassociation -- NOT elementwise-tight under cancellation, and under
         #       cancellation neither path is guaranteed closer to the fp64 truth
-        #       (see the module comment).  ``DPTB_FUSED_CG_HEAD`` is NOT read here
-        #       (fused is already the default); the name is inert.
+        #       (see the module comment).  ``DPTB_FUSED_CG_HEAD`` is NOT read here;
+        #       the name is inert (the opt-in is the config field, not an env var).
+        #   (d) DEFAULT -> legacy.  No opt-in selects fused, so ``forward`` stays
+        #       bit-stable with pre-fusion (0715-refactor) checkpoints/configs.
         # -------------------------------------------------------------------
         if os.environ.get(_LEGACY_CG_HEAD_ENV) == "1":
             return self._forward_legacy(features)
@@ -386,16 +419,20 @@ class LateBlockExpansionCGHead(torch.nn.Module):
             or torch.are_deterministic_algorithms_enabled()
         ):
             return self._forward_legacy(features)
-        return self._forward_fused(features)
+        if self.cg_head_impl == _CG_HEAD_IMPL_FUSED:
+            return self._forward_fused(features)
+        return self._forward_legacy(features)
 
     def _forward_fused(self, features: torch.Tensor) -> torch.Tensor:
         """Grouped batched-einsum forward + a single scatter (design A.2).
 
-        The PERFORMANCE-DEFAULT forward path inside the certified eager fp32/fp64
-        domain (project decision 2026-07-20); ``_forward_legacy`` is the rollback and
-        reduction-order oracle, NOT the default.  Equivalent to the legacy loop only
-        up to floating-point REASSOCIATION -- the grouped einsums + single scatter
-        reduce in a different order.  Absent cancellation the drift is pure roundoff
+        The opt-in performance path, selected via ``cg_head_impl="fused"`` inside
+        the certified eager fp32/fp64 domain (project decision 2026-07-22 P1-3
+        COMPATIBILITY-DEFAULT, superseding the 2026-07-20 PERFORMANCE-DEFAULT);
+        ``_forward_legacy`` is the DEFAULT and remains the reduction-order oracle.
+        Equivalent to the legacy loop only up to floating-point REASSOCIATION -- the
+        grouped einsums + single scatter reduce in a different order.  Absent
+        cancellation the drift is pure roundoff
         (fp64 <= ~4e-16, fp32 <= ~2e-7; design A.4); under fp32 cancellation with
         independent per-tensor scales the relative elementwise drift can exceed any
         tight rtol and NEITHER path is guaranteed closer to the fp64 truth, so this
@@ -454,10 +491,11 @@ class LateBlockExpansionCGHead(torch.nn.Module):
 
     def _forward_legacy(self, features: torch.Tensor) -> torch.Tensor:
         """Reference per-path loop -- the reduction-order-stable ORACLE the fused
-        equivalence tests compare against and the ROLLBACK path, NOT the default
-        (design A.7).  ``forward`` routes here only under ``DPTB_LEGACY_CG_HEAD=1`` or
-        outside the certified eager fp32/fp64 domain (autocast, low-precision dtype,
-        deterministic mode); the fused path is the default otherwise."""
+        equivalence tests compare against and the DEFAULT forward path (design A.7;
+        project decision 2026-07-22 P1-3 COMPATIBILITY-DEFAULT).  ``forward`` routes
+        here whenever ``DPTB_LEGACY_CG_HEAD=1`` is set, the certified eager fp32/fp64
+        domain guard fires (autocast, low-precision dtype, deterministic mode), or
+        ``cg_head_impl`` is not explicitly set to ``"fused"`` (the default)."""
         condition = features.index_select(-1, self._scalar_indices)
         invariant = torch.nn.functional.silu(self.condition_down(condition))
         dynamic_weights = self.dynamic_up(invariant)

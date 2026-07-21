@@ -105,6 +105,20 @@ def _normalize_so2_expert_mixing_mode(mode: Optional[str]) -> str:
     return mode
 
 
+def _normalize_cg_head_impl(mode: Optional[str]) -> str:
+    """P1-3: reduction-path opt-in for the h_b0 late-CG head. ``legacy`` (default)
+    reproduces the pre-fusion (0715-refactor) per-path accumulation bit-stably;
+    ``fused`` opts in to the grouped-einsum reassociation (see
+    ``late_block_expansion_cg.py`` for the full numerics discussion). Validated
+    here so a bad value fails fast at embedding construction regardless of which
+    output_route is selected -- the h_b0 head itself performs the same check."""
+    mode = mode or "legacy"
+    allowed = {"legacy", "fused"}
+    if mode not in allowed:
+        raise ValueError(f"cg_head_impl must be one of {sorted(allowed)}, got {mode!r}.")
+    return mode
+
+
 def _build_so2_post_activation_expert_mixer(
         tp: SO2_Linear,
         activation: torch.nn.Module,
@@ -939,6 +953,7 @@ class LemMoEV3(torch.nn.Module):
             ao_projector_basis_convention: str = "deeptb_real_ao",
             ao_projector_backend: str = "reference_wigner",
             ao_projector_bank_path: Optional[str] = None,
+            cg_head_impl: str = "legacy",
             res_update: bool = True,
             res_update_ratios: Optional[List[float]] = None,
             res_update_ratios_learnable: bool = False,
@@ -1061,6 +1076,7 @@ class LemMoEV3(torch.nn.Module):
         self.ao_projector_basis_convention = str(ao_projector_basis_convention)
         self.ao_projector_backend = str(ao_projector_backend)
         self.ao_projector_bank_path = ao_projector_bank_path
+        self.cg_head_impl = _normalize_cg_head_impl(cg_head_impl)
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
@@ -1081,13 +1097,14 @@ class LemMoEV3(torch.nn.Module):
         log.info(f"  - OneHot TP Mode: {self.onehot_tp_mode}")
         log.info(
             "  - Output Head: route=%s legacy_mode=%s contract=%s rank=%d "
-            "init=%g condition=%s",
+            "init=%g condition=%s cg_head_impl=%s",
             self.output_route_name,
             self.rme_head_mode,
             self.output_head_contract,
             self.rme_fusion_rank,
             self.rme_fusion_init,
             self.rme_fusion_condition,
+            self.cg_head_impl,
         )
         log.info(f"  - SO2 Expert Mixing Mode: {self.so2_expert_mixing_mode}")
         log.info(
@@ -1310,6 +1327,7 @@ class LemMoEV3(torch.nn.Module):
             ao_projector_basis_convention=self.ao_projector_basis_convention,
             ao_projector_backend=self.ao_projector_backend,
             ao_projector_bank_path=self.ao_projector_bank_path,
+            cg_head_impl=self.cg_head_impl,
             dtype=self.dtype,
             device=self.device,
         )

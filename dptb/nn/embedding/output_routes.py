@@ -85,6 +85,11 @@ class OutputHeadContext:
     ao_projector_bank_path: Optional[str]
     dtype: torch.dtype
     device: Union[str, torch.device]
+    # P1-3: reduction-path opt-in for the h_b0 late-CG head
+    # (``late_block_expansion_cg.LateBlockExpansionCGHead``).  Defaulted so
+    # existing direct ``OutputHeadContext(...)`` construction (other routes,
+    # tests) keeps working unchanged; only ``_factory_h_b0`` reads it.
+    cg_head_impl: str = "legacy"
 
 
 _ROUTE_SPECS: Dict[str, OutputRouteSpec] = {
@@ -565,6 +570,9 @@ def _factory_h_b0(ctx: OutputHeadContext):
     from .late_block_expansion_cg import LateBlockExpansionCGHead
 
     kwargs = _common_kwargs(ctx)
+    # P1-3: only the h_b0 head has a legacy/fused reduction-path choice; keep this
+    # local to this factory so no other route's head constructor sees the kwarg.
+    kwargs["cg_head_impl"] = ctx.cg_head_impl
     return (
         LateBlockExpansionCGHead(ctx.final_irreps, ctx.full_basis, symmetrize=False, **kwargs),
         LateBlockExpansionCGHead(ctx.final_irreps, ctx.full_basis, symmetrize=True, **kwargs),
