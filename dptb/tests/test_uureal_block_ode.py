@@ -567,8 +567,12 @@ def test_directed_compatible_metric_coexists_with_canonical_and_matches_hand_red
     directed_onsite = hand_metric(node_diff, node_valid)
     directed_hopping = hand_metric(edge_diff, edge_valid)
 
-    torch.testing.assert_close(state["train_onsite_loss"], canonical_onsite, rtol=1e-6, atol=1e-7)
-    torch.testing.assert_close(state["train_hopping_loss"], canonical_hopping, rtol=1e-6, atol=1e-7)
+    # Canonical flow-endpoint metric lives under the flow namespace (FINDING E: it is
+    # no longer aliased into the bare compatible train_onsite_loss/train_hopping_loss).
+    torch.testing.assert_close(state["train_flow_onsite_loss"], canonical_onsite, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(state["train_flow_hopping_loss"], canonical_hopping, rtol=1e-6, atol=1e-7)
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
     torch.testing.assert_close(
         state["train_compatible_directed_onsite_loss"], directed_onsite, rtol=1e-6, atol=1e-7
     )

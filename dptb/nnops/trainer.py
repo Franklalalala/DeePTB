@@ -731,7 +731,11 @@ class Trainer(BaseTrainer):
                 if self.flow_cfm.enabled:
                     original_batch = batch.copy()
                     validation_prior_seed = (
-                        self.flow_cfm.validation_seed(num_batches, "prior")
+                        # Batch-index-INDEPENDENT prior base seed: the per-uid
+                        # substream already decorrelates graphs, so the base seed
+                        # must not vary with the batch position (see
+                        # flow.validation_prior_base_seed).
+                        self.flow_cfm.validation_prior_base_seed()
                         if getattr(self.flow_cfm, "prior", "zero") == "projected_te"
                         else None
                     )

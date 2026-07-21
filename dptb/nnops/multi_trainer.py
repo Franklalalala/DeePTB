@@ -2731,19 +2731,24 @@ class MultiTrainer(Trainer):
 
     def _gather_display_window_expert_metrics(self) -> List[torch.Tensor]:
         local_steps = max(float(self._display_window_pack_local[self._P_STEP_COUNT].item()), 1.0)
-        # Divide the onsite/hopping expert sums by their OWN fired-step counts so a
-        # throttled step (which added 0 to the sum) does not dilute the mean.  At
-        # interval=1 every step fires => fired count == local_steps, byte-identical
-        # to the previous sum/local_steps.  clamp_min(1.0) mirrors local_steps'
-        # max(..., 1.0) floor for an all-throttled/empty window.  grad_norm, lr and
-        # the raw active_nodes/active_edges telemetry keep the plain step-count mean.
-        onsite_steps = self._display_window_expert_onsite_steps_local.clamp_min(1.0)
-        hopping_steps = self._display_window_expert_hopping_steps_local.clamp_min(1.0)
-
+        # Gather RAW per-rank onsite/hopping sums AND their fired-step counts -- NOT
+        # the pre-divided rank-local means.  _flush_display_window then pools them
+        # per expert as Σsum / Σfired across the DP ranks that share that expert (a
+        # fired-count-weighted global mean).  Averaging already-divided rank means
+        # (the previous behavior) silently discards the fired-count weight, so when
+        # one expert spans several DP ranks with UNEQUAL fired counts -- different
+        # data shards, e.g. a rank whose local batch had no edge in the distance
+        # range -- the displayed onsite/hopping was the wrong equal-rank average.
+        # For the common one-rank-per-expert case the pool is over a single rank, so
+        # it equals the old rank-local mean and is byte-identical.  lr and the
+        # active_nodes/active_edges telemetry keep their previous per-rank means.
+        #   layout: [onsite_sum, onsite_fired, hopping_sum, hopping_fired, lr,
+        #            active_nodes_mean, active_edges_mean]
         local_metric = torch.stack([
-            self._display_window_expert_onsite_sum_local / onsite_steps,
-            self._display_window_expert_hopping_sum_local / hopping_steps,
-            self._display_window_pack_local[self._P_GRAD_NORM_SUM] / local_steps,
+            self._display_window_expert_onsite_sum_local,
+            self._display_window_expert_onsite_steps_local,
+            self._display_window_expert_hopping_sum_local,
+            self._display_window_expert_hopping_steps_local,
             torch.tensor(float(self._display_window_last_lr_local), dtype=self.dtype, device=self.device),
             self._display_window_expert_active_nodes_sum_local / local_steps,
             self._display_window_expert_active_edges_sum_local / local_steps,
@@ -2755,6 +2760,36 @@ class MultiTrainer(Trainer):
         gathered = [torch.zeros_like(local_metric) for _ in range(self.world_size)]
         self._all_gather_(gathered, local_metric, name="dist/all_gather(display_window_expert_metrics)")
         return gathered
+
+    def _expert_display_metrics_from_gathered(self, gathered: List[torch.Tensor]) -> Dict[str, float]:
+        """Per-expert display onsite/hopping/lr/active from the gathered rank vectors.
+
+        Groups the per-rank vectors (layout: see
+        :meth:`_gather_display_window_expert_metrics`) by expert and, for each
+        expert, POOLS the raw onsite/hopping sums over its DP ranks and divides by
+        the pooled fired-step count -- a fired-count-weighted global mean, NOT an
+        equal-weight average of rank-local means (which loses the weight when the
+        expert's ranks have unequal fired counts).  lr and the active_nodes/
+        active_edges telemetry keep their per-rank mean.  One rank per expert makes
+        the pool a single term, so it is byte-identical to the previous mean.
+        """
+        expert_metrics: Dict[int, List[torch.Tensor]] = {}
+        for rank_idx, vec in enumerate(gathered):
+            expert_metrics.setdefault(self._rank_to_expert_idx(rank_idx), []).append(vec)
+
+        out: Dict[str, float] = {}
+        for expert_idx in range(self.num_experts):
+            vecs = expert_metrics.get(expert_idx, [])
+            if not vecs:
+                continue
+            stacked = torch.stack(vecs)
+            col_sum = stacked.sum(dim=0)
+            out[f"expert_{expert_idx}_onsite"] = float((col_sum[0] / col_sum[1].clamp_min(1.0)).item())
+            out[f"expert_{expert_idx}_hopping"] = float((col_sum[2] / col_sum[3].clamp_min(1.0)).item())
+            out[f"expert_{expert_idx}_lr"] = float(stacked[:, 4].mean().item())
+            out[f"expert_{expert_idx}_active_nodes"] = float(stacked[:, 5].mean().item())
+            out[f"expert_{expert_idx}_active_edges"] = float(stacked[:, 6].mean().item())
+        return out
 
     def _flush_display_window(self, time_idx: int) -> Optional[Dict[str, Any]]:
         if not self._has_pending_display_window():
@@ -2808,7 +2843,7 @@ class MultiTrainer(Trainer):
         )
         total_grad_norm_mean = reduced_pack[self._P_GRAD_NORM_SUM] / reduced_pack[self._P_STEP_COUNT].clamp_min(1.0)
 
-        avg_lr = sum(float(vec[3].item()) for vec in gathered) / max(len(gathered), 1)
+        avg_lr = sum(float(vec[4].item()) for vec in gathered) / max(len(gathered), 1)
 
         state = {
             'field': 'iteration',
@@ -2821,22 +2856,7 @@ class MultiTrainer(Trainer):
             "train_hopping_loss": float(train_hopping_show.item()),
         }
 
-        expert_metrics: Dict[int, List[torch.Tensor]] = {}
-        for rank_idx, vec in enumerate(gathered):
-            expert_idx = self._rank_to_expert_idx(rank_idx)
-            expert_metrics.setdefault(expert_idx, []).append(vec)
-
-        for expert_idx in range(self.num_experts):
-            vecs = expert_metrics.get(expert_idx, [])
-            if not vecs:
-                continue
-            stacked = torch.stack(vecs)
-            mean_vec = stacked.mean(dim=0)
-            state[f"expert_{expert_idx}_onsite"] = float(mean_vec[0].item())
-            state[f"expert_{expert_idx}_hopping"] = float(mean_vec[1].item())
-            state[f"expert_{expert_idx}_lr"] = float(mean_vec[3].item())
-            state[f"expert_{expert_idx}_active_nodes"] = float(mean_vec[4].item())
-            state[f"expert_{expert_idx}_active_edges"] = float(mean_vec[5].item())
+        state.update(self._expert_display_metrics_from_gathered(gathered))
 
         if float(reduced_pack[self._P_CV_CNT].item()) > 0.0:
             state["expert_load_cv"] = float((reduced_pack[self._P_CV_SUM] / reduced_pack[self._P_CV_CNT]).item())
@@ -3840,6 +3860,21 @@ class MultiTrainer(Trainer):
         with torch.no_grad():
             total_loss = torch.scalar_tensor(0., dtype=self.dtype, device=self.device)
             validation_metric_sums: Dict[str, Any] = {}
+            # Per-key valid-batch counts (mirrors Trainer.validation): a metric that
+            # is None/omitted on a batch -- a throttled feature-compatible
+            # onsite/hopping, an empty distance range -- must contribute to NEITHER
+            # its numerator NOR its own denominator, instead of being diluted by a
+            # flat ``/num_batches``.  Every accumulation routes through ``_accumulate``
+            # so the count stays in lock-step with the sum; at interval=1 each key is
+            # present every batch (count == num_batches) so the reported value is
+            # byte-identical to the previous ``/num_batches``.
+            validation_metric_counts: Dict[str, Any] = {}
+
+            def _accumulate(state):
+                self._accumulate_metric_state(
+                    validation_metric_sums, state, validation_metric_counts
+                )
+
             num_batches = 0
             self.model.eval()
             generator = getattr(self, "validation_loader_generator", None)
@@ -3852,7 +3887,11 @@ class MultiTrainer(Trainer):
 
                 flow_euler_validation = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
                 validation_prior_seed = (
-                    self.flow_cfm.validation_seed(num_batches, "prior")
+                    # Batch-index-INDEPENDENT prior base seed (see
+                    # flow.validation_prior_base_seed): the per-uid substream
+                    # already decorrelates graphs, so re-batching/resharding the
+                    # validation loader must not change a record's prior.
+                    self.flow_cfm.validation_prior_base_seed()
                     if flow_euler_validation
                     and getattr(self.flow_cfm, "prior", "zero") == "projected_te"
                     else None
@@ -3887,7 +3926,7 @@ class MultiTrainer(Trainer):
                                 self.validation_lossfunc,
                                 num_steps=int(num_steps),
                             )
-                            self._accumulate_metric_state(validation_metric_sums, state)
+                            _accumulate(state)
                             if loss_i is None:
                                 loss_i = state.get(
                                     "validation_loss",
@@ -3921,13 +3960,12 @@ class MultiTrainer(Trainer):
                         if loss_i is None:
                             loss_i = reduced_pack[self._P_LOSS_OPT_SUM].detach() / max(self.world_size, 1)
 
-                        self._accumulate_metric_state(
-                            validation_metric_sums,
+                        _accumulate(
                             self._pack_component_state(
                                 reduced_pack,
                                 prefix="validation",
                                 criterion=self.validation_lossfunc,
-                            ),
+                            )
                         )
 
                 else:
@@ -3951,7 +3989,7 @@ class MultiTrainer(Trainer):
                                 self.validation_lossfunc,
                                 num_steps=int(num_steps),
                             )
-                            self._accumulate_metric_state(validation_metric_sums, state)
+                            _accumulate(state)
                             if loss_i is None:
                                 loss_i = state.get(
                                     "validation_loss",
@@ -3995,44 +4033,40 @@ class MultiTrainer(Trainer):
                                 loss_i = local_pack[self._P_LOSS_OPT_SUM].detach() / local_pack[
                                     self._P_STEP_COUNT
                                 ].clamp_min(1.0)
-                                self._accumulate_metric_state(
-                                    validation_metric_sums,
+                                _accumulate(
                                     self._pack_component_state(
                                         local_pack,
                                         prefix="validation",
                                         criterion=self.validation_lossfunc,
-                                    ),
+                                    )
                                 )
                             else:
                                 with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
                                     loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
                                     fallback_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
-                                    self._accumulate_metric_state(
-                                        validation_metric_sums,
+                                    _accumulate(
                                         {
                                             "validation_onsite_loss": fallback_metrics["onsite"],
                                             "validation_hopping_loss": fallback_metrics["hopping"],
-                                        },
+                                        }
                                     )
                         else:
-                            self._accumulate_metric_state(
-                                validation_metric_sums,
+                            _accumulate(
                                 self._pack_component_state(
                                     local_pack,
                                     prefix="validation",
                                     criterion=self.validation_lossfunc,
-                                ),
+                                )
                             )
                     else:
                         with self._tagger.tag("validation/full_forward_stitched", it=self.iter):
                             loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
                         full_metrics = self._snapshot_loss_metrics(self.validation_lossfunc)
-                        self._accumulate_metric_state(
-                            validation_metric_sums,
+                        _accumulate(
                             {
                                 "validation_onsite_loss": full_metrics["onsite"],
                                 "validation_hopping_loss": full_metrics["hopping"],
-                            },
+                            }
                         )
 
                 total_loss = total_loss + loss_i.detach()
@@ -4043,9 +4077,12 @@ class MultiTrainer(Trainer):
 
         if not fast:
             total_loss = total_loss / len(self.validation_loader)
-        divisor = max(num_batches, 1)
+        # Each key by its OWN contributing-batch count (fallback to num_batches for
+        # any key not routed through _accumulate); a throttled/omitted metric thus
+        # dilutes neither the numerator nor the denominator.
         self._last_flow_validation_state = {
-            key: value / divisor for key, value in validation_metric_sums.items()
+            key: value / max(validation_metric_counts.get(key, num_batches), 1)
+            for key, value in validation_metric_sums.items()
         }
 
         return total_loss

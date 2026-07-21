@@ -815,6 +815,27 @@ class HamiltonianCFM:
         value = (value * 0x94D049BB133111EB) & _MAX_TORCH_SEED
         return (value ^ (value >> 31)) & _MAX_TORCH_SEED
 
+    def validation_prior_base_seed(self) -> int:
+        """Batch-index-INDEPENDENT base seed for SEEDED validation prior draws.
+
+        The per-(sample_uid, node|edge) substream (see
+        :meth:`_prior_uid_substream_seed`) already gives every graph an epsilon
+        that is invariant to batch composition, order, and sharding.  The prior
+        base seed the validation caller threads into that substream must therefore
+        NOT depend on the batch position -- otherwise a record's epsilon changes
+        when it moves between validation batches (a smaller batch size, a
+        resharded/reordered loader, an inserted record), re-introducing exactly
+        the batch-composition dependence the substream was built to remove.
+
+        :meth:`validation_seed` deliberately mixes ``batch_index`` into its output
+        (so successive draws decorrelate); this canonicalises the prior stream at
+        the fixed point ``batch_index == 0``, so the base seed is a pure function
+        of ``te_prior_validation_seed`` and the ``"prior"`` stream tag alone.  The
+        time stream (``validation_seed(..., "time")``) is a separate axis and is
+        intentionally left batch-indexed.
+        """
+        return self.validation_seed(0, "prior")
+
     @staticmethod
     def _seeded_generator(device: torch.device, seed: Optional[int]) -> Optional[torch.Generator]:
         if seed is None:
@@ -3533,13 +3554,19 @@ class HamiltonianCFM:
             ((node_stats, self.node_weight), (edge_stats, self.edge_weight))
         )
 
+        # NOTE: the flow objective publishes its endpoint node/edge metric ONLY under
+        # the flow namespace (train_flow_onsite_loss/train_flow_hopping_loss).  It does
+        # NOT alias it into the bare train_onsite_loss/train_hopping_loss: those legacy
+        # tags carry feature-compatible semantics and are written solely by the
+        # compatible pass (Trainer._compatible_loss_state*, legacy_prefix), so the two
+        # namespaces never mix under one tag.  (Previously the flow value was aliased
+        # here; the compatible pass then overwrote it every step, but if that pass were
+        # ever throttled/absent the flow value would leak under the compatible tag.)
         state: Dict[str, torch.Tensor] = {
             "train_flow_t": ctx.t.detach().mean(),
             "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
             "train_flow_onsite_loss": node_component.detach(),
             "train_flow_hopping_loss": edge_component.detach(),
-            "train_onsite_loss": node_component.detach(),
-            "train_hopping_loss": edge_component.detach(),
             "block_ode_target_projection_residual": torch.as_tensor(
                 target_residual, device=total.device, dtype=total.dtype
             ),
@@ -3551,7 +3578,7 @@ class HamiltonianCFM:
         if self.uureal_block_ode:
             # Historical-comparison metric (review P1-5).  Two deliberately
             # coexisting reductions:
-            #   * canonical (`train_*_loss` above): each independent physical
+            #   * canonical (`train_flow_*_loss` above): each independent physical
             #     freedom counted ONCE -- onsite upper triangle plus one
             #     canonical edge per Hermitian (i,j,R)/(j,i,-R) pair;
             #   * compatible_directed (`train_compatible_directed_*`): every
@@ -3821,9 +3848,9 @@ class HamiltonianCFM:
                     self._compatible_clean_stats(node_diff, mask, "onsite")
                 )
             component_stats.append((node_stats, self.node_weight))
-            node_loss_detached = node_loss.detach()
-            state["train_flow_onsite_loss"] = node_loss_detached
-            state["train_onsite_loss"] = node_loss_detached
+            # Flow namespace only; the bare train_onsite_loss is compatible-only (see
+            # the block-ODE endpoint loss note above).
+            state["train_flow_onsite_loss"] = node_loss.detach()
 
         if ctx.edge_target is not None and self.edge_target_key in pred_data:
             pred = pred_data[self.edge_target_key]
@@ -3841,9 +3868,8 @@ class HamiltonianCFM:
                     self._compatible_clean_stats(edge_diff, mask, "hopping")
                 )
             component_stats.append((edge_stats, self.edge_weight))
-            edge_loss_detached = edge_loss.detach()
-            state["train_flow_hopping_loss"] = edge_loss_detached
-            state["train_hopping_loss"] = edge_loss_detached
+            # Flow namespace only; the bare train_hopping_loss is compatible-only.
+            state["train_flow_hopping_loss"] = edge_loss.detach()
 
         if not component_stats:
             raise KeyError(

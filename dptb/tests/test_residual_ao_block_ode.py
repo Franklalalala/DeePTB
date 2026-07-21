@@ -1887,6 +1887,54 @@ def test_h3_seeded_draw_is_batch_composition_invariant_per_uid():
         )
 
 
+def test_h3b_validation_prior_base_seed_is_batch_index_independent():
+    """H3b: the validation caller's prior base seed does NOT depend on batch position.
+
+    H3 proves a uid's epsilon is invariant to batch composition *given a fixed base
+    seed*.  This pins the other half of the contract -- the base seed the real
+    ``Trainer.validation()`` / ``MultiTrainer.validation()`` loops thread into that
+    substream -- to ``validation_prior_base_seed()``, which is a pure function of
+    ``te_prior_validation_seed`` and independent of the running batch index.  The two
+    together give per-record replay across re-batching/resharding.  Regression for the
+    prior caller that used ``validation_seed(num_batches, "prior")`` (batch-indexed).
+    """
+    mapper = _mapper()
+    flow = _b_te_flow(mapper)
+    data_a, h0_a, _ = _b_record(mapper, seed=0)
+    node_base, _ = flow.block_codec.blocks_to_rme(copy.deepcopy(data_a), h0_a)
+    dim = int(node_base.shape[-1])
+    device = node_base.device
+    t_h = mapper.chemical_symbol_to_type["H"]
+    t_c = mapper.chemical_symbol_to_type["C"]
+
+    # The base seed is constant and independent of any batch index ...
+    base = flow.validation_prior_base_seed()
+    assert base == flow.validation_prior_base_seed()
+    # ... whereas validation_seed() itself IS batch-indexed (the old caller's bug).
+    assert base != flow.validation_seed(1, "prior")
+    assert base != flow.validation_seed(7, "prior")
+    assert flow.validation_seed(1, "prior") != flow.validation_seed(7, "prior")
+
+    # Threading the constant base seed through the real substream path reproduces a
+    # uid's rows no matter which validation batch position it lands in.
+    draw_new_a = _node_te_draw(flow, dim, types=[t_h, t_c], batch=[0, 0], uids=[42], seed=base, device=device)
+    draw_new_b = _node_te_draw(flow, dim, types=[t_h, t_c], batch=[0, 0], uids=[42], seed=base, device=device)
+    assert torch.equal(draw_new_a, draw_new_b)
+    assert torch.count_nonzero(draw_new_a) > 0
+
+    # Contrast: had the caller kept mixing the batch index into the base seed, the
+    # SAME record would have been redrawn when it moved between validation batches.
+    old_pos0 = _node_te_draw(
+        flow, dim, types=[t_h, t_c], batch=[0, 0], uids=[42],
+        seed=flow.validation_seed(0, "prior"), device=device,
+    )
+    old_pos1 = _node_te_draw(
+        flow, dim, types=[t_h, t_c], batch=[0, 0], uids=[42],
+        seed=flow.validation_seed(1, "prior"), device=device,
+    )
+    assert not torch.equal(old_pos0, old_pos1)
+
+
 def test_h4_seeded_multi_graph_determinism_and_global_rng_isolation():
     """H4: two same-seed draws of a 2-graph batch are byte-identical and the global
     torch RNG is untouched (the per-uid substreams use private generators)."""

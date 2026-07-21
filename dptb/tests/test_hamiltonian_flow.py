@@ -307,11 +307,17 @@ def test_global_element_reduction_does_not_equal_weight_node_and_edge_components
     assert loss.item() == pytest.approx(7.0)
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
-    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    # FINDING E: the flow endpoint metric is published under the flow namespace
+    # ONLY; the bare train_onsite_loss/train_hopping_loss compatible tags are written
+    # solely by the downstream compatible pass (forced on when flow is enabled), so
+    # the raw flow state never aliases the flow value into them.  TB compatibility is
+    # preserved by that pass, which emits the tags with the comparable compatible
+    # value (see commit "Restore CFM TensorBoard compatibility").
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
 
 
-def test_cfm_writes_default_legacy_train_tags_and_router_stats():
+def test_cfm_writes_flow_namespace_tags_and_router_stats():
     flow = HamiltonianCFM(
         {
             "enabled": True,
@@ -332,8 +338,10 @@ def test_cfm_writes_default_legacy_train_tags_and_router_stats():
 
     assert state["train_flow_onsite_loss"].item() == pytest.approx(1.0)
     assert state["train_flow_hopping_loss"].item() == pytest.approx(9.0)
-    assert state["train_onsite_loss"].item() == pytest.approx(1.0)
-    assert state["train_hopping_loss"].item() == pytest.approx(9.0)
+    # FINDING E: flow-namespace only; the bare compatible tags are compatible-pass-
+    # owned (not aliased from the flow value here).  Router stats still ride along.
+    assert "train_onsite_loss" not in state
+    assert "train_hopping_loss" not in state
     assert state["mean_max_prob"].item() == pytest.approx(0.75)
     assert state["expert_load_cv"].item() == pytest.approx(0.25)
 
@@ -1417,7 +1425,10 @@ def test_display_window_component_tags_use_compatible_stats_semantics():
     trainer._gather_cuda_memory_metrics = lambda: {}
     trainer._all_reduce_ = lambda tensor, name=None: tensor
     trainer._gather_display_window_expert_metrics = lambda: [
-        torch.tensor([99.0, 77.0, 0.0, 0.1, 1.0, 1.0])
+        # new gathered layout: [onsite_sum, onsite_fired, hopping_sum, hopping_fired,
+        # lr, active_nodes_mean, active_edges_mean]; deliberately conflicting expert
+        # values, which must NOT reach the compatible-stats train_onsite/hopping tags.
+        torch.tensor([99.0, 1.0, 77.0, 1.0, 0.1, 1.0, 1.0])
     ]
     trainer._rank_to_expert_idx = lambda rank_idx: 0
     trainer._add_optimizer_diagnostics_to_state = lambda state: None
@@ -1449,7 +1460,10 @@ def test_display_window_component_tags_ignore_legacy_reduce_flag():
     trainer._gather_cuda_memory_metrics = lambda: {}
     trainer._all_reduce_ = lambda tensor, name=None: tensor
     trainer._gather_display_window_expert_metrics = lambda: [
-        torch.tensor([99.0, 77.0, 0.0, 0.1, 1.0, 1.0])
+        # new gathered layout: [onsite_sum, onsite_fired, hopping_sum, hopping_fired,
+        # lr, active_nodes_mean, active_edges_mean]; deliberately conflicting expert
+        # values, which must NOT reach the compatible-stats train_onsite/hopping tags.
+        torch.tensor([99.0, 1.0, 77.0, 1.0, 0.1, 1.0, 1.0])
     ]
     trainer._rank_to_expert_idx = lambda rank_idx: 0
     trainer._add_optimizer_diagnostics_to_state = lambda state: None

@@ -17,6 +17,9 @@ never KeyError a consumer and no carry-forward is needed.
 
 from __future__ import annotations
 
+import contextlib
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -518,6 +521,54 @@ def test_h10_interval_one_twin_is_byte_identical_to_uniform_divisor():
 
 
 # ===========================================================================
+# H10b: the SAME per-key-count fix, now on MultiTrainer.validation (FINDING C /
+# review F2).  MultiTrainer.validation divided every accumulated metric by a
+# UNIFORM num_batches and never threaded a per-key count, so a metric omitted on
+# some batches was diluted (the standard Trainer was fixed by H10; this was not).
+# Drives the real validation() loop (non-distributed full-forward path) over a
+# 2-batch loader whose second batch omits onsite/hopping.
+# ===========================================================================
+class _NullTagger:
+    def tag(self, *args, **kwargs):
+        return contextlib.nullcontext()
+
+
+def test_h10b_multitrainer_validation_per_key_count_not_diluted(monkeypatch):
+    """MultiTrainer.validation twin of H10: onsite present on 1 of 2 batches must
+    report 2.0 (divided by its OWN contributing-batch count), not 1.0 (value /
+    num_batches).  Exercises the real validation() accumulation + divisor."""
+    mt = _minimal_multitrainer()
+    mt.model = SimpleNamespace(eval=lambda: None)
+    mt.validation_loader = [object(), object()]  # two batches
+    mt.validation_loader_generator = None
+    mt.distributed_expert = False
+    mt.flow_cfm = None
+    mt.log_single_model_compatible_loss = False
+    mt.iter = 0
+    mt._tagger = _NullTagger()
+    mt.validation_lossfunc = object()
+
+    monkeypatch.setattr(
+        mt, "_prepare_batch_bundle", lambda batch, with_lengths=True: (None, None)
+    )
+    monkeypatch.setattr(
+        mt, "_run_full_batch_loss", lambda *a, **k: torch.zeros((), dtype=mt.dtype)
+    )
+    snapshots = iter([
+        {"onsite": torch.tensor(2.0, dtype=mt.dtype), "hopping": torch.tensor(2.0, dtype=mt.dtype)},
+        {"onsite": None, "hopping": None},  # throttled/omitted this batch
+    ])
+    monkeypatch.setattr(mt, "_snapshot_loss_metrics", lambda crit: next(snapshots))
+
+    mt.validation(fast=False)
+
+    state = mt._last_flow_validation_state
+    # Un-diluted: divided by its own count (1 firing batch), not num_batches (2).
+    assert state["validation_onsite_loss"].item() == pytest.approx(2.0)
+    assert state["validation_hopping_loss"].item() == pytest.approx(2.0)
+
+
+# ===========================================================================
 # H11: MultiTrainer per-expert display metric + fired-step window (P2
 # multi_trainer.py).  Same FINDING B mechanism, now on the expert-display seam:
 # the per-expert onsite/hopping ratio and the display-window average must use the
@@ -613,15 +664,74 @@ def test_h11_display_window_expert_metric_averages_only_over_fired_steps():
     mt._update_display_window_local(_single_expert_payload(mt, 2.0), current_local_lr=1e-3)
     mt._update_display_window_local(_single_expert_payload(mt, None), current_local_lr=1e-3)
 
-    onsite, hopping, _grad, _lr, active_nodes, active_edges = (
+    onsite_sum, onsite_fired, hopping_sum, hopping_fired, lr, active_nodes, active_edges = (
         mt._gather_display_window_expert_metrics()[0]
     )
-    # Averaged over fired steps (1), not the 2 window steps.
-    assert onsite.item() == pytest.approx(2.0)
-    assert hopping.item() == pytest.approx(2.0)
+    # Gathered layout now carries RAW sums + fired counts (the per-expert merge does
+    # Σsum/Σfired downstream); the single-rank pooled mean is still 2, averaged over
+    # the fired step (1), not the 2 window steps.
+    assert (onsite_sum / onsite_fired.clamp_min(1.0)).item() == pytest.approx(2.0)
+    assert (hopping_sum / hopping_fired.clamp_min(1.0)).item() == pytest.approx(2.0)
+    assert onsite_fired.item() == pytest.approx(1.0)
+    assert hopping_fired.item() == pytest.approx(1.0)
     # fired-step counters recorded exactly one contributing step per metric.
     assert mt._display_window_expert_onsite_steps_local.item() == pytest.approx(1.0)
     assert mt._display_window_expert_hopping_steps_local.item() == pytest.approx(1.0)
     # raw active telemetry: mean over BOTH window steps (unchanged by throttling).
     assert active_nodes.item() == pytest.approx(_ACTIVE_NODES)
     assert active_edges.item() == pytest.approx(_ACTIVE_EDGES)
+
+
+def test_h11b_expert_display_pools_fired_counts_across_dp_ranks():
+    """Two DP ranks mapped to the SAME expert with UNEQUAL fired counts: the merged
+    onsite/hopping must be the pooled Σsum/Σfired (fired-count-weighted global mean),
+    NOT the equal-weight average of the two rank-local means (FINDING D / review F3).
+
+    rank0: onsite_sum=10, fired=1  (rank-local mean 10)
+    rank1: onsite_sum=9,  fired=9  (rank-local mean 1)
+    pooled = (10+9)/(1+9) = 1.9    (average of rank means would be the wrong 5.5)
+    """
+    mt = _minimal_multitrainer()
+    mt.num_experts = 1
+    mt._rank_to_expert_idx = lambda rank: 0  # both ranks -> expert 0
+
+    def _vec(onsite_sum, onsite_fired, hopping_sum, hopping_fired, lr, an, ae):
+        return torch.tensor(
+            [onsite_sum, onsite_fired, hopping_sum, hopping_fired, lr, an, ae],
+            dtype=mt.dtype,
+        )
+
+    gathered = [
+        _vec(10.0, 1.0, 3.0, 1.0, 1e-3, 4.0, 6.0),
+        _vec(9.0, 9.0, 27.0, 9.0, 1e-3, 4.0, 6.0),
+    ]
+    merged = mt._expert_display_metrics_from_gathered(gathered)
+
+    assert merged["expert_0_onsite"] == pytest.approx((10.0 + 9.0) / (1.0 + 9.0))    # 1.9
+    assert merged["expert_0_hopping"] == pytest.approx((3.0 + 27.0) / (1.0 + 9.0))   # 3.0
+    # The old equal-weight average of rank-local means would have been 5.5 (wrong).
+    assert merged["expert_0_onsite"] != pytest.approx((10.0 / 1.0 + 9.0 / 9.0) / 2)
+    # lr and active telemetry keep the per-rank mean.
+    assert merged["expert_0_lr"] == pytest.approx(1e-3)
+    assert merged["expert_0_active_nodes"] == pytest.approx(4.0)
+    assert merged["expert_0_active_edges"] == pytest.approx(6.0)
+
+
+def test_h11c_payload_metrics_never_source_onsite_from_flow_namespace():
+    """FINDING E: the compatible onsite/hopping payload must come from the compatible
+    metric, never the flow-namespaced train_flow_* value.  Since the flow objective no
+    longer aliases its value into the bare train_onsite_loss, a flow-only state must
+    not report the flow value as the compatible onsite/hopping -- the namespaces are
+    disjoint (in a real run the forced compatible pass supplies the compatible value)."""
+    mt = _minimal_multitrainer()
+    flow_only = {
+        "train_flow_onsite_loss": torch.tensor(7.0, dtype=mt.dtype),
+        "train_flow_hopping_loss": torch.tensor(9.0, dtype=mt.dtype),
+        # no train_compatible_*, no bare train_onsite_loss, no _compatible_clean_stats
+    }
+    metrics = mt._payload_metrics_from_flow_state(flow_only, prefix="train")
+    # Not the flow value; falls back to the neutral default, not train_flow_*.
+    assert metrics["onsite"].item() != pytest.approx(7.0)
+    assert metrics["hopping"].item() != pytest.approx(9.0)
+    assert metrics["onsite"].item() == pytest.approx(0.0)
+    assert metrics["hopping"].item() == pytest.approx(0.0)
