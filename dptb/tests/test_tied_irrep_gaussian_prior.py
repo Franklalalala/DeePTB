@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from e3nn import o3
 
 from dptb.data import _keys
 from dptb.data.interfaces.blockwise_tensor import (
@@ -25,9 +26,12 @@ from dptb.utils.argcheck import flow_options, validate_block_ode_contract
 from test_residual_ao_block_ode import (  # noqa: E402
     FP64_ATOL,
     _EndpointSpy,
+    _LinearEchoModel,
     _b_flow,
     _b_record,
     _mapper,
+    _rotate_canvas_blocks,
+    _shared_canvas_wigner_d,
     _water_graph,
     _water_mapper,
 )
@@ -474,6 +478,109 @@ def test_tied_prior_eps_satisfies_physical_projection_and_codec_contract():
     )
     torch.testing.assert_close(roundtrip.node_blocks, eps.node_blocks, rtol=0.0, atol=FP64_ATOL)
     torch.testing.assert_close(roundtrip.edge_blocks, eps.edge_blocks, rtol=0.0, atol=FP64_ATOL)
+
+
+def _certified_tied_latent(flow, data, h0, seed=_TIED_SEED):
+    """A valid transformable latent: the seeded tied_irrep_gaussian eps (codec-image).
+
+    Mirrors ``test_residual_ao_block_ode._certified_latent`` with
+    ``flow._residual_te_eps`` swapped for ``flow._residual_tied_irrep_gaussian_eps``
+    -- the two share an identical signature (PR#31 review section 3a/3d), so
+    this is otherwise a verbatim copy.
+    """
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+    return flow._residual_tied_irrep_gaussian_eps(
+        copy.deepcopy(data),
+        node_base,
+        edge_base,
+        generator=flow._seeded_generator(node_base.device, seed),
+        certify_image=True,
+    )
+
+
+def test_h1_tied_irrep_prior_state_is_pathwise_equivariant_while_seeded_is_layout_replay():
+    """PR#31 review P1-2: no SO(3) rotation-equivariance test existed for
+    ``tied_irrep_gaussian``, despite the ready-to-reuse pathwise-equivariance
+    harness ``test_residual_ao_block_ode.py`` built for the sibling
+    ``projected_te`` prior.  This is that harness ported near-verbatim (only
+    the flow builder and the eps-drawing call change), closing the gap: the
+    explicit ``prior_state`` latent IS pathwise equivariant under simultaneous
+    input rotation, while the SEEDED per-uid draw is only layout-replay (same
+    numeric draw regardless of structure orientation, since it is keyed by
+    ``sample_uid`` rather than by geometry) -- exactly the contrast the
+    projected_te version documents, now verified for a tied-irrep-sourced
+    latent too instead of resting on code-reading alone (review section 2c).
+    """
+    mapper = _mapper()
+    flow = _b_tied_flow(mapper)  # fp64 tied_irrep_gaussian B-mode flow
+    data, h0, _d1 = _b_record(mapper)
+    eps = _certified_tied_latent(flow, data, h0)
+
+    base = flow.sample(
+        _LinearEchoModel(0.7),
+        copy.deepcopy(data),
+        num_steps=1,
+        prior_state=BlockTensorResult(
+            eps.node_blocks.clone(), eps.edge_blocks.clone(), eps.node_shapes, eps.edge_shapes
+        ),
+    )
+    base_node = base[_keys.NODE_PRED_HAMIL_BLOCKS_KEY].clone()
+    base_edge = base[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY].clone()
+
+    # e3nn's D_from_matrix routes angle intermediates through the default dtype, so
+    # fp64 covariance requires a fp64 default (mirrors the section-1 covariance tests).
+    previous_default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        torch.manual_seed(0)
+        rotation = o3.rand_matrix(dtype=torch.float64)  # proper SO(3)
+        d_ao = _shared_canvas_wigner_d(rotation)
+
+        rotated = copy.deepcopy(data)
+        rotated["pos"] = data["pos"] @ rotation.transpose(-1, -2)
+        rotated[_keys.NODE_H0_BLOCKS_KEY] = _rotate_canvas_blocks(h0.node_blocks, d_ao)
+        rotated[_keys.EDGE_H0_BLOCKS_KEY] = _rotate_canvas_blocks(h0.edge_blocks, d_ao)
+        rotated_latent = BlockTensorResult(
+            _rotate_canvas_blocks(eps.node_blocks, d_ao),
+            _rotate_canvas_blocks(eps.edge_blocks, d_ao),
+            eps.node_shapes,
+            eps.edge_shapes,
+        )
+
+        rot = flow.sample(
+            _LinearEchoModel(0.7), copy.deepcopy(rotated), num_steps=1, prior_state=rotated_latent
+        )
+
+        atol = flow.block_inverse_atol * 10.0
+        torch.testing.assert_close(
+            rot[_keys.NODE_PRED_HAMIL_BLOCKS_KEY],
+            _rotate_canvas_blocks(base_node, d_ao),
+            rtol=0.0,
+            atol=atol,
+        )
+        torch.testing.assert_close(
+            rot[_keys.EDGE_PRED_HAMIL_BLOCKS_KEY],
+            _rotate_canvas_blocks(base_edge, d_ao),
+            rtol=0.0,
+            atol=atol,
+        )
+
+        # CONTRAST: seeded draws are layout-replay only -- the per-uid eps is the
+        # SAME block draw for x and R.x (same shapes, same sample_uid), so it is NOT
+        # rotated with the input and the seeded output breaks pathwise covariance.
+        seed_base = flow.sample(
+            _LinearEchoModel(0.7), copy.deepcopy(data), num_steps=1, prior_seed=_TIED_SEED
+        )
+        seed_rot = flow.sample(
+            _LinearEchoModel(0.7), copy.deepcopy(rotated), num_steps=1, prior_seed=_TIED_SEED
+        )
+        assert not torch.allclose(
+            seed_rot[_keys.NODE_PRED_HAMIL_BLOCKS_KEY],
+            _rotate_canvas_blocks(seed_base[_keys.NODE_PRED_HAMIL_BLOCKS_KEY], d_ao),
+            atol=1e-6,
+        )
+    finally:
+        torch.set_default_dtype(previous_default)
 
 
 def test_tied_prior_constructor_rejects_unsupported_contracts():
