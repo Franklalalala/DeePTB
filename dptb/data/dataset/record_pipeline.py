@@ -257,7 +257,11 @@ class RecordSchemaValidator:
             )
         if getattr(dataset, "require_residual_from_full_h_target", False):
             _host.assert_residual_from_full_h_target_contract(
-                data_dict, h0_key=dataset.h0_key
+                data_dict,
+                h0_key=dataset.h0_key,
+                expected_physical_h0_source_fingerprint=getattr(
+                    dataset, "expected_physical_h0_source_fingerprint", None
+                ),
             )
         if getattr(dataset, "require_uureal_block_ode", False):
             self._validate_uureal_block_ode(dataset, data_dict)

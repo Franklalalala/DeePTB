@@ -30,12 +30,18 @@ import torch
 from dptb.data import _keys
 from dptb.data.build import DatasetBuilder
 from dptb.data.dataset.lmdb_dataset import (
+    _shard_content_fingerprint,
     _stable_shard_ordinal,
+    assert_absolute_full_h_target_contract,
     assert_residual_from_full_h_target_contract,
 )
 from dptb.data.interfaces.p2_contract import (
     ABSOLUTE_FULL_H_SEMANTICS,
+    DEDICATED_PHYSICAL_H0_SOURCE,
+    PHYSICAL_H0_SOURCE_FINGERPRINT_KEY,
+    PHYSICAL_H0_SOURCE_KEY,
     RAW_HAMILTONIAN_SAMPLE_SCHEMA,
+    RAW_PHYSICAL_H0_SOURCE,
     SAMPLE_SCHEMA_KEY,
     TARGET_SEMANTICS_KEY,
     TARGET_SOURCE_KEY,
@@ -378,14 +384,16 @@ def test_h8_sample_uid_is_stable_per_record_and_distinct_across_records(tmp_path
 
 
 def test_h8b_sample_uid_is_composition_independent_and_collision_free(tmp_path):
-    """H8b: a record's uid is a function of its shard's realpath + row ALONE.
+    """H8b: a record's uid is a function of its shard's CONTENT + row ALONE.
 
     Regression for the dense-ordinal scheme, under which a shard's ordinal was its
     sorted position in whatever set of shards a dataset happened to load, so (a) the
     same physical shard changed uid between single- and multi-shard datasets and
     (b) two independent single-shard datasets both took ordinal 0 and aliased row N
     to the same uid (and hence the same SEEDED prior substream).  The identity is
-    now ``(hash(realpath) << 32) | row``.
+    now ``(hash(content fingerprint) << 32) | row`` (P2-2: content-anchored, not
+    path-anchored, so relocating a byte-identical shard no longer changes uid --
+    see ``test_sample_uid_content_fingerprint.py`` for that regression).
     """
     rec = _raw_absolute_full_h_record()
     dir_a = tmp_path / "A"
@@ -395,20 +403,164 @@ def test_h8b_sample_uid_is_composition_independent_and_collision_free(tmp_path):
 
     # Two DISTINCT single-shard datasets, each with a record at row 0.  Under the
     # old dense ordinal both shards were ordinal 0, so row 0 collided to uid 0.
+    # Their basenames ("shard-a.lmdb"/"shard-b.lmdb") differ, so they remain
+    # distinct shards under content-anchored fingerprinting too.
     ds_a = _build_two_record_dataset(dir_a, [rec], name="shard-a")
     ds_b = _build_two_record_dataset(dir_b, [rec], name="shard-b")
+
+    # Compute the independently-expected ordinal (and resolve the realpath)
+    # BEFORE any .get() call: reading a record caches an open lmdb env handle
+    # for the shard's path on the dataset for its lifetime, and
+    # _shard_content_fingerprint opens that SAME path again to read the first
+    # record -- lmdb refuses to open a path twice in one process, so this must
+    # run first.
+    realpath_a = ds_a._resolve_shard_realpath(0)
+    expected_shard_id_a = _stable_shard_ordinal(_shard_content_fingerprint(realpath_a))
+
     uid_a0 = int(ds_a.get(0)[_keys.SAMPLE_UID_KEY].item())
     uid_b0 = int(ds_b.get(0)[_keys.SAMPLE_UID_KEY].item())
     assert uid_a0 != uid_b0                   # no cross-dataset collision ...
     assert (uid_a0 >> 32) != (uid_b0 >> 32)   # ... because their shard ids differ
 
-    # The shard id is the content-stable hash of the shard's OWN realpath -- not a
-    # dense position (which would be 0 for a lone shard), so it is invariant to
-    # which other shards a dataset co-loads.
-    realpath_a = ds_a._resolve_shard_realpath(0)
-    assert (uid_a0 >> 32) == _stable_shard_ordinal(realpath_a)
+    # The shard id is the content-stable hash of the shard's OWN content
+    # fingerprint (basename + entry count + first record) -- not a dense
+    # position (which would be 0 for a lone shard) and not a hash of the
+    # realpath string itself -- so it is invariant to which other shards a
+    # dataset co-loads AND to the shard's on-disk location.
+    assert (uid_a0 >> 32) == expected_shard_id_a
     assert (uid_a0 & 0xFFFFFFFF) == 0  # row 0
 
-    # Reloading the SAME physical shard reproduces the SAME uid.
+    # Reloading the SAME physical shard reproduces the SAME uid. ds_a.get(0)
+    # above cached an open read env for "A/shard-a.lmdb" on ds_a for its
+    # lifetime (LMDBDataset._get_lmdb_env); py-lmdb refuses a second
+    # Environment.open() on that same path while it is still open in this
+    # process, so release it before _build_two_record_dataset reopens the
+    # path for a write (same cleanup __del__ would eventually do).
+    for env in ds_a._lmdb_env_cache.values():
+        env.close()
+    ds_a._lmdb_env_cache.clear()
     ds_a_again = _build_two_record_dataset(dir_a, [rec], name="shard-a")
     assert int(ds_a_again.get(0)[_keys.SAMPLE_UID_KEY].item()) == uid_a0
+
+
+# ===========================================================================
+# H9: physical-H0 authority/fingerprint contract parity (P2-3).  The ordinary
+# Full-H route (assert_absolute_full_h_target_contract with require_h0=True,
+# wired from record_pipeline.py whenever require_full_h_target=True and
+# get_H0=True) and the residual-from-Full-H route
+# (assert_residual_from_full_h_target_contract) consume the SAME raw
+# absolute_full_h records, so they must agree on whether a record's
+# physical_h0_source/physical_h0_source_fingerprint authority declaration is
+# self-consistent. Before this fix, only the Full-H route ran
+# assert_physical_h0_authority_contract; a record claiming
+# physical_h0_source=dedicated_h0_blocks (contradicting the schema-fixed raw
+# authority RAW_HAMILTONIAN_SAMPLE_SCHEMA always has) was rejected on the
+# Full-H route but silently accepted by the residual route, which subtracted
+# raw hamiltonian_0 anyway -- the same record's provenance was
+# self-contradictory depending only on which route loaded it.
+#
+# The "ordinary Full-H route" comparator below calls
+# assert_absolute_full_h_target_contract directly (the exact function
+# record_pipeline.py invokes for require_full_h_target=True records) rather
+# than going through a full require_full_h_target=True dataset: a record
+# declaring physical_h0_source=dedicated_h0_blocks ALSO trips
+# record_pipeline.py's separate, schema-agnostic
+# _assert_dedicated_physical_h0_dataset_fingerprint pre-check (production
+# dataset-level dedicated-H0-content auditing, unrelated to this fix) before
+# reaching assert_absolute_full_h_target_contract, which would fail the SAME
+# record for a DIFFERENT reason (an unconfigured
+# expected_physical_h0_source_fingerprint) and obscure exactly which contract
+# is under test here.
+# ===========================================================================
+def _raw_record_with_dedicated_h0_source(*, fingerprint=None) -> dict:
+    """A raw absolute_full_h record that ALSO declares dedicated physical-H0
+    authority -- contradictory for RAW_HAMILTONIAN_SAMPLE_SCHEMA, whose
+    authority is fixed to raw_hamiltonian_0 regardless of what it claims."""
+    record = _raw_absolute_full_h_record()
+    record[PHYSICAL_H0_SOURCE_KEY] = DEDICATED_PHYSICAL_H0_SOURCE
+    if fingerprint is not None:
+        record[PHYSICAL_H0_SOURCE_FINGERPRINT_KEY] = fingerprint
+    return record
+
+
+def test_h9_residual_route_matches_full_h_route_and_rejects_too(tmp_path):
+    """The bug repro: residual-from-Full-H must fail closed on the SAME
+    contradictory record the ordinary Full-H route rejects (fingerprint
+    missing), instead of silently subtracting raw hamiltonian_0 under a
+    provenance claim the record itself contradicts."""
+    dataset = _build_dataset(
+        tmp_path,
+        _raw_record_with_dedicated_h0_source(),
+        name="h9-residual-repro",
+        residual_hamiltonian=True,
+        require_residual_from_full_h_target=True,
+    )
+    with pytest.raises(ValueError, match="authority"):
+        dataset.get(0)
+
+
+def test_h9_residual_route_rejects_dedicated_source_with_wrong_fingerprint(tmp_path):
+    """Same repro, but with an explicit (arbitrary/wrong) fingerprint present
+    rather than missing -- still contradictory for a raw-schema record (whose
+    authority is fixed to raw, not dedicated, regardless of fingerprint), and
+    still must fail closed on the residual route."""
+    dataset = _build_dataset(
+        tmp_path,
+        _raw_record_with_dedicated_h0_source(fingerprint="0" * 64),
+        name="h9-residual-wrong-fingerprint",
+        residual_hamiltonian=True,
+        require_residual_from_full_h_target=True,
+    )
+    with pytest.raises(ValueError, match="authority"):
+        dataset.get(0)
+
+
+def test_h9_contract_fn_direct_call_rejects_dedicated_source():
+    """Direct unit call: assert_residual_from_full_h_target_contract itself
+    raises on the masquerading authority declaration, naming 'authority'."""
+    with pytest.raises(ValueError, match="authority"):
+        assert_residual_from_full_h_target_contract(
+            _raw_record_with_dedicated_h0_source()
+        )
+    # ... and the contract it now delegates to raises the identical way.
+    with pytest.raises(ValueError, match="authority"):
+        assert_absolute_full_h_target_contract(
+            _raw_record_with_dedicated_h0_source(), require_h0=True
+        )
+
+
+@pytest.mark.parametrize(
+    "physical_h0_source", [None, RAW_PHYSICAL_H0_SOURCE],
+    ids=["unset", "explicit-raw"],
+)
+def test_h9_residual_route_does_not_misfire_on_legitimate_raw_authority(
+    tmp_path, physical_h0_source
+):
+    """No false positive: a genuine raw record either omitting
+    physical_h0_source (the common case) or explicitly declaring it as the
+    schema-fixed raw_hamiltonian_0 authority still loads and materializes the
+    residual target exactly as before (node [1, 1], edge [.5, .5])."""
+    record = _raw_absolute_full_h_record()
+    if physical_h0_source is not None:
+        record[PHYSICAL_H0_SOURCE_KEY] = physical_h0_source
+
+    dataset = _build_dataset(
+        tmp_path,
+        record,
+        name=f"h9-legit-{physical_h0_source or 'unset'}",
+        residual_hamiltonian=True,
+        require_residual_from_full_h_target=True,
+    )
+    sample = dataset.get(0)
+    torch.testing.assert_close(
+        sample[_keys.NODE_DELTA_HAMIL_BLOCKS_KEY].flatten(), torch.tensor([1.0, 1.0])
+    )
+    torch.testing.assert_close(
+        sample[_keys.EDGE_DELTA_HAMIL_BLOCKS_KEY].flatten(), torch.tensor([0.5, 0.5])
+    )
+
+
+def test_h9_contract_fn_direct_call_accepts_legitimate_raw_record():
+    """Direct unit call: the clean fixture (no physical_h0_source declared)
+    passes the contract, including the new authority check, without raising."""
+    assert_residual_from_full_h_target_contract(_raw_absolute_full_h_record())

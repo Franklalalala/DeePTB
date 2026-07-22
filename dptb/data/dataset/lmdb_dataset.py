@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Tuple, Dict, Any, List, Callable, Union, Optional, Mapping
+from typing import Tuple, Dict, Any, List, Callable, Union, Optional, Mapping, Iterable
 
 import torch
 from dptb.utils.tools import download_url, extract_zip
@@ -75,21 +75,125 @@ register_fields(
 )
 
 
+def _shard_content_fingerprint(lmdb_path: str) -> str:
+    """Hex-digest fingerprint of an LMDB shard's *content*, independent of its path.
+
+    Feeds ``_stable_shard_ordinal`` for real on-disk shards so a record's
+    ``sample_uid`` (and any SEEDED prior epsilon derived from it) is a function of
+    what a shard contains, never of where it happens to be mounted.  Opens the env
+    read-only and reads exactly one record, so this stays O(1) regardless of shard
+    size. The digest is sha1 over three components, each closing a distinct
+    collision mode:
+
+    * the shard's basename -- disambiguates two otherwise-different datasets whose
+      remaining components coincide, most importantly two *empty* shards (0
+      entries): with no first record to read, the entry-count and first-record
+      components below are both trivially empty for ANY empty shard, so the
+      basename is what keeps two unrelated empty shards from aliasing.
+    * the total entry count (``txn.stat()['entries']``) -- a whole-shard content
+      summary that changes whenever records are added, removed, or the shard is
+      regenerated, obtained without a full scan.
+    * the first record's raw key bytes, plus the sha1 digest of its raw (still
+      pickled) value bytes -- anchors the fingerprint to actual on-disk content,
+      not merely size, while reading only the single first cursor entry.
+
+    Two byte-identical copies of the same shard directory living at different
+    filesystem paths (different container mount, node, restored archive, working
+    directory, ...) but keeping the same directory name hash to the SAME
+    fingerprint here -- that aliasing is intentional, it is what makes
+    ``sample_uid`` (and validation's seeded prior epsilon) reproducible across
+    where the data happens to live.
+    """
+    db_env = lmdb.open(
+        lmdb_path, readonly=True, lock=False, readahead=False, max_readers=2048
+    )
+    try:
+        with db_env.begin(buffers=True) as txn:
+            entries = int(txn.stat()["entries"])
+            first_key = b""
+            first_value_digest = b""
+            cursor = txn.cursor()
+            if cursor.first():
+                first_key = bytes(cursor.key())
+                first_value_digest = hashlib.sha1(bytes(cursor.value())).digest()
+    finally:
+        db_env.close()
+
+    basename = os.path.basename(os.path.normpath(lmdb_path))
+    hasher = hashlib.sha1()
+    for component in (
+        os.fsencode(basename),
+        str(entries).encode("ascii"),
+        first_key,
+        first_value_digest,
+    ):
+        # Length-prefix each component so e.g. an entry count and a first key
+        # cannot shift bytes across the boundary between fields and coincide
+        # with a different (basename, entries, key, value) tuple.
+        hasher.update(len(component).to_bytes(8, "big"))
+        hasher.update(component)
+    return hasher.hexdigest()
+
+
 def _stable_shard_ordinal(shard_identity: str) -> int:
     """Composition-independent 31-bit shard ordinal from a content-stable hash.
 
-    A record's ``sample_uid`` packs this ordinal with the LMDB row key.  Because it
-    hashes the shard identity (its realpath) ALONE -- not the shard's position in
-    whatever set of shards a given dataset happens to load -- the same physical
-    shard maps to the same ordinal across single- vs multi-shard datasets, rank-
-    local shard subsets, and concatenations.  sha1 keeps it stable across runs and
-    worker processes (unlike the per-process-salted builtin ``hash``).  The
-    constructor detects the astronomically unlikely 31-bit collision between two
-    distinct realpaths and fails closed (see ``_shard_uid_offsets``).  The same
-    hash also serves the lightweight ``__new__``/no-path-map fixtures.
+    A record's ``sample_uid`` packs this ordinal with the LMDB row key.  For real
+    on-disk shards the caller passes ``_shard_content_fingerprint(realpath)`` --
+    NOT the realpath itself -- so the ordinal is a function of the shard's
+    content ALONE: not its on-disk path, and not its position in whatever set of
+    shards a given dataset happens to load.  The same physical (byte-identical)
+    shard therefore maps to the same ordinal across single- vs multi-shard
+    datasets, rank-local shard subsets, concatenations, AND relocations (a
+    different mount point, container, restored archive, or working directory).
+    sha1 keeps it stable across runs and worker processes (unlike the per-
+    process-salted builtin ``hash``). The constructor detects the astronomically
+    unlikely 31-bit collision between two distinct fingerprints -- including the
+    non-astronomically-unlikely case of the SAME content genuinely mounted twice
+    under the dataset's shard set -- and fails closed (see ``_shard_uid_offsets``).
+    The same hash also serves the lightweight ``__new__``/no-path-map fixtures,
+    which pass an opaque logical identity string directly (no real shard to open
+    and fingerprint).
     """
     digest = hashlib.sha1(os.fsencode(shard_identity)).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def _build_shard_uid_offsets(shard_realpaths: Iterable[str]) -> Dict[str, int]:
+    """Map each unique shard realpath to its content-anchored 31-bit ordinal.
+
+    Extracted out of ``LMDBDataset.__init__`` (which calls this with the
+    deduplicated realpaths of every shard the dataset loaded) so the
+    collision-detection behavior is directly unit-testable without
+    constructing a full dataset. Two DISTINCT realpaths whose CONTENT
+    fingerprints coincide -- most notably the pathological case of the same
+    physical shard mounted twice under a dataset's roots, but also the
+    astronomically unlikely 31-bit truncation collision between two
+    genuinely different shards -- fail closed rather than silently letting
+    two shards share a per-record identity (and SEEDED prior substream).
+    """
+    offsets: Dict[str, int] = {}
+    ordinal_owner: Dict[int, str] = {}
+    for realpath in sorted(set(shard_realpaths)):
+        fingerprint = _shard_content_fingerprint(realpath)
+        ordinal = _stable_shard_ordinal(fingerprint)
+        clash = ordinal_owner.get(ordinal)
+        if clash is not None and clash != realpath:
+            raise ValueError(
+                "sample_uid shard-ordinal collision: "
+                f"{clash!r} and {realpath!r} have the same content "
+                f"fingerprint (basename + entry count + first record), both "
+                f"hashing to the 31-bit shard ordinal {ordinal}, so two "
+                "shards would share a per-record identity (and SEEDED prior "
+                "substream). If this is the same physical shard mounted "
+                "twice under this dataset's roots, remove the duplicate "
+                "path; if these are genuinely different shards that "
+                "coincidentally share a basename, entry count, and first "
+                "record, rename one so its basename differs."
+            )
+        ordinal_owner[ordinal] = realpath
+        offsets[realpath] = ordinal
+    return offsets
 
 
 def _parse_lmdb_block_key(key: Any):
@@ -438,6 +542,7 @@ def assert_residual_from_full_h_target_contract(
     data_dict: Dict[str, Any],
     *,
     h0_key: str = "hamiltonian_0",
+    expected_physical_h0_source_fingerprint: Optional[str] = None,
 ) -> None:
     """Require an absolute-Full-H raw record whose residual dH is materialized online.
 
@@ -450,6 +555,20 @@ def assert_residual_from_full_h_target_contract(
     semantics and would therefore reject these absolute_full_h records; the new
     opt-in gate certifies the absolute-Full-H declaration instead while still
     forbidding any prepacked/ambiguous target.
+
+    Also runs :func:`assert_physical_h0_authority_contract` -- the SAME
+    physical_h0_source/physical_h0_source_fingerprint authority check the
+    ordinary Full-H route (``assert_absolute_full_h_target_contract`` with
+    ``require_h0=True``) runs on this schema.  Without it, a record that
+    declares ``physical_h0_source=dedicated_h0_blocks`` (with a missing or
+    wrong fingerprint) would be rejected on the Full-H route -- raw-schema
+    records fix physical-H0 authority to ``raw_hamiltonian_0`` -- but silently
+    accepted here, subtracting the raw ``hamiltonian_0`` dict anyway: the same
+    record's provenance would be self-contradictory depending only on which
+    route loaded it. ``h0_key`` is already validated to be a non-empty raw
+    dict above, and ``schema`` to be ``RAW_HAMILTONIAN_SAMPLE_SCHEMA``, by the
+    time this runs, so it exercises exactly the ``source in {None,
+    RAW_PHYSICAL_H0_SOURCE}`` branch for a genuine raw record.
     """
 
     # Converter/compact provenance markers must be rejected HERE, at the loader,
@@ -514,6 +633,18 @@ def assert_residual_from_full_h_target_contract(
             "residual-from-Full-H supervision requires a non-empty physical-H0 "
             f"block dictionary at {h0_key!r}."
         )
+
+    # Same physical-H0 authority/fingerprint contract the ordinary Full-H route
+    # enforces (see docstring): fails closed on a raw-schema record that
+    # contradicts its fixed raw_hamiltonian_0 authority (e.g. declares
+    # physical_h0_source=dedicated_h0_blocks) instead of silently subtracting
+    # raw_hamiltonian_0 under a mismatched provenance claim.
+    assert_physical_h0_authority_contract(
+        data_dict,
+        schema=schema,
+        h0_key=h0_key,
+        expected_source_fingerprint=expected_physical_h0_source_fingerprint,
+    )
 
     assert_residual_target_source_is_raw(data_dict)
     prepacked_full_h = [
@@ -1270,35 +1401,27 @@ class LMDBDataset(AtomicDataset):
                     self._lmdb_path_map += [lmdb_path] * txn.stat()['entries']
                 db_env.close()
 
-        # Composition-INDEPENDENT shard identities for sample_uid.  The shard
-        # ordinal must be a function of the shard ALONE, not of which other shards
-        # happen to be co-loaded -- otherwise the same physical record's packed uid
-        # (and thus its SEEDED prior epsilon) changes when the dataset composition
-        # changes: single-shard debug vs multi-shard production, an added/removed
-        # shard, a rank-local shard subset, or a ConcatDataset.  A content-stable
-        # hash of the shard realpath (``_stable_shard_ordinal``) gives that; the
-        # dense 0..K-1 ordinal it replaces did not (a shard's position in the sorted
-        # set moved with the set).  Distinct realpaths must not alias in the 31-bit
-        # ordinal space, so a collision fails closed here rather than silently
+        # Composition-INDEPENDENT AND path-INDEPENDENT shard identities for
+        # sample_uid.  The shard ordinal must be a function of the shard's
+        # CONTENT alone -- not of which other shards happen to be co-loaded, and
+        # not of the shard's on-disk path -- otherwise the same physical record's
+        # packed uid (and thus its SEEDED prior epsilon) changes when the dataset
+        # composition changes (single-shard debug vs multi-shard production, an
+        # added/removed shard, a rank-local shard subset, a ConcatDataset) OR when
+        # the byte-identical LMDB is simply relocated (container/multi-node mount,
+        # archive restore, a different working directory).  A content-stable
+        # fingerprint of the shard (``_shard_content_fingerprint``, hashed down by
+        # ``_stable_shard_ordinal``) gives that; hashing the realpath itself does
+        # not (it is stable across composition but not across relocation), and the
+        # dense 0..K-1 ordinal it originally replaced gave neither (a shard's
+        # position in the sorted set moved with the set).  Two shards whose content
+        # fingerprints collide -- including the pathological case of the SAME
+        # content genuinely mounted twice under this dataset's roots -- fail
+        # closed (see ``_build_shard_uid_offsets``) rather than silently
         # correlating two shards' per-record identities and prior noise.
-        unique_shard_realpaths = sorted(
-            {os.path.realpath(path) for path in self._lmdb_path_map}
+        self._shard_uid_offsets = _build_shard_uid_offsets(
+            os.path.realpath(path) for path in self._lmdb_path_map
         )
-        self._shard_uid_offsets = {}
-        ordinal_owner = {}
-        for realpath in unique_shard_realpaths:
-            ordinal = _stable_shard_ordinal(realpath)
-            clash = ordinal_owner.get(ordinal)
-            if clash is not None and clash != realpath:
-                raise ValueError(
-                    "sample_uid shard-ordinal collision: "
-                    f"{clash!r} and {realpath!r} both hash to the 31-bit shard "
-                    f"ordinal {ordinal}, so two distinct shards would share a "
-                    "per-record identity (and SEEDED prior substream). Rename or "
-                    "relocate one shard so their realpaths differ."
-                )
-            ordinal_owner[ordinal] = realpath
-            self._shard_uid_offsets[realpath] = ordinal
 
     def len(self):
         return self.num_graphs
@@ -1436,15 +1559,19 @@ class LMDBDataset(AtomicDataset):
         * ``row_id`` is the LMDB integer record key within its shard
           (``index_map[idx]``), i.e. the 4-byte big-endian key used to fetch the
           record, so ``0 <= row_id < 2**32``.
-        * ``shard_id`` is a content-stable 31-bit hash of the shard's realpath
-          (``_stable_shard_ordinal``, cached in ``_shard_uid_offsets``) -- a
-          function of the shard ALONE, not of the dataset's shard set.
+        * ``shard_id`` is a content-stable 31-bit hash of the shard's CONTENT
+          fingerprint (``_shard_content_fingerprint`` + ``_stable_shard_ordinal``,
+          cached in ``_shard_uid_offsets`` keyed by realpath for O(1) lookup) -- a
+          function of what the shard contains, not of its on-disk path nor of the
+          dataset's shard set.
 
         The result fits in 63 bits (a positive int64). It is independent of batch
-        composition/DataLoader order AND of which other shards are co-loaded,
-        because both the shard ordinal (a hash of the shard's own realpath) and the
-        row key are deterministic functions of the immutable on-disk record -- not
-        of the enclosing dataset's shard set.
+        composition/DataLoader order, of which other shards are co-loaded, AND of
+        the shard's on-disk location (relocating a byte-identical LMDB does not
+        change its records' uids), because the shard ordinal is a hash of the
+        shard's own content and the row key is a deterministic function of the
+        immutable on-disk record -- neither depends on the enclosing dataset's
+        shard set or mount path.
         """
         raw_idx = int(idx)
         index_map = getattr(self, "index_map", None)
@@ -1457,6 +1584,11 @@ class LMDBDataset(AtomicDataset):
         if shard_realpath in offsets:
             shard_id = int(offsets[shard_realpath])
         else:
+            # No precomputed offset: only reachable from lightweight ``__new__``
+            # fixtures with no real ``_shard_uid_offsets`` map (see
+            # ``_resolve_shard_realpath``), where ``shard_realpath`` is an opaque
+            # logical identity string, not an openable LMDB path -- hash it
+            # directly rather than attempting to fingerprint non-existent content.
             shard_id = _stable_shard_ordinal(shard_realpath)
         return ((shard_id & 0x7FFFFFFF) << 32) | (row_id & 0xFFFFFFFF)
 
