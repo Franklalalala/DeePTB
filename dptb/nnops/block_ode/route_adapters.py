@@ -55,31 +55,133 @@ from typing import Any
 import torch
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.data.interfaces.blockwise_tensor import (
+    BlockTensorResult,
+    attach_prediction_block_tensors,
+    infer_block_shapes,
+    mapper_max_norb,
+)
+from dptb.nnops.block_flow_codec import project_block_state
+from dptb.nnops.block_ode.rollout import RolloutContext
 
 
 class FullHRouteAdapter:
     """Adapter for the generic full-H block-ODE route (``output_space='ao_block_ode'``).
 
     Has no route-specific data-contract check today (generic ``block_ode`` never
-    grew one), so this class carries only the owner back-reference for now.
+    grew one).
 
-    PR5b/PR5c will add: the full-H per-step state-write-in (RME carried under
+    PR5b (this PR) added the full-H rollout slivers: the initial state
+    (``_block_initial_state``), the per-step state-write-in (RME carried under
     ``node_h0_key``/``edge_h0_key``), the endpoint decode that runs
     ``block_codec.endpoint_to_full(...)`` before blending (unique to this route),
-    the full-H initial state, and this route's ``prepare_batch`` branch.
+    and the final-state assembly. PR5c will add this route's ``prepare_batch``
+    branch.
     """
 
     def __init__(self, owner: Any) -> None:
         self._owner = owner
 
+    # -- rollout slivers (PR5b) ------------------------------------------
+    def initial_state(self, owner: Any, state: AtomicDataDict.Type, *, prior_seed, prior_state):
+        """Draw the full A-mode start state B0 = H0 + eps and freeze the context.
+
+        ``prior_state`` is not accepted by this route (``sample()`` rejects a
+        non-None ``prior_state`` before dispatch); it is threaded through for a
+        uniform adapter signature and ignored here.
+        """
+        if owner.block_codec is None:
+            raise RuntimeError("Block-space ODE codec was not constructed.")
+        topology_sidecar = owner._snapshot_block_topology(state)
+        owner._restore_block_topology(state, topology_sidecar)
+        h0_blocks, _ = owner._physical_h0_blocks(state)
+        accumulator_dtype = owner.dtype
+        h0_blocks = BlockTensorResult(
+            h0_blocks.node_blocks.to(dtype=accumulator_dtype),
+            h0_blocks.edge_blocks.to(dtype=accumulator_dtype),
+            h0_blocks.node_shapes,
+            h0_blocks.edge_shapes,
+        )
+        block_current, _, _ = owner._block_initial_state(
+            state, h0_blocks, prior_seed=prior_seed
+        )
+        owner._drop_block_authority_fields(state)
+        ctx = RolloutContext(
+            topology_sidecar=topology_sidecar,
+            device=block_current.node_blocks.device,
+            dtype=accumulator_dtype,
+            h0_blocks=h0_blocks,
+        )
+        return block_current, ctx
+
+    def check_step(self, owner: Any, *, cur_t, next_t, alpha) -> None:
+        if not bool((cur_t < 1.0).item()):
+            raise RuntimeError("Block-space ODE must never evaluate the model at t=1.")
+        if not bool(((alpha > 0.0) & (alpha <= 1.0)).item()):
+            raise RuntimeError(
+                f"Invalid block-space ODE blend alpha={float(alpha.item())}."
+            )
+
+    def write_state_in(self, owner: Any, state: AtomicDataDict.Type, current, ctx) -> None:
+        node_rme, edge_rme = owner.block_codec.blocks_to_rme(state, current)
+        state[owner.node_h0_key] = node_rme.clone()
+        state[owner.edge_h0_key] = edge_rme.clone()
+        if owner.overwrite_feature_keys:
+            state[owner.node_target_key] = node_rme.clone()
+            state[owner.edge_target_key] = edge_rme.clone()
+
+    def decode_endpoint(self, owner: Any, prediction, merged, current, ctx):
+        raw_node_endpoint = owner._require_real_finite_tensor(
+            prediction[owner.node_output_key],
+            label="block-space ODE node endpoint prediction",
+        )
+        raw_edge_endpoint = owner._require_real_finite_tensor(
+            prediction[owner.edge_output_key],
+            label="block-space ODE edge endpoint prediction",
+        )
+        endpoint = BlockTensorResult(
+            raw_node_endpoint.to(
+                device=current.node_blocks.device, dtype=ctx.dtype
+            ),
+            raw_edge_endpoint.to(
+                device=current.edge_blocks.device, dtype=ctx.dtype
+            ),
+            current.node_shapes,
+            current.edge_shapes,
+        )
+        full_endpoint = owner.block_codec.endpoint_to_full(endpoint, ctx.h0_blocks)
+        full_endpoint = project_block_state(merged, owner.idp, full_endpoint)
+        return full_endpoint
+
+    def finalize(self, owner: Any, state: AtomicDataDict.Type, current, ctx, *, num_graphs):
+        node_final_rme, edge_final_rme = owner.block_codec.blocks_to_rme(state, current)
+        state[owner.node_h0_key] = node_final_rme
+        state[owner.edge_h0_key] = edge_final_rme
+        if owner.overwrite_feature_keys:
+            state[owner.node_target_key] = node_final_rme
+            state[owner.edge_target_key] = edge_final_rme
+        attach_prediction_block_tensors(
+            state,
+            current,
+            node_key=owner.node_output_key,
+            edge_key=owner.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        state[owner.flow_time_key] = torch.ones(
+            num_graphs, device=current.node_blocks.device, dtype=ctx.dtype
+        )
+        return state
+
 
 class UuRealRouteAdapter:
     """Adapter for the ``uureal_block_ode`` route (reduced-SOC compact uu-real residual).
 
-    PR5b/PR5c will add: the uu-real per-step state-write-in
-    (``_attach_uureal_residual_state`` block sidecars), the residual endpoint
-    decode (already a pure delta, no ``endpoint_to_full``), the uu-real initial
-    state, and this route's ``prepare_batch`` branch.
+    PR5b (this PR) added the uu-real rollout slivers: the compact-uu zero initial
+    state, the per-step state-write-in (``_attach_uureal_residual_state`` block
+    sidecars), the pure-residual endpoint decode (already a pure delta, no
+    ``endpoint_to_full``), and the final-state assembly. PR5c will add this
+    route's ``prepare_batch`` branch.
     """
 
     def __init__(self, owner: Any) -> None:
@@ -160,15 +262,79 @@ class UuRealRouteAdapter:
             if value.is_complex() or not bool(torch.isfinite(value).all().item()):
                 raise ValueError(f"uureal_block_ode requires finite real {key}.")
 
+    # -- rollout slivers (PR5b) ------------------------------------------
+    def initial_state(self, owner: Any, state: AtomicDataDict.Type, *, prior_seed, prior_state):
+        """Roll out the compact-uu residual state D from D0 = 0 (no H0 materialization)."""
+        owner._require_uureal_block_contract(state, require_endpoint_labels=False)
+        topology_sidecar = owner._snapshot_block_topology(state)
+        owner._restore_block_topology(state, topology_sidecar)
+        node_shapes, edge_shapes = infer_block_shapes(state, owner.idp, device=owner.device)
+        canvas = mapper_max_norb(owner.idp)
+        node_count = int(node_shapes.shape[0])
+        edge_count = int(edge_shapes.shape[0])
+        current = BlockTensorResult(
+            torch.zeros((node_count, canvas, canvas), dtype=owner.dtype, device=owner.device),
+            torch.zeros((edge_count, canvas, canvas), dtype=owner.dtype, device=owner.device),
+            node_shapes,
+            edge_shapes,
+        )
+        owner._drop_block_authority_fields(state)
+        ctx = RolloutContext(
+            topology_sidecar=topology_sidecar,
+            device=owner.device,
+            dtype=owner.dtype,
+        )
+        return current, ctx
+
+    def check_step(self, owner: Any, *, cur_t, next_t, alpha) -> None:
+        return None
+
+    def write_state_in(self, owner: Any, state: AtomicDataDict.Type, current, ctx) -> None:
+        owner._attach_uureal_residual_state(state, current)
+
+    def decode_endpoint(self, owner: Any, prediction, merged, current, ctx):
+        endpoint = BlockTensorResult(
+            owner._require_real_finite_tensor(
+                prediction[owner.node_output_key],
+                label="uureal residual node endpoint",
+            ).to(device=owner.device, dtype=owner.dtype),
+            owner._require_real_finite_tensor(
+                prediction[owner.edge_output_key],
+                label="uureal residual edge endpoint",
+            ).to(device=owner.device, dtype=owner.dtype),
+            current.node_shapes,
+            current.edge_shapes,
+        )
+        endpoint = project_block_state(merged, owner.idp, endpoint)
+        return endpoint
+
+    def finalize(self, owner: Any, state: AtomicDataDict.Type, current, ctx, *, num_graphs):
+        owner._attach_uureal_residual_state(state, current)
+        attach_prediction_block_tensors(
+            state,
+            current,
+            node_key=owner.node_output_key,
+            edge_key=owner.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        state[owner.flow_time_key] = torch.ones(
+            num_graphs, device=owner.device, dtype=owner.dtype
+        )
+        return state
+
 
 class ResidualRouteAdapter:
     """Adapter for the ``residual_ao_block_ode`` route (non-SOC direct AO residual).
 
-    PR5b/PR5c will add: the spatial-residual per-step state-write-in
-    (``_attach_spatial_residual_state`` block sidecars, re-asserting the constant
-    physical-H0 channel each step), the residual endpoint decode (already a pure
-    delta, no ``endpoint_to_full``), the D_0=0 initial state
-    (``_prior_state_as_residual_D0``), and this route's ``prepare_batch`` branch.
+    PR5b (this PR) added the spatial-residual rollout slivers: the initial state
+    (zero / explicit-latent ``_prior_state_as_residual_D0`` / stochastic
+    ``_residual_stochastic_eps`` D0, plus the constant physical-H0 RME channel),
+    the per-step state-write-in (``_attach_spatial_residual_state`` block sidecars,
+    re-asserting the constant physical-H0 channel each step), the pure-residual
+    endpoint decode (already a pure delta, no ``endpoint_to_full``), and the
+    ``H = H0 + D`` exactly-once finalize. PR5c will add this route's
+    ``prepare_batch`` branch.
     """
 
     def __init__(self, owner: Any) -> None:
@@ -250,6 +416,142 @@ class ResidualRouteAdapter:
                 "residual_ao_block_ode consumes raw non-SOC records; uu-real "
                 f"residual state keys are forbidden (found {forbidden_state})."
             )
+
+    # -- rollout slivers (PR5b) ------------------------------------------
+    def initial_state(self, owner: Any, state: AtomicDataDict.Type, *, prior_seed, prior_state):
+        """Build the residual D0 and derive the constant physical-H0 RME channel."""
+        if owner.block_codec is None:
+            raise RuntimeError("Block-space ODE codec was not constructed.")
+        owner._require_spatial_residual_block_contract(
+            state, require_endpoint_labels=False
+        )
+        topology_sidecar = owner._snapshot_block_topology(state)
+        owner._restore_block_topology(state, topology_sidecar)
+        h0_blocks, _ = owner._physical_h0_blocks(state)
+        h0_blocks = BlockTensorResult(
+            h0_blocks.node_blocks.to(dtype=owner.dtype),
+            h0_blocks.edge_blocks.to(dtype=owner.dtype),
+            h0_blocks.node_shapes,
+            h0_blocks.edge_shapes,
+        )
+        # Physical H0 RME is derived ONCE from the certified H0 blocks and written
+        # to the H0 keys as the constant conditioning channel (contract-(2) rollout
+        # lock): the model sees the SAME physical H0 RME at every step, while only
+        # the residual state D advances (carried in the spatial residual keys).
+        node_base, edge_base = owner.block_codec.blocks_to_rme(
+            state, h0_blocks, certify_image=True
+        )
+        if owner.prior == "zero":
+            # Zero prior: D0 = 0 exactly (byte-identical to v1).  A prior_seed and
+            # an explicit prior_state are both meaningless here and rejected,
+            # mirroring _block_initial_state's zero-prior symmetry (the top-level
+            # sample() guard rejects them before dispatch; this is defense in depth
+            # for direct callers).
+            if prior_seed is not None:
+                raise ValueError(
+                    "residual_ao_block_ode with prior='zero' uses an exact zero "
+                    "prior and rejects prior_seed."
+                )
+            if prior_state is not None:
+                raise ValueError(
+                    "residual_ao_block_ode with prior='zero' uses an exact zero "
+                    "prior and rejects prior_state."
+                )
+            current = BlockTensorResult(
+                torch.zeros_like(h0_blocks.node_blocks),
+                torch.zeros_like(h0_blocks.edge_blocks),
+                h0_blocks.node_shapes,
+                h0_blocks.edge_shapes,
+            )
+        elif prior_state is not None:
+            # TA-1 explicit latent: D0 = prior_state verbatim (validated/certified).
+            # Mutually exclusive with prior_seed -- the caller supplies the state
+            # rather than seeding a draw of it.
+            if prior_seed is not None:
+                raise ValueError(
+                    "residual_ao_block_ode prior_state and prior_seed are mutually "
+                    "exclusive: supply an explicit latent OR seed a draw, not both."
+                )
+            current = owner._prior_state_as_residual_D0(state, prior_state, h0_blocks)
+        else:
+            # Stochastic residual prior: D0 = eps, drawn deterministically for a
+            # given seed and certified in the codec image, matching the training
+            # boundary state D_0 = project(eps) exactly.
+            current = owner._residual_stochastic_eps(
+                state,
+                node_base,
+                edge_base,
+                generator=owner._seeded_generator(node_base.device, prior_seed),
+                certify_image=True,
+            )
+        owner._drop_block_authority_fields(state)
+        state[owner.node_h0_key] = node_base
+        state[owner.edge_h0_key] = edge_base
+        ctx = RolloutContext(
+            topology_sidecar=topology_sidecar,
+            device=owner.device,
+            dtype=owner.dtype,
+            h0_blocks=h0_blocks,
+            node_base=node_base,
+            edge_base=edge_base,
+        )
+        return current, ctx
+
+    def check_step(self, owner: Any, *, cur_t, next_t, alpha) -> None:
+        return None
+
+    def write_state_in(self, owner: Any, state: AtomicDataDict.Type, current, ctx) -> None:
+        owner._attach_spatial_residual_state(state, current)
+        # Re-assert the constant channel every step: a model that echoed a
+        # mutated H0 key back through ``merged`` must not drift contract (2).
+        state[owner.node_h0_key] = ctx.node_base
+        state[owner.edge_h0_key] = ctx.edge_base
+
+    def decode_endpoint(self, owner: Any, prediction, merged, current, ctx):
+        endpoint = BlockTensorResult(
+            owner._require_real_finite_tensor(
+                prediction[owner.node_output_key],
+                label="spatial residual node endpoint",
+            ).to(device=owner.device, dtype=owner.dtype),
+            owner._require_real_finite_tensor(
+                prediction[owner.edge_output_key],
+                label="spatial residual edge endpoint",
+            ).to(device=owner.device, dtype=owner.dtype),
+            current.node_shapes,
+            current.edge_shapes,
+        )
+        endpoint = project_block_state(merged, owner.idp, endpoint)
+        return endpoint
+
+    def finalize(self, owner: Any, state: AtomicDataDict.Type, current, ctx, *, num_graphs):
+        # Assemble the full Hamiltonian H = H0 + D exactly ONCE, outside the ODE.
+        owner._attach_spatial_residual_state(state, current)
+        full = project_block_state(
+            state,
+            owner.idp,
+            BlockTensorResult(
+                ctx.h0_blocks.node_blocks + current.node_blocks,
+                ctx.h0_blocks.edge_blocks + current.edge_blocks,
+                ctx.h0_blocks.node_shapes,
+                ctx.h0_blocks.edge_shapes,
+            ),
+        )
+        attach_prediction_block_tensors(
+            state,
+            full,
+            node_key=owner.node_output_key,
+            edge_key=owner.edge_output_key,
+            node_shape_key=_keys.NODE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+            edge_shape_key=_keys.EDGE_PRED_HAMIL_BLOCK_SHAPE_KEY,
+        )
+        # H0 keys stay PHYSICAL H0 RME (deliberate divergence from the generic
+        # ao_block_ode sampler, which overwrites them with the final state RME).
+        state[owner.node_h0_key] = ctx.node_base
+        state[owner.edge_h0_key] = ctx.edge_base
+        state[owner.flow_time_key] = torch.ones(
+            num_graphs, device=owner.device, dtype=owner.dtype
+        )
+        return state
 
 
 class RouteAdapters:

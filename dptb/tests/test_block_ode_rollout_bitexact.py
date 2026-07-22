@@ -437,7 +437,7 @@ def test_rollout_is_bit_identical_to_pre_refactor_golden(route):
             f"missing rollout golden {GOLDEN_PATH.name}; regenerate with "
             "`python dptb/tests/test_block_ode_rollout_bitexact.py` from a known-good baseline."
         )
-    golden = torch.load(GOLDEN_PATH)
+    golden = torch.load(GOLDEN_PATH, weights_only=True)
     got = _run_route(route)
     # torch.equal, NOT allclose: a pure code-motion must be bit-for-bit identical;
     # any mismatch means the shared-loop abstraction reordered a float operation.
