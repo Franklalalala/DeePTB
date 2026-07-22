@@ -691,7 +691,7 @@ class HamiltonianCFM:
                 edge_name=self.prior_edge,
             )
         self._prior_ctx = PriorContext(self)
-        self._route_adapters = RouteAdapters(self)
+        self._route_adapters = RouteAdapters()
         self.prior_calibration_path = str(options.get("prior_calibration", "") or "")
         self._prior_calibration_artifact: Optional[Dict[str, Any]] = None
         self._prior_calibration_cache: Dict[
@@ -2405,7 +2405,7 @@ class HamiltonianCFM:
     @classmethod
     def _block_topology_keys(cls) -> Tuple[str, ...]:
         """Graph metadata a model output may never redefine during block ODE."""
-        return _block_ode_topology._block_topology_keys()
+        return _block_ode_topology._block_topology_keys(dispatch=cls)
 
     @staticmethod
     def _missing_keys(data: AtomicDataDict.Type, keys: Tuple[str, ...]) -> list[str]:
@@ -2413,7 +2413,7 @@ class HamiltonianCFM:
 
     @classmethod
     def _metadata_scalar(cls, value: Any) -> Any:
-        return _block_ode_topology._metadata_scalar(value)
+        return _block_ode_topology._metadata_scalar(value, dispatch=cls)
 
     def _require_uureal_block_contract(
         self,
@@ -2425,11 +2425,11 @@ class HamiltonianCFM:
 
         Delegates to
         :meth:`dptb.nnops.block_ode.route_adapters.UuRealRouteAdapter.require_block_contract`
-        (extracted verbatim, ``self.`` -> ``self._owner.``); error text is
+        (extracted verbatim, ``self.`` -> ``owner.``); error text is
         preserved character-for-character (redteam tests assert on it).
         """
         return self._route_adapters.uureal.require_block_contract(
-            data, require_endpoint_labels=require_endpoint_labels
+            self, data, require_endpoint_labels=require_endpoint_labels
         )
 
     @staticmethod
@@ -2446,11 +2446,11 @@ class HamiltonianCFM:
 
         Delegates to
         :meth:`dptb.nnops.block_ode.route_adapters.ResidualRouteAdapter.require_block_contract`
-        (extracted verbatim, ``self.`` -> ``self._owner.``); error text is
+        (extracted verbatim, ``self.`` -> ``owner.``); error text is
         preserved character-for-character (redteam tests assert on it).
         """
         return self._route_adapters.residual.require_block_contract(
-            data, require_endpoint_labels=require_endpoint_labels
+            self, data, require_endpoint_labels=require_endpoint_labels
         )
 
     @staticmethod
@@ -2463,7 +2463,7 @@ class HamiltonianCFM:
 
     @classmethod
     def _snapshot_block_topology(cls, data: AtomicDataDict.Type) -> Dict[str, Any]:
-        return _block_ode_topology._snapshot_block_topology(data)
+        return _block_ode_topology._snapshot_block_topology(data, dispatch=cls)
 
     def _drop_block_authority_fields(self, data: AtomicDataDict.Type) -> None:
         """Keep certified endpoint/H0 block side channels outside model I/O."""
@@ -2491,7 +2491,9 @@ class HamiltonianCFM:
         data_topology: Dict[str, Any],
         ref_topology: Dict[str, Any],
     ) -> None:
-        _block_ode_topology._require_matching_block_topology(data_topology, ref_topology)
+        _block_ode_topology._require_matching_block_topology(
+            data_topology, ref_topology, dispatch=cls
+        )
 
     @classmethod
     def _restore_block_topology(
@@ -2502,12 +2504,12 @@ class HamiltonianCFM:
         clone_values: bool = False,
     ) -> None:
         _block_ode_topology._restore_block_topology(
-            data, snapshot, clone_values=clone_values
+            data, snapshot, clone_values=clone_values, dispatch=cls
         )
 
     @classmethod
     def _max_abs(cls, value: torch.Tensor, *, label: str = "residual") -> float:
-        return _block_ode_topology._max_abs(value, label=label)
+        return _block_ode_topology._max_abs(value, label=label, dispatch=cls)
 
     def _block_state_from_fields(
         self,
@@ -2793,6 +2795,7 @@ class HamiltonianCFM:
             # full-H).  Only the legacy non-block-ode ``rme``/``ao_block`` path
             # below stays inline (out of block-ODE scope).
             return self._route_adapters.select(self).prepare_batch(
+                self,
                 data,
                 ref_data,
                 t=t,

@@ -13,19 +13,23 @@ one adapter object per route:
     * :class:`UuRealRouteAdapter`  -- ``uureal_block_ode`` route
     * :class:`ResidualRouteAdapter`-- ``residual_ao_block_ode`` route
 
-Each adapter is a *behaviour object with an owner back-reference*, matching the
-idiom this repository already uses for ``dptb.nnops.flow_priors.PriorContext``
-and ``dptb.nnops.dynamic_batch_controller.DynamicBatchController``: it stores the
-owning :class:`dptb.nnops.flow.HamiltonianCFM` as ``self._owner`` and reads its
-state and helper methods live through that reference. Crucially, every call an
-adapter makes back into owner state is spelled ``self._owner._method(...)`` --
-resolved dynamically off the live instance at call time, never a reference
-captured at import -- so an instance-level monkeypatch of an owner helper on a
-real ``HamiltonianCFM`` (the fault-injection mechanism several tests rely on;
-see ``test_h5_ta3_belt_fires_through_residual_eps_draw_path`` in
-``test_residual_ao_block_ode.py`` for the canonical example) continues to
-resolve through the patched instance. ``HamiltonianCFM`` keeps every original
-method name as a 1-line delegator forwarding into the corresponding adapter.
+Each adapter is a *stateless behaviour object*: it holds no owner back-reference
+and instead receives the owning :class:`dptb.nnops.flow.HamiltonianCFM` as an
+explicit ``owner`` argument on every method call -- the rollout slivers, the
+``prepare_batch`` branch, and the route data-contract check alike (a single owner
+protocol, unlike the sibling ``dptb.nnops.flow_priors.PriorContext`` which still
+stores its owner). Crucially, every call an adapter makes back into owner state is
+spelled ``owner._method(...)`` -- resolved dynamically off the passed-in live
+instance at call time, never a reference captured at import or construction -- so
+an instance-level monkeypatch of an owner helper on a real ``HamiltonianCFM`` (the
+fault-injection mechanism several tests rely on; see
+``test_h5_ta3_belt_fires_through_residual_eps_draw_path`` in
+``test_residual_ao_block_ode.py`` for the canonical example) continues to resolve
+through the patched instance. Because the adapters carry no back-reference, a
+shallow-copied owner also dispatches through its own live attributes rather than a
+stale construction-time instance. ``HamiltonianCFM`` keeps every original method
+name as a 1-line delegator forwarding into the corresponding adapter, passing
+``self`` as ``owner``.
 
 Import direction (block_ode package rule): this module must never import
 ``dptb.nnops.flow`` -- ``flow.py`` imports downward into ``block_ode/*``, never
@@ -79,9 +83,6 @@ class FullHRouteAdapter:
     and the final-state assembly. PR5c will add this route's ``prepare_batch``
     branch.
     """
-
-    def __init__(self, owner: Any) -> None:
-        self._owner = owner
 
     # -- rollout slivers (PR5b) ------------------------------------------
     def initial_state(self, owner: Any, state: AtomicDataDict.Type, *, prior_seed, prior_state):
@@ -176,6 +177,7 @@ class FullHRouteAdapter:
     # -- training-time one-step assembly (PR5c) --------------------------
     def prepare_batch(
         self,
+        owner: Any,
         data: AtomicDataDict.Type,
         ref_data: AtomicDataDict.Type,
         *,
@@ -193,7 +195,6 @@ class FullHRouteAdapter:
         residual route, whose H0 keys carry the constant physical H0 and whose
         residual state travels in the spatial residual keys).
         """
-        owner = self._owner
         assert owner.block_codec is not None
         certify_image = owner._strict_image_certification_due()
         h0_blocks, h0_projection_residual = owner._physical_h0_blocks(
@@ -304,17 +305,15 @@ class UuRealRouteAdapter:
     route's ``prepare_batch`` branch.
     """
 
-    def __init__(self, owner: Any) -> None:
-        self._owner = owner
-
     # -- route-specific data contract (PR5a) -----------------------------
     def require_block_contract(
         self,
+        owner: Any,
         data: AtomicDataDict.Type,
         *,
         require_endpoint_labels: bool = True,
     ) -> None:
-        keep = int(self._owner.idp.reduced_matrix_element)
+        keep = int(owner.idp.reduced_matrix_element)
         required = (
             "blockwise_spatial_schema",
             "blockwise_target_mode",
@@ -323,20 +322,20 @@ class UuRealRouteAdapter:
             "soc_uureal_compact",
             "soc_uureal_full_rme",
             "soc_uureal_keep",
-            self._owner.node_h0_key,
-            self._owner.edge_h0_key,
+            owner.node_h0_key,
+            owner.edge_h0_key,
         )
         if require_endpoint_labels:
             # Training/scoring needs the residual endpoint labels; label-free
             # inference (sampling) starts from D_0=0 with mapper-derived shapes
             # and never reads them, so it must not demand them.
             required = required + (
-                self._owner.node_block_target_key,
-                self._owner.edge_block_target_key,
-                self._owner.node_block_shape_key,
-                self._owner.edge_block_shape_key,
+                owner.node_block_target_key,
+                owner.edge_block_target_key,
+                owner.node_block_shape_key,
+                owner.edge_block_shape_key,
             )
-        missing = self._owner._missing_keys(data, required)
+        missing = owner._missing_keys(data, required)
         if missing:
             raise KeyError(f"uureal_block_ode data contract missing keys={missing}.")
         expected = {
@@ -347,7 +346,7 @@ class UuRealRouteAdapter:
             "soc_uureal_keep": keep,
         }
         for key, wanted in expected.items():
-            actual = self._owner._metadata_scalar(data[key])
+            actual = owner._metadata_scalar(data[key])
             if actual != wanted:
                 raise ValueError(
                     f"uureal_block_ode requires {key}={wanted!r}; got {actual!r}."
@@ -362,7 +361,7 @@ class UuRealRouteAdapter:
             "blockwise_source_target_feature_width",
             "blockwise_source_h0_feature_width",
         ):
-            raw_actual = self._owner._metadata_scalar(data[key])
+            raw_actual = owner._metadata_scalar(data[key])
             try:
                 actual = int(raw_actual)
             except (TypeError, ValueError):
@@ -373,7 +372,7 @@ class UuRealRouteAdapter:
                 raise ValueError(
                     f"uureal_block_ode requires {key} >= keep={keep}; got {actual}."
                 )
-        for key in (self._owner.node_h0_key, self._owner.edge_h0_key):
+        for key in (owner.node_h0_key, owner.edge_h0_key):
             value = torch.as_tensor(data[key])
             if value.ndim != 2 or value.shape[-1] != keep:
                 raise ValueError(
@@ -445,6 +444,7 @@ class UuRealRouteAdapter:
     # -- training-time one-step assembly (PR5c) --------------------------
     def prepare_batch(
         self,
+        owner: Any,
         data: AtomicDataDict.Type,
         ref_data: AtomicDataDict.Type,
         *,
@@ -461,7 +461,6 @@ class UuRealRouteAdapter:
         The compact uu-real residual travels as a pure ``t``-scaled delta in the
         uu-real residual block keys; ``prior_seed`` is unused (zero prior only).
         """
-        owner = self._owner
         endpoint, endpoint_projection_residual = owner._block_state_from_fields(
             ref_data,
             ref_data,
@@ -532,12 +531,10 @@ class ResidualRouteAdapter:
     ``prepare_batch`` branch.
     """
 
-    def __init__(self, owner: Any) -> None:
-        self._owner = owner
-
     # -- route-specific data contract (PR5a) -----------------------------
     def require_block_contract(
         self,
+        owner: Any,
         data: AtomicDataDict.Type,
         *,
         require_endpoint_labels: bool = True,
@@ -551,28 +548,28 @@ class ResidualRouteAdapter:
         demand them.  Mapper non-SOC-ness is a ctor check, not a per-batch one.
         """
         required = (
-            self._owner.node_h0_block_key,
-            self._owner.edge_h0_block_key,
-            self._owner.node_h0_block_shape_key,
-            self._owner.edge_h0_block_shape_key,
+            owner.node_h0_block_key,
+            owner.edge_h0_block_key,
+            owner.node_h0_block_shape_key,
+            owner.edge_h0_block_shape_key,
         )
         if require_endpoint_labels:
             required = required + (
-                self._owner.node_block_target_key,
-                self._owner.edge_block_target_key,
-                self._owner.node_block_shape_key,
-                self._owner.edge_block_shape_key,
+                owner.node_block_target_key,
+                owner.edge_block_target_key,
+                owner.node_block_shape_key,
+                owner.edge_block_shape_key,
             )
-        missing = self._owner._missing_keys(data, required)
+        missing = owner._missing_keys(data, required)
         if missing:
             raise KeyError(f"residual_ao_block_ode data contract missing keys={missing}.")
-        for key in (self._owner.node_h0_block_key, self._owner.edge_h0_block_key):
-            self._owner._require_real_finite_tensor(
+        for key in (owner.node_h0_block_key, owner.edge_h0_block_key):
+            owner._require_real_finite_tensor(
                 data[key], label=f"residual_ao_block_ode {key}"
             )
         if require_endpoint_labels:
-            for key in (self._owner.node_block_target_key, self._owner.edge_block_target_key):
-                self._owner._require_real_finite_tensor(
+            for key in (owner.node_block_target_key, owner.edge_block_target_key):
+                owner._require_real_finite_tensor(
                     data[key], label=f"residual_ao_block_ode {key}"
                 )
         # A raw non-SOC record must never carry compact uu_real metadata: those
@@ -750,6 +747,7 @@ class ResidualRouteAdapter:
     # -- training-time one-step assembly (PR5c) --------------------------
     def prepare_batch(
         self,
+        owner: Any,
         data: AtomicDataDict.Type,
         ref_data: AtomicDataDict.Type,
         *,
@@ -768,7 +766,6 @@ class ResidualRouteAdapter:
         block keys. ``owner._require_spatial_residual_block_contract`` is called
         through the owner so an instance-level monkeypatch still resolves.
         """
-        owner = self._owner
         assert owner.block_codec is not None
         owner._require_spatial_residual_block_contract(data)
         owner._require_spatial_residual_block_contract(ref_data)
@@ -896,10 +893,11 @@ class RouteAdapters:
     """Route-keyed registry of the three block-ODE route adapters.
 
     Constructed once per ``HamiltonianCFM`` (see ``HamiltonianCFM.__init__``) and
-    holds one adapter instance per block-ODE route, each carrying a
-    back-reference to the same owning ``HamiltonianCFM``. The three adapters are
-    reachable by name (``.full_h``/``.uureal``/``.residual``) and by route via
-    :meth:`select`.
+    holds one stateless adapter instance per block-ODE route. The registry itself
+    is stateless too: the active ``HamiltonianCFM`` is passed explicitly into
+    :meth:`select` and threaded on into each adapter method, so nothing here holds
+    an owner back-reference. The three adapters are reachable by name
+    (``.full_h``/``.uureal``/``.residual``) and by route via :meth:`select`.
 
     ``select(owner)`` returns the adapter for the owner's active block-ODE route.
     The three routes are mutually exclusive and, once ``block_ode`` is set,
@@ -909,11 +907,10 @@ class RouteAdapters:
     the shared rollout engine; PR5c uses ``select`` to route ``prepare_batch``.
     """
 
-    def __init__(self, owner: Any) -> None:
-        self._owner = owner
-        self.full_h = FullHRouteAdapter(owner)
-        self.uureal = UuRealRouteAdapter(owner)
-        self.residual = ResidualRouteAdapter(owner)
+    def __init__(self) -> None:
+        self.full_h = FullHRouteAdapter()
+        self.uureal = UuRealRouteAdapter()
+        self.residual = ResidualRouteAdapter()
 
     def select(self, owner: Any):
         """Return the route adapter for ``owner``'s active block-ODE route.

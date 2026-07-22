@@ -20,6 +20,32 @@ from dptb.data import AtomicDataDict, _keys
 from dptb.data.interfaces.blockwise_tensor import BlockTensorResult
 
 
+def _resolve_topology_leaf(dispatch: Any, name: str):
+    """Resolve an overridable topology *leaf* helper for dynamic dispatch (RF1).
+
+    Several functions in this module call sibling helpers that a
+    ``HamiltonianCFM`` subclass is allowed to override to widen the immutable
+    block-topology authority set -- primarily ``_block_primary_topology_keys``,
+    but also ``_block_topology_keys``, ``_clone_sidecar_value``,
+    ``_metadata_scalar`` and ``_require_real_finite_tensor``.  The pre-refactor
+    ``HamiltonianCFM`` bodies spelled those calls ``cls._<leaf>(...)`` so the
+    override participated; the extracted module functions must preserve that.
+
+    ``dispatch is None`` -> the module-global function of that ``name``.  This
+    is the base-class / plain-module path and is byte-for-byte identical to the
+    pre-fix behaviour (every internal call resolves to the module global just
+    as before).  A class or instance -> ``getattr(dispatch, name)`` so a
+    subclass override is honoured, reproducing the ``cls._<leaf>(...)`` dynamic
+    dispatch.  ``HamiltonianCFM``'s ``@classmethod`` delegators pass ``cls`` as
+    ``dispatch``; because the delegators themselves thread ``cls`` back down,
+    an override of an *intermediate* leaf (e.g. ``_block_topology_keys``) is
+    honoured too, not only the innermost one.
+    """
+    if dispatch is None:
+        return globals()[name]
+    return getattr(dispatch, name)
+
+
 def _require_real_finite_tensor(value: Any, *, label: str) -> torch.Tensor:
     tensor = torch.as_tensor(value)
     if tensor.is_complex():
@@ -49,7 +75,7 @@ def _block_primary_topology_keys() -> Tuple[str, ...]:
     return tuple(dict.fromkeys(keys))
 
 
-def _block_topology_keys() -> Tuple[str, ...]:
+def _block_topology_keys(*, dispatch: Any = None) -> Tuple[str, ...]:
     """Graph metadata a model output may never redefine during block ODE."""
     names = (
         # Derived geometry is topology-dependent too.  If it was absent on
@@ -58,7 +84,8 @@ def _block_topology_keys() -> Tuple[str, ...]:
         ("EDGE_VECTORS_KEY", "edge_vectors"),
         ("EDGE_LENGTH_KEY", "edge_lengths"),
     )
-    keys = list(_block_primary_topology_keys())
+    primary = _resolve_topology_leaf(dispatch, "_block_primary_topology_keys")
+    keys = list(primary())
     keys.extend(str(getattr(_keys, name, fallback)) for name, fallback in names)
     return tuple(dict.fromkeys(keys))
 
@@ -67,7 +94,7 @@ def _missing_keys(data: AtomicDataDict.Type, keys: Tuple[str, ...]) -> list[str]
     return [key for key in keys if key not in data]
 
 
-def _metadata_scalar(value: Any) -> Any:
+def _metadata_scalar(value: Any, *, dispatch: Any = None) -> Any:
     if torch.is_tensor(value):
         values = value.detach().cpu().reshape(-1).tolist()
         if not values or any(item != values[0] for item in values[1:]):
@@ -76,7 +103,8 @@ def _metadata_scalar(value: Any) -> Any:
             )
         return values[0]
     if isinstance(value, (list, tuple)):
-        values = [_metadata_scalar(item) for item in value]
+        recurse = _resolve_topology_leaf(dispatch, "_metadata_scalar")
+        values = [recurse(item) for item in value]
         if not values or any(item != values[0] for item in values[1:]):
             raise ValueError(
                 "uureal_block_ode batched metadata values must be nonempty and identical."
@@ -113,10 +141,14 @@ def _clone_sidecar_value(value: Any) -> Any:
     return value.clone() if torch.is_tensor(value) else copy.deepcopy(value)
 
 
-def _snapshot_block_topology(data: AtomicDataDict.Type) -> Dict[str, Any]:
+def _snapshot_block_topology(
+    data: AtomicDataDict.Type, *, dispatch: Any = None
+) -> Dict[str, Any]:
+    topology_keys = _resolve_topology_leaf(dispatch, "_block_topology_keys")
+    clone = _resolve_topology_leaf(dispatch, "_clone_sidecar_value")
     return {
-        key: _clone_sidecar_value(data[key])
-        for key in _block_topology_keys()
+        key: clone(data[key])
+        for key in topology_keys()
         if key in data
     }
 
@@ -169,8 +201,11 @@ def _require_fresh_block_ode_outputs(
 def _require_matching_block_topology(
     data_topology: Dict[str, Any],
     ref_topology: Dict[str, Any],
+    *,
+    dispatch: Any = None,
 ) -> None:
-    for key in _block_primary_topology_keys():
+    primary = _resolve_topology_leaf(dispatch, "_block_primary_topology_keys")
+    for key in primary():
         in_data = key in data_topology
         in_ref = key in ref_topology
         if in_data != in_ref:
@@ -208,17 +243,23 @@ def _restore_block_topology(
     snapshot: Dict[str, Any],
     *,
     clone_values: bool = False,
+    dispatch: Any = None,
 ) -> None:
-    for key in _block_topology_keys():
+    topology_keys = _resolve_topology_leaf(dispatch, "_block_topology_keys")
+    clone = _resolve_topology_leaf(dispatch, "_clone_sidecar_value")
+    for key in topology_keys():
         if key in snapshot:
             value = snapshot[key]
-            data[key] = _clone_sidecar_value(value) if clone_values else value
+            data[key] = clone(value) if clone_values else value
         else:
             data.pop(key, None)
 
 
-def _max_abs(value: torch.Tensor, *, label: str = "residual") -> float:
-    value = _require_real_finite_tensor(value, label=label)
+def _max_abs(
+    value: torch.Tensor, *, label: str = "residual", dispatch: Any = None
+) -> float:
+    require = _resolve_topology_leaf(dispatch, "_require_real_finite_tensor")
+    value = require(value, label=label)
     if value.numel() == 0:
         return 0.0
     return float(value.detach().abs().max().item())

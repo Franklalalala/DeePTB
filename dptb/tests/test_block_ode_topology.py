@@ -58,6 +58,11 @@ def test_topology_module_exposes_exactly_the_migrated_functions():
         "_attach_uureal_residual_state",
         "_attach_spatial_residual_state",
         "_max_abs",
+        # Added post-PR2 by the RF1 fix (not a migrated HamiltonianCFM method):
+        # the dynamic-dispatch resolver that lets the moved helpers honour a
+        # subclass override of an overridable topology leaf, restoring the
+        # pre-refactor ``cls._<leaf>(...)`` semantics.
+        "_resolve_topology_leaf",
     }
     actual = {
         name

@@ -229,8 +229,15 @@ def _draw_residual_component(
         if key in data
     }
     num_graphs = owner._num_graphs(prior_data)
-    draw_fn = getattr(owner, config.draw_engine_name)
-    node_noise = draw_fn(
+    # RF3: resolve the draw engine off the live owner separately for the node
+    # and the edge component -- the pre-refactor ``HamiltonianCFM`` bodies
+    # spelled ``owner._<draw_engine>(...)`` once per component, so an
+    # instance-level monkeypatch (the fault-injection mechanism several tests
+    # rely on), a stateful descriptor, or a subclass hook installed *during*
+    # the node draw is re-resolved for the edge draw rather than reusing a
+    # once-captured bound method.  For a normal, stateless draw engine both
+    # lookups return the same callable, so this is numerically bit-identical.
+    node_noise = getattr(owner, config.draw_engine_name)(
         torch.zeros_like(node_like),
         owner.node_sigma,
         data=prior_data,
@@ -239,7 +246,7 @@ def _draw_residual_component(
         generator=generator,
         **config.draw_kwargs,
     )
-    edge_noise = draw_fn(
+    edge_noise = getattr(owner, config.draw_engine_name)(
         torch.zeros_like(edge_like),
         owner.edge_sigma,
         data=prior_data,
@@ -249,12 +256,22 @@ def _draw_residual_component(
         **config.draw_kwargs,
     )
 
-    sigma_scale = getattr(owner, config.sigma_scale_attr)
-
     def run_assert(node_component: torch.Tensor, edge_component: torch.Tensor) -> None:
+        # RF3: read the prior-strength scale off the live owner once per
+        # component (the pre-refactor bodies accessed
+        # ``owner.<sigma_scale_attr>`` separately in each assertion tuple
+        # entry), not once cached for both components.
         components = (
-            ("node", node_component, owner.node_sigma * sigma_scale),
-            ("edge", edge_component, owner.edge_sigma * sigma_scale),
+            (
+                "node",
+                node_component,
+                owner.node_sigma * getattr(owner, config.sigma_scale_attr),
+            ),
+            (
+                "edge",
+                edge_component,
+                owner.edge_sigma * getattr(owner, config.sigma_scale_attr),
+            ),
         )
         if config.assert_via_projected_te:
             owner._assert_projected_te_draw_finite_and_scaled(components)
