@@ -50,11 +50,14 @@ docstring names them):
         training-time one-step state assembly / blend / endpoint projection).
 """
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.data.interfaces.blockwise_tensor import BlockTensorResult
+from dptb.nnops.block_flow_codec import _FLOW_PROJECTED_STATE_TOKEN, project_block_state
+from dptb.nnops.flow_context import CFMContext
 
 
 class FullHRouteAdapter:
@@ -71,6 +74,126 @@ class FullHRouteAdapter:
 
     def __init__(self, owner: Any) -> None:
         self._owner = owner
+
+    # -- training-time one-step assembly (PR5c) --------------------------
+    def prepare_batch(
+        self,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        t: torch.Tensor,
+        node_t: torch.Tensor,
+        edge_t: torch.Tensor,
+        device: Any,
+        dtype: Any,
+        prior_seed: Optional[int],
+    ) -> tuple:
+        """Generic full-H ``prepare_batch`` branch (extracted verbatim from
+        ``HamiltonianCFM.prepare_batch``; ``self.`` -> ``owner.``).
+
+        The full-H route's H0 keys carry the *interpolated* state RME (unlike the
+        residual route, whose H0 keys carry the constant physical H0 and whose
+        residual state travels in the spatial residual keys).
+        """
+        owner = self._owner
+        assert owner.block_codec is not None
+        certify_image = owner._strict_image_certification_due()
+        h0_blocks, h0_projection_residual = owner._physical_h0_blocks(
+            data, device=device, dtype=dtype
+        )
+        endpoint, endpoint_projection_residual = owner._block_state_from_fields(
+            ref_data,
+            ref_data,
+            node_key=owner.node_block_target_key,
+            edge_key=owner.edge_block_target_key,
+            node_shape_key=owner.node_block_shape_key,
+            edge_shape_key=owner.edge_block_shape_key,
+            label=f"{owner.target_semantics} endpoint",
+            device=device,
+            dtype=dtype,
+        )
+        # Coupled RME is generated only from certified blocks.  Legacy main
+        # and H0 feature side channels are intentionally ignored because
+        # older LMDBs store AO-product gathers under the same key names.
+        node_base, edge_base = owner.block_codec.blocks_to_rme(
+            data,
+            h0_blocks,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
+        node_target, edge_target = owner.block_codec.blocks_to_rme(
+            data,
+            endpoint,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
+        block_start, node_prior, edge_prior = owner._block_initial_state(
+            data,
+            h0_blocks,
+            prior_seed=prior_seed,
+            certify_image=certify_image,
+        )
+
+        full_endpoint = owner.block_codec.endpoint_to_full(endpoint, h0_blocks)
+        full_endpoint = project_block_state(data, owner.idp, full_endpoint)
+        node_alpha = node_t.reshape((-1,) + (1,) * (full_endpoint.node_blocks.ndim - 1))
+        edge_alpha = edge_t.reshape((-1,) + (1,) * (full_endpoint.edge_blocks.ndim - 1))
+        block_current = project_block_state(
+            data,
+            owner.idp,
+            BlockTensorResult(
+                node_blocks=(1.0 - node_alpha) * block_start.node_blocks
+                + node_alpha * full_endpoint.node_blocks,
+                edge_blocks=(1.0 - edge_alpha) * block_start.edge_blocks
+                + edge_alpha * full_endpoint.edge_blocks,
+                node_shapes=h0_blocks.node_shapes,
+                edge_shapes=h0_blocks.edge_shapes,
+            ),
+        )
+        node_current, edge_current = owner.block_codec.blocks_to_rme(
+            data,
+            block_current,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
+        if owner.detach_interpolated_h0:
+            node_current = node_current.detach()
+            edge_current = edge_current.detach()
+        data[owner.node_h0_key] = node_current
+        data[owner.edge_h0_key] = edge_current
+        if owner.overwrite_feature_keys:
+            data[owner.node_target_key] = node_current
+            data[owner.edge_target_key] = edge_current
+        data[owner.flow_time_key] = t.detach()
+        ref_data[owner.flow_time_key] = t.detach()
+        ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+            endpoint_projection_residual, device=device, dtype=dtype
+        )
+        ref_data["_block_ode_h0_projection_residual"] = torch.as_tensor(
+            h0_projection_residual, device=device, dtype=dtype
+        )
+        # Endpoint/H0 block side channels are flow authority, not model
+        # inputs.  Removing them also breaks the shallow aliases created by
+        # Trainer's input/reference copies, so an in-place model cannot
+        # rewrite the labels used below by ``loss``.
+        owner._drop_block_authority_fields(data)
+        # Advance only after all unconditional contract gates and any due
+        # certification pass; a failed batch remains due on retry.
+        owner._strict_certification_batches += 1
+        return data, ref_data, CFMContext(
+            t=t,
+            node_t=node_t,
+            edge_t=edge_t,
+            node_base=node_base,
+            edge_base=edge_base,
+            node_target=node_target,
+            edge_target=edge_target,
+            node_current=node_current,
+            edge_current=edge_current,
+            node_prior=node_prior,
+            edge_prior=edge_prior,
+            block_target_semantics=owner.target_semantics,
+        )
 
 
 class UuRealRouteAdapter:
@@ -159,6 +282,82 @@ class UuRealRouteAdapter:
                 )
             if value.is_complex() or not bool(torch.isfinite(value).all().item()):
                 raise ValueError(f"uureal_block_ode requires finite real {key}.")
+
+    # -- training-time one-step assembly (PR5c) --------------------------
+    def prepare_batch(
+        self,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        t: torch.Tensor,
+        node_t: torch.Tensor,
+        edge_t: torch.Tensor,
+        device: Any,
+        dtype: Any,
+        prior_seed: Optional[int],
+    ) -> tuple:
+        """``uureal_block_ode`` ``prepare_batch`` branch (extracted verbatim from
+        ``HamiltonianCFM.prepare_batch``; ``self.`` -> ``owner.``).
+
+        The compact uu-real residual travels as a pure ``t``-scaled delta in the
+        uu-real residual block keys; ``prior_seed`` is unused (zero prior only).
+        """
+        owner = self._owner
+        endpoint, endpoint_projection_residual = owner._block_state_from_fields(
+            ref_data,
+            ref_data,
+            node_key=owner.node_block_target_key,
+            edge_key=owner.edge_block_target_key,
+            node_shape_key=owner.node_block_shape_key,
+            edge_shape_key=owner.edge_block_shape_key,
+            label="residual_dh endpoint",
+            device=device,
+            dtype=dtype,
+        )
+        node_alpha = node_t.reshape(
+            (-1,) + (1,) * (endpoint.node_blocks.ndim - 1)
+        )
+        edge_alpha = edge_t.reshape(
+            (-1,) + (1,) * (endpoint.edge_blocks.ndim - 1)
+        )
+        current = project_block_state(
+            data,
+            owner.idp,
+            BlockTensorResult(
+                node_alpha * endpoint.node_blocks,
+                edge_alpha * endpoint.edge_blocks,
+                endpoint.node_shapes,
+                endpoint.edge_shapes,
+            ),
+        )
+        if owner.detach_interpolated_h0:
+            current = BlockTensorResult(
+                current.node_blocks.detach(),
+                current.edge_blocks.detach(),
+                current.node_shapes,
+                current.edge_shapes,
+            )
+        owner._attach_uureal_residual_state(data, current)
+        data[owner.flow_time_key] = t.detach()
+        ref_data[owner.flow_time_key] = t.detach()
+        ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+            endpoint_projection_residual, device=device, dtype=dtype
+        )
+        owner._drop_block_authority_fields(data)
+        return data, ref_data, CFMContext(
+            t=t,
+            node_t=node_t,
+            edge_t=edge_t,
+            node_base=torch.as_tensor(data[owner.node_h0_key]),
+            edge_base=torch.as_tensor(data[owner.edge_h0_key]),
+            node_target=None,
+            edge_target=None,
+            node_current=current.node_blocks,
+            edge_current=current.edge_blocks,
+            node_prior=torch.zeros_like(current.node_blocks),
+            edge_prior=torch.zeros_like(current.edge_blocks),
+            block_target_semantics="residual_dh",
+        )
 
 
 class ResidualRouteAdapter:
@@ -250,6 +449,150 @@ class ResidualRouteAdapter:
                 "residual_ao_block_ode consumes raw non-SOC records; uu-real "
                 f"residual state keys are forbidden (found {forbidden_state})."
             )
+
+    # -- training-time one-step assembly (PR5c) --------------------------
+    def prepare_batch(
+        self,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        t: torch.Tensor,
+        node_t: torch.Tensor,
+        edge_t: torch.Tensor,
+        device: Any,
+        dtype: Any,
+        prior_seed: Optional[int],
+    ) -> tuple:
+        """``residual_ao_block_ode`` ``prepare_batch`` branch (extracted verbatim
+        from ``HamiltonianCFM.prepare_batch``; ``self.`` -> ``owner.``).
+
+        The physical H0 RME is the constant conditioning channel written once to
+        the H0 keys; the pure residual state D travels in the spatial residual
+        block keys. ``owner._require_spatial_residual_block_contract`` is called
+        through the owner so an instance-level monkeypatch still resolves.
+        """
+        owner = self._owner
+        assert owner.block_codec is not None
+        owner._require_spatial_residual_block_contract(data)
+        owner._require_spatial_residual_block_contract(ref_data)
+        certify_image = owner._strict_image_certification_due()
+        h0_blocks, h0_projection_residual = owner._physical_h0_blocks(
+            data, device=device, dtype=dtype
+        )
+        endpoint, endpoint_projection_residual = owner._block_state_from_fields(
+            ref_data,
+            ref_data,
+            node_key=owner.node_block_target_key,
+            edge_key=owner.edge_block_target_key,
+            node_shape_key=owner.node_block_shape_key,
+            edge_shape_key=owner.edge_block_shape_key,
+            label="residual_dh endpoint",
+            device=device,
+            dtype=dtype,
+        )
+        # Physical H0 RME is the CONSTANT conditioning channel: written to the
+        # H0 keys exactly once and never interpolated.  The pure residual state
+        # D travels in the spatial residual block keys instead.  This is the
+        # deliberate divergence from the generic ao_block_ode branch below,
+        # whose H0 keys carry the interpolated state RME.
+        node_base, edge_base = owner.block_codec.blocks_to_rme(
+            data,
+            h0_blocks,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
+        data[owner.node_h0_key] = node_base
+        data[owner.edge_h0_key] = edge_base
+        node_alpha = node_t.reshape((-1,) + (1,) * (endpoint.node_blocks.ndim - 1))
+        edge_alpha = edge_t.reshape((-1,) + (1,) * (endpoint.edge_blocks.ndim - 1))
+        if owner.prior == "zero":
+            # Zero prior: D_t = t * D1 exactly (no (1 - t) * prior term).  Legacy
+            # feature-key overwrites are intentionally skipped for B: the H0 keys
+            # already expose the physical conditioning channel honestly.
+            D_t = project_block_state(
+                data,
+                owner.idp,
+                BlockTensorResult(
+                    node_alpha * endpoint.node_blocks,
+                    edge_alpha * endpoint.edge_blocks,
+                    endpoint.node_shapes,
+                    endpoint.edge_shapes,
+                ),
+            )
+            node_prior_blocks = None
+            edge_prior_blocks = None
+        else:
+            # Stochastic bridge: draw eps in the certified codec image
+            # (NO H0 added), then D_t = project((1 - t) * eps + t * D1).
+            # The (1 - t) * eps term removes the deterministic
+            # D_t = t * D1 shortcut left by the zero prior.  prior_seed
+            # selects the deterministic validation stream; training keeps
+            # fresh rowwise noise.
+            eps = owner._residual_stochastic_eps(
+                data,
+                node_base,
+                edge_base,
+                generator=owner._seeded_generator(device, prior_seed),
+                certify_image=certify_image,
+            )
+            D_t = project_block_state(
+                data,
+                owner.idp,
+                BlockTensorResult(
+                    (1.0 - node_alpha) * eps.node_blocks
+                    + node_alpha * endpoint.node_blocks,
+                    (1.0 - edge_alpha) * eps.edge_blocks
+                    + edge_alpha * endpoint.edge_blocks,
+                    endpoint.node_shapes,
+                    endpoint.edge_shapes,
+                ),
+            )
+            node_prior_blocks = eps.node_blocks
+            edge_prior_blocks = eps.edge_blocks
+        if owner.detach_interpolated_h0:
+            D_t = BlockTensorResult(
+                D_t.node_blocks.detach(),
+                D_t.edge_blocks.detach(),
+                D_t.node_shapes,
+                D_t.edge_shapes,
+            )
+        owner._attach_spatial_residual_state(data, D_t)
+        data[owner.flow_time_key] = t.detach()
+        ref_data[owner.flow_time_key] = t.detach()
+        ref_data["_block_ode_target_projection_residual"] = torch.as_tensor(
+            endpoint_projection_residual, device=device, dtype=dtype
+        )
+        ref_data["_block_ode_h0_projection_residual"] = torch.as_tensor(
+            h0_projection_residual, device=device, dtype=dtype
+        )
+        owner._drop_block_authority_fields(data)
+        owner._strict_certification_batches += 1
+        return data, ref_data, CFMContext(
+            t=t,
+            node_t=node_t,
+            edge_t=edge_t,
+            node_base=node_base,
+            edge_base=edge_base,
+            node_target=None,
+            edge_target=None,
+            node_current=D_t.node_blocks,
+            edge_current=D_t.edge_blocks,
+            # Zero prior keeps the exact zeros_like telemetry; projected_te
+            # exposes the drawn epsilon.  CFMContext.node_prior has no runtime
+            # consumer for this mode (the block-ODE loss reads node_current /
+            # node_target only), so this is telemetry-only either way.
+            node_prior=(
+                torch.zeros_like(D_t.node_blocks)
+                if node_prior_blocks is None
+                else node_prior_blocks
+            ),
+            edge_prior=(
+                torch.zeros_like(D_t.edge_blocks)
+                if edge_prior_blocks is None
+                else edge_prior_blocks
+            ),
+            block_target_semantics="residual_dh",
+        )
 
 
 class RouteAdapters:
