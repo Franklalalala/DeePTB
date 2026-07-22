@@ -2383,6 +2383,18 @@ def slem():
     doc_rme_fusion_init = "Stddev of dynamic output-head projections. 0.0 disables dynamic residual/path weights at initialization."
     doc_rme_fusion_condition = "Condition source for output heads. Currently only `scalar_0e`."
     doc_rme_cartesian_scope = "ICT/Cartesian product scope for `late_rme_cartesian_hybrid` and `late_block_cartesian_projector`: `missing_only` or `all`."
+    doc_cg_head_impl = (
+        "Reduction path for the h_b0 late-CG output head (`late_block_expansion_cg`). "
+        "`legacy` (default) accumulates per-path contributions in the fixed Python-loop "
+        "order used since 0715-refactor -- bit-stable with existing checkpoints/configs. "
+        "`fused` opts in to a grouped-einsum + scatter reassociation of the same sum for a "
+        "speedup not reproduced in-tree (external benchmark: ~4-5x on the head, ~-3.2% "
+        "wall-clock per training iteration), at the cost of floating-point reassociation "
+        "drift versus `legacy` (see late_block_expansion_cg.py for the certified tolerances "
+        "and the cancellation-regime caveat). Falls back to `legacy` regardless of this "
+        "setting under autocast, a non-fp32/64 dtype, or `use_deterministic_algorithms(True)`. "
+        "Only meaningful when the resolved output_route is h_b0; ignored otherwise."
+    )
     doc_ao_projector_channels = "Direct AO-pair decoder multiplicity. `0` builds the complete ordered AO-pair representation with dimension max_norb^2; positive values are compressed ablations."
     doc_ao_projector_normalization = "AO-pair projector normalization. Currently `e3hamiltonian`."
     doc_ao_projector_basis = "AO-pair projector basis convention. Currently `deeptb_real_ao`."
@@ -2439,6 +2451,7 @@ def slem():
         Argument("rme_fusion_condition", str, optional=True, default="scalar_0e", doc=doc_rme_fusion_condition),
         Argument("rme_cartesian_scope", [str, None], optional=True, default=None, doc=doc_rme_cartesian_scope),
         Argument("rme_ict_scope", [str, None], optional=True, default=None, doc=doc_rme_cartesian_scope),
+        Argument("cg_head_impl", str, optional=True, default="legacy", doc=doc_cg_head_impl),
         Argument("ao_projector_channels", int, optional=True, default=0, doc=doc_ao_projector_channels),
         Argument("ao_projector_normalization", str, optional=True, default="e3hamiltonian", doc=doc_ao_projector_normalization),
         Argument("ao_projector_basis_convention", str, optional=True, default="deeptb_real_ao", doc=doc_ao_projector_basis),
