@@ -28,6 +28,7 @@ from test_residual_ao_block_ode import (  # noqa: E402
     _b_flow,
     _b_record,
     _mapper,
+    _water_graph,
     _water_mapper,
 )
 
@@ -73,6 +74,14 @@ def _node_tied_draw(flow, dim, *, types, batch, uids, seed, device):
 
 
 def test_dense_all_one_expansion_fixed_vector_fixture():
+    """Golden fixture for ``dense_all_one_irrep_expansion``, regenerated after
+    PR#31 review finding P1-1 (missing sqrt(2L+1) Wigner-3j -> Clebsch-Gordan
+    normalization for every L>=1 channel).  Values below were printed by a
+    throwaway script calling the FIXED implementation, not hand-derived --
+    see ``test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row``
+    just below for the independent cross-check against the real production
+    codec that these numbers were verified against (bit-exact to fp64).
+    """
     z = torch.tensor(
         [
             0.10,
@@ -104,9 +113,9 @@ def test_dense_all_one_expansion_fixed_vector_fixture():
         block[3:6, 3:6],
         torch.tensor(
             [
-                [0.0643, -0.0375, -0.0064],
-                [-0.0131, 0.1483, -0.0439],
-                [0.0507, -0.0194, 0.1338],
+                [0.0009, -0.0778, 0.0000],
+                [-0.0354, 0.1890, -0.0919],
+                [0.0990, -0.0495, 0.1565],
             ],
             dtype=torch.float64,
         ),
@@ -117,9 +126,9 @@ def test_dense_all_one_expansion_fixed_vector_fixture():
         0.5 * (block[3:6, 3:6] + block[3:6, 3:6].T),
         torch.tensor(
             [
-                [0.0643, -0.0253, 0.0221],
-                [-0.0253, 0.1483, -0.0316],
-                [0.0221, -0.0316, 0.1338],
+                [0.0009, -0.0566, 0.0495],
+                [-0.0566, 0.1890, -0.0707],
+                [0.0495, -0.0707, 0.1565],
             ],
             dtype=torch.float64,
         ),
@@ -128,14 +137,14 @@ def test_dense_all_one_expansion_fixed_vector_fixture():
     )
     torch.testing.assert_close(
         block[0:1, 3:6],
-        torch.tensor([[-0.0173, 0.0404, -0.0173]], dtype=torch.float64),
+        torch.tensor([[-0.0300, 0.0700, -0.0300]], dtype=torch.float64),
         rtol=0.0,
         atol=5e-5,
     )
     torch.testing.assert_close(
         block[0:1, 9:14],
         torch.tensor(
-            [[0.0313, -0.0358, 0.0402, -0.0447, 0.0492]],
+            [[0.0700, -0.0800, 0.0900, -0.1000, 0.1100]],
             dtype=torch.float64,
         ),
         rtol=0.0,
@@ -144,6 +153,77 @@ def test_dense_all_one_expansion_fixed_vector_fixture():
     assert int(torch.linalg.matrix_rank(block, tol=1e-12).item()) == 9
     sym = 0.5 * (block + block.T)
     assert int(torch.linalg.matrix_rank(sym, tol=1e-12).item()) == 9
+
+
+def test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row():
+    """PR#31 review P1-1 fast-vs-dense cross-check (the gap review found: the
+    two "halves" of this prior's math -- ``fill_tied_irrep_rme`` (production)
+    and ``dense_all_one_irrep_expansion`` (docs'/tests' reference) -- were
+    never cross-checked against each other anywhere).
+
+    Feeds the doc's own Section-4 ``z`` vector through BOTH paths on water's
+    real oxygen ``3s2p1d`` basis (literally the canonical ``3x0e+2x1e+1x2e``
+    shape): the dense reference directly, and the production path via
+    ``fill_tied_irrep_rme`` -> ``flow.block_codec.rme_to_blocks`` (i.e. the
+    real ``E3Hamiltonian``).  Asserts ``allclose`` to fp64 precision for every
+    block REVIEW_PR31.md's ratio table checked (s-s, s1-p1, s1-d, and the raw
+    p1-p1 mix of L=0/1/2): before the sqrt(2L+1) fix these ratios were
+    1/sqrt(3)/sqrt(5)/non-scalar; after it, all four are bit-exact.
+
+    Scope note: this intentionally does NOT assert full-matrix equality.
+    ``dense_all_one_irrep_expansion`` independently recomputes the "mirror"
+    direction of an off-diagonal multi-copy or cross-degree shell pair (e.g.
+    the second p-shell against the first, or the d-shell against a p-shell),
+    while production instead derives that direction by a literal transpose of
+    the canonical (ascending shell-index) block. Swapping a Wigner-3j's first
+    two arguments equals the transpose only when ``l_out1+l_out2+l_in`` is
+    even (verified directly against ``o3.wigner_3j``); for an odd-parity
+    coupled degree (e.g. p-p's L=1, or p-d's L=2) dense's independent
+    recompute and production's transpose disagree in sign on that channel.
+    This is a real, narrower, separate gap from P1-1 -- out of this task's
+    scope (P1-1 is specifically the missing sqrt(2L+1) factor) -- and is
+    never exercised by the single-copy-target blocks checked here or by any
+    block the docs' worked example shows.
+    """
+    mapper = _water_mapper()
+    flow = _b_tied_flow(mapper)
+    data = _water_graph(mapper, dtype=torch.float64)
+    dim = mapper.orbpair_irreps.dim
+
+    z = torch.tensor(
+        [
+            0.10, -0.20, 0.30,
+            0.01, 0.02, 0.03,
+            -0.04, 0.05, -0.06,
+            0.07, -0.08, 0.09, -0.10, 0.11,
+        ],
+        dtype=torch.float64,
+    )
+    g0 = z[0] + z[1] + z[2]
+    g1 = z[3:6] + z[6:9]
+    g2 = z[9:14]
+
+    # _water_graph's atomic_numbers=[8,1,1] -> row 0 is the O node; only that
+    # row's mask is set so the H rows stay exactly zero (irrelevant here).
+    node_like = torch.zeros(3, dim, dtype=torch.float64)
+    node_mask = torch.zeros_like(node_like, dtype=torch.bool)
+    node_mask[0, :] = True
+    effective_latent = torch.zeros(3, 9, dtype=torch.float64)
+    effective_latent[0] = torch.cat([g0.reshape(1), g1, g2])
+
+    slices = flow._te_irrep_slices(dim)
+    node_rme = fill_tied_irrep_rme(node_like, slices, node_mask, effective_latent, sigma=1.0)
+    n_edges = int(data[_keys.EDGE_INDEX_KEY].shape[1])
+    edge_rme = torch.zeros(n_edges, dim, dtype=torch.float64)
+
+    packed = flow.block_codec.rme_to_blocks(data, node_rme, edge_rme, project=False)
+    production = packed.node_blocks[0]
+    dense = dense_all_one_irrep_expansion(z)
+
+    torch.testing.assert_close(production[:3, :3], dense[:3, :3], rtol=0.0, atol=FP64_ATOL)
+    torch.testing.assert_close(production[0:1, 3:6], dense[0:1, 3:6], rtol=0.0, atol=FP64_ATOL)
+    torch.testing.assert_close(production[0:1, 9:14], dense[0:1, 9:14], rtol=0.0, atol=FP64_ATOL)
+    torch.testing.assert_close(production[3:6, 3:6], dense[3:6, 3:6], rtol=0.0, atol=FP64_ATOL)
 
 
 def test_effective_latent_variances_match_multiplicity_sums():

@@ -175,9 +175,9 @@ For the first `p` radial shell, the raw three-by-three expansion is
 
 ```text
 epsilon_p1p1_raw =
-[[ 0.0643, -0.0375, -0.0064],
- [-0.0131,  0.1483, -0.0439],
- [ 0.0507, -0.0194,  0.1338]]
+[[ 0.0009, -0.0778,  0.0000],
+ [-0.0354,  0.1890, -0.0919],
+ [ 0.0990, -0.0495,  0.1565]]
 ```
 
 The `p-p` product contains \(L=0,1,2\).  Its \(L=1\) component is
@@ -188,23 +188,37 @@ block projection removes that antisymmetric component:
 epsilon_p1p1 = 0.5 * (epsilon_raw + epsilon_raw.T)
 
              =
-[[ 0.0643, -0.0253,  0.0221],
- [-0.0253,  0.1483, -0.0316],
- [ 0.0221, -0.0316,  0.1338]]
+[[ 0.0009, -0.0566,  0.0495],
+ [-0.0566,  0.1890, -0.0707],
+ [ 0.0495, -0.0707,  0.1565]]
 ```
 
 The same effective vector and rank-2 field simultaneously produce
 
 ```text
 epsilon_s1p1 =
-[[-0.0173, 0.0404, -0.0173]]
+[[-0.0300, 0.0700, -0.0300]]
 
 epsilon_s1d =
-[[0.0313, -0.0358, 0.0402, -0.0447, 0.0492]]
+[[0.0700, -0.0800, 0.0900, -0.1000, 0.1100]]
 ```
 
 `epsilon_s1p1` is generated from `g1`; `epsilon_s1d` is generated from `g2`.
 Neither is obtained by multiplying the scalar `g0` into another irrep.
+
+All five numbers above are printed directly by the fixed
+`dense_all_one_irrep_expansion` (a throwaway script, not hand arithmetic) and
+independently cross-checked bit-exact against the real production codec
+(`fill_tied_irrep_rme` -> `flow.block_codec.rme_to_blocks`, i.e.
+`E3Hamiltonian`) on water's real oxygen `3s2p1d` row -- see
+`test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row`
+in `dptb/tests/test_tied_irrep_gaussian_prior.py`.  An earlier version of
+this section was generated from a `dense_all_one_irrep_expansion` that was
+missing the standard `sqrt(2L+1)` Wigner-3j-to-Clebsch-Gordan normalization
+factor for every `L>=1` channel; `epsilon_s1p1`/`epsilon_s1d` were off by
+`sqrt(3)`/`sqrt(5)` and `epsilon_p1p1`'s non-scalar channels were mis-scaled
+by different factors (only its trace, the pure `L=0` part, was correct). The
+`epsilon_ss` block was unaffected (`L=0` only, `sqrt(1)=1`).
 
 ## 5. Before and after adding the prior
 
@@ -231,9 +245,9 @@ With the tied-irrep prior and `sigma=1`,
 D0 = epsilon_p1p1
 
 H0 + D0 =
-[[-0.4357, -0.0053,  0.0221],
- [-0.0053, -0.3317, -0.0216],
- [ 0.0221, -0.0216, -0.3862]]
+[[-0.4991, -0.0366,  0.0495],
+ [-0.0366, -0.2910, -0.0607],
+ [ 0.0495, -0.0607, -0.3635]]
 ```
 
 The model receives `D0` as its evolving residual block state and receives `H0`
@@ -258,14 +272,14 @@ which gives
 
 ```text
 D_0.25 =
-[[ 0.0532, -0.0165,  0.0166],
- [-0.0165,  0.1087, -0.0225],
- [ 0.0166, -0.0225,  0.1079]]
+[[ 0.0057, -0.0399,  0.0371],
+ [-0.0399,  0.1392, -0.0518],
+ [ 0.0371, -0.0518,  0.1249]]
 
 H0 + D_0.25 =
-[[-0.4468,  0.0035,  0.0166],
- [ 0.0035, -0.3713, -0.0125],
- [ 0.0166, -0.0125, -0.4122]]
+[[-0.4943, -0.0199,  0.0371],
+ [-0.0199, -0.3408, -0.0418],
+ [ 0.0371, -0.0418, -0.3951]]
 ```
 
 At `t=1`, the prior contribution is zero:
