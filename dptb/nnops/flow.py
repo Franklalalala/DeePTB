@@ -36,6 +36,7 @@ from dptb.nnops.block_flow_codec import (
     _FLOW_PROJECTED_STATE_TOKEN,
     project_block_state,
 )
+from dptb.nnops.block_ode import endpoint_stats
 from dptb.nnops.flow_context import CFMContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
@@ -3750,183 +3751,19 @@ class HamiltonianCFM:
         *,
         prediction_is_full_h: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Fail-closed endpoint loss on independent physical block freedoms."""
-        if ctx.block_target_semantics != self.target_semantics:
-            raise ValueError(
-                "Block-space ODE target semantics changed between prepare_batch and loss."
-            )
-        missing = [
-            key
-            for key in (
-                self.node_output_key,
-                self.edge_output_key,
-                self.node_block_target_key,
-                self.edge_block_target_key,
-                self.node_block_shape_key,
-                self.edge_block_shape_key,
-            )
-            if key not in (pred_data if key in {self.node_output_key, self.edge_output_key} else ref_data)
-        ]
-        if missing:
-            raise KeyError(f"Block-space ODE endpoint loss is missing required keys={missing}.")
+        """Fail-closed endpoint loss on independent physical block freedoms.
 
-        node_pred = pred_data[self.node_output_key]
-        edge_pred = pred_data[self.edge_output_key]
-        node_target = torch.as_tensor(
-            ref_data[self.node_block_target_key], device=node_pred.device, dtype=node_pred.dtype
+        Delegates to :func:`dptb.nnops.block_ode.endpoint_stats.block_ode_endpoint_loss`
+        (extracted verbatim, ``self.`` -> ``owner.``); see that module's docstring
+        for the canonical/directed dual-population design this implements.
+        """
+        return endpoint_stats.block_ode_endpoint_loss(
+            self,
+            pred_data,
+            ref_data,
+            ctx,
+            prediction_is_full_h=prediction_is_full_h,
         )
-        edge_target = torch.as_tensor(
-            ref_data[self.edge_block_target_key], device=edge_pred.device, dtype=edge_pred.dtype
-        )
-        if node_pred.shape != node_target.shape or edge_pred.shape != edge_target.shape:
-            raise ValueError(
-                "Block-space ODE prediction/target canvas mismatch: "
-                f"node {tuple(node_pred.shape)} vs {tuple(node_target.shape)}, "
-                f"edge {tuple(edge_pred.shape)} vs {tuple(edge_target.shape)}."
-            )
-        node_shapes = torch.as_tensor(ref_data[self.node_block_shape_key], device=node_pred.device)
-        edge_shapes = torch.as_tensor(ref_data[self.edge_block_shape_key], device=edge_pred.device)
-        pred_state = BlockTensorResult(node_pred, edge_pred, node_shapes, edge_shapes)
-        target_state = BlockTensorResult(node_target, edge_target, node_shapes, edge_shapes)
-
-        # Model outputs are predictions, not graph authority.  Pairing and
-        # species shapes must come from the independently preserved reference
-        # topology or a returned/stale PBC shift can redefine Hermitian mates.
-        target_projected = project_block_state(ref_data, self.idp, target_state)
-        target_residual = max(
-            self._max_abs(target_projected.node_blocks - node_target),
-            self._max_abs(target_projected.edge_blocks - edge_target),
-        )
-        if target_residual > self.block_inverse_atol:
-            raise ValueError(
-                "Block-space ODE target violates onsite/reverse/padding constraints: "
-                f"max residual={target_residual:.6g}, atol={self.block_inverse_atol}."
-            )
-
-        if prediction_is_full_h and self.target_semantics == "residual_dh":
-            if ctx.node_base is None or ctx.edge_base is None:
-                raise ValueError("Residual block sample scoring requires both H0 RME components.")
-            h0 = self.block_codec.rme_to_blocks(
-                ref_data, ctx.node_base, ctx.edge_base, project=True
-            )
-            target_state = self.block_codec.endpoint_to_full(target_projected, h0)
-            target_projected = project_block_state(ref_data, self.idp, target_state)
-
-        pred_projected = project_block_state(ref_data, self.idp, pred_state)
-        node_diff = pred_projected.node_blocks - target_projected.node_blocks
-        edge_diff = pred_projected.edge_blocks - target_projected.edge_blocks
-
-        node_valid = block_mask_from_shapes(
-            pred_projected.node_shapes, tuple(node_diff.shape[-2:])
-        )
-        upper = torch.triu(
-            torch.ones(tuple(node_diff.shape[-2:]), dtype=torch.bool, device=node_diff.device)
-        )
-        node_mask = node_valid & upper.unsqueeze(0)
-
-        edge_valid = block_mask_from_shapes(
-            pred_projected.edge_shapes, tuple(edge_diff.shape[-2:])
-        )
-        rev = strict_reverse_edge_index(
-            ref_data, device=edge_diff.device, idp=self.idp
-        )
-        rows = torch.arange(edge_diff.shape[0], device=edge_diff.device)
-        canonical_rows = rows <= rev
-        edge_mask = edge_valid & canonical_rows.view(-1, 1, 1)
-        self_reverse = rows == rev
-        if bool(self_reverse.any().item()):
-            edge_mask[self_reverse] &= upper.unsqueeze(0)
-
-        node_stats = self._metric_stats(
-            node_diff, node_mask, self.loss_type, self._time_weight(ctx.node_t)
-        )
-        edge_stats = self._metric_stats(
-            edge_diff, edge_mask, self.loss_type, self._time_weight(ctx.edge_t)
-        )
-        node_component = node_stats[0]
-        edge_component = edge_stats[0]
-        total = self._reduce_component_stats(
-            ((node_stats, self.node_weight), (edge_stats, self.edge_weight))
-        )
-
-        # NOTE: the flow objective publishes its endpoint node/edge metric ONLY under
-        # the flow namespace (train_flow_onsite_loss/train_flow_hopping_loss).  It does
-        # NOT alias it into the bare train_onsite_loss/train_hopping_loss: those legacy
-        # tags carry feature-compatible semantics and are written solely by the
-        # compatible pass (Trainer._compatible_loss_state*, legacy_prefix), so the two
-        # namespaces never mix under one tag.  (Previously the flow value was aliased
-        # here; the compatible pass then overwrote it every step, but if that pass were
-        # ever throttled/absent the flow value would leak under the compatible tag.)
-        #
-        # P1-1 (block endpoint population parity): `_compatible_clean_stats` below is
-        # handed to Trainer._compatible_loss_state_from_flow_stats, which reduces it
-        # through the *criterion's own* `compatible_loss_from_stats`
-        # (HamilBlockwiseNexTHamLoss).  That criterion's `block_components` counts
-        # EVERY shape-active directed AO entry -- no onsite lower-triangle drop, no
-        # reverse-edge dedup (see blockwise_tensor.block_components /
-        # block_mask_from_shapes).  `node_mask`/`edge_mask` above intentionally keep
-        # only ONE independent physical freedom per Hermitian pair (onsite upper
-        # triangle, one side of each reverse-edge pair) for the *training* reduction
-        # -- a DIFFERENT population from the criterion's directed-full count.
-        # Publishing the canonical sums under a "block" label the criterion treats as
-        # directed-full silently understated L1/RMSE (population off by ~2x on
-        # non-symmetric error).  Feed `_compatible_clean_stats` the directed-full
-        # `node_valid`/`edge_valid` masks instead -- the same population
-        # `train_compatible_directed_*` below already uses -- so the label and the
-        # population it carries finally agree with the criterion's own definition.
-        # This is an exact recount, not an approximation: Hermitian pairing is
-        # bit-exact post-projection (project_block_state symmetrizes onsite as
-        # 0.5*(X+X.T) and derives every reverse edge as the literal transpose of a
-        # shared `averaged` tensor via index_copy_), so summing node_diff/edge_diff
-        # over the full directed mask reproduces exactly what an analytic
-        # canonical-sum doubling would give (diagonal/self-reverse counted once,
-        # off-diagonal/reverse-pair counted twice) -- see
-        # test_block_ode_compatible_stats_match_criterion_directed_population for the
-        # locked numerical identity.
-        state: Dict[str, torch.Tensor] = {
-            "train_flow_t": ctx.t.detach().mean(),
-            "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
-            "train_flow_onsite_loss": node_component.detach(),
-            "train_flow_hopping_loss": edge_component.detach(),
-            "block_ode_target_projection_residual": torch.as_tensor(
-                target_residual, device=total.device, dtype=total.dtype
-            ),
-            "_compatible_clean_stats": {
-                **self._compatible_clean_stats(node_diff, node_valid, "onsite"),
-                **self._compatible_clean_stats(edge_diff, edge_valid, "hopping"),
-            },
-        }
-        if self.uureal_block_ode:
-            # Historical-comparison metric (review P1-5).  Two deliberately
-            # coexisting reductions:
-            #   * canonical (`train_flow_*_loss` above): each independent physical
-            #     freedom counted ONCE -- onsite upper triangle plus one
-            #     canonical edge per Hermitian (i,j,R)/(j,i,-R) pair;
-            #   * compatible_directed (`train_compatible_directed_*`): every
-            #     stored directed coordinate counted, i.e. all mapper-valid
-            #     onsite entries and ALL directed edges -- the same population
-            #     the historical SOC uu-real RME losses (H-B0/H-A1 runs)
-            #     averaged over, and (as of P1-1) the same population now backing
-            #     the `_compatible_clean_stats` payload above.  Counts differ
-            #     (~2x from canonical) and values differ whenever the error is not
-            #     Hermitian-symmetric, so curves plotted against historical runs
-            #     must use the directed keys.
-            directed_node_stats = self._metric_stats(
-                node_diff, node_valid, self.loss_type, self._time_weight(ctx.node_t)
-            )
-            directed_edge_stats = self._metric_stats(
-                edge_diff, edge_valid, self.loss_type, self._time_weight(ctx.edge_t)
-            )
-            directed_total = self._reduce_component_stats(
-                (
-                    (directed_node_stats, self.node_weight),
-                    (directed_edge_stats, self.edge_weight),
-                )
-            )
-            state["train_compatible_directed_onsite_loss"] = directed_node_stats[0].detach()
-            state["train_compatible_directed_hopping_loss"] = directed_edge_stats[0].detach()
-            state["train_compatible_directed_loss"] = directed_total.detach()
-        return self._finalize_loss(total, state, pred_data)
 
     @staticmethod
     def _safe_exact_rmse(
