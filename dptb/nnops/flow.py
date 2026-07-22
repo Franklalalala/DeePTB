@@ -38,6 +38,7 @@ from dptb.nnops.block_flow_codec import (
 )
 from dptb.nnops.block_ode import topology as _block_ode_topology
 from dptb.nnops.block_ode import endpoint_stats
+from dptb.nnops.block_ode import stochastic_priors
 from dptb.nnops.flow_context import CFMContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
@@ -1114,36 +1115,17 @@ class HamiltonianCFM:
     ) -> None:
         """Runtime belt for any stochastic block prior draw before it is used.
 
-        ``components`` is an iterable of ``(label, tensor, effective_scale)``.  A
-        drawn component must be all-finite, and -- when its configured effective
-        scale is nonzero and it has any elements -- must not be entirely zero (a
-        silent all-masked / subnormal-underflow collapse of the stochastic
-        bridge).  The error names the effective scale, dtype, and component label.
+        Delegates to :func:`dptb.nnops.block_ode.stochastic_priors._assert_stochastic_prior_draw_finite_and_scaled`
+        (extracted verbatim); see that module for the full docstring.
         """
-        for label, tensor, effective_scale in components:
-            if tensor is None:
-                continue
-            if tensor.numel() and not bool(torch.isfinite(tensor).all().item()):
-                raise ValueError(
-                    f"{prior_name} {label} draw contains NaN/Inf (effective scale="
-                    f"{float(effective_scale):.6g}, dtype={tensor.dtype}, "
-                    f"component={label})."
-                )
-            if (
-                float(effective_scale) != 0.0
-                and tensor.numel() > 0
-                and not bool(tensor.detach().any().item())
-            ):
-                raise ValueError(
-                    f"{prior_name} {label} draw is entirely zero despite a nonzero "
-                    f"configured effective scale={float(effective_scale):.6g} "
-                    f"(dtype={tensor.dtype}, component={label})."
-                )
+        return stochastic_priors._assert_stochastic_prior_draw_finite_and_scaled(
+            prior_name, components
+        )
 
     def _assert_projected_te_draw_finite_and_scaled(self, components) -> None:
         """TA-3 runtime belt for any projected_te draw, before it is used."""
-        self._assert_stochastic_prior_draw_finite_and_scaled(
-            "projected_te", components
+        return stochastic_priors._assert_projected_te_draw_finite_and_scaled(
+            self, components
         )
 
     def _sample_t(
@@ -2723,120 +2705,18 @@ class HamiltonianCFM:
     ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
         """Draw one endpoint-independent start state and certify its codec image.
 
-        Seeded-replay semantics (TA-1/TA-2): a fixed ``prior_seed`` reproduces the
-        SAME start state bitwise only for an identical tensor layout, plus
-        DISTRIBUTIONAL equivariance; the draw is keyed per graph by ``sample_uid``
-        (batch-composition invariant) but is NOT pathwise equivariant under an
-        input rotation/permutation.
-
-        A-mode asymmetry (TA-1a): unlike ``residual_ao_block_ode``, this A-mode
-        start state is the FULL state ``B0 = H0 + eps`` (not a pure residual D0),
-        so an explicit transformable ``prior_state`` latent does NOT drop in
-        trivially here (a caller-supplied full B0 would need its own H0-relative
-        residual bookkeeping and a distinct verbatim-vs-projected contract).  The
-        explicit-latent path is therefore offered only by the residual sampler;
-        A-mode is left seeded-only by design.
+        Delegates to :func:`dptb.nnops.block_ode.stochastic_priors._block_initial_state`
+        (extracted verbatim); see that module for the full docstring (seeded-replay
+        semantics, the A-mode H0+noise asymmetry) and the shared
+        ``_draw_residual_component`` template it is built on.
         """
-        assert self.block_codec is not None
-        node_h0, edge_h0 = self.block_codec.blocks_to_rme(
+        return stochastic_priors._block_initial_state(
+            self,
             data,
             h0_blocks,
+            prior_seed=prior_seed,
             certify_image=certify_image,
-            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
         )
-        if self.prior == "zero":
-            if prior_seed is not None:
-                raise ValueError("block-space prior_seed requires prior='projected_te'.")
-            return (
-                self._clone_block_state(h0_blocks),
-                torch.zeros_like(node_h0),
-                torch.zeros_like(edge_h0),
-            )
-
-        if self.prior not in self._projected_te_prior_names:
-            raise RuntimeError(f"Unsupported block-space prior {self.prior!r}.")
-
-        def draw(
-            generator: Optional[torch.Generator],
-        ) -> Tuple[BlockTensorResult, torch.Tensor, torch.Tensor]:
-            prior_data = {
-                key: data[key]
-                for key in (
-                    AtomicDataDict.ATOM_TYPE_KEY,
-                    AtomicDataDict.EDGE_TYPE_KEY,
-                    _keys.BATCH_KEY,
-                    _keys.EDGE_INDEX_KEY,
-                    # TA-2: the stable per-graph id must ride the restricted prior
-                    # substream data so a SEEDED draw can key per-uid generators.
-                    _keys.SAMPLE_UID_KEY,
-                )
-                if key in data
-            }
-            num_graphs = self._num_graphs(prior_data)
-            node_noise = self._te_prior_like(
-                torch.zeros_like(node_h0),
-                self.node_sigma,
-                data=prior_data,
-                label="node",
-                reference_scale=False,
-                num_graphs=num_graphs,
-                generator=generator,
-            )
-            edge_noise = self._te_prior_like(
-                torch.zeros_like(edge_h0),
-                self.edge_sigma,
-                data=prior_data,
-                label="edge",
-                reference_scale=False,
-                num_graphs=num_graphs,
-                generator=generator,
-            )
-            # TA-3: runtime belt on the projected_te draw before it is folded into
-            # the start state -- all-finite, and not silently all-zero for a
-            # component with a nonzero configured effective scale.
-            self._assert_projected_te_draw_finite_and_scaled(
-                (
-                    ("node", node_noise, self.node_sigma * self.te_prior_sigma),
-                    ("edge", edge_noise, self.edge_sigma * self.te_prior_sigma),
-                )
-            )
-            noise_blocks = self.block_codec.rme_to_blocks(
-                data, node_noise, edge_noise, project=False
-            )
-            start = project_block_state(
-                data,
-                self.idp,
-                BlockTensorResult(
-                    h0_blocks.node_blocks + noise_blocks.node_blocks,
-                    h0_blocks.edge_blocks + noise_blocks.edge_blocks,
-                    h0_blocks.node_shapes,
-                    h0_blocks.edge_shapes,
-                ),
-            )
-            node_start, edge_start = self.block_codec.blocks_to_rme(
-                data,
-                start,
-                certify_image=certify_image,
-                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
-            )
-            roundtrip = self.block_codec.rme_to_blocks(
-                data, node_start, edge_start, project=True
-            )
-            residual = max(
-                self._max_abs(roundtrip.node_blocks - start.node_blocks),
-                self._max_abs(roundtrip.edge_blocks - start.edge_blocks),
-            )
-            if residual > self.block_inverse_atol:
-                raise ValueError(
-                    "Projected TE block start is outside the certified codec image: "
-                    f"max residual={residual:.6g}, atol={self.block_inverse_atol:.6g}."
-                )
-            return start, node_start - node_h0, edge_start - edge_h0
-
-        if prior_seed is None:
-            return draw(None)
-        generator = self._seeded_generator(h0_blocks.node_blocks.device, prior_seed)
-        return draw(generator)
 
     def _residual_te_eps(
         self,
@@ -2849,94 +2729,17 @@ class HamiltonianCFM:
     ) -> BlockTensorResult:
         """Draw the projected_te residual epsilon in block space; NO H0 added.
 
-        Mirrors the TE-noise draw of :meth:`_block_initial_state` exactly (same
-        node/edge sigma semantics and the same seeded-generator path) but forms
-        the PURE noise residual ``eps = project(rme_to_blocks(noise, project=False))``
-        instead of A's ``H0 + noise`` start state: the direct-residual mode tracks
-        ``D = H - H0``, so the t=0 boundary of D is the prior noise alone.
-
-        ``eps`` is in the certified codec image by construction (the forward CG map
-        is linear, ``rme_to_blocks(project=False)`` lands on that image, and
-        :func:`project_block_state` is an image-preserving projection).  When
-        certification is due the epsilon is certified the same way A certifies its
-        noisy start -- a repack roundtrip residual bounded by ``block_inverse_atol``.
-
-        Seeded-replay semantics (TA-1/TA-2): a fixed ``generator`` reproduces the
-        SAME epsilon bitwise only for an identical tensor layout, and otherwise
-        only DISTRIBUTIONAL equivariance -- sample(R.x, seed) is drawn from the
-        rotation of sample(x, seed)'s law, not equal to it.  The draw is keyed
-        per graph by ``sample_uid`` (batch-composition invariant) but is NOT
-        pathwise equivariant under an input rotation/permutation; for a
-        transformable latent, pass an explicit ``prior_state`` to the sampler and
-        rotate/permute it alongside the input.
+        Delegates to :func:`dptb.nnops.block_ode.stochastic_priors._residual_te_eps`
+        (extracted verbatim); see that module for the full docstring.
         """
-        assert self.block_codec is not None
-        prior_data = {
-            key: data[key]
-            for key in (
-                AtomicDataDict.ATOM_TYPE_KEY,
-                AtomicDataDict.EDGE_TYPE_KEY,
-                _keys.BATCH_KEY,
-                _keys.EDGE_INDEX_KEY,
-                # TA-2: the stable per-graph id must ride the restricted prior
-                # substream data so a SEEDED draw can key per-uid generators.
-                _keys.SAMPLE_UID_KEY,
-            )
-            if key in data
-        }
-        num_graphs = self._num_graphs(prior_data)
-        node_noise = self._te_prior_like(
-            torch.zeros_like(node_like),
-            self.node_sigma,
-            data=prior_data,
-            label="node",
-            reference_scale=False,
-            num_graphs=num_graphs,
+        return stochastic_priors._residual_te_eps(
+            self,
+            data,
+            node_like,
+            edge_like,
             generator=generator,
+            certify_image=certify_image,
         )
-        edge_noise = self._te_prior_like(
-            torch.zeros_like(edge_like),
-            self.edge_sigma,
-            data=prior_data,
-            label="edge",
-            reference_scale=False,
-            num_graphs=num_graphs,
-            generator=generator,
-        )
-        noise_blocks = self.block_codec.rme_to_blocks(
-            data, node_noise, edge_noise, project=False
-        )
-        eps = project_block_state(data, self.idp, noise_blocks)
-        # TA-3: runtime belt on the projected_te draw before it is used as D0 --
-        # all-finite, and not silently all-zero for a component with a nonzero
-        # configured effective scale.
-        self._assert_projected_te_draw_finite_and_scaled(
-            (
-                ("node", eps.node_blocks, self.node_sigma * self.te_prior_sigma),
-                ("edge", eps.edge_blocks, self.edge_sigma * self.te_prior_sigma),
-            )
-        )
-        if certify_image:
-            node_eps, edge_eps = self.block_codec.blocks_to_rme(
-                data,
-                eps,
-                certify_image=certify_image,
-                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
-            )
-            roundtrip = self.block_codec.rme_to_blocks(
-                data, node_eps, edge_eps, project=True
-            )
-            residual = max(
-                self._max_abs(roundtrip.node_blocks - eps.node_blocks),
-                self._max_abs(roundtrip.edge_blocks - eps.edge_blocks),
-            )
-            if residual > self.block_inverse_atol:
-                raise ValueError(
-                    "Projected TE residual epsilon is outside the certified codec "
-                    f"image: max residual={residual:.6g}, "
-                    f"atol={self.block_inverse_atol:.6g}."
-                )
-        return eps
 
     def _residual_tied_irrep_gaussian_eps(
         self,
@@ -2948,75 +2751,14 @@ class HamiltonianCFM:
         certify_image: bool,
     ) -> BlockTensorResult:
         """Draw the multiplicity-tied total-L residual epsilon; NO H0 added."""
-        assert self.block_codec is not None
-        prior_data = {
-            key: data[key]
-            for key in (
-                AtomicDataDict.ATOM_TYPE_KEY,
-                AtomicDataDict.EDGE_TYPE_KEY,
-                _keys.BATCH_KEY,
-                _keys.EDGE_INDEX_KEY,
-                _keys.SAMPLE_UID_KEY,
-            )
-            if key in data
-        }
-        num_graphs = self._num_graphs(prior_data)
-        node_noise = self._tied_irrep_gaussian_prior_like(
-            torch.zeros_like(node_like),
-            self.node_sigma,
-            data=prior_data,
-            label="node",
-            num_graphs=num_graphs,
+        return stochastic_priors._residual_tied_irrep_gaussian_eps(
+            self,
+            data,
+            node_like,
+            edge_like,
             generator=generator,
+            certify_image=certify_image,
         )
-        edge_noise = self._tied_irrep_gaussian_prior_like(
-            torch.zeros_like(edge_like),
-            self.edge_sigma,
-            data=prior_data,
-            label="edge",
-            num_graphs=num_graphs,
-            generator=generator,
-        )
-        noise_blocks = self.block_codec.rme_to_blocks(
-            data, node_noise, edge_noise, project=False
-        )
-        eps = project_block_state(data, self.idp, noise_blocks)
-        self._assert_stochastic_prior_draw_finite_and_scaled(
-            self.prior,
-            (
-                (
-                    "node",
-                    eps.node_blocks,
-                    self.node_sigma * self.tied_irrep_sigma,
-                ),
-                (
-                    "edge",
-                    eps.edge_blocks,
-                    self.edge_sigma * self.tied_irrep_sigma,
-                ),
-            ),
-        )
-        if certify_image:
-            node_eps, edge_eps = self.block_codec.blocks_to_rme(
-                data,
-                eps,
-                certify_image=certify_image,
-                _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
-            )
-            roundtrip = self.block_codec.rme_to_blocks(
-                data, node_eps, edge_eps, project=True
-            )
-            residual = max(
-                self._max_abs(roundtrip.node_blocks - eps.node_blocks),
-                self._max_abs(roundtrip.edge_blocks - eps.edge_blocks),
-            )
-            if residual > self.block_inverse_atol:
-                raise ValueError(
-                    "tied_irrep_gaussian residual epsilon is outside the "
-                    "certified codec image: max residual="
-                    f"{residual:.6g}, atol={self.block_inverse_atol:.6g}."
-                )
-        return eps
 
     def _residual_stochastic_eps(
         self,
@@ -3027,33 +2769,18 @@ class HamiltonianCFM:
         generator: Optional[torch.Generator],
         certify_image: bool,
     ) -> BlockTensorResult:
-        if self.prior in self._projected_te_prior_names:
-            return self._residual_te_eps(
-                data,
-                node_like,
-                edge_like,
-                generator=generator,
-                certify_image=certify_image,
-            )
-        if self.prior in self._tied_irrep_gaussian_prior_names:
-            return self._residual_tied_irrep_gaussian_eps(
-                data,
-                node_like,
-                edge_like,
-                generator=generator,
-                certify_image=certify_image,
-            )
-        raise RuntimeError(f"Unsupported residual stochastic prior {self.prior!r}.")
+        return stochastic_priors._residual_stochastic_eps(
+            self,
+            data,
+            node_like,
+            edge_like,
+            generator=generator,
+            certify_image=certify_image,
+        )
 
     def _strict_image_certification_due(self) -> bool:
         """Schedule only the pure repack/residual image-space self-check."""
-
-        batch = self._strict_certification_batches
-        if self._strict_certification_mode == "always":
-            return True
-        if self._strict_certification_mode == "first_batch":
-            return batch == 0
-        return batch % self._strict_certification_period == 0
+        return stochastic_priors._strict_image_certification_due(self)
 
     def prepare_batch(
         self,
