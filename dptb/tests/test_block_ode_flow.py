@@ -349,6 +349,78 @@ def test_multitrainer_residual_euler_validation_scores_full_sample_via_flow():
     assert torch.equal(trainer.model.inputs[0][1], trainer.model.inputs[1][1])
 
 
+def test_multitrainer_block_ode_validation_fails_fast_on_metric_space_mismatch():
+    """P1-1: MultiTrainer._build_validation_euler_payload's block_ode branch has
+    no raw-batch recompute fallback (an immediate RuntimeError follows a None
+    compatible_state a few lines down), so a flow/criterion metric_space
+    mismatch must raise the specific diagnostic instead of collapsing into
+    that generic message. Same harness as
+    test_multitrainer_residual_euler_validation_scores_full_sample_via_flow
+    above, except the criterion now declares a label ("rme") that disagrees
+    with what block-ODE always publishes ("block")."""
+    idp, data, codec, _ = _case()
+    delta = _scaled_endpoint(
+        codec,
+        data,
+        data[_keys.NODE_H0_KEY],
+        data[_keys.EDGE_H0_KEY],
+        scale=0.25,
+    )
+    batch = _fresh(data)
+    batch[_keys.NODE_DELTA_HAMIL_BLOCKS_KEY] = delta.node_blocks.clone()
+    batch[_keys.EDGE_DELTA_HAMIL_BLOCKS_KEY] = delta.edge_blocks.clone()
+    batch[_keys.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = delta.node_shapes.clone()
+    batch[_keys.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = delta.edge_shapes.clone()
+
+    class MismatchedSpaceCriterion:
+        endpoint_metric_space = "rme"
+
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError(
+                "block_ode branch has no raw-batch fallback; a metric-space "
+                "mismatch must raise before ever calling the criterion directly"
+            )
+
+        @staticmethod
+        def compatible_loss_from_stats(**stats):
+            raise AssertionError(
+                "must fail before reducing mismatched-population stats"
+            )
+
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 1
+    trainer.dtype = torch.float64
+    trainer.device = torch.device("cpu")
+    trainer._tagger = SimpleNamespace(
+        tag=lambda *_args, **_kwargs: nullcontext()
+    )
+    trainer.model = EndpointSequence([delta])
+    trainer.flow_cfm = _flow(
+        idp,
+        semantics="residual_dh",
+        prior="projected_te",
+        te_prior_mode="irrep",
+        node_sigma=0.25,
+        edge_sigma=0.25,
+    )
+    trainer.flow_cfm.log_validation_flow_euler_loss = False
+    trainer._prepare_expert_masks = lambda batch_dict, *_args: (
+        torch.ones(batch_dict[_keys.EDGE_H0_KEY].shape[0], dtype=torch.bool),
+        torch.ones(batch_dict[_keys.NODE_H0_KEY].shape[0], dtype=torch.bool),
+    )
+
+    with pytest.raises(ValueError, match=r"metric_space='block'.*endpoint_metric_space='rme'"):
+        trainer._build_validation_euler_payload(
+            batch_dict=batch,
+            batch_info={},
+            criterion=MismatchedSpaceCriterion(),
+            expert_idx=0,
+            range_dis=(0.0, 1.0),
+            num_steps=1,
+            prior_seed=20260719,
+        )
+
+
 def test_block_ode_reinjects_lem_sidecar_each_step_without_leaking_it():
     idp, data, _, h0 = _case()
     metadata = {

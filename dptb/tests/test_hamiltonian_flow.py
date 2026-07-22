@@ -1899,6 +1899,51 @@ def test_model_in_loss_train_loss_aligns_from_endpoint_stats(monkeypatch):
     assert state["train_hopping_loss"].item() == pytest.approx(hopping)
 
 
+class _ModelInLossFlowWithMismatchedStats(_ModelInLossFlow):
+    """model_in_loss=True flow whose published stats declare the WRONG label.
+
+    Mirrors _ModelInLossFlowWithStats but tags the payload "rme" while the
+    paired criterion below declares endpoint_metric_space="block". There is no
+    raw-batch recompute fallback on the model_in_loss=True branch of
+    Trainer._loss_on_batch (see the ``not model_in_loss`` gate a few lines
+    below the call), so this must fail fast with the specific
+    metric-space-mismatch ValueError instead of silently returning None and
+    surfacing only the generic "could not reconstruct" RuntimeError three
+    lines later (P1-1).
+    """
+
+    def loss_with_model(self, model, batch, batch_for_loss):
+        loss, state = super().loss_with_model(model, batch, batch_for_loss)
+        stats = _compatible_clean_stats()
+        stats["_compatible_clean_stats"]["metric_space"] = "rme"
+        state.update(stats)
+        return loss, state
+
+
+def test_model_in_loss_train_loss_fails_fast_on_metric_space_mismatch(monkeypatch):
+    trainer = object.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.flow_cfm = _ModelInLossFlowWithMismatchedStats()
+    trainer.model = _UNUSED_MODEL
+    lossfunc = _BlockEndpointFallbackLoss()
+    assert lossfunc.endpoint_metric_space == "block"
+
+    def fake_to_dict(batch):
+        return {"raw_batch": True}
+
+    def fail_compatible(*args, **kwargs):
+        raise AssertionError(
+            "model_in_loss=True has no raw-batch fallback; a metric-space "
+            "mismatch must raise before ever reaching it"
+        )
+
+    monkeypatch.setattr(trainer_module.AtomicData, "to_AtomicDataDict", fake_to_dict)
+    monkeypatch.setattr(Trainer, "_compatible_loss_state", staticmethod(fail_compatible))
+
+    with pytest.raises(ValueError, match=r"metric_space='rme'.*endpoint_metric_space='block'"):
+        trainer._loss_on_batch(_FakeBatch(), lossfunc)
+
+
 def test_loss_on_batch_can_skip_flow_for_reference_batch(monkeypatch):
     trainer = object.__new__(Trainer)
     trainer.device = torch.device("cpu")
