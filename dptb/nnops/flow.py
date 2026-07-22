@@ -8,6 +8,26 @@ fields by an interpolated Hamiltonian state H_t and trains the existing model to
 predict the clean converged Hamiltonian.  This mirrors the residual-CFM training
 used by QHFlow/QHFlow2, but is adapted to DeePTB/NextHAM-style physical H0
 features.
+
+The block-space ODE subsystem -- the three routes (generic full-H,
+``uureal_block_ode``, ``residual_ao_block_ode``), their shared topology
+contract, stochastic residual/start-state priors, the single Euler rollout
+engine, and the endpoint loss -- has been extracted into the
+:mod:`dptb.nnops.block_ode` package (see that package's ``__init__.py`` and
+each submodule's docstring for the implementations:
+:mod:`dptb.nnops.block_ode.topology`, :mod:`dptb.nnops.block_ode.stochastic_priors`,
+:mod:`dptb.nnops.block_ode.route_adapters`, :mod:`dptb.nnops.block_ode.rollout`,
+:mod:`dptb.nnops.block_ode.endpoint_stats`). ``HamiltonianCFM`` retains every
+one of those methods under its original public/private name as a thin
+delegator (1-3 lines) into the matching collaborator, so callers, subclasses
+(``HamiltonianPixelMeanFlow``), and tests that reach into
+``flow._private_method(...)`` or monkeypatch an instance attribute keep
+working unchanged -- see the collaborator modules' own docstrings for the
+"owner back-reference" idiom this relies on. The legacy (pre-block-ode) CFM
+path and the generic shared infrastructure (validation-seed machinery, time
+sampling, general/absolute prior helpers, metric/stats reduction) remain in
+this file; they are not block-ode-specific (several are also used by the
+non-block-ode ``rme``/``ao_block`` fallback paths below).
 """
 
 import copy
