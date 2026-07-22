@@ -38,6 +38,7 @@ from dptb.nnops.block_flow_codec import (
 )
 from dptb.nnops.block_ode import topology as _block_ode_topology
 from dptb.nnops.block_ode import endpoint_stats
+from dptb.nnops.block_ode.route_adapters import RouteAdapters
 from dptb.nnops.flow_context import CFMContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
@@ -668,6 +669,7 @@ class HamiltonianCFM:
                 edge_name=self.prior_edge,
             )
         self._prior_ctx = PriorContext(self)
+        self._route_adapters = RouteAdapters(self)
         self.prior_calibration_path = str(options.get("prior_calibration", "") or "")
         self._prior_calibration_artifact: Optional[Dict[str, Any]] = None
         self._prior_calibration_cache: Dict[
@@ -2416,73 +2418,16 @@ class HamiltonianCFM:
         *,
         require_endpoint_labels: bool = True,
     ) -> None:
-        keep = int(self.idp.reduced_matrix_element)
-        required = (
-            "blockwise_spatial_schema",
-            "blockwise_target_mode",
-            "blockwise_source_target_feature_width",
-            "blockwise_source_h0_feature_width",
-            "soc_uureal_compact",
-            "soc_uureal_full_rme",
-            "soc_uureal_keep",
-            self.node_h0_key,
-            self.edge_h0_key,
+        """Fail-closed ``uureal_block_ode`` data contract.
+
+        Delegates to
+        :meth:`dptb.nnops.block_ode.route_adapters.UuRealRouteAdapter.require_block_contract`
+        (extracted verbatim, ``self.`` -> ``self._owner.``); error text is
+        preserved character-for-character (redteam tests assert on it).
+        """
+        return self._route_adapters.uureal.require_block_contract(
+            data, require_endpoint_labels=require_endpoint_labels
         )
-        if require_endpoint_labels:
-            # Training/scoring needs the residual endpoint labels; label-free
-            # inference (sampling) starts from D_0=0 with mapper-derived shapes
-            # and never reads them, so it must not demand them.
-            required = required + (
-                self.node_block_target_key,
-                self.edge_block_target_key,
-                self.node_block_shape_key,
-                self.edge_block_shape_key,
-            )
-        missing = self._missing_keys(data, required)
-        if missing:
-            raise KeyError(f"uureal_block_ode data contract missing keys={missing}.")
-        expected = {
-            "blockwise_spatial_schema": "deeptb.blockwise_spatial/v1",
-            "blockwise_target_mode": "already-delta",
-            "soc_uureal_compact": True,
-            "soc_uureal_full_rme": keep * 8,
-            "soc_uureal_keep": keep,
-        }
-        for key, wanted in expected.items():
-            actual = self._metadata_scalar(data[key])
-            if actual != wanted:
-                raise ValueError(
-                    f"uureal_block_ode requires {key}={wanted!r}; got {actual!r}."
-                )
-        # A normal full-SOC->uu_real conversion records the ORIGINAL source width
-        # (e.g. 5832 for a keep=729 compact target).  The contract is that the
-        # *stored* tensors are keep-wide and keep matches the mapper; the recorded
-        # source width must only be a valid integer >= keep (keep==source when the
-        # source was already compact).  Forcing source_width==keep rejected every
-        # genuine converter product.
-        for key in (
-            "blockwise_source_target_feature_width",
-            "blockwise_source_h0_feature_width",
-        ):
-            raw_actual = self._metadata_scalar(data[key])
-            try:
-                actual = int(raw_actual)
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"uureal_block_ode requires integer {key}; got {raw_actual!r}."
-                )
-            if actual < keep:
-                raise ValueError(
-                    f"uureal_block_ode requires {key} >= keep={keep}; got {actual}."
-                )
-        for key in (self.node_h0_key, self.edge_h0_key):
-            value = torch.as_tensor(data[key])
-            if value.ndim != 2 or value.shape[-1] != keep:
-                raise ValueError(
-                    f"uureal_block_ode requires {key} width {keep}; got {tuple(value.shape)}."
-                )
-            if value.is_complex() or not bool(torch.isfinite(value).all().item()):
-                raise ValueError(f"uureal_block_ode requires finite real {key}.")
 
     @staticmethod
     def _attach_uureal_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
@@ -2496,73 +2441,14 @@ class HamiltonianCFM:
     ) -> None:
         """Fail-closed non-SOC direct-residual block contract.
 
-        ``residual_ao_block_ode`` consumes plain non-SOC raw records: the physical
-        H0 AO blocks (+ shapes) are always required, while the delta endpoint
-        labels are required only for training/scoring.  Label-free sampling starts
-        from D_0=0 with mapper-derived shapes and never reads them, so it must not
-        demand them.  Mapper non-SOC-ness is a ctor check, not a per-batch one.
+        Delegates to
+        :meth:`dptb.nnops.block_ode.route_adapters.ResidualRouteAdapter.require_block_contract`
+        (extracted verbatim, ``self.`` -> ``self._owner.``); error text is
+        preserved character-for-character (redteam tests assert on it).
         """
-        required = (
-            self.node_h0_block_key,
-            self.edge_h0_block_key,
-            self.node_h0_block_shape_key,
-            self.edge_h0_block_shape_key,
+        return self._route_adapters.residual.require_block_contract(
+            data, require_endpoint_labels=require_endpoint_labels
         )
-        if require_endpoint_labels:
-            required = required + (
-                self.node_block_target_key,
-                self.edge_block_target_key,
-                self.node_block_shape_key,
-                self.edge_block_shape_key,
-            )
-        missing = self._missing_keys(data, required)
-        if missing:
-            raise KeyError(f"residual_ao_block_ode data contract missing keys={missing}.")
-        for key in (self.node_h0_block_key, self.edge_h0_block_key):
-            self._require_real_finite_tensor(
-                data[key], label=f"residual_ao_block_ode {key}"
-            )
-        if require_endpoint_labels:
-            for key in (self.node_block_target_key, self.edge_block_target_key):
-                self._require_real_finite_tensor(
-                    data[key], label=f"residual_ao_block_ode {key}"
-                )
-        # A raw non-SOC record must never carry compact uu_real metadata: those
-        # markers belong to uureal_block_ode and would signal a converter product
-        # masquerading as a plain spatial record.
-        forbidden_metadata = [
-            key
-            for key in (
-                "soc_uureal_compact",
-                "soc_uureal_full_rme",
-                "soc_uureal_keep",
-                "blockwise_spatial_schema",
-                "blockwise_target_mode",
-            )
-            if key in data
-        ]
-        if forbidden_metadata:
-            raise ValueError(
-                "residual_ao_block_ode consumes raw non-SOC records; uu-real "
-                f"compact metadata is forbidden (found {forbidden_metadata})."
-            )
-        # Nor the reduced-SOC delta state keys, which would silently redirect the
-        # conditioning channel away from the spatial residual projector.
-        forbidden_state = [
-            key
-            for key in (
-                _keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY,
-                _keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY,
-                _keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
-                _keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
-            )
-            if key in data
-        ]
-        if forbidden_state:
-            raise ValueError(
-                "residual_ao_block_ode consumes raw non-SOC records; uu-real "
-                f"residual state keys are forbidden (found {forbidden_state})."
-            )
 
     @staticmethod
     def _attach_spatial_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
