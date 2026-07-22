@@ -8,10 +8,18 @@ from typing import Iterable, Tuple
 import torch
 from e3nn import o3
 
+from dptb.nnops.tied_irrep_constants import TIED_IRREP_CANONICAL_IRREPS
 
 TIED_IRREP_GAUSSIAN_PRIOR = "tied_irrep_gaussian"
 TIED_IRREP_SUPPORTED_MODE = "so3_tied"
-TIED_IRREP_CANONICAL_IRREPS = "3x0e + 2x1e + 1x2e"
+# TIED_IRREP_CANONICAL_IRREPS itself now lives in the dependency-free
+# dptb.nnops.tied_irrep_constants (PR#31 review finding P2-2/P2-1: this
+# literal was independently hardcoded in 3+ places, including a
+# regex-string-diff copy in dptb.utils.argcheck that could silently diverge
+# from this module's o3.Irreps-equivalence check). Re-exported here under the
+# same name so existing ``from dptb.nnops.tied_irrep_gaussian_prior import
+# TIED_IRREP_CANONICAL_IRREPS`` call sites (e.g. flow.py) keep working
+# unchanged.
 TIED_IRREP_LATENT_WIDTH = 9
 TIED_IRREP_EFFECTIVE_VARIANCES = {0: 3.0, 1: 2.0, 2: 1.0}
 
