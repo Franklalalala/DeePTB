@@ -12,6 +12,12 @@ from dptb.configuration import canonicalize_training_config
 # circular import.  See dptb/nnops/blockwise_metric_space.py's module
 # docstring for the full explanation.
 from dptb.nnops.blockwise_metric_space import endpoint_metric_space_for_options
+# Also dependency-free (no torch, no e3nn): see
+# dptb/nnops/tied_irrep_constants.py's module docstring. e3nn/torch
+# themselves are only imported lazily, inside validate_block_ode_contract's
+# tied_irrep_gaussian branch, to compare tied_irrep_irreps by o3.Irreps
+# equivalence without paying that import weight for every argcheck caller.
+from dptb.nnops.tied_irrep_constants import TIED_IRREP_CANONICAL_IRREPS
 
 
 log = logging.getLogger(__name__)
@@ -227,7 +233,7 @@ def flow_options():
         Argument("te_prior_validation_seed", int, optional=True, default=None),
         Argument("tied_irrep_sigma", (int, float), optional=True, default=1.0),
         Argument("tied_irrep_mode", str, optional=True, default=""),
-        Argument("tied_irrep_irreps", str, optional=True, default="3x0e + 2x1e + 1x2e"),
+        Argument("tied_irrep_irreps", str, optional=True, default=TIED_IRREP_CANONICAL_IRREPS),
         Argument("tied_irrep_validation_seed", int, optional=True, default=None),
         Argument("prior_node_key", str, optional=True, default=""),
         Argument("prior_edge_key", str, optional=True, default=""),
@@ -546,14 +552,32 @@ def validate_block_ode_contract(data):
             raise ValueError(
                 "tied_irrep_gaussian requires tied_irrep_mode='so3_tied'"
             )
-        canonical_irreps = "3x0e + 2x1e + 1x2e"
         configured_irreps = str(flow.get("tied_irrep_irreps", ""))
-        if re.sub(r"\s+", "", configured_irreps) != re.sub(
-            r"\s+", "", canonical_irreps
-        ):
+        # Compare via o3.Irreps equivalence, not a literal string diff, so
+        # this schema-time gate agrees exactly with flow.py's runtime
+        # validate_tied_irrep_options (tied_irrep_gaussian_prior.py): e.g.
+        # "3x0e + 2x1e + 2e" and "3x0e + 2x1e + 1x2e" parse to the same
+        # o3.Irreps object (bare "2e" is e3nn shorthand for "1x2e") but
+        # differ as strings -- PR#31 review finding P2-1. e3nn/torch are
+        # imported lazily here rather than at module scope: see
+        # dptb/nnops/tied_irrep_constants.py's module docstring for why
+        # dptb.utils.argcheck must stay importable without that weight for
+        # callers who never validate a tied_irrep_gaussian config.
+        from e3nn import o3 as _tied_irrep_o3
+
+        try:
+            irreps_match = _tied_irrep_o3.Irreps(
+                configured_irreps
+            ) == _tied_irrep_o3.Irreps(TIED_IRREP_CANONICAL_IRREPS)
+        except Exception as exc:
+            raise ValueError(
+                "tied_irrep_gaussian requires a valid tied_irrep_irreps "
+                f"string; got {configured_irreps!r}"
+            ) from exc
+        if not irreps_match:
             raise ValueError(
                 "tied_irrep_gaussian currently supports exactly "
-                f"tied_irrep_irreps={canonical_irreps!r}"
+                f"tied_irrep_irreps={TIED_IRREP_CANONICAL_IRREPS!r}"
             )
         raw_scales = {
             "node_sigma": flow.get("node_sigma", 1.0),

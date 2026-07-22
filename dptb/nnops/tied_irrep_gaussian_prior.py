@@ -8,10 +8,18 @@ from typing import Iterable, Tuple
 import torch
 from e3nn import o3
 
+from dptb.nnops.tied_irrep_constants import TIED_IRREP_CANONICAL_IRREPS
 
 TIED_IRREP_GAUSSIAN_PRIOR = "tied_irrep_gaussian"
 TIED_IRREP_SUPPORTED_MODE = "so3_tied"
-TIED_IRREP_CANONICAL_IRREPS = "3x0e + 2x1e + 1x2e"
+# TIED_IRREP_CANONICAL_IRREPS itself now lives in the dependency-free
+# dptb.nnops.tied_irrep_constants (PR#31 review finding P2-2/P2-1: this
+# literal was independently hardcoded in 3+ places, including a
+# regex-string-diff copy in dptb.utils.argcheck that could silently diverge
+# from this module's o3.Irreps-equivalence check). Re-exported here under the
+# same name so existing ``from dptb.nnops.tied_irrep_gaussian_prior import
+# TIED_IRREP_CANONICAL_IRREPS`` call sites (e.g. flow.py) keep working
+# unchanged.
 TIED_IRREP_LATENT_WIDTH = 9
 TIED_IRREP_EFFECTIVE_VARIANCES = {0: 3.0, 1: 2.0, 2: 1.0}
 
@@ -165,7 +173,27 @@ def dense_all_one_irrep_expansion(
     *,
     irrep_spec: str = TIED_IRREP_CANONICAL_IRREPS,
 ) -> torch.Tensor:
-    """Reference dense all-one expansion for the canonical 14D irrep vector."""
+    """Reference dense all-one expansion for the canonical 14D irrep vector.
+
+    Matches the real production path (``fill_tied_irrep_rme`` ->
+    ``BlockStateCodec.rme_to_blocks``, i.e. ``E3Hamiltonian``) bit-exactly for
+    every single-copy-target block and for any canonical (ascending
+    shell-index) direction of a multi-copy or cross-degree block -- see
+    ``test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row``
+    in ``dptb/tests/test_tied_irrep_gaussian_prior.py``.
+
+    Known scope limit: the "mirror" direction of an off-diagonal, higher-
+    shell-index multi-copy or cross-degree block (e.g. the second p-shell
+    against the first, or the d-shell against a p-shell) is NOT guaranteed to
+    match production.  This function recomputes that direction independently
+    (a fresh ``o3.wigner_3j(ir_out2.l, ir_out1.l, ir_in.l)`` call), while
+    production derives it by a literal, unsigned transpose of the canonical
+    block.  Swapping a Wigner-3j's first two arguments equals its transpose
+    only when ``ir_out1.l + ir_out2.l + ir_in.l`` is even; for an odd-parity
+    coupled degree (e.g. p-p's L=1, or p-d's L=2) the two disagree in sign on
+    that channel.  This is independent of, and narrower than, the
+    sqrt(2L+1) Clebsch-Gordan normalization this function applies below.
+    """
     validate_tied_irrep_options(mode=TIED_IRREP_SUPPORTED_MODE, irreps=irrep_spec)
     irreps = o3.Irreps(irrep_spec)
     x = torch.as_tensor(z)
@@ -196,13 +224,25 @@ def dense_all_one_irrep_expansion(
                     device=x.device,
                     dtype=x.dtype,
                 )
+                # Standard Wigner-3j -> Clebsch-Gordan normalization: e3nn's
+                # raw ``wigner_3j`` is missing the sqrt(2L+1) factor relative
+                # to a normalized CG coefficient, where L is the coupled
+                # (summed/input) degree ``ir_in.l`` here.  This must match the
+                # production codec exactly: ``E3Hamiltonian._initialize_CG_basis``
+                # (dptb/nn/hamiltonian.py) builds its ``cgbasis`` as
+                # ``wigner_3j(l1, l2, l_ird) * (2 * l_ird + 1) ** 0.5`` for
+                # every coupled degree ``l_ird``, which is exactly ``ir_in.l``
+                # in this loop's naming.  Dropping this factor was PR#31
+                # review finding P1-1: every L>=1 contribution here was
+                # under-scaled by 1/sqrt(2L+1) relative to
+                # ``BlockStateCodec.rme_to_blocks`` (the real production path).
                 w3j = o3.wigner_3j(
                     int(ir_out1.l),
                     int(ir_out2.l),
                     int(ir_in.l),
                     dtype=x.dtype,
                     device=x.device,
-                )
+                ) * (2 * int(ir_in.l) + 1) ** 0.5
                 result = torch.einsum(
                     "wuv,ijk,bwk->buivj",
                     weights,
