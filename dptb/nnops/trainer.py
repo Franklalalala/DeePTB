@@ -468,6 +468,13 @@ class Trainer(BaseTrainer):
                 prefix="train_compatible",
                 legacy_prefix="train",
                 global_step=getattr(self, "iter", None),
+                # Mirror this method's own fallback gate below (`not
+                # model_in_loss`): when model_in_loss is True there is no raw-batch
+                # recompute fallback to fall through to, so a metric_space
+                # mismatch must fail fast with a diagnostic instead of silently
+                # returning None and falling through to the generic
+                # "could not reconstruct" RuntimeError a few lines down (P1-1).
+                fail_on_metric_space_mismatch=model_in_loss,
             )
             if compatible_state is None and not model_in_loss:
                 compatible_state = self._compatible_loss_state(
