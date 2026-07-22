@@ -177,22 +177,49 @@ def dense_all_one_irrep_expansion(
 
     Matches the real production path (``fill_tied_irrep_rme`` ->
     ``BlockStateCodec.rme_to_blocks``, i.e. ``E3Hamiltonian``) bit-exactly for
-    every single-copy-target block and for any canonical (ascending
-    shell-index) direction of a multi-copy or cross-degree block -- see
-    ``test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row``
-    in ``dptb/tests/test_tied_irrep_gaussian_prior.py``.
+    EVERY block of water's real ``3s2p1d`` oxygen basis, mirror pairs and
+    cross-degree pairs included -- see
+    ``test_dense_all_one_expansion_matches_production_codec_full_water_oxygen_matrix``
+    and ``test_dense_all_one_expansion_matches_production_codec_on_homonuclear_edge``
+    in ``dptb/tests/test_tied_irrep_gaussian_prior.py`` (the latter confirms
+    edge rows, not just node rows, reduce to the identical convention once a
+    directed edge and its reverse partner are tied to the same field).
 
-    Known scope limit: the "mirror" direction of an off-diagonal, higher-
-    shell-index multi-copy or cross-degree block (e.g. the second p-shell
-    against the first, or the d-shell against a p-shell) is NOT guaranteed to
-    match production.  This function recomputes that direction independently
-    (a fresh ``o3.wigner_3j(ir_out2.l, ir_out1.l, ir_in.l)`` call), while
-    production derives it by a literal, unsigned transpose of the canonical
-    block.  Swapping a Wigner-3j's first two arguments equals its transpose
-    only when ``ir_out1.l + ir_out2.l + ir_in.l`` is even; for an odd-parity
-    coupled degree (e.g. p-p's L=1, or p-d's L=2) the two disagree in sign on
-    that channel.  This is independent of, and narrower than, the
-    sqrt(2L+1) Clebsch-Gordan normalization this function applies below.
+    Shell-index convention: within one irrep chunk (``mul`` copies of the same
+    ``ir``, e.g. the two ``1e`` radial copies), copy order follows ascending
+    position in the flattened input -- i.e. copy 0 is the "first" shell, copy
+    1 the "second", matching ``OrbitalMapper.get_orbpair_maps``'s ascending
+    radial-index storage convention exactly.  Across chunks, ascending chunk
+    order (the irrep string's own declared order, e.g. s before p before d)
+    matches ``OrbitalMapper.get_orbpairtype_maps``'s ascending type order.
+
+    Production (``BlockStateCodec.rme_to_blocks`` ->
+    ``feature_tensors_to_block_tensors``) stores each such shell pair exactly
+    once, in ascending shell-index order, and reconstructs the descending
+    ("mirror") direction of every off-diagonal pair by a literal, unsigned
+    transpose of that canonical block -- never an independent recompute (see
+    ``dptb/data/interfaces/blockwise_tensor.py``'s
+    ``symmetrize_onsite``/``complete_edge_blocks_from_reverse`` paths). A
+    single triple-nested loop that computes every ordered ``(j, k)`` chunk
+    pair independently -- the earlier version of this function -- disagrees
+    with that convention in two ways, both fixed by the post-processing below
+    instead of by an independent recompute of the descending direction:
+
+    1. Same-chunk, multiple radial copies (e.g. the two ``1e`` "p" copies):
+       the per-``(j, k)`` einsum's ``weights`` tensor is all-ones and does not
+       depend on the copy indices ``(u, v)``, so every copy-pair sub-block
+       comes out numerically IDENTICAL across ``(u, v)`` -- including the
+       ``u > v`` "descending copy" ones -- instead of the ``u <= v`` value's
+       transpose.
+    2. Cross-chunk, different total degree (e.g. "p" vs "d"): the independent
+       computation for chunk pair ``(k, j)`` uses a fresh
+       ``wigner_3j(ir_out2.l, ir_out1.l, ir_in.l)`` call.  Swapping a
+       Wigner-3j's first two arguments equals the transpose of the original
+       only when ``ir_out1.l + ir_out2.l + ir_in.l`` is even; a block that
+       sums more than one coupled degree of mixed parity (e.g. p-d's L=1 and
+       L=2) then disagrees with the transpose on some channels and agrees on
+       others -- neither the correct value nor even internally
+       transpose-consistent with its own canonical direction.
     """
     validate_tied_irrep_options(mode=TIED_IRREP_SUPPORTED_MODE, irreps=irrep_spec)
     irreps = o3.Irreps(irrep_spec)
@@ -251,6 +278,41 @@ def dense_all_one_irrep_expansion(
                 ).reshape(batch, int(mul_out1 * ir_out1.dim), int(mul_out2 * ir_out2.dim))
                 key = (j, k)
                 outputs[key] = result if key not in outputs else outputs[key] + result
+
+    # Fix 1 (same-chunk copy order): every (u, v) copy-pair sub-block the loop
+    # above produced for a diagonal chunk key (j, j) is numerically identical
+    # (see docstring point 1).  Keep that shared value for u <= v (the
+    # ascending/canonical copy order, already correct -- e.g. p1-p1, p1-p2,
+    # p2-p2) and overwrite u > v (e.g. p2-p1) with its transpose.
+    for j, (mul_j, ir_j) in enumerate(irreps):
+        mul_j = int(mul_j)
+        if mul_j <= 1:
+            continue
+        block = outputs.get((j, j))
+        if block is None:
+            continue
+        dim_j = int(ir_j.dim)
+        template = block[:, 0:dim_j, 0:dim_j]
+        fixed = block.clone()
+        for u in range(mul_j):
+            for v in range(mul_j):
+                if u <= v:
+                    continue
+                fixed[:, u * dim_j:(u + 1) * dim_j, v * dim_j:(v + 1) * dim_j] = (
+                    template.transpose(-1, -2)
+                )
+        outputs[(j, j)] = fixed
+
+    # Fix 2 (cross-chunk mirror): discard whatever the independent
+    # (k, j)-with-k>j computation above produced (see docstring point 2) and
+    # replace it with the literal transpose of the ascending-chunk-order
+    # (j, k) canonical block, matching production exactly.
+    n_chunks = len(irreps)
+    for j in range(n_chunks):
+        for k in range(j + 1, n_chunks):
+            canonical = outputs.get((j, k))
+            if canonical is not None:
+                outputs[(k, j)] = canonical.transpose(-1, -2)
 
     rows = []
     for i, (_mul_i, ir_i) in enumerate(irreps):

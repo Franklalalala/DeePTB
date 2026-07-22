@@ -211,7 +211,7 @@ All five numbers above are printed directly by the fixed
 independently cross-checked bit-exact against the real production codec
 (`fill_tied_irrep_rme` -> `flow.block_codec.rme_to_blocks`, i.e.
 `E3Hamiltonian`) on water's real oxygen `3s2p1d` row -- see
-`test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row`
+`test_dense_all_one_expansion_matches_production_codec_full_water_oxygen_matrix`
 in `dptb/tests/test_tied_irrep_gaussian_prior.py`.  An earlier version of
 this section was generated from a `dense_all_one_irrep_expansion` that was
 missing the standard `sqrt(2L+1)` Wigner-3j-to-Clebsch-Gordan normalization
@@ -219,6 +219,25 @@ factor for every `L>=1` channel; `epsilon_s1p1`/`epsilon_s1d` were off by
 `sqrt(3)`/`sqrt(5)` and `epsilon_p1p1`'s non-scalar channels were mis-scaled
 by different factors (only its trace, the pure `L=0` part, was correct). The
 `epsilon_ss` block was unaffected (`L=0` only, `sqrt(1)=1`).
+
+`epsilon_ss`, `epsilon_p1p1`, `epsilon_s1p1`, and `epsilon_s1d` are each
+either a self-pair block (`s`-`s`, `p1`-`p1`) or an ascending-shell-index
+("canonical") pair (`s1` before `p1`; `s1` before `d1`), so none of them were
+affected by a separate, narrower issue a later review pass found and fixed:
+`dense_all_one_irrep_expansion` originally recomputed the *descending*
+shell-index direction of an off-diagonal multi-copy or cross-degree pair
+(e.g. the second `p` copy against the first, or `d` against `p`)
+independently instead of deriving it as the transpose of the ascending
+direction, the way the production codec actually does
+(`feature_tensors_to_block_tensors`'s `symmetrize_onsite` path). That made 3
+of the 36 ordered shell-pair blocks in O's full onsite matrix
+(`p2`-`p1`, `d1`-`p1`, `d1`-`p2`) numerically wrong -- none of which this
+section's worked example exercises. It is fixed now; the full 14x14 matrix
+(every ordered pair of O's 6 individual shells, node row and a homonuclear
+edge row) is cross-checked bit-exact against production in
+`test_dense_all_one_expansion_matches_production_codec_full_water_oxygen_matrix`
+and
+`test_dense_all_one_expansion_matches_production_codec_on_homonuclear_edge`.
 
 ## 5. Before and after adding the prior
 
