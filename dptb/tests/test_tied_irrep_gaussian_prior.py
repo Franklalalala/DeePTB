@@ -231,6 +231,17 @@ def test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row():
 
 
 def test_effective_latent_variances_match_multiplicity_sums():
+    """PR#31 review nit-3: assert each L=1/L=2 component individually rather
+    than only their mean-over-degree.  The original mean-based check was
+    statistically fine (``effective_tied_irrep_latent`` applies a uniform
+    per-slice scale, so no single m-component can get a different factor than
+    its siblings) but was a strictly weaker regression guard: it could not by
+    itself catch a future bug that scaled, say, only ``variances[1]``
+    differently from ``variances[2]``/``variances[3]`` as long as their mean
+    still landed near 2.0.  Same sampling budget/tolerance as before (8192
+    draws, seed 0, rtol=0.08) -- per-component sampling noise at this N still
+    sits several standard deviations inside that tolerance.
+    """
     generator = torch.Generator().manual_seed(0)
     standard = torch.randn(8192, 9, dtype=torch.float64, generator=generator)
     effective = effective_tied_irrep_latent(standard)
@@ -241,18 +252,20 @@ def test_effective_latent_variances_match_multiplicity_sums():
         rtol=0.08,
         atol=0.0,
     )
-    torch.testing.assert_close(
-        variances[1:4].mean(),
-        torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[1], dtype=torch.float64),
-        rtol=0.08,
-        atol=0.0,
-    )
-    torch.testing.assert_close(
-        variances[4:9].mean(),
-        torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[2], dtype=torch.float64),
-        rtol=0.08,
-        atol=0.0,
-    )
+    for component in range(1, 4):
+        torch.testing.assert_close(
+            variances[component],
+            torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[1], dtype=torch.float64),
+            rtol=0.08,
+            atol=0.0,
+        )
+    for component in range(4, 9):
+        torch.testing.assert_close(
+            variances[component],
+            torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[2], dtype=torch.float64),
+            rtol=0.08,
+            atol=0.0,
+        )
 
 
 def test_rme_draw_is_degree_tied_low_rank_and_zeros_high_l():
@@ -371,6 +384,51 @@ def test_seeded_draw_is_batch_composition_invariant_per_uid():
             num_graphs=1,
             generator=flow._seeded_generator(device, _TIED_SEED),
         )
+
+
+def test_seeded_node_and_edge_tied_draws_are_independent_substreams():
+    """PR#31 review nit-5 / section 3a: node and edge draws for the SAME
+    graph must come from independent substreams, not accidentally alias each
+    other. ``_residual_tied_irrep_gaussian_eps`` calls
+    ``_tied_irrep_gaussian_prior_like`` twice with the SAME ``generator``
+    object (once ``label="node"``, once ``label="edge"``); the two only stay
+    distinct because ``_prior_uid_substream_seed`` XORs in a distinct
+    per-component constant before deriving each substream. This is
+    pre-existing, ``projected_te``-shared infrastructure PR#31 reuses
+    unmodified (review confirmed it sound by reading the source), but
+    ``test_seeded_draw_is_batch_composition_invariant_per_uid`` above only
+    ever exercises node draws for ``tied_irrep_gaussian`` -- nothing asserted
+    node != edge specifically, so a future refactor that accidentally
+    aliased the two component streams would pass silently.
+    """
+    mapper = _mapper()
+    flow = _b_tied_flow(mapper)
+    data, h0, _d1 = _b_record(mapper)
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
+
+    generator = flow._seeded_generator(node_base.device, _TIED_SEED)
+    node_noise = flow._tied_irrep_gaussian_prior_like(
+        torch.zeros_like(node_base),
+        flow.node_sigma,
+        data=data,
+        label="node",
+        num_graphs=1,
+        generator=generator,
+    )
+    edge_noise = flow._tied_irrep_gaussian_prior_like(
+        torch.zeros_like(edge_base),
+        flow.edge_sigma,
+        data=data,
+        label="edge",
+        num_graphs=1,
+        generator=generator,
+    )
+    assert torch.count_nonzero(node_noise) > 0
+    assert torch.count_nonzero(edge_noise) > 0
+    # Same shape here (this graph has 2 nodes and 2 directed edges) is what
+    # makes the elementwise inequality below meaningful rather than vacuous.
+    assert node_noise.shape == edge_noise.shape
+    assert not torch.equal(node_noise, edge_noise)
 
 
 def test_prepare_batch_and_sampler_share_tied_prior_d0_law():
