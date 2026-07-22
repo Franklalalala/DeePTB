@@ -10,11 +10,15 @@ from dptb.data import _keys
 from dptb.data.interfaces import blockwise_tensor as blockwise_module
 from dptb.data.interfaces.blockwise_tensor import (
     BlockTensorResult,
+    block_components,
     block_mask_from_shapes,
     canonical_block_tensors_to_feature_tensors,
+    l1_rmse_from_components,
+    strict_reverse_edge_index,
 )
 from dptb.data.transforms import OrbitalMapper
 from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
+from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
 from dptb.nnops.flow import HamiltonianCFM
 from dptb.nnops.multi_trainer import MultiTrainer
 
@@ -343,6 +347,78 @@ def test_multitrainer_residual_euler_validation_scores_full_sample_via_flow():
     assert len(score_calls) == 2
     assert torch.equal(trainer.model.inputs[0][0], trainer.model.inputs[1][0])
     assert torch.equal(trainer.model.inputs[0][1], trainer.model.inputs[1][1])
+
+
+def test_multitrainer_block_ode_validation_fails_fast_on_metric_space_mismatch():
+    """P1-1: MultiTrainer._build_validation_euler_payload's block_ode branch has
+    no raw-batch recompute fallback (an immediate RuntimeError follows a None
+    compatible_state a few lines down), so a flow/criterion metric_space
+    mismatch must raise the specific diagnostic instead of collapsing into
+    that generic message. Same harness as
+    test_multitrainer_residual_euler_validation_scores_full_sample_via_flow
+    above, except the criterion now declares a label ("rme") that disagrees
+    with what block-ODE always publishes ("block")."""
+    idp, data, codec, _ = _case()
+    delta = _scaled_endpoint(
+        codec,
+        data,
+        data[_keys.NODE_H0_KEY],
+        data[_keys.EDGE_H0_KEY],
+        scale=0.25,
+    )
+    batch = _fresh(data)
+    batch[_keys.NODE_DELTA_HAMIL_BLOCKS_KEY] = delta.node_blocks.clone()
+    batch[_keys.EDGE_DELTA_HAMIL_BLOCKS_KEY] = delta.edge_blocks.clone()
+    batch[_keys.NODE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = delta.node_shapes.clone()
+    batch[_keys.EDGE_DELTA_HAMIL_BLOCK_SHAPE_KEY] = delta.edge_shapes.clone()
+
+    class MismatchedSpaceCriterion:
+        endpoint_metric_space = "rme"
+
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError(
+                "block_ode branch has no raw-batch fallback; a metric-space "
+                "mismatch must raise before ever calling the criterion directly"
+            )
+
+        @staticmethod
+        def compatible_loss_from_stats(**stats):
+            raise AssertionError(
+                "must fail before reducing mismatched-population stats"
+            )
+
+    trainer = object.__new__(MultiTrainer)
+    trainer.iter = 1
+    trainer.dtype = torch.float64
+    trainer.device = torch.device("cpu")
+    trainer._tagger = SimpleNamespace(
+        tag=lambda *_args, **_kwargs: nullcontext()
+    )
+    trainer.model = EndpointSequence([delta])
+    trainer.flow_cfm = _flow(
+        idp,
+        semantics="residual_dh",
+        prior="projected_te",
+        te_prior_mode="irrep",
+        node_sigma=0.25,
+        edge_sigma=0.25,
+    )
+    trainer.flow_cfm.log_validation_flow_euler_loss = False
+    trainer._prepare_expert_masks = lambda batch_dict, *_args: (
+        torch.ones(batch_dict[_keys.EDGE_H0_KEY].shape[0], dtype=torch.bool),
+        torch.ones(batch_dict[_keys.NODE_H0_KEY].shape[0], dtype=torch.bool),
+    )
+
+    with pytest.raises(ValueError, match=r"metric_space='block'.*endpoint_metric_space='rme'"):
+        trainer._build_validation_euler_payload(
+            batch_dict=batch,
+            batch_info={},
+            criterion=MismatchedSpaceCriterion(),
+            expert_idx=0,
+            range_dis=(0.0, 1.0),
+            num_steps=1,
+            prior_seed=20260719,
+        )
 
 
 def test_block_ode_reinjects_lem_sidecar_each_step_without_leaking_it():
@@ -1097,8 +1173,14 @@ def test_new_loss_requires_both_components_exact_shapes_and_physical_target():
     pred[flow.edge_output_key] = endpoint.edge_blocks
     loss, state = flow.loss(pred, ref, ctx)
     assert loss.item() <= ATOL
-    assert state["_compatible_clean_stats"]["onsite_count"].item() == 7
-    assert state["_compatible_clean_stats"]["hopping_count"].item() == 3
+    # P1-1: _compatible_clean_stats counts the criterion's directed-full AO
+    # population (every shape-active entry: H 1x1 + C 3x3 = 10 onsite,
+    # edge(1,3) + edge(3,1) = 6 hopping), not the canonical independent-freedom
+    # subset (onsite upper triangle = 7, one reverse-edge side = 3) that
+    # train_flow_onsite_loss/train_flow_hopping_loss use for training.  zero
+    # error here makes only the counts (not the l1/mse sums, still 0) visible.
+    assert state["_compatible_clean_stats"]["onsite_count"].item() == 10
+    assert state["_compatible_clean_stats"]["hopping_count"].item() == 6
 
     polluted_topology = pred.copy()
     polluted_topology[_keys.EDGE_CELL_SHIFT_KEY] = torch.ones_like(
@@ -1171,3 +1253,163 @@ def test_residual_training_and_sample_scoring_have_flow_owned_semantics():
     assert "_block_ode_sample_is_full" not in sampled
     sample_loss, _ = flow.loss_on_sample(sampled, ref, ctx)
     assert sample_loss.item() <= ATOL
+
+
+# ===========================================================================
+# P1-1 regression: the block-ODE endpoint's `_compatible_clean_stats` payload
+# (consumed by Trainer._compatible_loss_state_from_flow_stats ->
+# criterion.compatible_loss_from_stats) must count the SAME population as
+# HamilBlockwiseNexTHamLoss.block_components: every shape-active directed AO
+# entry.  It must NOT reuse the canonical population (onsite upper triangle,
+# one side of each reverse-edge pair) that `train_flow_onsite_loss`/
+# `train_flow_hopping_loss` use for the training reduction -- that population
+# is ~2x smaller whenever the error is not itself Hermitian-symmetric-in-count,
+# and silently relabeling it "block" (the same tag the criterion uses for its
+# directed-full count) used to understate L1/RMSE by ~30% on exactly such
+# errors (see the module docstring counterexample in flow.py's fix comment).
+# ===========================================================================
+
+
+def _canonical_population_masks(idp, ref, pred_projected, node_shapes, edge_shapes):
+    """Reproduce the pre-fix canonical (independent-freedom) population masks.
+
+    Used only to prove this test's directed-full case is not degenerate --
+    i.e. canonical and directed genuinely differ here, so a regression back to
+    canonical counts would fail the population/count assertions below.
+    """
+    node_valid = block_mask_from_shapes(
+        node_shapes, tuple(pred_projected.node_blocks.shape[-2:])
+    )
+    upper = torch.triu(
+        torch.ones(tuple(pred_projected.node_blocks.shape[-2:]), dtype=torch.bool)
+    )
+    node_mask = node_valid & upper.unsqueeze(0)
+
+    edge_valid = block_mask_from_shapes(
+        edge_shapes, tuple(pred_projected.edge_blocks.shape[-2:])
+    )
+    rev = strict_reverse_edge_index(ref, idp=idp)
+    rows = torch.arange(pred_projected.edge_blocks.shape[0])
+    canonical_rows = rows <= rev
+    edge_mask = edge_valid & canonical_rows.view(-1, 1, 1)
+    self_reverse = rows == rev
+    if bool(self_reverse.any().item()):
+        edge_mask[self_reverse] &= upper.unsqueeze(0)
+    return node_mask, edge_mask
+
+
+def test_block_ode_compatible_stats_match_criterion_directed_population():
+    """flow's published block-endpoint stats == criterion's own block_components.
+
+    Builds a Hermitian-symmetric-error absolute_full_h block-ODE sample
+    (pred = 2*target; _case()'s target blocks are exactly onsite-symmetric and
+    reverse-edge-consistent by construction via project_block_state) so
+    project_block_state is provably a no-op on both pred and target here --
+    isolating the population-selection bug from any projection effect.  Then
+    checks, to atol=1e-12:
+
+    1. flow's `_compatible_clean_stats` raw sums/counts equal
+       `blockwise_tensor.block_components` called directly on the identical
+       (projection-invariant) pred/target block tensors -- the criterion's own
+       population, not reimplemented by hand.
+    2. Reducing flow's stats through
+       `HamilBlockwiseNexTHamLoss.compatible_loss_from_stats` reproduces the
+       same onsite/hopping/total the criterion's own reduction formula
+       (`l1_rmse_from_components`) gives on that identical population.
+    3. The directed-full population genuinely differs from the canonical
+       (pre-fix) population on this sample, so the test cannot pass by
+       accident if a future change reverts to canonical counts.
+    """
+    idp, data, codec, h0_blocks = _case()
+    batch = _fresh(data)
+    batch["node_full_hamil_target_blocks"] = h0_blocks.node_blocks.clone()
+    batch["edge_full_hamil_target_blocks"] = h0_blocks.edge_blocks.clone()
+    batch["node_full_hamil_target_block_shape"] = h0_blocks.node_shapes.clone()
+    batch["edge_full_hamil_target_block_shape"] = h0_blocks.edge_shapes.clone()
+
+    flow = _flow(idp)  # semantics="absolute_full_h" default
+    assert not flow.uureal_block_ode and flow.block_ode
+
+    _prepared, ref, ctx = flow.prepare_batch(
+        _fresh(batch), _fresh(batch), t=torch.tensor([0.0])
+    )
+    pred = dict(ref)
+    pred[flow.node_output_key] = 2.0 * torch.as_tensor(ref[flow.node_block_target_key])
+    pred[flow.edge_output_key] = 2.0 * torch.as_tensor(ref[flow.edge_block_target_key])
+
+    loss, state = flow.loss(pred, ref, ctx)
+    assert torch.isfinite(loss)
+    stats = state["_compatible_clean_stats"]
+    assert stats["metric_space"] == "block"
+
+    node_shapes = torch.as_tensor(ref[flow.node_block_shape_key])
+    edge_shapes = torch.as_tensor(ref[flow.edge_block_shape_key])
+    pred_state = BlockTensorResult(
+        pred[flow.node_output_key], pred[flow.edge_output_key], node_shapes, edge_shapes
+    )
+    target_state = BlockTensorResult(
+        torch.as_tensor(ref[flow.node_block_target_key]),
+        torch.as_tensor(ref[flow.edge_block_target_key]),
+        node_shapes,
+        edge_shapes,
+    )
+    pred_projected = project_block_state(ref, idp, pred_state)
+    target_projected = project_block_state(ref, idp, target_state)
+    # Precondition this test relies on: projection is exactly a no-op here.
+    torch.testing.assert_close(
+        pred_projected.node_blocks, pred_state.node_blocks, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        pred_projected.edge_blocks, pred_state.edge_blocks, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        target_projected.node_blocks, target_state.node_blocks, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        target_projected.edge_blocks, target_state.edge_blocks, rtol=0.0, atol=0.0
+    )
+
+    # (1) flow's raw sums/counts vs the criterion's own directed-full reducer.
+    node_comp = block_components(
+        pred_projected.node_blocks,
+        target_projected.node_blocks,
+        node_shapes,
+        complex_reduction="modulus",
+    )
+    edge_comp = block_components(
+        pred_projected.edge_blocks,
+        target_projected.edge_blocks,
+        edge_shapes,
+        complex_reduction="modulus",
+    )
+    torch.testing.assert_close(stats["onsite_l1_sum"], node_comp.abs_sum, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(stats["onsite_mse_sum"], node_comp.square_sum, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(stats["onsite_count"], node_comp.count, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(stats["hopping_l1_sum"], edge_comp.abs_sum, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(stats["hopping_mse_sum"], edge_comp.square_sum, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(stats["hopping_count"], edge_comp.count, rtol=0.0, atol=1e-12)
+
+    # (2) end-to-end reduction through the criterion's compatible_loss_from_stats.
+    criterion = HamilBlockwiseNexTHamLoss(basis={"H": "1s"})
+    assert criterion.endpoint_metric_space == "block"
+    total_from_flow, onsite_from_flow, hopping_from_flow = criterion.compatible_loss_from_stats(
+        onsite_l1_sum=stats["onsite_l1_sum"],
+        onsite_mse_sum=stats["onsite_mse_sum"],
+        onsite_count=stats["onsite_count"],
+        hopping_l1_sum=stats["hopping_l1_sum"],
+        hopping_mse_sum=stats["hopping_mse_sum"],
+        hopping_count=stats["hopping_count"],
+    )
+    onsite_direct = l1_rmse_from_components(node_comp, eps=criterion.eps)
+    hopping_direct = l1_rmse_from_components(edge_comp, eps=criterion.eps)
+    total_direct = 0.5 * (onsite_direct + hopping_direct)
+    torch.testing.assert_close(onsite_from_flow, onsite_direct, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(hopping_from_flow, hopping_direct, rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(total_from_flow, total_direct, rtol=0.0, atol=1e-12)
+
+    # (3) non-degeneracy: directed-full must genuinely outcount canonical here.
+    node_mask, edge_mask = _canonical_population_masks(
+        idp, ref, pred_projected, node_shapes, edge_shapes
+    )
+    assert int(node_mask.sum()) < int(node_comp.count.item())
+    assert int(edge_mask.sum()) < int(edge_comp.count.item())

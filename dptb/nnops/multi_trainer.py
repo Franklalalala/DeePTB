@@ -3401,6 +3401,12 @@ class MultiTrainer(Trainer):
                 prefix="train_compatible",
                 legacy_prefix="train",
                 global_step=getattr(self, "iter", None),
+                # This branch (block_ode) has no raw-batch recompute fallback --
+                # the euler-rolled sample is not directly re-scoreable by the
+                # criterion's forward(), see the immediate RuntimeError below.
+                # Fail fast with a diagnostic on a metric_space mismatch instead
+                # of letting it collapse into that generic message (P1-1).
+                fail_on_metric_space_mismatch=True,
             )
             if compatible_state is None:
                 raise RuntimeError(

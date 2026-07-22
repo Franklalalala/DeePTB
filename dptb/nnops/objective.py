@@ -238,6 +238,12 @@ class FlowObjective:
                 prefix=compatible_prefix,
                 legacy_prefix=flow_prefix,
                 global_step=t.iter,
+                # model_in_loss branch: unlike the `else` branch below, there is
+                # no raw-batch criterion-recompute fallback here, so a
+                # metric_space mismatch must fail fast with a diagnostic instead
+                # of silently falling through to the generic RuntimeError at the
+                # bottom of this method (P1-1).
+                fail_on_metric_space_mismatch=True,
             )
             if compatible_state is not None:
                 flow_state.update(compatible_state)

@@ -537,6 +537,58 @@ def _flow_validation_ode_steps(
         out["validation_ode_steps"] = sorted(steps)
 
 
+# output_space spellings whose block-ODE route parametrizes the rollout as
+# D_t = t * D1, so the exact t=0, D=0 inference boundary only receives
+# training mass when t0_probability > 0 (dptb.nnops.flow's uureal_block_ode /
+# residual_ao_block_ode branches, mirrored by
+# dptb.utils.argcheck.validate_block_ode_contract's uureal_mode /
+# residual_spatial_mode checks).  The plain ao_block_ode route is deliberately
+# excluded: it keeps the schema-wide t0_probability default of 0.0.
+_BLOCK_ODE_T0_BOUNDARY_OUTPUT_SPACES = frozenset(
+    (
+        "uureal_block_ode",
+        "spatial_uureal_residual_block_ode",
+        "uureal_residual_block_ode",
+        "residual_ao_block_ode",
+    )
+)
+
+
+def _flow_t0_probability_boundary_default(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
+    """Give uureal/residual block-ODE routes their documented 0.15 default.
+
+    dargs' schema-wide default for ``t0_probability`` is 0.0 (it has no way to
+    know these two routes need a different one), and ``normalize()`` runs
+    dargs' ``normalize_value`` immediately after this canonicalization pass.
+    By the time ``validate_block_ode_contract`` inspects the config, "omitted"
+    and "explicit 0.0" would already be indistinguishable -- both read back as
+    0.0 -- unless resolved here, before dargs ever sees the dict.  That made
+    the "omitting t0_probability lets the runtime default 0.15 apply" comments
+    in ``dptb.nnops.flow`` and ``validate_block_ode_contract`` unreachable in
+    the real ``normalize()`` pipeline: any uureal_block_ode/residual_ao_block_ode
+    config that didn't set t0_probability explicitly failed config-time
+    validation, even though the identical dict validated fine when those
+    validators were called directly (bypassing dargs' default injection), and
+    even though the flow constructor's own ``options.get("t0_probability", 0.15)``
+    fallback works correctly in that direct-call context.
+
+    Only fill the key in when it is genuinely absent; an explicit value
+    (including an explicit 0.0) is left completely untouched and still fails
+    the positive-probability contract check downstream, exactly as documented.
+    """
+
+    if "t0_probability" in out:
+        return
+    output_space = out.get("output_space", "")
+    normalized_output_space = (
+        _normalized_name(output_space) if isinstance(output_space, str) else ""
+    )
+    if normalized_output_space in _BLOCK_ODE_T0_BOUNDARY_OUTPUT_SPACES:
+        out["t0_probability"] = 0.15
+
+
 def _flow_omit_time_scaling(
     out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
 ) -> None:
@@ -613,6 +665,7 @@ _FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
     _Transform(_flow_prediction_reconstruction_marker),
     _Transform(_flow_validation_metrics),
     _Transform(_flow_validation_ode_steps),
+    _Transform(_flow_t0_probability_boundary_default),
     _Transform(_flow_omit_time_scaling),
     _Transform(_flow_dead_top_flags),
     _Transform(_flow_final_normalize),
