@@ -36,6 +36,7 @@ from dptb.nnops.block_flow_codec import (
     _FLOW_PROJECTED_STATE_TOKEN,
     project_block_state,
 )
+from dptb.nnops.block_ode import topology as _block_ode_topology
 from dptb.nnops.flow_context import CFMContext, _to_torch_dtype
 from dptb.nnops import prior_calibration
 from dptb.nnops.flow_priors import (
@@ -2388,78 +2389,25 @@ class HamiltonianCFM:
 
     @staticmethod
     def _require_real_finite_tensor(value: Any, *, label: str) -> torch.Tensor:
-        tensor = torch.as_tensor(value)
-        if tensor.is_complex():
-            raise ValueError(f"{label} must be real for non-SOC block-space ODE.")
-        if not bool(torch.isfinite(tensor).all().item()):
-            raise ValueError(f"{label} contains NaN or Inf.")
-        return tensor
+        return _block_ode_topology._require_real_finite_tensor(value, label=label)
 
     @staticmethod
     def _block_primary_topology_keys() -> Tuple[str, ...]:
         """Primary graph metadata defining AO row identity and reverse pairs."""
-        names = (
-            ("EDGE_INDEX_KEY", "edge_index"),
-            ("EDGE_CELL_SHIFT_KEY", "edge_cell_shift"),
-            ("ATOMIC_NUMBERS_KEY", "atomic_numbers"),
-            ("ATOM_TYPE_KEY", "atom_types"),
-            ("POSITIONS_KEY", "pos"),
-            ("BATCH_KEY", "batch"),
-            ("PBC_KEY", "pbc"),
-            ("EDGE_TYPE_KEY", "edge_type"),
-            ("CELL_KEY", "cell"),
-        )
-        keys = [str(getattr(_keys, name, fallback)) for name, fallback in names]
-        # Some legacy/raw dictionaries use the plural spelling even though the
-        # canonical AtomicData key is singular.
-        keys.append("edge_types")
-        return tuple(dict.fromkeys(keys))
+        return _block_ode_topology._block_primary_topology_keys()
 
     @classmethod
     def _block_topology_keys(cls) -> Tuple[str, ...]:
         """Graph metadata a model output may never redefine during block ODE."""
-        names = (
-            # Derived geometry is topology-dependent too.  If it was absent on
-            # entry, discard a model-returned value so the next step recomputes
-            # it from the immutable primary graph instead of trusting stale data.
-            ("EDGE_VECTORS_KEY", "edge_vectors"),
-            ("EDGE_LENGTH_KEY", "edge_lengths"),
-        )
-        keys = list(cls._block_primary_topology_keys())
-        keys.extend(str(getattr(_keys, name, fallback)) for name, fallback in names)
-        return tuple(dict.fromkeys(keys))
+        return _block_ode_topology._block_topology_keys()
 
     @staticmethod
     def _missing_keys(data: AtomicDataDict.Type, keys: Tuple[str, ...]) -> list[str]:
-        return [key for key in keys if key not in data]
+        return _block_ode_topology._missing_keys(data, keys)
 
     @classmethod
     def _metadata_scalar(cls, value: Any) -> Any:
-        if torch.is_tensor(value):
-            values = value.detach().cpu().reshape(-1).tolist()
-            if not values or any(item != values[0] for item in values[1:]):
-                raise ValueError(
-                    "uureal_block_ode batched metadata values must be nonempty and identical."
-                )
-            return values[0]
-        if isinstance(value, (list, tuple)):
-            values = [cls._metadata_scalar(item) for item in value]
-            if not values or any(item != values[0] for item in values[1:]):
-                raise ValueError(
-                    "uureal_block_ode batched metadata values must be nonempty and identical."
-                )
-            return values[0]
-        try:
-            import numpy as np
-        except Exception:
-            return value
-        array = np.asarray(value)
-        values = array.reshape(-1).tolist()
-        if not values or any(item != values[0] for item in values[1:]):
-            raise ValueError(
-                "uureal_block_ode batched metadata values must be nonempty and identical."
-            )
-        return values[0]
+        return _block_ode_topology._metadata_scalar(value)
 
     def _require_uureal_block_contract(
         self,
@@ -2537,10 +2485,7 @@ class HamiltonianCFM:
 
     @staticmethod
     def _attach_uureal_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
-        data[_keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY] = state.node_blocks
-        data[_keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY] = state.edge_blocks
-        data[_keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.node_shapes
-        data[_keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.edge_shapes
+        _block_ode_topology._attach_uureal_residual_state(data, state)
 
     def _require_spatial_residual_block_contract(
         self,
@@ -2620,47 +2565,24 @@ class HamiltonianCFM:
 
     @staticmethod
     def _attach_spatial_residual_state(data: AtomicDataDict.Type, state: BlockTensorResult) -> None:
-        data[_keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY] = state.node_blocks
-        data[_keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY] = state.edge_blocks
-        data[_keys.NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.node_shapes
-        data[_keys.EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY] = state.edge_shapes
+        _block_ode_topology._attach_spatial_residual_state(data, state)
 
     @staticmethod
     def _clone_sidecar_value(value: Any) -> Any:
-        return value.clone() if torch.is_tensor(value) else copy.deepcopy(value)
+        return _block_ode_topology._clone_sidecar_value(value)
 
     @classmethod
     def _snapshot_block_topology(cls, data: AtomicDataDict.Type) -> Dict[str, Any]:
-        return {
-            key: cls._clone_sidecar_value(data[key])
-            for key in cls._block_topology_keys()
-            if key in data
-        }
+        return _block_ode_topology._snapshot_block_topology(data)
 
     def _drop_block_authority_fields(self, data: AtomicDataDict.Type) -> None:
         """Keep certified endpoint/H0 block side channels outside model I/O."""
-        for key in (
-            self.node_block_target_key,
-            self.edge_block_target_key,
-            self.node_block_shape_key,
-            self.edge_block_shape_key,
-            self.node_h0_block_key,
-            self.edge_h0_block_key,
-            self.node_h0_block_shape_key,
-            self.edge_h0_block_shape_key,
-        ):
-            data.pop(key, None)
+        _block_ode_topology._drop_block_authority_fields(self, data)
 
     def _block_ode_output_only_keys(self) -> Tuple[str, ...]:
         """Model outputs that must never be recycled as the next step's input."""
-        return tuple(
-            dict.fromkeys(
-                (
-                    self.node_output_key,
-                    self.edge_output_key,
-                    *_BLOCK_ODE_OUTPUT_ONLY_KEYS,
-                )
-            )
+        return _block_ode_topology._block_ode_output_only_keys(
+            self, _BLOCK_ODE_OUTPUT_ONLY_KEYS
         )
 
     def _require_fresh_block_ode_outputs(
@@ -2669,13 +2591,9 @@ class HamiltonianCFM:
         *,
         step: int,
     ) -> None:
-        missing = self._missing_keys(
-            prediction, (self.node_output_key, self.edge_output_key)
+        _block_ode_topology._require_fresh_block_ode_outputs(
+            self, prediction, step=step
         )
-        if missing:
-            raise ValueError(
-                f"Block-space ODE step {step} is missing fresh model output keys={missing}."
-            )
 
     @classmethod
     def _require_matching_block_topology(
@@ -2683,37 +2601,7 @@ class HamiltonianCFM:
         data_topology: Dict[str, Any],
         ref_topology: Dict[str, Any],
     ) -> None:
-        for key in cls._block_primary_topology_keys():
-            in_data = key in data_topology
-            in_ref = key in ref_topology
-            if in_data != in_ref:
-                raise ValueError(
-                    "Block-space ODE data/ref topology mismatch: "
-                    f"key {key!r} is present in only one dictionary."
-                )
-            if not in_data:
-                continue
-            left = data_topology[key]
-            right = ref_topology[key]
-            if torch.is_tensor(left) or torch.is_tensor(right):
-                try:
-                    left_t = torch.as_tensor(left).detach().cpu()
-                    right_t = torch.as_tensor(right).detach().cpu()
-                except Exception as exc:
-                    raise ValueError(
-                        f"Block-space ODE cannot compare data/ref topology key {key!r}."
-                    ) from exc
-                equal = left_t.shape == right_t.shape and torch.equal(left_t, right_t)
-            else:
-                try:
-                    equal = bool(left == right)
-                except Exception:
-                    equal = False
-            if not equal:
-                raise ValueError(
-                    "Block-space ODE data/ref topology mismatch at "
-                    f"key {key!r}; row-aligned H0/endpoint blocks cannot be mixed."
-                )
+        _block_ode_topology._require_matching_block_topology(data_topology, ref_topology)
 
     @classmethod
     def _restore_block_topology(
@@ -2723,19 +2611,13 @@ class HamiltonianCFM:
         *,
         clone_values: bool = False,
     ) -> None:
-        for key in cls._block_topology_keys():
-            if key in snapshot:
-                value = snapshot[key]
-                data[key] = cls._clone_sidecar_value(value) if clone_values else value
-            else:
-                data.pop(key, None)
+        _block_ode_topology._restore_block_topology(
+            data, snapshot, clone_values=clone_values
+        )
 
     @classmethod
     def _max_abs(cls, value: torch.Tensor, *, label: str = "residual") -> float:
-        value = cls._require_real_finite_tensor(value, label=label)
-        if value.numel() == 0:
-            return 0.0
-        return float(value.detach().abs().max().item())
+        return _block_ode_topology._max_abs(value, label=label)
 
     def _block_state_from_fields(
         self,
