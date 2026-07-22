@@ -3857,6 +3857,32 @@ class HamiltonianCFM:
         # namespaces never mix under one tag.  (Previously the flow value was aliased
         # here; the compatible pass then overwrote it every step, but if that pass were
         # ever throttled/absent the flow value would leak under the compatible tag.)
+        #
+        # P1-1 (block endpoint population parity): `_compatible_clean_stats` below is
+        # handed to Trainer._compatible_loss_state_from_flow_stats, which reduces it
+        # through the *criterion's own* `compatible_loss_from_stats`
+        # (HamilBlockwiseNexTHamLoss).  That criterion's `block_components` counts
+        # EVERY shape-active directed AO entry -- no onsite lower-triangle drop, no
+        # reverse-edge dedup (see blockwise_tensor.block_components /
+        # block_mask_from_shapes).  `node_mask`/`edge_mask` above intentionally keep
+        # only ONE independent physical freedom per Hermitian pair (onsite upper
+        # triangle, one side of each reverse-edge pair) for the *training* reduction
+        # -- a DIFFERENT population from the criterion's directed-full count.
+        # Publishing the canonical sums under a "block" label the criterion treats as
+        # directed-full silently understated L1/RMSE (population off by ~2x on
+        # non-symmetric error).  Feed `_compatible_clean_stats` the directed-full
+        # `node_valid`/`edge_valid` masks instead -- the same population
+        # `train_compatible_directed_*` below already uses -- so the label and the
+        # population it carries finally agree with the criterion's own definition.
+        # This is an exact recount, not an approximation: Hermitian pairing is
+        # bit-exact post-projection (project_block_state symmetrizes onsite as
+        # 0.5*(X+X.T) and derives every reverse edge as the literal transpose of a
+        # shared `averaged` tensor via index_copy_), so summing node_diff/edge_diff
+        # over the full directed mask reproduces exactly what an analytic
+        # canonical-sum doubling would give (diagonal/self-reverse counted once,
+        # off-diagonal/reverse-pair counted twice) -- see
+        # test_block_ode_compatible_stats_match_criterion_directed_population for the
+        # locked numerical identity.
         state: Dict[str, torch.Tensor] = {
             "train_flow_t": ctx.t.detach().mean(),
             "train_flow_weight": self._time_weight(ctx.t).detach().mean(),
@@ -3866,8 +3892,8 @@ class HamiltonianCFM:
                 target_residual, device=total.device, dtype=total.dtype
             ),
             "_compatible_clean_stats": {
-                **self._compatible_clean_stats(node_diff, node_mask, "onsite"),
-                **self._compatible_clean_stats(edge_diff, edge_mask, "hopping"),
+                **self._compatible_clean_stats(node_diff, node_valid, "onsite"),
+                **self._compatible_clean_stats(edge_diff, edge_valid, "hopping"),
             },
         }
         if self.uureal_block_ode:
@@ -3880,9 +3906,11 @@ class HamiltonianCFM:
             #     stored directed coordinate counted, i.e. all mapper-valid
             #     onsite entries and ALL directed edges -- the same population
             #     the historical SOC uu-real RME losses (H-B0/H-A1 runs)
-            #     averaged over.  Counts differ (~2x) and values differ whenever
-            #     the error is not Hermitian-symmetric, so curves plotted
-            #     against historical runs must use the directed keys.
+            #     averaged over, and (as of P1-1) the same population now backing
+            #     the `_compatible_clean_stats` payload above.  Counts differ
+            #     (~2x from canonical) and values differ whenever the error is not
+            #     Hermitian-symmetric, so curves plotted against historical runs
+            #     must use the directed keys.
             directed_node_stats = self._metric_stats(
                 node_diff, node_valid, self.loss_type, self._time_weight(ctx.node_t)
             )

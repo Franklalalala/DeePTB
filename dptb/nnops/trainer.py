@@ -652,7 +652,40 @@ class Trainer(BaseTrainer):
         prefix,
         legacy_prefix=None,
         global_step=None,
+        fail_on_metric_space_mismatch=False,
     ):
+        """Reduce a flow-published stats payload through the criterion's own reducer.
+
+        ``fail_on_metric_space_mismatch`` (default ``False``, fully backward
+        compatible) governs what happens when the flow's declared
+        ``metric_space`` label disagrees with the criterion's
+        ``endpoint_metric_space``:
+
+        * ``False`` (the historical behavior): return ``None``.  Callers that
+          have a genuine, safe recompute fallback for a cross-representation
+          criterion (e.g. ``Trainer._compatible_loss_state`` re-invoking the
+          criterion directly on the raw batch) rely on this to trigger that
+          fallback -- see e.g. ``test_flow_stats_reject_cross_representation_
+          endpoint_reduction`` / ``test_multitrainer_flow_fallback_replaces_
+          cross_space_raw_stats``.  Do not flip this default globally: it would
+          silently remove that fallback for every caller of this shared method.
+        * ``True``: raise immediately with a diagnostic error instead of
+          returning ``None``.  Reserved for call sites where no such fallback
+          exists or is safe (block-ODE validation sampling: the euler-rolled
+          state is not directly re-scoreable by the criterion's raw
+          ``forward()``), where a ``None`` here previously cascaded into either
+          a generic "missing keys" error (only checked at ``num_steps == 1``)
+          or an uncaught ``AttributeError`` inside ``_accumulate_metric_state``
+          for other step counts.  Opt in only where the caller already knows no
+          fallback will be attempted (mirror its own ``not block_ode`` gate).
+
+        This flag does NOT change the match branch: once the flow route
+        genuinely publishes the same population under a given label as the
+        criterion (P1-1 fixed this for block-ODE endpoints -- see
+        HamiltonianCFM._block_ode_endpoint_loss), equal labels already imply
+        equal populations, so no additional runtime population check is
+        possible or needed here beyond the label comparison itself.
+        """
         stats = flow_state.get("_compatible_clean_stats", None)
         if not isinstance(stats, dict):
             return None
@@ -679,6 +712,21 @@ class Trainer(BaseTrainer):
             stats_metric_space is not None
             and str(stats_metric_space) != str(criterion_metric_space)
         ):
+            if fail_on_metric_space_mismatch:
+                raise ValueError(
+                    "Flow published endpoint stats in metric_space="
+                    f"{stats_metric_space!r} but the criterion declares "
+                    f"endpoint_metric_space={criterion_metric_space!r}. This "
+                    "route has no safe raw-batch fallback (a block-ODE euler "
+                    "sample is not directly re-scoreable by the criterion's "
+                    "forward()), so reducing mismatched-population statistics "
+                    "through compatible_loss_from_stats would silently "
+                    "redefine the validation endpoint metric (the P1-1 block "
+                    "endpoint population divergence). Align the flow route's "
+                    "published _compatible_clean_stats population/metric_space "
+                    "with the criterion instead of relying on string equality "
+                    "to prove interoperability."
+                )
             return None
         reduce_from_stats = getattr(loss_obj, "compatible_loss_from_stats", None)
         if not callable(reduce_from_stats):
@@ -1343,6 +1391,15 @@ class Trainer(BaseTrainer):
                                         prefix=f"validation_compatible_euler_{num_steps}",
                                         legacy_prefix=legacy_prefix,
                                         global_step=getattr(self, "iter", None),
+                                        # This branch is reached only when block_ode
+                                        # is True (guard above); the `else` recomputes
+                                        # via the criterion directly instead of a
+                                        # stats reduction, so there is no fallback to
+                                        # preserve here. Fail fast on a metric_space
+                                        # mismatch instead of letting a silently
+                                        # dropped compatible_state reach
+                                        # _accumulate_metric_state as None (P1-1).
+                                        fail_on_metric_space_mismatch=True,
                                     )
                                 )
                             else:
@@ -1468,6 +1525,20 @@ class Trainer(BaseTrainer):
                         legacy_prefix = "validation" if int(num_steps) == 1 else None
                         compatible_state = None
                         if sample_state is not None:
+                            # Fail fast exactly when the fallback below will NOT be
+                            # attempted (block_ode=True): mirror the `not block_ode`
+                            # gate so a metric_space mismatch raises immediately
+                            # instead of leaving compatible_state=None to reach
+                            # _accumulate_metric_state (AttributeError for
+                            # num_steps != 1) or a generic missing-keys error only
+                            # for num_steps == 1 (P1-1).  Passed only when True so
+                            # the call keeps its historical signature -- and stays
+                            # compatible with test doubles/monkeypatches of
+                            # _compatible_loss_state_from_flow_stats that predate
+                            # this opt-in kwarg -- on the common block_ode=False path.
+                            strict_kwargs = (
+                                {"fail_on_metric_space_mismatch": True} if block_ode else {}
+                            )
                             compatible_state = self._compatible_loss_state_from_flow_stats(
                                 self.validation_lossfunc,
                                 sample_state,
@@ -1475,6 +1546,7 @@ class Trainer(BaseTrainer):
                                 prefix=f"validation_compatible_euler_{num_steps}",
                                 legacy_prefix=legacy_prefix,
                                 global_step=getattr(self, "iter", None),
+                                **strict_kwargs,
                             )
                         if compatible_state is None and not block_ode:
                             compatible_ref = t0_ref if t0_ref is not None else batch_for_loss.copy()
