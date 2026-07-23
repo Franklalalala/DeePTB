@@ -913,6 +913,16 @@ def _apply_onehot_tp(tp: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, mode
 
 @Embedding.register("lem_moe_v3")
 class LemMoEV3(torch.nn.Module):
+    @staticmethod
+    def _init_layer_type():
+        """Extension point for embeddings that reuse the LEM v3 backbone."""
+        return InitLayer
+
+    @staticmethod
+    def _layer_type():
+        """Extension point for embeddings that reuse the LEM v3 backbone."""
+        return Layer
+
     def __init__(
             self,
             basis: Dict[str, Union[str, list]] = None,
@@ -1189,7 +1199,7 @@ class LemMoEV3(torch.nn.Module):
             full_expert_fast_path=mole_full_expert_fast_path,
         )
 
-        self.init_layer = InitLayer(
+        self.init_layer = self._init_layer_type()(
             idp=self.idp,
             num_types=self.n_atom,
             n_radial_basis=n_radial_basis,
@@ -1239,7 +1249,7 @@ class LemMoEV3(torch.nn.Module):
 
             use_node_ffn = ffn_hidden_factor > 1.0 and ((i < n_layers - 1) or ffn_apply_to_last)
 
-            self.layers.append(Layer(
+            self.layers.append(self._layer_type()(
                 num_types=self.n_atom,
                 avg_num_neighbors=avg_num_neighbors,
                 irreps_in=irreps_in,
