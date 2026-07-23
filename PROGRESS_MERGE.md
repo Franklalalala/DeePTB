@@ -181,3 +181,39 @@ C:\Users\16608\.conda\envs\dptb\python.exe -m pytest `
   dptb/tests/test_block_ode_graph_contract.py `
   dptb/tests/test_block_ode_redteam.py -q
 ```
+
+## Stage 4 — merged `test_lem_pair_*` regression suite
+
+- Timestamp: 2026-07-23 18:16:00 +08:00
+- Status: SUCCESS
+- Added shared fp64 fixtures plus four focused suites:
+  `test_lem_pair_dual_cutoff.py`, `test_lem_pair_norm_switches.py`,
+  `test_lem_pair_refine.py`, and `test_lem_pair_flow_contract.py`.
+- Result: **7 passed, 2 baseline deprecation warnings** in 36.72 s.
+- Hard-gate evidence:
+  - `mp_cutoff=None` versus all-active cutoff: node blocks, edge blocks, and
+    overlap latents bit-exact;
+  - real dual split preserved full ordered head rows and produced fp64 AO-block
+    equivariance max drift `5.8286708792820718e-16`;
+  - additive node/edge/latent residuals were bit-exact to `2 + 1 = 3`;
+  - every disabled latent norm was `Identity`;
+  - pair-refinement invariant-weight drift
+    `5.5511151231257827e-17`, AO-block drift
+    `2.1163626406917047e-16`, and nontrivial minimum refinement amplitude
+    `3.8065839747235534e-02`;
+  - enabled residual block-ODE flow passed ordered full-edge coverage,
+    strict certification, edge graph ownership, and finite-output checks;
+  - default-all-off `LemPair` versus equivalent `LemMoEV3H0`: constructor RNG,
+    complete state dict, node blocks, edge blocks, and overlap latents were
+    bit-exact.
+
+Reproduction:
+
+```powershell
+$env:PYTHONPATH='E:\deeptb\wt_0723_merge'
+C:\Users\16608\.conda\envs\dptb\python.exe -m pytest `
+  dptb/tests/test_lem_pair_dual_cutoff.py `
+  dptb/tests/test_lem_pair_norm_switches.py `
+  dptb/tests/test_lem_pair_refine.py `
+  dptb/tests/test_lem_pair_flow_contract.py -q
+```
