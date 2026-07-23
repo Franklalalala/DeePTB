@@ -550,8 +550,11 @@ def validate_block_ode_contract(data):
     model = dict(data.get("model_options", {}) or {})
     prediction = dict(model.get("prediction", {}) or {})
     embedding = dict(model.get("embedding", {}) or {})
-    if str(embedding.get("method", "")).lower() != "lem_moe_v3_h0":
-        raise ValueError("block_ode requires embedding.method='lem_moe_v3_h0'")
+    embedding_method = str(embedding.get("method", "")).lower()
+    if embedding_method not in {"lem_moe_v3_h0", "lem_pair"}:
+        raise ValueError(
+            "block_ode requires embedding.method='lem_moe_v3_h0' or 'lem_pair'"
+        )
     if str(embedding.get("output_route", "")).lower() != "h_b0":
         raise ValueError("block_ode requires embedding.output_route='h_b0'")
     if not bool(embedding.get("require_full_block_edge_coverage", False)):

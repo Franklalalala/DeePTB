@@ -152,3 +152,32 @@ C:\Users\16608\.conda\envs\dptb\python.exe -m pytest `
   dptb/tests/test_hb0_active_edge_contract.py `
   dptb/tests/test_equivariant_norm_precision.py -q
 ```
+
+## Stage 3 — registry / contract / argcheck
+
+- Timestamp: 2026-07-23 18:06:00 +08:00
+- Status: SUCCESS
+- Added `slem_pair()` as `slem_h0()` plus the pair-only controls:
+  `mp_avg_num_neighbors`, `res_update_additive`, `latents_layernorm`, and all
+  five `pair_refine_*` fields. `mp_cutoff` is inherited from `slem()`.
+- Added `lem_pair` to the embedding Variant and cutoff extraction method set.
+- Changed the block-ODE method gate to the exact allowlist
+  `{"lem_moe_v3_h0", "lem_pair"}` while retaining an error string compatible
+  with existing red-team assertions.
+- Added `lem_pair` to legacy SwiGLU checkpoint compatibility routing.
+- Strict dargs normalization/check of an H-B0 config with every new field:
+  PASS; normalized method `lem_pair`, pair refinement enabled.
+- Real block-ODE water overlay with `method: lem_pair`: contract validation
+  PASS.
+- Focused config/contract regression: 46 passed, 13 baseline deprecation
+  warnings.
+
+Reproduction:
+
+```powershell
+$env:PYTHONPATH='E:\deeptb\wt_0723_merge'
+C:\Users\16608\.conda\envs\dptb\python.exe -m pytest `
+  dptb/tests/test_output_route_config_argcheck.py `
+  dptb/tests/test_block_ode_graph_contract.py `
+  dptb/tests/test_block_ode_redteam.py -q
+```

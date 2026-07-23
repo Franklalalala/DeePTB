@@ -1572,6 +1572,7 @@ def embedding():
             Argument("lem_moe_v3", dict, slem()),
             Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
+            Argument("lem_pair", dict, slem_pair()),
             Argument("lem_moe_v3_prior", dict, slem_prior()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_non_linear", dict, slem()),
@@ -1928,6 +1929,22 @@ def slem_h0():
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
         Argument("require_full_block_edge_coverage", bool, optional=True, default=False,
                  doc=doc_require_full_block_edge_coverage),
+    ]
+
+
+def slem_pair():
+    """LEM H0 schema plus pair-topology, norm, and refinement controls."""
+    return slem_h0() + [
+        Argument("mp_avg_num_neighbors", [int, float, None], optional=True, default=None),
+        Argument("res_update_additive", bool, optional=True, default=False,
+                 doc="Use unscaled x + delta residual updates in the pair backbone."),
+        Argument("latents_layernorm", bool, optional=True, default=True,
+                 doc="Apply LayerNorm before pair-backbone latent updates."),
+        Argument("pair_refine_enable", bool, optional=True, default=False),
+        Argument("pair_refine_rank", int, optional=True, default=16),
+        Argument("pair_refine_condition", str, optional=True, default="scalar_0e"),
+        Argument("pair_refine_internal_weights", bool, optional=True, default=True),
+        Argument("pair_refine_init", [int, float], optional=True, default=0.0),
     ]
 
 
@@ -3368,7 +3385,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_prior", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_pair", "lem_moe_v3_prior", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")

@@ -430,7 +430,12 @@ def _maybe_enable_legacy_swiglu_s2_compat(model_options: dict, state_dict: dict)
     embedding = model_options.get("embedding", None)
     if not isinstance(embedding, dict):
         return model_options
-    if embedding.get("method") not in {"lem_moe_v3", "lem_moe_v3_h0", "lem_moe_v3_prior"}:
+    if embedding.get("method") not in {
+        "lem_moe_v3",
+        "lem_moe_v3_h0",
+        "lem_pair",
+        "lem_moe_v3_prior",
+    }:
         return model_options
     if embedding.get("swiglu_s2_compat_mode", "modern") != "modern":
         return model_options
