@@ -7,6 +7,7 @@ import weakref
 from typing import Any, Dict, Optional, Union
 
 import torch
+from e3nn.o3 import Linear
 from torch_scatter import scatter
 
 from dptb.data import AtomicDataDict
@@ -233,6 +234,7 @@ class PairLayer(Layer):
     """Run legacy layer math on the private MP subset and read all pairs last."""
 
     _pair_owner_ref = None
+    _pair_is_first = False
     _pair_is_last = False
 
     @staticmethod
@@ -279,6 +281,14 @@ class PairLayer(Layer):
 
         mp_active_mask = owner._last_mp_mask.index_select(0, active_edges)
         mp_edges = active_edges[mp_active_mask]
+        if self._pair_is_first:
+            if edge_features.shape[0] != active_edges.numel():
+                raise ValueError(
+                    "lem_pair dual cutoff expected one initial edge context row "
+                    "per active head edge; got "
+                    f"{edge_features.shape[0]} and {active_edges.numel()}."
+                )
+            owner._pair_initial_edge_context = edge_features
         if edge_features.shape[0] == active_edges.numel():
             edge_features = edge_features[mp_active_mask]
         if edge_one_hot.shape[0] == active_edges.numel():
@@ -325,8 +335,30 @@ class PairLayer(Layer):
             self.node_update.env_sum_normalizations = old_normalization
 
         if self._pair_is_last:
-            readout_input = node_features.new_zeros(
-                active_edges.numel(), self.irreps_out.dim
+            initial_edge_context = owner._pair_initial_edge_context
+            if initial_edge_context is None:
+                raise RuntimeError(
+                    "lem_pair dual cutoff lost the full-edge context before readout."
+                )
+            if initial_edge_context.shape[0] != active_edges.numel():
+                raise ValueError(
+                    "lem_pair dual cutoff full-edge context and active-edge rows "
+                    f"disagree: {initial_edge_context.shape[0]} != "
+                    f"{active_edges.numel()}."
+                )
+            readout_input = owner.dual_cutoff_edge_context_projection(
+                initial_edge_context
+            )
+            mp_positions = torch.nonzero(
+                mp_active_mask, as_tuple=False
+            ).flatten()
+            if edge_features.shape[0] != mp_positions.numel():
+                raise ValueError(
+                    "lem_pair dual cutoff mature MP edge rows and mask disagree: "
+                    f"{edge_features.shape[0]} != {mp_positions.numel()}."
+                )
+            readout_input = torch.index_copy(
+                readout_input, 0, mp_positions, edge_features
             )
             edge_features, _, _ = owner.dual_cutoff_pair_readout(
                 latents,
@@ -398,7 +430,9 @@ class LemPair(LemMoEV3H0):
         self._last_mp_mask = None
         self._last_mp_active_mask = None
         self._pair_run_dual = False
+        self._pair_initial_edge_context = None
         self.dual_cutoff_pair_readout = None
+        self.dual_cutoff_edge_context_projection = None
         self.res_update_additive = bool(res_update_additive)
         self.latents_layernorm = bool(latents_layernorm)
         self.pair_refine_enable = bool(pair_refine_enable)
@@ -413,6 +447,14 @@ class LemPair(LemMoEV3H0):
 
         if self.mp_cutoff is not None:
             final_irreps = self.layers[-1].irreps_out
+            base_init = getattr(self.init_layer, "base_init", self.init_layer)
+            self.dual_cutoff_edge_context_projection = Linear(
+                base_init.irreps_out,
+                final_irreps,
+                shared_weights=True,
+                internal_weights=True,
+                biases=False,
+            ).to(dtype=self.dtype, device=self.device)
             self.dual_cutoff_pair_readout = PairUpdateEdge(
                 num_types=self.n_atom,
                 node_irreps_in=final_irreps,
@@ -497,12 +539,18 @@ class LemPair(LemMoEV3H0):
         base_init._pair_owner_ref = owner_ref
         for index, layer in enumerate(self.layers):
             layer._pair_owner_ref = owner_ref
+            layer._pair_is_first = index == 0
             layer._pair_is_last = index == len(self.layers) - 1
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         """Dispatch the legacy skeleton through pair-specific init/layers."""
         self._pair_run_dual = False
-        return super().forward(data)
+        self._pair_initial_edge_context = None
+        try:
+            return super().forward(data)
+        finally:
+            # Do not retain an autograd graph through a module attribute between batches.
+            self._pair_initial_edge_context = None
 
     def _apply_block_native_output_heads(
         self,

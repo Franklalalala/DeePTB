@@ -121,3 +121,47 @@ def test_all_active_head_rows_keep_the_legacy_branch_when_stored_rows_do_not():
             _keys.EDGE_OVERLAP_KEY,
         ):
             assert torch.equal(reference[key], actual[key])
+
+
+def test_non_mp_readout_keeps_its_direct_h0_edge_context():
+    with fp64_default():
+        pair_model = model(mp_cutoff=1.0)
+        data = molecule_data(pair_model)
+        src, dst = data[_keys.EDGE_INDEX_KEY]
+        lengths = (
+            data[_keys.POSITIONS_KEY].index_select(0, src)
+            - data[_keys.POSITIONS_KEY].index_select(0, dst)
+        ).norm(dim=-1)
+        non_mp_edge = int(torch.nonzero(lengths >= 1.0, as_tuple=False)[0])
+        captured = []
+
+        def capture(_module, inputs):
+            captured.append(inputs[3].detach().clone())
+
+        handle = pair_model.dual_cutoff_pair_readout.register_forward_pre_hook(
+            capture
+        )
+        try:
+            reference = pair_model(clone_data(data))
+            perturbed_data = clone_data(data)
+            h0_dim = perturbed_data[_keys.EDGE_H0_KEY].shape[-1]
+            perturbed_data[_keys.EDGE_H0_KEY][non_mp_edge] = torch.linspace(
+                0.1, 0.1 * h0_dim, h0_dim, dtype=torch.float64
+            )
+            perturbed = pair_model(perturbed_data)
+        finally:
+            handle.remove()
+
+        assert pair_model._last_mp_mask[non_mp_edge].item() is False
+        assert len(captured) == 2
+        context_delta = captured[1] - captured[0]
+        assert context_delta[non_mp_edge].abs().max().item() > 0.0
+        other_rows = torch.arange(context_delta.shape[0]) != non_mp_edge
+        assert torch.equal(
+            context_delta[other_rows], torch.zeros_like(context_delta[other_rows])
+        )
+        block_delta = (
+            perturbed[_keys.EDGE_HAMILTONIAN_KEY][non_mp_edge]
+            - reference[_keys.EDGE_HAMILTONIAN_KEY][non_mp_edge]
+        ).abs().max().item()
+        assert block_delta > 0.0
