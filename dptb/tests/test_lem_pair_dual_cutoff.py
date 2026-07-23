@@ -4,12 +4,14 @@ import torch
 from e3nn import o3
 
 from dptb.data import _keys
+from dptb.nn.embedding.lem_pair import LemPair
 
 from test_lem_pair_common import (
     ao_wigner,
     clone_data,
     fp64_default,
     model,
+    model_options,
     molecule_data,
     rotate_data,
 )
@@ -75,3 +77,47 @@ def test_dual_cutoff_is_equivariant_and_keeps_full_ordered_head_rows():
         ).abs().max().item()
         print(f"lem_pair_dual_cutoff_block_max_abs={drift:.16e}")
         assert drift <= 1.0e-9
+
+
+def test_all_active_head_rows_keep_the_legacy_branch_when_stored_rows_do_not():
+    with fp64_default():
+        options = model_options()
+        options["require_full_block_edge_coverage"] = False
+        torch.manual_seed(20260723)
+        disabled = LemPair(mp_cutoff=None, **options).eval()
+        torch.manual_seed(20260723)
+        all_active = LemPair(mp_cutoff=1.0, **options).eval()
+        incompatible = all_active.load_state_dict(disabled.state_dict(), strict=False)
+        assert not incompatible.unexpected_keys
+        assert incompatible.missing_keys
+
+        base = molecule_data(disabled)
+        src, dst = base[_keys.EDGE_INDEX_KEY]
+        lengths = (
+            base[_keys.POSITIONS_KEY].index_select(0, src)
+            - base[_keys.POSITIONS_KEY].index_select(0, dst)
+        ).norm(dim=-1)
+        cutoff_coeffs = (lengths < 0.9).to(dtype=torch.float64)
+        active_edges = torch.nonzero(cutoff_coeffs > 0, as_tuple=False).flatten()
+        assert active_edges.numel() > 0
+        assert int(active_edges.numel()) < int(lengths.numel())
+        assert bool((lengths.index_select(0, active_edges) < 1.0).all())
+        assert bool((lengths >= 1.0).any())
+
+        reference_data = molecule_data(disabled)
+        actual_data = molecule_data(all_active)
+        for data in (reference_data, actual_data):
+            data[_keys.LEM_ACTIVE_EDGES_KEY] = active_edges.clone()
+            data[_keys.LEM_CUTOFF_COEFFS_KEY] = cutoff_coeffs.clone()
+
+        reference = disabled(reference_data)
+        actual = all_active(actual_data)
+        assert all_active._pair_run_dual is False
+        assert bool(all_active._last_mp_active_mask.all())
+        assert not bool(all_active._last_mp_mask.all())
+        for key in (
+            _keys.NODE_HAMILTONIAN_KEY,
+            _keys.EDGE_HAMILTONIAN_KEY,
+            _keys.EDGE_OVERLAP_KEY,
+        ):
+            assert torch.equal(reference[key], actual[key])

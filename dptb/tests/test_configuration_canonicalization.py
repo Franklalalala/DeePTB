@@ -310,6 +310,25 @@ def test_h0_and_p2_init_boolean_combinations_collapse_to_scopes():
     assert h0["h0_init_scope"] == "edge"
     assert h0["fallback_to_hamiltonian"] is False
 
+    pair_default = canonicalize_embedding_options(
+        {"method": "lem_pair"}, warn_deprecated=False
+    )
+    assert pair_default["h0_init_scope"] == "both"
+
+    pair = canonicalize_embedding_options(
+        {
+            "method": "lem_pair",
+            "use_h0_init": True,
+            "use_h0_node_init": False,
+            "use_h0_edge_init": True,
+        },
+        warn_deprecated=False,
+    )
+    assert pair["h0_init_scope"] == "edge"
+    assert "use_h0_init" not in pair
+    assert "use_h0_node_init" not in pair
+    assert "use_h0_edge_init" not in pair
+
     p2 = canonicalize_embedding_options(
         {
             "method": "lem_moe_v3_prior",

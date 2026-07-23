@@ -831,7 +831,7 @@ def migrate_legacy_checkpoint_train_options(
 # ---------------------------------------------------------------------------
 # model_options.embedding registry rows.
 # ---------------------------------------------------------------------------
-_H0_METHODS = {"lem_moe_v3_h0", "lem_moe_v3_edge_h0", "lem_non_linear_h0"}
+_H0_METHODS = {"lem_moe_v3_h0", "lem_pair", "lem_moe_v3_edge_h0", "lem_non_linear_h0"}
 
 _SOFT_EDGE_MEMORY_ALIASES = {
     "use_soft_edge_memory": "enabled",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import weakref
 from typing import Any, Dict, Optional, Union
 
@@ -18,6 +19,49 @@ from .pair_so3_refine import PairSO3RefineTP
 
 
 Cutoff = Union[float, int, Dict[str, float]]
+
+
+def _positive_finite_scalar(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (float, int)):
+        raise TypeError(f"{label} must be a real scalar, got {type(value)!r}.")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{label} must be finite and strictly positive, got {value!r}.")
+    return result
+
+
+def _validated_mp_cutoff(mp_cutoff: Optional[Cutoff], idp: Any) -> Optional[Cutoff]:
+    if mp_cutoff is None:
+        return None
+    if isinstance(mp_cutoff, bool):
+        raise TypeError("mp_cutoff must not be boolean.")
+    if isinstance(mp_cutoff, (float, int)):
+        return _positive_finite_scalar(mp_cutoff, label="mp_cutoff")
+    if not isinstance(mp_cutoff, dict):
+        raise TypeError(
+            "mp_cutoff must be a scalar or an element-cutoff dictionary; "
+            f"got {type(mp_cutoff)!r}."
+        )
+    if not mp_cutoff:
+        raise ValueError("mp_cutoff element dictionary must not be empty.")
+    normalized: Dict[str, float] = {}
+    for symbol, value in mp_cutoff.items():
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise TypeError(
+                "mp_cutoff element keys must be non-empty chemical-symbol strings; "
+                f"got {symbol!r}."
+            )
+        normalized[symbol] = _positive_finite_scalar(
+            value, label=f"mp_cutoff[{symbol!r}]"
+        )
+    required_symbols = set(idp.basis)
+    missing = sorted(required_symbols.difference(normalized))
+    if missing:
+        raise ValueError(
+            "mp_cutoff element dictionary must cover every basis species; "
+            f"missing {missing}."
+        )
+    return normalized
 
 
 def _get_mp_edge_mask(
@@ -85,8 +129,22 @@ class PairInitLayer(InitLayer):
             idp=self.idp,
             mp_cutoff=owner.mp_cutoff,
         )
+        if cutoff_coeffs is None:
+            decision_cutoff_coeffs = self.cutoff_coefficients(edge_length, bond_type)
+        else:
+            decision_cutoff_coeffs = cutoff_coeffs.to(
+                device=edge_length.device, dtype=edge_length.dtype
+            ).reshape(-1)
+        if active_edges is None:
+            decision_active_edges = (decision_cutoff_coeffs > 0).nonzero().squeeze(-1)
+        else:
+            decision_active_edges = active_edges.to(
+                device=edge_length.device, dtype=torch.long
+            ).reshape(-1)
+        mp_active_mask = mp_mask.index_select(0, decision_active_edges)
         owner._last_mp_mask = mp_mask.detach()
-        owner._pair_run_dual = not bool(mp_mask.all().item())
+        owner._last_mp_active_mask = mp_active_mask.detach()
+        owner._pair_run_dual = not bool(mp_active_mask.all().item())
         if not owner._pair_run_dual:
             return super().forward(
                 edge_index,
@@ -318,14 +376,27 @@ class LemPair(LemMoEV3H0):
         pair_refine_init: float = 0.0,
         **kwargs: Any,
     ) -> None:
+        if (
+            res_update_additive
+            and bool(kwargs.get("res_update", True))
+            and bool(kwargs.get("res_update_ratios_learnable", False))
+        ):
+            raise ValueError(
+                "res_update_additive=true bypasses the learned residual-ratio "
+                "parameters; set res_update_ratios_learnable=false."
+            )
         super().__init__(avg_num_neighbors=avg_num_neighbors, **kwargs)
-        self.mp_cutoff = mp_cutoff
-        self.mp_avg_num_neighbors = (
+        self.mp_cutoff = _validated_mp_cutoff(mp_cutoff, self.idp)
+        neighbor_count = (
             avg_num_neighbors
             if mp_avg_num_neighbors is None
-            else float(mp_avg_num_neighbors)
+            else mp_avg_num_neighbors
+        )
+        self.mp_avg_num_neighbors = _positive_finite_scalar(
+            neighbor_count, label="mp_avg_num_neighbors"
         )
         self._last_mp_mask = None
+        self._last_mp_active_mask = None
         self._pair_run_dual = False
         self.dual_cutoff_pair_readout = None
         self.res_update_additive = bool(res_update_additive)
