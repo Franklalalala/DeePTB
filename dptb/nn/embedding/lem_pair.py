@@ -12,7 +12,7 @@ from dptb.data import AtomicDataDict
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
-from .lem_moe_v3 import InitLayer, Layer, UpdateEdge
+from .lem_moe_v3 import InitLayer, Layer, UpdateEdge, UpdateNode
 from .lem_moe_v3_h0 import LemMoEV3H0
 from .pair_so3_refine import PairSO3RefineTP
 
@@ -149,11 +149,41 @@ class PairInitLayer(InitLayer):
         return latents, node_features, edge_features, cutoff_coeffs, active_edges
 
 
+class PairUpdateNode(UpdateNode):
+    """Node update with an opt-in unscaled residual."""
+
+    res_update_additive = False
+
+    def _residual_coefficients(self):
+        if self.res_update_additive:
+            return 1.0, 1.0
+        return super()._residual_coefficients()
+
+
+class PairUpdateEdge(UpdateEdge):
+    """Edge/latent update with an opt-in unscaled residual."""
+
+    res_update_additive = False
+
+    def _residual_coefficients(self):
+        if self.res_update_additive:
+            return 1.0, 1.0
+        return super()._residual_coefficients()
+
+
 class PairLayer(Layer):
     """Run legacy layer math on the private MP subset and read all pairs last."""
 
     _pair_owner_ref = None
     _pair_is_last = False
+
+    @staticmethod
+    def _edge_update_type():
+        return PairUpdateEdge
+
+    @staticmethod
+    def _node_update_type():
+        return PairUpdateNode
 
     def forward(
         self,
@@ -279,6 +309,8 @@ class LemPair(LemMoEV3H0):
         avg_num_neighbors: Optional[float] = None,
         mp_cutoff: Optional[Cutoff] = None,
         mp_avg_num_neighbors: Optional[float] = None,
+        res_update_additive: bool = False,
+        latents_layernorm: bool = True,
         pair_refine_enable: bool = False,
         pair_refine_rank: int = 16,
         pair_refine_condition: str = "scalar_0e",
@@ -296,11 +328,21 @@ class LemPair(LemMoEV3H0):
         self._last_mp_mask = None
         self._pair_run_dual = False
         self.dual_cutoff_pair_readout = None
+        self.res_update_additive = bool(res_update_additive)
+        self.latents_layernorm = bool(latents_layernorm)
         self.pair_refine_enable = bool(pair_refine_enable)
+
+        for layer in self.layers:
+            layer.res_update_additive = self.res_update_additive
+            layer.latents_layernorm = self.latents_layernorm
+            layer.node_update.res_update_additive = self.res_update_additive
+            layer.edge_update.res_update_additive = self.res_update_additive
+            if not self.latents_layernorm:
+                layer.edge_update.ln = torch.nn.Identity()
 
         if self.mp_cutoff is not None:
             final_irreps = self.layers[-1].irreps_out
-            self.dual_cutoff_pair_readout = UpdateEdge(
+            self.dual_cutoff_pair_readout = PairUpdateEdge(
                 num_types=self.n_atom,
                 node_irreps_in=final_irreps,
                 irreps_in=final_irreps,
@@ -349,6 +391,11 @@ class LemPair(LemMoEV3H0):
                 num_experts=kwargs.get("num_experts", 8),
                 num_shared_experts=kwargs.get("num_shared_experts", 1),
             )
+            self.dual_cutoff_pair_readout.res_update_additive = (
+                self.res_update_additive
+            )
+            if not self.latents_layernorm:
+                self.dual_cutoff_pair_readout.ln = torch.nn.Identity()
             self.register_buffer(
                 "dual_cutoff_readout_normalization",
                 torch.as_tensor(

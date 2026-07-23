@@ -125,3 +125,30 @@ C:\Users\16608\.conda\envs\dptb\python.exe -m pytest `
   dptb/tests/test_hb0_active_edge_contract.py `
   dptb/tests/test_output_route_registry.py -q
 ```
+
+## Stage 2 — pair-backbone norm switches
+
+- Timestamp: 2026-07-23 18:01:00 +08:00
+- Status: SUCCESS
+- Added `PairUpdateNode` / `PairUpdateEdge` subclasses and made `PairLayer`
+  construct only those subclasses through protected legacy-default factories.
+- `res_update_additive=true` overrides the new model's residual coefficient
+  hook with exact Python scalars `(1.0, 1.0)` for node, edge, and latent
+  streams. The default delegates to the original sigmoid/rsqrt hook.
+- `latents_layernorm=false` replaces only `PairUpdateEdge.ln` (including the
+  optional full-pair readout) with `torch.nn.Identity`.
+- Equivalent default `LemPair` versus `LemMoEV3H0`: constructor RNG, state-dict
+  keys, and all 128 state tensors were bit-exact in the two-layer fp64 probe.
+- Enabled structure probe: every layer/update had the pair subclass, every
+  latent norm was `Identity`, and both residual hooks returned exactly
+  `(1.0, 1.0)`.
+- Focused legacy regression: 15 passed.
+
+Reproduction:
+
+```powershell
+$env:PYTHONPATH='E:\deeptb\wt_0723_merge'
+C:\Users\16608\.conda\envs\dptb\python.exe -m pytest `
+  dptb/tests/test_hb0_active_edge_contract.py `
+  dptb/tests/test_equivariant_norm_precision.py -q
+```

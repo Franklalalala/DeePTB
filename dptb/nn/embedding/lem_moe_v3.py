@@ -2113,6 +2113,12 @@ class UpdateNode(torch.nn.Module):
                     biases=True,
                 )
 
+    def _residual_coefficients(self):
+        update_coefficients = self._res_update_params.sigmoid()
+        coefficient_old = torch.rsqrt(update_coefficients.square() + 1)
+        coefficient_new = update_coefficients * coefficient_old
+        return coefficient_old, coefficient_new
+
     def forward(self, latents, node_features, edge_features, atom_type, node_onehot, edge_index, edge_vector,
                 cutoff_coeffs, active_edges, wigner_D_all, mole_globals, node_batch=None):  # Accept globals
         edge_center = edge_index[0]
@@ -2190,9 +2196,7 @@ class UpdateNode(torch.nn.Module):
         new_node_features = new_node_features * norm_const
 
         if self.res_update:
-            update_coefficients = self._res_update_params.sigmoid()
-            coefficient_old = torch.rsqrt(update_coefficients.square() + 1)
-            coefficient_new = update_coefficients * coefficient_old
+            coefficient_old, coefficient_new = self._residual_coefficients()
 
             if self.use_identity_res:
                 node_features = coefficient_old * node_features + coefficient_new * new_node_features
@@ -2408,6 +2412,12 @@ class UpdateEdge(torch.nn.Module):
                     biases=True,
                 )
 
+    def _residual_coefficients(self):
+        update_coefficients = self._res_update_params.sigmoid()
+        coefficient_old = torch.rsqrt(update_coefficients.square() + 1)
+        coefficient_new = update_coefficients * coefficient_old
+        return coefficient_old, coefficient_new
+
     def forward(self, latents, node_features, node_onehot, edge_features, edge_index, edge_vector, cutoff_coeffs,
                 active_edges, edge_one_hot, wigner_D_all, mole_globals):  # Accept globals
         edge_center = edge_index[0]
@@ -2458,9 +2468,7 @@ class UpdateEdge(torch.nn.Module):
         new_latents = cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
 
         if self.res_update:
-            update_coefficients = self._res_update_params.sigmoid()
-            coefficient_old = torch.rsqrt(update_coefficients.square() + 1)
-            coefficient_new = update_coefficients * coefficient_old
+            coefficient_old, coefficient_new = self._residual_coefficients()
 
             if self.use_identity_res:
                 edge_features = coefficient_old * edge_features + coefficient_new * new_edge_features
@@ -2488,6 +2496,14 @@ class UpdateEdge(torch.nn.Module):
 
 
 class Layer(torch.nn.Module):
+    @staticmethod
+    def _edge_update_type():
+        return UpdateEdge
+
+    @staticmethod
+    def _node_update_type():
+        return UpdateNode
+
     def __init__(
             self,
             num_types: int,
@@ -2548,7 +2564,7 @@ class Layer(torch.nn.Module):
         self.device = device
         self.num_types = num_types
 
-        self.edge_update = UpdateEdge(
+        self.edge_update = self._edge_update_type()(
             node_irreps_in=self.irreps_in,
             num_types=num_types,
             irreps_in=self.irreps_in,
@@ -2582,7 +2598,7 @@ class Layer(torch.nn.Module):
             onehot_tp_mode=onehot_tp_mode,
         )
 
-        self.node_update = UpdateNode(
+        self.node_update = self._node_update_type()(
             edge_irreps_in=self.edge_update.irreps_out,
             irreps_in=self.irreps_in,
             irreps_out=self.irreps_out,
