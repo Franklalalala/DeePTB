@@ -84,6 +84,43 @@ Overall status: IN PROGRESS
 - Reproduce:
   `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_contract_validation.py dptb/tests/test_configuration_canonicalization.py dptb/tests/test_output_route_config_argcheck.py -q`
 
+## Stage 5 — six hard-gate groups
+
+- Timestamp: 2026-07-24 09:08:41 +08:00
+- Status: PASS
+- G1 batch partition invariance: A standalone, A+B, and B+A are bit-exact
+  across node Hamiltonian, edge Hamiltonian, and overlap rows;
+  `max|delta|=0`.
+- G2 dual + block-ODE:
+  - non-MP H0 row perturbation output `max|delta|=4.9686738103199395e-04`;
+  - non-MP residual row perturbation output
+    `max|delta|=6.8409908952647008e-04`;
+  - H0 input-row gradient norm `2.4423842928700354e-02`;
+  - residual input-row gradient norm `2.0258515789310576e-02`;
+  - nonzero residual-state SO(3) block drift
+    `7.6327832942979512e-17`.
+  - The rotation subtest holds mapper-order H0 at its valid zero tensor while
+    rotating the nonzero residual AO state. Nonzero H0 sensitivity is tested
+    independently in the same test; mapper/codec H0 covariance remains covered
+    by `test_residual_ao_block_ode.py`.
+- G3: consecutive all-active and real-split backward passes give non-None
+  gradients for every `requires_grad` parameter, including dual projection and
+  readout parameters.
+- Dead parameter policy tightened for DDP: unreachable base environment weights
+  under H0 `replace+both`, unused identity-residual linears, and discarded fresh
+  readout latent parameters are frozen. Forward tensors and state_dict entries
+  are unchanged.
+- G4: split sizes `(0,)`, `(0, 6)`, and `(0, 0)` observed for single-zero,
+  mixed, and all-zero MP cases; all outputs/gradients finite.
+- G5 references the Stage-4 12-test red-team file; G6 references Stage-3
+  lifecycle plus Stage-4 migration and is completed by Stage 6 cross-tree
+  golden.
+- New hard-gate file: 4 passed, 2 warnings in 29.90 s.
+- Full Stage-5 gate (all `test_lem_pair_*` plus five required block-ODE
+  suites): 208 passed, 136 warnings in 83.08 s.
+- Reproduce:
+  `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_*.py dptb/tests/test_hb0_active_edge_contract.py dptb/tests/test_block_ode_flow.py dptb/tests/test_residual_ao_block_ode.py dptb/tests/test_block_ode_graph_contract.py dptb/tests/test_block_ode_redteam.py -q`
+
 ## Stage 2 — configuration-determined dual architecture
 
 - Timestamp: 2026-07-24 08:27:49 +08:00

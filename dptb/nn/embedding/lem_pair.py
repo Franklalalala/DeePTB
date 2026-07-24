@@ -502,11 +502,28 @@ class LemPair(LemMoEV3H0):
         self.latents_layernorm = bool(latents_layernorm)
         self.pair_refine_enable = bool(pair_refine_enable)
 
+        if (
+            getattr(self.init_layer, "merge_mode", None) == "replace"
+            and getattr(self.init_layer, "use_h0_node_init", False)
+            and getattr(self.init_layer, "use_h0_edge_init", False)
+        ):
+            # Both base node/edge environment features are replaced by H0.
+            # The base latent path remains live, but this envelope projection
+            # is unreachable from every model output.
+            for parameter in self.init_layer.base_init.env_embed_mlp.parameters():
+                parameter.requires_grad_(False)
+
         for layer in self.layers:
             layer.res_update_additive = self.res_update_additive
             layer.latents_layernorm = self.latents_layernorm
             layer.node_update.res_update_additive = self.res_update_additive
             layer.edge_update.res_update_additive = self.res_update_additive
+            for update in (layer.edge_update, layer.node_update):
+                if (
+                    not update.res_update or update.use_identity_res
+                ) and hasattr(update, "linear_res"):
+                    for parameter in update.linear_res.parameters():
+                        parameter.requires_grad_(False)
             if not self.latents_layernorm:
                 layer.edge_update.ln = torch.nn.Identity()
 
@@ -584,6 +601,19 @@ class LemPair(LemMoEV3H0):
             )
             # The fresh readout has res_update=False and discards its returned
             # latent, so residual-additive and latent-LN switches do not apply.
+            # Freeze the corresponding dead parameters as well: keeping them
+            # trainable would violate the constant DDP participation contract.
+            dead_readout_parts = (
+                final_layer.dual_cutoff_pair_readout.ln,
+                final_layer.dual_cutoff_pair_readout.latents_mlp_1,
+                final_layer.dual_cutoff_pair_readout.latents_mlp_2,
+            )
+            for dead_part in dead_readout_parts:
+                for parameter in dead_part.parameters():
+                    parameter.requires_grad_(False)
+            final_layer.dual_cutoff_pair_readout._res_update_params.requires_grad_(
+                False
+            )
             final_layer.register_buffer(
                 "dual_cutoff_readout_normalization",
                 torch.as_tensor(
