@@ -1927,6 +1927,12 @@ def slem_h0():
         Argument("flow_time_missing_value", (int, float), optional=True, default=0.0, doc=doc_flow_time_missing_value),
         Argument("require_full_block_edge_coverage", bool, optional=True, default=False,
                  doc=doc_require_full_block_edge_coverage),
+        Argument("hb0_hermitian_average", bool, optional=True, default=False,
+                 doc="Transpose-average directed reverse H-B0 edge blocks at the embedding output boundary."),
+        Argument("condition_source", str, optional=True, default="edge_0e",
+                 doc="H-B0 edge-head conditioner source: edge_0e or endpoints."),
+        Argument("log_head_input_rms", bool, optional=True, default=False,
+                 doc="Attach detached per-irrep-slice node/edge head-input RMS tensors to model output."),
     ]
 
 

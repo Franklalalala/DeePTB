@@ -85,6 +85,12 @@ _FUSED_CG_HEAD_ENV = "DPTB_FUSED_CG_HEAD"
 _CG_HEAD_IMPL_LEGACY = "legacy"
 _CG_HEAD_IMPL_FUSED = "fused"
 _CG_HEAD_IMPL_CHOICES = (_CG_HEAD_IMPL_LEGACY, _CG_HEAD_IMPL_FUSED)
+_CONDITION_SOURCE_EDGE_0E = "edge_0e"
+_CONDITION_SOURCE_ENDPOINTS = "endpoints"
+_CONDITION_SOURCE_CHOICES = (
+    _CONDITION_SOURCE_EDGE_0E,
+    _CONDITION_SOURCE_ENDPOINTS,
+)
 
 
 def _shell_l(shell: str) -> int:
@@ -126,6 +132,15 @@ def _autocast_is_active() -> bool:
     return bool(torch.is_autocast_enabled()) or _cpu_autocast_enabled()
 
 
+def _scalar_0e_indices(irreps: Union[str, o3.Irreps]) -> Sequence[int]:
+    irreps = o3.Irreps(irreps)
+    indices = []
+    for term_slice, (_, ir) in zip(irreps.slices(), irreps):
+        if ir.l == 0 and ir.p == 1:
+            indices.extend(range(term_slice.start, term_slice.stop))
+    return indices
+
+
 class LateBlockExpansionCGHead(torch.nn.Module):
     """Decode hidden irreps directly into ``[max_norb, max_norb]`` AO blocks."""
 
@@ -147,6 +162,8 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         device: Optional[Union[str, torch.device]] = None,
         cg_head_impl: str = _CG_HEAD_IMPL_LEGACY,
+        condition_source: str = _CONDITION_SOURCE_EDGE_0E,
+        node_irreps: Optional[Union[str, o3.Irreps]] = None,
     ) -> None:
         super().__init__()
         self.irreps_in = o3.Irreps(irreps_in)
@@ -156,6 +173,8 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         self.dynamic_init = float(init)
         self.condition = str(condition).strip().lower()
         self.cg_head_impl = str(cg_head_impl).strip().lower()
+        self.condition_source = self.normalize_condition_source(condition_source)
+        self.node_irreps = None
 
         if not self.full_basis:
             raise ValueError("full_basis must contain at least one AO shell.")
@@ -193,10 +212,7 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         self.output_shape = (self.max_norb, self.max_norb)
         self.ao_irreps = o3.Irreps(ao_terms)
 
-        scalar_indices = []
-        for term_slice, (_, ir) in zip(self.irreps_in.slices(), self.irreps_in):
-            if ir.l == 0 and ir.p == 1:
-                scalar_indices.extend(range(term_slice.start, term_slice.stop))
+        scalar_indices = _scalar_0e_indices(self.irreps_in)
         if not scalar_indices:
             raise ValueError(
                 "late_block_expansion_cg requires at least one 0e input "
@@ -207,6 +223,15 @@ class LateBlockExpansionCGHead(torch.nn.Module):
             torch.tensor(scalar_indices, dtype=torch.long, device=device),
             persistent=False,
         )
+        condition_dim = len(scalar_indices)
+        if self.condition_source == _CONDITION_SOURCE_ENDPOINTS:
+            node_scalar_indices = self._require_node_scalar_indices(node_irreps)
+            condition_dim += 2 * len(node_scalar_indices)
+            self.register_buffer(
+                "_node_scalar_indices",
+                torch.tensor(node_scalar_indices, dtype=torch.long, device=device),
+                persistent=False,
+            )
 
         self._paths = []
         weight_offset = 0
@@ -252,7 +277,7 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         self.num_path_weights = weight_offset
         self.static_weights = torch.nn.Parameter(torch.cat(static_weights, dim=0))
         self.condition_down = torch.nn.Linear(
-            len(scalar_indices), self.rank, bias=True, **factory_kwargs
+            condition_dim, self.rank, bias=True, **factory_kwargs
         )
         self.dynamic_up = torch.nn.Linear(
             self.rank, self.num_path_weights, bias=True, **factory_kwargs
@@ -264,6 +289,103 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         # state_dict is byte-identical to the legacy module (the 5 learnable
         # tensors only) and old checkpoints load strict=True.
         self._build_fused_plan(device=device)
+
+    @staticmethod
+    def normalize_condition_source(condition_source: str) -> str:
+        source = str(condition_source).strip().lower()
+        if source not in _CONDITION_SOURCE_CHOICES:
+            raise ValueError(
+                f"condition_source must be one of {_CONDITION_SOURCE_CHOICES}, "
+                f"got {condition_source!r}."
+            )
+        return source
+
+    def _require_node_scalar_indices(
+        self, node_irreps: Optional[Union[str, o3.Irreps]]
+    ) -> Sequence[int]:
+        if node_irreps is None:
+            raise ValueError(
+                "condition_source='endpoints' requires node_irreps."
+            )
+        self.node_irreps = o3.Irreps(node_irreps)
+        node_scalar_indices = _scalar_0e_indices(self.node_irreps)
+        if not node_scalar_indices:
+            raise ValueError(
+                "condition_source='endpoints' requires at least one node 0e "
+                f"multiplicity; node_irreps={self.node_irreps}."
+            )
+        return node_scalar_indices
+
+    def configure_condition_source(
+        self,
+        condition_source: str,
+        *,
+        node_irreps: Optional[Union[str, o3.Irreps]] = None,
+    ) -> None:
+        """Opt in after the route factory without changing its default path."""
+        source = self.normalize_condition_source(condition_source)
+        if source == self.condition_source:
+            return
+        if (
+            self.condition_source != _CONDITION_SOURCE_EDGE_0E
+            or source != _CONDITION_SOURCE_ENDPOINTS
+        ):
+            raise ValueError(
+                f"Cannot reconfigure condition_source from "
+                f"{self.condition_source!r} to {source!r}."
+            )
+        node_scalar_indices = self._require_node_scalar_indices(node_irreps)
+        self.register_buffer(
+            "_node_scalar_indices",
+            torch.tensor(
+                node_scalar_indices,
+                dtype=torch.long,
+                device=self.condition_down.weight.device,
+            ),
+            persistent=False,
+        )
+        condition_dim = self._scalar_indices.numel() + 2 * len(node_scalar_indices)
+        replacement = torch.nn.Linear(
+            condition_dim,
+            self.rank,
+            bias=True,
+            dtype=self.condition_down.weight.dtype,
+            device=self.condition_down.weight.device,
+        )
+        torch.nn.init.kaiming_uniform_(replacement.weight, a=math.sqrt(5.0))
+        if replacement.bias is not None:
+            torch.nn.init.zeros_(replacement.bias)
+        self.condition_down = replacement
+        self.condition_source = source
+
+    def _condition_input(
+        self,
+        features: torch.Tensor,
+        extra_condition: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        condition = features.index_select(-1, self._scalar_indices)
+        if self.condition_source == _CONDITION_SOURCE_EDGE_0E:
+            if extra_condition is not None:
+                raise ValueError(
+                    "extra_condition is valid only for "
+                    "condition_source='endpoints'."
+                )
+            return condition
+        if extra_condition is None:
+            raise ValueError(
+                "condition_source='endpoints' requires extra_condition."
+            )
+        expected_dim = self.condition_down.in_features - condition.shape[-1]
+        if (
+            extra_condition.shape[:-1] != features.shape[:-1]
+            or extra_condition.shape[-1] != expected_dim
+        ):
+            raise ValueError(
+                "Endpoint extra_condition shape mismatch: expected "
+                f"{(*features.shape[:-1], expected_dim)}, got "
+                f"{tuple(extra_condition.shape)}."
+            )
+        return torch.cat([condition, extra_condition], dim=-1)
 
     def reset_dynamic_parameters(self) -> None:
         torch.nn.init.kaiming_uniform_(self.condition_down.weight, a=math.sqrt(5.0))
@@ -367,7 +489,11 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         scatter_index = torch.cat(scatter_index_parts, dim=0)
         self.register_buffer("_fused_scatter_index", scatter_index, persistent=False)
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        features: torch.Tensor,
+        extra_condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if features.shape[-1] != self.irreps_in.dim:
             raise ValueError(
                 f"Expected last dimension {self.irreps_in.dim}, got "
@@ -412,18 +538,22 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         #       bit-stable with pre-fusion (0715-refactor) checkpoints/configs.
         # -------------------------------------------------------------------
         if os.environ.get(_LEGACY_CG_HEAD_ENV) == "1":
-            return self._forward_legacy(features)
+            return self._forward_legacy(features, extra_condition)
         if (
             _autocast_is_active()
             or features.dtype not in (torch.float32, torch.float64)
             or torch.are_deterministic_algorithms_enabled()
         ):
-            return self._forward_legacy(features)
+            return self._forward_legacy(features, extra_condition)
         if self.cg_head_impl == _CG_HEAD_IMPL_FUSED:
-            return self._forward_fused(features)
-        return self._forward_legacy(features)
+            return self._forward_fused(features, extra_condition)
+        return self._forward_legacy(features, extra_condition)
 
-    def _forward_fused(self, features: torch.Tensor) -> torch.Tensor:
+    def _forward_fused(
+        self,
+        features: torch.Tensor,
+        extra_condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Grouped batched-einsum forward + a single scatter (design A.2).
 
         The opt-in performance path, selected via ``cg_head_impl="fused"`` inside
@@ -441,7 +571,7 @@ class LateBlockExpansionCGHead(torch.nn.Module):
         regime the parity tests exercise) signals a real semantic divergence, not
         precision.
         """
-        condition = features.index_select(-1, self._scalar_indices)
+        condition = self._condition_input(features, extra_condition)
         invariant = torch.nn.functional.silu(self.condition_down(condition))
         dynamic_weights = self.dynamic_up(invariant)      # [..., num_path_weights]
         static = self.static_weights                      # [num_path_weights]
@@ -489,14 +619,18 @@ class LateBlockExpansionCGHead(torch.nn.Module):
             output = 0.5 * (output + output.transpose(-1, -2))
         return output
 
-    def _forward_legacy(self, features: torch.Tensor) -> torch.Tensor:
+    def _forward_legacy(
+        self,
+        features: torch.Tensor,
+        extra_condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Reference per-path loop -- the reduction-order-stable ORACLE the fused
         equivalence tests compare against and the DEFAULT forward path (design A.7;
         project decision 2026-07-22 P1-3 COMPATIBILITY-DEFAULT).  ``forward`` routes
         here whenever ``DPTB_LEGACY_CG_HEAD=1`` is set, the certified eager fp32/fp64
         domain guard fires (autocast, low-precision dtype, deterministic mode), or
         ``cg_head_impl`` is not explicitly set to ``"fused"`` (the default)."""
-        condition = features.index_select(-1, self._scalar_indices)
+        condition = self._condition_input(features, extra_condition)
         invariant = torch.nn.functional.silu(self.condition_down(condition))
         dynamic_weights = self.dynamic_up(invariant)
         input_slices = self.irreps_in.slices()

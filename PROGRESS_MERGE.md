@@ -1,4 +1,25 @@
-# IN PROGRESS — Stages 0–1 passed; Stage 2 is in progress.
+# IN PROGRESS — Stages 0–2 passed; Stage 3 is in progress.
+
+## Merge Stage 2 — Lane B endpoint/Hermitian/RMS heads
+
+- Timestamp: 2026-07-24 09:51:35 +08:00
+- Status: PASS
+- Imported B-exclusive head implementation and tests from `8baec4e`.
+- Reconciled `LemMoEV3H0`: `condition_source` defaults to `edge_0e`;
+  `hb0_hermitian_average` and `log_head_input_rms` default to `false`.
+  Their H-B0-only validation is retained.
+- The head call is executed once. C's optional full-cutoff envelope is passed
+  first, then B's optional RMS 3-tuple is unpacked. This preserves the required
+  `LemPair._apply` → `LemMoEV3._apply` MRO.
+- B targeted result including the added
+  `pair_refine_enable=true + log_head_input_rms=true` MRO smoke:
+  **13 passed** in 58.16 s.
+- Complete B + all `test_lem_pair_*` + output-route/argcheck gate:
+  **44 passed, 5 warnings** in 136.29 s.
+- Default gates are proven bit-exact by B's tests: implicit vs explicit
+  `condition_source=edge_0e`, `hb0_hermitian_average=false`, and
+  `log_head_input_rms=false` all preserve RNG/state/output exactly.
+- Gate: PASS.
 
 ## Merge Stage 1 — Lane C refine low-rank/identity/envelope
 

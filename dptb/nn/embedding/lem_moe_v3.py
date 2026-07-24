@@ -1398,6 +1398,97 @@ class LemMoEV3(torch.nn.Module):
         self._species_compact_cache = (index, norb)
         return index, norb
 
+    @staticmethod
+    @functools.lru_cache(maxsize=32)
+    def _cached_hb0_reverse_edge_permutation(
+        edge_pairs: Tuple[Tuple[int, int], ...],
+    ) -> Tuple[int, ...]:
+        """Return active-row reverse mates without mutating module state."""
+        lookup = {}
+        for row, pair in enumerate(edge_pairs):
+            if pair in lookup:
+                raise ValueError(
+                    "hb0_hermitian_average requires unique directed active edges; "
+                    f"duplicate edge {pair} occurs at rows {lookup[pair]} and {row}."
+                )
+            lookup[pair] = row
+        reverse = []
+        for row, (src, dst) in enumerate(edge_pairs):
+            mate = lookup.get((dst, src))
+            if mate is None:
+                raise ValueError(
+                    "hb0_hermitian_average requires every active directed edge to "
+                    f"have a reverse partner; row {row} edge ({src}, {dst}) is missing "
+                    f"({dst}, {src})."
+                )
+            reverse.append(mate)
+        return tuple(reverse)
+
+    @classmethod
+    def _hermitian_average_hb0_edge_blocks(
+        cls,
+        edge_blocks: torch.Tensor,
+        edge_index: torch.Tensor,
+        active_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        selected = edge_index.index_select(1, active_edges).detach().cpu().T.tolist()
+        edge_pairs = tuple((int(src), int(dst)) for src, dst in selected)
+        reverse = torch.tensor(
+            cls._cached_hb0_reverse_edge_permutation(edge_pairs),
+            dtype=torch.long,
+            device=edge_blocks.device,
+        )
+        rows = torch.arange(reverse.numel(), dtype=torch.long, device=edge_blocks.device)
+        canonical = rows[rows <= reverse]
+        mates = reverse.index_select(0, canonical)
+        averaged = 0.5 * (
+            edge_blocks.index_select(0, canonical)
+            + edge_blocks.index_select(0, mates).transpose(-1, -2)
+        )
+        projected = torch.zeros_like(edge_blocks)
+        projected = torch.index_copy(projected, 0, canonical, averaged)
+        projected = torch.index_copy(
+            projected, 0, mates, averaged.transpose(-1, -2)
+        )
+        return projected
+
+    @staticmethod
+    def _head_input_rms_by_irreps(
+        features: torch.Tensor,
+        irreps: o3.Irreps,
+    ) -> torch.Tensor:
+        detached = features.detach()
+        values = []
+        for term_slice in irreps.slices():
+            block = detached[..., term_slice]
+            if block.numel() == 0:
+                values.append(detached.new_zeros(()))
+            else:
+                values.append(block.square().mean().sqrt())
+        return torch.stack(values)
+
+    def _head_input_rms(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        node_irreps = o3.Irreps(self.out_node.irreps_in)
+        edge_irreps = o3.Irreps(self.out_edge.irreps_in)
+        return {
+            "node": self._head_input_rms_by_irreps(node_features, node_irreps),
+            "edge": self._head_input_rms_by_irreps(edge_features, edge_irreps),
+            "node_l": torch.tensor(
+                [ir.l for _, ir in node_irreps],
+                dtype=torch.long,
+                device=node_features.device,
+            ),
+            "edge_l": torch.tensor(
+                [ir.l for _, ir in edge_irreps],
+                dtype=torch.long,
+                device=edge_features.device,
+            ),
+        }
+
     def _apply_block_native_output_heads(
         self,
         node_features: torch.Tensor,
@@ -1407,7 +1498,28 @@ class LemMoEV3(torch.nn.Module):
         active_edges: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         out_node_blocks = self.out_node(node_features)
-        out_edge_blocks = self.out_edge(edge_features)
+        if getattr(self.out_edge, "condition_source", "edge_0e") == "endpoints":
+            active_edges_for_condition = active_edges.to(
+                device=edge_index.device, dtype=torch.long
+            ).reshape(-1)
+            active_edge_index = edge_index.index_select(
+                1, active_edges_for_condition
+            ).to(device=node_features.device)
+            node_0e = node_features.index_select(
+                -1, self.out_edge._node_scalar_indices
+            )
+            extra_condition = torch.cat(
+                [
+                    node_0e.index_select(0, active_edge_index[0]),
+                    node_0e.index_select(0, active_edge_index[1]),
+                ],
+                dim=-1,
+            )
+            out_edge_blocks = self.out_edge(
+                edge_features, extra_condition=extra_condition
+            )
+        else:
+            out_edge_blocks = self.out_edge(edge_features)
 
         # Heads emit union full-basis slot canvases; blockwise targets/loss use
         # the species-contiguous layout, so translate at this boundary.
@@ -1428,6 +1540,16 @@ class LemMoEV3(torch.nn.Module):
             compact_index[dst_type],
             compact_norb[dst_type],
         )
+        if getattr(self, "hb0_hermitian_average", False):
+            out_edge_blocks = self._hermitian_average_hb0_edge_blocks(
+                out_edge_blocks, edge_index, active_edges
+            )
+        if getattr(self, "log_head_input_rms", False):
+            return (
+                out_node_blocks,
+                out_edge_blocks,
+                self._head_input_rms(node_features, edge_features),
+            )
         return out_node_blocks, out_edge_blocks
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
@@ -1541,9 +1663,19 @@ class LemMoEV3(torch.nn.Module):
             )
             node_features = torch.cat([node_features, pad], dim=0)
         if self.use_block_native_output:
-            out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
-                node_features, edge_features, atom_type, edge_index, active_edges
-            )
+            if getattr(self, "log_head_input_rms", False):
+                (
+                    out_node_blocks,
+                    out_edge_blocks,
+                    head_input_rms,
+                ) = self._apply_block_native_output_heads(
+                    node_features, edge_features, atom_type, edge_index, active_edges
+                )
+                data["head_input_rms"] = head_input_rms
+            else:
+                out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
+                    node_features, edge_features, atom_type, edge_index, active_edges
+                )
             data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
             data[_keys.EDGE_HAMILTONIAN_KEY] = out_edge_blocks.new_zeros(
                 (edge_index.shape[1], self.out_edge.max_norb, self.out_edge.max_norb)

@@ -19,6 +19,7 @@ from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0_helpers import H0InitLayer
 from .flow_time import FlowTimeConditioner
+from .late_block_expansion_cg import LateBlockExpansionCGHead
 
 
 @Embedding.register("lem_moe_v3_h0")
@@ -72,10 +73,35 @@ class LemMoEV3H0(LemMoEV3):
         flow_time_missing_value: float = 0.0,
         flow_time_key_weights: Any = None,
         require_full_block_edge_coverage: bool = False,
+        hb0_hermitian_average: bool = False,
+        condition_source: str = "edge_0e",
+        log_head_input_rms: bool = False,
         env_embed_multiplicity: int = 32,
         **kwargs: Any,
     ):
+        condition_source = LateBlockExpansionCGHead.normalize_condition_source(
+            condition_source
+        )
         super().__init__(env_embed_multiplicity=env_embed_multiplicity, **kwargs)
+        self.hb0_hermitian_average = bool(hb0_hermitian_average)
+        if self.hb0_hermitian_average and self.output_route_name != "h_b0":
+            raise ValueError(
+                "hb0_hermitian_average=true requires output_route='h_b0'."
+            )
+        self.condition_source = condition_source
+        if self.condition_source == "endpoints":
+            if self.output_route_name != "h_b0":
+                raise ValueError(
+                    "condition_source='endpoints' requires output_route='h_b0'."
+                )
+            self.out_edge.configure_condition_source(
+                "endpoints", node_irreps=self.layers[-1].irreps_out
+            )
+        self.log_head_input_rms = bool(log_head_input_rms)
+        if self.log_head_input_rms and self.output_route_name != "h_b0":
+            raise ValueError(
+                "log_head_input_rms=true requires output_route='h_b0'."
+            )
         (
             self.h0_init_scope,
             self.use_h0_init,
@@ -354,7 +380,7 @@ class LemMoEV3H0(LemMoEV3):
             head_kwargs = {}
             if getattr(self, "pair_refine_enable", False):
                 head_kwargs["full_cutoff_coeffs"] = cutoff_coeffs
-            out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
+            head_outputs = self._apply_block_native_output_heads(
                 node_features,
                 edge_features,
                 atom_type,
@@ -362,6 +388,11 @@ class LemMoEV3H0(LemMoEV3):
                 active_edges,
                 **head_kwargs,
             )
+            if getattr(self, "log_head_input_rms", False):
+                out_node_blocks, out_edge_blocks, head_input_rms = head_outputs
+                data["head_input_rms"] = head_input_rms
+            else:
+                out_node_blocks, out_edge_blocks = head_outputs
             data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
             data[_keys.EDGE_HAMILTONIAN_KEY] = torch.zeros(
                 edge_index.shape[1],
