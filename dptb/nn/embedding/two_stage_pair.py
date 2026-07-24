@@ -194,6 +194,21 @@ class NormFreePairRefineLayer(torch.nn.Module):
         self.static_weights = torch.nn.Parameter(
             torch.empty(self.tensor_product.weight_numel, **factory_kwargs)
         )
+        (
+            self.path_tensor_product,
+            path_output_index,
+            path_gate_index,
+        ) = self._build_path_tensor_product(dtype=dtype, device=device)
+        self.register_buffer(
+            "_path_output_index",
+            path_output_index,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_path_gate_index",
+            path_gate_index,
+            persistent=False,
+        )
         self.amplitude_gate = (
             torch.nn.Linear(self.rank, 1, bias=True, **factory_kwargs)
             if self.tail_gate
@@ -208,6 +223,72 @@ class NormFreePairRefineLayer(torch.nn.Module):
     @property
     def dynamic_dof_per_edge(self) -> int:
         return int(self.path_count + (1 if self.tail_gate else 0))
+
+    def _build_path_tensor_product(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: Union[str, torch.device],
+    ) -> tuple[o3.TensorProduct, torch.Tensor, torch.Tensor]:
+        """Expose each full-FCTP instruction in a separate output block.
+
+        e3nn stores the final normalization coefficient in
+        ``Instruction.path_weight``.  Disabling normalization in the split
+        tensor product and supplying its square as the raw instruction weight
+        reproduces the original contribution exactly.  This lets one shared
+        static weight vector serve every edge; invariant gates are applied to
+        the split output coordinates before the original irreps layout is
+        recovered with ``scatter_add_``.
+        """
+        path_output_terms = []
+        path_instructions = []
+        output_index = []
+        gate_index = []
+        edge_slices = self.edge_irreps.slices()
+        for path, instruction in enumerate(self.tensor_product.instructions):
+            mul, irrep = self.edge_irreps[instruction.i_out]
+            path_output_terms.append((mul, irrep))
+            path_instructions.append(
+                (
+                    instruction.i_in1,
+                    instruction.i_in2,
+                    path,
+                    instruction.connection_mode,
+                    True,
+                    float(instruction.path_weight) ** 2,
+                )
+            )
+            edge_slice = edge_slices[instruction.i_out]
+            output_index.extend(range(edge_slice.start, edge_slice.stop))
+            gate_index.extend([path] * (edge_slice.stop - edge_slice.start))
+
+        path_tensor_product = o3.TensorProduct(
+            self.node_irreps,
+            self.node_irreps,
+            o3.Irreps(path_output_terms),
+            path_instructions,
+            irrep_normalization="none",
+            path_normalization="none",
+            shared_weights=True,
+            internal_weights=False,
+        ).to(dtype=dtype, device=device)
+        if path_tensor_product.weight_numel != self.weight_numel:
+            raise RuntimeError(
+                "Split per-path tensor-product static layout disagrees with "
+                f"the full FCTP: {path_tensor_product.weight_numel} != "
+                f"{self.weight_numel}."
+            )
+        # This tensor product is fully determined by the irreps and owns no
+        # learned state.  e3nn registers generated constants (output masks and
+        # Wigner tensors) as persistent buffers by default; marking them
+        # non-persistent keeps the pre-optimization state_dict key set stable.
+        for module in path_tensor_product.modules():
+            module._non_persistent_buffers_set.update(module._buffers.keys())
+        return (
+            path_tensor_product,
+            torch.tensor(output_index, dtype=torch.long, device=device),
+            torch.tensor(gate_index, dtype=torch.long, device=device),
+        )
 
     def reset_parameters(self) -> None:
         self.condition_down.reset_parameters()
@@ -249,14 +330,21 @@ class NormFreePairRefineLayer(torch.nn.Module):
         )
         return torch.nn.functional.silu(self.condition_down(condition))
 
-    def forward(
+    def _prepare_forward(
         self,
         node_features: torch.Tensor,
         edge_features: torch.Tensor,
         edge_index: torch.Tensor,
         edge_vector: torch.Tensor,
         active_edges: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
         active_edges = active_edges.to(
             device=edge_index.device, dtype=torch.long
         ).reshape(-1)
@@ -268,7 +356,14 @@ class NormFreePairRefineLayer(torch.nn.Module):
                 f"edge_irreps={self.edge_irreps}; got {tuple(edge_features.shape)}."
             )
         if active_edges.numel() == 0:
-            return edge_features
+            return (
+                active_edges,
+                active_edge_index,
+                edge_features.new_empty((0, self.path_count)),
+                edge_features.new_empty((0,), dtype=torch.long),
+                edge_features.new_empty((0,), dtype=torch.long),
+                None,
+            )
 
         invariant = self._condition(
             node_features,
@@ -276,9 +371,6 @@ class NormFreePairRefineLayer(torch.nn.Module):
             active_edge_index,
             active_edge_vector,
         )
-        # One learned invariant scalar per CG instruction/path.  Expanding to
-        # e3nn's channel-mixing weight layout is bounded by edge_chunk_size,
-        # never by the full edge count.
         path_gates = 1.0 + torch.tanh(self.path_gate_up(invariant))
         amplitude = (
             2.0 * torch.sigmoid(self.amplitude_gate(invariant))
@@ -286,6 +378,28 @@ class NormFreePairRefineLayer(torch.nn.Module):
             else None
         )
         src, dst = active_edge_index
+        return active_edges, active_edge_index, path_gates, src, dst, amplitude
+
+    def _forward_materialized(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vector: torch.Tensor,
+        active_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reference implementation retaining the former expanded-weight path."""
+        prepared = self._prepare_forward(
+            node_features,
+            edge_features,
+            edge_index,
+            edge_vector,
+            active_edges,
+        )
+        active_edges = prepared[0]
+        if active_edges.numel() == 0:
+            return edge_features
+        _, _, path_gates, src, dst, amplitude = prepared
         refinements = []
         for start in range(0, active_edges.numel(), self.edge_chunk_size):
             stop = min(start + self.edge_chunk_size, active_edges.numel())
@@ -297,6 +411,58 @@ class NormFreePairRefineLayer(torch.nn.Module):
                 node_features.index_select(0, src[start:stop]),
                 node_features.index_select(0, dst[start:stop]),
                 weights,
+            )
+            if amplitude is not None:
+                update = update * amplitude[start:stop]
+            refinements.append(update)
+        refinement = torch.cat(refinements, dim=0)
+
+        # Eq. 14 norm-free tail: exact unit-coefficient residual addition.
+        return edge_features + refinement
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vector: torch.Tensor,
+        active_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        prepared = self._prepare_forward(
+            node_features,
+            edge_features,
+            edge_index,
+            edge_vector,
+            active_edges,
+        )
+        active_edges = prepared[0]
+        if active_edges.numel() == 0:
+            return edge_features
+        _, _, path_gates, src, dst, amplitude = prepared
+
+        # edge_chunk_size now bounds split path outputs only.  No
+        # [chunk, weight_numel] tensor is materialized: the shared static
+        # vector is consumed once by e3nn, then per-path gates are applied to
+        # output coordinates before restoring the original irreps layout.
+        refinements = []
+        for start in range(0, active_edges.numel(), self.edge_chunk_size):
+            stop = min(start + self.edge_chunk_size, active_edges.numel())
+            path_features = self.path_tensor_product(
+                node_features.index_select(0, src[start:stop]),
+                node_features.index_select(0, dst[start:stop]),
+                self.static_weights,
+            )
+            component_gates = path_gates[start:stop].index_select(
+                1, self._path_gate_index
+            )
+            path_features = path_features * component_gates
+            update = edge_features.new_zeros(
+                (stop - start, self.edge_irreps.dim)
+            )
+            update.scatter_add_(
+                1,
+                self._path_output_index.expand(stop - start, -1),
+                path_features,
             )
             if amplitude is not None:
                 update = update * amplitude[start:stop]

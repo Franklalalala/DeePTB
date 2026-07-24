@@ -6,7 +6,10 @@ import torch
 import pytest
 from e3nn import o3
 
-from dptb.nn.embedding.two_stage_pair import TwoStagePairStream
+from dptb.nn.embedding.two_stage_pair import (
+    NormFreePairRefineLayer,
+    TwoStagePairStream,
+)
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
 
@@ -81,6 +84,73 @@ def _case(*, n_refine_layers=0, tail_gate=False):
         ),
     )
     return stream, irreps, inputs
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(torch.float64, 1.0e-12), (torch.float32, 1.0e-5)],
+)
+@pytest.mark.parametrize("tail_gate", [False, True])
+def test_refine_zero_materialization_matches_two_layer_reference(
+    dtype, tolerance, tail_gate
+):
+    torch.manual_seed(20260725)
+    irreps = o3.Irreps("2x0e+2x1o+1x1e+1x2e")
+    layers = torch.nn.ModuleList(
+        [
+            NormFreePairRefineLayer(
+                irreps,
+                irreps,
+                rank=3,
+                radial_dim=2,
+                edge_chunk_size=2,
+                tail_gate=tail_gate,
+                dtype=dtype,
+                device="cpu",
+            )
+            for _ in range(2)
+        ]
+    ).eval()
+    node_features = torch.randn(4, irreps.dim, dtype=dtype)
+    all_edges = _complete_directed_edges(4)
+    active_edges = torch.tensor([0, 2, 5, 7, 10], dtype=torch.long)
+    edge_vector = torch.randn(all_edges.shape[1], 3, dtype=dtype)
+    edge_features = torch.randn(active_edges.numel(), irreps.dim, dtype=dtype)
+
+    reference = edge_features
+    candidate = edge_features
+    for layer in layers:
+        reference = layer._forward_materialized(
+            node_features,
+            reference,
+            all_edges,
+            edge_vector,
+            active_edges,
+        )
+        candidate = layer(
+            node_features,
+            candidate,
+            all_edges,
+            edge_vector,
+            active_edges,
+        )
+
+    max_abs = (candidate - reference).abs().max().item()
+    print(
+        "two_stage_zero_materialization "
+        f"dtype={dtype} tail_gate={tail_gate} max_abs={max_abs:.16e}"
+    )
+    assert max_abs <= tolerance
+    assert active_edges.numel() % layers[0].edge_chunk_size != 0
+    assert "_path_output_index" not in layers[0].state_dict()
+    assert "_path_gate_index" not in layers[0].state_dict()
+    assert "_weight_path_index" not in layers[0].state_dict()
+    assert "static_weights" in layers[0].state_dict()
+    assert not any(
+        key.startswith("path_tensor_product.")
+        for key in layers[0].state_dict()
+    )
+    layers[0].load_state_dict(layers[0].state_dict(), strict=True)
 
 
 def test_eq13_late_pair_construction_is_equivariant():
