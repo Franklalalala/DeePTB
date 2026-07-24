@@ -28,7 +28,6 @@ def test_mp_cutoff_none_and_provably_redundant_are_bit_identical():
         assert all_active.mp_cutoff is None
         assert all_active.dual_cutoff_pair_readout is None
         assert all_active.dual_cutoff_edge_context_projection is None
-        assert all_active._last_mp_mask is None
         for key in (
             _keys.NODE_HAMILTONIAN_KEY,
             _keys.EDGE_HAMILTONIAN_KEY,
@@ -58,7 +57,11 @@ def test_dual_cutoff_is_equivariant_and_keeps_full_ordered_head_rows():
         finally:
             handle.remove()
 
-        mask = pair_model._last_mp_mask
+        src, dst = data[_keys.EDGE_INDEX_KEY]
+        mask = (
+            data[_keys.POSITIONS_KEY].index_select(0, src)
+            - data[_keys.POSITIONS_KEY].index_select(0, dst)
+        ).norm(dim=-1) < pair_model.mp_cutoff
         assert int(mask.sum()) > 0
         assert int((~mask).sum()) > 0
         n_edges = data[_keys.EDGE_INDEX_KEY].shape[1]
@@ -121,8 +124,6 @@ def test_configured_cutoff_keeps_dual_architecture_for_all_active_head_rows():
             handle.remove()
         assert len(calls) == 2
         assert all_active.mp_cutoff == 1.0
-        assert bool(all_active._last_mp_active_mask.all())
-        assert not bool(all_active._last_mp_mask.all())
         for key in (
             _keys.NODE_HAMILTONIAN_KEY,
             _keys.EDGE_HAMILTONIAN_KEY,
@@ -160,7 +161,7 @@ def test_non_mp_readout_keeps_its_direct_h0_edge_context():
         finally:
             handle.remove()
 
-        assert pair_model._last_mp_mask[non_mp_edge].item() is False
+        assert lengths[non_mp_edge].item() >= pair_model.mp_cutoff
         assert len(captured) == 2
         context_delta = captured[1] - captured[0]
         assert context_delta[non_mp_edge].abs().max().item() > 0.0

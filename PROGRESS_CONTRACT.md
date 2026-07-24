@@ -27,6 +27,37 @@ Overall status: IN PROGRESS
 - Reproduce:
   `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_common.py dptb/tests/test_lem_pair_dual_cutoff.py dptb/tests/test_lem_pair_flow_contract.py dptb/tests/test_lem_pair_norm_switches.py dptb/tests/test_lem_pair_refine.py dptb/tests/test_lem_pair_contract_validation.py -q`
 
+## Stage 3 — lifecycle-safe pair topology
+
+- Timestamp: 2026-07-24 08:42:19 +08:00
+- Status: PASS
+- Chosen design: dual projection/readout ownership moved into the final
+  `PairLayer`; the initial full-edge context is carried explicitly as a
+  layer-to-layer value. This avoids changing the duplicated H0 forward loop
+  while removing all owner references and pair forward-time context state.
+- Every pair layer stores a pure cutoff copy and a non-persistent type-pair
+  cutoff lookup buffer. No pair module attribute or buffer changes in forward.
+- Exact state_dict migration map (`L = n_layers - 1`):
+  - `dual_cutoff_readout_normalization` ->
+    `layers.L.dual_cutoff_readout_normalization`
+  - `dual_cutoff_pair_readout.*` ->
+    `layers.L.dual_cutoff_pair_readout.*`
+  - `dual_cutoff_edge_context_projection.*` ->
+    `layers.L.dual_cutoff_edge_context_projection.*`
+- State key count remains 225 in the two-layer dual fixture; only the above
+  prefixes and traversal order changed.
+- e3nn's `SphericalHarmonics.sph_func` ScriptFunction cache was the remaining
+  deepcopy/pickle blocker. LemPair now uses the exact underlying Python
+  spherical-harmonics function; golden outputs remain bit-identical.
+- Lifecycle tests: 3 passed in 31.65 s. Deepcopy object/module/parameter graphs
+  are independent, strict state_dict round-trip is exact, and whole-object
+  `torch.save`/`torch.load(weights_only=False)` is exact.
+- Full stage result: 19 passed, 2 warnings in 63.37 s.
+- S2-to-S3 golden: dual `torch.equal=True`, legacy `torch.equal=True`, both
+  `max|delta|=0`. Temporary golden tensors were removed after comparison.
+- Reproduce:
+  `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_common.py dptb/tests/test_lem_pair_dual_cutoff.py dptb/tests/test_lem_pair_flow_contract.py dptb/tests/test_lem_pair_norm_switches.py dptb/tests/test_lem_pair_refine.py dptb/tests/test_lem_pair_contract_validation.py dptb/tests/test_lem_pair_lifecycle.py -q`
+
 ## Stage 2 — configuration-determined dual architecture
 
 - Timestamp: 2026-07-24 08:27:49 +08:00

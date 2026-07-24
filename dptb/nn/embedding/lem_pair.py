@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import logging
-import weakref
 from typing import Any, Dict, Optional, Union
 
 import torch
 from e3nn.o3 import Linear
+from e3nn.o3._spherical_harmonics import (
+    _spherical_harmonics as _e3nn_spherical_harmonics,
+)
 from torch_scatter import scatter
 
-from dptb.data import AtomicDataDict
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
@@ -148,7 +150,8 @@ def _get_mp_edge_mask(
 class PairInitLayer(InitLayer):
     """Legacy init plus MP-only node aggregation for a real cutoff split."""
 
-    _pair_owner_ref = None
+    mp_cutoff = None
+    mp_avg_num_neighbors = None
 
     def forward(
         self,
@@ -161,8 +164,7 @@ class PairInitLayer(InitLayer):
         active_edges: Optional[torch.Tensor] = None,
         cutoff_coeffs: Optional[torch.Tensor] = None,
     ):
-        owner = self._pair_owner_ref() if self._pair_owner_ref is not None else None
-        if owner is None or owner.mp_cutoff is None:
+        if self.mp_cutoff is None:
             return super().forward(
                 edge_index,
                 atom_type,
@@ -178,7 +180,7 @@ class PairInitLayer(InitLayer):
             edge_length=edge_length,
             bond_type=bond_type,
             idp=self.idp,
-            mp_cutoff=owner.mp_cutoff,
+            mp_cutoff=self.mp_cutoff,
         )
 
         edge_center = edge_index[0]
@@ -216,10 +218,6 @@ class PairInitLayer(InitLayer):
         edge_features = self._env_weighter(edge_sh[active_edges], weights_e)
 
         mp_active_mask = mp_mask.index_select(0, active_edges)
-        # Detached masks are diagnostics only. Architecture selection is fixed
-        # at construction and must never depend on batch contents.
-        owner._last_mp_mask = mp_mask.detach()
-        owner._last_mp_active_mask = mp_active_mask.detach()
         mp_edges = active_edges[mp_active_mask]
         node_features = scatter(
             edge_features[mp_active_mask],
@@ -228,7 +226,7 @@ class PairInitLayer(InitLayer):
             dim_size=atom_type.numel(),
         )
         node_features = node_features * torch.as_tensor(
-            owner.mp_avg_num_neighbors,
+            self.mp_avg_num_neighbors,
             dtype=node_features.dtype,
             device=node_features.device,
         ).rsqrt()
@@ -260,8 +258,7 @@ class PairUpdateEdge(UpdateEdge):
 class PairLayer(Layer):
     """Run legacy layer math on the private MP subset and read all pairs last."""
 
-    _pair_owner_ref = None
-    _pair_is_first = False
+    mp_cutoff = None
     _pair_is_last = False
 
     @staticmethod
@@ -271,6 +268,41 @@ class PairLayer(Layer):
     @staticmethod
     def _node_update_type():
         return PairUpdateNode
+
+    def configure_dual_cutoff(self, mp_cutoff: Cutoff, idp: Any) -> None:
+        """Store an immutable cutoff copy and a type-pair lookup buffer."""
+        self.mp_cutoff = copy.deepcopy(mp_cutoff)
+        template = self.node_update.env_sum_normalizations
+        table = template.new_empty((len(idp.type_names), len(idp.type_names)))
+        if isinstance(self.mp_cutoff, (float, int)):
+            table.fill_(float(self.mp_cutoff))
+        else:
+            for atom_i, type_i in idp.chemical_symbol_to_type.items():
+                for atom_j, type_j in idp.chemical_symbol_to_type.items():
+                    table[type_i, type_j] = 0.5 * (
+                        float(self.mp_cutoff[atom_i])
+                        + float(self.mp_cutoff[atom_j])
+                    )
+        self.register_buffer("_mp_cutoff_by_type", table, persistent=False)
+
+    def _mp_active_mask(
+        self,
+        edge_index: torch.Tensor,
+        edge_vector: torch.Tensor,
+        atom_type: torch.Tensor,
+        active_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        active_edges = active_edges.to(
+            device=edge_index.device, dtype=torch.long
+        ).reshape(-1)
+        active_edge_index = edge_index.index_select(1, active_edges)
+        src_type = atom_type.index_select(0, active_edge_index[0])
+        dst_type = atom_type.index_select(0, active_edge_index[1])
+        pair_cutoff = self._mp_cutoff_by_type[
+            src_type.to(dtype=torch.long), dst_type.to(dtype=torch.long)
+        ].to(device=edge_vector.device, dtype=edge_vector.dtype)
+        edge_length = edge_vector.index_select(0, active_edges).norm(dim=-1)
+        return edge_length < pair_cutoff
 
     def forward(
         self,
@@ -288,8 +320,7 @@ class PairLayer(Layer):
         mole_globals,
         node_batch=None,
     ):
-        owner = self._pair_owner_ref() if self._pair_owner_ref is not None else None
-        if owner is None or owner.mp_cutoff is None:
+        if self.mp_cutoff is None:
             return super().forward(
                 latents,
                 node_features,
@@ -306,16 +337,14 @@ class PairLayer(Layer):
                 node_batch,
             )
 
-        mp_active_mask = owner._last_mp_mask.index_select(0, active_edges)
+        if isinstance(edge_features, tuple):
+            edge_features, initial_edge_context = edge_features
+        else:
+            initial_edge_context = edge_features
+        mp_active_mask = self._mp_active_mask(
+            edge_index, edge_vector, atom_type, active_edges
+        )
         mp_edges = active_edges[mp_active_mask]
-        if self._pair_is_first:
-            if edge_features.shape[0] != active_edges.numel():
-                raise ValueError(
-                    "lem_pair dual cutoff expected one initial edge context row "
-                    "per active head edge; got "
-                    f"{edge_features.shape[0]} and {active_edges.numel()}."
-                )
-            owner._pair_initial_edge_context = edge_features
         if edge_features.shape[0] == active_edges.numel():
             edge_features = edge_features[mp_active_mask]
         if edge_one_hot.shape[0] == active_edges.numel():
@@ -353,18 +382,13 @@ class PairLayer(Layer):
         )
 
         if self._pair_is_last:
-            initial_edge_context = owner._pair_initial_edge_context
-            if initial_edge_context is None:
-                raise RuntimeError(
-                    "lem_pair dual cutoff lost the full-edge context before readout."
-                )
             if initial_edge_context.shape[0] != active_edges.numel():
                 raise ValueError(
                     "lem_pair dual cutoff full-edge context and active-edge rows "
                     f"disagree: {initial_edge_context.shape[0]} != "
                     f"{active_edges.numel()}."
                 )
-            readout_input = owner.dual_cutoff_edge_context_projection(
+            readout_input = self.dual_cutoff_edge_context_projection(
                 initial_edge_context
             )
             mp_positions = torch.nonzero(
@@ -378,7 +402,7 @@ class PairLayer(Layer):
             readout_input = torch.index_copy(
                 readout_input, 0, mp_positions, edge_features
             )
-            edge_features, _, _ = owner.dual_cutoff_pair_readout(
+            edge_features, _, _ = self.dual_cutoff_pair_readout(
                 latents,
                 node_features,
                 node_onehot,
@@ -392,8 +416,10 @@ class PairLayer(Layer):
                 mole_globals,
             )
             edge_features = (
-                edge_features * owner.dual_cutoff_readout_normalization
+                edge_features * self.dual_cutoff_readout_normalization
             )
+        else:
+            edge_features = (edge_features, initial_edge_context)
         return latents, node_features, edge_features, wigner_D_all
 
 
@@ -437,6 +463,10 @@ class LemPair(LemMoEV3H0):
             )
         r_max = kwargs.get("r_max", 5.0)
         super().__init__(avg_num_neighbors=avg_num_neighbors, **kwargs)
+        # e3nn stores a ScriptFunction cache on SphericalHarmonics, which
+        # cannot be deep-copied or pickled. The underlying Python function is
+        # numerically identical and makes whole-model lifecycle operations work.
+        self.sh.sph_func = _e3nn_spherical_harmonics
         self.mp_cutoff = _canonicalize_mp_cutoff(mp_cutoff, r_max, self.idp)
         neighbor_count = (
             avg_num_neighbors
@@ -446,11 +476,6 @@ class LemPair(LemMoEV3H0):
         self.mp_avg_num_neighbors = _positive_finite_scalar(
             neighbor_count, label="mp_avg_num_neighbors"
         )
-        self._last_mp_mask = None
-        self._last_mp_active_mask = None
-        self._pair_initial_edge_context = None
-        self.dual_cutoff_pair_readout = None
-        self.dual_cutoff_edge_context_projection = None
         self.res_update_additive = bool(res_update_additive)
         self.latents_layernorm = bool(latents_layernorm)
         self.pair_refine_enable = bool(pair_refine_enable)
@@ -464,25 +489,29 @@ class LemPair(LemMoEV3H0):
                 layer.edge_update.ln = torch.nn.Identity()
 
         if self.mp_cutoff is not None:
+            base_init = getattr(self.init_layer, "base_init", self.init_layer)
+            base_init.mp_cutoff = copy.deepcopy(self.mp_cutoff)
+            base_init.mp_avg_num_neighbors = self.mp_avg_num_neighbors
             mp_normalization = torch.as_tensor(
                 self.mp_avg_num_neighbors,
                 dtype=self.dtype,
                 device=self.device,
             ).rsqrt()
             for layer in self.layers:
+                layer.configure_dual_cutoff(self.mp_cutoff, self.idp)
                 # Dual topology is a construction-time choice, so the MP
                 # aggregation normalization is a permanent layer constant.
                 layer.node_update.env_sum_normalizations = mp_normalization.clone()
             final_irreps = self.layers[-1].irreps_out
-            base_init = getattr(self.init_layer, "base_init", self.init_layer)
-            self.dual_cutoff_edge_context_projection = Linear(
+            final_layer = self.layers[-1]
+            final_layer.dual_cutoff_edge_context_projection = Linear(
                 base_init.irreps_out,
                 final_irreps,
                 shared_weights=True,
                 internal_weights=True,
                 biases=False,
             ).to(dtype=self.dtype, device=self.device)
-            self.dual_cutoff_pair_readout = PairUpdateEdge(
+            final_layer.dual_cutoff_pair_readout = PairUpdateEdge(
                 num_types=self.n_atom,
                 node_irreps_in=final_irreps,
                 irreps_in=final_irreps,
@@ -533,7 +562,7 @@ class LemPair(LemMoEV3H0):
             )
             # The fresh readout has res_update=False and discards its returned
             # latent, so residual-additive and latent-LN switches do not apply.
-            self.register_buffer(
+            final_layer.register_buffer(
                 "dual_cutoff_readout_normalization",
                 torch.as_tensor(
                     avg_num_neighbors, dtype=self.dtype, device=self.device
@@ -558,22 +587,24 @@ class LemPair(LemMoEV3H0):
                 device=self.device,
             )
 
-        owner_ref = weakref.ref(self)
-        base_init = getattr(self.init_layer, "base_init", self.init_layer)
-        base_init._pair_owner_ref = owner_ref
         for index, layer in enumerate(self.layers):
-            layer._pair_owner_ref = owner_ref
-            layer._pair_is_first = index == 0
             layer._pair_is_last = index == len(self.layers) - 1
 
-    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
-        """Dispatch the legacy skeleton through pair-specific init/layers."""
-        self._pair_initial_edge_context = None
-        try:
-            return super().forward(data)
-        finally:
-            # Do not retain an autograd graph through a module attribute between batches.
-            self._pair_initial_edge_context = None
+    @property
+    def dual_cutoff_pair_readout(self):
+        """Compatibility accessor; parameters are owned by the final pair layer."""
+        if self.mp_cutoff is None:
+            return None
+        return getattr(self.layers[-1], "dual_cutoff_pair_readout", None)
+
+    @property
+    def dual_cutoff_edge_context_projection(self):
+        """Compatibility accessor; parameters are owned by the final pair layer."""
+        if self.mp_cutoff is None:
+            return None
+        return getattr(
+            self.layers[-1], "dual_cutoff_edge_context_projection", None
+        )
 
     def _apply_block_native_output_heads(
         self,
