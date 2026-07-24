@@ -1558,7 +1558,7 @@ def embedding():
             Argument("lem_light", dict, slem()),
             Argument("lem_light_v2", dict, slem()),
             Argument("lem_charge", dict, slem()),
-            Argument("lem_cutoff", dict, slem()),
+            Argument("lem_cutoff", dict, slem_cutoff()),
             Argument("lem_moe_openequi", dict, slem()),
             Argument("lem_in_frame_moe", dict, slem()),
             Argument("lem_full_tp", dict, slem()),
@@ -1794,8 +1794,6 @@ def slem():
         Argument("avg_num_neighbors", [int, float], optional=False, doc=doc_avg_num_neighbors),
         Argument("r_max", [float, int, dict], optional=False, doc=doc_r_max),
         Argument("n_layers", int, optional=False, doc=doc_n_layers),
-        Argument("mp_cutoff", [float, int, dict], optional=True),
-
         Argument("self_mix_mode", str, optional=True, default="full"),
         Argument("self_mix_type", str, optional=True, default="all"),
         Argument("self_mix_flag", bool, optional=True, default=False),
@@ -1935,6 +1933,7 @@ def slem_h0():
 def slem_pair():
     """LEM H0 schema plus pair-topology, norm, and refinement controls."""
     return slem_h0() + [
+        Argument("mp_cutoff", [float, int, dict], optional=True),
         Argument("mp_avg_num_neighbors", [int, float, None], optional=True, default=None),
         Argument("res_update_additive", bool, optional=True, default=False,
                  doc="Use unscaled x + delta residual updates in the pair backbone."),
@@ -1945,6 +1944,13 @@ def slem_pair():
         Argument("pair_refine_condition", str, optional=True, default="scalar_0e"),
         Argument("pair_refine_internal_weights", bool, optional=True, default=True),
         Argument("pair_refine_init", [int, float], optional=True, default=0.0),
+    ]
+
+
+def slem_cutoff():
+    """Legacy LemCutoff schema; it independently consumes ``mp_cutoff``."""
+    return slem() + [
+        Argument("mp_cutoff", [float, int, dict], optional=True),
     ]
 
 

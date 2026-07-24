@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 import math
 import logging
-from typing import Any, Dict, Optional, Union
+import re
+from typing import Any, Dict, Iterable, Mapping, Optional, Union
 
 import torch
 from e3nn.o3 import Linear
@@ -65,6 +66,12 @@ def _validated_mp_cutoff(mp_cutoff: Optional[Cutoff], idp: Any) -> Optional[Cuto
         raise ValueError(
             "mp_cutoff element dictionary must cover every basis species; "
             f"missing {missing}."
+        )
+    unknown = sorted(set(normalized).difference(required_symbols))
+    if unknown:
+        raise ValueError(
+            "mp_cutoff element dictionary contains unknown basis species; "
+            f"unknown {unknown}."
         )
     return normalized
 
@@ -130,16 +137,31 @@ def _get_mp_edge_mask(
         return edge_length < float(mp_cutoff)
     if isinstance(mp_cutoff, dict):
         mask = torch.zeros_like(edge_length, dtype=torch.bool)
+        recognized = torch.zeros_like(edge_length, dtype=torch.bool)
         for bond, type_index in idp.bond_to_type.items():
             atoms = bond.split("-")
             if len(atoms) != 2:
-                continue
+                raise ValueError(
+                    "Cannot resolve lem_pair bond label into two elements: "
+                    f"{bond!r}."
+                )
             cutoff_i = mp_cutoff.get(atoms[0])
             cutoff_j = mp_cutoff.get(atoms[1])
             if cutoff_i is None or cutoff_j is None:
-                continue
+                raise KeyError(
+                    "mp_cutoff is missing an element required by bond "
+                    f"{bond!r}."
+                )
             pair_cutoff = 0.5 * (float(cutoff_i) + float(cutoff_j))
-            mask |= (bond_type == int(type_index)) & (edge_length < pair_cutoff)
+            type_rows = bond_type == int(type_index)
+            recognized |= type_rows
+            mask |= type_rows & (edge_length < pair_cutoff)
+        if not bool(recognized.all().item()):
+            unknown_types = torch.unique(bond_type[~recognized]).detach().cpu().tolist()
+            raise ValueError(
+                "lem_pair encountered bond_type rows absent from idp.bond_to_type: "
+                f"{unknown_types}."
+            )
         return mask
     raise TypeError(
         "mp_cutoff must be a scalar or an element-cutoff dictionary; "
@@ -624,3 +646,50 @@ class LemPair(LemMoEV3H0):
         return super()._apply_block_native_output_heads(
             node_features, edge_features, atom_type, edge_index, active_edges
         )
+
+
+def _migration_prefix_matches(key: str, prefix: str) -> bool:
+    if key.startswith(prefix):
+        return True
+    if prefix.startswith("dual_cutoff_"):
+        return re.match(r"^layers\.\d+\." + re.escape(prefix), key) is not None
+    return False
+
+
+def load_lem_h0_backbone(
+    model: torch.nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    allowed_missing_prefixes: Iterable[str],
+):
+    """Strictly warm-start a LemPair from a legacy LemMoEV3H0 state dict.
+
+    Missing keys are accepted only under every explicitly listed prefix.
+    The public top-level ``dual_cutoff_*`` prefixes also match the Stage-3
+    final-layer ownership path ``layers.<L>.dual_cutoff_*``. Unexpected keys,
+    uncovered missing keys, and unused allowlist prefixes all fail closed.
+    """
+    prefixes = tuple(str(prefix) for prefix in allowed_missing_prefixes)
+    if not prefixes or any(not prefix for prefix in prefixes):
+        raise ValueError("allowed_missing_prefixes must contain non-empty prefixes.")
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = tuple(incompatible.missing_keys)
+    unexpected = tuple(incompatible.unexpected_keys)
+    uncovered = tuple(
+        key
+        for key in missing
+        if not any(_migration_prefix_matches(key, prefix) for prefix in prefixes)
+    )
+    unused = tuple(
+        prefix
+        for prefix in prefixes
+        if not any(_migration_prefix_matches(key, prefix) for key in missing)
+    )
+    if uncovered or unexpected or unused:
+        raise RuntimeError(
+            "Lem H0 backbone migration rejected incompatible state_dict: "
+            f"uncovered_missing={list(uncovered)}, "
+            f"unexpected={list(unexpected)}, "
+            f"unused_allowed_prefixes={list(unused)}."
+        )
+    return incompatible

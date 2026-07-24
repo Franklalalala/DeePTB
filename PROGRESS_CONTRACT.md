@@ -58,6 +58,32 @@ Overall status: IN PROGRESS
 - Reproduce:
   `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_common.py dptb/tests/test_lem_pair_dual_cutoff.py dptb/tests/test_lem_pair_flow_contract.py dptb/tests/test_lem_pair_norm_switches.py dptb/tests/test_lem_pair_refine.py dptb/tests/test_lem_pair_contract_validation.py dptb/tests/test_lem_pair_lifecycle.py -q`
 
+## Stage 4 — schema ownership, fail-closed validation, migration
+
+- Timestamp: 2026-07-24 08:49:48 +08:00
+- Status: PASS
+- Consumer audit: besides LemPair, `dptb/nn/embedding/lem_cutoff.py`
+  independently implements `mp_cutoff`. The field was removed from public
+  `slem()` and retained only by `slem_pair()` plus a dedicated
+  `slem_cutoff()` schema. Strict argcheck rejects `lem_moe_v3_h0 +
+  mp_cutoff` and accepts both real consumers.
+- Constructor red-team now rejects scalar/dict NaN, infinity, non-positive
+  values, booleans, missing basis species, unknown species, and invalid
+  `mp_avg_num_neighbors`.
+- Runtime dict masking now raises on malformed bond labels, missing element
+  keys, and unknown bond-type rows instead of silently excluding them.
+- Added `load_lem_h0_backbone(model, state_dict, *,
+  allowed_missing_prefixes)`. It rejects uncovered missing keys, every
+  unexpected key, and unused allowlist prefixes. Public top-level
+  `dual_cutoff_*` allowlist prefixes map explicitly to the Stage-3 final-layer
+  ownership path.
+- Legacy `LemMoEV3H0` -> dual+refine LemPair migration passes with the exact
+  allowlist; a single renamed source key fails closed. The existing all-off
+  strict-load/bit-exact test remains green.
+- Gate result: 82 passed, 1 warning in 51.03 s (wall clock 54.791 s).
+- Reproduce:
+  `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_contract_validation.py dptb/tests/test_configuration_canonicalization.py dptb/tests/test_output_route_config_argcheck.py -q`
+
 ## Stage 2 — configuration-determined dual architecture
 
 - Timestamp: 2026-07-24 08:27:49 +08:00
