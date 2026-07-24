@@ -133,24 +133,67 @@ def test_block_ode_flow_highl_state_is_equivariant_when_ao_blocks_rotate(
             .item()
             > 0.0
         )
-        base_output = model(base_data)
+        init_layer = model.embedding.init_layer
+        projector_inputs = {"node": [], "edge": []}
+        handles = [
+            init_layer.node_projector.register_forward_pre_hook(
+                lambda _module, args: projector_inputs["node"].append(
+                    args[0].detach().clone()
+                )
+            ),
+            init_layer.edge_projector.register_forward_pre_hook(
+                lambda _module, args: projector_inputs["edge"].append(
+                    args[0].detach().clone()
+                )
+            ),
+        ]
+        try:
+            base_output = model(base_data)
+            base_projector_inputs = {
+                key: values.pop() for key, values in projector_inputs.items()
+            }
 
-        torch.manual_seed(101)
-        rotation = o3.rand_matrix(dtype=torch.float64)
-        xyz_to_yzx = torch.tensor(
-            [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
-            dtype=torch.float64,
+            torch.manual_seed(101)
+            rotation = o3.rand_matrix(dtype=torch.float64)
+            xyz_to_yzx = torch.tensor(
+                [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+                dtype=torch.float64,
+            )
+            rme_rotation = xyz_to_yzx @ rotation @ xyz_to_yzx.T
+            d_ao = _shared_canvas_wigner_d(rme_rotation)
+            rotated_raw = _rotate_flow_record(raw, rotation, d_ao)
+            rotated_data, _, _ = flow.prepare_batch(
+                copy.deepcopy(rotated_raw),
+                copy.deepcopy(rotated_raw),
+                t=time,
+            )
+            rotated_output = model(rotated_data)
+            rotated_projector_inputs = {
+                key: values.pop() for key, values in projector_inputs.items()
+            }
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        # G-FIX2: the actual H0 tensors presented to the sorted-irrep linears
+        # must already transform in that representation.  This is the boundary
+        # that drifted by O(1) before the raw->sorted fix.
+        d_h0 = init_layer.h0_irreps.D_from_matrix(rme_rotation)
+        h0_boundary_drifts = {}
+        for label in ("node", "edge"):
+            expected = torch.einsum(
+                "ij,nj->ni", d_h0, base_projector_inputs[label]
+            )
+            h0_boundary_drifts[label] = (
+                rotated_projector_inputs[label] - expected
+            ).abs().max().item()
+        print(
+            "block_ode_flow_highl_h0_boundary "
+            f"two_stage_pair_enable={two_stage_pair_enable} "
+            f"node_max_abs={h0_boundary_drifts['node']:.16e} "
+            f"edge_max_abs={h0_boundary_drifts['edge']:.16e}"
         )
-        d_ao = _shared_canvas_wigner_d(
-            xyz_to_yzx @ rotation @ xyz_to_yzx.T
-        )
-        rotated_raw = _rotate_flow_record(raw, rotation, d_ao)
-        rotated_data, _, _ = flow.prepare_batch(
-            copy.deepcopy(rotated_raw),
-            copy.deepcopy(rotated_raw),
-            t=time,
-        )
-        rotated_output = model(rotated_data)
+        assert max(h0_boundary_drifts.values()) <= 2.0e-15, h0_boundary_drifts
 
         drifts = {}
         for label, key in (

@@ -115,3 +115,71 @@ C:\Users\16608\.conda\envs\dptb\python.exe -m py_compile \
 ```
 
 Result: **PASS**. `git diff --check`: **PASS**.
+
+## Stage 2 — G-FIX1–4 verification
+
+Timestamp: 2026-07-24 10:36:24 +08:00
+Status: PASS
+
+### G-FIX1 — l>0 flow equivariance
+
+```text
+C:\Users\16608\.conda\envs\dptb\python.exe -m pytest \
+  dptb/tests/test_block_ode_flow_highl_equivariance.py -q -s
+```
+
+Result: **2 passed, 4 warnings in 29.14 s**.
+
+| two-stage | node output max abs drift | edge output max abs drift |
+|---|---:|---:|
+| off | 6.6613381477509392e-16 | 2.7755575615628914e-16 |
+| on | 6.6613381477509392e-16 | 3.6776137690708310e-16 |
+
+Both are below the required `1e-9` fp64 gate.
+
+### G-FIX2 — actual sorted-projector input boundary
+
+The high-l test now installs forward pre-hooks on the real
+`H0InitLayer.node_projector` and `edge_projector`. It compares the tensors
+actually presented to those sorted-irrep linears under the correct Wigner
+rotation, without any post-hoc sorting in the test.
+
+| two-stage | node projector-input drift | edge projector-input drift |
+|---|---:|---:|
+| off | 1.7763568394002505e-15 | 5.5511151231257827e-17 |
+| on | 1.7763568394002505e-15 | 5.5511151231257827e-17 |
+
+The node value is the same `1.78e-15` fp64 roundoff reported by the upstream
+boundary scan after its diagnostic sort; it replaces the former O(1) drift and
+the production path now performs that sort itself.
+
+### G-FIX3 — uu_real bit identity
+
+`test_uureal_projection_is_bit_exact_with_legacy_sort_path` constructs the
+directed SOC-uu_real configuration and compares the fixed generic path against
+the preserved legacy `_uureal_h0_sort_index` path:
+
+- sorted node tensors: `torch.equal`
+- sorted edge tensors: `torch.equal`
+- node projector outputs: `torch.equal`
+- edge projector outputs: `torch.equal`
+- legacy persistent `_uureal_h0_sort_index` remains in state_dict
+- generic `_h0_sort_index` is non-persistent
+
+### G-FIX4 — zero and scalar H0 bit identity
+
+`test_zero_and_scalar_only_h0_are_bit_exact_under_sort` verifies:
+
+- non-scalar mapper with all-zero H0: sorted tensor and biased projector output
+  are `torch.equal` to the pre-fix raw input path;
+- pure `1s`/l=0 mapper: sort index is exactly the identity, and random H0 plus
+  projector output are `torch.equal`.
+
+```text
+C:\Users\16608\.conda\envs\dptb\python.exe -m pytest \
+  dptb/tests/test_h0_rme_sort_contract.py -q -s
+```
+
+Result: **2 passed in 25.01 s**.
+
+Both changed test files pass `py_compile`; `git diff --check`: **PASS**.
