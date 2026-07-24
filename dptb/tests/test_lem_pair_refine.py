@@ -97,3 +97,50 @@ def test_pair_refine_is_nontrivial_invariant_conditioned_and_equivariant():
         )
         assert invariant_drift <= 1.0e-9
         assert block_drift <= 1.0e-9
+
+
+def test_per_path_identity_refine_wiring_is_bit_exact_and_receives_envelope():
+    with fp64_default():
+        options = model_options()
+        torch.manual_seed(20260724)
+        reference_model = LemPair(**options).eval()
+        torch.manual_seed(20260724)
+        identity_model = LemPair(
+            **options,
+            pair_refine_enable=True,
+            pair_refine_rank=4,
+            pair_refine_weight_mode="per_path",
+            pair_refine_max_weight_numel=1_000_000,
+            pair_refine_identity_init=True,
+        ).eval()
+
+        assert identity_model.pair_refine.weight_mode == "per_path"
+        assert identity_model.pair_refine.identity_init is True
+        assert identity_model.pair_refine.max_weight_numel == 1_000_000
+
+        captured_scales = []
+
+        def capture_scale(module, args, kwargs):
+            captured_scales.append(kwargs["edge_scale"].detach().clone())
+
+        handle = identity_model.pair_refine.register_forward_pre_hook(
+            capture_scale,
+            with_kwargs=True,
+        )
+        try:
+            data = molecule_data(reference_model)
+            reference = reference_model(clone_data(data))
+            actual = identity_model(clone_data(data))
+        finally:
+            handle.remove()
+
+        assert len(captured_scales) == 1
+        assert captured_scales[0].ndim == 1
+        assert captured_scales[0].shape[0] > 0
+        assert torch.all(captured_scales[0] > 0)
+        for key in (
+            _keys.NODE_HAMILTONIAN_KEY,
+            _keys.EDGE_HAMILTONIAN_KEY,
+            _keys.EDGE_OVERLAP_KEY,
+        ):
+            assert torch.equal(reference[key], actual[key])

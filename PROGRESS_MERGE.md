@@ -1,4 +1,45 @@
-# IN PROGRESS — Stage 0 scope complete; implementation not yet started.
+# IN PROGRESS — Stages 0–1 passed; Stage 2 is in progress.
+
+## Merge Stage 1 — Lane C refine low-rank/identity/envelope
+
+- Timestamp: 2026-07-24 09:45:57 +08:00
+- Status: PASS
+- Imported Lane C implementation from `49cdb74`: `pair_so3_refine.py`,
+  `pair_refine_cost.py`, and `test_pair_refine_lowrank.py`.
+- Reconciled A-owned `LemPair`: added `pair_refine_weight_mode` (default
+  `full`), `pair_refine_max_weight_numel` (default `None`), and
+  `pair_refine_identity_init` (default `false`). Full-r_max cutoff
+  coefficients are selected on active edges and passed as the explicit
+  refinement envelope.
+- Added a merge-level wiring test proving per-path identity initialization
+  is bit-exact with refinement disabled and receives a non-empty positive
+  envelope.
+- Targeted C + legacy refine result: **25 passed** in 41.95 s.
+- Final C + all eight `test_lem_pair_*` files: **52 passed, 4 warnings** in
+  108.91 s.
+- Explicit Lane-A-vs-merge default-full golden: post-construction RNG,
+  7 state tensors, and output all `torch.equal`; `max|Δ|=0`.
+- Gate: PASS.
+
+## Merge Stage 0 — A baseline and overlap audit
+
+- Timestamp: 2026-07-24 09:37:00 +08:00
+- Status: PASS
+- Worktree/branch: `E:\deeptb\wt_0724_merge`, `feat/0724-merge-all`, starting
+  merge commit `ad907ba`; worktree clean.
+- Baseline command: `pytest dptb/tests/test_lem_pair_common.py
+  dptb/tests/test_lem_pair_dual_cutoff.py
+  dptb/tests/test_lem_pair_flow_contract.py
+  dptb/tests/test_lem_pair_hard_gates.py
+  dptb/tests/test_lem_pair_lifecycle.py
+  dptb/tests/test_lem_pair_contract_validation.py
+  dptb/tests/test_configuration_canonicalization.py -q`
+- Result: **92 passed, 4 warnings** in 96.31 s.
+- B/C/D `dcacda5..HEAD --stat` and name-status were reviewed. They match the
+  supplied overlap map: C owns only refine implementation/cost/test files;
+  B and D meet in `lem_moe_v3_h0.py` and `argcheck.py`; B additionally owns
+  the endpoint head implementation; D owns the new two-stage module/tests.
+- Gate: PASS.
 
 ## Stage 0 — scope / design
 

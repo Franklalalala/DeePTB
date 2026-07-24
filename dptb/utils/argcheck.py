@@ -1944,6 +1944,12 @@ def slem_pair():
         Argument("pair_refine_condition", str, optional=True, default="scalar_0e"),
         Argument("pair_refine_internal_weights", bool, optional=True, default=True),
         Argument("pair_refine_init", [int, float], optional=True, default=0.0),
+        Argument("pair_refine_weight_mode", str, optional=True, default="full",
+                 doc="Dynamic TP weights: legacy `full` or low-rank `per_path`."),
+        Argument("pair_refine_max_weight_numel", [int, None], optional=True, default=None,
+                 doc="Optional constructor guard on the full FCTP weight count."),
+        Argument("pair_refine_identity_init", bool, optional=True, default=False,
+                 doc="Zero dynamic and static refinement weights at initialization."),
     ]
 
 

@@ -472,6 +472,9 @@ class LemPair(LemMoEV3H0):
         pair_refine_condition: str = "scalar_0e",
         pair_refine_internal_weights: bool = True,
         pair_refine_init: float = 0.0,
+        pair_refine_weight_mode: str = "full",
+        pair_refine_max_weight_numel: Optional[int] = None,
+        pair_refine_identity_init: bool = False,
         **kwargs: Any,
     ) -> None:
         if (
@@ -635,6 +638,9 @@ class LemPair(LemMoEV3H0):
                 condition=pair_refine_condition,
                 internal_weights=pair_refine_internal_weights,
                 dynamic_init=pair_refine_init,
+                weight_mode=pair_refine_weight_mode,
+                max_weight_numel=pair_refine_max_weight_numel,
+                identity_init=pair_refine_identity_init,
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -665,13 +671,33 @@ class LemPair(LemMoEV3H0):
         atom_type,
         edge_index,
         active_edges,
+        full_cutoff_coeffs=None,
     ):
+        edge_scale = None
+        if full_cutoff_coeffs is not None:
+            edge_scale = (
+                full_cutoff_coeffs.to(
+                    device=edge_features.device,
+                    dtype=edge_features.dtype,
+                )
+                .reshape(-1)
+                .index_select(
+                    0,
+                    active_edges.to(
+                        device=edge_features.device,
+                        dtype=torch.long,
+                    ),
+                )
+            )
         if self.pair_refine_enable:
             active_edge_index = edge_index.index_select(
                 1, active_edges.to(device=edge_index.device, dtype=torch.long)
             )
             edge_features = self.pair_refine(
-                node_features, edge_features, active_edge_index
+                node_features,
+                edge_features,
+                active_edge_index,
+                edge_scale=edge_scale,
             )
         return super()._apply_block_native_output_heads(
             node_features, edge_features, atom_type, edge_index, active_edges

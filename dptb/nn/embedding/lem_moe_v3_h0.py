@@ -351,8 +351,16 @@ class LemMoEV3H0(LemMoEV3):
             node_features = torch.cat([node_features, pad], dim=0)
 
         if getattr(self, "use_block_native_output", False):
+            head_kwargs = {}
+            if getattr(self, "pair_refine_enable", False):
+                head_kwargs["full_cutoff_coeffs"] = cutoff_coeffs
             out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
-                node_features, edge_features, atom_type, edge_index, active_edges
+                node_features,
+                edge_features,
+                atom_type,
+                edge_index,
+                active_edges,
+                **head_kwargs,
             )
             data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
             data[_keys.EDGE_HAMILTONIAN_KEY] = torch.zeros(
