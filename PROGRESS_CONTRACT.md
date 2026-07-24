@@ -121,6 +121,24 @@ Overall status: IN PROGRESS
 - Reproduce:
   `C:\Users\16608\.conda\envs\dptb\python.exe -m pytest dptb/tests/test_lem_pair_*.py dptb/tests/test_hb0_active_edge_contract.py dptb/tests/test_block_ode_flow.py dptb/tests/test_residual_ao_block_ode.py dptb/tests/test_block_ode_graph_contract.py dptb/tests/test_block_ode_redteam.py -q`
 
+## Stage 6 — base-vs-head legacy golden
+
+- Timestamp: 2026-07-24 09:13:10 +08:00
+- Status: PASS
+- Added `scripts/crosstree_golden_lem_h0.py`. Each child imports and constructs
+  `LemMoEV3H0` directly from its own PYTHONPATH; LemPair is not imported.
+- Base tree verified at `a6f152e`; children run with
+  `PYTHONDONTWRITEBYTECODE=1` to preserve the base tree as read-only.
+- fp32: PASS, 184 ordered state tensors, all tensors and node/edge/overlap
+  outputs `torch.equal`, `max|delta|=0`.
+- fp64: PASS, 184 ordered state tensors, all tensors and node/edge/overlap
+  outputs `torch.equal`, `max|delta|=0`.
+- Wall clock: 99.620 s.
+- Report:
+  `F:\claude\0724_pair_iter2\results\crosstree_golden_A.md`
+- Reproduce:
+  `C:\Users\16608\.conda\envs\dptb\python.exe scripts/crosstree_golden_lem_h0.py`
+
 ## Stage 2 — configuration-determined dual architecture
 
 - Timestamp: 2026-07-24 08:27:49 +08:00
