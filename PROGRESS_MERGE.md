@@ -1,4 +1,24 @@
-# IN PROGRESS — Stages 0–2 passed; Stage 3 is in progress.
+# IN PROGRESS — Stages 0–3 passed; Stage 4 is in progress.
+
+## Merge Stage 3 — Lane D two-stage pair stream
+
+- Timestamp: 2026-07-24 09:58:11 +08:00
+- Status: PASS
+- Imported `TwoStagePairStream` and D tests from `e8b1c2c`.
+- Added the seven `two_stage_pair_*` arguments to `LemMoEV3H0` and
+  `slem_h0()`. `two_stage_pair_enable` defaults to `false`; disabled models
+  retain `two_stage_pair=None` and construct no module.
+- Forward ordering is exactly: backbone → optional two-stage replacement of
+  active-edge features → optional C refine envelope → B endpoint/Hermitian/RMS
+  head dispatch.
+- D targeted result: **13 passed, 2 warnings** in 47.48 s.
+- D+B+A merge gate: **55 passed, 6 warnings** in 158.58 s.
+- Disabled bit-exact gate: post-construction RNG/state/output all
+  `torch.equal`, no `two_stage_pair.*` module/state.
+- Enabled end-to-end equivariance: `max|Δ|=7.2164496600635175e-16`.
+- `LemPair + two_stage_pair + condition_source=endpoints` combination:
+  `max|Δ|=1.9984014443252818e-15`.
+- Gate: PASS.
 
 ## Merge Stage 2 — Lane B endpoint/Hermitian/RMS heads
 

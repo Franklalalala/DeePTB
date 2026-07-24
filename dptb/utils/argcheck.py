@@ -1933,6 +1933,13 @@ def slem_h0():
                  doc="H-B0 edge-head conditioner source: edge_0e or endpoints."),
         Argument("log_head_input_rms", bool, optional=True, default=False,
                  doc="Attach detached per-irrep-slice node/edge head-input RMS tensors to model output."),
+        Argument("two_stage_pair_enable", bool, optional=True, default=False),
+        Argument("two_stage_pair_refine_layers", int, optional=True, default=2),
+        Argument("two_stage_pair_tail_gate", bool, optional=True, default=False),
+        Argument("two_stage_pair_refine_rank", int, optional=True, default=16),
+        Argument("two_stage_pair_refine_condition", str, optional=True, default="scalar_0e"),
+        Argument("two_stage_pair_refine_radial_dim", int, optional=True, default=4),
+        Argument("two_stage_pair_refine_edge_chunk_size", int, optional=True, default=64),
     ]
 
 

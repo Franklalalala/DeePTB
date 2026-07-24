@@ -20,6 +20,7 @@ from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0_helpers import H0InitLayer
 from .flow_time import FlowTimeConditioner
 from .late_block_expansion_cg import LateBlockExpansionCGHead
+from .two_stage_pair import TwoStagePairStream
 
 
 @Embedding.register("lem_moe_v3_h0")
@@ -77,6 +78,13 @@ class LemMoEV3H0(LemMoEV3):
         condition_source: str = "edge_0e",
         log_head_input_rms: bool = False,
         env_embed_multiplicity: int = 32,
+        two_stage_pair_enable: bool = False,
+        two_stage_pair_refine_layers: int = 2,
+        two_stage_pair_tail_gate: bool = False,
+        two_stage_pair_refine_rank: int = 16,
+        two_stage_pair_refine_condition: str = "scalar_0e",
+        two_stage_pair_refine_radial_dim: int = 4,
+        two_stage_pair_refine_edge_chunk_size: int = 64,
         **kwargs: Any,
     ):
         condition_source = LateBlockExpansionCGHead.normalize_condition_source(
@@ -102,6 +110,8 @@ class LemMoEV3H0(LemMoEV3):
             raise ValueError(
                 "log_head_input_rms=true requires output_route='h_b0'."
             )
+        self.two_stage_pair_enable = bool(two_stage_pair_enable)
+        self.two_stage_pair = None
         (
             self.h0_init_scope,
             self.use_h0_init,
@@ -115,6 +125,11 @@ class LemMoEV3H0(LemMoEV3):
             option_name="h0_init_scope",
         )
         self.require_full_block_edge_coverage = bool(require_full_block_edge_coverage)
+        if self.two_stage_pair_enable and not self.use_h0_init:
+            raise ValueError(
+                "two_stage_pair_enable=true requires an active H0 init scope in "
+                "LemMoEV3H0 so the current ordered-edge state is available."
+            )
         if self.require_full_block_edge_coverage and (
             not self.use_h0_init or self.output_route_name != "h_b0"
         ):
@@ -171,6 +186,60 @@ class LemMoEV3H0(LemMoEV3):
                 self_edge_tol=h0_self_edge_tol,
                 dtype=self.dtype,
                 device=self.device,
+            )
+        if self.two_stage_pair_enable:
+            final_irreps = self.layers[-1].irreps_out
+            self.two_stage_pair = TwoStagePairStream(
+                num_types=self.n_atom,
+                node_irreps=final_irreps,
+                edge_irreps=final_irreps,
+                latent_dim=self.latent_dim,
+                norm_eps=kwargs.get("norm_eps", 1.0e-8),
+                latent_channels=kwargs.get("latent_channels", [128, 128]),
+                radial_emb=kwargs.get("tp_radial_emb", False),
+                radial_channels=kwargs.get("tp_radial_channels", [128, 128]),
+                use_layer_onehot_tp=kwargs.get("use_layer_onehot_tp", True),
+                edge_one_hot_dim=kwargs.get("edge_one_hot_dim", 128),
+                equivariant_norm_type=kwargs.get("equivariant_norm_type", "none"),
+                activation_type="gate",
+                swiglu_s2_grid_resolution=kwargs.get(
+                    "swiglu_s2_grid_resolution", (14, 14)
+                ),
+                swiglu_s2_compat_mode=kwargs.get(
+                    "swiglu_s2_compat_mode", "modern"
+                ),
+                so2_wigner_apply_mode=kwargs.get(
+                    "so2_wigner_apply_mode", "compact_blocks"
+                ),
+                so2_fusion_mode=kwargs.get(
+                    "so2_fusion_mode", "streamed_m_major_cueq"
+                ),
+                mole_linear_mode=kwargs.get(
+                    "mole_linear_mode", "cueq_indexed_linear"
+                ),
+                so2_expert_mixing_mode=kwargs.get(
+                    "so2_expert_mixing_mode", "pre_activation"
+                ),
+                so2_expert_route_chunk_size=kwargs.get(
+                    "so2_expert_route_chunk_size", None
+                ),
+                so2_expert_route_checkpoint=kwargs.get(
+                    "so2_expert_route_checkpoint", False
+                ),
+                so2_output_router_hidden_dim=kwargs.get(
+                    "so2_output_router_hidden_dim", 32
+                ),
+                onehot_tp_mode=kwargs.get("onehot_tp_mode", None),
+                dtype=self.dtype,
+                device=self.device,
+                num_experts=kwargs.get("num_experts", 8),
+                num_shared_experts=kwargs.get("num_shared_experts", 1),
+                n_refine_layers=two_stage_pair_refine_layers,
+                refine_rank=two_stage_pair_refine_rank,
+                refine_condition=two_stage_pair_refine_condition,
+                refine_radial_dim=two_stage_pair_refine_radial_dim,
+                refine_edge_chunk_size=two_stage_pair_refine_edge_chunk_size,
+                tail_gate=two_stage_pair_tail_gate,
             )
 
     @staticmethod
@@ -375,6 +444,21 @@ class LemMoEV3H0(LemMoEV3):
                 dtype=node_features.dtype,
             )
             node_features = torch.cat([node_features, pad], dim=0)
+
+        if getattr(self, "two_stage_pair_enable", False):
+            edge_features = self.two_stage_pair(
+                latents,
+                node_features,
+                node_one_hot,
+                edge_features,
+                edge_index,
+                edge_vector,
+                cutoff_coeffs,
+                active_edges,
+                edge_one_hot,
+                wigner_D_all,
+                mole_globals,
+            )
 
         if getattr(self, "use_block_native_output", False):
             head_kwargs = {}
