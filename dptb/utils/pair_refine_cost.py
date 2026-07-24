@@ -9,7 +9,9 @@ explicit optional cross-check against the installed e3nn implementation.
 
 For an e3nn fully connected tensor product, every parity/triangle-compatible
 ``(input term 1, input term 2, output term)`` triple is one instruction.  Its
-external-weight slice contains ``mul1 * mul2 * mulout`` scalar weights.
+external-weight slice contains ``mul1 * mul2 * mulout`` scalar weights.  The
+QHFlow mode retains only equal-multiplicity ``uuu`` instructions, whose slices
+contain ``mul`` scalars.
 """
 from __future__ import annotations
 
@@ -78,6 +80,56 @@ def fctp_weight_numel(node: list[Term], edge: list[Term]) -> int:
     )
 
 
+def uuu_path_count(node: list[Term], edge: list[Term]) -> int:
+    """Count compatible equal-multiplicity ``uuu`` instructions."""
+    return sum(
+        1
+        for a in node
+        for b in node
+        for out in edge
+        if a.mul == b.mul == out.mul and compatible(a, b, out)
+    )
+
+
+def uuu_weight_numel(node: list[Term], edge: list[Term]) -> int:
+    """Count per-edge dynamic scalars in the QHFlow ``uuu`` tensor product."""
+    return sum(
+        out.mul
+        for a in node
+        for b in node
+        for out in edge
+        if a.mul == b.mul == out.mul and compatible(a, b, out)
+    )
+
+
+def shared_linear_params(
+    irreps_in: list[Term],
+    irreps_out: list[Term],
+    *,
+    biases: bool = True,
+) -> int:
+    """Count parameters in an e3nn shared ``o3.Linear``."""
+    weights = sum(
+        term_in.mul * term_out.mul
+        for term_in in irreps_in
+        for term_out in irreps_out
+        if (
+            term_in.ell == term_out.ell
+            and term_in.parity == term_out.parity
+        )
+    )
+    bias_params = (
+        sum(
+            term.mul
+            for term in irreps_out
+            if term.ell == 0 and term.parity == 1
+        )
+        if biases
+        else 0
+    )
+    return weights + bias_params
+
+
 def e3nn_fctp_weight_numel(
     node_irreps: Union[str, object],
     edge_irreps: Optional[Union[str, object]] = None,
@@ -137,33 +189,76 @@ def estimate(
     rank: int,
     dtype_bytes: int,
     internal_weights: bool,
+    weight_mode: str = "full",
 ) -> dict[str, int | str]:
+    if weight_mode not in {"full", "per_path", "qhflow"}:
+        raise ValueError(
+            "weight_mode must be 'full', 'per_path', or 'qhflow', "
+            f"got {weight_mode!r}."
+        )
     node = parse_irreps(irreps)
     edge = node
     weight_numel = fctp_weight_numel(node, edge)
     path_count = fctp_path_count(node, edge)
+    qhflow_path_count = uuu_path_count(node, edge)
+    qhflow_weight_numel = uuu_weight_numel(node, edge)
     condition_dim = 2 * scalar_0e_dim(node) + scalar_0e_dim(edge)
     condition_down_params = condition_dim * rank + rank
-    dynamic_up_params = rank * weight_numel + weight_numel
-    static_params = weight_numel if internal_weights else 0
-    total_params = condition_down_params + dynamic_up_params + static_params
-    per_edge_bytes = weight_numel * dtype_bytes
+    dynamic_weight_numel = {
+        "full": weight_numel,
+        "per_path": path_count,
+        "qhflow": qhflow_weight_numel,
+    }[weight_mode]
+    dynamic_up_params = (
+        rank * dynamic_weight_numel + dynamic_weight_numel
+    )
+    static_params = (
+        weight_numel
+        if internal_weights and weight_mode != "qhflow"
+        else 0
+    )
+    linear_pre_params = (
+        shared_linear_params(node, node) if weight_mode == "qhflow" else 0
+    )
+    linear_post_params = (
+        shared_linear_params(edge, edge) if weight_mode == "qhflow" else 0
+    )
+    total_params = (
+        condition_down_params
+        + dynamic_up_params
+        + static_params
+        + linear_pre_params
+        + linear_post_params
+    )
+    per_edge_bytes = dynamic_weight_numel * dtype_bytes
     batch_bytes = per_edge_bytes * edges
     return {
         "irreps": irreps,
+        "weight_mode": weight_mode,
         "weight_numel_per_edge": weight_numel,
         "path_count": path_count,
+        "qhflow_path_count": qhflow_path_count,
+        "qhflow_weight_numel_per_edge": qhflow_weight_numel,
+        "dynamic_weight_numel_per_edge": dynamic_weight_numel,
         "condition_dim": condition_dim,
         "rank": rank,
         "condition_down_params": condition_down_params,
         "dynamic_up_params": dynamic_up_params,
         "static_params": static_params,
+        "linear_pre_params": linear_pre_params,
+        "linear_post_params": linear_post_params,
         "total_refiner_params": total_params,
         "dynamic_weight_buffer_per_edge": human_bytes(per_edge_bytes),
         "dynamic_weight_buffer_for_batch": human_bytes(batch_bytes),
         "per_path_buffer_per_edge": human_bytes(path_count * dtype_bytes),
         "per_path_buffer_for_batch": human_bytes(
             path_count * dtype_bytes * edges
+        ),
+        "qhflow_buffer_per_edge": human_bytes(
+            qhflow_weight_numel * dtype_bytes
+        ),
+        "qhflow_buffer_for_batch": human_bytes(
+            qhflow_weight_numel * dtype_bytes * edges
         ),
         "edges": edges,
         "dtype_bytes": dtype_bytes,
@@ -172,15 +267,27 @@ def estimate(
 
 def print_estimate(result: dict[str, int | str]) -> None:
     print(f"irreps: {result['irreps']}")
+    print(f"weight mode: {result['weight_mode']}")
     print(f"FCTP instructions / edge: {result['path_count']:,}")
     print(f"FCTP external weights / edge: {result['weight_numel_per_edge']:,}")
+    print(f"QHFlow uuu instructions / edge: {result['qhflow_path_count']:,}")
+    print(
+        "QHFlow uuu dynamic weights / edge: "
+        f"{result['qhflow_weight_numel_per_edge']:,}"
+    )
+    print(
+        "selected dynamic weights / edge: "
+        f"{result['dynamic_weight_numel_per_edge']:,}"
+    )
     print(f"condition dim -> rank: {result['condition_dim']} -> {result['rank']}")
     print(f"condition_down params: {result['condition_down_params']:,}")
     print(f"dynamic_up params: {result['dynamic_up_params']:,}")
     print(f"static TP params: {result['static_params']:,}")
+    print(f"Linear_pre params: {result['linear_pre_params']:,}")
+    print(f"Linear_post params: {result['linear_post_params']:,}")
     print(f"total refiner params: {result['total_refiner_params']:,}")
     print(
-        "materialized full dynamic-weight buffer: "
+        "materialized selected dynamic-weight buffer: "
         f"{result['dynamic_weight_buffer_per_edge']} / edge; "
         f"{result['dynamic_weight_buffer_for_batch']} for "
         f"{result['edges']:,} edges"
@@ -189,6 +296,12 @@ def print_estimate(result: dict[str, int | str]) -> None:
         "materialized per-path gate buffer: "
         f"{result['per_path_buffer_per_edge']} / edge; "
         f"{result['per_path_buffer_for_batch']} for "
+        f"{result['edges']:,} edges"
+    )
+    print(
+        "materialized QHFlow uuu buffer: "
+        f"{result['qhflow_buffer_per_edge']} / edge; "
+        f"{result['qhflow_buffer_for_batch']} for "
         f"{result['edges']:,} edges"
     )
 
@@ -200,6 +313,11 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--dtype-bytes", type=int, default=4)
     parser.add_argument("--no-static", action="store_true")
+    parser.add_argument(
+        "--weight-mode",
+        choices=("full", "per_path", "qhflow"),
+        default="full",
+    )
     parser.add_argument(
         "--validate-e3nn",
         action="store_true",
@@ -228,6 +346,7 @@ def main() -> None:
                 rank=args.rank,
                 dtype_bytes=args.dtype_bytes,
                 internal_weights=not args.no_static,
+                weight_mode=args.weight_mode,
             )
         )
 

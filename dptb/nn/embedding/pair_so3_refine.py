@@ -36,6 +36,11 @@ class PairSO3RefineTP(torch.nn.Module):
     ``weight_mode="per_path"`` instead predicts one scalar delta gate per
     tensor-product instruction.  A gate of zero leaves that instruction's
     learned static tensor-product contribution unchanged.
+    ``weight_mode="qhflow"`` sandwiches a per-edge ``uuu`` tensor product
+    between shared equivariant linears.  Its conditioner predicts the full
+    diagonal ``uuu`` weight vector, avoiding the multiplicity-cubed cost of
+    the fully connected tensor product while retaining channel-resolved
+    dynamic weights.
 
     ``dynamic_init=0`` alone is not an identity initialization: with the
     default ``internal_weights=True``, learned static weights are still
@@ -92,9 +97,9 @@ class PairSO3RefineTP(torch.nn.Module):
                 "PairSO3RefineTP supports only condition='scalar_0e', "
                 f"got {condition!r}."
             )
-        if self.weight_mode not in {"full", "per_path"}:
+        if self.weight_mode not in {"full", "per_path", "qhflow"}:
             raise ValueError(
-                "weight_mode must be 'full' or 'per_path', "
+                "weight_mode must be 'full', 'per_path', or 'qhflow', "
                 f"got {weight_mode!r}."
             )
         if self.weight_mode == "per_path" and not self.internal_weights:
@@ -118,13 +123,19 @@ class PairSO3RefineTP(torch.nn.Module):
             _scalar_0e_indices(self.edge_irreps, device=device),
             persistent=False,
         )
-        self.tensor_product = o3.FullyConnectedTensorProduct(
-            self.node_irreps,
-            self.node_irreps,
-            self.edge_irreps,
-            shared_weights=False,
-            internal_weights=False,
-        )
+        if self.weight_mode == "qhflow":
+            self.tensor_product = self._build_qhflow_tensor_product(
+                dtype=dtype,
+                device=device,
+            )
+        else:
+            self.tensor_product = o3.FullyConnectedTensorProduct(
+                self.node_irreps,
+                self.node_irreps,
+                self.edge_irreps,
+                shared_weights=False,
+                internal_weights=False,
+            )
         if dtype is not None or device is not None:
             self.tensor_product = self.tensor_product.to(dtype=dtype, device=device)
         if self.tensor_product.weight_numel <= 0:
@@ -133,14 +144,19 @@ class PairSO3RefineTP(torch.nn.Module):
                 f"node_irreps={self.node_irreps}, edge_irreps={self.edge_irreps}."
             )
         dtype_for_cost = dtype if dtype is not None else torch.get_default_dtype()
+        full_weight_numel = (
+            self._full_fctp_weight_numel()
+            if self.weight_mode == "qhflow"
+            else int(self.tensor_product.weight_numel)
+        )
         full_dynamic_weight_bytes = (
-            int(self.tensor_product.weight_numel)
+            full_weight_numel
             * torch.empty((), dtype=dtype_for_cost).element_size()
         )
         dynamic_dof = (
-            int(self.tensor_product.weight_numel)
-            if self.weight_mode == "full"
-            else len(self.tensor_product.instructions)
+            len(self.tensor_product.instructions)
+            if self.weight_mode == "per_path"
+            else int(self.tensor_product.weight_numel)
         )
         dynamic_weight_bytes = (
             dynamic_dof * torch.empty((), dtype=dtype_for_cost).element_size()
@@ -173,6 +189,21 @@ class PairSO3RefineTP(torch.nn.Module):
             factory_kwargs["dtype"] = dtype
         if device is not None:
             factory_kwargs["device"] = device
+        if self.weight_mode == "qhflow":
+            self.linear_pre = o3.Linear(
+                self.node_irreps,
+                self.node_irreps,
+                internal_weights=True,
+                shared_weights=True,
+                biases=True,
+            ).to(dtype=dtype, device=device)
+            self.linear_post = o3.Linear(
+                self.edge_irreps,
+                self.edge_irreps,
+                internal_weights=True,
+                shared_weights=True,
+                biases=True,
+            ).to(dtype=dtype, device=device)
         condition_dim = (
             2 * int(self._node_scalar_indices.numel())
             + int(self._edge_scalar_indices.numel())
@@ -181,7 +212,7 @@ class PairSO3RefineTP(torch.nn.Module):
             condition_dim, self.rank, bias=True, **factory_kwargs
         )
         dynamic_dim = (
-            self.weight_numel if self.weight_mode == "full" else self.n_paths
+            self.n_paths if self.weight_mode == "per_path" else self.weight_numel
         )
         self.dynamic_up = torch.nn.Linear(
             self.rank,
@@ -189,7 +220,7 @@ class PairSO3RefineTP(torch.nn.Module):
             bias=True,
             **factory_kwargs,
         )
-        if self.internal_weights:
+        if self.internal_weights and self.weight_mode != "qhflow":
             self.static_weights = torch.nn.Parameter(
                 torch.empty(self.tensor_product.weight_numel, **factory_kwargs)
             )
@@ -220,6 +251,62 @@ class PairSO3RefineTP(torch.nn.Module):
     @property
     def n_paths(self) -> int:
         return len(self.tensor_product.instructions)
+
+    def _full_fctp_weight_numel(self) -> int:
+        return sum(
+            mul_in1 * mul_in2 * mul_out
+            for mul_in1, ir_in1 in self.node_irreps
+            for mul_in2, ir_in2 in self.node_irreps
+            for mul_out, ir_out in self.edge_irreps
+            if ir_out in ir_in1 * ir_in2
+        )
+
+    def _build_qhflow_tensor_product(
+        self,
+        *,
+        dtype: Optional[torch.dtype],
+        device: Optional[Union[str, torch.device]],
+    ) -> o3.TensorProduct:
+        """Build the multiplicity-diagonal QHFlow tensor product.
+
+        ``uuu`` requires equal multiplicities for both inputs and the output.
+        e3nn's default normalization is used deliberately; the explicit
+        weight-count assertion below fixes the expected per-edge layout.
+        """
+        instructions = []
+        expected_weight_numel = 0
+        for i_in1, (mul_in1, ir_in1) in enumerate(self.node_irreps):
+            for i_in2, (mul_in2, ir_in2) in enumerate(self.node_irreps):
+                if mul_in1 != mul_in2:
+                    continue
+                for i_out, (mul_out, ir_out) in enumerate(self.edge_irreps):
+                    if mul_out == mul_in1 and ir_out in ir_in1 * ir_in2:
+                        instructions.append(
+                            (i_in1, i_in2, i_out, "uuu", True)
+                        )
+                        expected_weight_numel += mul_out
+        if not instructions:
+            raise ValueError(
+                "No compatible multiplicity-diagonal uuu paths were found for "
+                f"node_irreps={self.node_irreps}, edge_irreps={self.edge_irreps}."
+            )
+        tensor_product = o3.TensorProduct(
+            self.node_irreps,
+            self.node_irreps,
+            self.edge_irreps,
+            instructions,
+            shared_weights=False,
+            internal_weights=False,
+        )
+        if dtype is not None or device is not None:
+            tensor_product = tensor_product.to(dtype=dtype, device=device)
+        if tensor_product.weight_numel != expected_weight_numel:
+            raise RuntimeError(
+                "QHFlow uuu tensor-product weight layout disagrees with the "
+                f"instruction count: {tensor_product.weight_numel} != "
+                f"{expected_weight_numel}."
+            )
+        return tensor_product
 
     def _build_path_tensor_product(
         self,
@@ -308,6 +395,32 @@ class PairSO3RefineTP(torch.nn.Module):
                     mean=0.0,
                     std=1.0 / math.sqrt(float(self.weight_numel)),
                 )
+        if self.weight_mode == "qhflow" and self.identity_init:
+            torch.nn.init.zeros_(self.linear_post.weight)
+            if self.linear_post.bias is not None:
+                torch.nn.init.zeros_(self.linear_post.bias)
+
+    def _condition_weights(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        src, dst = edge_index[0], edge_index[1]
+        condition = torch.cat(
+            (
+                node_features.index_select(0, src).index_select(
+                    1, self._node_scalar_indices
+                ),
+                node_features.index_select(0, dst).index_select(
+                    1, self._node_scalar_indices
+                ),
+                edge_features.index_select(1, self._edge_scalar_indices),
+            ),
+            dim=-1,
+        )
+        invariant = torch.nn.functional.silu(self.condition_down(condition))
+        return self.dynamic_up(invariant)
 
     def _validate_inputs(
         self,
@@ -352,21 +465,16 @@ class PairSO3RefineTP(torch.nn.Module):
     ) -> torch.Tensor:
         """Return full weights or per-instruction scalar delta gates."""
         edge_index = self._validate_inputs(node_features, edge_features, edge_index)
-        src, dst = edge_index[0], edge_index[1]
-        condition = torch.cat(
-            (
-                node_features.index_select(0, src).index_select(
-                    1, self._node_scalar_indices
-                ),
-                node_features.index_select(0, dst).index_select(
-                    1, self._node_scalar_indices
-                ),
-                edge_features.index_select(1, self._edge_scalar_indices),
-            ),
-            dim=-1,
+        condition_node_features = (
+            self.linear_pre(node_features)
+            if self.weight_mode == "qhflow"
+            else node_features
         )
-        invariant = torch.nn.functional.silu(self.condition_down(condition))
-        weights = self.dynamic_up(invariant)
+        weights = self._condition_weights(
+            condition_node_features,
+            edge_features,
+            edge_index,
+        )
         if self.weight_mode == "full" and self.static_weights is not None:
             weights = weights + self.static_weights
         return weights
@@ -407,13 +515,26 @@ class PairSO3RefineTP(torch.nn.Module):
                 edge_scale,
                 edge_features.shape[0],
             )
-        weights = self.attention_weights(node_features, edge_features, edge_index)
+        if self.weight_mode == "qhflow":
+            pair_node_features = self.linear_pre(node_features)
+            weights = self._condition_weights(
+                pair_node_features,
+                edge_features,
+                edge_index,
+            )
+        else:
+            pair_node_features = node_features
+            weights = self.attention_weights(
+                node_features,
+                edge_features,
+                edge_index,
+            )
         src, dst = edge_index[0], edge_index[1]
-        node_src = node_features.index_select(0, src)
-        node_dst = node_features.index_select(0, dst)
+        node_src = pair_node_features.index_select(0, src)
+        node_dst = pair_node_features.index_select(0, dst)
         if self.weight_mode == "full":
             refinement = self.tensor_product(node_src, node_dst, weights)
-        else:
+        elif self.weight_mode == "per_path":
             path_features = self.path_tensor_product(
                 node_src,
                 node_dst,
@@ -426,6 +547,10 @@ class PairSO3RefineTP(torch.nn.Module):
                 1,
                 self._path_output_index.expand(edge_features.shape[0], -1),
                 path_features,
+            )
+        else:
+            refinement = self.linear_post(
+                self.tensor_product(node_src, node_dst, weights)
             )
         if edge_scale is not None:
             refinement = refinement * edge_scale
