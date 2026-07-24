@@ -245,3 +245,71 @@ bug and are semantically incompatible with the corrected conditioning layout.
 The cross-irrep mismatch cannot be repaired by a simple learned-weight
 permutation; retraining is required for the equivariance benefit. uu_real,
 zero-H0, and pure-l=0 behavior remain bit-exact.
+
+## Stage 4 — merge Stage 5 closeout
+
+Timestamp: 2026-07-24 10:47:47 +08:00
+Status: PASS
+
+### All-default bit-exact summary
+
+Focused command:
+
+```text
+pytest \
+  test_lem_pair_refine.py::test_default_off_is_bit_exact_clean_superset_of_lem_moe_v3_h0 \
+  test_hb0_endpoint_condition.py::test_condition_source_default_and_explicit_edge_0e_are_bit_exact \
+  test_hb0_hermiticity.py::test_hb0_hermitian_average_default_false_is_bit_exact_and_keeps_node_blocks \
+  test_hb0_head_input_rms.py::test_head_input_rms_default_off_has_no_key_and_is_bit_exact \
+  test_two_stage_pair_integration.py::test_default_disabled_is_bit_exact_and_does_not_construct_a_module
+```
+
+Result: **5 passed in 45.14 s**.
+
+The combined proof is transitive:
+
+1. Cross-tree golden: old `wt_0724_base` `LemMoEV3H0` equals current merge
+   `LemMoEV3H0`, fp32/fp64, 184 state tensors, `max|Δ|=0`.
+2. Current default `LemPair` equals current `LemMoEV3H0` in RNG state,
+   state_dict keys/tensors, and outputs when pair refinement/topology options
+   are disabled.
+3. Default/explicit legacy values for endpoint conditioning, Hermitian
+   averaging, RMS telemetry, and two-stage pair have equal RNG/state/output;
+   disabled pair-refine and two-stage modules are not constructed.
+
+Thus the single merged configuration with all opt-in feature families left at
+their defaults is bit-exact to the old `LemMoEV3H0`.
+
+### Flag/config matrix for natlan ablations
+
+| config name | default | owner | effect | lane |
+|---|---|---|---|---|
+| `mp_cutoff` | `None` | `LemPair` | Enables the fixed-architecture dual-cutoff MP subgraph; `None` keeps the legacy topology. | A |
+| `mp_avg_num_neighbors` | `None` | `LemPair` | Optional MP-subgraph normalization override used only with dual cutoff. | A |
+| `res_update_additive` | `false` | `LemPair` | Opts into unscaled `x + delta` residual updates. | A |
+| `latents_layernorm` | `true` | `LemPair` | Applies the legacy LayerNorm before pair-backbone latent updates. | A |
+| `pair_refine_enable` | `false` | `LemPair` | Constructs and applies the final ordered-edge SO(3) pair refinement. | C |
+| `pair_refine_rank` | `16` | `LemPair` | Conditioner bottleneck rank for pair refinement. | C |
+| `pair_refine_condition` | `scalar_0e` | `LemPair` | Selects the invariant condition passed to dynamic refinement weights. | C |
+| `pair_refine_internal_weights` | `true` | `LemPair` | Enables the refinement TP's shared/internal static weights. | C |
+| `pair_refine_init` | `0.0` | `LemPair` | Initializes dynamic refinement amplitude. | C |
+| `pair_refine_weight_mode` | `full` | `LemPair` | Chooses legacy full per-edge TP weights or low-cost `per_path`. | C |
+| `pair_refine_max_weight_numel` | `None` | `LemPair` | Optional fail-closed cap on full FCTP weight count. | C |
+| `pair_refine_identity_init` | `false` | `LemPair` | When true, zero-initializes dynamic/static refinement for identity output. | C |
+| `condition_source` | `edge_0e` | `LemMoEV3H0` | Keeps the legacy H-B0 edge conditioner; `endpoints` opts into endpoint conditioning. | B |
+| `hb0_hermitian_average` | `false` | `LemMoEV3H0` | Opt-in reverse-edge transpose averaging at the H-B0 output boundary. | B |
+| `log_head_input_rms` | `false` | `LemMoEV3H0` | Attaches detached per-irrep node/edge head-input RMS telemetry. | B |
+| `two_stage_pair_enable` | `false` | `LemMoEV3H0` | Constructs the QHFlow-style late pair stream and norm-free refinement tail. | D |
+| `two_stage_pair_refine_layers` | `2` | `LemMoEV3H0` | Number of norm-free two-stage pair tail layers. | D |
+| `two_stage_pair_tail_gate` | `false` | `LemMoEV3H0` | Opts into gating the two-stage refinement tail. | D |
+| `two_stage_pair_refine_rank` | `16` | `LemMoEV3H0` | Dynamic conditioner rank in the two-stage tail. | D |
+| `two_stage_pair_refine_condition` | `scalar_0e` | `LemMoEV3H0` | Invariant source for two-stage dynamic refinement. | D |
+| `two_stage_pair_refine_radial_dim` | `4` | `LemMoEV3H0` | Radial embedding width used by the late pair stream. | D |
+| `two_stage_pair_refine_edge_chunk_size` | `64` | `LemMoEV3H0` | Ordered-edge chunk size for two-stage refinement memory control. | D |
+
+Final hard gates at this stage:
+
+- cross-tree golden fp32/fp64: **PASS**, 184 tensors, `max|Δ|=0`;
+- A/B/C/D + named block-ODE/H0 regression: **361 passed**;
+- focused all-default bit identity: **5 passed**;
+- flag matrix: **complete**.
