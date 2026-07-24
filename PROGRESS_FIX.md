@@ -84,3 +84,34 @@ bitwise equal to `_sorted_irrep_coordinate_index(mapper)`, and
 paths use the same mapper-derived raw→sorted algorithm; their numerical
 permutations must not be compared across different mapper layouts.
 
+## Stage 1 — minimal raw→sorted repair
+
+Timestamp: 2026-07-24 10:30:27 +08:00
+Status: PASS
+
+Implementation:
+
+- `H0InitLayer` now derives one mapper-specific `_h0_sort_index` for every H0
+  projector configuration.
+- The generic buffer is non-persistent, preserving the legacy/default
+  state_dict key set and cross-tree golden contract.
+- Both node and edge sources now follow the single correct contract:
+  raw-layout mask first, then `index_select(_h0_sort_index)`, then the
+  sorted-irrep projector.
+- The existing persistent uu_real buffer remains present and is checked against
+  the generic mapper-derived index, preserving its checkpoint and runtime
+  behavior.
+- The spatial projector's own index and irreps are checked against the H0
+  projector contract.
+- The incorrect comment claiming that frozen/spatial H0 should stay raw at the
+  projector boundary was replaced with the explicit raw-source/sorted-projector
+  contract.
+
+Verification:
+
+```text
+C:\Users\16608\.conda\envs\dptb\python.exe -m py_compile \
+  dptb\nn\embedding\lem_moe_v3_h0_helpers.py
+```
+
+Result: **PASS**. `git diff --check`: **PASS**.

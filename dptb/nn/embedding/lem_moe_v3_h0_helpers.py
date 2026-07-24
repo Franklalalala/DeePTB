@@ -520,6 +520,22 @@ class H0InitLayer(torch.nn.Module):
         self.idp = base_init.idp
         self.irreps_out = base_init.irreps_out
         self.h0_irreps = self.idp.orbpair_irreps.sort()[0].simplify()
+        derived_h0_irreps, h0_sort_index = _sorted_irrep_coordinate_index(
+            self.idp, device=device
+        )
+        if self.h0_irreps != derived_h0_irreps:
+            raise RuntimeError(
+                "H0Init sorted irreps disagree with the mapper-derived "
+                "raw-to-sorted coordinate permutation."
+            )
+        # H0/node/edge feature sources and their mapper masks use raw orbpair
+        # order, while the two equivariant projectors below declare sorted
+        # irreps.  Every H0 path must therefore mask in raw order and apply this
+        # permutation immediately before projection.  Keep the generic buffer
+        # non-persistent so legacy/default state_dict keys remain bit-exact.
+        self.register_buffer(
+            "_h0_sort_index", h0_sort_index, persistent=False
+        )
         self.h0_dim = self.h0_irreps.dim
         self.h0_node_key = h0_node_key
         self.h0_edge_key = h0_edge_key
@@ -568,11 +584,17 @@ class H0InitLayer(torch.nn.Module):
                 self.residual_block_projector.sort_index.detach().clone(),
                 persistent=True,
             )
-        # Non-SOC spatial residual projector: a SEPARATE conditioning channel for
-        # residual_ao_block_ode.  Unlike the uu_real path it never rewrites the H0
-        # source layout (the H0 channel keeps its raw layout as in the frozen
-        # ao_block_ode mode), so no _uureal_h0_sort_index / H0 index_select is
-        # registered here; the projector owns its own irrep consistency guard.
+            if not torch.equal(
+                self._h0_sort_index, self._uureal_h0_sort_index
+            ):
+                raise RuntimeError(
+                    "H0Init and uu_real residual projector raw-to-sorted "
+                    "coordinate permutations disagree."
+                )
+        # The non-SOC spatial residual projector is a separate conditioning
+        # channel for residual_ao_block_ode.  It owns an equivalent mapper-derived
+        # raw-to-sorted permutation for its AO-block contraction; the ordinary H0
+        # channel still uses the generic permutation registered above.
         self.spatial_residual_block_projector = (
             DirectSpatialResidualBlockProjector(
                 self.idp, self.irreps_out, dtype=dtype, device=device
@@ -580,6 +602,19 @@ class H0InitLayer(torch.nn.Module):
             if self.use_spatial_residual_block_input
             else None
         )
+        if self.spatial_residual_block_projector is not None:
+            if self.h0_irreps != self.spatial_residual_block_projector.irreps_in:
+                raise RuntimeError(
+                    "H0Init and spatial residual projector irrep layouts disagree."
+                )
+            if not torch.equal(
+                self._h0_sort_index,
+                self.spatial_residual_block_projector.sort_index,
+            ):
+                raise RuntimeError(
+                    "H0Init and spatial residual projector raw-to-sorted "
+                    "coordinate permutations disagree."
+                )
 
     def _candidate_keys(
         self,
@@ -726,8 +761,7 @@ class H0InitLayer(torch.nn.Module):
             return base_node_features
 
         node_source = self._mask_node_source(node_source, atom_type)
-        if self.use_uureal_residual_block_input:
-            node_source = node_source.index_select(1, self._uureal_h0_sort_index)
+        node_source = node_source.index_select(1, self._h0_sort_index)
         return self._merge_features(base_node_features, self.node_projector(node_source))
 
     def forward(
@@ -775,8 +809,7 @@ class H0InitLayer(torch.nn.Module):
                 )
                 return latents, base_node_features, base_edge_features, cutoff_coeffs, active_edges
             edge_source = self._mask_edge_source(edge_source, bond_type)
-            if self.use_uureal_residual_block_input:
-                edge_source = edge_source.index_select(1, self._uureal_h0_sort_index)
+            edge_source = edge_source.index_select(1, self._h0_sort_index)
             edge_features_h0 = self.edge_projector(edge_source[active_edges])
             edge_features = self._merge_features(base_edge_features, edge_features_h0)
 
