@@ -183,3 +183,65 @@ C:\Users\16608\.conda\envs\dptb\python.exe -m pytest \
 Result: **2 passed in 25.01 s**.
 
 Both changed test files pass `py_compile`; `git diff --check`: **PASS**.
+
+## Stage 3 — cross-tree golden, regression, and breaking-change report
+
+Timestamp: 2026-07-24 10:44:47 +08:00
+Status: PASS
+
+### Cross-tree golden
+
+The script's historical default head points at `wt_0724_contract`, so the
+fixed merge tree was passed explicitly:
+
+```text
+C:\Users\16608\.conda\envs\dptb\python.exe \
+  scripts\crosstree_golden_lem_h0.py \
+  --base E:\deeptb\wt_0724_base \
+  --head E:\deeptb\wt_0724_merge \
+  --report F:\claude\0724_pair_iter2\results\crosstree_golden_FIX.md
+```
+
+Result:
+
+```text
+float32=PASS state_tensors=184 max_delta=0.0000000000000000e+00
+float64=PASS state_tensors=184 max_delta=0.0000000000000000e+00
+```
+
+### Regression
+
+`pytest dptb/tests -q` was attempted first and stopped at two collection
+errors:
+
+- `ModuleNotFoundError: so2_cuda_ops`: the brief's explicit environment
+  exemption.
+- `test_dpa4_focus_attention.py` imports the absent
+  `EdgeMessageValueGate`. Git history proves this is pre-existing:
+  `cb624ac` removed the class while leaving the test; neither `dcacda5` nor
+  pre-fix `ed50321` contains the class.
+
+The task-authorized alternative gate then covered the complete A/B/C/D test
+files plus all named block-ODE/H0/configuration regressions, including the new
+high-l and H0 sort-contract tests:
+
+```text
+361 passed, 162 warnings in 167.71 s (0:02:47)
+```
+
+No old test failed due to a nonzero-l raw-order expectation; no old assertion
+was changed. The only updated pre-existing test is the high-l regression that
+originally exposed the bug, now strengthened to inspect the actual projector
+input boundary.
+
+### Breaking impact
+
+Full report:
+`F:\claude\0724_pair_iter2\results\h0_equivariance_fix_report.md`.
+
+RUN06/B_HB0 (`residual_ao_block_ode`) is in the affected spatial-residual
+path. Existing checkpoints were trained against the non-equivariant raw-layout
+bug and are semantically incompatible with the corrected conditioning layout.
+The cross-irrep mismatch cannot be repaired by a simple learned-weight
+permutation; retraining is required for the equivariance benefit. uu_real,
+zero-H0, and pure-l=0 behavior remain bit-exact.
