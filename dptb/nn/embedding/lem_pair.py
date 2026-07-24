@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import weakref
 from typing import Any, Dict, Optional, Union
 
@@ -20,6 +21,7 @@ from .pair_so3_refine import PairSO3RefineTP
 
 
 Cutoff = Union[float, int, Dict[str, float]]
+log = logging.getLogger(__name__)
 
 
 def _positive_finite_scalar(value: Any, *, label: str) -> float:
@@ -63,6 +65,54 @@ def _validated_mp_cutoff(mp_cutoff: Optional[Cutoff], idp: Any) -> Optional[Cuto
             f"missing {missing}."
         )
     return normalized
+
+
+def _pair_cutoff_value(
+    cutoff: Any,
+    atom_i: str,
+    atom_j: str,
+) -> Optional[float]:
+    """Return the configured pair cutoff, or ``None`` when it is not provable."""
+    if isinstance(cutoff, bool):
+        return None
+    if isinstance(cutoff, (float, int)):
+        value = float(cutoff)
+        return value if math.isfinite(value) else None
+    if not isinstance(cutoff, dict):
+        return None
+    if atom_i not in cutoff or atom_j not in cutoff:
+        return None
+    try:
+        value_i = float(cutoff[atom_i])
+        value_j = float(cutoff[atom_j])
+    except (TypeError, ValueError):
+        return None
+    pair_cutoff = 0.5 * (value_i + value_j)
+    return pair_cutoff if math.isfinite(pair_cutoff) else None
+
+
+def _canonicalize_mp_cutoff(
+    mp_cutoff: Optional[Cutoff],
+    r_max: Any,
+    idp: Any,
+) -> Optional[Cutoff]:
+    """Disable a private cutoff only when every represented pair is redundant."""
+    normalized = _validated_mp_cutoff(mp_cutoff, idp)
+    if normalized is None:
+        return None
+    for bond in idp.bond_to_type:
+        atoms = bond.split("-")
+        if len(atoms) != 2:
+            return normalized
+        mp_pair = _pair_cutoff_value(normalized, atoms[0], atoms[1])
+        head_pair = _pair_cutoff_value(r_max, atoms[0], atoms[1])
+        if mp_pair is None or head_pair is None or mp_pair < head_pair:
+            return normalized
+    log.warning(
+        "mp_cutoff is not smaller than r_max for every represented element "
+        "pair; canonicalizing mp_cutoff to None (legacy architecture)."
+    )
+    return None
 
 
 def _get_mp_edge_mask(
@@ -130,33 +180,6 @@ class PairInitLayer(InitLayer):
             idp=self.idp,
             mp_cutoff=owner.mp_cutoff,
         )
-        if cutoff_coeffs is None:
-            decision_cutoff_coeffs = self.cutoff_coefficients(edge_length, bond_type)
-        else:
-            decision_cutoff_coeffs = cutoff_coeffs.to(
-                device=edge_length.device, dtype=edge_length.dtype
-            ).reshape(-1)
-        if active_edges is None:
-            decision_active_edges = (decision_cutoff_coeffs > 0).nonzero().squeeze(-1)
-        else:
-            decision_active_edges = active_edges.to(
-                device=edge_length.device, dtype=torch.long
-            ).reshape(-1)
-        mp_active_mask = mp_mask.index_select(0, decision_active_edges)
-        owner._last_mp_mask = mp_mask.detach()
-        owner._last_mp_active_mask = mp_active_mask.detach()
-        owner._pair_run_dual = not bool(mp_active_mask.all().item())
-        if not owner._pair_run_dual:
-            return super().forward(
-                edge_index,
-                atom_type,
-                bond_type,
-                edge_sh,
-                edge_length,
-                edge_one_hot,
-                active_edges,
-                cutoff_coeffs,
-            )
 
         edge_center = edge_index[0]
         edge_invariants = self.bessel(edge_length)
@@ -193,6 +216,10 @@ class PairInitLayer(InitLayer):
         edge_features = self._env_weighter(edge_sh[active_edges], weights_e)
 
         mp_active_mask = mp_mask.index_select(0, active_edges)
+        # Detached masks are diagnostics only. Architecture selection is fixed
+        # at construction and must never depend on batch contents.
+        owner._last_mp_mask = mp_mask.detach()
+        owner._last_mp_active_mask = mp_active_mask.detach()
         mp_edges = active_edges[mp_active_mask]
         node_features = scatter(
             edge_features[mp_active_mask],
@@ -262,7 +289,7 @@ class PairLayer(Layer):
         node_batch=None,
     ):
         owner = self._pair_owner_ref() if self._pair_owner_ref is not None else None
-        if owner is None or not owner._pair_run_dual:
+        if owner is None or owner.mp_cutoff is None:
             return super().forward(
                 latents,
                 node_features,
@@ -309,30 +336,21 @@ class PairLayer(Layer):
             topk_values=mole_globals.topk_values,
         )
 
-        old_normalization = self.node_update.env_sum_normalizations
-        self.node_update.env_sum_normalizations = torch.as_tensor(
-            owner.mp_avg_num_neighbors,
-            dtype=node_features.dtype,
-            device=node_features.device,
-        ).rsqrt()
-        try:
-            latents, node_features, edge_features, wigner_D_all = super().forward(
-                latents,
-                node_features,
-                edge_features,
-                node_onehot,
-                edge_index,
-                edge_vector,
-                atom_type,
-                cutoff_coeffs,
-                mp_edges,
-                mp_edge_one_hot,
-                wigner_D_all,
-                mp_mole_globals,
-                node_batch,
-            )
-        finally:
-            self.node_update.env_sum_normalizations = old_normalization
+        latents, node_features, edge_features, wigner_D_all = super().forward(
+            latents,
+            node_features,
+            edge_features,
+            node_onehot,
+            edge_index,
+            edge_vector,
+            atom_type,
+            cutoff_coeffs,
+            mp_edges,
+            mp_edge_one_hot,
+            wigner_D_all,
+            mp_mole_globals,
+            node_batch,
+        )
 
         if self._pair_is_last:
             initial_edge_context = owner._pair_initial_edge_context
@@ -417,8 +435,9 @@ class LemPair(LemMoEV3H0):
                 "res_update_additive=true bypasses the learned residual-ratio "
                 "parameters; set res_update_ratios_learnable=false."
             )
+        r_max = kwargs.get("r_max", 5.0)
         super().__init__(avg_num_neighbors=avg_num_neighbors, **kwargs)
-        self.mp_cutoff = _validated_mp_cutoff(mp_cutoff, self.idp)
+        self.mp_cutoff = _canonicalize_mp_cutoff(mp_cutoff, r_max, self.idp)
         neighbor_count = (
             avg_num_neighbors
             if mp_avg_num_neighbors is None
@@ -429,7 +448,6 @@ class LemPair(LemMoEV3H0):
         )
         self._last_mp_mask = None
         self._last_mp_active_mask = None
-        self._pair_run_dual = False
         self._pair_initial_edge_context = None
         self.dual_cutoff_pair_readout = None
         self.dual_cutoff_edge_context_projection = None
@@ -446,6 +464,15 @@ class LemPair(LemMoEV3H0):
                 layer.edge_update.ln = torch.nn.Identity()
 
         if self.mp_cutoff is not None:
+            mp_normalization = torch.as_tensor(
+                self.mp_avg_num_neighbors,
+                dtype=self.dtype,
+                device=self.device,
+            ).rsqrt()
+            for layer in self.layers:
+                # Dual topology is a construction-time choice, so the MP
+                # aggregation normalization is a permanent layer constant.
+                layer.node_update.env_sum_normalizations = mp_normalization.clone()
             final_irreps = self.layers[-1].irreps_out
             base_init = getattr(self.init_layer, "base_init", self.init_layer)
             self.dual_cutoff_edge_context_projection = Linear(
@@ -504,11 +531,8 @@ class LemPair(LemMoEV3H0):
                 num_experts=kwargs.get("num_experts", 8),
                 num_shared_experts=kwargs.get("num_shared_experts", 1),
             )
-            self.dual_cutoff_pair_readout.res_update_additive = (
-                self.res_update_additive
-            )
-            if not self.latents_layernorm:
-                self.dual_cutoff_pair_readout.ln = torch.nn.Identity()
+            # The fresh readout has res_update=False and discards its returned
+            # latent, so residual-additive and latent-LN switches do not apply.
             self.register_buffer(
                 "dual_cutoff_readout_normalization",
                 torch.as_tensor(
@@ -544,7 +568,6 @@ class LemPair(LemMoEV3H0):
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         """Dispatch the legacy skeleton through pair-specific init/layers."""
-        self._pair_run_dual = False
         self._pair_initial_edge_context = None
         try:
             return super().forward(data)

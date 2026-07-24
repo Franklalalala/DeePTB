@@ -17,17 +17,18 @@ from test_lem_pair_common import (
 )
 
 
-def test_mp_cutoff_none_and_all_active_are_bit_identical():
+def test_mp_cutoff_none_and_provably_redundant_are_bit_identical():
     with fp64_default():
         disabled = model(mp_cutoff=None)
         all_active = model(mp_cutoff=1.0e9)
-        incompatible = all_active.load_state_dict(disabled.state_dict(), strict=False)
-        assert not incompatible.unexpected_keys
-        assert incompatible.missing_keys
+        all_active.load_state_dict(disabled.state_dict(), strict=True)
 
         reference = disabled(molecule_data(disabled))
         actual = all_active(molecule_data(all_active))
-        assert bool(all_active._last_mp_mask.all())
+        assert all_active.mp_cutoff is None
+        assert all_active.dual_cutoff_pair_readout is None
+        assert all_active.dual_cutoff_edge_context_projection is None
+        assert all_active._last_mp_mask is None
         for key in (
             _keys.NODE_HAMILTONIAN_KEY,
             _keys.EDGE_HAMILTONIAN_KEY,
@@ -79,19 +80,14 @@ def test_dual_cutoff_is_equivariant_and_keeps_full_ordered_head_rows():
         assert drift <= 1.0e-9
 
 
-def test_all_active_head_rows_keep_the_legacy_branch_when_stored_rows_do_not():
+def test_configured_cutoff_keeps_dual_architecture_for_all_active_head_rows():
     with fp64_default():
         options = model_options()
         options["require_full_block_edge_coverage"] = False
         torch.manual_seed(20260723)
-        disabled = LemPair(mp_cutoff=None, **options).eval()
-        torch.manual_seed(20260723)
         all_active = LemPair(mp_cutoff=1.0, **options).eval()
-        incompatible = all_active.load_state_dict(disabled.state_dict(), strict=False)
-        assert not incompatible.unexpected_keys
-        assert incompatible.missing_keys
 
-        base = molecule_data(disabled)
+        base = molecule_data(all_active)
         src, dst = base[_keys.EDGE_INDEX_KEY]
         lengths = (
             base[_keys.POSITIONS_KEY].index_select(0, src)
@@ -104,15 +100,27 @@ def test_all_active_head_rows_keep_the_legacy_branch_when_stored_rows_do_not():
         assert bool((lengths.index_select(0, active_edges) < 1.0).all())
         assert bool((lengths >= 1.0).any())
 
-        reference_data = molecule_data(disabled)
-        actual_data = molecule_data(all_active)
-        for data in (reference_data, actual_data):
-            data[_keys.LEM_ACTIVE_EDGES_KEY] = active_edges.clone()
-            data[_keys.LEM_CUTOFF_COEFFS_KEY] = cutoff_coeffs.clone()
+        calls = []
 
-        reference = disabled(reference_data)
-        actual = all_active(actual_data)
-        assert all_active._pair_run_dual is False
+        def capture(_module, _inputs):
+            calls.append(True)
+
+        handle = all_active.dual_cutoff_pair_readout.register_forward_pre_hook(
+            capture
+        )
+        try:
+            reference_data = molecule_data(all_active)
+            actual_data = molecule_data(all_active)
+            for data in (reference_data, actual_data):
+                data[_keys.LEM_ACTIVE_EDGES_KEY] = active_edges.clone()
+                data[_keys.LEM_CUTOFF_COEFFS_KEY] = cutoff_coeffs.clone()
+
+            reference = all_active(reference_data)
+            actual = all_active(actual_data)
+        finally:
+            handle.remove()
+        assert len(calls) == 2
+        assert all_active.mp_cutoff == 1.0
         assert bool(all_active._last_mp_active_mask.all())
         assert not bool(all_active._last_mp_mask.all())
         for key in (
