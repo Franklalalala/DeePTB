@@ -1,4 +1,79 @@
-# IN PROGRESS — Stages 0–3 passed; Stage 4 is in progress.
+# BLOCKED — Stage 4 exposed a real baseline H0 raw/sorted-RME equivariance bug; Stage 5 was not entered.
+
+## Merge Stage 4 — l>0 flow AO-block equivariance
+
+- Timestamp: 2026-07-24 10:08:30 +08:00
+- Status: BLOCKED (hard gate)
+- Added `test_block_ode_flow_highl_equivariance.py`. It uses a genuine C
+  `1s1p` state with nonzero p-shell rows, rotates geometry, and rotates all
+  node/edge H0 and delta-H AO blocks by `D B D^T` before flow preparation.
+- Reproduction:
+  `pytest dptb/tests/test_block_ode_flow_highl_equivariance.py -q -s`
+- Result: **2 failed, 4 warnings** in 30.53 s.
+  - two-stage off: node `max|Δ|=8.1091233946705366e-01`, edge
+    `1.9660634910835956e-01`;
+  - two-stage on: node `max|Δ|=8.1091233946705366e-01`, edge
+    `2.8586735079904640e-01`.
+- Localization:
+  - flow-prepared spatial residual AO blocks remain covariant:
+    node `1.67e-16`, edge `5.55e-17`;
+  - `DirectSpatialResidualBlockProjector._contract`: node `9.99e-16`,
+    edge `5.55e-17`;
+  - its equivariant linears: node `2.66e-15`, edge `1.11e-16`;
+  - flow-produced H0 RME interpreted in the current order: node `2.287`,
+    edge `0.905`;
+  - applying the already-defined projector `sort_index` to those H0 RME
+    rows restores covariance: node `1.78e-15`, edge `1.11e-16`;
+  - current `H0InitLayer` output therefore first loses covariance at the H0
+    projection boundary: node `1.792`, edge `1.127`.
+- Root cause: `BlockStateCodec.blocks_to_rme()` supplies coupled RME in raw
+  orbpair order, while `H0InitLayer.h0_irreps` and its node/edge `Linear`
+  modules declare sorted irreps. The non-SOC spatial path explicitly omits the
+  sort applied by the uu-real path. This is shared baseline code and explains
+  why the failure is identical with two-stage off/on.
+- Full finding: `F:\claude\0724_pair_iter2\results\highl_equivariance_finding.md`.
+- Per the Stage-4 hard gate, no fix was implemented and Stage 5
+  cross-tree/full regression was not started.
+
+## Merge flag matrix
+
+| Flag | Default | Owner | Semantics | Lane |
+|---|---:|---|---|---|
+| `mp_cutoff` | `None` | `LemPair` | Enables the construction-time private MP topology; `None` keeps legacy topology. | A |
+| `mp_avg_num_neighbors` | `None` | `LemPair` | Optional MP-subgraph aggregation normalization. | A |
+| `res_update_additive` | `false` | `LemPair` | Uses unscaled additive residual updates in the pair backbone. | A |
+| `latents_layernorm` | `true` | `LemPair` | Preserves legacy latent LayerNorm; set false for the norm-free ablation. | A |
+| `pair_refine_enable` | `false` | `LemPair` | Constructs and applies the post-backbone SO(3) pair refinement. | A/C |
+| `pair_refine_rank` | `16` | `LemPair` | Conditioner bottleneck width. | A/C |
+| `pair_refine_condition` | `scalar_0e` | `LemPair` | Invariant conditioner source. | A/C |
+| `pair_refine_internal_weights` | `true` | `LemPair` | Enables learned static TP weights. | A/C |
+| `pair_refine_init` | `0.0` | `LemPair` | Dynamic conditioner initialization scale. | A/C |
+| `pair_refine_weight_mode` | `full` | `LemPair` | Selects legacy full external weights or low-cost `per_path` gates. | C |
+| `pair_refine_max_weight_numel` | `None` | `LemPair` | Optional fail-closed guard on full TP weight count. | C |
+| `pair_refine_identity_init` | `false` | `LemPair` | Zeroes static/dynamic refinement for exact identity initialization. | C |
+| `hb0_hermitian_average` | `false` | `LemMoEV3H0` | Opt-in reverse-edge transpose averaging at the H-B0 boundary. | B |
+| `condition_source` | `edge_0e` | `LemMoEV3H0` | Selects legacy edge scalar or endpoint scalar head conditioning. | B |
+| `log_head_input_rms` | `false` | `LemMoEV3H0` | Attaches detached per-irrep node/edge head-input RMS telemetry. | B |
+| `two_stage_pair_enable` | `false` | `LemMoEV3H0` | Constructs late pair rebuilding plus norm-free refinement tail. | D |
+| `two_stage_pair_refine_layers` | `2` | `LemMoEV3H0` | Number of two-stage refinement tail layers. | D |
+| `two_stage_pair_tail_gate` | `false` | `LemMoEV3H0` | Enables the optional tail output gate. | D |
+| `two_stage_pair_refine_rank` | `16` | `LemMoEV3H0` | Dynamic per-path conditioner rank. | D |
+| `two_stage_pair_refine_condition` | `scalar_0e` | `LemMoEV3H0` | Two-stage tail conditioner source. | D |
+| `two_stage_pair_refine_radial_dim` | `4` | `LemMoEV3H0` | Radial feature width used by the two-stage tail. | D |
+| `two_stage_pair_refine_edge_chunk_size` | `64` | `LemMoEV3H0` | Edge chunk size for bounded tail memory. | D |
+
+## Merge commits (`ad907ba..HEAD`)
+
+- `HEAD test(merge): expose high-l H0 flow equivariance blocker`
+- `fe763ff feat(merge): integrate lane D two-stage pair`
+- `2ea5d4e feat(merge): integrate lane B H-B0 heads`
+- `0f1f97f feat(merge): integrate lane C refine controls`
+
+## Deferred item
+
+- BRIEF D4 remains deferred: the private MP topology still uses a hard boolean
+  cutoff. A smooth force/position-gradient envelope is out of scope for this
+  fixed-structure Hamiltonian round.
 
 ## Merge Stage 3 — Lane D two-stage pair stream
 
