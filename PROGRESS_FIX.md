@@ -1,4 +1,4 @@
-# PARTIAL — Stage 0 passed; implementation has not started
+# DONE — H0 raw→sorted equivariance fixed; golden is bit-exact and 361-test regression gate passes
 
 ## Stage 0 — reproduction and complete H0 consumer audit
 
@@ -313,3 +313,24 @@ Final hard gates at this stage:
 - A/B/C/D + named block-ODE/H0 regression: **361 passed**;
 - focused all-default bit identity: **5 passed**;
 - flag matrix: **complete**.
+
+## Final handoff
+
+Timestamp: 2026-07-24 10:48:44 +08:00
+
+`git log --oneline ad907ba..HEAD` at handoff preparation:
+
+```text
+a9e852a docs(merge): close Stage 5 flags and bit gates (5 passed)
+966cb48 docs(h0): record golden and regression gates (361 passed)
+a9a057a test(h0): verify flow equivariance and bit invariants (4 passed)
+33f64c4 fix(h0): sort raw RME before residual/plain projectors (py_compile pass)
+5e8ede1 docs(fix): audit H0 raw-vs-sorted consumers (2 failed reproduced)
+ed50321 test(merge): expose high-l H0 flow equivariance blocker
+fe763ff feat(merge): integrate lane D two-stage pair
+2ea5d4e feat(merge): integrate lane B H-B0 heads
+0f1f97f feat(merge): integrate lane C refine controls
+```
+
+The subsequent local-only handoff commit contains this final DONE/status
+update. No `git push`, remote deployment, or training was performed.
