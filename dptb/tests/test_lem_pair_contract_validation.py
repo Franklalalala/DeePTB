@@ -188,7 +188,9 @@ def test_legacy_h0_backbone_migration_is_allowlisted_and_fail_closed():
         for prefix in allowed
     )
 
-    tampered = dict(legacy.state_dict())
+    # Keep nn.Module state_dict metadata: stripping it is now deliberately
+    # rejected for affected high-l H0 checkpoints before key migration runs.
+    tampered = legacy.state_dict()
     original_key = next(iter(tampered))
     tampered[original_key + "_typo"] = tampered.pop(original_key)
     with pytest.raises(RuntimeError, match="migration rejected"):

@@ -424,7 +424,7 @@ class PairLayer(Layer):
             readout_input = torch.index_copy(
                 readout_input, 0, mp_positions, edge_features
             )
-            edge_features, _, _ = self.dual_cutoff_pair_readout(
+            edge_features, _, wigner_D_all = self.dual_cutoff_pair_readout(
                 latents,
                 node_features,
                 node_onehot,

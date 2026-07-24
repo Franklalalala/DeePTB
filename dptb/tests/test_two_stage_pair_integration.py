@@ -221,6 +221,74 @@ def test_lem_pair_two_stage_endpoint_combination_is_equivariant():
         assert drift <= 1.0e-9
 
 
+def test_dual_cutoff_two_stage_endpoint_rms_and_refine_share_full_edge_wigner():
+    """A real MP/head split must not forward MP-row Wigner blocks to Stage 2."""
+
+    with _deterministic_fp64():
+        options = model_options()
+        options.update(
+            mp_cutoff=1.0,
+            condition_source="endpoints",
+            hb0_hermitian_average=True,
+            log_head_input_rms=True,
+            pair_refine_enable=True,
+            pair_refine_rank=3,
+            pair_refine_weight_mode="per_path",
+            pair_refine_max_weight_numel=1_000_000,
+            pair_refine_identity_init=True,
+            two_stage_pair_enable=True,
+            two_stage_pair_refine_layers=2,
+            two_stage_pair_refine_rank=3,
+            two_stage_pair_refine_radial_dim=3,
+            two_stage_pair_refine_edge_chunk_size=2,
+        )
+        torch.manual_seed(20260724)
+        model = LemPair(**options).eval()
+        data = molecule_data(model)
+
+        edge_index = data[_keys.EDGE_INDEX_KEY]
+        edge_vector = (
+            data[_keys.POSITIONS_KEY].index_select(0, edge_index[0])
+            - data[_keys.POSITIONS_KEY].index_select(0, edge_index[1])
+        )
+        mp_mask = edge_vector.norm(dim=-1) < 1.0
+        assert 0 < int(mp_mask.sum()) < int(mp_mask.numel())
+
+        reference = model(clone_data(data))
+        assert "head_input_rms" in reference
+        assert torch.isfinite(reference[_keys.EDGE_HAMILTONIAN_KEY]).all()
+
+        torch.manual_seed(83)
+        rotation = o3.rand_matrix(dtype=torch.float64)
+        rotated = model(rotate_data(data, rotation))
+        d_ao = ao_wigner(model, rotation)
+        expected = torch.einsum(
+            "ij,njk,lk->nil",
+            d_ao,
+            reference[_keys.EDGE_HAMILTONIAN_KEY],
+            d_ao,
+        )
+        drift = float(
+            (rotated[_keys.EDGE_HAMILTONIAN_KEY] - expected).abs().max()
+        )
+        print(f"dual_cutoff_two_stage_full_wigner_max_abs={drift:.16e}")
+        assert drift <= 1.0e-9
+
+        model.train()
+        model.zero_grad(set_to_none=True)
+        output = model(clone_data(data))
+        output[_keys.EDGE_HAMILTONIAN_KEY].sum().backward()
+        for prefix in ("two_stage_pair.", "pair_refine."):
+            gradients = {
+                name: parameter.grad
+                for name, parameter in model.named_parameters()
+                if name.startswith(prefix) and parameter.requires_grad
+            }
+            assert gradients
+            assert all(value is not None for value in gradients.values())
+            assert any(value.norm().item() > 0.0 for value in gradients.values())
+
+
 def _prepared_flow_pair(model):
     flow = _b_flow(model.idp, dtype=torch.float64)
     raw, _, _ = _b_record(model.idp, dtype=torch.float64, seed=31)

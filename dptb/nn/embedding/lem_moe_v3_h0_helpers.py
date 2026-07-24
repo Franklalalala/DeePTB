@@ -121,10 +121,16 @@ def _sorted_irrep_coordinate_index(idp, *, device=None) -> tuple[o3.Irreps, torc
         sorted_terms.append((int(raw[term_index].mul), raw[term_index].ir))
     index = torch.tensor(coordinate_order, dtype=torch.long, device=device)
     sorted_irreps = o3.Irreps(sorted_terms).simplify()
-    if index.numel() != int(idp.reduced_matrix_element):
+    mapper_dim = int(idp.reduced_matrix_element)
+    if index.numel() != mapper_dim:
         raise RuntimeError(
-            "uu_real mapper irrep permutation width disagrees with reduced_matrix_element: "
+            "mapper irrep permutation width disagrees with reduced_matrix_element: "
             f"permutation={index.numel()}, mapper={idp.reduced_matrix_element}."
+        )
+    expected = torch.arange(mapper_dim, dtype=torch.long, device=index.device)
+    if not torch.equal(index.sort().values, expected):
+        raise RuntimeError(
+            "mapper raw-to-sorted irrep coordinate index is not a permutation."
         )
     return sorted_irreps, index
 
@@ -484,6 +490,12 @@ def _get_feature_source_with_key(
 
 
 class H0InitLayer(torch.nn.Module):
+    # v2 fixes the generic non-uu_real H0 input contract: mapper/raw orbpair
+    # coordinates are permuted into sorted-irrep coordinates before the e3nn
+    # node/edge projectors.  Keep the marker in module metadata rather than as a
+    # persistent tensor so parameter keys and initialization RNG stay unchanged.
+    _version = 2
+
     def __init__(
         self,
         base_init: torch.nn.Module,
@@ -615,6 +627,52 @@ class H0InitLayer(torch.nn.Module):
                     "H0Init and spatial residual projector raw-to-sorted "
                     "coordinate permutations disagree."
                 )
+
+    def _legacy_unsorted_h0_checkpoint_is_unsafe(self) -> bool:
+        """Whether a pre-v2 checkpoint was trained against the broken layout."""
+
+        sort_index = self._h0_sort_index.detach()
+        identity = torch.arange(
+            sort_index.numel(),
+            dtype=sort_index.dtype,
+            device=sort_index.device,
+        )
+        return bool(
+            (self.use_h0_node_init or self.use_h0_edge_init)
+            and not self.use_uureal_residual_block_input
+            and not torch.equal(sort_index, identity)
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        version = local_metadata.get("version")
+        if self._legacy_unsorted_h0_checkpoint_is_unsafe() and (
+            version is None or int(version) < self._version
+        ):
+            module_name = prefix[:-1] if prefix.endswith(".") else prefix
+            error_msgs.append(
+                f"{module_name or '<root>'}: checkpoint H0 layout version "
+                f"{version!r} predates the H0 raw-to-sorted RME layout fix "
+                f"(required version {self._version}). This high-l non-uu_real "
+                "checkpoint cannot be resumed safely; retrain from initialization."
+            )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _candidate_keys(
         self,

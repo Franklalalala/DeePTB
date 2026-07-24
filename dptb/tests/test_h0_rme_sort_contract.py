@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from dptb.data.transforms import OrbitalMapper
@@ -105,3 +106,56 @@ def test_zero_and_scalar_only_h0_are_bit_exact_under_sort():
         scalar_layer.edge_projector(sorted_scalar_h0),
         scalar_layer.edge_projector(scalar_h0),
     )
+
+
+def _mark_state_as_legacy(state):
+    assert state._metadata[""]["version"] == H0InitLayer._version
+    state._metadata[""]["version"] = 1
+    return state
+
+
+def test_current_h0_layout_checkpoint_round_trip_is_strict():
+    source = _h0_layer({"H": "1s", "C": "1s1p"})
+    target = _h0_layer({"H": "1s", "C": "1s1p"})
+    target.load_state_dict(source.state_dict(), strict=True)
+
+
+def test_legacy_highl_non_uureal_checkpoint_fails_closed():
+    source = _h0_layer({"H": "1s", "C": "1s1p"})
+    target = _h0_layer({"H": "1s", "C": "1s1p"})
+    state = _mark_state_as_legacy(source.state_dict())
+    with pytest.raises(
+        RuntimeError,
+        match="predates the H0 raw-to-sorted RME layout fix",
+    ):
+        target.load_state_dict(state, strict=True)
+
+
+def test_stripped_highl_checkpoint_metadata_fails_closed():
+    source = _h0_layer({"H": "1s", "C": "1s1p"})
+    target = _h0_layer({"H": "1s", "C": "1s1p"})
+    stripped = dict(source.state_dict())
+    with pytest.raises(
+        RuntimeError,
+        match="predates the H0 raw-to-sorted RME layout fix",
+    ):
+        target.load_state_dict(stripped, strict=True)
+
+
+def test_legacy_scalar_only_checkpoint_remains_loadable():
+    source = _h0_layer({"H": "1s"})
+    target = _h0_layer({"H": "1s"})
+    state = _mark_state_as_legacy(source.state_dict())
+    target.load_state_dict(state, strict=True)
+
+
+def test_legacy_uureal_checkpoint_remains_loadable():
+    kwargs = dict(
+        basis={"H": "1s", "C": "1s1p"},
+        has_soc=True,
+        use_uureal_residual_block_input=True,
+    )
+    source = _h0_layer(**kwargs)
+    target = _h0_layer(**kwargs)
+    state = _mark_state_as_legacy(source.state_dict())
+    target.load_state_dict(state, strict=True)
