@@ -79,6 +79,7 @@ class LemMoEV3H0(LemMoEV3):
         log_head_input_rms: bool = False,
         env_embed_multiplicity: int = 32,
         two_stage_pair_enable: bool = False,
+        allow_no_h0_current_state: bool = False,
         two_stage_pair_refine_layers: int = 2,
         two_stage_pair_tail_gate: bool = False,
         two_stage_pair_refine_rank: int = 16,
@@ -111,6 +112,7 @@ class LemMoEV3H0(LemMoEV3):
                 "log_head_input_rms=true requires output_route='h_b0'."
             )
         self.two_stage_pair_enable = bool(two_stage_pair_enable)
+        self.allow_no_h0_current_state = bool(allow_no_h0_current_state)
         self.two_stage_pair = None
         (
             self.h0_init_scope,
@@ -125,17 +127,27 @@ class LemMoEV3H0(LemMoEV3):
             option_name="h0_init_scope",
         )
         self.require_full_block_edge_coverage = bool(require_full_block_edge_coverage)
-        if self.two_stage_pair_enable and not self.use_h0_init:
+        if (
+            self.two_stage_pair_enable
+            and not self.use_h0_init
+            and not self.allow_no_h0_current_state
+        ):
             raise ValueError(
                 "two_stage_pair_enable=true requires an active H0 init scope in "
-                "LemMoEV3H0 so the current ordered-edge state is available."
+                "LemMoEV3H0 or allow_no_h0_current_state=true for an absolute "
+                "Full-H flow."
             )
         if self.require_full_block_edge_coverage and (
-            not self.use_h0_init or self.output_route_name != "h_b0"
+            (
+                not self.use_h0_init
+                and not self.allow_no_h0_current_state
+            )
+            or self.output_route_name != "h_b0"
         ):
             raise ValueError(
                 "require_full_block_edge_coverage=true is supported only by "
-                "the LemMoEV3H0 H-B0 route with use_h0_init=true."
+                "the LemMoEV3H0 H-B0 route with use_h0_init=true or an explicitly "
+                "authorized absolute Full-H current-state input."
             )
         self.use_flow_time_embedding = bool(use_flow_time_embedding)
         self.flow_time_condition_edges = bool(flow_time_condition_edges)

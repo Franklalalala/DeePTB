@@ -1934,6 +1934,16 @@ def slem_h0():
         Argument("log_head_input_rms", bool, optional=True, default=False,
                  doc="Attach detached per-irrep-slice node/edge head-input RMS tensors to model output."),
         Argument("two_stage_pair_enable", bool, optional=True, default=False),
+        Argument(
+            "allow_no_h0_current_state",
+            bool,
+            optional=True,
+            default=False,
+            doc=(
+                "Allow the absolute Full-H block-ODE route to supply its current "
+                "state through node/edge features without physical-H0 feature init."
+            ),
+        ),
         Argument("two_stage_pair_refine_layers", int, optional=True, default=2),
         Argument("two_stage_pair_tail_gate", bool, optional=True, default=False),
         Argument("two_stage_pair_refine_rank", int, optional=True, default=16),

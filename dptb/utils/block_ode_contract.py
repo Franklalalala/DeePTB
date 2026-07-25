@@ -609,6 +609,26 @@ def validate_block_ode_contract(data):
             "block_ode requires embedding.h0_init_scope='both' for both node and "
             "edge H0 initialization"
         )
+    allow_no_h0_current_state = bool(
+        embedding.get("allow_no_h0_current_state", False)
+    )
+    if allow_no_h0_current_state and not (
+        absolute_full_h_mode and h0_init_scope != "both"
+    ):
+        raise ValueError(
+            "embedding.allow_no_h0_current_state=true is reserved for "
+            "mode='absolute', output_space='ao_block_ode', "
+            "target_semantics='absolute_full_h', and disabled H0 feature init"
+        )
+    if (
+        absolute_full_h_mode
+        and h0_init_scope != "both"
+        and not allow_no_h0_current_state
+    ):
+        raise ValueError(
+            "absolute no-H0 block_ode requires "
+            "embedding.allow_no_h0_current_state=true"
+        )
     if bool(embedding.get("use_uureal_residual_block_input", False)) != uureal_mode:
         raise ValueError(
             "uureal_block_ode and embedding.use_uureal_residual_block_input must be enabled together"

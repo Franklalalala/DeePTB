@@ -13,6 +13,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     canonical_block_tensors_to_feature_tensors,
 )
 from dptb.data.transforms import OrbitalMapper
+from dptb.nn.embedding.lem_moe_v3_h0 import LemMoEV3H0
 from dptb.nn.hamiltonian import _contract_cg_rme, _inverse_contract_cg_hr
 from dptb.nnops.block_flow_codec import BlockStateCodec, project_block_state
 from dptb.nnops.flow import HamiltonianCFM
@@ -25,6 +26,7 @@ from dptb.tests.test_block_ode_flow import (
     _pd_legacy_product_h0_case,
     _scaled_endpoint,
 )
+from dptb.tests.test_lem_pair_common import model_options
 from dptb.utils.argcheck import flow_options, slem_h0, validate_block_ode_contract
 
 
@@ -122,6 +124,7 @@ def test_absolute_generic_tied_irrep_allows_no_h0_feature_initialization():
         }
     )
     config["model_options"]["embedding"]["h0_init_scope"] = "none"
+    config["model_options"]["embedding"]["allow_no_h0_current_state"] = True
 
     assert validate_block_ode_contract(config) is None
 
@@ -149,6 +152,38 @@ def test_absolute_mode_does_not_enter_residual_ao_block_ode_route():
 
     with pytest.raises(ValueError, match="requires flow_options.mode='residual'"):
         validate_block_ode_contract(config)
+
+
+def test_absolute_current_state_marker_builds_no_h0_late_pair_model():
+    options = model_options()
+    options.update(
+        h0_init_scope="none",
+        use_h0_init=False,
+        use_h0_node_init=False,
+        use_h0_edge_init=False,
+        allow_no_h0_current_state=True,
+        two_stage_pair_enable=True,
+    )
+
+    model = LemMoEV3H0(**options)
+
+    assert model.use_h0_init is False
+    assert model.allow_no_h0_current_state is True
+    assert model.two_stage_pair is not None
+
+
+def test_no_h0_late_pair_model_still_rejects_without_absolute_marker():
+    options = model_options()
+    options.update(
+        h0_init_scope="none",
+        use_h0_init=False,
+        use_h0_node_init=False,
+        use_h0_edge_init=False,
+        two_stage_pair_enable=True,
+    )
+
+    with pytest.raises(ValueError, match="allow_no_h0_current_state=true"):
+        LemMoEV3H0(**options)
 
 
 def test_red_inverse_cg_nonorthogonal_solve():
