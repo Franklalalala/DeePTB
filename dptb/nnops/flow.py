@@ -297,9 +297,13 @@ class HamiltonianCFM:
         self._strict_certification_batches = 0
 
         # Residual CFM is the recommended mode for DeePTB: base = DFT/NextHAM H0.
-        self.mode = str(options.get("mode", "residual")).lower()
+        configured_mode = str(options.get("mode", "residual")).lower()
+        self.mode = "full" if configured_mode == "absolute" else configured_mode
         if self.mode not in {"residual", "full"}:
-            raise ValueError(f"Unsupported flow_options.mode={self.mode!r}; use 'residual' or 'full'.")
+            raise ValueError(
+                f"Unsupported flow_options.mode={configured_mode!r}; "
+                "use 'residual', 'absolute', or legacy alias 'full'."
+            )
 
         # In DeePTB, zero prior means the inference start state is exactly physical H0.
         # Gaussian is available for QHFlow-style noisy residual priors.
@@ -361,7 +365,12 @@ class HamiltonianCFM:
                     "Block-space ODE v1 requires float32 or float64 so its strict "
                     "inverse tolerance has a certified dtype contract."
                 )
-            if self.mode != "residual":
+            absolute_full_h_mode = (
+                self.mode == "full"
+                and self.output_space == "ao_block_ode"
+                and self.target_semantics == "absolute_full_h"
+            )
+            if self.mode != "residual" and not absolute_full_h_mode:
                 raise ValueError(
                     "Block-space ODE v1 requires mode='residual' so B0 is physical H0."
                 )
@@ -380,10 +389,15 @@ class HamiltonianCFM:
                         "prior='tied_irrep_gaussian'; generic TE/Gaussian priors "
                         "do not own the projected block start-state contract."
                     )
-            elif (
-                not self.uureal_block_ode
-                and self.prior not in {"zero", *self._projected_te_prior_names}
-            ):
+            elif not self.uureal_block_ode and self.prior not in {
+                "zero",
+                *self._projected_te_prior_names,
+                *(
+                    self._tied_irrep_gaussian_prior_names
+                    if absolute_full_h_mode
+                    else ()
+                ),
+            }:
                 raise ValueError(
                     "Block-space ODE supports only prior='zero' or the explicit "
                     "prior='projected_te'; generic TE/Gaussian priors do not own "
@@ -579,10 +593,14 @@ class HamiltonianCFM:
                     f"te_prior_validation_seed in [0, {_MAX_TORCH_SEED}]."
                 )
         if self.prior in self._tied_irrep_gaussian_prior_names:
-            if not self.residual_ao_block_ode:
+            if not self.residual_ao_block_ode and not (
+                self.mode == "full"
+                and self.output_space == "ao_block_ode"
+                and self.target_semantics == "absolute_full_h"
+            ):
                 raise ValueError(
                     "prior='tied_irrep_gaussian' is supported only by "
-                    "residual_ao_block_ode."
+                    "residual_ao_block_ode or absolute ao_block_ode."
                 )
             validate_tied_irrep_options(
                 mode=options.get("tied_irrep_mode", ""),

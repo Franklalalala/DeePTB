@@ -109,6 +109,48 @@ def _valid_contract() -> dict:
     }
 
 
+def test_absolute_generic_tied_irrep_allows_no_h0_feature_initialization():
+    config = _valid_contract()
+    config["train_options"]["flow_options"].update(
+        {
+            "mode": "absolute",
+            "prior": "tied_irrep_gaussian",
+            "tied_irrep_mode": "so3_tied",
+            "tied_irrep_irreps": "3x0e + 2x1e + 1x2e",
+            "tied_irrep_sigma": 1.0,
+            "tied_irrep_validation_seed": 20260725,
+        }
+    )
+    config["model_options"]["embedding"]["h0_init_scope"] = "none"
+
+    assert validate_block_ode_contract(config) is None
+
+
+def test_residual_block_ode_still_rejects_no_h0_feature_initialization():
+    config = _valid_contract()
+    config["model_options"]["embedding"]["h0_init_scope"] = "none"
+
+    with pytest.raises(
+        ValueError,
+        match="h0_init_scope='both'.*node and edge H0 initialization",
+    ):
+        validate_block_ode_contract(config)
+
+
+def test_absolute_mode_does_not_enter_residual_ao_block_ode_route():
+    config = _valid_contract()
+    config["train_options"]["flow_options"].update(
+        {
+            "mode": "absolute",
+            "output_space": "residual_ao_block_ode",
+            "prior": "tied_irrep_gaussian",
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires flow_options.mode='residual'"):
+        validate_block_ode_contract(config)
+
+
 def test_red_inverse_cg_nonorthogonal_solve():
     nonorthogonal = torch.tensor([[[2.0, 0.0], [0.0, 3.0]]], dtype=torch.float64)
     rme = torch.tensor([[[1.25], [-0.75]]], dtype=torch.float64)

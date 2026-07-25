@@ -458,6 +458,45 @@ def _block_initial_state(
         certify_image=certify_image,
         _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
     )
+    if owner.mode == "full":
+        if owner.prior == "zero":
+            if prior_seed is not None:
+                raise ValueError(
+                    "block-space prior_seed requires a stochastic block prior."
+                )
+            zero_state = BlockTensorResult(
+                torch.zeros_like(h0_blocks.node_blocks),
+                torch.zeros_like(h0_blocks.edge_blocks),
+                h0_blocks.node_shapes,
+                h0_blocks.edge_shapes,
+            )
+            return zero_state, torch.zeros_like(node_h0), torch.zeros_like(edge_h0)
+        if owner.prior not in {
+            *owner._projected_te_prior_names,
+            *owner._tied_irrep_gaussian_prior_names,
+        }:
+            raise RuntimeError(
+                f"Unsupported absolute block-space prior {owner.prior!r}."
+            )
+        generator = (
+            None
+            if prior_seed is None
+            else owner._seeded_generator(h0_blocks.node_blocks.device, prior_seed)
+        )
+        state = owner._residual_stochastic_eps(
+            data,
+            node_h0,
+            edge_h0,
+            generator=generator,
+            certify_image=certify_image,
+        )
+        node_prior, edge_prior = owner.block_codec.blocks_to_rme(
+            data,
+            state,
+            certify_image=certify_image,
+            _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
+        )
+        return state, node_prior, edge_prior
     if owner.prior == "zero":
         if prior_seed is not None:
             raise ValueError("block-space prior_seed requires prior='projected_te'.")

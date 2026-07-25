@@ -179,6 +179,41 @@ def _scaled_endpoint(codec, data, node_h0, edge_h0, scale):
     return codec.rme_to_blocks(data, node_h0 * scale, edge_h0 * scale, project=True)
 
 
+def test_absolute_tied_irrep_start_is_not_centered_on_physical_h0():
+    idp, data, _, h0 = _case()
+    flow = _flow(
+        idp,
+        mode="absolute",
+        prior="tied_irrep_gaussian",
+        tied_irrep_mode="so3_tied",
+        tied_irrep_irreps="3x0e + 2x1e + 1x2e",
+        tied_irrep_sigma=1.0,
+        tied_irrep_validation_seed=20260725,
+    )
+    shifted_h0 = BlockTensorResult(
+        h0.node_blocks * 7.0,
+        h0.edge_blocks * 7.0,
+        h0.node_shapes,
+        h0.edge_shapes,
+    )
+
+    start_a, node_a, edge_a = flow._block_initial_state(
+        data, h0, prior_seed=20260725
+    )
+    start_b, node_b, edge_b = flow._block_initial_state(
+        data, shifted_h0, prior_seed=20260725
+    )
+
+    torch.testing.assert_close(start_a.node_blocks, start_b.node_blocks)
+    torch.testing.assert_close(start_a.edge_blocks, start_b.edge_blocks)
+    torch.testing.assert_close(node_a, node_b)
+    torch.testing.assert_close(edge_a, edge_b)
+    assert torch.isfinite(start_a.node_blocks).all()
+    assert torch.isfinite(start_a.edge_blocks).all()
+    assert start_a.node_blocks.abs().max().item() > 0.0
+    assert start_a.edge_blocks.abs().max().item() > 0.0
+
+
 class EndpointSequence(torch.nn.Module):
     def __init__(self, endpoints):
         super().__init__()

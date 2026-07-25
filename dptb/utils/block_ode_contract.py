@@ -183,7 +183,14 @@ def validate_block_ode_contract(data):
             "block_ode is a distinct mode: set block_ode=true and "
             "output_space='ao_block_ode'; do not reuse the frozen ao_block adapter"
         )
-    if str(flow.get("mode", "")).lower() != "residual":
+    flow_mode = str(flow.get("mode", "")).lower().replace("-", "_")
+    semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
+    absolute_full_h_mode = (
+        flow_mode == "absolute"
+        and expected_output_space == "ao_block_ode"
+        and semantics == "absolute_full_h"
+    )
+    if flow_mode != "residual" and not absolute_full_h_mode:
         raise ValueError("block_ode v1 requires flow_options.mode='residual'")
     prior = str(flow.get("prior", "")).lower().replace("-", "_")
     if uureal_mode and prior != "zero":
@@ -197,7 +204,14 @@ def validate_block_ode_contract(data):
             "residual_ao_block_ode supports only prior='zero', "
             "prior='projected_te', or prior='tied_irrep_gaussian'"
         )
-    if not residual_spatial_mode and prior not in {"zero", "projected_te"}:
+    if (
+        not residual_spatial_mode
+        and prior not in {
+            "zero",
+            "projected_te",
+            *(("tied_irrep_gaussian",) if absolute_full_h_mode else ()),
+        }
+    ):
         raise ValueError(
             "block_ode supports only prior='zero' or explicit prior='projected_te'"
         )
@@ -322,7 +336,6 @@ def validate_block_ode_contract(data):
                 "tied_irrep_gaussian requires an explicit integer "
                 f"tied_irrep_validation_seed in [0, {(1 << 64) - 1}]"
             )
-    semantics = str(flow.get("target_semantics", "")).lower().replace("-", "_")
     if semantics not in {"absolute_full_h", "residual_dh"}:
         raise ValueError("block_ode requires explicit absolute_full_h/residual_dh semantics")
     if uureal_mode and semantics != "residual_dh":
@@ -591,7 +604,7 @@ def validate_block_ode_contract(data):
     h0_init_scope = str(embedding.get("h0_init_scope", "both")).lower().replace(
         "-", "_"
     )
-    if h0_init_scope != "both":
+    if flow_mode == "residual" and h0_init_scope != "both":
         raise ValueError(
             "block_ode requires embedding.h0_init_scope='both' for both node and "
             "edge H0 initialization"
