@@ -142,6 +142,8 @@ def _validate_matrix_stack(
         raise FixedMuOperatorError(f"H and S shapes must match, got {h_arr.shape} and {s_arr.shape}")
     if h_arr.ndim < 2 or h_arr.shape[-1] != h_arr.shape[-2]:
         raise FixedMuOperatorError(f"H/S must be square matrices or stacks, got shape {h_arr.shape}")
+    if h_arr.shape[-1] == 0:
+        raise FixedMuOperatorError("H/S matrix size must be positive")
     if not np.issubdtype(h_arr.dtype, np.number) or not np.issubdtype(s_arr.dtype, np.number):
         raise FixedMuOperatorError("H and S must be numeric arrays")
     dtype = np.result_type(h_arr, s_arr, np.float64)
@@ -183,6 +185,12 @@ def _prepare_weights(
     k_axis: Optional[int],
     normalize_k_weights: bool,
 ) -> np.ndarray:
+    if k_axis is None and k_weights is not None:
+        _reject_torch_tensor("k_weights", k_weights)
+        raise FixedMuOperatorError(
+            "k_weights requires an explicit k_axis; batch/sample weights are "
+            "not accepted by this fixed-mu postprocess reference"
+        )
     if not leading_shape:
         if k_weights is None:
             return np.asarray(1.0, dtype=np.float64)
@@ -441,10 +449,10 @@ def fixed_mu_observables(
         and ``1`` for explicit spin/SOC spinor matrices.
     k_weights, k_axis
         Optional Brillouin-zone weights and the leading axis to sum over.
-        Weights are normalized only along an explicit ``k_axis``.  With
-        ``k_axis=None`` no k aggregation is performed and scalar/per-item
-        weights are used only in ledgers/conservation, not to normalize batch
-        samples.
+        ``k_weights`` is accepted only with an explicit ``k_axis`` and is then
+        normalized along that axis.  With ``k_axis=None`` no k aggregation is
+        performed, batch/sample weights are rejected, and returned densities
+        have the same unweighted leading shape as the input matrices.
     """
 
     mu = _as_float_scalar("mu", mu)
