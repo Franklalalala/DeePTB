@@ -541,6 +541,8 @@ def validate_qeq_result(result: QEqResult, *, atol: float = 1e-8) -> None:
     if charges.ndim < 1:
         raise QEqOperatorError(f"QEq charges must have shape [..., natom], got {charges.shape}")
     n = charges.shape[-1]
+    if n <= 0:
+        raise QEqOperatorError("QEq result must contain at least one charge site")
     leading_shape = charges.shape[:-1]
     _require_same_shape("total_charge", qtot, leading_shape)
     _require_same_shape("electronegativity", chi, leading_shape + (n,))

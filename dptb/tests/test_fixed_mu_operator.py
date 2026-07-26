@@ -1,4 +1,5 @@
-from dataclasses import replace
+import pickle
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
@@ -13,6 +14,10 @@ from dptb.nnops.fixed_mu_operator import (
     generalized_bands,
     validate_conservation,
 )
+
+
+def _replace_result(result, **changes):
+    return replace(result, validation_context=getattr(result, "_validation_context", None), **changes)
 
 
 def test_generalized_bands_are_s_orthonormal_nonorthogonal():
@@ -93,10 +98,12 @@ def test_fixed_mu_result_arrays_are_read_only_defensive_copies():
     with pytest.raises(ValueError, match="read-only"):
         result.conservation.electron_count_residual[...] = 1.0
     with pytest.raises(ValueError, match="read-only"):
-        result._hamiltonian[0, 0] = 0.0
+        result._validation_context.hamiltonian[0, 0] = 0.0
+    with pytest.raises(ValueError, match="WRITEABLE"):
+        result._validation_context.hamiltonian.setflags(write=True)
 
     density_alias = result.density.copy()
-    rebuilt = replace(result, density=density_alias)
+    rebuilt = _replace_result(result, density=density_alias)
     density_alias[0, 0] += 10.0
     np.testing.assert_allclose(rebuilt.density, result.density, atol=1e-12)
 
@@ -109,24 +116,149 @@ def test_validate_conservation_recomputes_density_and_ledgers_from_hs_snapshots(
     bad_density = result.density.copy()
     bad_density[0, 0] += 0.1
     with pytest.raises(FixedMuOperatorError, match="density"):
-        validate_conservation(replace(result, density=bad_density), atol=1e-10)
+        validate_conservation(_replace_result(result, density=bad_density), atol=1e-10)
 
     with pytest.raises(FixedMuOperatorError, match="electron_count"):
-        validate_conservation(replace(result, electron_count=result.electron_count + 0.5), atol=1e-10)
+        validate_conservation(_replace_result(result, electron_count=result.electron_count + 0.5), atol=1e-10)
 
     bad_energies = replace(result.energies, band_energy=result.energies.band_energy + 0.5)
     with pytest.raises(FixedMuOperatorError, match="energy band_energy"):
-        validate_conservation(replace(result, energies=bad_energies), atol=1e-10)
+        validate_conservation(_replace_result(result, energies=bad_energies), atol=1e-10)
 
     bad_conservation = replace(
         result.conservation,
         band_energy_from_density=result.conservation.band_energy_from_density + 0.5,
     )
     with pytest.raises(FixedMuOperatorError, match="conservation band_energy_from_density"):
-        validate_conservation(replace(result, conservation=bad_conservation), atol=1e-10)
+        validate_conservation(_replace_result(result, conservation=bad_conservation), atol=1e-10)
 
-    with pytest.raises(FixedMuOperatorError, match="H/S snapshots"):
-        validate_conservation(replace(result, _hamiltonian=None, _overlap=None), atol=1e-10)
+    with pytest.raises(FixedMuOperatorError, match="H/S context"):
+        validate_conservation(replace(result), atol=1e-10)
+
+
+def test_fixed_mu_validation_context_is_excluded_from_public_serialization():
+    h = np.diag([-1.0, 1.0])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+
+    public = asdict(result)
+    assert "_validation_context" not in public
+    assert "validation_context" not in public
+    assert "_hamiltonian" not in public
+    assert "_overlap" not in public
+    assert "_validation_context" not in result.to_dict()
+
+    restored = pickle.loads(pickle.dumps(result))
+    with pytest.raises(FixedMuOperatorError, match="H/S context"):
+        validate_conservation(restored, atol=1e-10)
+    validate_conservation(restored, h=h, s=s, atol=1e-10)
+
+
+def test_validate_conservation_revalidates_k_axis_and_weight_contract():
+    h = np.stack([np.diag([-1.0, 0.5]), np.diag([-0.25, 0.75])])
+    s = np.broadcast_to(np.eye(2), h.shape).copy()
+    result = fixed_mu_observables(
+        h,
+        s,
+        mu=0.0,
+        kT=0.0,
+        spin_degeneracy=2.0,
+        k_weights=np.array([0.25, 0.75]),
+        k_axis=0,
+    )
+
+    bad_weights = result.k_weights.copy()
+    bad_weights[0] = -0.1
+    with pytest.raises(FixedMuOperatorError, match="nonnegative"):
+        validate_conservation(_replace_result(result, k_weights=bad_weights), atol=1e-10)
+
+    bad_shape_weights = np.ones((2, 1))
+    with pytest.raises(FixedMuOperatorError, match="stored k_weights shape"):
+        validate_conservation(_replace_result(result, k_weights=bad_shape_weights), atol=1e-10)
+
+    unnormalized_weights = np.array([2.0, 1.0])
+    with pytest.raises(FixedMuOperatorError, match="sum to one"):
+        validate_conservation(_replace_result(result, k_weights=unnormalized_weights), atol=1e-10)
+
+    with pytest.raises(FixedMuOperatorError, match="k_axis must be an integer"):
+        validate_conservation(_replace_result(result, k_axis=object()), atol=1e-10)
+
+
+def test_positive_unnormalized_k_weights_are_preserved_with_provenance():
+    h = np.stack([np.diag([-1.0, 0.5]), np.diag([-0.25, 0.75])])
+    s = np.broadcast_to(np.eye(2), h.shape).copy()
+    weights = np.array([2.0, 1.0])
+    result = fixed_mu_observables(
+        h,
+        s,
+        mu=0.1,
+        kT=0.05,
+        spin_degeneracy=2.0,
+        k_weights=weights,
+        k_axis=0,
+        normalize_k_weights=False,
+    )
+
+    assert result.normalize_k_weights is False
+    np.testing.assert_allclose(result.k_weights, weights, atol=1e-12)
+    validate_conservation(result, atol=1e-10)
+    np.testing.assert_allclose(
+        result.energies.grand_energy,
+        result.energies.free_energy - result.mu * result.electron_count,
+        atol=1e-12,
+    )
+
+
+def test_validate_conservation_rechecks_hs_context_and_nested_types():
+    h = np.array([[-1.0, 0.05], [0.05, 0.6]], dtype=float)
+    s = np.array([[1.1, 0.02], [0.02, 0.9]], dtype=float)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+
+    bad_h = h.copy()
+    bad_h[0, 1] += 0.2
+    bad_h[1, 0] += 0.2
+    with pytest.raises(FixedMuOperatorError, match="generalized eigen residual"):
+        validate_conservation(result, h=bad_h, s=s, atol=1e-10)
+
+    bad_s = s.copy()
+    bad_s[0, 1] += 0.2
+    with pytest.raises(FixedMuOperatorError, match="Hermitian"):
+        validate_conservation(result, h=h, s=bad_s, atol=1e-10)
+
+    with pytest.raises(FixedMuOperatorError, match="energies must be an EnergyLedger"):
+        _replace_result(result, energies=object())
+    with pytest.raises(FixedMuOperatorError, match="conservation must be a ConservationLedger"):
+        _replace_result(result, conservation=object())
+
+
+def test_complex_soc_kpoint_batch_validates_fixed_mu_contract():
+    h = np.array(
+        [
+            [[0.1, 0.2j], [-0.2j, 0.4]],
+            [[-0.2, 0.05 + 0.03j], [0.05 - 0.03j, 0.7]],
+        ],
+        dtype=np.complex128,
+    )
+    s = np.array(
+        [
+            [[1.2, 0.05 - 0.02j], [0.05 + 0.02j, 1.1]],
+            [[1.1, -0.04j], [0.04j, 1.3]],
+        ],
+        dtype=np.complex128,
+    )
+    result = fixed_mu_observables(
+        h,
+        s,
+        mu=0.25,
+        kT=0.05,
+        spin_degeneracy=1.0,
+        k_weights=np.array([0.4, 0.6]),
+        k_axis=0,
+    )
+
+    assert result.density.shape == (2, 2)
+    assert np.iscomplexobj(result.density)
+    validate_conservation(result, atol=1e-9)
 
 
 def test_validate_conservation_recomputes_fixed_mu_occupations_and_energy_closures():
@@ -137,17 +269,17 @@ def test_validate_conservation_recomputes_fixed_mu_occupations_and_energy_closur
     bad_occ = result.occupations.copy()
     bad_occ[0] += 0.1
     with pytest.raises(FixedMuOperatorError, match="occupations"):
-        validate_conservation(replace(result, occupations=bad_occ), atol=1e-10)
+        validate_conservation(_replace_result(result, occupations=bad_occ), atol=1e-10)
 
     bad_eigvals = result.eigvals.copy()
     bad_eigvals[0] += 0.1
-    with pytest.raises(FixedMuOperatorError, match="occupations|energy"):
-        validate_conservation(replace(result, eigvals=bad_eigvals), atol=1e-10)
+    with pytest.raises(FixedMuOperatorError, match="generalized eigen residual"):
+        validate_conservation(_replace_result(result, eigvals=bad_eigvals), atol=1e-10)
 
     for field_name in ("entropy_term", "free_energy", "grand_energy"):
         bad_energies = replace(result.energies, **{field_name: getattr(result.energies, field_name) + 0.25})
         with pytest.raises(FixedMuOperatorError, match=f"energy {field_name}"):
-            validate_conservation(replace(result, energies=bad_energies), atol=1e-10)
+            validate_conservation(_replace_result(result, energies=bad_energies), atol=1e-10)
 
 
 def test_finite_temperature_dos_and_density_response_match_finite_difference():

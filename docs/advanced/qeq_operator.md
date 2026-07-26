@@ -46,14 +46,21 @@ constrained-kernel diagnostics, and KKT conditioning from the current
 fields and diagnostics before applying the physical residual tolerances.
 
 `validate_conservation` for fixed-mu results is intentionally separate from
-QEq.  Solver-produced `FixedMuResult` objects carry private read-only
-Hamiltonian and overlap snapshots so the validator can recompute density
-aggregation, Fermi occupations from eigenvalues, all band/entropy/free/grand
-energy ledger terms, `free_energy = band_energy + entropy_term`,
-`grand_energy = free_energy - mu * N`, `Tr(D S)`, `Tr(D H)`, residual ledgers,
-and density hermiticity from the current fixed-mu arrays.  These checks are
-deliberately dense-reference checks over the returned arrays and snapshots; the
-validator is for fail-closed postprocess validation, not a cheap training-loop
-assertion.  Externally constructed fixed-mu results that lack those snapshots
-fail closed because their ledgers cannot be checked against the original H/S
-matrices.
+QEq.  Solver-produced `FixedMuResult` objects carry a non-field, non-serialized
+validation context with immutable Hamiltonian and overlap snapshots.  The
+context is excluded from `dataclasses.asdict`, `FixedMuResult.to_dict()`, and
+pickle state, so deserialized or externally constructed results must call
+`validate_conservation(result, h=..., s=...)` explicitly.  The result stores the
+scalar provenance needed to rerun validation, including `normalize_k_weights`,
+`eig_floor`, `max_condition`, and `hermitian_tol`.
+
+The fixed-mu validator recomputes k-axis canonicalization, finite/nonnegative
+stored-weight checks, normalized-weight sums when normalization provenance is
+enabled, H/S Hermiticity, S positive-definiteness and condition, `C^H S C = I`,
+`H C = S C eps`, Fermi occupations from eigenvalues, density aggregation, all
+band/entropy/free/grand energy ledger terms, `free_energy = band_energy +
+entropy_term`, `grand_energy = free_energy - mu * N`, `Tr(D S)`, `Tr(D H)`,
+residual ledgers, and density hermiticity from the current fixed-mu arrays.
+These checks are deliberately dense-reference checks over the returned arrays
+and validation H/S; the validator is for fail-closed postprocess validation, not
+a cheap training-loop assertion.

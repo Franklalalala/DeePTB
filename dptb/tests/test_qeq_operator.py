@@ -241,6 +241,22 @@ def test_validate_qeq_result_recomputes_current_arrays_not_stale_cache():
         validate_qeq_result(replace(result, diagnostics=bad_symmetry_diag), atol=1e-8)
 
 
+def test_validate_qeq_result_wraps_zero_site_results():
+    result = solve_qeq(np.array([1.0]), np.array([[1.0]]))
+    zero_site = replace(
+        result,
+        charges=np.empty((0,)),
+        total_charge=np.asarray(0.0),
+        electronegativity=np.empty((0,)),
+        hardness_kernel=np.empty((0, 0)),
+        lagrange_multiplier=np.asarray(0.0),
+        stationarity=np.empty((0,)),
+    )
+
+    with pytest.raises(QEqOperatorError, match="at least one charge site"):
+        validate_qeq_result(zero_site, atol=1e-8)
+
+
 def test_invalid_shapes_fail_closed():
     with pytest.raises(QEqOperatorError, match="electronegativity"):
         solve_qeq(np.array(1.0), np.eye(1))

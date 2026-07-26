@@ -8,8 +8,8 @@ They do not preserve PyTorch autograd graphs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple
+from dataclasses import InitVar, asdict, dataclass, fields
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -87,6 +87,18 @@ class ConservationLedger:
 
 
 @dataclass(frozen=True)
+class FixedMuValidationContext:
+    """Non-serialized immutable H/S snapshots for fixed-mu validation."""
+
+    hamiltonian: np.ndarray
+    overlap: np.ndarray
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "hamiltonian", _readonly_array(self.hamiltonian))
+        object.__setattr__(self, "overlap", _readonly_array(self.overlap))
+
+
+@dataclass(frozen=True)
 class FixedMuResult:
     """Observable bundle for ``H, S`` evaluated at a fixed ``mu``.
 
@@ -114,16 +126,31 @@ class FixedMuResult:
     k_axis: Optional[int]
     min_overlap_eig: np.ndarray
     overlap_condition: np.ndarray
-    _hamiltonian: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
-    _overlap: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    normalize_k_weights: bool = True
+    eig_floor: float = 1e-10
+    max_condition: float = 1e12
+    hermitian_tol: float = 1e-8
+    validation_context: InitVar[Optional[FixedMuValidationContext]] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, validation_context: Optional[FixedMuValidationContext]) -> None:
+        if not isinstance(self.energies, EnergyLedger):
+            raise FixedMuOperatorError("energies must be an EnergyLedger")
+        if not isinstance(self.conservation, ConservationLedger):
+            raise FixedMuOperatorError("conservation must be a ConservationLedger")
         object.__setattr__(self, "mu", _as_float_scalar("mu", self.mu))
         object.__setattr__(self, "kT", _as_float_scalar("kT", self.kT, nonnegative=True))
         object.__setattr__(
             self,
             "spin_degeneracy",
             _as_float_scalar("spin_degeneracy", self.spin_degeneracy, positive=True),
+        )
+        object.__setattr__(self, "normalize_k_weights", bool(self.normalize_k_weights))
+        object.__setattr__(self, "eig_floor", _as_float_scalar("eig_floor", self.eig_floor, positive=True))
+        object.__setattr__(self, "max_condition", _as_float_scalar("max_condition", self.max_condition, positive=True))
+        object.__setattr__(
+            self,
+            "hermitian_tol",
+            _as_float_scalar("hermitian_tol", self.hermitian_tol, nonnegative=True),
         )
         for field_name in (
             "eigvals",
@@ -141,16 +168,27 @@ class FixedMuResult:
             "overlap_condition",
         ):
             object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
-        if self._hamiltonian is not None:
-            object.__setattr__(self, "_hamiltonian", _readonly_array(self._hamiltonian))
-        if self._overlap is not None:
-            object.__setattr__(self, "_overlap", _readonly_array(self._overlap))
+        if validation_context is not None and not isinstance(validation_context, FixedMuValidationContext):
+            raise FixedMuOperatorError("validation_context must be a FixedMuValidationContext")
+        object.__setattr__(self, "_validation_context", validation_context)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {field_info.name: getattr(self, field_info.name) for field_info in fields(self)}
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
+        self.__post_init__(None)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 def _readonly_array(value: ArrayLike, *, dtype: Any = None) -> np.ndarray:
-    arr = np.array(value, dtype=dtype, copy=True)
-    arr.setflags(write=False)
-    return arr
+    arr = np.array(value, dtype=dtype, copy=True, order="C")
+    immutable = np.frombuffer(arr.tobytes(order="C"), dtype=arr.dtype).reshape(arr.shape)
+    immutable.setflags(write=False)
+    return immutable
 
 
 def hermitian_part(x: ArrayLike) -> np.ndarray:
@@ -233,7 +271,10 @@ def _canonical_k_axis(k_axis: Optional[int], leading_ndim: int) -> Optional[int]
         return None
     if leading_ndim == 0:
         raise FixedMuOperatorError("k_axis is invalid for a single matrix with no leading k dimension")
-    axis = int(k_axis)
+    try:
+        axis = int(k_axis)
+    except (TypeError, ValueError) as exc:
+        raise FixedMuOperatorError(f"k_axis must be an integer, got {k_axis!r}") from exc
     if axis < 0:
         axis += leading_ndim
     if axis < 0 or axis >= leading_ndim:
@@ -298,6 +339,42 @@ def _prepare_weights(
         if np.any(total <= 0.0):
             raise FixedMuOperatorError("k_weights must have positive sum along k_axis")
         weights = weights / total
+    return weights
+
+
+def _validate_stored_weights(
+    leading_shape: Tuple[int, ...],
+    *,
+    k_weights: ArrayLike,
+    k_axis: Optional[int],
+    normalize_k_weights: bool,
+    atol: float,
+    rtol: float,
+) -> np.ndarray:
+    _reject_torch_tensor("k_weights", k_weights)
+    try:
+        weights = np.asarray(k_weights, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise FixedMuOperatorError("k_weights must be numeric") from exc
+    if not leading_shape:
+        if weights.shape not in [(), (1,)]:
+            raise FixedMuOperatorError("single-matrix stored k_weights must be scalar")
+        weights = np.asarray(float(weights.reshape(-1)[0]), dtype=np.float64)
+    elif weights.shape != leading_shape:
+        raise FixedMuOperatorError(
+            f"stored k_weights shape {weights.shape} must match leading H/S shape {leading_shape}"
+        )
+
+    if not np.isfinite(weights).all():
+        raise FixedMuOperatorError("k_weights must be finite")
+    if np.any(weights < 0.0):
+        raise FixedMuOperatorError("k_weights must be nonnegative")
+    if normalize_k_weights and k_axis is not None:
+        total = weights.sum(axis=k_axis, keepdims=True)
+        if np.any(total <= 0.0):
+            raise FixedMuOperatorError("k_weights must have positive sum along k_axis")
+        if not np.allclose(total, np.ones_like(total), atol=atol, rtol=rtol):
+            raise FixedMuOperatorError("normalized stored k_weights must sum to one along k_axis")
     return weights
 
 
@@ -592,8 +669,11 @@ def fixed_mu_observables(
         k_axis=k_axis_c,
         min_overlap_eig=bands.min_overlap_eig,
         overlap_condition=bands.overlap_condition,
-        _hamiltonian=h_arr,
-        _overlap=s_arr,
+        normalize_k_weights=normalize_k_weights,
+        eig_floor=eig_floor,
+        max_condition=max_condition,
+        hermitian_tol=hermitian_tol,
+        validation_context=FixedMuValidationContext(h_arr, s_arr),
     )
 
 
@@ -613,52 +693,89 @@ def _assert_recomputed_close(
         raise FixedMuOperatorError(f"fixed-mu stored {name} does not match recomputed value")
 
 
-def validate_conservation(result: FixedMuResult, *, atol: float = 1e-8, rtol: float = 1e-8) -> None:
+def validate_conservation(
+    result: FixedMuResult,
+    *,
+    h: Optional[ArrayLike] = None,
+    s: Optional[ArrayLike] = None,
+    atol: float = 1e-8,
+    rtol: float = 1e-8,
+) -> None:
     """Fail closed when density-matrix ledgers do not conserve N or band energy.
 
-    Validation recomputes the density aggregation, ``Tr(D S)``, ``Tr(D H)``,
-    residuals, and hermiticity from the current result arrays and the private
-    H/S snapshots carried by solver-produced results.  Externally constructed
-    results without those snapshots fail closed because their ledgers cannot be
-    checked against the Hamiltonian and overlap matrices.
+    Validation recomputes the k-axis/weight contract, H/S safety checks,
+    generalized-eigenpair residuals, density aggregation, ``Tr(D S)``,
+    ``Tr(D H)``, residuals, and hermiticity from the current result arrays and
+    either caller-supplied H/S arrays or the non-serialized private context
+    carried by solver-produced results.  Externally constructed or deserialized
+    results without H/S context must pass ``h=`` and ``s=`` explicitly.
     """
 
     if not isinstance(result, FixedMuResult):
         raise FixedMuOperatorError("result must be a FixedMuResult")
+    if not isinstance(result.energies, EnergyLedger):
+        raise FixedMuOperatorError("energies must be an EnergyLedger")
+    if not isinstance(result.conservation, ConservationLedger):
+        raise FixedMuOperatorError("conservation must be a ConservationLedger")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     rtol = _as_float_scalar("rtol", rtol, nonnegative=True)
-    h_arr = result._hamiltonian
-    s_arr = result._overlap
-    if h_arr is None or s_arr is None:
-        raise FixedMuOperatorError("FixedMuResult is missing H/S snapshots required for conservation validation")
+    if (h is None) != (s is None):
+        raise FixedMuOperatorError("validate_conservation requires both h and s, or neither")
+    if h is None and s is None:
+        context = getattr(result, "_validation_context", None)
+        if context is None:
+            raise FixedMuOperatorError(
+                "FixedMuResult is missing H/S context; pass h= and s= for conservation validation"
+            )
+        h = context.hamiltonian
+        s = context.overlap
+    h_arr, s_arr = _validate_matrix_stack(h, s, hermitian_tol=result.hermitian_tol)
+    min_overlap_eig, overlap_condition = _check_overlap(
+        s_arr,
+        eig_floor=result.eig_floor,
+        max_condition=result.max_condition,
+    )
+    leading_shape = h_arr.shape[:-2]
+    k_axis_c = _canonical_k_axis(result.k_axis, len(leading_shape))
+    weights = _validate_stored_weights(
+        leading_shape,
+        k_weights=result.k_weights,
+        k_axis=k_axis_c,
+        normalize_k_weights=result.normalize_k_weights,
+        atol=atol,
+        rtol=rtol,
+    )
 
     eigvals = np.asarray(result.eigvals)
     eigvecs = np.asarray(result.eigvecs)
     density_k = np.asarray(result.density_k)
-    weights = np.asarray(result.k_weights)
     try:
         f_base, response_base = _stable_fermi(eigvals, mu=result.mu, kT=result.kT)
         occupations = result.spin_degeneracy * f_base
         occupation_response = result.spin_degeneracy * response_base
+        s_orthonormal = np.swapaxes(eigvecs.conj(), -1, -2) @ s_arr @ eigvecs
+        identity = np.broadcast_to(np.eye(eigvecs.shape[-1], dtype=s_orthonormal.dtype), s_orthonormal.shape)
+        h_c = h_arr @ eigvecs
+        s_c_eps = (s_arr @ eigvecs) * eigvals[..., None, :]
         density_k_from_vectors = _density_from_vectors(eigvecs, occupations)
         density_response_k_from_vectors = _density_from_vectors(eigvecs, occupation_response)
         aggregated_density_from_vectors = _aggregate_matrix(
             density_k_from_vectors,
-            k_axis=result.k_axis,
+            k_axis=k_axis_c,
             weights=weights,
         )
         aggregated_density_response = _aggregate_matrix(
             density_response_k_from_vectors,
-            k_axis=result.k_axis,
+            k_axis=k_axis_c,
             weights=weights,
         )
         electron_count_from_occupations = _aggregate_matrix(
             weights * np.sum(occupations, axis=-1),
-            k_axis=result.k_axis,
+            k_axis=k_axis_c,
         )
         dos_like_response = _aggregate_matrix(
             weights * np.sum(occupation_response, axis=-1),
-            k_axis=result.k_axis,
+            k_axis=k_axis_c,
         )
         energy_ledger = _energy_ledger(
             eigvals,
@@ -667,16 +784,51 @@ def validate_conservation(result: FixedMuResult, *, atol: float = 1e-8, rtol: fl
             mu=result.mu,
             kT=result.kT,
             spin_degeneracy=result.spin_degeneracy,
-            k_axis=result.k_axis,
+            k_axis=k_axis_c,
         )
-        aggregated_density = _aggregate_matrix(density_k, k_axis=result.k_axis, weights=weights)
+        aggregated_density = _aggregate_matrix(density_k, k_axis=k_axis_c, weights=weights)
         ne_from_d_k = weights * _trace_last2(density_k @ s_arr)
         band_from_d_k = weights * _trace_last2(density_k @ h_arr)
-        ne_from_d = _aggregate_matrix(ne_from_d_k, k_axis=result.k_axis)
-        band_from_d = _aggregate_matrix(band_from_d_k, k_axis=result.k_axis)
-    except (TypeError, ValueError) as exc:
+        ne_from_d = _aggregate_matrix(ne_from_d_k, k_axis=k_axis_c)
+        band_from_d = _aggregate_matrix(band_from_d_k, k_axis=k_axis_c)
+    except (IndexError, TypeError, ValueError) as exc:
         raise FixedMuOperatorError("fixed-mu result arrays are not shape-compatible for conservation validation") from exc
 
+    _assert_recomputed_close(
+        "min_overlap_eig",
+        np.asarray(result.min_overlap_eig),
+        min_overlap_eig,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "overlap_condition",
+        np.asarray(result.overlap_condition),
+        overlap_condition,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "generalized S-orthonormality",
+        s_orthonormal,
+        identity,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "generalized eigen residual",
+        h_c,
+        s_c_eps,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "k_weights",
+        np.asarray(result.k_weights),
+        weights,
+        atol=atol,
+        rtol=rtol,
+    )
     _assert_recomputed_close(
         "occupations",
         np.asarray(result.occupations),
