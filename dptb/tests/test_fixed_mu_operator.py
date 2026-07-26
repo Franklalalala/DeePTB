@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -77,6 +79,75 @@ def test_density_and_energy_ledgers_conserve_nonorthogonal_hamiltonian():
     np.testing.assert_allclose(result.electron_count, 4.0, atol=1e-10)
     np.testing.assert_allclose(result.conservation.electron_count_residual, 0.0, atol=1e-10)
     np.testing.assert_allclose(result.conservation.band_energy_residual, 0.0, atol=1e-10)
+
+
+def test_fixed_mu_result_arrays_are_read_only_defensive_copies():
+    h = np.diag([-1.0, 1.0])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+
+    with pytest.raises(ValueError, match="read-only"):
+        result.density[0, 0] = 0.0
+    with pytest.raises(ValueError, match="read-only"):
+        result.energies.band_energy[...] = 0.0
+    with pytest.raises(ValueError, match="read-only"):
+        result.conservation.electron_count_residual[...] = 1.0
+    with pytest.raises(ValueError, match="read-only"):
+        result._hamiltonian[0, 0] = 0.0
+
+    density_alias = result.density.copy()
+    rebuilt = replace(result, density=density_alias)
+    density_alias[0, 0] += 10.0
+    np.testing.assert_allclose(rebuilt.density, result.density, atol=1e-12)
+
+
+def test_validate_conservation_recomputes_density_and_ledgers_from_hs_snapshots():
+    h = np.array([[-1.0, 0.05], [0.05, 0.6]], dtype=float)
+    s = np.array([[1.1, 0.02], [0.02, 0.9]], dtype=float)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+
+    bad_density = result.density.copy()
+    bad_density[0, 0] += 0.1
+    with pytest.raises(FixedMuOperatorError, match="density"):
+        validate_conservation(replace(result, density=bad_density), atol=1e-10)
+
+    with pytest.raises(FixedMuOperatorError, match="electron_count"):
+        validate_conservation(replace(result, electron_count=result.electron_count + 0.5), atol=1e-10)
+
+    bad_energies = replace(result.energies, band_energy=result.energies.band_energy + 0.5)
+    with pytest.raises(FixedMuOperatorError, match="energy band_energy"):
+        validate_conservation(replace(result, energies=bad_energies), atol=1e-10)
+
+    bad_conservation = replace(
+        result.conservation,
+        band_energy_from_density=result.conservation.band_energy_from_density + 0.5,
+    )
+    with pytest.raises(FixedMuOperatorError, match="conservation band_energy_from_density"):
+        validate_conservation(replace(result, conservation=bad_conservation), atol=1e-10)
+
+    with pytest.raises(FixedMuOperatorError, match="H/S snapshots"):
+        validate_conservation(replace(result, _hamiltonian=None, _overlap=None), atol=1e-10)
+
+
+def test_validate_conservation_recomputes_fixed_mu_occupations_and_energy_closures():
+    h = np.diag([-0.4, 0.1, 0.7])
+    s = np.eye(3)
+    result = fixed_mu_observables(h, s, mu=0.23, kT=0.15, spin_degeneracy=2.0)
+
+    bad_occ = result.occupations.copy()
+    bad_occ[0] += 0.1
+    with pytest.raises(FixedMuOperatorError, match="occupations"):
+        validate_conservation(replace(result, occupations=bad_occ), atol=1e-10)
+
+    bad_eigvals = result.eigvals.copy()
+    bad_eigvals[0] += 0.1
+    with pytest.raises(FixedMuOperatorError, match="occupations|energy"):
+        validate_conservation(replace(result, eigvals=bad_eigvals), atol=1e-10)
+
+    for field_name in ("entropy_term", "free_energy", "grand_energy"):
+        bad_energies = replace(result.energies, **{field_name: getattr(result.energies, field_name) + 0.25})
+        with pytest.raises(FixedMuOperatorError, match=f"energy {field_name}"):
+            validate_conservation(replace(result, energies=bad_energies), atol=1e-10)
 
 
 def test_finite_temperature_dos_and_density_response_match_finite_difference():
@@ -266,6 +337,15 @@ def test_invalid_inputs_fail_closed():
         fixed_mu_observables(np.eye(2), np.eye(2), mu=0.0, spin_degeneracy=0.0)
     with pytest.raises(FixedMuOperatorError, match="matrix size must be positive"):
         fixed_mu_observables(np.empty((0, 0)), np.empty((0, 0)), mu=0.0)
+
+
+def test_invalid_scalar_conversion_errors_are_fixed_mu_operator_errors():
+    h = np.eye(1)
+    s = np.eye(1)
+    with pytest.raises(FixedMuOperatorError, match="mu must be a scalar float"):
+        fixed_mu_observables(h, s, mu=object())
+    with pytest.raises(FixedMuOperatorError, match="kT must be a scalar float"):
+        fermi_dirac(np.array([0.0]), mu=0.0, kT=object())
 
 
 class _FakeTorchTensor:

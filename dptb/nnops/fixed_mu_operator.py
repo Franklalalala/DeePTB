@@ -8,7 +8,7 @@ They do not preserve PyTorch autograd graphs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -42,6 +42,10 @@ class GeneralizedBands:
     min_overlap_eig: np.ndarray
     overlap_condition: np.ndarray
 
+    def __post_init__(self) -> None:
+        for field_name in ("eigvals", "eigvecs", "min_overlap_eig", "overlap_condition"):
+            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+
 
 @dataclass(frozen=True)
 class EnergyLedger:
@@ -56,6 +60,10 @@ class EnergyLedger:
     free_energy: np.ndarray
     grand_energy: np.ndarray
 
+    def __post_init__(self) -> None:
+        for field_name in ("band_energy", "entropy_term", "free_energy", "grand_energy"):
+            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+
 
 @dataclass(frozen=True)
 class ConservationLedger:
@@ -67,10 +75,25 @@ class ConservationLedger:
     band_energy_residual: np.ndarray
     density_hermiticity_error: np.ndarray
 
+    def __post_init__(self) -> None:
+        for field_name in (
+            "electron_count_from_density",
+            "band_energy_from_density",
+            "electron_count_residual",
+            "band_energy_residual",
+            "density_hermiticity_error",
+        ):
+            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+
 
 @dataclass(frozen=True)
 class FixedMuResult:
-    """Observable bundle for ``H, S`` evaluated at a fixed ``mu``."""
+    """Observable bundle for ``H, S`` evaluated at a fixed ``mu``.
+
+    Array fields are defensive read-only copies.  Solver-produced results also
+    carry private read-only H/S snapshots so conservation validation can
+    recompute ``Tr(D S)`` and ``Tr(D H)`` instead of trusting cached ledgers.
+    """
 
     mu: float
     kT: float
@@ -91,6 +114,43 @@ class FixedMuResult:
     k_axis: Optional[int]
     min_overlap_eig: np.ndarray
     overlap_condition: np.ndarray
+    _hamiltonian: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    _overlap: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mu", _as_float_scalar("mu", self.mu))
+        object.__setattr__(self, "kT", _as_float_scalar("kT", self.kT, nonnegative=True))
+        object.__setattr__(
+            self,
+            "spin_degeneracy",
+            _as_float_scalar("spin_degeneracy", self.spin_degeneracy, positive=True),
+        )
+        for field_name in (
+            "eigvals",
+            "eigvecs",
+            "occupations",
+            "occupation_response",
+            "density_k",
+            "density_response_k",
+            "electron_count",
+            "dos_like_response",
+            "density",
+            "density_response",
+            "k_weights",
+            "min_overlap_eig",
+            "overlap_condition",
+        ):
+            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+        if self._hamiltonian is not None:
+            object.__setattr__(self, "_hamiltonian", _readonly_array(self._hamiltonian))
+        if self._overlap is not None:
+            object.__setattr__(self, "_overlap", _readonly_array(self._overlap))
+
+
+def _readonly_array(value: ArrayLike, *, dtype: Any = None) -> np.ndarray:
+    arr = np.array(value, dtype=dtype, copy=True)
+    arr.setflags(write=False)
+    return arr
 
 
 def hermitian_part(x: ArrayLike) -> np.ndarray:
@@ -118,7 +178,10 @@ def _reject_torch_tensor(name: str, x: Any) -> None:
 
 def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnegative: bool = False) -> float:
     _reject_torch_tensor(name, value)
-    out = float(value)
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise FixedMuOperatorError(f"{name} must be a scalar float, got {value!r}") from exc
     if not np.isfinite(out):
         raise FixedMuOperatorError(f"{name} must be finite, got {value!r}")
     if positive and out <= 0.0:
@@ -529,20 +592,236 @@ def fixed_mu_observables(
         k_axis=k_axis_c,
         min_overlap_eig=bands.min_overlap_eig,
         overlap_condition=bands.overlap_condition,
+        _hamiltonian=h_arr,
+        _overlap=s_arr,
     )
 
 
-def validate_conservation(result: FixedMuResult, *, atol: float = 1e-8, rtol: float = 1e-8) -> None:
-    """Fail closed when density-matrix ledgers do not conserve N or band energy."""
+def _assert_recomputed_close(
+    name: str,
+    stored: np.ndarray,
+    recomputed: np.ndarray,
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    if stored.shape != recomputed.shape:
+        raise FixedMuOperatorError(
+            f"fixed-mu stored {name} has shape {stored.shape}, recomputed {recomputed.shape}"
+        )
+    if not np.allclose(stored, recomputed, atol=atol, rtol=rtol):
+        raise FixedMuOperatorError(f"fixed-mu stored {name} does not match recomputed value")
 
+
+def validate_conservation(result: FixedMuResult, *, atol: float = 1e-8, rtol: float = 1e-8) -> None:
+    """Fail closed when density-matrix ledgers do not conserve N or band energy.
+
+    Validation recomputes the density aggregation, ``Tr(D S)``, ``Tr(D H)``,
+    residuals, and hermiticity from the current result arrays and the private
+    H/S snapshots carried by solver-produced results.  Externally constructed
+    results without those snapshots fail closed because their ledgers cannot be
+    checked against the Hamiltonian and overlap matrices.
+    """
+
+    if not isinstance(result, FixedMuResult):
+        raise FixedMuOperatorError("result must be a FixedMuResult")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     rtol = _as_float_scalar("rtol", rtol, nonnegative=True)
+    h_arr = result._hamiltonian
+    s_arr = result._overlap
+    if h_arr is None or s_arr is None:
+        raise FixedMuOperatorError("FixedMuResult is missing H/S snapshots required for conservation validation")
+
+    eigvals = np.asarray(result.eigvals)
+    eigvecs = np.asarray(result.eigvecs)
+    density_k = np.asarray(result.density_k)
+    weights = np.asarray(result.k_weights)
+    try:
+        f_base, response_base = _stable_fermi(eigvals, mu=result.mu, kT=result.kT)
+        occupations = result.spin_degeneracy * f_base
+        occupation_response = result.spin_degeneracy * response_base
+        density_k_from_vectors = _density_from_vectors(eigvecs, occupations)
+        density_response_k_from_vectors = _density_from_vectors(eigvecs, occupation_response)
+        aggregated_density_from_vectors = _aggregate_matrix(
+            density_k_from_vectors,
+            k_axis=result.k_axis,
+            weights=weights,
+        )
+        aggregated_density_response = _aggregate_matrix(
+            density_response_k_from_vectors,
+            k_axis=result.k_axis,
+            weights=weights,
+        )
+        electron_count_from_occupations = _aggregate_matrix(
+            weights * np.sum(occupations, axis=-1),
+            k_axis=result.k_axis,
+        )
+        dos_like_response = _aggregate_matrix(
+            weights * np.sum(occupation_response, axis=-1),
+            k_axis=result.k_axis,
+        )
+        energy_ledger = _energy_ledger(
+            eigvals,
+            f_base,
+            weights,
+            mu=result.mu,
+            kT=result.kT,
+            spin_degeneracy=result.spin_degeneracy,
+            k_axis=result.k_axis,
+        )
+        aggregated_density = _aggregate_matrix(density_k, k_axis=result.k_axis, weights=weights)
+        ne_from_d_k = weights * _trace_last2(density_k @ s_arr)
+        band_from_d_k = weights * _trace_last2(density_k @ h_arr)
+        ne_from_d = _aggregate_matrix(ne_from_d_k, k_axis=result.k_axis)
+        band_from_d = _aggregate_matrix(band_from_d_k, k_axis=result.k_axis)
+    except (TypeError, ValueError) as exc:
+        raise FixedMuOperatorError("fixed-mu result arrays are not shape-compatible for conservation validation") from exc
+
+    _assert_recomputed_close(
+        "occupations",
+        np.asarray(result.occupations),
+        occupations,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "occupation_response",
+        np.asarray(result.occupation_response),
+        occupation_response,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "density_k",
+        density_k,
+        density_k_from_vectors,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "density_response_k",
+        np.asarray(result.density_response_k),
+        density_response_k_from_vectors,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "electron_count",
+        np.asarray(result.electron_count),
+        electron_count_from_occupations,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "dos_like_response",
+        np.asarray(result.dos_like_response),
+        dos_like_response,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "density_response",
+        np.asarray(result.density_response),
+        aggregated_density_response,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "energy band_energy",
+        np.asarray(result.energies.band_energy),
+        energy_ledger.band_energy,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "energy entropy_term",
+        np.asarray(result.energies.entropy_term),
+        energy_ledger.entropy_term,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "energy free_energy",
+        np.asarray(result.energies.free_energy),
+        energy_ledger.free_energy,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "energy grand_energy",
+        np.asarray(result.energies.grand_energy),
+        energy_ledger.grand_energy,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "energy free_energy closure",
+        np.asarray(result.energies.free_energy),
+        np.asarray(result.energies.band_energy) + np.asarray(result.energies.entropy_term),
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "energy grand_energy closure",
+        np.asarray(result.energies.grand_energy),
+        np.asarray(result.energies.free_energy) - result.mu * np.asarray(result.electron_count),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    electron_residual = ne_from_d - result.electron_count
+    band_residual = band_from_d - result.energies.band_energy
+    density_hermiticity_error = _density_hermiticity_error(result.density)
+
+    _assert_recomputed_close(
+        "density",
+        np.asarray(result.density),
+        aggregated_density,
+        atol=atol,
+        rtol=rtol,
+    )
     cons = result.conservation
-    if not np.allclose(cons.electron_count_from_density, result.electron_count, atol=atol, rtol=rtol):
+    _assert_recomputed_close(
+        "conservation electron_count_from_density",
+        np.asarray(cons.electron_count_from_density),
+        ne_from_d,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "conservation band_energy_from_density",
+        np.asarray(cons.band_energy_from_density),
+        band_from_d,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "conservation electron_count_residual",
+        np.asarray(cons.electron_count_residual),
+        electron_residual,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "conservation band_energy_residual",
+        np.asarray(cons.band_energy_residual),
+        band_residual,
+        atol=atol,
+        rtol=rtol,
+    )
+    _assert_recomputed_close(
+        "conservation density_hermiticity_error",
+        np.asarray(cons.density_hermiticity_error),
+        density_hermiticity_error,
+        atol=atol,
+        rtol=rtol,
+    )
+
+    if not np.allclose(ne_from_d, result.electron_count, atol=atol, rtol=rtol):
         raise FixedMuOperatorError("Tr(D S) does not match N(mu)")
-    if not np.allclose(cons.band_energy_from_density, result.energies.band_energy, atol=atol, rtol=rtol):
+    if not np.allclose(band_from_d, result.energies.band_energy, atol=atol, rtol=rtol):
         raise FixedMuOperatorError("Tr(D H) does not match the band-energy ledger")
-    if np.any(cons.density_hermiticity_error > atol + rtol):
+    if np.any(density_hermiticity_error > atol + rtol):
         raise FixedMuOperatorError("D(mu) is not Hermitian within tolerance")
 
 

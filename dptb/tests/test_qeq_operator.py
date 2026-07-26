@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -180,8 +182,63 @@ def test_validate_qeq_result_fails_for_mutated_result():
         units=result.units,
     )
 
-    with pytest.raises(QEqOperatorError, match="sum"):
+    with pytest.raises(QEqOperatorError, match="diagnostic charge_residual"):
         validate_qeq_result(bad, atol=1e-8)
+
+
+def test_qeq_result_arrays_are_read_only_defensive_copies():
+    result = solve_qeq(np.array([1.0, 3.0]), np.array([[5.0, 1.0], [1.0, 7.0]]))
+
+    with pytest.raises(ValueError, match="read-only"):
+        result.charges[0] = 1.0
+    with pytest.raises(ValueError, match="read-only"):
+        result.diagnostics.charge_residual[...] = 1.0
+
+    charges_alias = result.charges.copy()
+    rebuilt = replace(result, charges=charges_alias)
+    charges_alias[0] += 10.0
+    np.testing.assert_allclose(rebuilt.charges, result.charges, atol=1e-12)
+
+    diag_alias = result.diagnostics.stationarity_max_abs.copy()
+    rebuilt_diag = replace(result.diagnostics, stationarity_max_abs=diag_alias)
+    diag_alias[...] = 10.0
+    np.testing.assert_allclose(rebuilt_diag.stationarity_max_abs, result.diagnostics.stationarity_max_abs, atol=1e-12)
+
+
+def test_validate_qeq_result_recomputes_current_arrays_not_stale_cache():
+    result = solve_qeq(np.array([1.0, 3.0]), np.array([[5.0, 1.0], [1.0, 7.0]]))
+
+    bad_charges = result.charges.copy()
+    bad_charges[0] += 0.1
+    with pytest.raises(QEqOperatorError):
+        validate_qeq_result(replace(result, charges=bad_charges), atol=1e-8)
+
+    bad_energy = result.energy + 1.0
+    with pytest.raises(QEqOperatorError, match="stored energy"):
+        validate_qeq_result(replace(result, energy=bad_energy), atol=1e-8)
+
+    bad_multiplier = result.lagrange_multiplier + 0.25
+    with pytest.raises(QEqOperatorError, match="stationarity"):
+        validate_qeq_result(replace(result, lagrange_multiplier=bad_multiplier), atol=1e-8)
+
+    bad_kernel = result.hardness_kernel.copy()
+    bad_kernel[0, 0] += 0.25
+    with pytest.raises(QEqOperatorError):
+        validate_qeq_result(replace(result, hardness_kernel=bad_kernel), atol=1e-8)
+
+    bad_diag = replace(
+        result.diagnostics,
+        stationarity_max_abs=result.diagnostics.stationarity_max_abs + 1.0,
+    )
+    with pytest.raises(QEqOperatorError, match="diagnostic stationarity_max_abs"):
+        validate_qeq_result(replace(result, diagnostics=bad_diag), atol=1e-8)
+
+    bad_symmetry_diag = replace(
+        result.diagnostics,
+        kernel_symmetry_error=result.diagnostics.kernel_symmetry_error + 1.0,
+    )
+    with pytest.raises(QEqOperatorError, match="diagnostic kernel_symmetry_error"):
+        validate_qeq_result(replace(result, diagnostics=bad_symmetry_diag), atol=1e-8)
 
 
 def test_invalid_shapes_fail_closed():

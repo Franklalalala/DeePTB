@@ -68,10 +68,28 @@ class QEqDiagnostics:
     constrained_condition: np.ndarray
     kkt_condition: np.ndarray
 
+    def __post_init__(self) -> None:
+        for field_name in (
+            "charge_residual",
+            "stationarity_max_abs",
+            "stationarity_l2",
+            "energy_identity_residual",
+            "kernel_symmetry_error",
+            "constrained_min_eig",
+            "constrained_max_eig",
+            "constrained_condition",
+            "kkt_condition",
+        ):
+            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name), dtype=np.float64))
+
 
 @dataclass(frozen=True)
 class QEqResult:
-    """Observable bundle for the dense constrained QEq solve."""
+    """Observable bundle for the dense constrained QEq solve.
+
+    Array fields are defensive read-only copies.  This prevents in-place alias
+    mutations from making cached diagnostics disagree with the physical fields.
+    """
 
     charges: np.ndarray
     total_charge: np.ndarray
@@ -85,6 +103,27 @@ class QEqResult:
     energy_identity: np.ndarray
     diagnostics: QEqDiagnostics
     units: QEqUnits
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "charges",
+            "total_charge",
+            "electronegativity",
+            "hardness_kernel",
+            "lagrange_multiplier",
+            "stationarity",
+            "energy",
+            "linear_energy",
+            "quadratic_energy",
+            "energy_identity",
+        ):
+            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name), dtype=np.float64))
+
+
+def _readonly_array(value: ArrayLike, *, dtype: Any = None) -> np.ndarray:
+    arr = np.array(value, dtype=dtype, copy=True)
+    arr.setflags(write=False)
+    return arr
 
 
 def _looks_like_torch_tensor(x: Any) -> bool:
@@ -191,13 +230,14 @@ def _validate_qeq_inputs(
 
     symmetry_tol = _as_float_scalar("symmetry_tol", symmetry_tol, nonnegative=True)
     asym = kernel - np.swapaxes(kernel, -1, -2)
-    symmetry_error = np.max(np.abs(asym), axis=(-1, -2))
-    if np.any(symmetry_error > symmetry_tol):
+    raw_symmetry_error = np.max(np.abs(asym), axis=(-1, -2))
+    if np.any(raw_symmetry_error > symmetry_tol):
         raise QEqOperatorError(
             f"hardness_kernel must be symmetric within symmetry_tol={symmetry_tol:g}; "
-            f"max asymmetry={float(np.max(symmetry_error)):.6g}"
+            f"max asymmetry={float(np.max(raw_symmetry_error)):.6g}"
         )
     kernel = 0.5 * (kernel + np.swapaxes(kernel, -1, -2))
+    symmetry_error = np.max(np.abs(kernel - np.swapaxes(kernel, -1, -2)), axis=(-1, -2))
     qtot = _prepare_total_charge(total_charge, leading_shape)
     return chi, kernel, qtot, symmetry_error
 
@@ -254,6 +294,51 @@ def _constrained_kernel_diagnostics(
             f"max={float(np.max(cond_arr)):.6g}"
         )
     return min_arr, max_arr, cond_arr
+
+
+def _recompute_constrained_kernel_diagnostics(kernel: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    leading_shape = kernel.shape[:-2]
+    n = kernel.shape[-1]
+    if n == 1:
+        return (
+            np.full(leading_shape, np.inf, dtype=np.float64),
+            np.zeros(leading_shape, dtype=np.float64),
+            np.ones(leading_shape, dtype=np.float64),
+        )
+
+    basis = _sum_zero_basis(n)
+    flat_kernel = kernel.reshape((-1, n, n))
+    min_eigs = []
+    max_eigs = []
+    conds = []
+    for kernel_one in flat_kernel:
+        tangent_kernel = basis.T @ kernel_one @ basis
+        eigvals = np.linalg.eigvalsh(tangent_kernel)
+        min_eig = float(eigvals[0])
+        max_eig = float(eigvals[-1])
+        cond = max_eig / min_eig if min_eig > 0.0 else np.inf
+        min_eigs.append(min_eig)
+        max_eigs.append(max_eig)
+        conds.append(cond)
+    return (
+        np.asarray(min_eigs, dtype=np.float64).reshape(leading_shape),
+        np.asarray(max_eigs, dtype=np.float64).reshape(leading_shape),
+        np.asarray(conds, dtype=np.float64).reshape(leading_shape),
+    )
+
+
+def _recompute_kkt_condition(kernel: np.ndarray) -> np.ndarray:
+    leading_shape = kernel.shape[:-2]
+    n = kernel.shape[-1]
+    flat_kernel = kernel.reshape((-1, n, n))
+    conditions = []
+    for kernel_one in flat_kernel:
+        kkt = np.zeros((n + 1, n + 1), dtype=np.float64)
+        kkt[:n, :n] = kernel_one
+        kkt[:n, n] = 1.0
+        kkt[n, :n] = 1.0
+        conditions.append(float(np.linalg.cond(kkt)))
+    return np.asarray(conditions, dtype=np.float64).reshape(leading_shape)
 
 
 def _solve_kkt(
@@ -406,16 +491,164 @@ def solve_qeq(
     return result
 
 
+def _require_result_array(name: str, value: ArrayLike, *, finite: bool = True) -> np.ndarray:
+    arr = np.asarray(value)
+    if not np.issubdtype(arr.dtype, np.number):
+        raise QEqOperatorError(f"QEq {name} must be numeric")
+    if np.iscomplexobj(arr):
+        raise QEqOperatorError(f"QEq {name} must be real")
+    arr = np.asarray(arr, dtype=np.float64)
+    if finite and not np.isfinite(arr).all():
+        raise QEqOperatorError(f"QEq {name} must contain only finite values")
+    return arr
+
+
+def _require_same_shape(name: str, actual: np.ndarray, expected_shape: Tuple[int, ...]) -> None:
+    if actual.shape != expected_shape:
+        raise QEqOperatorError(f"QEq {name} has shape {actual.shape}, expected {expected_shape}")
+
+
+def _assert_recomputed_close(name: str, stored: np.ndarray, recomputed: np.ndarray, *, atol: float) -> None:
+    if stored.shape != recomputed.shape:
+        raise QEqOperatorError(f"QEq stored {name} has shape {stored.shape}, recomputed {recomputed.shape}")
+    if not np.allclose(stored, recomputed, atol=atol, rtol=0.0):
+        raise QEqOperatorError(f"QEq stored {name} does not match recomputed value")
+
+
 def validate_qeq_result(result: QEqResult, *, atol: float = 1e-8) -> None:
-    """Fail closed when a QEq solve violates its contract beyond ``atol``."""
+    """Fail closed when a QEq result violates its recomputed contract.
+
+    Validation recomputes charge conservation, KKT stationarity, energy pieces,
+    the constrained-kernel spectrum, and KKT conditioning from the current
+    result arrays.  Stored result fields and diagnostics must agree with those
+    recomputed quantities; cached residuals alone are never trusted.
+    """
 
     if not isinstance(result, QEqResult):
         raise QEqOperatorError("result must be a QEqResult")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
+    if not isinstance(result.diagnostics, QEqDiagnostics):
+        raise QEqOperatorError("QEq diagnostics must be a QEqDiagnostics instance")
+    if not isinstance(result.units, QEqUnits):
+        raise QEqOperatorError("QEq units must be a QEqUnits instance")
+
+    charges = _require_result_array("charges", result.charges)
+    qtot = _require_result_array("total_charge", result.total_charge)
+    chi = _require_result_array("electronegativity", result.electronegativity)
+    kernel = _require_result_array("hardness_kernel", result.hardness_kernel)
+    multiplier = _require_result_array("lagrange_multiplier", result.lagrange_multiplier)
+
+    if charges.ndim < 1:
+        raise QEqOperatorError(f"QEq charges must have shape [..., natom], got {charges.shape}")
+    n = charges.shape[-1]
+    leading_shape = charges.shape[:-1]
+    _require_same_shape("total_charge", qtot, leading_shape)
+    _require_same_shape("electronegativity", chi, leading_shape + (n,))
+    _require_same_shape("hardness_kernel", kernel, leading_shape + (n, n))
+    _require_same_shape("lagrange_multiplier", multiplier, leading_shape)
+
+    asym = kernel - np.swapaxes(kernel, -1, -2)
+    symmetry_error = np.max(np.abs(asym), axis=(-1, -2))
+    if np.any(symmetry_error > atol):
+        raise QEqOperatorError("QEq hardness_kernel is not symmetric within tolerance")
+
+    charge_residual = np.sum(charges, axis=-1) - qtot
+    stationarity = chi + np.einsum("...ij,...j->...i", kernel, charges, optimize=True) + multiplier[..., None]
+    stationarity_max_abs = np.max(np.abs(stationarity), axis=-1)
+    stationarity_l2 = np.linalg.norm(stationarity, axis=-1)
+    energy, linear_energy, quadratic_energy, energy_identity = _qeq_energies(
+        chi,
+        kernel,
+        charges,
+        qtot,
+        multiplier,
+    )
+    energy_identity_residual = energy - energy_identity
+    constrained_min_eig, constrained_max_eig, constrained_condition = _recompute_constrained_kernel_diagnostics(kernel)
+    if n > 1 and np.any(constrained_min_eig <= 0.0):
+        raise QEqKernelConditionError("QEq hardness_kernel is not positive definite on the fixed-charge subspace")
+    kkt_condition = _recompute_kkt_condition(kernel)
+
+    _assert_recomputed_close("stationarity", _require_result_array("stationarity", result.stationarity), stationarity, atol=atol)
+    _assert_recomputed_close("energy", _require_result_array("energy", result.energy), energy, atol=atol)
+    _assert_recomputed_close(
+        "linear_energy",
+        _require_result_array("linear_energy", result.linear_energy),
+        linear_energy,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "quadratic_energy",
+        _require_result_array("quadratic_energy", result.quadratic_energy),
+        quadratic_energy,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "energy_identity",
+        _require_result_array("energy_identity", result.energy_identity),
+        energy_identity,
+        atol=atol,
+    )
+
     diagnostics = result.diagnostics
-    if np.any(np.abs(diagnostics.charge_residual) > atol):
+    _assert_recomputed_close(
+        "diagnostic charge_residual",
+        _require_result_array("diagnostics.charge_residual", diagnostics.charge_residual),
+        charge_residual,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic stationarity_max_abs",
+        _require_result_array("diagnostics.stationarity_max_abs", diagnostics.stationarity_max_abs),
+        stationarity_max_abs,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic stationarity_l2",
+        _require_result_array("diagnostics.stationarity_l2", diagnostics.stationarity_l2),
+        stationarity_l2,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic energy_identity_residual",
+        _require_result_array("diagnostics.energy_identity_residual", diagnostics.energy_identity_residual),
+        energy_identity_residual,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic kernel_symmetry_error",
+        _require_result_array("diagnostics.kernel_symmetry_error", diagnostics.kernel_symmetry_error),
+        symmetry_error,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic constrained_min_eig",
+        _require_result_array("diagnostics.constrained_min_eig", diagnostics.constrained_min_eig, finite=False),
+        constrained_min_eig,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic constrained_max_eig",
+        _require_result_array("diagnostics.constrained_max_eig", diagnostics.constrained_max_eig),
+        constrained_max_eig,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic constrained_condition",
+        _require_result_array("diagnostics.constrained_condition", diagnostics.constrained_condition),
+        constrained_condition,
+        atol=atol,
+    )
+    _assert_recomputed_close(
+        "diagnostic kkt_condition",
+        _require_result_array("diagnostics.kkt_condition", diagnostics.kkt_condition),
+        kkt_condition,
+        atol=max(atol, 1e-10),
+    )
+
+    if np.any(np.abs(charge_residual) > atol):
         raise QEqOperatorError("QEq charges do not satisfy sum(q) = total_charge")
-    if np.any(diagnostics.stationarity_max_abs > atol):
+    if np.any(stationarity_max_abs > atol):
         raise QEqOperatorError("QEq KKT stationarity residual exceeds tolerance")
-    if np.any(np.abs(diagnostics.energy_identity_residual) > atol):
+    if np.any(np.abs(energy_identity_residual) > atol):
         raise QEqOperatorError("QEq energy identity residual exceeds tolerance")

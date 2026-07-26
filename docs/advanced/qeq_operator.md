@@ -32,3 +32,28 @@ singular, ill-conditioned, or non-convex constrained kernels. Returned
 diagnostics include the fixed-charge residual, KKT stationarity residual,
 energy-identity residual, constrained-kernel eigenvalues, constrained condition
 number, and KKT condition number.
+
+## Validator Semantics
+
+QEq and fixed-mu result dataclasses own defensive read-only copies of their
+array fields.  A frozen dataclass alone does not protect nested NumPy arrays, so
+in-place mutation of returned arrays is intentionally rejected.
+
+`validate_qeq_result` does not trust cached diagnostics.  It recomputes charge
+conservation, KKT stationarity, total/linear/quadratic/identity energies,
+constrained-kernel diagnostics, and KKT conditioning from the current
+`QEqResult` arrays, then compares those recomputed values against the stored
+fields and diagnostics before applying the physical residual tolerances.
+
+`validate_conservation` for fixed-mu results is intentionally separate from
+QEq.  Solver-produced `FixedMuResult` objects carry private read-only
+Hamiltonian and overlap snapshots so the validator can recompute density
+aggregation, Fermi occupations from eigenvalues, all band/entropy/free/grand
+energy ledger terms, `free_energy = band_energy + entropy_term`,
+`grand_energy = free_energy - mu * N`, `Tr(D S)`, `Tr(D H)`, residual ledgers,
+and density hermiticity from the current fixed-mu arrays.  These checks are
+deliberately dense-reference checks over the returned arrays and snapshots; the
+validator is for fail-closed postprocess validation, not a cheap training-loop
+assertion.  Externally constructed fixed-mu results that lack those snapshots
+fail closed because their ledgers cannot be checked against the original H/S
+matrices.
