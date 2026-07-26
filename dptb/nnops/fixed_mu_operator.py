@@ -117,6 +117,7 @@ def _reject_torch_tensor(name: str, x: Any) -> None:
 
 
 def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnegative: bool = False) -> float:
+    _reject_torch_tensor(name, value)
     out = float(value)
     if not np.isfinite(out):
         raise FixedMuOperatorError(f"{name} must be finite, got {value!r}")
@@ -198,8 +199,14 @@ def _prepare_weights(
     if k_weights is None:
         weights = np.ones(leading_shape, dtype=np.float64)
     else:
+        _reject_torch_tensor("k_weights", k_weights)
         raw = np.asarray(k_weights, dtype=np.float64)
-        if k_axis is not None and raw.ndim == 1 and raw.shape[0] == leading_shape[k_axis]:
+        if k_axis is not None and raw.ndim == 1:
+            if raw.shape[0] != leading_shape[k_axis]:
+                raise FixedMuOperatorError(
+                    f"1D k_weights length must equal leading_shape[k_axis]="
+                    f"{leading_shape[k_axis]}, got {raw.shape[0]}"
+                )
             shape = [1] * len(leading_shape)
             shape[k_axis] = raw.shape[0]
             raw = raw.reshape(shape)
@@ -330,6 +337,7 @@ def fermi_dirac(
     mu = _as_float_scalar("mu", mu)
     kT = _as_float_scalar("kT", kT, nonnegative=True)
     spin_degeneracy = _as_float_scalar("spin_degeneracy", spin_degeneracy, positive=True)
+    _reject_torch_tensor("energies", energies)
     eps = np.asarray(energies, dtype=np.float64)
     if not np.isfinite(eps).all():
         raise FixedMuOperatorError("energies must be finite")
@@ -547,4 +555,10 @@ def fixed_mu_observables_from_torch(h: Any, s: Any, *, detach: bool = False, **k
             raise FixedMuOperatorError(f"{name} must be a torch Tensor-like object for this wrapper")
     h_np = h.detach().cpu().numpy()
     s_np = s.detach().cpu().numpy()
-    return fixed_mu_observables(h_np, s_np, **kwargs)
+    converted_kwargs = {}
+    for key, value in kwargs.items():
+        if _looks_like_torch_tensor(value):
+            converted_kwargs[key] = value.detach().cpu().numpy()
+        else:
+            converted_kwargs[key] = value
+    return fixed_mu_observables(h_np, s_np, **converted_kwargs)

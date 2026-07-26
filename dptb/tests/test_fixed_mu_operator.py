@@ -130,6 +130,20 @@ def test_batch_kpoint_weights_aggregate_only_over_requested_k_axis():
     validate_conservation(result, atol=1e-12)
 
 
+def test_raw_1d_k_weights_must_match_requested_k_axis_length():
+    h = np.zeros((3, 2, 2, 2), dtype=float)
+    h[..., 0, 0] = -1.0
+    h[..., 1, 1] = 1.0
+    s = np.broadcast_to(np.eye(2), h.shape).copy()
+    with pytest.raises(FixedMuOperatorError, match="1D k_weights length"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=np.array([0.4, 0.6]), k_axis=0)
+
+    full_shape_weights = np.array([[1.0, 2.0], [2.0, 1.0], [1.0, 1.0]])
+    result = fixed_mu_observables(h, s, mu=0.0, k_weights=full_shape_weights, k_axis=0)
+    np.testing.assert_allclose(result.k_weights.sum(axis=0), np.ones(2))
+    np.testing.assert_allclose(result.electron_count, np.array([2.0, 2.0]))
+
+
 def test_density_k_and_response_k_are_raw_per_k_not_weighted():
     h = np.array(
         [
@@ -268,4 +282,25 @@ def test_torch_like_inputs_are_rejected_without_silent_detach():
     with pytest.raises(FixedMuOperatorError, match="detach=True"):
         fixed_mu_observables_from_torch(h, s, mu=0.0)
     result = fixed_mu_observables_from_torch(h, s, detach=True, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+    np.testing.assert_allclose(result.electron_count, 2.0)
+
+
+def test_torch_like_weights_and_energies_do_not_silently_convert():
+    h = np.stack([np.diag([-1.0, 1.0]), np.diag([-0.5, 0.5])])
+    s = np.broadcast_to(np.eye(2), h.shape).copy()
+    weights = _FakeTorchTensor(np.array([0.25, 0.75]))
+    with pytest.raises(FixedMuOperatorError, match="k_weights looks like a torch Tensor"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=weights, k_axis=0)
+    with pytest.raises(FixedMuOperatorError, match="energies looks like a torch Tensor"):
+        fermi_dirac(_FakeTorchTensor(np.array([-1.0, 1.0])), mu=0.0, kT=0.1)
+
+    result = fixed_mu_observables_from_torch(
+        _FakeTorchTensor(h),
+        _FakeTorchTensor(s),
+        detach=True,
+        mu=0.0,
+        k_weights=weights,
+        k_axis=0,
+    )
+    np.testing.assert_allclose(result.k_weights, np.array([0.25, 0.75]))
     np.testing.assert_allclose(result.electron_count, 2.0)
