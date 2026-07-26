@@ -14,7 +14,7 @@ import torch
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.transforms_upper_triangle import OrbitalMapper
-from dptb.nn.sktb.onsiteDB import onsite_energy_database
+from dptb.nnops.onsite_database import onsite_energy_database
 from dptb.nnops import prior_calibration, prior_physical
 from dptb.nnops.flow import HamiltonianCFM
 from dptb.utils.argcheck import flow_options
@@ -373,7 +373,7 @@ def test_split_prior_rejects_one_sided_and_nonphysical_names():
         )
 
 
-def test_argcheck_accepts_new_keys_and_defaults_are_inert():
+def test_argcheck_accepts_canonical_new_keys_and_defaults_are_inert():
     schema = flow_options()
     value = schema.normalize_value(
         {
@@ -383,7 +383,6 @@ def test_argcheck_accepts_new_keys_and_defaults_are_inert():
             "huckel_scale_mode": "pair_block",
             "huckel_scale_global": 0.5,
             "huckel_edge_channel_scale": "1.0",
-            "overlap_huckel_edge_channel_scale": [1.0],
             "prior_calibration": "/tmp/calib.pt",
             "basis_onsite_mode": "calibrated",
             "prior_node": "basis_onsite",
@@ -393,7 +392,6 @@ def test_argcheck_accepts_new_keys_and_defaults_are_inert():
     schema.check_value(value, strict=True)
     assert value["huckel_energy_mode"] == "orbital_pair"
     assert value["huckel_edge_channel_scale"] == "1.0"
-    assert value["overlap_huckel_edge_channel_scale"] == [1.0]
     assert value["prior_edge"] == "external"
 
     defaults = schema.normalize_value({"enabled": False})

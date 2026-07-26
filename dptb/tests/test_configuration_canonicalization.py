@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from dargs.dargs import ArgumentKeyError
 
 from dptb.configuration import (
     canonicalize_embedding_options,
@@ -48,7 +49,6 @@ def test_flow_aliases_survive_schema_defaults_and_reach_runtime():
             "overlap_huckel_k": 9.0,
             "overlap_huckel_edge_channel_scale": [2.0],
             "prior_jitter_sigma": 0.25,
-            "dftb_skdata": "sentinel-skdata",
         }
     )
 
@@ -56,7 +56,6 @@ def test_flow_aliases_survive_schema_defaults_and_reach_runtime():
     assert "prior_jitter_sigma" not in normalized
     assert normalized["huckel_k"] == pytest.approx(9.0)
     assert normalized["physical_prior_jitter_sigma"] == pytest.approx(0.25)
-    assert normalized["prior_skdata"] == "sentinel-skdata"
     family = flow._families[OverlapHuckelFamily]
     assert family.huckel_k == pytest.approx(9.0)
     assert family.huckel_edge_channel_scale == [2.0]
@@ -89,7 +88,6 @@ def test_alias_conflict_is_strict_even_when_canonical_equals_old_default():
             None,
             [2.0],
         ),
-        ("prior_skdata", "dftb_skdata", "", "sentinel-skdata"),
         (
             "physical_prior_jitter_sigma",
             "prior_jitter_sigma",
@@ -789,19 +787,23 @@ def test_emit_alias_warnings_is_one_per_legacy_key():
 def test_legacy_flow_aliases_resolve_and_warn_once_per_key():
     with pytest.warns(FutureWarning) as record:
         out = canonicalize_flow_options(
-            {"overlap_huckel_k": 9.0, "dftb_skdata": "sentinel"},
+            {"overlap_huckel_k": 9.0},
             warn_deprecated=True,
         )
     assert out["huckel_k"] == pytest.approx(9.0)
-    assert out["prior_skdata"] == "sentinel"
     assert "overlap_huckel_k" not in out
-    assert "dftb_skdata" not in out
 
     messages = [str(w.message) for w in record if w.category is FutureWarning]
     assert sum("'overlap_huckel_k'" in m for m in messages) == 1
-    assert sum("'dftb_skdata'" in m for m in messages) == 1
     # Each deprecation names the removal version.
     assert all("2.3" in m for m in messages)
+
+
+def test_retired_dftb_skdata_is_rejected_by_strict_schema():
+    with pytest.raises(ArgumentKeyError, match="dftb_skdata"):
+        _schema_then_runtime(
+            {"enabled": True, "dftb_skdata": "retired-skdata"}
+        )
 
 
 def test_endpoint_truth_table_alias_warns_once_per_key():

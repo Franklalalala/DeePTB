@@ -1,4 +1,20 @@
 import pytest
+import shutil
+
+
+def _require_cuda_extension_toolchain():
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None or shutil.which("ninja") is None:
+        pytest.skip("SO2 CUDA extension tests require nvcc and ninja")
+
+
+def _require_so2_cuda_ops():
+    pytest.importorskip(
+        "so2_cuda_ops",
+        reason="install the optional DeePTB so2 extra for this CUDA backend",
+    )
+    _require_cuda_extension_toolchain()
 
 
 class _FakeCudaInput:
@@ -13,6 +29,7 @@ def test_non_moe_so2_indexed_sandwich_multi_matches_standard_forward_backward():
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE SO2 indexed_sandwich_multi backend requires CUDA")
+    _require_cuda_extension_toolchain()
 
     from dptb.nn.tensor_product import SO2_Linear
 
@@ -172,6 +189,7 @@ def test_non_moe_so2_scheduler_single_route_layout_without_graph_index():
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("SO2 CUDA scheduler layout helper requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.so2_cuda_scheduler import prepare_so2_single_route_layout
 
@@ -250,6 +268,7 @@ def test_non_moe_so2_indexed_sandwich_cuda_matches_standard_forward_backward(
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE SO2 indexed_sandwich_cuda backends require CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.tensor_product import SO2_Linear
 
@@ -354,6 +373,7 @@ def test_non_moe_so2_indexed_sandwich_cuda_multi_block_complex_matches_standard(
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE SO2 block-complex CUDA backend requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.tensor_product import SO2_Linear
 
@@ -403,6 +423,7 @@ def test_non_moe_so2_indexed_sandwich_scheduled_matches_standard_forward_backwar
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE scheduled SO2 sandwich backend requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.tensor_product import SO2_Linear
 
@@ -452,6 +473,7 @@ def test_non_moe_so2_indexed_sandwich_materialized_matches_standard_forward_back
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE materialized SO2 sandwich backend requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.tensor_product import SO2_Linear
 
@@ -500,6 +522,7 @@ def test_non_moe_so2_indexed_sandwich_materialized_scheduled_matches_standard_fo
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE materialized scheduled SO2 backend requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.tensor_product import SO2_Linear
 
@@ -561,6 +584,7 @@ def test_non_moe_so2_materialized_scheduled_block_dense_strategy_matches_standar
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("non-MoE materialized scheduled SO2 backend requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.tensor_product import SO2_Linear
 

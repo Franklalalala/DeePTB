@@ -659,7 +659,7 @@ def validate_block_ode_contract(data):
     expected_residual_from_full_h = residual_spatial_mode
     for split, split_options in configured_splits.items():
         path = f"data_options.{split}"
-        dataset_type = str(split_options.get("type", "DefaultDataset"))
+        dataset_type = str(split_options.get("type", "LMDBDataset"))
         if dataset_type != "LMDBDataset":
             raise ValueError(
                 f"{path}.type must be 'LMDBDataset' for block_ode; "

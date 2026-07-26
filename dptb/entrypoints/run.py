@@ -1,6 +1,5 @@
 import os
 import logging
-import json
 from typing import Optional
 from pathlib import Path
 from dptb.nn.build import build_model
@@ -56,15 +55,11 @@ def run(
         jdata = normalize_run(jdata)  
     else:
         assert run_opt["structure"] is not None, "Please provide a structure file or a json file."
-        jdata, com_opts = auto_band_config(structure=structure, kpathtype='vasp')
+        jdata, _ = auto_band_config(structure=structure, kpathtype='vasp')
         assert jdata['task_options']["task"] == "band", "No Input json is provided, then only band task is supported."
         jdata = normalize_run(jdata)
 
-        if init_model in ['poly2','poly4']:
-            modelname = f'base_{init_model}.pth'
-            init_model = os.path.join(os.path.dirname(__file__), '..', 'nn', 'dftb', modelname)
-            in_common_options.update(com_opts)
-        elif not(init_model.endswith(".pth") or init_model.endswith(".json")):
+        if not(init_model.endswith(".pth") or init_model.endswith(".json")):
             raise ValueError(f'init_model {init_model} is not supported.')
         run_opt.update({'init_model': init_model})
             

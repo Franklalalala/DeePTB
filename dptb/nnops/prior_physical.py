@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 import torch
 
-from dptb.nn.sktb.onsiteDB import onsite_energy_database
+from dptb.nnops.onsite_database import onsite_energy_database
 
 
 def orbital_l(orbital: str) -> int:

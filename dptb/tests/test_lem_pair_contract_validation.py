@@ -123,17 +123,26 @@ def test_legacy_h0_method_rejects_pair_only_mp_cutoff_in_strict_argcheck():
         argument.check_value(normalized, strict=True)
 
 
-@pytest.mark.parametrize("method", ["lem_pair", "lem_cutoff"])
-def test_only_actual_mp_cutoff_consumers_accept_the_field(method):
+def test_retained_mp_cutoff_consumer_accepts_the_field():
     root = Path(__file__).resolve().parents[2]
     payload = yaml.safe_load(
         (root / "configs" / "route_h_b0_late_block_expansion_cg.yaml").read_text()
     )["model_options"]
-    payload["embedding"]["method"] = method
+    payload["embedding"]["method"] = "lem_pair"
     payload["embedding"]["mp_cutoff"] = 1.0
     argument = model_options_argcheck()
     normalized = argument.normalize_value(payload)
     argument.check_value(normalized, strict=True)
+
+
+def test_retired_lem_cutoff_embedding_is_rejected():
+    root = Path(__file__).resolve().parents[2]
+    payload = yaml.safe_load(
+        (root / "configs" / "route_h_b0_late_block_expansion_cg.yaml").read_text()
+    )["model_options"]
+    payload["embedding"]["method"] = "lem_cutoff"
+    with pytest.raises(Exception, match="lem_cutoff"):
+        model_options_argcheck().normalize_value(payload)
 
 
 def test_legacy_h0_backbone_migration_is_allowlisted_and_fail_closed():

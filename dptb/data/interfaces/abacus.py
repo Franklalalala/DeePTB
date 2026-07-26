@@ -381,8 +381,8 @@ def _abacus_parse(input_path,
 
         if output_mode == "conv":
             with h5py.File(os.path.join(output_path, "hamiltonians.h5"), 'w') as fid:
-                # creating a default group here adapting to the format used in DefaultDataset.
-                # by the way DefaultDataset loading h5 file, the index should be "1" here.
+                # Keep the historical grouped HDF5 layout; downstream LMDB
+                # materialization still reads group "1".
                 default_group = fid.create_group("0")
                 for key_str, value in hamiltonian_dict.items():
                     default_group[key_str] = value
@@ -708,8 +708,8 @@ def _abacus_parse_md(input_path,
                     os.path.join(input_path, data_name, "matrix/"+str(i)+"_data-HR-sparse_SPIN0.csr"), 13.605698, # Ryd2eV
                     spinful=spinful)
                 assert tmp == norbits * (1 + spinful)
-                # creating a default group here adapting to the format used in DefaultDataset.
-                # by the way DefaultDataset loading h5 file, the index should be "1" here.
+                # Keep the historical grouped HDF5 layout; downstream LMDB
+                # materialization still reads group "1".
                 default_group = fid.create_group(str(i))
                 for key_str, value in hamiltonian_dict.items():
                     default_group[key_str] = value

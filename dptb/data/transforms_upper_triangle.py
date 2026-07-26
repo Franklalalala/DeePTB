@@ -476,15 +476,16 @@ class OrbitalMapper(BondMapper):
 
         self.basis = basis
         self.method = method
+        if self.method != "e3tb":
+            raise ValueError(
+                f"0726-light supports only method='e3tb', got {self.method!r}."
+            )
         self.device = device
 
         # ===== 新增：SOC flags =====
         self.has_soc = bool(has_soc)
         self.soc_upper_triangle_bonds = bool(soc_upper_triangle_bonds)
         self.soc_complex_doubling = bool(soc_complex_doubling)
-
-        if self.method not in ["e3tb", "sktb"]:
-            raise ValueError
 
         # ===== SOC 默认 bond_types 上三角（最小改动：只在 has_soc=True 时改变 bond_types）=====
         self.bond_types_full = list(self.bond_types)
@@ -496,9 +497,6 @@ class OrbitalMapper(BondMapper):
         # non-SOC: factor = 1
         self._soc_feature_factor = 1
         if self.has_soc:
-            if self.method != "e3tb":
-                # 最小改动：不在 sktb 上强行引入 SOC（避免 silently wrong）
-                raise NotImplementedError("SOC branch currently only implemented for method='e3tb'")
             self._soc_feature_factor = 4 * (2 if self.soc_complex_doubling else 1)
 
         # ===== 原始逻辑：basis 解析 =====
@@ -553,61 +551,16 @@ class OrbitalMapper(BondMapper):
         self.full_basis_norb = full_basis_norb
 
         # ===== 原始逻辑：reduced_matrix_element（SOC 时按 factor 扩展，其他不动）=====
-        if self.method == "e3tb":
-            total_onsite_block_elements = 0
-            for ko in orbtype_count.keys():
-                total_onsite_block_elements += orbtype_count[ko] * (2 * anglrMId[ko] + 1) ** 2
-
-            base_rme = int((self.full_basis_norb ** 2 + total_onsite_block_elements) / 2)
-
-            # SOC 最小改动：只在 has_soc=True 时按因子扩大
-            self.reduced_matrix_element = base_rme * self._soc_feature_factor
-        else:
-            # sktb 原始逻辑不改（且 SOC 不允许到这里）
-            self.reduced_matrix_element = (
-                1 * orbtype_count["s"] * orbtype_count["s"] +
-                2 * orbtype_count["s"] * orbtype_count["p"] +
-                2 * orbtype_count["s"] * orbtype_count["d"] +
-                2 * orbtype_count["s"] * orbtype_count["f"] +
-                2 * orbtype_count["s"] * orbtype_count["g"] +
-                2 * orbtype_count["s"] * orbtype_count["h"]
-            ) + \
-            2 * (
-                1 * orbtype_count["p"] * orbtype_count["p"] +
-                2 * orbtype_count["p"] * orbtype_count["d"] +
-                2 * orbtype_count["p"] * orbtype_count["f"] +
-                2 * orbtype_count["p"] * orbtype_count["g"] +
-                2 * orbtype_count["p"] * orbtype_count["h"]
-            ) + \
-            3 * (
-                1 * orbtype_count["d"] * orbtype_count["d"] +
-                2 * orbtype_count["d"] * orbtype_count["f"] +
-                2 * orbtype_count["d"] * orbtype_count["g"] +
-                2 * orbtype_count["d"] * orbtype_count["h"]
-            ) + \
-            4 * (
-                1 * orbtype_count["f"] * orbtype_count["f"] +
-                2 * orbtype_count["f"] * orbtype_count["g"] +
-                2 * orbtype_count["f"] * orbtype_count["h"]
-            ) + \
-            5 * (
-                1 * orbtype_count["g"] * orbtype_count["g"] +
-                2 * orbtype_count["g"] * orbtype_count["h"]
-            ) + \
-            6 * (
-                1 * orbtype_count["h"] * orbtype_count["h"]
+        total_onsite_block_elements = 0
+        for ko in orbtype_count.keys():
+            total_onsite_block_elements += (
+                orbtype_count[ko] * (2 * anglrMId[ko] + 1) ** 2
             )
 
-            self.reduced_matrix_element = self.reduced_matrix_element + orbtype_count["s"] + 2 * orbtype_count["p"] + 3 * orbtype_count["d"] + 4 * orbtype_count["f"] + 5 * orbtype_count["g"] + 6 * orbtype_count["h"]
-            self.reduced_matrix_element = int(self.reduced_matrix_element / 2)
-            self.n_onsite_Es = 0.5 * (orbtype_count["s"] ** 2 + orbtype_count["s"]) \
-                               + 0.5 * (orbtype_count["p"] ** 2 + orbtype_count["p"]) \
-                               + 0.5 * (orbtype_count["d"] ** 2 + orbtype_count["d"]) \
-                               + 0.5 * (orbtype_count["f"] ** 2 + orbtype_count["f"]) \
-                               + 0.5 * (orbtype_count["g"] ** 2 + orbtype_count["g"]) \
-                               + 0.5 * (orbtype_count["h"] ** 2 + orbtype_count["h"])
-            self.n_onsite_Es = int(self.n_onsite_Es)
-            self.n_onsite_socLs = orbtype_count["s"] + orbtype_count["p"] + orbtype_count["d"] + orbtype_count["f"] + orbtype_count["g"] + orbtype_count["h"]
+        base_rme = int(
+            (self.full_basis_norb ** 2 + total_onsite_block_elements) / 2
+        )
+        self.reduced_matrix_element = base_rme * self._soc_feature_factor
 
         # ===== 原始逻辑：sort basis =====
         for ib in self.basis.keys():
@@ -684,25 +637,24 @@ class OrbitalMapper(BondMapper):
                         self.mask_to_erme[self.bond_to_type[ib]][self.orbpair_maps[jof + "-" + iof]] = True
 
         # ===== 原始逻辑：mask_to_ndiag / full_mask_to_diag（e3tb）=====
-        if self.method == "e3tb":
-            self.mask_to_ndiag = torch.zeros(len(self.type_names), self.reduced_matrix_element, dtype=torch.bool, device=self.device)
-            for ib, bb in self.basis.items():
-                for io in bb:
-                    iof = self.basis_to_full_basis[ib][io]
-                    if self.orbpair_maps.get(iof + "-" + iof) is not None:
-                        sli = self.orbpair_maps[iof + "-" + iof]
-                        l = anglrMId[re.findall("[a-z]", iof)[0]]
-                        indices = torch.arange(2 * l + 1)
-                        indices = indices + indices * (2 * l + 1)
-                        indices += sli.start
-                        assert indices.max() < sli.stop
-                        self.mask_to_ndiag[self.chemical_symbol_to_type[ib]][indices] = True
+        self.mask_to_ndiag = torch.zeros(len(self.type_names), self.reduced_matrix_element, dtype=torch.bool, device=self.device)
+        for ib, bb in self.basis.items():
+            for io in bb:
+                iof = self.basis_to_full_basis[ib][io]
+                if self.orbpair_maps.get(iof + "-" + iof) is not None:
+                    sli = self.orbpair_maps[iof + "-" + iof]
+                    l = anglrMId[re.findall("[a-z]", iof)[0]]
+                    indices = torch.arange(2 * l + 1)
+                    indices = indices + indices * (2 * l + 1)
+                    indices += sli.start
+                    assert indices.max() < sli.stop
+                    self.mask_to_ndiag[self.chemical_symbol_to_type[ib]][indices] = True
 
-            self.full_mask_to_diag = torch.zeros(self.reduced_matrix_element, dtype=torch.bool, device=self.device)
-            for orbs, islice in self.orbpair_maps.items():
-                fio, fjo = orbs.split('-')
-                if fio == fjo:
-                    self.full_mask_to_diag[islice] = True
+        self.full_mask_to_diag = torch.zeros(self.reduced_matrix_element, dtype=torch.bool, device=self.device)
+        for orbs, islice in self.orbpair_maps.items():
+            fio, fjo = orbs.split('-')
+            if fio == fjo:
+                self.full_mask_to_diag[islice] = True
 
         log.info(
             f"Initialized OrbitalMapper(method={self.method}, has_soc={self.has_soc}, "
@@ -724,9 +676,7 @@ class OrbitalMapper(BondMapper):
 
     def get_orbpairtype_maps(self):
         """
-        原始逻辑 + SOC 最小改动：
-        - e3tb: n_rme = (2l+1)(2l'+1) * soc_factor
-        - sktb: 原样
+        E3 upper-triangle mapping with an optional SOC feature factor.
         """
         self.orbpairtype_maps = {}
         ist = 0
@@ -736,10 +686,11 @@ class OrbitalMapper(BondMapper):
                     if self.orbtype_count[jo] != 0:
                         orb_pair = io + "-" + jo
                         il, jl = anglrMId[io], anglrMId[jo]
-                        if self.method == "e3tb":
-                            n_rme = (2 * il + 1) * (2 * jl + 1) * self._soc_feature_factor
-                        else:
-                            n_rme = min(il, jl) + 1
+                        n_rme = (
+                            (2 * il + 1)
+                            * (2 * jl + 1)
+                            * self._soc_feature_factor
+                        )
                         numhops = self.orbtype_count[io] * self.orbtype_count[jo] * n_rme
                         if io == jo:
                             numhops += self.orbtype_count[jo] * n_rme
@@ -765,10 +716,11 @@ class OrbitalMapper(BondMapper):
                 iio, jjo = full_basis_pair[1], full_basis_pair[4]
                 il, jl = anglrMId[iio], anglrMId[jjo]
 
-                if self.method == "e3tb":
-                    n_feature = (2 * il + 1) * (2 * jl + 1) * self._soc_feature_factor
-                else:
-                    n_feature = min(il, jl) + 1
+                n_feature = (
+                    (2 * il + 1)
+                    * (2 * jl + 1)
+                    * self._soc_feature_factor
+                )
 
                 if iio == jjo:
                     start = self.orbpairtype_maps[iio + "-" + jjo].start + \
@@ -794,10 +746,7 @@ class OrbitalMapper(BondMapper):
             iio, jjo = full_basis_pair[1], full_basis_pair[4]
             il, jl = anglrMId[iio], anglrMId[jjo]
 
-            if self.method == 'e3tb':
-                n_feature = int((2 * il + 1) * (2 * jl + 1) * 4 / 2)
-            else:
-                raise NotImplementedError
+            n_feature = int((2 * il + 1) * (2 * jl + 1) * 4 / 2)
             ist = int(ist)
             self.orbpair_soc_maps[full_basis_pair] = slice(ist, ist + n_feature)
             ist += n_feature
@@ -809,73 +758,6 @@ class OrbitalMapper(BondMapper):
         self.reduced_soc_matrix_elemet = int(reduced_soc_matrix_elemet)
         return self.orbpair_soc_maps
 
-    def get_skonsite_maps(self):
-        assert self.method == "sktb", "Only sktb orbitalmapper have skonsite maps."
-
-        if hasattr(self, "skonsite_maps"):
-            return self.skonsite_maps
-
-        if not hasattr(self, "skonsitetype_maps"):
-            self.get_skonsitetype_maps()
-
-        self.mask_diag = torch.zeros(self.n_onsite_Es, dtype=torch.bool, device=self.device)
-        self.skonsite_maps = {}
-        for i, io in enumerate(self.full_basis):
-            for j, jo in enumerate(self.full_basis[i:]):
-                ir, jr = int(io[0]), int(jo[0])
-                iio, jjo = io[1], jo[1]
-                if iio == jjo:
-                    full_basis_pair = io + "-" + jo
-                    start = int(self.skonsitetype_maps[iio].start + ((2 * self.orbtype_count[jjo] - ir + 2) * (ir - 1) / 2 + jr - ir))
-                    self.skonsite_maps[full_basis_pair] = slice(start, start + 1)
-                    if io == jo:
-                        self.mask_diag[start] = True
-
-        return self.skonsite_maps
-
-    def get_skonsitetype_maps(self):
-        self.skonsitetype_maps = {}
-        ist = 0
-
-        assert self.method == "sktb", "Only sktb orbitalmapper have skonsite maps."
-        for i, io in enumerate(["s", "p", "d", "f", "g", "h"]):
-            if self.orbtype_count[io] != 0:
-                numonsites = int(0.5 * (self.orbtype_count[io] ** 2 + self.orbtype_count[io]))
-                self.skonsitetype_maps[io] = slice(ist, ist + numonsites)
-                ist += numonsites
-
-        return self.skonsitetype_maps
-
-    def get_sksoctype_maps(self):
-        self.sksoctype_maps = {}
-        ist = 0
-
-        assert self.method == "sktb", "Only sktb orbitalmapper have sksoctype maps."
-        for i, io in enumerate(["s", "p", "d", "f", "g", "h"]):
-            if self.orbtype_count[io] != 0:
-                numonsites = self.orbtype_count[io]
-                self.sksoctype_maps[io] = slice(ist, ist + numonsites)
-                ist += numonsites
-
-        return self.sksoctype_maps
-
-    def get_sksoc_maps(self):
-        assert self.method == "sktb", "Only sktb orbitalmapper have sksoc maps."
-
-        if hasattr(self, "sksoc_maps"):
-            return self.sksoc_maps
-
-        if not hasattr(self, "sksoctype_maps"):
-            self.get_sksoctype_maps()
-
-        self.sksoc_maps = {}
-        for i, io in enumerate(self.full_basis):
-            ir = int(io[0])
-            iio = io[1]
-            start = int(self.sksoctype_maps[iio].start + (ir - 1))
-            self.sksoc_maps[io] = slice(start, start + 1)
-
-        return self.sksoc_maps
 
     def get_orbital_maps(self):
         self.orbital_maps = {}

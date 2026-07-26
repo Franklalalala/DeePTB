@@ -8,14 +8,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dptb.nn.cuda_ops.grouped_gemm import indexed_sandwich_multi_gemm
-from dptb.nn.so2_moe_fused_p0 import (
-    _PackPairsMultiFunction,
-    _ScatterPairOutputFunction,
-    _ScatterRawPairOutputFunction,
-    _ScatterRawPairsMultiOutputMajorFunction,
-    _multi_output_entry_map,
-    _wigner_tensor_and_mode,
-)
+try:
+    from dptb.nn.so2_moe_fused_p0 import (
+        _PackPairsMultiFunction,
+        _ScatterPairOutputFunction,
+        _ScatterRawPairOutputFunction,
+        _ScatterRawPairsMultiOutputMajorFunction,
+        _multi_output_entry_map,
+        _wigner_tensor_and_mode,
+    )
+except ImportError as exc:
+    _SO2_BACKEND_IMPORT_ERROR = exc
+else:
+    _SO2_BACKEND_IMPORT_ERROR = None
 from dptb.nn.so2_sandwich_common import so2_m0_output, so2_pair_maps
 
 _WARNED: set[str] = set()
@@ -240,6 +245,13 @@ def try_forward_so2_materialized_sandwich(
         else os.environ.get("DPTB_SO2_MATERIALIZED_STRICT", "0").lower() in ("1", "true", "yes", "on")
     )
     try:
+        if _SO2_BACKEND_IMPORT_ERROR is not None:
+            if strict:
+                raise RuntimeError(
+                    "The materialized SO2 route requires the optional "
+                    "so2-cuda-ops package."
+                ) from _SO2_BACKEND_IMPORT_ERROR
+            return None
         if x.device.type != "cuda" or x.dtype != torch.float32:
             return None
         if module.irreps_out.lmax < 1:

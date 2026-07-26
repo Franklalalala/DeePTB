@@ -1,8 +1,6 @@
-from dptb.nn.deeptb import NNENV, MIX
+from dptb.nn.deeptb import NNENV
 from dptb.configuration import migrate_legacy_checkpoint_model_options
 import logging
-from dptb.nn.nnsk import NNSK
-from dptb.nn.dftbsk import DFTBSK
 import torch
 import torch.nn as nn
 from dptb.utils.tools import j_must_have, j_loader
@@ -347,60 +345,24 @@ class DistanceEnsembleWrapper(nn.Module):
         return res
 
 
-# ======================================================================
-# [独立扩展模块] Multi-Expert Helper Functions
-# ======================================================================
-def _infer_num_xgrid_from_state_dict(state_dict: dict):
-    if state_dict is None: return None
-    for k, v in state_dict.items():
-        if k.endswith("distance_param") and torch.is_tensor(v) and v.ndim >= 1: return int(v.shape[0])
-    return None
+def _construct_single_model(model_options, common_options):
+    return NNENV(**model_options, **common_options)
 
 
-def _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options, common_options,
-                            ref_state_dict=None):
-    extra_kwargs = {}
-    num_xgrid = _infer_num_xgrid_from_state_dict(ref_state_dict)
-    if num_xgrid is not None:
-        if init_dftbsk:
-            extra_kwargs["num_xgrid"] = num_xgrid
-        elif init_mixed and model_options.get("dftbsk") is not None:
-            extra_kwargs["num_xgrid"] = num_xgrid
-
-    if init_nnenv:
-        return NNENV(**model_options, **common_options)
-    elif init_nnsk:
-        return NNSK(**model_options["nnsk"], **common_options)
-    elif init_mixed:
-        return MIX(**model_options, **common_options, **extra_kwargs)
-    elif init_dftbsk:
-        return DFTBSK(**model_options["dftbsk"], **common_options, **extra_kwargs)
-    else:
-        raise ValueError("Failed to determine model type.")
+def _construct_single_model_from_reference(
+    checkpoint, model_options, common_options
+):
+    return NNENV.from_reference(checkpoint, **model_options, **common_options)
 
 
-def _construct_single_model_from_reference(checkpoint, init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options,
-                                           common_options):
-    if init_nnenv:
-        return NNENV.from_reference(checkpoint, **model_options, **common_options)
-    elif init_nnsk:
-        return NNSK.from_reference(checkpoint, **model_options["nnsk"], **common_options)
-    elif init_mixed:
-        return MIX.from_reference(checkpoint, **model_options, **common_options)
-    elif init_dftbsk:
-        return DFTBSK.from_reference(checkpoint, **model_options["dftbsk"], **common_options)
-    else:
-        raise ValueError("Failed to determine model type.")
-
-
-def _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk, init_mixed, init_dftbsk,
-                                     model_options, common_options):
+def _replicate_prototype_to_ensemble(
+    prototype_model, distance_ranges, model_options, common_options
+):
     proto_state = prototype_model.state_dict()
     experts = [prototype_model]
     for i in range(1, len(distance_ranges)):
         with DeterministicExpertSeed(i + 1):
-            m = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options, common_options,
-                                        ref_state_dict=proto_state)
+            m = _construct_single_model(model_options, common_options)
         m.load_state_dict(proto_state, strict=True)
         experts.append(m)
     return DistanceEnsembleWrapper(experts=experts, distance_ranges=distance_ranges)
@@ -452,16 +414,16 @@ def _maybe_enable_legacy_swiglu_s2_compat(model_options: dict, state_dict: dict)
     return patched
 
 
-def _build_ensemble_from_wrapper_state(wrapper_state_dict, distance_ranges, init_nnenv, init_nnsk, init_mixed,
-                                       init_dftbsk, model_options, common_options):
+def _build_ensemble_from_wrapper_state(
+    wrapper_state_dict, distance_ranges, model_options, common_options
+):
     ckpt_num_experts = _count_experts_in_state_dict(wrapper_state_dict)
     if ckpt_num_experts != len(distance_ranges):
         raise ValueError(f"Checkpoint has {ckpt_num_experts} experts, but requires {len(distance_ranges)}.")
     experts = []
     for i in range(len(distance_ranges)):
         with DeterministicExpertSeed(i + 1):
-            m = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options, common_options,
-                                        ref_state_dict=wrapper_state_dict)
+            m = _construct_single_model(model_options, common_options)
         experts.append(m)
     model = DistanceEnsembleWrapper(experts=experts, distance_ranges=distance_ranges)
     model.load_state_dict(wrapper_state_dict, strict=True)
@@ -489,10 +451,6 @@ def build_model(
             raise ValueError(
                 "You need to provide model_options and common_options when you are initializing a model from scratch.")
 
-    init_nnenv = False
-    init_nnsk = False
-    init_mixed = False
-    init_dftbsk = False
     ckpt_state_dict = None
 
     if not from_scratch:
@@ -520,55 +478,18 @@ def build_model(
 
     model_options = _maybe_enable_legacy_swiglu_s2_compat(model_options, ckpt_state_dict)
 
-    if model_options.get("dftbsk"):
-        assert not model_options.get("nnsk"), "There should only be one of the dftbsk and nnsk in model_options."
-        if all((model_options.get("embedding"), model_options.get("prediction"))):
-            init_mixed = True
-            if not model_options['prediction']['method'] == 'sktb':
-                log.error("The prediction method must be sktb for mix mode.")
-                raise ValueError("The prediction method must be sktb for mix mode.")
-
-            if not model_options['embedding']['method'] in ['se2']:
-                log.error("The embedding method must be se2 for mix mode.")
-                raise ValueError("The embedding method must be se2 for mix mode.")
-        elif not any((model_options.get("embedding"), model_options.get("prediction"))):
-            init_dftbsk = True
-        else:
-            raise ValueError("Model_options are not set correctly!")
-
-    elif model_options.get("nnsk"):
-        if all((model_options.get("embedding"), model_options.get("prediction"))):
-            init_mixed = True
-            if not model_options['prediction']['method'] == 'sktb':
-                log.error("The prediction method must be sktb for mix mode.")
-                raise ValueError("The prediction method must be sktb for mix mode.")
-
-            if not model_options['embedding']['method'] in ['se2']:
-                log.error("The embedding method must be se2 for mix mode.")
-                raise ValueError("The embedding method must be se2 for mix mode.")
-
-        elif not any((model_options.get("embedding"), model_options.get("prediction"))):
-            init_nnsk = True
-        else:
-            raise ValueError("Model_options are not set correctly!")
-    else:
-        if all((model_options.get("embedding"), model_options.get("prediction"))):
-            init_nnenv = True
-            if model_options["prediction"]['method'] == 'sktb':
-                if not model_options['embedding']['method'] in ['se2']:
-                    log.error("The embedding method must be se2 for sktb prediction in nnenv mode.")
-                    raise ValueError("The embedding method must be se2 for sktb prediction in deeptb mode.")
-
-            if model_options["prediction"]['method'] in {'e3tb', 'block_native'}:
-                if model_options['embedding']['method'] in ['se2']:
-                    log.error("The embedding method can not be se2 for e3tb/block_native prediction in deeptb mode.")
-                    raise ValueError("The embedding method can not be se2 for e3tb/block_native prediction in deeptb mode.")
-        else:
-            raise ValueError("Model_options are not set correctly!")
-
-        assert int(init_dftbsk) + int(init_mixed) + int(init_nnenv) + int(
-            init_nnsk) == 1, "IF not sk, you can only choose one of the mixed, nnenv, dftb and nnsk options."
-
+    retired = [key for key in ("nnsk", "dftbsk") if model_options.get(key)]
+    if retired:
+        raise ValueError(
+            "0726-light removed the retired SK/DFTB model routes: "
+            + ", ".join(retired)
+        )
+    if not all((model_options.get("embedding"), model_options.get("prediction"))):
+        raise ValueError("model_options must define both embedding and prediction.")
+    if model_options["prediction"].get("method") not in {"e3tb", "block_native"}:
+        raise ValueError(
+            "0726-light supports prediction.method='e3tb' or 'block_native'."
+        )
     if device:
         common_options.update({"device": device})
 
@@ -579,52 +500,45 @@ def build_model(
         log.info(f"Wrapping model with DistanceEnsembleWrapper ({len(distance_ranges)} experts)")
         if from_scratch:
             with DeterministicExpertSeed(1):
-                prototype_model = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options,
-                                                          common_options, ref_state_dict=None)
-            model = _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk,
-                                                     init_mixed, init_dftbsk, model_options, common_options)
+                prototype_model = _construct_single_model(
+                    model_options, common_options
+                )
+            model = _replicate_prototype_to_ensemble(
+                prototype_model, distance_ranges, model_options, common_options
+            )
         else:
             if ckpt_state_dict is None:
                 with DeterministicExpertSeed(1):
-                    prototype_model = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk,
-                                                              model_options, common_options, ref_state_dict=None)
-                model = _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk,
-                                                         init_mixed, init_dftbsk, model_options, common_options)
+                    prototype_model = _construct_single_model(
+                        model_options, common_options
+                    )
+                model = _replicate_prototype_to_ensemble(
+                    prototype_model, distance_ranges, model_options, common_options
+                )
             elif _is_multi_expert_state_dict(ckpt_state_dict):
-                model = _build_ensemble_from_wrapper_state(ckpt_state_dict, distance_ranges, init_nnenv, init_nnsk,
-                                                           init_mixed, init_dftbsk, model_options, common_options)
+                model = _build_ensemble_from_wrapper_state(
+                    ckpt_state_dict,
+                    distance_ranges,
+                    model_options,
+                    common_options,
+                )
             else:
                 with DeterministicExpertSeed(1):
-                    prototype_model = _construct_single_model_from_reference(checkpoint, init_nnenv, init_nnsk,
-                                                                             init_mixed, init_dftbsk, model_options,
-                                                                             common_options)
-                model = _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk,
-                                                         init_mixed, init_dftbsk, model_options, common_options)
+                    prototype_model = _construct_single_model_from_reference(
+                        checkpoint, model_options, common_options
+                    )
+                model = _replicate_prototype_to_ensemble(
+                    prototype_model, distance_ranges, model_options, common_options
+                )
 
     else:
         with DeterministicExpertSeed(1):
             if from_scratch:
-                if init_nnenv:
-                    model = NNENV(**model_options, **common_options)
-                elif init_nnsk:
-                    model = NNSK(**model_options["nnsk"], **common_options)
-                elif init_mixed:
-                    model = MIX(**model_options, **common_options)
-                elif init_dftbsk:
-                    model = DFTBSK(**model_options["dftbsk"], **common_options)
-                else:
-                    model = None
+                model = NNENV(**model_options, **common_options)
             else:
-                if init_nnenv:
-                    model = NNENV.from_reference(checkpoint, **model_options, **common_options)
-                elif init_nnsk:
-                    model = NNSK.from_reference(checkpoint, **model_options["nnsk"], **common_options)
-                elif init_mixed:
-                    model = MIX.from_reference(checkpoint, **model_options, **common_options)
-                elif init_dftbsk:
-                    model = DFTBSK.from_reference(checkpoint, **model_options["dftbsk"], **common_options)
-                else:
-                    model = None
+                model = NNENV.from_reference(
+                    checkpoint, **model_options, **common_options
+                )
 
     if not no_check:
         for k, v in model.model_options.items():

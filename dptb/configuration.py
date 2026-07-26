@@ -43,7 +43,6 @@ _LEGACY_CHECKPOINT_FLOW_ALIAS_DEFAULTS = (
         "overlap_huckel_edge_channel_scale",
         None,
     ),
-    ("prior_skdata", "dftb_skdata", ""),
     ("physical_prior_jitter_sigma", "prior_jitter_sigma", 0.0),
 )
 
@@ -658,7 +657,6 @@ _FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
     _Rename("meanflow", ("pixel_meanflow",)),
     _Rename("huckel_k", ("overlap_huckel_k",)),
     _Rename("huckel_edge_channel_scale", ("overlap_huckel_edge_channel_scale",)),
-    _Rename("prior_skdata", ("dftb_skdata", "skdata")),
     _Rename("physical_prior_jitter_sigma", ("prior_jitter_sigma",)),
     _Transform(_flow_meanflow_subtree),
     _Transform(_flow_missing_h0_policy),

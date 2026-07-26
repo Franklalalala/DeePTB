@@ -39,7 +39,10 @@ def test_compact_wigner_config_is_threaded_to_lem():
     argcheck_source = ARGCHECK_SOURCE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     assert 'so2_wigner_apply_mode: str = "compact_blocks"' in lem_source
-    assert 'so2_fusion_mode: str = "staged"' in lem_source
+    assert (
+        'so2_fusion_mode: str = "streamed_m_major_cueq"'
+        in lem_source
+    )
     assert "wigner_apply_mode=so2_wigner_apply_mode" in lem_source
     assert "so2_fusion_mode=so2_fusion_mode" in lem_source
     assert 'Argument("so2_wigner_apply_mode", str' in argcheck_source

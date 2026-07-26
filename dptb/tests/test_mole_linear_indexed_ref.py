@@ -560,6 +560,10 @@ def test_mole_linear_cublas_grouped_smoke_if_available():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("cuBLAS grouped GEMM smoke requires CUDA")
+    pytest.importorskip(
+        "so2_cuda_ops",
+        reason="cuBLAS grouped GEMM smoke requires the optional SO2 extension",
+    )
 
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear
 
@@ -618,6 +622,10 @@ def test_cublas_grouped_multi_smoke_if_available():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("cuBLAS grouped GEMM smoke requires CUDA")
+    pytest.importorskip(
+        "so2_cuda_ops",
+        reason="cuBLAS grouped GEMM smoke requires the optional SO2 extension",
+    )
 
     import torch.nn.functional as F
     from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi

@@ -1,6 +1,5 @@
-========================================
 Full Input Parameters
-========================================
+=====================
 
 .. toctree::
    :maxdepth: 2
@@ -10,4 +9,3 @@ Full Input Parameters
    model_options
    data_options
    run_options
-   set_info

@@ -1,15 +1,10 @@
 # this file is to check the input configuration file to run specific commands.
 
-import os
-import sys
-import torch
 from dptb.utils.tools import j_loader, j_must_have
-import logging
-from typing import Dict, List, Optional, Any
+from typing import Optional
 from dptb.utils.argcheck import normalize
 
 
-log = logging.getLogger(__name__)
 #TODO: 对于loss 和 data option 的检查还没有完整
 
 def check_config_train(
@@ -45,51 +40,13 @@ def check_config_train(
     
     if not (restart or init_model):
         model_options = jdata["model_options"]
-        if  model_options.get("nnsk"):
-            if all((model_options.get("embedding"), model_options.get("prediction"))):
-                init_mixed = True
-                if not model_options['prediction']['method'] == 'sktb':
-                    log.error("The prediction method must be sktb for mix mode.")
-                    raise ValueError("The prediction method must be sktb for mix mode.")
-                
-                if not model_options['embedding']['method'] in ['se2']:
-                    log.error("The embedding method must be se2 for mix mode.")
-                    raise ValueError("The embedding method must be se2 for mix mode.")
-        
-            elif not any((model_options.get("embedding"), model_options.get("prediction"))):
-                init_nnsk = True
-            else:
-                log.error("Model_options are not set correctly! \n" + 
-                          "You can only choose one of the mixed, deeptb, and nnsk modes.\n" + 
-                          " -  `mixed`, set all the `nnsk` `embedding` and `prediction` options.\n" +
-                          " -  `deeptb`, set `embedding` and `prediction` options and no `nnsk`.\n" +
-                          " -  `nnsk`, set only `nnsk` options.")
-                raise ValueError("Model_options are not set correctly!")
-        else:
-            if all((model_options.get("embedding"), model_options.get("prediction"))):
-                init_deeptb = True
-                if model_options["prediction"]['method'] == 'sktb':
-                    log.warning("The prediction method is sktb, but the nnsk option is not set. this is highly not recommand.\n"+
-                                "We recommand to train nnsk then train mix model for sktb. \n"+
-                                "Please make sure you know what you are doing!")
-                    if not model_options['embedding']['method'] in ['se2']:
-                        log.error("The embedding method must be se2 for sktb prediction in deeptb mode.")
-                        raise ValueError("The embedding method must be se2 for sktb prediction in deeptb mode.")
-                if model_options["prediction"]['method'] == 'e3tb':
-                    # 对于E3 statistics 一定会设置的吗？
-                    # if statistics is None:
-                    #    log.error("The statistics must be provided for e3tb prediction method.")
-                    #     raise ValueError("The statistics must be provided for e3tb prediction method.")
-                    if  model_options['embedding']['method'] in ['se2']:
-                        log.error("The embedding method can not be se2 for e3tb prediction in deeptb mode.")
-                        raise ValueError("The embedding method can not be se2 for e3tb prediction in deeptb mode.")
-            else:
-                log.error("Model_options are not set correctly! \n" + 
-                          "You can only choose one of the mixed, deeptb, and nnsk modes.\n" + 
-                          " -  `mixed`, set all the `nnsk` `embedding` and `prediction` options.\n" +
-                          " -  `deeptb`, set `embedding` and `prediction` options and no `nnsk`.\n" +
-                          " -  `nnsk`, set only `nnsk` options.")
-                raise ValueError("Model_options are not set correctly!")
+        if not all(
+            (model_options.get("embedding"), model_options.get("prediction"))
+        ):
+            raise ValueError(
+                "0726-light requires model_options.embedding and "
+                "model_options.prediction."
+            )
         
         #if jdata["data_options"].get("reference"):
         #    log.info("reference set is provided. Then the loss options should have set the reference loss options.")

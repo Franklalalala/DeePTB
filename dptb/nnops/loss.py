@@ -13,7 +13,6 @@ from torch_scatter import scatter_mean
 from dptb.utils.torch_geometric import Batch
 import matplotlib.pyplot as plt
 from dptb.utils.constants import anglrMId
-from dptb.nn.dftbsk import DFTBSK
 import re
 from dptb.nn.hr2hk import HR2HK, HR2HK_Gamma_Only
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
@@ -83,47 +82,6 @@ def _l1_rmse_loss_from_sums(
     l1_mean = abs_sum / safe_count
     mse_mean = square_sum / safe_count
     return 0.5 * (l1_mean + torch.sqrt(mse_mean + (1.0 - valid) + 1e-12)) * valid
-
-@Loss.register("skints")
-class DFTBskLoss(nn.Module):
-    def __init__(
-                self,
-                basis: Dict[str, Union[str, list]]=None,
-                skdata: str=None,
-                overlap: bool = False,
-                dtype: Union[str, torch.dtype] = torch.float32, 
-                device: Union[str, torch.device] = torch.device("cpu"),
-                **kwargs) -> None:
-        
-        super().__init__()
-        if isinstance(dtype, str):
-            dtype = getattr(torch, dtype)
-        self.dtype = dtype
-        self.device = device
-        
-        self.loss = nn.MSELoss()
-
-        self.dftbsk = DFTBSK(basis=basis, skdata=skdata, overlap=overlap, dtype=dtype, device=device,transform=False)
-
-        self.overlap = overlap
-    
-    def forward(self, data: AtomicDataDict, ref_data: AtomicDataDict):
-        total_loss = 0.
-        ref_data = AtomicData.to_AtomicDataDict(ref_data)
-        ref_data = self.dftbsk(ref_data)
-
-        # onsite loss
-        onsite_loss = mse_loss(data[AtomicDataDict.NODE_FEATURES_KEY], ref_data[AtomicDataDict.NODE_FEATURES_KEY])
-
-        # hopping loss
-        hopping_loss = mse_loss(data[AtomicDataDict.EDGE_FEATURES_KEY], ref_data[AtomicDataDict.EDGE_FEATURES_KEY])
-
-        # overlap loss
-        total_loss = onsite_loss + hopping_loss
-        if self.overlap:
-            total_loss = total_loss + mse_loss(data[AtomicDataDict.EDGE_OVERLAP_KEY], ref_data[AtomicDataDict.EDGE_OVERLAP_KEY])
-        
-        return total_loss
 
 @Loss.register("eigvals")
 class EigLoss(nn.Module):

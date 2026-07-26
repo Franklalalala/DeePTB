@@ -1,5 +1,21 @@
 import pytest
 import os
+import shutil
+
+
+def _require_cuda_extension_toolchain():
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None or shutil.which("ninja") is None:
+        pytest.skip("SO2 CUDA extension tests require nvcc and ninja")
+
+
+def _require_so2_cuda_ops():
+    pytest.importorskip(
+        "so2_cuda_ops",
+        reason="install the optional DeePTB so2 extra for fused CUDA tests",
+    )
+    _require_cuda_extension_toolchain()
 
 
 def test_so2_fused_p0_mode_is_opt_in():
@@ -38,6 +54,7 @@ def test_cutlass_grouped_gemm_matches_torch_if_available():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUTLASS grouped GEMM smoke requires CUDA")
+    _require_cuda_extension_toolchain()
     if not (
         os.environ.get("DPTB_CUTLASS_ROOT")
         or os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT")
@@ -71,6 +88,7 @@ def test_so2_fused_p0_cuda_pair_ops_match_torch_helpers_if_available(wigner_kind
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 CUDA pair-op smoke requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.so2_moe_fused_p0 import (
         _output_m0_grad_cuda,
@@ -277,6 +295,7 @@ def test_so2_fused_p0_cutlass_tiled_forward_matches_scalar_if_available(tile_out
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 tiled forward smoke requires CUDA")
+    _require_so2_cuda_ops()
     if not os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT"):
         pytest.skip("SO2 MoE fused P0 tiled forward requires CUTLASS root")
 
@@ -383,6 +402,7 @@ def test_so2_fused_p0_forward_matches_streamed_ref_if_available():
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 smoke requires CUDA")
+    _require_so2_cuda_ops()
 
     from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
     from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
@@ -433,6 +453,7 @@ def test_so2_fused_p0_compact_backward_matches_streamed_ref_if_available(monkeyp
     pytest.importorskip("e3nn")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 backward smoke requires CUDA")
+    _require_so2_cuda_ops()
     if forward_mode != "scalar":
         if not os.environ.get("DPTB_SO2_MOE_FUSED_P0_CUTLASS_ROOT"):
             pytest.skip("SO2 MoE fused P0 tiled trainable smoke requires CUTLASS root")
@@ -549,6 +570,7 @@ def test_so2_fused_p0_indexed_sandwich_matches_streamed_ref_if_available(monkeyp
         pytest.importorskip("cuequivariance_torch")
     if not torch.cuda.is_available():
         pytest.skip("SO2 MoE fused P0 indexed-sandwich smoke requires CUDA")
+    _require_so2_cuda_ops()
     if forward_mode == "indexed_sandwich_multi_cute_tiled":
         cutlass_root = os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_CUTLASS_ROOT") or os.environ.get("DPTB_CUTLASS_ROOT")
         if not cutlass_root:

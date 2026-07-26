@@ -8,76 +8,32 @@ repository = "https://github.com/deepmodeling/DeePTB"
 
 [tool.poetry.dependencies]
 python = ">=3.9, <=3.12.9"
-pytest = ">=7.2.0"
-pytest-order = "1.2.0"
 numpy = "*"
 scipy = "*"
-spglib = "*"
 matplotlib = "*"
 ase = "*"
 pyyaml = "*"
-future = "*"
 dargs = "0.4.4"
-xitorch = "0.3.0"
 e3nn = ">=0.5.1"
 torch-runstats = "0.2.0"
 opt-einsum = "3.3.0"
 h5py = ">=3.7.0,<=3.11.0,!=3.10.0"
 lmdb = "1.4.1"
-pyfiglet = "1.0.2"
+tqdm = "*"
 tensorboard = "*"
 seekpath = "*"
-pandas = "*"
-openpyxl = "*"
-seaborn = "*"
-so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main" }
+so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main", optional = true }
+
+[tool.poetry.extras]
+so2 = ["so2-cuda-ops"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.2.0"
 pytest-order = "1.2.0"
-numpy = "*"
-scipy = "*"
-spglib = "*"
-matplotlib = "*"
-ase = "*"
-pyyaml = "*"
-future = "*"
-dargs = "0.4.4"
-xitorch = "0.3.0"
 e3nn = ">=0.5.1,<=0.5.3"
-torch-runstats = "0.2.0"
-opt-einsum = "3.3.0"
-h5py = ">=3.7.0,<=3.11.0,!=3.10.0"
-lmdb = "1.4.1"
-pyfiglet = "1.0.2"
-tensorboard = "*"
-seekpath = "*"
-pandas = "*"
-openpyxl = "*"
-seaborn = "*"
-
-[tool.poetry.group.3Dfermi]
-optional = true
-
-[tool.poetry.group.3Dfermi.dependencies]
-ifermi = "*"
-pymatgen = "*"
-
-[tool.poetry.group.tbtrans_init]
-optional = true
-
-[tool.poetry.group.tbtrans_init.dependencies]
-sisl = "*"
-
-[tool.poetry.group.pybinding]
-optional = true
-
-[tool.poetry.group.pybinding.dependencies]
-pybinding = "*"
 
 [tool.poetry.scripts]
 dptb = 'dptb.__main__:main'
-dptb-qm9 = 'dptb.data.interfaces.pyscf:main'
 
 [build-system]
 requires = ["poetry-core", "poetry-dynamic-versioning"]

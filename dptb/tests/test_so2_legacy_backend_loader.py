@@ -17,5 +17,12 @@ def test_legacy_so2_backend_imports_without_external_so2_cuda_ops():
     assert hasattr(fused, "_load_extension")
     assert hasattr(fused, "try_forward_so2_moe_fused_p0")
 
+    materialized = importlib.import_module(
+        "dptb.nn.so2_materialized_sandwich"
+    )
+    assert hasattr(
+        materialized, "try_forward_so2_materialized_sandwich"
+    )
+
     scheduler = importlib.import_module("dptb.nn.so2_cuda_scheduler")
     assert scheduler.SO2CudaSchedulerFunction.__module__ == "dptb.nn.so2_cuda_scheduler"

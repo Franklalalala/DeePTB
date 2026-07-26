@@ -4,7 +4,6 @@ import logging
 from dptb.utils.tools import get_lr_scheduler, j_must_have, get_optimizer, lr_scheduler_requires_metric
 from abc import ABCMeta, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
-from future.utils import with_metaclass
 from dptb.utils.constants import dtype_dict
 from dptb.plugins.base_plugin import PluginUser
 from dptb.nnops.training_state import TrainingState
@@ -50,7 +49,7 @@ def _apply_epoch_lr_step(trainer):
         trainer.lr_scheduler.step()  # modify the lr at each epoch (should we add it to pluggins so we could record the lr scheduler process? update 0927, this has been done in tensorboard monitor.)
 
 
-class BaseTrainer(with_metaclass(ABCMeta, PluginUser)):
+class BaseTrainer(PluginUser, metaclass=ABCMeta):
 
     # ``iter``/``ep`` are backed by a single TrainingState so the live counters
     # and the checkpointed resume state are one source of truth; existing code

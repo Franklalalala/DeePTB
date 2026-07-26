@@ -25,7 +25,6 @@ DeePTB is organized into several modules. Here's a brief overview:
 
 - `data`: Data processing module.
 - `entrypoints`: Entry points for the command-line interface.
-- `negf`: Nonequilibrium Green's Function (NEGF) module.
 - `nn`: Neural network model module.
 - `nnops`: Neural network operations module.
 - `plugins`: Plugins for various functionalities.

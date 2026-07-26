@@ -12,7 +12,7 @@ from dptb.data import AtomicDataDict
 from dptb.nn.embedding.emb import Embedding
 from ..radial_basis import BesselBasis
 from ..base import ScalarMLPFunction
-from dptb.nn.embedding.from_deephe3.deephe3 import tp_path_exists
+from dptb.nn.embedding.irreps_utils import tp_path_exists
 from dptb.data import _keys
 from dptb.nn.cutoff import cosine_cutoff, polynomial_cutoff
 from dptb.nn.rescale import E3ElementLinear
@@ -23,8 +23,6 @@ import math
 from dptb.data.transforms import OrbitalMapper
 from ..type_encode.one_hot import OneHotAtomEncoding, OneHotEdgeEmbedding
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
-from .lem import Layer
-
 from math import ceil
 
 # --- OpenEquivariance Imports & Helpers ---

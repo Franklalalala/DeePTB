@@ -451,15 +451,14 @@ class OrbitalMapper(BondMapper):
             chemical_symbol_to_type: Optional[Dict[str, int]] = None,
             method: str = "e3tb",
             device: Union[str, torch.device] = torch.device("cpu"),
-            # SOC Flags (Primarily for e3tb)
+            # SOC flags for the maintained E3 representation.
             has_soc: bool = False,
             soc_complex_doubling: bool = True,
             nextham_uureal_mask: bool = False,
             full_soc_prediction: bool = False,
     ):
         """
-        Maps orbital pairs to feature indices (Reduced Matrix Elements).
-        Supports both 'e3tb' (DeepH-like) and 'sktb' (Slater-Koster) methods.
+        Maps orbital pairs to E3 feature indices (Reduced Matrix Elements).
         """
 
         # --- Stack Inspection for Logging Caller ---
@@ -486,6 +485,10 @@ class OrbitalMapper(BondMapper):
 
         self.basis = basis
         self.method = method
+        if self.method != "e3tb":
+            raise ValueError(
+                f"0726-light supports only method='e3tb', got {self.method!r}."
+            )
         self.device = device
         self.has_soc = has_soc
         self.soc_complex_doubling = soc_complex_doubling if has_soc else False
@@ -494,23 +497,18 @@ class OrbitalMapper(BondMapper):
             nextham_uureal_mask=nextham_uureal_mask,
             full_soc_prediction=self.full_soc_prediction,
         )
-        self.soc_uureal_target = bool(
-            self.method == "e3tb" and self.has_soc and self.nextham_uureal_mask
-        )
+        self.soc_uureal_target = bool(self.has_soc and self.nextham_uureal_mask)
         if self.soc_uureal_target:
             log.info(
                 "[OrbitalMapper] nextham_uureal_mask=True: build a reduced "
                 "SOC target space containing only uu_real. The full SOC "
                 "spin/complex factor is kept out of RME maps and irreps."
             )
-        elif self.method == "e3tb" and self.has_soc and self.full_soc_prediction:
+        elif self.has_soc and self.full_soc_prediction:
             log.info(
                 "[OrbitalMapper] full_soc_prediction=True: use the full SOC "
                 "target space, including all spin and real/imag blocks."
             )
-        if self.method not in ["e3tb", "sktb"]:
-            raise ValueError(f"Unknown method {self.method}, only 'e3tb' and 'sktb' are supported.")
-
         # ==========================================
         # 1. Unified Basis Parsing (Super Basis Logic)
         # ==========================================
@@ -558,58 +556,22 @@ class OrbitalMapper(BondMapper):
         # ==========================================
         # 2. Reduced Matrix Element (RME) Calculation
         # ==========================================
-        if self.method == "e3tb":
-            if not self.has_soc:
-                # [Non-SOC]: Compressed storage (Upper triangle including diagonal blocks)
-                # Count = (Full_N^2 + Sum(Onsite_Block_Diags)) / 2
-                total_onsite_block_elements = 0
-                for ko in orbtype_count.keys():
-                    total_onsite_block_elements += orbtype_count[ko] * (2 * anglrMId[ko] + 1) ** 2
-                self.reduced_matrix_element = int((self.full_basis_norb ** 2 + total_onsite_block_elements) / 2)
-            else:
-                # [SOC]: Full matrix storage
-                # Full SOC uses N^2 * 4 spin blocks * 2 real/imag parts.
-                factor = self._e3tb_soc_feature_factor()
-                self.reduced_matrix_element = self.full_basis_norb ** 2 * factor
-
-        else:
-            # [SKTB]: Strict restoration of SKTB counting logic
-            # Count = Sum of SK integrals (min(l,l')+1) for all pairs in upper triangle.
-            rme_count = 0
-            types = ["s", "p", "d", "f", "g", "h"]
-            for i, io in enumerate(types):
-                if orbtype_count[io] == 0: continue
-                for j in range(i, len(types)):
-                    jo = types[j]
-                    if orbtype_count[jo] == 0: continue
-
-                    il, jl = anglrMId[io], anglrMId[jo]
-                    n_sk = min(il, jl) + 1  # Number of SK integrals
-
-                    # Total pairs between type i and type j
-                    pair_hops = orbtype_count[io] * orbtype_count[jo] * n_sk
-
-                    # If diagonal block type (e.g. s-s), we only store upper triangle
-                    if io == jo:
-                        # (N*N + N)/2 logic, derived as:
-                        pair_hops += orbtype_count[io] * n_sk
-                        pair_hops = int(pair_hops / 2)
-
-                    rme_count += pair_hops
-
-            self.reduced_matrix_element = rme_count
-
-            # SKTB specific: Onsite Energy and SOC parameter counts
-            self.n_onsite_Es = 0
-            self.n_onsite_socLs = 0
+        if not self.has_soc:
+            # Non-SOC uses compressed upper-triangle storage, including
+            # complete diagonal orbital blocks.
+            total_onsite_block_elements = 0
             for ko in orbtype_count.keys():
-                cnt = orbtype_count[ko]
-                # Onsite Energies: (N^2 + N)/2 -> Upper triangle of onsite block
-                self.n_onsite_Es += int(0.5 * (cnt ** 2 + cnt))
-                # Onsite SOC Strengths: 1 parameter per orbital shell
-                self.n_onsite_socLs += cnt
-
-            self.n_onsite_Es = int(self.n_onsite_Es)
+                total_onsite_block_elements += (
+                    orbtype_count[ko] * (2 * anglrMId[ko] + 1) ** 2
+                )
+            self.reduced_matrix_element = int(
+                (self.full_basis_norb ** 2 + total_onsite_block_elements) / 2
+            )
+        else:
+            # SOC uses full matrix storage. Full SOC has four spin blocks
+            # and, when requested, separate real/imaginary channels.
+            factor = self._e3tb_soc_feature_factor()
+            self.reduced_matrix_element = self.full_basis_norb ** 2 * factor
 
         # ==========================================
         # 3. Maps & Masks Initialization
@@ -667,7 +629,7 @@ class OrbitalMapper(BondMapper):
                 iof = self.basis_to_full_basis[ib][io]
                 for jo in bb:
                     jof = self.basis_to_full_basis[ib][jo]
-                    # Note: For SKTB/Non-SOC E3TB, only upper triangle keys exist in maps
+                    # Non-SOC E3 stores only upper-triangle orbital-pair keys.
                     if self.orbpair_maps.get(iof + "-" + jof) is not None:
                         self.mask_to_nrme[self.chemical_symbol_to_type[ib]][self.orbpair_maps[iof + "-" + jof]] = True
 
@@ -682,12 +644,12 @@ class OrbitalMapper(BondMapper):
                     # Try forward lookup
                     if self.orbpair_maps.get(iof + "-" + jof) is not None:
                         self.mask_to_erme[self.bond_to_type[ib]][self.orbpair_maps[iof + "-" + jof]] = True
-                    # If symmetric storage (SKTB or Non-SOC E3TB), try reverse lookup
+                    # For non-SOC symmetric storage, try the reverse lookup.
                     elif (not self.has_soc) and self.orbpair_maps.get(jof + "-" + iof) is not None:
                         self.mask_to_erme[self.bond_to_type[ib]][self.orbpair_maps[jof + "-" + iof]] = True
 
-        # Special Diagonal Mask for Non-SOC E3TB (SKTB handles this in get_skonsite_maps)
-        if self.method == "e3tb" and not self.has_soc:
+        # Special diagonal mask for non-SOC E3.
+        if not self.has_soc:
             self.mask_to_ndiag = torch.zeros(len(self.type_names), self.reduced_matrix_element, dtype=torch.bool,
                                              device=self.device)
             for ib, bb in self.basis.items():
@@ -711,7 +673,7 @@ class OrbitalMapper(BondMapper):
 
     def _e3tb_soc_feature_factor(self) -> int:
         """Number of SOC storage channels per spatial matrix element."""
-        if self.method == "e3tb" and self.has_soc:
+        if self.has_soc:
             return 1 if self.nextham_uureal_mask else 4 * (2 if self.soc_complex_doubling else 1)
         return 1
 
@@ -725,8 +687,10 @@ class OrbitalMapper(BondMapper):
         - inside each (real/imag) half: spin blocks are contiguous and uu is the first block
           => uu_real occupies the first base_dim entries of each orbpair slice.
         """
-        if not (self.method == "e3tb" and self.has_soc):
-            log.warning("[OrbitalMapper] nextham_uureal_mask=True but (method!=e3tb or has_soc=False). Skip.")
+        if not self.has_soc:
+            log.warning(
+                "[OrbitalMapper] nextham_uureal_mask=True but has_soc=False. Skip."
+            )
             return
 
         uu_real_mask_1d = torch.zeros(
@@ -763,10 +727,7 @@ class OrbitalMapper(BondMapper):
     def get_orbpairtype_maps(self):
         """
         Maps orbital type pairs (e.g., s-s, s-p) to RME slices.
-        Logic variations:
-        - SKTB: Uses min(l, l')+1 features, stores Upper Triangle only.
-        - E3TB (Non-SOC): Uses (2l+1)(2l'+1) features, stores Upper Triangle only.
-        - E3TB (SOC): Uses (2l+1)(2l'+1)*Factor features, stores Full Matrix.
+        Non-SOC stores the upper triangle; SOC stores the full matrix.
         """
         self.orbpairtype_maps = {}
         ist = 0
@@ -775,9 +736,7 @@ class OrbitalMapper(BondMapper):
         for i, io in enumerate(types):
             if self.orbtype_count[io] == 0: continue
 
-            # SOC E3TB: Iterate j from 0 (Full Matrix)
-            # SKTB / Non-SOC: Iterate j from i (Upper Triangle)
-            start_j = 0 if (self.method == "e3tb" and self.has_soc) else i
+            start_j = 0 if self.has_soc else i
 
             for j in range(start_j, len(types)):
                 jo = types[j]
@@ -786,23 +745,17 @@ class OrbitalMapper(BondMapper):
                 orb_pair = io + "-" + jo
                 il, jl = anglrMId[io], anglrMId[jo]
 
-                # Determine feature size per hop
-                if self.method == "e3tb":
-                    if self.has_soc:
-                        factor = self._e3tb_soc_feature_factor()
-                        n_rme = (2 * il + 1) * (2 * jl + 1) * factor
-                    else:
-                        n_rme = (2 * il + 1) * (2 * jl + 1)
+                if self.has_soc:
+                    factor = self._e3tb_soc_feature_factor()
+                    n_rme = (2 * il + 1) * (2 * jl + 1) * factor
                 else:
-                    # SKTB logic
-                    n_rme = min(il, jl) + 1
+                    n_rme = (2 * il + 1) * (2 * jl + 1)
 
                 # Calculate number of hops in this block
                 numhops = self.orbtype_count[io] * self.orbtype_count[jo] * n_rme
 
-                # Compress diagonal blocks (s-s, p-p) for symmetric storage methods
-                is_symmetric_storage = (not self.has_soc) or (self.method == "sktb")
-                if is_symmetric_storage and io == jo:
+                # Compress diagonal blocks for non-SOC symmetric storage.
+                if not self.has_soc and io == jo:
                     numhops += self.orbtype_count[jo] * n_rme
                     numhops = int(numhops / 2)
 
@@ -822,8 +775,7 @@ class OrbitalMapper(BondMapper):
 
         # Iterate through Full Basis
         for i, io in enumerate(self.full_basis):
-            # SOC E3TB: Full loop. Others: Upper Triangle loop.
-            start_j = 0 if (self.method == "e3tb" and self.has_soc) else i
+            start_j = 0 if self.has_soc else i
 
             for j in range(start_j, len(self.full_basis)):
                 jo = self.full_basis[j]
@@ -842,20 +794,14 @@ class OrbitalMapper(BondMapper):
                 if type_pair not in self.orbpairtype_maps: continue
                 type_slice = self.orbpairtype_maps[type_pair]
 
-                # Determine feature size
-                if self.method == "e3tb":
-                    if self.has_soc:
-                        factor = self._e3tb_soc_feature_factor()
-                        n_feature = (2 * il + 1) * (2 * jl + 1) * factor
-                    else:
-                        n_feature = (2 * il + 1) * (2 * jl + 1)
+                if self.has_soc:
+                    factor = self._e3tb_soc_feature_factor()
+                    n_feature = (2 * il + 1) * (2 * jl + 1) * factor
                 else:
-                    n_feature = min(il, jl) + 1
+                    n_feature = (2 * il + 1) * (2 * jl + 1)
 
                 # Calculate Offset within the block
-                is_symmetric_storage = (not self.has_soc) or (self.method == "sktb")
-
-                if is_symmetric_storage and i_type == j_type:
+                if not self.has_soc and i_type == j_type:
                     # Diagonal Block Compression (Arithmetic Progression Offset)
                     # i_n, j_n are 1-based indices relative to their type
                     count = self.orbtype_count[j_type]
@@ -870,86 +816,6 @@ class OrbitalMapper(BondMapper):
                 self.orbpair_maps[f"{io}-{jo}"] = slice(start, start + n_feature)
 
         return self.orbpair_maps
-
-    # ================== SKTB Specific Methods (Restored) ==================
-
-    def get_skonsite_maps(self):
-        """SKTB: Maps orbital pairs to Onsite Energy indices."""
-        assert self.method == "sktb", "Only sktb orbitalmapper have skonsite maps."
-
-        if hasattr(self, "skonsite_maps"): return self.skonsite_maps
-        if not hasattr(self, "skonsitetype_maps"): self.get_skonsitetype_maps()
-
-        self.mask_diag = torch.zeros(self.n_onsite_Es, dtype=torch.bool, device=self.device)
-        self.skonsite_maps = {}
-
-        # Similar to get_orbpair_maps, but for Onsite Energy storage (Upper Triangle)
-        for i, io in enumerate(self.full_basis):
-            for j, jo in enumerate(self.full_basis[i:]):  # Upper Triangle
-                i_n = int(re.findall(r'\d+', io)[0])
-                i_type = re.findall(r'[a-z]', io)[0]
-                j_n = int(re.findall(r'\d+', jo)[0])
-                j_type = re.findall(r'[a-z]', jo)[0]
-
-                # Onsite terms only exist between same orbital types (s-s, p-p, etc.)
-                if i_type == j_type:
-                    full_basis_pair = io + "-" + jo
-                    type_start = self.skonsitetype_maps[i_type].start
-                    count = self.orbtype_count[i_type]
-
-                    # Offset calculation (Upper triangle arithmetic progression)
-                    offset = ((2 * count + 2 - i_n) * (i_n - 1) // 2 + (j_n - i_n))
-                    start = int(type_start + offset)
-
-                    self.skonsite_maps[full_basis_pair] = slice(start, start + 1)
-                    if io == jo:
-                        self.mask_diag[start] = True
-
-        return self.skonsite_maps
-
-    def get_skonsitetype_maps(self):
-        """SKTB: Maps orbital types to Onsite Energy blocks."""
-        assert self.method == "sktb"
-        self.skonsitetype_maps = {}
-        ist = 0
-        for io in ["s", "p", "d", "f", "g", "h"]:
-            if self.orbtype_count[io] != 0:
-                # Storage size: (N^2 + N)/2
-                numonsites = int(0.5 * (self.orbtype_count[io] ** 2 + self.orbtype_count[io]))
-                self.skonsitetype_maps[io] = slice(ist, ist + numonsites)
-                ist += numonsites
-        return self.skonsitetype_maps
-
-    def get_sksoctype_maps(self):
-        """SKTB: Maps orbital types to Onsite SOC blocks."""
-        assert self.method == "sktb"
-        self.sksoctype_maps = {}
-        ist = 0
-        for io in ["s", "p", "d", "f", "g", "h"]:
-            if self.orbtype_count[io] != 0:
-                # 1 SOC parameter per orbital shell (lambda)
-                numonsites = self.orbtype_count[io]
-                self.sksoctype_maps[io] = slice(ist, ist + numonsites)
-                ist += numonsites
-        return self.sksoctype_maps
-
-    def get_sksoc_maps(self):
-        """SKTB: Maps specific orbitals to Onsite SOC indices."""
-        assert self.method == "sktb"
-        if hasattr(self, "sksoc_maps"): return self.sksoc_maps
-        if not hasattr(self, "sksoctype_maps"): self.get_sksoctype_maps()
-
-        self.sksoc_maps = {}
-        for io in self.full_basis:
-            i_n = int(re.findall(r'\d+', io)[0])
-            i_type = re.findall(r'[a-z]', io)[0]
-
-            start = int(self.sksoctype_maps[i_type].start + (i_n - 1))
-            self.sksoc_maps[io] = slice(start, start + 1)
-
-        return self.sksoc_maps
-
-    # ================== Common Utility Methods ==================
 
     def get_orbital_maps(self):
         """Generates slices for each atom's basis in the Hamiltonian."""

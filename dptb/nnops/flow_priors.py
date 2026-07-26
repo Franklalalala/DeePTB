@@ -34,9 +34,9 @@ HAAR_DM_NAMES = frozenset({"haar_dm", "haar_density", "haar_projector"})
 EXTERNAL_NAMES = frozenset(
     {"external", "dftb", "dftb_xtb", "xtb", "physical", "sk", "nnsk"}
 )
-DFTBSK_NAMES = frozenset(
-    {"dftbsk", "dftb_sk", "dftb_scf0", "dftb_on_the_fly", "skf", "skfile"}
-)
+# The on-the-fly DFTB-SK model family is intentionally absent in 0726-light.
+# Keep the exported name so flow.py remains byte-identical and sees no aliases.
+DFTBSK_NAMES = frozenset()
 
 
 class PriorContext:
@@ -607,174 +607,20 @@ class ExternalFamily(PriorFamily):
 
 
 class DFTBSKFamily(PriorFamily):
-    NAMES = DFTBSK_NAMES
+    """Compatibility placeholder for the byte-identical flow dispatcher.
 
-    def __init__(
-        self,
-        *,
-        prior: str,
-        skdata: str,
-        overlap: bool,
-        strict: bool,
-        require_geometry: bool,
-    ) -> None:
-        self.prior = prior
-        self.prior_skdata = skdata
-        self.dftb_prior_overlap = overlap
-        self.dftb_prior_strict = strict
-        self.dftb_prior_require_geometry = require_geometry
-        self._model_cache: Dict[Tuple[str, torch.dtype], Any] = {}
-        self._last: Optional[
-            Tuple[
-                Tuple[int, int, int, str, torch.dtype],
-                Optional[torch.Tensor],
-                Optional[torch.Tensor],
-            ]
-        ] = None
+    ``flow.py`` still imports this symbol and probes it as an optional fallback,
+    but 0726-light deliberately ships no DFTB-SK implementation or aliases.
+    """
+
+    NAMES = DFTBSK_NAMES
 
     @classmethod
     def from_options(cls, options: Dict[str, Any], idp: Any) -> "DFTBSKFamily":
-        skdata = str(
-            options.get(
-                "prior_skdata", options.get("dftb_skdata", options.get("skdata", ""))
-            )
-            or ""
-        )
-        return cls(
-            prior=str(options.get("prior", "zero")).lower().replace("-", "_"),
-            skdata=skdata,
-            overlap=bool(options.get("dftb_prior_overlap", False)),
-            strict=bool(options.get("dftb_prior_strict", True)),
-            require_geometry=bool(options.get("dftb_prior_require_geometry", True)),
-        )
-
-    def should_try(self) -> bool:
-        if self.prior in self.NAMES:
-            return True
-        return bool(self.prior_skdata) and self.prior in {
-            "dftb",
-            "dftb_xtb",
-            "physical",
-            "sk",
-        }
-
-    def _basis(self, ctx: PriorContext) -> Optional[Dict[str, Any]]:
-        basis = getattr(ctx.idp, "basis", None)
-        if isinstance(basis, dict):
-            return basis
-        return None
-
-    def _model(self, ctx: PriorContext, *, device: torch.device, dtype: torch.dtype) -> Any:
-        if not self.prior_skdata:
-            raise ValueError(
-                "On-the-fly DFTB-SK prior requires flow_options.prior_skdata "
-                "or flow_options.dftb_skdata."
-            )
-        basis = self._basis(ctx)
-        if basis is None:
-            raise ValueError(
-                "On-the-fly DFTB-SK prior requires an idp with a basis dictionary."
-            )
-        key = (str(device), dtype)
-        model = self._model_cache.get(key)
-        if model is None:
-            from dptb.nn.dftbsk import DFTBSK
-
-            model = DFTBSK(
-                basis=basis,
-                skdata=self.prior_skdata,
-                overlap=self.dftb_prior_overlap,
-                dtype=dtype,
-                device=device,
-                transform=True,
-            )
-            model.eval()
-            self._model_cache[key] = model
-        return model
-
-    def _outputs(
-        self,
-        data: Optional[AtomicDataDict.Type],
-        ctx: PriorContext,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if data is None:
-            return None, None
-        cache_key = (
-            id(data),
-            id(data.get(AtomicDataDict.ATOM_TYPE_KEY, None)),
-            id(data.get(_keys.EDGE_INDEX_KEY, None)),
-            str(device),
-            dtype,
-        )
-        if self._last is not None:
-            last_key, last_node, last_edge = self._last
-            if last_key == cache_key:
-                return last_node, last_edge
-
-        runtime_data = data.copy()
-        if self.dftb_prior_require_geometry and (
-            _keys.EDGE_VECTORS_KEY not in runtime_data
-            and (
-                _keys.POSITIONS_KEY not in runtime_data
-                or _keys.EDGE_INDEX_KEY not in runtime_data
-            )
-        ):
-            raise KeyError(
-                "On-the-fly DFTB-SK prior requires edge_vectors or pos+edge_index "
-                "so hopping features can be rotated into the DeePTB RME layout."
-            )
-        if _keys.PBC_KEY not in runtime_data:
-            num_graphs = ctx.num_graphs(runtime_data)
-            runtime_data[_keys.PBC_KEY] = torch.zeros(
-                num_graphs,
-                3,
-                device=device,
-                dtype=torch.bool,
-            )
-        model = self._model(ctx, device=device, dtype=dtype)
-        with torch.no_grad():
-            out = model(runtime_data)
-        node = out.get(_keys.NODE_FEATURES_KEY, None)
-        edge = out.get(_keys.EDGE_FEATURES_KEY, None)
-        self._last = (cache_key, node, edge)
-        return node, edge
+        return cls()
 
     def absolute_prior_like(self, like, *, data, label, ctx):
-        if not self.should_try():
-            return None
-        if not self.prior_skdata:
-            if self.prior in self.NAMES:
-                raise ValueError(
-                    "flow_options.prior='dftbsk' requires prior_skdata/dftb_skdata."
-                )
-            return None
-        try:
-            node, edge = self._outputs(
-                data,
-                ctx,
-                device=like.device,
-                dtype=like.dtype,
-            )
-            source = node if label == "node" else edge if label == "edge" else None
-            if source is None:
-                return None
-            return ctx.coerce_prior_source(
-                source,
-                like,
-                key=f"on_the_fly_dftbsk:{label}",
-                label=label,
-            )
-        except Exception as exc:
-            if self.prior in self.NAMES or self.dftb_prior_strict:
-                raise RuntimeError(
-                    "On-the-fly DFTB-SK prior failed. Check prior_skdata, basis, "
-                    "edge geometry, and target feature layout."
-                ) from exc
-            log.warning("On-the-fly DFTB-SK prior failed; falling back: %s", exc)
-            return None
+        return None
 
 
 class SplitPriorFamily(PriorFamily):
@@ -784,13 +630,13 @@ class SplitPriorFamily(PriorFamily):
     different node/edge mechanisms.
 
     Only absolute physical families are composable (basis_onsite /
-    overlap_huckel / external / dftbsk).  Haar-DM is excluded: its node and edge
+    overlap_huckel / external).  Haar-DM is excluded: its node and edge
     candidates must share one coherent draw, which a per-label split would break.
     Fail-closed: a side whose family produces no prior raises instead of
     degrading to zeros.
     """
 
-    SPLIT_ALLOWED = (BasisOnsiteFamily, OverlapHuckelFamily, ExternalFamily, DFTBSKFamily)
+    SPLIT_ALLOWED = (BasisOnsiteFamily, OverlapHuckelFamily, ExternalFamily)
 
     def __init__(self, *, node_family: PriorFamily, edge_family: PriorFamily,
                  node_name: str, edge_name: str) -> None:

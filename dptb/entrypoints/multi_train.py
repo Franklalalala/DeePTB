@@ -362,19 +362,13 @@ def _multi_train_impl(
                     jdata["model_options"] = checkpoint_model_options
 
                 basis = f["config"]["common_options"]["basis"]
-                if len(checkpoint_model_options) == 1 and checkpoint_model_options.get("nnsk") is not None:
-                    for asym, orb in jdata["common_options"]["basis"].items():
-                        assert asym in basis.keys(), f"Atom {asym} not found in model's basis"
-                        if orb != basis[asym]:
-                            log.info(f"Initializing Orbital {orb} of Atom {asym} from {basis[asym]}")
-                    for asym, orb in basis.items():
-                        if asym not in jdata["common_options"]["basis"].keys():
-                            jdata["common_options"]["basis"][asym] = orb
-                else:
-                    for asym, orb in jdata["common_options"]["basis"].items():
-                        assert asym in basis.keys(), f"Atom {asym} not found in model's basis"
-                        assert orb == basis[asym], f"Orbital {orb} of Atom {asym} not consistent with the model's basis."
-                    jdata["common_options"]["basis"] = basis
+                for asym, orb in jdata["common_options"]["basis"].items():
+                    assert asym in basis, f"Atom {asym} not found in model's basis"
+                    assert orb == basis[asym], (
+                        f"Orbital {orb} of Atom {asym} is inconsistent with "
+                        "the checkpoint basis."
+                    )
+                jdata["common_options"]["basis"] = basis
 
                 if restart:
                     jdata["train_options"] = merge_restart_train_options(

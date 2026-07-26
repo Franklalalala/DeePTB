@@ -564,7 +564,9 @@ def test_h10b_multitrainer_validation_per_key_count_not_diluted(monkeypatch):
     mt.log_single_model_compatible_loss = False
     mt.iter = 0
     mt._tagger = _NullTagger()
-    mt.validation_lossfunc = object()
+    mt.validation_lossfunc = SimpleNamespace(
+        supports_endpoint_triplet=True
+    )
 
     monkeypatch.setattr(
         mt, "_prepare_batch_bundle", lambda batch, with_lengths=True: (None, None)

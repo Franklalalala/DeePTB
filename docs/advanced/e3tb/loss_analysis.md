@@ -13,7 +13,7 @@ from dptb.nn import build_model
 
 dataset = build_dataset(
     root="your dataset root",
-    type="DefaultDataset",
+    type="LMDBDataset",
     prefix="frame",
     get_overlap=True,
     get_Hamiltonian=True,

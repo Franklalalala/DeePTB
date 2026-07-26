@@ -181,24 +181,7 @@ class Saver(Plugin, StatefulPlugin):
         return None
 
     def _configure_push(self):
-        if self.trainer.model.name == "nnsk":
-            push_option = self.trainer.model.model_options["nnsk"].get("push", False)
-            if push_option:
-                if abs(push_option['rs_thr']) + abs(push_option['w_thr']) != 0.0 and abs(push_option['ovp_thr']) != 0.0:
-                    log.error("rs_thr, w_thr and ovp_thr cannot be pushed at the same time.")
-                    raise ValueError("rs_thr, w_thr and ovp_thr cannot be pushed at the same time.")
-
-                if abs(push_option['rs_thr']) + abs(push_option['w_thr']) != 0.0:
-                    push = 'rs_w'
-                elif abs(push_option['ovp_thr']) != 0.0:
-                    push = 'overlap'
-                else:
-                    push = False
-            else:
-                push = False
-        else:
-            push = False
-        self.push = push
+        self.push = False
 
     def _safe_link_or_copy(self, src_abs, dst):
         try:

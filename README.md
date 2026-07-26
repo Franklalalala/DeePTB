@@ -1,135 +1,78 @@
 <p align="center">
-    <img src="docs/deeptb-logo.png" alt="DeePTB Logo" style="width: 80vw; height: auto;" />
-</p>
-<!-- <h1 align="center">DeePTB</h1> -->
-
-<!--# DeePTB -->
-<p align="center">
- <a href="https://github.com/deepmodeling"><img src="https://img.shields.io/badge/DeepModeling-Incubating_Project-blue" alt="DeepModeling"></a>
- <a href="https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml"><img src="https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml/badge.svg" alt="Build"></a>
- <a href="https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml"><img src="https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml/badge.svg" alt="Test"></a>
- <a href="https://pypi.org/project/dptb/"><img src="https://img.shields.io/pypi/v/dptb.svg" alt="PyPI version"></a>
- <a href="https://github.com/deepmodeling/DeePTB/blob/main/LICENSE"><img src="https://img.shields.io/github/license/deepmodeling/DeePTB.svg" alt="License"></a>
+  <img src="docs/deeptb-logo.png" alt="DeePTB Logo" width="720" />
 </p>
 
-<!--
-[![DeepModeling](https://img.shields.io/badge/DeepModeling-Incubating_Project-blue)](https://github.com/deepmodeling)
-[![Build](https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml/badge.svg)](https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml)
-[![Test](https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml/badge.svg)](https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml)
--->
+# DeePTB 0726-light
 
-## 🚀 About DeePTB
-DeePTB is an innovative Python package that uses deep learning to accelerate *ab initio* electronic structure simulations. It offers versatile, accurate, and efficient simulations for a wide range of materials and phenomena. Trained on small systems, DeePTB can predict electronic structures of large systems, handle structural perturbations, and integrate with molecular dynamics for finite temperature simulations, providing comprehensive insights into atomic and electronic behavior.
+`0726-light` is the focused DeePTB development line for the actively
+maintained E3-equivariant Hamiltonian and quantum-operator workflows. It is
+derived from `0721-stable` and intentionally removes historical model,
+transport, conversion, and dataset implementations that are outside the
+current development path.
 
-- **Key Features**
-DeePTB contains two main components: 
-  1. **DeePTB-SK**: deep learning based local environment dependent Slater-Koster TB.
-      - Customizable Slater-Koster parameterization with neural network corrections for . 
-      - Flexible basis and exchange-correlation functional choices.
-      - Handle systems with strong spin-orbit coupling (SOC) effects.
+## Maintained scope
 
-  2. **DeePTB-E3**: E3-equivariant neural networks for representing quantum operators.
-      - Construct DFT Hamiltonians/density and overlap matrices under full LCAO basis.
-      - Utilize (**S**trictly) **L**ocalized **E**quivariant **M**essage-passing (**(S)LEM**) model for high data-efficiency and accuracy.
-      - Employs SO(2) convolution for efficient handling of higher-order orbitals in LCAO basis.
+- LEM/MoE-v3, H0, pair, nonlinear, in-frame, and EMol embedding endpoints.
+- `e3tb` and `block_native` prediction heads.
+- Hamiltonian/SOC construction and band or AO-block output.
+- LMDB-backed datasets and record/materialization pipelines.
+- Conditional flow matching, MeanFlow, block ODE, physical priors, and
+  current trainer/restart/distributed workflows.
+- Current SO(2), grouped-GEMM, and optional `so2-cuda-ops` acceleration.
 
+The large, recently maintained `dptb/nnops/flow.py` implementation is kept
+unchanged from `0721-stable`.
 
-For more details, see our papers:
-- [DeePTB-SK: Nat Commun 15, 6772 (2024)](https://doi.org/10.1038/s41467-024-51006-4)
-- [DeePTB-E3: ICLR 2025 Spotlight](https://openreview.net/forum?id=kpq3IIjUD3)
+## Intentional incompatibilities
 
+This branch does not provide NNSK/SKTB/DFTB/MIX models, NEGF transport,
+DOS/Fermi-surface integrations, legacy non-LMDB dataset classes, historical
+embedding aliases, or the old conversion/template CLI commands. Unsupported
+configuration and checkpoint routes fail early with a clear error.
 
-## 📚 Documentation
+See [`LIGHTWEIGHT_SCOPE.md`](LIGHTWEIGHT_SCOPE.md) for the exact retained and
+removed surface.
 
-- **Online documentation**
-  
-    For a comprehensive guide and usage tutorials, visit [Documentation website](https://deeptb.readthedocs.io/en/latest/).
+## Installation
 
-- **Contributing**
+Use Python 3.9-3.12 and install PyTorch for the intended CPU/CUDA platform
+first:
 
-    We welcome contributions to DeePTB. Please refer to our [contributing guidelines](https://deeptb.readthedocs.io/en/latest/community/contribution_guide.html) for details.
-
-
-
-## 🛠️ Installation
-
-Installing **DeePTB** is straightforward. We recommend using a virtual environment for dependency management.
-
-- **Requirements**
-  - Git
-  - Python 3.9 to 3.12.
-  - Torch 2.0.0 to 2.5.1 ([PyTorch Installation](https://pytorch.org/get-started/locally)).
-  - ifermi (optional, for 3D fermi-surface plotting).
-  - TBPLaS (optional).
-
-- **From Source** 
-  
-    Highly recommended to install DeePTB from source to get the latest features and bug fixes.
-  1. **Setup Python environment**:
-        Using conda (recommended, python >=3.9, <=3.12 ), e.g.,
-        ```bash
-        conda create -n dptb_venv python=3.10
-        conda activate dptb_venv
-        ```
-        or using venv (make sure python >=3.9,<=3.12)
-    
-        ```bash
-        python -m venv dptb_venv
-        source dptb_venv/bin/activate
-        ```
-
-  2. **Clone DeePTB and  Navigate to the root directory**:
-        ```bash
-        git clone https://github.com/deepmodeling/DeePTB.git
-        cd DeePTB
-        ```
-
-  3. **Install `torch`**:
-        ```bash
-        pip install "torch>=2.0.0,<=2.5.0"
-        ```
-  4. **Install `torch-scatter`** (two ways):
-        - **Recommended**: Install torch and torch-scatter using the following commands:
-            ```bash
-            python docs/auto_install_torch_scatter.py
-            ```
-        - **Manual**: Install torch and torch-scatter manually:
-            ```bash
-            pip install torch-scatter -f https://data.pyg.org/whl/torch-${version}+${CUDA}.html
-            ```
-            where `${version}` is the version of torch, e.g., 2.5.0, and `${CUDA}` is the CUDA version, e.g., cpu, cu118, cu121, cu124. See [torch_scatter doc](https://github.com/rusty1s/pytorch_scatter) for more details.   
-
-  5. **Install DeePTB**:
-        ```bash
-        pip install .
-        ```
-
-- **Easy Installation**
-  
-  note: not fully tested, please use the source installation for a stable version.
-  1. Using PyPi
-  2. Ensure you have Python 3.9 to 3.12 and Torch installed.
-  3. Install DeePTB with pip:
-        ```bash
-        pip install dptb
-        ```
-
-## Test code 
-
-To ensure the code is correctly installed, please run the unit tests first:
 ```bash
-pytest ./dptb/tests/
+conda create -n dptb python=3.10
+conda activate dptb
+pip install "torch>=2.0"
+pip install .
 ```
-Be careful if not all tests pass!
 
-## 🤝 How to Cite
+The optional optimized SO(2) kernels are supplied by
+[`so2-cuda-ops`](https://github.com/Franklalalala/SO2CUDA). CPU imports and
+standard fallback routes remain usable when that extension is unavailable.
+Install them together with DeePTB using `pip install ".[so2]"`.
 
-The following references are required to be cited when using DeePTB. Specifically:
+## Commands
 
-- **For DeePTB-SK:**
+```bash
+dptb train input.yaml -o output
+dptb test test.yaml --init-model checkpoint.pth --output output
+dptb run run.yaml --init-model checkpoint.pth --output output
+```
 
-    Q. Gu, Z. Zhouyin, S. K. Pandey, P. Zhang, L. Zhang, and W. E, Deep Learning Tight-Binding Approach for Large-Scale Electronic Simulations at Finite Temperatures with Ab Initio Accuracy, Nat Commun 15, 6772 (2024).
-  
-- **For DeePTB-E3:**
-  
-    Z. Zhouyin, Z. Gan, S. K. Pandey, L. Zhang, and Q. Gu, Learning Local Equivariant Representations for Quantum Operators, In The 13th International Conference on Learning Representations (ICLR) 2025. 
+Use the strict schema reference under `docs/input_params/` for current
+configuration fields.
+
+## Validation
+
+```bash
+python -m pytest dptb/tests
+```
+
+CUDA-only kernel tests skip automatically when the required device or
+extension is unavailable.
+
+## Citation
+
+For the maintained E3 model family, cite:
+
+> Z. Zhouyin, Z. Gan, S. K. Pandey, L. Zhang, and Q. Gu, “Learning Local
+> Equivariant Representations for Quantum Operators,” ICLR 2025 Spotlight.

@@ -198,13 +198,6 @@ class Trainer(BaseTrainer):
         self._last_flow_validation_state = {}
         self._last_self_consistency_state = {}
 
-        if train_options["loss_options"]["train"]["method"] == "skints":
-            assert self.model.name == 'nnsk', "The model should be nnsk for the skints loss function."
-            assert self.model.onsite_fn.functype in ['none',
-                                                     'uniform'], "The onsite function should be none or uniform for the skints loss function."
-            log.info("The skints loss function is used for training, the model.transform is then set to False.")
-            self.model.transform = False
-
     def _assert_model_in_loss_endpoint_contract(self) -> None:
         """Validate criteria used directly with a model-in-loss flow."""
         assert_model_in_loss_endpoint_metric_space(

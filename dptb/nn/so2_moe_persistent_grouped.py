@@ -36,13 +36,24 @@ from typing import Optional
 import torch
 
 from dptb.nn.cuda_ops.extension_loader import load_cuda_extension, truthy_env
-from dptb.nn.so2_moe_fused_p0 import _segmented_m0_backward, _segmented_pair_backward
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2WignerBlocks, _mole_graph_index
 
 _EXT = None
 _WARNED: set[str] = set()
 _LAYOUT_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
 _LAYOUT_CACHE_MAX = 32
+
+
+def _segmented_m0_backward(*args, **kwargs):
+    from dptb.nn.so2_moe_fused_p0 import _segmented_m0_backward as backend
+
+    return backend(*args, **kwargs)
+
+
+def _segmented_pair_backward(*args, **kwargs):
+    from dptb.nn.so2_moe_fused_p0 import _segmented_pair_backward as backend
+
+    return backend(*args, **kwargs)
 
 
 def _flag(name: str, default: str = "0") -> bool:

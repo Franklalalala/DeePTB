@@ -17,7 +17,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.nn.embedding.emb import Embedding
 from ..radial_basis import BesselBasis
 from ..base import ScalarMLPFunction
-from dptb.nn.embedding.from_deephe3.deephe3 import tp_path_exists
+from dptb.nn.embedding.irreps_utils import tp_path_exists
 from dptb.data import _keys
 from dptb.nn.cutoff import cosine_cutoff, polynomial_cutoff
 from dptb.nn.rescale import E3ElementLinear
@@ -385,7 +385,9 @@ class GatedEdgeAggregation(torch.nn.Module):
             contribution = contribution[same_graph]
             edge_message = edge_message[same_graph]
             edge_graph = batch[dst]
-            num_graphs = int(batch.max().item()) + 1 if batch.numel() else 1
+            # Graph ids carried by nodes are bounded by the node count.  Using
+            # that safe upper bound avoids a CUDA -> host scalar sync here.
+            num_graphs = int(batch.shape[0]) if batch.numel() else 1
             graph_mass = scatter_add(contribution, edge_graph, dim=0, dim_size=num_graphs)
             selected_graph = int(torch.argmax(graph_mass).item())
             graph_nodes = torch.nonzero(batch == selected_graph, as_tuple=False).flatten()

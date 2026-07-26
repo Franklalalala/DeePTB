@@ -3,7 +3,6 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from dptb.data.dataset._base_datasets import AtomicInMemoryDataset
 from dptb.data.dataset.lmdb_dataset import LMDBDataset
 from dptb.data import AtomicDataDict
 from dptb.data.transforms import OrbitalMapper
@@ -598,35 +597,6 @@ def test_split_batch_for_oom_bisects_and_preserves_metadata():
     assert right.__dptb_item_costs__ == [4, 5]
     assert left.num_graphs == 2
     assert right.num_graphs == 2
-
-
-def test_atomic_inmemory_dataset_exposes_dynamic_batch_cost_parts_without_get_example():
-    data_list = [
-        Data(
-            pos=torch.zeros((2, 3)),
-            edge_index=torch.zeros((2, 3), dtype=torch.long),
-            env_index=torch.zeros((2, 4), dtype=torch.long),
-            onsitenv_index=torch.zeros((2, 5), dtype=torch.long),
-            kpoint=torch.zeros((2, 3)),
-            eigenvalue=torch.zeros((2, 3)),
-        ),
-        Data(
-            pos=torch.zeros((4, 3)),
-            edge_index=torch.zeros((2, 6), dtype=torch.long),
-            env_index=torch.zeros((2, 7), dtype=torch.long),
-            onsitenv_index=torch.zeros((2, 8), dtype=torch.long),
-            kpoint=torch.zeros((1, 3)),
-            eigenvalue=torch.zeros((1, 3)),
-        ),
-    ]
-    dataset = AtomicInMemoryDataset.__new__(AtomicInMemoryDataset)
-    dataset.data = Batch.from_data_list(data_list)
-    dataset._indices = None
-
-    assert dataset.get_dynamic_batch_cost_parts(1) == {
-        "block": 0,
-        "edge": 6,
-    }
 
 
 def test_lmdb_dataset_exposes_dynamic_batch_cost_parts_from_entry_metadata():

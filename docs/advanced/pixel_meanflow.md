@@ -88,9 +88,10 @@ loss; those are not required for the paper-conservative path.
 
 ## Physical prior and jitter
 
-For no-H0 or weak-H0 PMF experiments, prefer a low-cost physical prior over a
-plain dense Gaussian. The current non-NN on-the-fly path uses DeePTB's DFTB-SK
-module with Slater-Koster parameters:
+For no-H0 or weak-H0 PMF experiments, prefer a maintained low-cost physical
+prior over a plain dense Gaussian. `basis_onsite` uses the onsite database;
+`overlap_huckel` uses supplied overlap fields; and `external` consumes explicit
+absolute-prior fields from the dataset.
 
 ```json
 {
@@ -98,10 +99,8 @@ module with Slater-Koster parameters:
     "enabled": true,
     "objective": "pixel_meanflow",
     "mode": "residual",
-    "prior": "dftbsk",
-    "prior_skdata": "/path/to/slater_koster_files_or_skparams.pth",
-    "dftb_prior_overlap": false,
-    "dftb_prior_require_geometry": true,
+    "prior": "basis_onsite",
+    "basis_onsite_scale": 1.0,
     "missing_h0_policy": "warn_zero",
     "physical_prior_jitter_sigma": 0.02,
     "physical_prior_jitter_reference_scale": true,
@@ -110,10 +109,9 @@ module with Slater-Koster parameters:
 }
 ```
 
-This path runs `DFTBSK(..., transform=True)` under `torch.no_grad()`, aligns the
-result to the active node/edge feature layout, converts the absolute guess to a
-residual prior, and then writes the interpolated state back to `node_h0` /
-`edge_h0` before the model initial layer sees the batch. It does not use NNSK.
+The prior family aligns its absolute guess to the active node/edge feature
+layout, converts it to a residual prior, and writes the interpolated state back
+to `node_h0` / `edge_h0` before the model initial layer sees the batch.
 
 For user-facing reports, describe the endpoint metric as
 `label_delta_H - pred_delta_H`. The code still contains internal

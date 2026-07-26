@@ -1,251 +1,529 @@
-========================================
 Data Options
-========================================
-.. _`data_options`: 
-
-data_options: 
+============
+data_options:
     | type: ``dict``
     | argument path: ``data_options``
 
     The options for dataset settings in training.
 
-    .. _`data_options/r_max`: 
-
-    r_max: 
-        | type: ``str`` | ``float`` | ``int``, optional, default: ``5.0``
+    r_max:
+        | type: ``int`` | ``NoneType`` | ``float``, optional, default: ``None``
         | argument path: ``data_options/r_max``
 
         r_max
 
-    .. _`data_options/oer_max`: 
-
-    oer_max: 
-        | type: ``str`` | ``float`` | ``int``, optional, default: ``5.0``
+    oer_max:
+        | type: ``int`` | ``NoneType`` | ``float``, optional, default: ``None``
         | argument path: ``data_options/oer_max``
 
         oer_max
 
-    .. _`data_options/er_max`: 
-
-    er_max: 
-        | type: ``str`` | ``float`` | ``int``, optional, default: ``5.0``
+    er_max:
+        | type: ``int`` | ``NoneType`` | ``float``, optional, default: ``None``
         | argument path: ``data_options/er_max``
 
         er_max
 
-    .. _`data_options/train`: 
-
-    train: 
+    train:
         | type: ``dict``
         | argument path: ``data_options/train``
 
-        The dataset settings for training.
+        LMDB dataset settings for training.
 
-        .. _`data_options/train/type`: 
-
-        type: 
-            | type: ``str``, optional, default: ``DefaultDataset``
+        type:
+            | type: ``str``, optional, default: ``LMDBDataset``
             | argument path: ``data_options/train/type``
 
-            The type of dataset.
+            The maintained dataset backend. Only LMDBDataset is supported.
 
-        .. _`data_options/train/root`: 
-
-        root: 
+        root:
             | type: ``str``
             | argument path: ``data_options/train/root``
 
-            This is where the dataset stores data files.
+            Root containing LMDB shard directories.
 
-        .. _`data_options/train/prefix`: 
-
-        prefix: 
-            | type: ``str`` | ``NoneType``, optional, default: ``None``
+        prefix:
+            | type: ``str``
             | argument path: ``data_options/train/prefix``
 
-            The prefix of the folders under root, which will be loaded in dataset.
+            Shard-directory prefix.
 
-        .. _`data_options/train/separator`: 
-
-        separator: 
+        separator:
             | type: ``str``, optional, default: ``.``
             | argument path: ``data_options/train/separator``
 
-            the sepatator used to separate the prefix and suffix in the dataset directory. Default: '.'
+            Prefix/suffix separator.
 
-        .. _`data_options/train/get_Hamiltonian`: 
-
-        get_Hamiltonian: 
+        get_Hamiltonian:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/train/get_Hamiltonian``
 
-            Choose whether the Hamiltonian blocks (and overlap blocks, if provided) are loaded when building dataset.
+            Load Hamiltonian blocks.
 
-        .. _`data_options/train/get_overlap`: 
+        get_H0:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/get_H0``
 
-        get_overlap: 
+            Load physical H0 initialization data.
+
+        get_P2:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/get_P2``
+
+            Backward-compatible switch for the selected P2/P23 prior.
+
+        prior_kind:
+            | type: ``str``, optional, default: ``p2``
+            | argument path: ``data_options/train/prior_kind``
+
+            Selected physical prior: p2 or p23.
+
+        residual_hamiltonian:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/residual_hamiltonian``
+
+            Train on dH = H - H0.
+
+        residual_shrink_policy:
+            | type: ``str``, optional, default: ``error``
+            | argument path: ``data_options/train/residual_shrink_policy``
+
+            Residual shrink gate: error, warn, or off.
+
+        min_residual_shrink:
+            | type: ``int`` | ``float``, optional, default: ``1.2``
+            | argument path: ``data_options/train/min_residual_shrink``
+
+            Minimum residual shrink ratio.
+
+        h0_key:
+            | type: ``str``, optional, default: ``hamiltonian_0``
+            | argument path: ``data_options/train/h0_key``
+
+            Raw LMDB H0 key.
+
+        prefer_precomputed_h0:
+            | type: ``bool``, optional, default: ``True``
+            | argument path: ``data_options/train/prefer_precomputed_h0``
+
+            Prefer stored node_h0/edge_h0 features.
+
+        p2_key:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/train/p2_key``
+
+            Deprecated explicit raw prior key; normally derived from prior_kind.
+
+        prefer_precomputed_p2:
+            | type: ``bool``, optional, default: ``True``
+            | argument path: ``data_options/train/prefer_precomputed_p2``
+
+            Prefer stored selected-prior RME features.
+
+        require_full_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/require_full_h_target``
+
+            Require versioned absolute Full-H target provenance.
+
+        require_residual_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/require_residual_h_target``
+
+            Require versioned residual-H target provenance.
+
+        require_uureal_block_ode:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/require_uureal_block_ode``
+
+            Require compact uu_real block-ODE records.
+
+        require_residual_from_full_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/require_residual_from_full_h_target``
+
+            Require online H-H0 materialization from absolute Full H.
+
+        expected_p2_source_fingerprint:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/train/expected_p2_source_fingerprint``
+
+            Expected selected-prior source SHA256.
+
+        expected_physical_h0_source_fingerprint:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/train/expected_physical_h0_source_fingerprint``
+
+            Expected physical-H0 source SHA256.
+
+        allow_unbound_prior_source_fingerprint:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/allow_unbound_prior_source_fingerprint``
+
+            Development-only prior provenance escape hatch.
+
+        audit_p2_representations:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/audit_p2_representations``
+
+            Audit selected-prior RME/AO consistency at ingest.
+
+        require_p2_blocks:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/train/require_p2_blocks``
+
+            Require selected-prior AO blocks.
+
+        get_overlap:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/train/get_overlap``
 
-            Choose whether the overlap blocks are loaded when building dataset.
+            Load overlap blocks.
 
-        .. _`data_options/train/get_DM`: 
-
-        get_DM: 
+        get_DM:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/train/get_DM``
 
-            Choose whether the density matrix is loaded when building dataset.
+            Load density matrices.
 
-        .. _`data_options/train/get_eigenvalues`: 
-
-        get_eigenvalues: 
+        get_eigenvalues:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/train/get_eigenvalues``
 
-            Choose whether the eigenvalues and k-points are loaded when building dataset.
+            Load eigenvalues and k-points.
 
-    .. _`data_options/validation`: 
-
-    validation: 
+    validation:
         | type: ``dict``, optional
         | argument path: ``data_options/validation``
 
-        The dataset settings for validation.
+        LMDB dataset settings for validation.
 
-        .. _`data_options/validation/type`: 
-
-        type: 
-            | type: ``str``, optional, default: ``DefaultDataset``
+        type:
+            | type: ``str``, optional, default: ``LMDBDataset``
             | argument path: ``data_options/validation/type``
 
-            The type of dataset.
+            The maintained dataset backend. Only LMDBDataset is supported.
 
-        .. _`data_options/validation/root`: 
-
-        root: 
+        root:
             | type: ``str``
             | argument path: ``data_options/validation/root``
 
-            This is where the dataset stores data files.
+            Root containing LMDB shard directories.
 
-        .. _`data_options/validation/prefix`: 
-
-        prefix: 
-            | type: ``str`` | ``NoneType``, optional, default: ``None``
+        prefix:
+            | type: ``str``
             | argument path: ``data_options/validation/prefix``
 
-            The prefix of the folders under root, which will be loaded in dataset.
+            Shard-directory prefix.
 
-        .. _`data_options/validation/separator`: 
-
-        separator: 
+        separator:
             | type: ``str``, optional, default: ``.``
             | argument path: ``data_options/validation/separator``
 
-            the sepatator used to separate the prefix and suffix in the dataset directory. Default: '.'
+            Prefix/suffix separator.
 
-        .. _`data_options/validation/get_Hamiltonian`: 
-
-        get_Hamiltonian: 
+        get_Hamiltonian:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/validation/get_Hamiltonian``
 
-            Choose whether the Hamiltonian blocks (and overlap blocks, if provided) are loaded when building dataset.
+            Load Hamiltonian blocks.
 
-        .. _`data_options/validation/get_overlap`: 
+        get_H0:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/get_H0``
 
-        get_overlap: 
+            Load physical H0 initialization data.
+
+        get_P2:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/get_P2``
+
+            Backward-compatible switch for the selected P2/P23 prior.
+
+        prior_kind:
+            | type: ``str``, optional, default: ``p2``
+            | argument path: ``data_options/validation/prior_kind``
+
+            Selected physical prior: p2 or p23.
+
+        residual_hamiltonian:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/residual_hamiltonian``
+
+            Train on dH = H - H0.
+
+        residual_shrink_policy:
+            | type: ``str``, optional, default: ``error``
+            | argument path: ``data_options/validation/residual_shrink_policy``
+
+            Residual shrink gate: error, warn, or off.
+
+        min_residual_shrink:
+            | type: ``int`` | ``float``, optional, default: ``1.2``
+            | argument path: ``data_options/validation/min_residual_shrink``
+
+            Minimum residual shrink ratio.
+
+        h0_key:
+            | type: ``str``, optional, default: ``hamiltonian_0``
+            | argument path: ``data_options/validation/h0_key``
+
+            Raw LMDB H0 key.
+
+        prefer_precomputed_h0:
+            | type: ``bool``, optional, default: ``True``
+            | argument path: ``data_options/validation/prefer_precomputed_h0``
+
+            Prefer stored node_h0/edge_h0 features.
+
+        p2_key:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/validation/p2_key``
+
+            Deprecated explicit raw prior key; normally derived from prior_kind.
+
+        prefer_precomputed_p2:
+            | type: ``bool``, optional, default: ``True``
+            | argument path: ``data_options/validation/prefer_precomputed_p2``
+
+            Prefer stored selected-prior RME features.
+
+        require_full_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/require_full_h_target``
+
+            Require versioned absolute Full-H target provenance.
+
+        require_residual_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/require_residual_h_target``
+
+            Require versioned residual-H target provenance.
+
+        require_uureal_block_ode:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/require_uureal_block_ode``
+
+            Require compact uu_real block-ODE records.
+
+        require_residual_from_full_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/require_residual_from_full_h_target``
+
+            Require online H-H0 materialization from absolute Full H.
+
+        expected_p2_source_fingerprint:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/validation/expected_p2_source_fingerprint``
+
+            Expected selected-prior source SHA256.
+
+        expected_physical_h0_source_fingerprint:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/validation/expected_physical_h0_source_fingerprint``
+
+            Expected physical-H0 source SHA256.
+
+        allow_unbound_prior_source_fingerprint:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/allow_unbound_prior_source_fingerprint``
+
+            Development-only prior provenance escape hatch.
+
+        audit_p2_representations:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/audit_p2_representations``
+
+            Audit selected-prior RME/AO consistency at ingest.
+
+        require_p2_blocks:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/validation/require_p2_blocks``
+
+            Require selected-prior AO blocks.
+
+        get_overlap:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/validation/get_overlap``
 
-            Choose whether the overlap blocks are loaded when building dataset.
+            Load overlap blocks.
 
-        .. _`data_options/validation/get_DM`: 
-
-        get_DM: 
+        get_DM:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/validation/get_DM``
 
-            Choose whether the density matrix is loaded when building dataset.
+            Load density matrices.
 
-        .. _`data_options/validation/get_eigenvalues`: 
-
-        get_eigenvalues: 
+        get_eigenvalues:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/validation/get_eigenvalues``
 
-            Choose whether the eigenvalues and k-points are loaded when building dataset.
+            Load eigenvalues and k-points.
 
-    .. _`data_options/reference`: 
-
-    reference: 
+    reference:
         | type: ``dict``, optional
         | argument path: ``data_options/reference``
 
-        The dataset settings for reference.
+        LMDB dataset settings for reference batches.
 
-        .. _`data_options/reference/type`: 
-
-        type: 
-            | type: ``str``, optional, default: ``DefaultDataset``
+        type:
+            | type: ``str``, optional, default: ``LMDBDataset``
             | argument path: ``data_options/reference/type``
 
-            The type of dataset.
+            The maintained dataset backend. Only LMDBDataset is supported.
 
-        .. _`data_options/reference/root`: 
-
-        root: 
+        root:
             | type: ``str``
             | argument path: ``data_options/reference/root``
 
-            This is where the dataset stores data files.
+            Root containing LMDB shard directories.
 
-        .. _`data_options/reference/prefix`: 
-
-        prefix: 
-            | type: ``str`` | ``NoneType``, optional, default: ``None``
+        prefix:
+            | type: ``str``
             | argument path: ``data_options/reference/prefix``
 
-            The prefix of the folders under root, which will be loaded in dataset.
+            Shard-directory prefix.
 
-        .. _`data_options/reference/separator`: 
-
-        separator: 
+        separator:
             | type: ``str``, optional, default: ``.``
             | argument path: ``data_options/reference/separator``
 
-            the sepatator used to separate the prefix and suffix in the dataset directory. Default: '.'
+            Prefix/suffix separator.
 
-        .. _`data_options/reference/get_Hamiltonian`: 
-
-        get_Hamiltonian: 
+        get_Hamiltonian:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/reference/get_Hamiltonian``
 
-            Choose whether the Hamiltonian blocks (and overlap blocks, if provided) are loaded when building dataset.
+            Load Hamiltonian blocks.
 
-        .. _`data_options/reference/get_overlap`: 
+        get_H0:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/get_H0``
 
-        get_overlap: 
+            Load physical H0 initialization data.
+
+        get_P2:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/get_P2``
+
+            Backward-compatible switch for the selected P2/P23 prior.
+
+        prior_kind:
+            | type: ``str``, optional, default: ``p2``
+            | argument path: ``data_options/reference/prior_kind``
+
+            Selected physical prior: p2 or p23.
+
+        residual_hamiltonian:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/residual_hamiltonian``
+
+            Train on dH = H - H0.
+
+        residual_shrink_policy:
+            | type: ``str``, optional, default: ``error``
+            | argument path: ``data_options/reference/residual_shrink_policy``
+
+            Residual shrink gate: error, warn, or off.
+
+        min_residual_shrink:
+            | type: ``int`` | ``float``, optional, default: ``1.2``
+            | argument path: ``data_options/reference/min_residual_shrink``
+
+            Minimum residual shrink ratio.
+
+        h0_key:
+            | type: ``str``, optional, default: ``hamiltonian_0``
+            | argument path: ``data_options/reference/h0_key``
+
+            Raw LMDB H0 key.
+
+        prefer_precomputed_h0:
+            | type: ``bool``, optional, default: ``True``
+            | argument path: ``data_options/reference/prefer_precomputed_h0``
+
+            Prefer stored node_h0/edge_h0 features.
+
+        p2_key:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/reference/p2_key``
+
+            Deprecated explicit raw prior key; normally derived from prior_kind.
+
+        prefer_precomputed_p2:
+            | type: ``bool``, optional, default: ``True``
+            | argument path: ``data_options/reference/prefer_precomputed_p2``
+
+            Prefer stored selected-prior RME features.
+
+        require_full_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/require_full_h_target``
+
+            Require versioned absolute Full-H target provenance.
+
+        require_residual_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/require_residual_h_target``
+
+            Require versioned residual-H target provenance.
+
+        require_uureal_block_ode:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/require_uureal_block_ode``
+
+            Require compact uu_real block-ODE records.
+
+        require_residual_from_full_h_target:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/require_residual_from_full_h_target``
+
+            Require online H-H0 materialization from absolute Full H.
+
+        expected_p2_source_fingerprint:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/reference/expected_p2_source_fingerprint``
+
+            Expected selected-prior source SHA256.
+
+        expected_physical_h0_source_fingerprint:
+            | type: ``str``, optional, default: (empty string)
+            | argument path: ``data_options/reference/expected_physical_h0_source_fingerprint``
+
+            Expected physical-H0 source SHA256.
+
+        allow_unbound_prior_source_fingerprint:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/allow_unbound_prior_source_fingerprint``
+
+            Development-only prior provenance escape hatch.
+
+        audit_p2_representations:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/audit_p2_representations``
+
+            Audit selected-prior RME/AO consistency at ingest.
+
+        require_p2_blocks:
+            | type: ``bool``, optional, default: ``False``
+            | argument path: ``data_options/reference/require_p2_blocks``
+
+            Require selected-prior AO blocks.
+
+        get_overlap:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/reference/get_overlap``
 
-            Choose whether the overlap blocks are loaded when building dataset.
+            Load overlap blocks.
 
-        .. _`data_options/reference/get_DM`: 
-
-        get_DM: 
+        get_DM:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/reference/get_DM``
 
-            Choose whether the density matrix is loaded when building dataset.
+            Load density matrices.
 
-        .. _`data_options/reference/get_eigenvalues`: 
-
-        get_eigenvalues: 
+        get_eigenvalues:
             | type: ``bool``, optional, default: ``False``
             | argument path: ``data_options/reference/get_eigenvalues``
 
-            Choose whether the eigenvalues and k-points are loaded when building dataset.
-
+            Load eigenvalues and k-points.

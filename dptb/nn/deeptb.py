@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch
-from typing import Union, Tuple, Optional, Callable, Dict
-import torch.nn.functional as F
+from typing import Union, Optional, Dict
 from dptb.configuration import (
     canonicalize_embedding_options,
     canonicalize_prediction_options,
@@ -10,7 +9,6 @@ from dptb.configuration import (
 )
 from dptb.nn.embedding import Embedding
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
 from dptb.data import AtomicDataDict
 from dptb.data.interfaces.p2_contract import (
     build_prior_spec,
@@ -21,19 +19,13 @@ from dptb.nn.blockwise_hamiltonian import (
     attach_full_hamiltonian_from_h0,
     attach_full_hamiltonian_from_prior,
 )
-from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian
-from dptb.nn.nnsk import NNSK
-from dptb.nn.dftbsk import DFTBSK
-from e3nn.o3 import Linear
+from dptb.nn.hamiltonian import E3Hamiltonian
 from dptb.nn.rescale import E3PerSpeciesScaleShift, E3PerEdgeSpeciesScaleShift
 from dptb.nn.embedding.output_routes import resolve_output_route, validate_prediction_route
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
 import logging
 
 log = logging.getLogger(__name__)
-
-""" if this class is called, it suggest user choose a embedding method. If not, it should directly use _sktb.py
-"""
 
 
 def _resolve_embedding_output_route_spec(embedding_module, embedding_options, prediction_options):
@@ -60,44 +52,6 @@ def _resolve_embedding_output_route_spec(embedding_module, embedding_options, pr
         )
     log.info("Embedding did not expose output_route_spec; assuming legacy_rme route.")
     return spec
-
-def get_neuron_config(nl):
-    """Extracts the configuration of a neural network from a list of layer sizes.
-
-    Args:
-        nl: A list of integers representing the number of neurons in each layer.
-            If the list has an even number of elements, the last element is assumed
-            to be the output layer size.
-
-    Returns:
-        A list of dictionaries, where each dictionary describes the configuration of
-        a layer in the neural network. Each dictionary has the following keys:
-        - in_features: The number of input neurons for the layer.
-        - hidden_features: The number of hidden neurons for the layer (if applicable).
-        - out_features: The number of output neurons for the layer.
-    
-        e.g.
-        [1, 2, 3, 4, 5, 6] -> [{'in_features': 1, 'hidden_features': 2, 'out_features': 3}, 
-                               {'in_features': 3, 'hidden_features': 4, 'out_features': 5}, 
-                               {'in_features': 5, 'out_features': 6}]
-        [1, 2, 3, 4, 5]    -> [{'in_features': 1, 'hidden_features': 2, 'out_features': 3}, 
-                               {'in_features': 3, 'hidden_features': 4, 'out_features': 5}]
-    """
-    
-    n = len(nl)
-    assert n > 1, "The neuron config should have at least 2 layers."
-    if n % 2 == 0:
-        d_out = nl[-1]
-        nl = nl[:-1]
-    config = []
-    for i in range(1,len(nl)-1, 2):
-        config.append({'in_features': nl[i-1], 'hidden_features': nl[i], 'out_features': nl[i+1]})
-
-    if n % 2 == 0:
-        config.append({'in_features': nl[-1], 'out_features': d_out})
-
-    return config
-
 
 class NNENV(nn.Module):
     quantities = ["hamiltonian", "energy"]
@@ -154,6 +108,14 @@ class NNENV(nn.Module):
         self.transform = transform
 
         self.method = prediction.get("method", "e3tb")
+        if self.method not in {"e3tb", "block_native"}:
+            raise ValueError(
+                "0726-light supports prediction.method='e3tb' or 'block_native'."
+            )
+        if overlap:
+            raise ValueError(
+                "0726-light removed the legacy SK overlap prediction route."
+            )
         # self.soc = prediction.get("soc", False)
         self.prediction = prediction
 
@@ -269,116 +231,30 @@ class NNENV(nn.Module):
                 self.output_route_spec.canonical_name,
             )
         
-        # initialize the prediction layer
-            
-        if self.method == "sktb":
-            prediction_copy["neurons"] = [self.embedding.out_node_dim] + prediction_copy["neurons"] + [self.idp.n_onsite_Es]
-            prediction_copy["config"] = get_neuron_config(prediction_copy["neurons"])
-
-            self.node_prediction_h = AtomicResNet(
-                **prediction_copy,
-                in_field=AtomicDataDict.NODE_FEATURES_KEY,
+        # initialize the maintained prediction layer
+        if prediction_copy.get("method") == "e3tb":
+            self.node_prediction_h = E3PerSpeciesScaleShift(
+                field=AtomicDataDict.NODE_FEATURES_KEY,
+                num_types=n_species,
+                irreps_in=self.embedding.out_node_irreps,
                 out_field=AtomicDataDict.NODE_FEATURES_KEY,
-                device=device, 
-                dtype=dtype
-            )
-
-            prediction_copy["neurons"][0] = self.embedding.out_edge_dim
-            prediction_copy["neurons"][-1] = self.idp.reduced_matrix_element
-            prediction_copy["config"] = get_neuron_config(prediction_copy["neurons"])
-            self.edge_prediction_h = AtomicResNet(
+                shifts=0.0,
+                scales=1.0,
+                dtype=self.dtype,
+                device=self.device,
                 **prediction_copy,
-                in_field=AtomicDataDict.EDGE_FEATURES_KEY,
-                out_field=AtomicDataDict.EDGE_FEATURES_KEY,
-                device=device, 
-                dtype=dtype
             )
-
-            if overlap:
-                self.idp.get_skonsite_maps()
-                self.idp_sk = self.idp
-                self.edge_prediction_s = AtomicResNet(
-                    **prediction_copy,
-                    in_field=AtomicDataDict.EDGE_OVERLAP_KEY,
-                    out_field=AtomicDataDict.EDGE_OVERLAP_KEY,
-                    device=device, 
-                    dtype=dtype
-                )
-
-                overlaponsite_param = torch.ones([len(self.idp.type_names), self.idp.n_onsite_Es, 1], dtype=self.dtype, device=self.device)
-                if not all(self.idp.mask_diag):
-                    self.overlaponsite_param = torch.nn.Parameter(overlaponsite_param)
-                else:
-                    self.overlaponsite_param = overlaponsite_param
-
-        elif prediction_copy.get("method") == "e3tb":
-            if embedding.get("method") == "trinity":
-                # hack to pass the dataset operation
-                self.node_prediction_h = lambda x: x
-                self.edge_prediction_h = lambda x: x
-                self.node_prediction_h.set_scale_shift = lambda scales, shifts: 0
-                self.edge_prediction_h.set_scale_shift = lambda scales, shifts: 0
-            else:
-                self.node_prediction_h = E3PerSpeciesScaleShift(
-                    field=AtomicDataDict.NODE_FEATURES_KEY,
-                    num_types=n_species,
-                    irreps_in=self.embedding.out_node_irreps,
-                    out_field = AtomicDataDict.NODE_FEATURES_KEY,
-                    shifts=0.,
-                    scales=1.,
-                    dtype=self.dtype,
-                    device=self.device,
-                    **prediction_copy,
-                )
-                
-                self.edge_prediction_h = E3PerEdgeSpeciesScaleShift(
-                    field=AtomicDataDict.EDGE_FEATURES_KEY,
-                    num_types=n_species,
-                    irreps_in=self.embedding.out_edge_irreps,
-                    out_field = AtomicDataDict.EDGE_FEATURES_KEY,
-                    shifts=0.,
-                    scales=1.,
-                    dtype=self.dtype,
-                    device=self.device,
-                    **prediction_copy,
-                )
-
-            if embedding.get("method") == "trinity":
-                self.idp_sk = OrbitalMapper(self.idp.basis, method="sktb", device=self.device)
-                prediction_copy = prediction_copy.copy()
-                prediction_copy["neurons"] = [self.embedding.latent_dim] + prediction_copy["neurons"] + [self.idp_sk.reduced_matrix_element]
-                prediction_copy["config"] = get_neuron_config(prediction_copy["neurons"])
-                self.edge_prediction_h2 = AtomicResNet(
-                    **prediction_copy,
-                    in_field=AtomicDataDict.EDGE_ATTRS_KEY,
-                    out_field=AtomicDataDict.EDGE_ATTRS_KEY,
-                    device=device,
-                    dtype=dtype
-                )
-
-            if overlap:
-                self.idp_sk = OrbitalMapper(self.idp.basis, method="sktb", device=self.device)
-                self.idp_sk.get_skonsite_maps()
-                prediction_copy = prediction.copy()
-                prediction_copy["neurons"] = [self.embedding.latent_dim] + prediction_copy["neurons"] + [self.idp_sk.reduced_matrix_element]
-                prediction_copy["config"] = get_neuron_config(prediction_copy["neurons"])
-                self.edge_prediction_s = AtomicResNet(
-                    **prediction_copy,
-                    in_field=AtomicDataDict.EDGE_OVERLAP_KEY,
-                    out_field=AtomicDataDict.EDGE_OVERLAP_KEY,
-                    device=device,
-                    dtype=dtype
-                )
-
-                overlaponsite_param = torch.ones([len(self.idp_sk.type_names), self.idp_sk.n_onsite_Es, 1], dtype=self.dtype, device=self.device)
-                if not all(self.idp_sk.mask_diag):
-                    self.overlaponsite_param = torch.nn.Parameter(overlaponsite_param)
-                else:
-                    self.overlaponsite_param = overlaponsite_param
-
-                
-                # raise NotImplementedError("The overlap prediction is not implemented for e3tb method.")
-
+            self.edge_prediction_h = E3PerEdgeSpeciesScaleShift(
+                field=AtomicDataDict.EDGE_FEATURES_KEY,
+                num_types=n_species,
+                irreps_in=self.embedding.out_edge_irreps,
+                out_field=AtomicDataDict.EDGE_FEATURES_KEY,
+                shifts=0.0,
+                scales=1.0,
+                dtype=self.dtype,
+                device=self.device,
+                **prediction_copy,
+            )
         elif prediction_copy.get("method") == "block_native":
             if overlap:
                 raise NotImplementedError("block_native prediction does not support overlap.")
@@ -387,27 +263,7 @@ class NNENV(nn.Module):
         else:
             raise NotImplementedError("The prediction model {} is not implemented.".format(prediction_copy["method"]))
 
-        
-        if self.method == "sktb":
-            self.hamiltonian = SKHamiltonian(
-                edge_field=AtomicDataDict.EDGE_FEATURES_KEY,
-                node_field=AtomicDataDict.NODE_FEATURES_KEY,
-                idp_sk=self.idp, 
-                dtype=self.dtype, 
-                device=self.device,
-                onsite=True,
-                )
-            if overlap:
-                self.overlap = SKHamiltonian(
-                    idp_sk=self.idp, 
-                    edge_field=AtomicDataDict.EDGE_OVERLAP_KEY, 
-                    node_field=AtomicDataDict.NODE_OVERLAP_KEY, 
-                    dtype=self.dtype, 
-                    device=self.device,
-                    onsite=True,
-                    )
-
-        elif self.method == "e3tb":
+        if self.method == "e3tb":
             hamiltonian_cls = BlockwiseE3Hamiltonian if self.blockwise_hamiltonian else E3Hamiltonian
             blockwise_ham_kwargs = {}
             if self.blockwise_hamiltonian:
@@ -442,29 +298,6 @@ class NNENV(nn.Module):
                 nextham_uureal_mask=self.nextham_uureal_mask,
                 **blockwise_ham_kwargs,
             )
-
-            if overlap:
-                self.overlap = SKHamiltonian(
-                    idp_sk=self.idp_sk, 
-                    edge_field=AtomicDataDict.EDGE_OVERLAP_KEY,
-                    node_field=AtomicDataDict.NODE_OVERLAP_KEY,
-                    onsite=True,
-                    strain=False,
-                    soc=False,
-                    dtype=self.dtype, 
-                    device=self.device,
-                    )
-            if hasattr(self, "edge_prediction_h2"):
-                self.h2miltonian = SKHamiltonian(
-                    idp_sk=self.idp_sk, 
-                    edge_field=AtomicDataDict.EDGE_ATTRS_KEY,
-                    node_field=AtomicDataDict.NODE_ATTRS_KEY,
-                    onsite=True,
-                    strain=False,
-                    soc=False,
-                    dtype=self.dtype, 
-                    device=self.device,
-                    )
         elif self.method == "block_native":
             pass
 
@@ -494,30 +327,12 @@ class NNENV(nn.Module):
                     validate_prior_blocks=self.block_native_validate_prior_blocks,
                 )
             return data
-        if hasattr(self, "overlap") and self.method == "sktb":
-            data[AtomicDataDict.EDGE_OVERLAP_KEY] = data[AtomicDataDict.EDGE_FEATURES_KEY]
-
-        if self.method != "e3tb" or self.scale_type != "no_scale":
+        if self.scale_type != "no_scale":
             data = self.node_prediction_h(data)
             data = self.edge_prediction_h(data)
 
-        if hasattr(self, "overlap"):
-            data = self.edge_prediction_s(data)
-            data[AtomicDataDict.NODE_OVERLAP_KEY] = self.overlaponsite_param[data[AtomicDataDict.ATOM_TYPE_KEY].flatten()]
-            data[AtomicDataDict.NODE_OVERLAP_KEY][:,self.idp_sk.mask_diag] = 1.
-        
-        # prediction for two-body part of e3tb
-        if hasattr(self, "edge_prediction_h2"):
-            data = self.edge_prediction_h2(data)
-        
         if self.transform:
             data = self.hamiltonian(data)
-            if hasattr(self, "overlap"):
-                data = self.overlap(data)
-            if hasattr(self, "edge_prediction_h2"):
-                data = self.h2miltonian(data)
-                data[AtomicDataDict.NODE_FEATURES_KEY] += data[AtomicDataDict.NODE_ATTRS_KEY]
-                data[AtomicDataDict.EDGE_FEATURES_KEY] += data[AtomicDataDict.EDGE_ATTRS_KEY]
 
         return data
     
@@ -562,198 +377,4 @@ class NNENV(nn.Module):
 
         del ckpt
 
-        return model
-
-
-class MIX(nn.Module):
-    name = "mix"
-    def __init__(
-            self,
-            embedding: dict,
-            prediction: dict,
-            nnsk: dict = None,
-            dftbsk: dict = None,
-            basis: Dict[str, Union[str, list]]=None,
-            overlap: bool = False,
-            idp_sk: Union[OrbitalMapper, None]=None,
-            dtype: Union[str, torch.dtype] = torch.float32,
-            device: Union[str, torch.device] = torch.device("cpu"),
-            transform: bool = True,
-            num_xgrid: int = -1,
-            **kwargs,
-    ):
-        super(MIX, self).__init__()
-
-        if isinstance(dtype, str):
-            dtype = getattr(torch, dtype)
-
-        self.dtype = dtype
-        self.device = device
-        self.transform = transform
-        self.basis = basis
-        
-        self.nnenv = NNENV(
-            embedding=embedding, 
-            prediction=prediction, 
-            basis=basis, 
-            idp=idp_sk,
-            overlap=overlap, 
-            dtype=dtype, 
-            device=device,
-            transform=False,
-            )
-        
-        if (dftbsk is None) == (nnsk is None):
-            raise ValueError("The mixed model should have exactly one of the dftbsk model or nnsk model.")
-
-        if nnsk is not None:
-            self.nnsk = NNSK(
-                basis=basis,
-                idp_sk=idp_sk, 
-                **nnsk,
-                overlap=overlap,
-                dtype=dtype, 
-                device=device,
-                transform=False,
-                )
-            self.idp = self.nnsk.idp
-            assert not self.nnsk.push, "The push option is not supported in the mixed model. The push option is only supported in the nnsk model."
-        
-            self.model_options = self.nnsk.model_options
-            self.hamiltonian = self.nnsk.hamiltonian
-            if overlap:
-                self.overlap = self.nnsk.overlap
-        elif dftbsk is not None:
-            self.dftbsk = DFTBSK(
-                basis=basis,
-                idp_sk=idp_sk,
-                **dftbsk,
-                overlap=overlap,
-                dtype=dtype,
-                device=device,
-                transform=False,
-                num_xgrid=num_xgrid,
-                )
-            self.idp = self.dftbsk.idp
-            self.model_options = self.dftbsk.model_options
-            self.hamiltonian = self.dftbsk.hamiltonian
-            if overlap:
-                self.overlap = self.dftbsk.overlap
-        else:
-            raise ValueError("The mixed model should have exactly one of the dftbsk model or nnsk model.")
-
-        self.model_options.update(self.nnenv.model_options)
-        
-
-    def forward(self, data: AtomicDataDict.Type):
-
-        if data.get(AtomicDataDict.EDGE_TYPE_KEY, None) is None:
-            self.idp(data)
-            
-        data_nnenv = self.nnenv(data)
-        if hasattr(self, "nnsk"):
-            data_sk = self.nnsk(data)
-        elif hasattr(self, "dftbsk"):
-            data_sk = self.dftbsk(data)
-        else:
-            raise ValueError("The mixed model should have exactly one of the dftbsk model or nnsk model.")
-
-        data_sk[AtomicDataDict.EDGE_FEATURES_KEY] = data_sk[AtomicDataDict.EDGE_FEATURES_KEY] * (1 + data_nnenv[AtomicDataDict.EDGE_FEATURES_KEY])
-        data_sk[AtomicDataDict.NODE_FEATURES_KEY] = data_sk[AtomicDataDict.NODE_FEATURES_KEY] * (1 + data_nnenv[AtomicDataDict.NODE_FEATURES_KEY])
-
-        if self.transform:
-            data_sk = self.hamiltonian(data_sk)
-            if hasattr(self, "overlap"):
-                data_sk = self.overlap(data_sk)
-
-        return data_sk
-    
-    @classmethod
-    def from_reference(
-        cls, 
-        checkpoint, 
-        embedding: dict=None,
-        prediction: dict=None,
-        nnsk: dict=None,
-        dftbsk: dict = None,
-        basis: Dict[str, Union[str, list]]=None,
-        overlap: bool = None,
-        dtype: Union[str, torch.dtype] = None,
-        device: Union[str, torch.device] = None,
-        transform: bool = True,
-        **kwargs,
-        ):
-        # the mapping from the parameters of the ref_model and the current model can be found using
-        # reference model's idp and current idp
-        if device == 'cuda':
-            if not torch.cuda.is_available():
-                device = 'cpu'
-                log.warning("CUDA is not available. The model will be loaded on CPU.")
-
-        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-        common_options = {
-            "dtype": dtype,
-            "device": device,
-            "basis": basis,
-            "overlap": overlap,
-        }
-
-        if ckpt["config"]["model_options"].get("nnsk",None) is not None:
-            if nnsk is None or len(nnsk) == 0:
-                nnsk = ckpt["config"]["model_options"]["nnsk"]
-        if ckpt["config"]["model_options"].get("dftbsk",None) is not None:
-            if dftbsk is None or len(dftbsk) == 0:
-                dftbsk = ckpt["config"]["model_options"]["dftbsk"]
-
-        if (dftbsk is None) == (nnsk is None):
-            raise ValueError("The mixed model should have exactly one of the dftbsk model or nnsk model.")
-
-        model_options = {
-            "embedding": embedding,
-            "prediction": prediction,
-            "nnsk": nnsk,
-            "dftbsk": dftbsk
-        }
-
-        if nnsk is not None:
-            if model_options["nnsk"].get("push") is not None:
-                model_options["nnsk"]["push"] = None
-                log.warning("The push option is not supported in the mixed model. The push option is only supported in the nnsk model.")
-
-        if len(embedding) == 0 or len(prediction) == 0:
-            assert ckpt["config"]["model_options"].get("embedding") is not None and ckpt["config"]["model_options"].get("prediction") is not None, \
-            "The reference model checkpoint should come from a mixed model if dptb info is not provided."
-
-            model_options["embedding"] = ckpt["config"]["model_options"]["embedding"]
-            model_options["prediction"] = ckpt["config"]["model_options"]["prediction"]
-
-        for k,v in common_options.items():
-            if v is None:
-                common_options[k] = ckpt["config"]["common_options"][k]
-
-        if nnsk is not None:
-            assert ckpt["config"]["model_options"].get("nnsk") is not None, "The referenced checkpoint should provide at least the nnsk model info."
-            
-            if ckpt["config"]["model_options"].get("embedding") is not None and ckpt["config"]["model_options"].get("prediction") is not None:
-                # read from mixed model
-                model = cls(**model_options, **common_options,transform=transform)
-                model.load_state_dict(ckpt["model_state_dict"])
-            else:
-                # read from nnsk model
-                model = cls(**model_options, **common_options,transform=transform)
-                model.nnsk.load_state_dict(ckpt["model_state_dict"])
-        else:
-            assert ckpt["config"]["model_options"].get("dftbsk") is not None, "The referenced checkpoint should provide at least the dftbsk model info."
-            
-            if ckpt["config"]["model_options"].get("embedding") is not None and ckpt["config"]["model_options"].get("prediction") is not None:    
-                num_xgrid = ckpt["model_state_dict"]["dftbsk.distance_param"].shape[0]
-                model = cls(**model_options, **common_options,transform=transform,num_xgrid=num_xgrid)
-                model.load_state_dict(ckpt["model_state_dict"])
-            else:
-                num_xgrid = ckpt["model_state_dict"]["distance_param"].shape[0]
-                model = cls(**model_options, **common_options,transform=transform,num_xgrid=num_xgrid)
-                model.dftbsk.load_state_dict(ckpt["model_state_dict"])
-
-        del ckpt
-        
         return model

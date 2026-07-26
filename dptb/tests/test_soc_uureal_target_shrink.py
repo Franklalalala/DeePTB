@@ -24,7 +24,11 @@ def test_soc_uureal_contract_is_encoded_in_mapper_and_model_paths():
 
     assert "full_soc_prediction" in argcheck
     assert "resolve_nextham_uureal_mask" in transforms
-    assert "full_soc_prediction=kwargs.get('full_soc_prediction', False)" in data_build
+    compact_data_build = "".join(data_build.split())
+    assert (
+        'full_soc_prediction=kwargs.get("full_soc_prediction",False)'
+        in compact_data_build
+    )
     assert "def _e3tb_soc_feature_factor" in transforms
     assert (
         "return 1 if self.nextham_uureal_mask else "

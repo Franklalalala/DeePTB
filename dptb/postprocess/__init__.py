@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING
 # 定义模块映射关系
 _import_structure = {
     "bandstructure": ["Band"],
-    "totbplas": ["TBPLaS"],
     "write_block": ["write_block"],
     "write_abacus_csr_file": ["write_blocks_to_abacus_csr"],
 }
@@ -11,14 +10,12 @@ _import_structure = {
 # 仅在类型检查期间导入（IDE补全用），运行时不执行
 if TYPE_CHECKING:
     from .bandstructure import Band
-    from .totbplas import TBPLaS
     from .write_block import write_block
     from .write_abacus_csr_file import write_blocks_to_abacus_csr
 
 # 核心逻辑：定义 __all__ 和 __getattr__
 __all__ = [
     "Band",
-    "TBPLaS",
     "write_block",
     "write_blocks_to_abacus_csr"
 ]

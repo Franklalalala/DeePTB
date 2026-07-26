@@ -7,7 +7,7 @@ import torch
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.transforms_upper_triangle import OrbitalMapper
-from dptb.nn.sktb.onsiteDB import onsite_energy_database
+from dptb.nnops.onsite_database import onsite_energy_database
 from dptb.nnops import prior_physical
 from dptb.nnops.flow import (
     CFMContext,
@@ -1346,9 +1346,8 @@ def test_external_candidate_keys_are_the_short_documented_list():
         assert dropped not in edge_keys
 
 
-def test_dftb_prior_fails_closed_without_matching_keys_or_skdata():
-    # Behavior change: prior=dftb/xtb/sk/nnsk with no matching keys and no skdata
-    # must fail closed (KeyError), no longer silently falling back to basis_onsite.
+def test_dftb_external_prior_fails_closed_without_matching_keys():
+    # Named external priors require a matching dataset field.
     device = torch.device("cpu")
     dtype = torch.float32
     data, ref = _make_batch(device=device, dtype=dtype)
@@ -1383,26 +1382,9 @@ def test_named_external_prior_alias_ignores_physical_zero_fallback():
         flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
 
 
-def test_dftbsk_prior_uses_on_the_fly_absolute_initial_guess():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32
-    data, ref = _make_batch(device=device, dtype=dtype)
-    node_guess = data[_keys.NODE_H0_KEY] + 0.75
-    edge_guess = data[_keys.EDGE_H0_KEY] - 0.25
-    flow = _flow("dftbsk", device=device, dtype=dtype)
-
-    def fake_dftbsk(like, *, data, label, ctx):
-        return node_guess if label == "node" else edge_guess
-
-    # The DFTB-SK builder now lives on the resolved prior family instance.
-    flow.prior_family.absolute_prior_like = fake_dftbsk
-
-    out, _ref_out, ctx = flow.prepare_batch(data, ref, t=torch.zeros(2, device=device, dtype=dtype))
-
-    torch.testing.assert_close(out[_keys.NODE_H0_KEY], node_guess)
-    torch.testing.assert_close(out[_keys.EDGE_H0_KEY], edge_guess)
-    torch.testing.assert_close(ctx.node_prior, node_guess - data[_keys.NODE_H0_KEY])
-    torch.testing.assert_close(ctx.edge_prior, edge_guess - data[_keys.EDGE_H0_KEY])
+def test_dftbsk_prior_alias_is_retired():
+    with pytest.raises(ValueError, match=r"Unsupported flow_options\.prior"):
+        _flow("dftbsk", device=torch.device("cpu"), dtype=torch.float32)
 
 
 def test_flow_options_argcheck_accepts_te_prior_config_keys():
@@ -1433,13 +1415,11 @@ def test_flow_options_argcheck_accepts_physical_prior_config_keys():
         {
             "enabled": True,
             "mode": "residual",
-            "prior": "dftbsk",
+            "prior": "external",
             "prior_node_key": "dftb_node_h0",
             "prior_edge_key": "dftb_edge_h0",
             "prior_key_prefixes": ["dftb", "xtb"],
             "allow_complex_prior_real_projection": True,
-            "prior_skdata": "/tmp/skfiles",
-            "dftb_prior_overlap": True,
             "physical_prior_fallback": "basis_onsite",
             "basis_onsite_scale": 0.5,
             "physical_prior_jitter_sigma": 0.01,
@@ -1449,12 +1429,10 @@ def test_flow_options_argcheck_accepts_physical_prior_config_keys():
     )
     schema.check_value(value, strict=True)
 
-    assert value["prior"] == "dftbsk"
+    assert value["prior"] == "external"
     assert value["prior_node_key"] == "dftb_node_h0"
     assert value["prior_key_prefixes"] == ["dftb", "xtb"]
     assert value["allow_complex_prior_real_projection"] is True
-    assert value["prior_skdata"] == "/tmp/skfiles"
-    assert value["dftb_prior_overlap"] is True
     assert value["basis_onsite_scale"] == pytest.approx(0.5)
     assert value["physical_prior_jitter_edge_decay"] == pytest.approx(2.0)
 

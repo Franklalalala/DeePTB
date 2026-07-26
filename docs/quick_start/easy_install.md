@@ -8,8 +8,6 @@ Before installing DeePTB, ensure you have the following prerequisites:
   - Git
   - Python 3.9 to 3.12.
   - Torch 2.0.0 to 2.5.1 ([PyTorch Installation](https://pytorch.org/get-started/locally)).
-  - ifermi (optional, for 3D fermi-surface plotting).
-  - TBPLaS (optional).
 
 ## Installation Methods
 

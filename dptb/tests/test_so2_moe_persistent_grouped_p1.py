@@ -1,4 +1,5 @@
 import math
+import shutil
 
 import pytest
 import torch
@@ -6,8 +7,16 @@ import torch
 from dptb.nn.so2_moe_persistent_grouped import _load_extension
 
 
+def _require_cuda_extension_toolchain():
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None or shutil.which("ninja") is None:
+        pytest.skip("SO2 CUDA extension tests require nvcc and ninja")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for persistent grouped P1")
 def test_direct_persistent_grouped_p1_m0_m1_identity_wigner():
+    _require_cuda_extension_toolchain()
     torch.manual_seed(1234)
     device = torch.device("cuda")
     dtype = torch.float32
@@ -106,6 +115,11 @@ def test_direct_persistent_grouped_p1_m0_m1_identity_wigner():
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for persistent grouped P1")
 def test_persistent_grouped_p1_train_matches_streamed_ref(monkeypatch, include_m0, mainloop):
+    pytest.importorskip(
+        "so2_cuda_ops",
+        reason="install the optional DeePTB so2 extra for persistent backward tests",
+    )
+    _require_cuda_extension_toolchain()
     torch.manual_seed(20260527)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_INCLUDE_M0", include_m0)
     monkeypatch.setenv("DPTB_SO2_MOE_PERSISTENT_P1_BACKWARD_MODE", "cuda_cublas_segmented")

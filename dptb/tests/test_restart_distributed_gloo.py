@@ -29,6 +29,7 @@ import sys
 import time
 import traceback
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -463,6 +464,13 @@ def _run_two_rank(worker, tmp_path, monkeypatch):
     init_method = (
         f"tcp://127.0.0.1:{_free_loopback_port()}?use_libuv=0"
     )
+    worker_env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[2])
+    worker_env["PYTHONPATH"] = repo_root + (
+        os.pathsep + worker_env["PYTHONPATH"]
+        if worker_env.get("PYTHONPATH")
+        else ""
+    )
     processes = []
     logs = []
     try:
@@ -477,7 +485,7 @@ def _run_two_rank(worker, tmp_path, monkeypatch):
                     ),
                     stdout=log_fh,
                     stderr=subprocess.STDOUT,
-                    env=os.environ.copy(),
+                    env=worker_env,
                 )
             )
 

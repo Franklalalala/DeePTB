@@ -2,7 +2,6 @@ import torch
 from e3nn import o3
 
 from dptb.nn.embedding.lem_moe_v3 import (
-    EdgeMessageValueGate,
     GatedEdgeAggregation,
     PostActivation0eFocusGate,
     SingleHead0eEnvelopeAttention,
@@ -154,37 +153,6 @@ def test_single_head_0e_attention_qk_layer_norm_enables_both_inputs():
     assert isinstance(attention.key_norm, torch.nn.LayerNorm)
 
 
-def test_edge_message_value_gate_filters_edges_before_aggregation():
-    irreps = o3.Irreps("2x0e+1x1o")
-    gate = EdgeMessageValueGate(
-        irreps,
-        query_scalar_dim=2,
-        message_scalar_dim=2,
-    )
-
-    message = torch.ones(4, irreps.dim)
-    query_scalars = torch.zeros(3, 2)
-    message_scalars = torch.zeros(4, 2)
-    dst_index = torch.tensor([0, 0, 1, 1], dtype=torch.long)
-
-    out = gate(
-        message,
-        query_scalars,
-        message_scalars,
-        dst_index,
-        dim_size=3,
-    )
-
-    assert gate.feature_gate_index.tolist() == [0, 1, 2, 2, 2]
-    assert torch.allclose(out, 0.5 * message)
-    stats = gate.last_stats
-    assert stats["active_edges"] == 4
-    assert stats["nodes_with_edges"] == 2
-    assert stats["gate_mean"] == 0.5
-    assert stats["gate_min"] == 0.5
-    assert stats["gate_max"] == 0.5
-    assert stats["pre_activation_max"] == 1.0
-    assert stats["post_activation_max"] == 0.5
 
 
 def test_update_node_can_bypass_env_message_weighting():
@@ -235,53 +203,6 @@ def test_update_node_can_bypass_env_message_weighting():
     assert torch.allclose(out, torch.ones(2, 1))
 
 
-def test_update_node_applies_edge_message_value_gate_before_scatter():
-    class DummyTP(torch.nn.Module):
-        def forward(self, x, r, mole_globals, latents=None, wigner_D_all=None):
-            return torch.ones(x.shape[0], 1, dtype=x.dtype, device=x.device), wigner_D_all
-
-    class DummyUpdate:
-        def __init__(self):
-            self.irreps_in = o3.Irreps("1x0e")
-            self.irreps_out = o3.Irreps("1x0e")
-            self.edge_irreps_in = o3.Irreps("1x0e")
-            self.tp = DummyTP()
-            self.activation = torch.nn.Identity()
-            self.lin_post = torch.nn.Identity()
-            self.focus_gate = torch.nn.Identity()
-            self.post_activation_expert_mixer = None
-            self.node_norm = None
-            self.edge_norm = None
-            self.node_attention = None
-            self.edge_aggregation_gate = None
-            self.edge_message_gate = EdgeMessageValueGate(
-                self.irreps_out,
-                query_scalar_dim=1,
-                message_scalar_dim=1,
-            )
-            self.env_sum_normalizations = torch.tensor(1.0)
-            self.res_update = False
-            self.use_layer_onehot_tp = False
-            self.edge_message_env_weight = False
-
-    dummy = DummyUpdate()
-    out = UpdateNode.forward(
-        dummy,
-        latents=torch.zeros(2, 1),
-        node_features=torch.zeros(2, 1),
-        edge_features=torch.zeros(2, 1),
-        atom_type=torch.zeros(2, 1, dtype=torch.long),
-        node_onehot=torch.zeros(2, 1),
-        edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
-        edge_vector=torch.zeros(2, 3),
-        cutoff_coeffs=torch.ones(2),
-        active_edges=torch.tensor([0, 1], dtype=torch.long),
-        wigner_D_all=None,
-        mole_globals=None,
-    )
-
-    assert torch.allclose(out, torch.full((2, 1), 0.5))
-    assert dummy.edge_message_gate.last_stats["active_edges"] == 2
 
 
 def test_gated_edge_aggregation_applies_equivariant_sigmoid_gate_and_records_stats():
