@@ -7,6 +7,7 @@ from dptb.nnops.fixed_mu_operator import (
     OverlapConditionError,
     fermi_dirac,
     fixed_mu_observables,
+    fixed_mu_observables_from_torch,
     generalized_bands,
     validate_conservation,
 )
@@ -129,6 +130,43 @@ def test_batch_kpoint_weights_aggregate_only_over_requested_k_axis():
     validate_conservation(result, atol=1e-12)
 
 
+def test_density_k_and_response_k_are_raw_per_k_not_weighted():
+    h = np.array(
+        [
+            [[-1.0, 0.0], [0.0, 0.5]],
+            [[0.25, 0.0], [0.0, 0.75]],
+        ],
+        dtype=float,
+    )
+    s = np.broadcast_to(np.eye(2), h.shape).copy()
+    weights = np.array([0.25, 0.75])
+    result = fixed_mu_observables(
+        h,
+        s,
+        mu=0.0,
+        kT=0.2,
+        spin_degeneracy=2.0,
+        k_weights=weights,
+        k_axis=0,
+    )
+    unweighted_first = fixed_mu_observables(h[0], s[0], mu=0.0, kT=0.2, spin_degeneracy=2.0)
+    unweighted_second = fixed_mu_observables(h[1], s[1], mu=0.0, kT=0.2, spin_degeneracy=2.0)
+    np.testing.assert_allclose(result.density_k[0], unweighted_first.density, atol=1e-12)
+    np.testing.assert_allclose(result.density_k[1], unweighted_second.density, atol=1e-12)
+    np.testing.assert_allclose(result.density_response_k[0], unweighted_first.density_response, atol=1e-12)
+    np.testing.assert_allclose(result.density_response_k[1], unweighted_second.density_response, atol=1e-12)
+    np.testing.assert_allclose(
+        result.density,
+        weights[0] * result.density_k[0] + weights[1] * result.density_k[1],
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result.density_response,
+        weights[0] * result.density_response_k[0] + weights[1] * result.density_response_k[1],
+        atol=1e-12,
+    )
+
+
 def test_batch_without_k_axis_keeps_samples_independent():
     h = np.zeros((2, 2, 2), dtype=float)
     h[0] = np.diag([-1.0, 0.5])
@@ -138,6 +176,20 @@ def test_batch_without_k_axis_keeps_samples_independent():
     np.testing.assert_allclose(result.k_weights, np.ones(2))
     np.testing.assert_allclose(result.electron_count, np.array([2.0, 4.0]))
     assert result.density.shape == (2, 2, 2)
+
+
+def test_scalar_k_weight_is_checked_and_not_normalized_without_k_axis():
+    h = np.diag([-1.0, 1.0])
+    s = np.eye(2)
+    with pytest.raises(FixedMuOperatorError, match="finite"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=np.nan)
+    with pytest.raises(FixedMuOperatorError, match="nonnegative"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=-1.0)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0, k_weights=2.0)
+    np.testing.assert_allclose(result.density, np.diag([2.0, 0.0]))
+    np.testing.assert_allclose(result.electron_count, 4.0)
+    np.testing.assert_allclose(result.conservation.electron_count_from_density, 4.0)
+    validate_conservation(result, atol=1e-12)
 
 
 def test_nonorthogonal_kweighted_grand_ledger_matches_mu_legendre_transform():
@@ -190,3 +242,30 @@ def test_invalid_inputs_fail_closed():
         fixed_mu_observables(np.array([[np.nan]]), np.eye(1), mu=0.0)
     with pytest.raises(FixedMuOperatorError):
         fixed_mu_observables(np.eye(2), np.eye(2), mu=0.0, spin_degeneracy=0.0)
+
+
+class _FakeTorchTensor:
+    __module__ = "torch"
+
+    def __init__(self, array):
+        self._array = np.asarray(array)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self._array
+
+
+def test_torch_like_inputs_are_rejected_without_silent_detach():
+    h = _FakeTorchTensor(np.diag([-1.0, 1.0]))
+    s = _FakeTorchTensor(np.eye(2))
+    with pytest.raises(FixedMuOperatorError, match="will not detach/cpu tensors silently"):
+        fixed_mu_observables(h, s, mu=0.0)
+    with pytest.raises(FixedMuOperatorError, match="detach=True"):
+        fixed_mu_observables_from_torch(h, s, mu=0.0)
+    result = fixed_mu_observables_from_torch(h, s, detach=True, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+    np.testing.assert_allclose(result.electron_count, 2.0)

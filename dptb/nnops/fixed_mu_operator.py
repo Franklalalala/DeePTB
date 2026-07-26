@@ -1,9 +1,10 @@
-"""Fixed-chemical-potential dense H/S operator utilities.
+"""Fixed-chemical-potential dense H/S postprocess reference utilities.
 
-The routines here are intentionally small and dependency-light.  They take
-predicted dense DPTB Hamiltonian/overlap matrices, solve the generalized
-eigenproblem, evaluate fixed-mu Fermi occupations, and return density-matrix
-and energy ledgers suitable for downstream conservation checks.
+The routines here are intentionally small NumPy/SciPy CPU reference kernels.
+They take predicted dense DPTB Hamiltonian/overlap matrices, solve the
+generalized eigenproblem, evaluate fixed-mu Fermi occupations, and return
+density-matrix and energy ledgers suitable for downstream conservation checks.
+They do not preserve PyTorch autograd graphs.
 """
 from __future__ import annotations
 
@@ -97,6 +98,24 @@ def hermitian_part(x: ArrayLike) -> np.ndarray:
     return 0.5 * (arr + np.swapaxes(arr.conj(), -1, -2))
 
 
+def _looks_like_torch_tensor(x: Any) -> bool:
+    typ = type(x)
+    module = getattr(typ, "__module__", "")
+    return module == "torch" or module.startswith("torch.") or (
+        hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy")
+    )
+
+
+def _reject_torch_tensor(name: str, x: Any) -> None:
+    if _looks_like_torch_tensor(x):
+        raise FixedMuOperatorError(
+            f"{name} looks like a torch Tensor. This module is a NumPy CPU "
+            "postprocess reference and will not detach/cpu tensors silently. "
+            "Use fixed_mu_observables_from_torch(..., detach=True) explicitly "
+            "or pass tensor.detach().cpu().numpy()."
+        )
+
+
 def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnegative: bool = False) -> float:
     out = float(value)
     if not np.isfinite(out):
@@ -114,6 +133,8 @@ def _validate_matrix_stack(
     *,
     hermitian_tol: float = 1e-8,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    _reject_torch_tensor("H", h)
+    _reject_torch_tensor("S", s)
     h_arr = np.asarray(h)
     s_arr = np.asarray(s)
     if h_arr.shape != s_arr.shape:
@@ -167,7 +188,12 @@ def _prepare_weights(
         weights = np.asarray(k_weights, dtype=np.float64)
         if weights.shape not in [(), (1,)]:
             raise FixedMuOperatorError("single-matrix k_weights must be scalar")
-        return np.asarray(float(weights.reshape(-1)[0]), dtype=np.float64)
+        weight = float(weights.reshape(-1)[0])
+        if not np.isfinite(weight):
+            raise FixedMuOperatorError("single-matrix k_weights must be finite")
+        if weight < 0.0:
+            raise FixedMuOperatorError("single-matrix k_weights must be nonnegative")
+        return np.asarray(weight, dtype=np.float64)
 
     if k_weights is None:
         weights = np.ones(leading_shape, dtype=np.float64)
@@ -317,14 +343,17 @@ def _weighted_sum(values: np.ndarray, weights: np.ndarray, *, k_axis: Optional[i
     return np.sum(weights * values, axis=k_axis)
 
 
-def _density_from_vectors(vecs: np.ndarray, occ: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    weighted_occ = occ * weights[..., None]
-    return np.einsum("...ni,...i,...mi->...nm", vecs, weighted_occ, vecs.conj(), optimize=True)
+def _density_from_vectors(vecs: np.ndarray, occ: np.ndarray) -> np.ndarray:
+    return np.einsum("...ni,...i,...mi->...nm", vecs, occ, vecs.conj(), optimize=True)
 
 
-def _aggregate_matrix(values: np.ndarray, *, k_axis: Optional[int]) -> np.ndarray:
+def _aggregate_matrix(values: np.ndarray, *, k_axis: Optional[int], weights: Optional[np.ndarray] = None) -> np.ndarray:
     if k_axis is None:
         return values
+    if weights is not None:
+        while weights.ndim < values.ndim:
+            weights = weights[..., None]
+        values = weights * values
     return np.sum(values, axis=k_axis)
 
 
@@ -403,7 +432,10 @@ def fixed_mu_observables(
         and ``1`` for explicit spin/SOC spinor matrices.
     k_weights, k_axis
         Optional Brillouin-zone weights and the leading axis to sum over.
-        With ``k_axis=None`` no k aggregation is performed.
+        Weights are normalized only along an explicit ``k_axis``.  With
+        ``k_axis=None`` no k aggregation is performed and scalar/per-item
+        weights are used only in ledgers/conservation, not to normalize batch
+        samples.
     """
 
     mu = _as_float_scalar("mu", mu)
@@ -429,10 +461,10 @@ def fixed_mu_observables(
     f_base, response_base = _stable_fermi(bands.eigvals, mu=mu, kT=kT)
     occupations = spin_degeneracy * f_base
     occupation_response = spin_degeneracy * response_base
-    density_k = _density_from_vectors(bands.eigvecs, occupations, weights)
-    density_response_k = _density_from_vectors(bands.eigvecs, occupation_response, weights)
-    density = _aggregate_matrix(density_k, k_axis=k_axis_c)
-    density_response = _aggregate_matrix(density_response_k, k_axis=k_axis_c)
+    density_k = _density_from_vectors(bands.eigvecs, occupations)
+    density_response_k = _density_from_vectors(bands.eigvecs, occupation_response)
+    density = _aggregate_matrix(density_k, k_axis=k_axis_c, weights=weights)
+    density_response = _aggregate_matrix(density_response_k, k_axis=k_axis_c, weights=weights)
 
     n_k = weights * np.sum(occupations, axis=-1)
     dos_k = weights * np.sum(occupation_response, axis=-1)
@@ -448,8 +480,8 @@ def fixed_mu_observables(
         k_axis=k_axis_c,
     )
 
-    ne_from_d_k = _trace_last2(density_k @ s_arr)
-    band_from_d_k = _trace_last2(density_k @ h_arr)
+    ne_from_d_k = weights * _trace_last2(density_k @ s_arr)
+    band_from_d_k = weights * _trace_last2(density_k @ h_arr)
     ne_from_d = _aggregate_matrix(ne_from_d_k, k_axis=k_axis_c)
     band_from_d = _aggregate_matrix(band_from_d_k, k_axis=k_axis_c)
     conservation = ConservationLedger(
@@ -495,3 +527,24 @@ def validate_conservation(result: FixedMuResult, *, atol: float = 1e-8, rtol: fl
         raise FixedMuOperatorError("Tr(D H) does not match the band-energy ledger")
     if np.any(cons.density_hermiticity_error > atol + rtol):
         raise FixedMuOperatorError("D(mu) is not Hermitian within tolerance")
+
+
+def fixed_mu_observables_from_torch(h: Any, s: Any, *, detach: bool = False, **kwargs: Any) -> FixedMuResult:
+    """Explicit PyTorch-to-NumPy CPU wrapper for postprocess use.
+
+    This wrapper always breaks autograd.  Callers must set ``detach=True`` to
+    acknowledge the detach/cpu/numpy conversion; otherwise a fail-closed error
+    is raised.
+    """
+
+    if not detach:
+        raise FixedMuOperatorError(
+            "fixed_mu_observables_from_torch breaks autograd by converting to "
+            "NumPy CPU arrays; call with detach=True explicitly."
+        )
+    for name, value in [("H", h), ("S", s)]:
+        if not (hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy")):
+            raise FixedMuOperatorError(f"{name} must be a torch Tensor-like object for this wrapper")
+    h_np = h.detach().cpu().numpy()
+    s_np = s.detach().cpu().numpy()
+    return fixed_mu_observables(h_np, s_np, **kwargs)
