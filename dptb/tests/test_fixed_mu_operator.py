@@ -192,18 +192,26 @@ def test_batch_without_k_axis_keeps_samples_independent():
     assert result.density.shape == (2, 2, 2)
 
 
-def test_scalar_k_weight_is_checked_and_not_normalized_without_k_axis():
+def test_k_weights_require_explicit_k_axis_and_density_trace_matches_n():
     h = np.diag([-1.0, 1.0])
     s = np.eye(2)
-    with pytest.raises(FixedMuOperatorError, match="finite"):
-        fixed_mu_observables(h, s, mu=0.0, k_weights=np.nan)
-    with pytest.raises(FixedMuOperatorError, match="nonnegative"):
-        fixed_mu_observables(h, s, mu=0.0, k_weights=-1.0)
-    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0, k_weights=2.0)
+    with pytest.raises(FixedMuOperatorError, match="k_weights requires an explicit k_axis"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=2.0)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
     np.testing.assert_allclose(result.density, np.diag([2.0, 0.0]))
-    np.testing.assert_allclose(result.electron_count, 4.0)
-    np.testing.assert_allclose(result.conservation.electron_count_from_density, 4.0)
+    np.testing.assert_allclose(result.electron_count, 2.0)
+    np.testing.assert_allclose(np.trace(result.density @ s).real, result.electron_count)
+    np.testing.assert_allclose(result.conservation.electron_count_from_density, result.electron_count)
     validate_conservation(result, atol=1e-12)
+
+
+def test_k_weight_values_are_checked_when_k_axis_is_explicit():
+    h = np.stack([np.diag([-1.0, 1.0]), np.diag([-0.5, 0.5])])
+    s = np.broadcast_to(np.eye(2), h.shape).copy()
+    with pytest.raises(FixedMuOperatorError, match="finite"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=np.array([np.nan, 1.0]), k_axis=0)
+    with pytest.raises(FixedMuOperatorError, match="nonnegative"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=np.array([-1.0, 2.0]), k_axis=0)
 
 
 def test_nonorthogonal_kweighted_grand_ledger_matches_mu_legendre_transform():
@@ -256,6 +264,8 @@ def test_invalid_inputs_fail_closed():
         fixed_mu_observables(np.array([[np.nan]]), np.eye(1), mu=0.0)
     with pytest.raises(FixedMuOperatorError):
         fixed_mu_observables(np.eye(2), np.eye(2), mu=0.0, spin_degeneracy=0.0)
+    with pytest.raises(FixedMuOperatorError, match="matrix size must be positive"):
+        fixed_mu_observables(np.empty((0, 0)), np.empty((0, 0)), mu=0.0)
 
 
 class _FakeTorchTensor:
@@ -312,12 +322,19 @@ def test_single_matrix_fake_torch_scalar_weight_is_rejected_before_numpy():
     weight = _FakeTorchTensor(np.array(1.0))
     with pytest.raises(FixedMuOperatorError, match="k_weights looks like a torch Tensor"):
         fixed_mu_observables(h, s, mu=0.0, k_weights=weight)
+    with pytest.raises(FixedMuOperatorError, match="k_weights requires an explicit k_axis"):
+        fixed_mu_observables_from_torch(
+            _FakeTorchTensor(h),
+            _FakeTorchTensor(s),
+            detach=True,
+            mu=0.0,
+            k_weights=weight,
+        )
     result = fixed_mu_observables_from_torch(
         _FakeTorchTensor(h),
         _FakeTorchTensor(s),
         detach=True,
         mu=0.0,
-        k_weights=weight,
     )
     np.testing.assert_allclose(result.electron_count, 2.0)
 
@@ -328,11 +345,18 @@ def test_single_matrix_fake_torch_shape_one_weight_is_rejected_before_numpy():
     weight = _FakeTorchTensor(np.array([1.0]))
     with pytest.raises(FixedMuOperatorError, match="k_weights looks like a torch Tensor"):
         fixed_mu_observables(h, s, mu=0.0, k_weights=weight)
+    with pytest.raises(FixedMuOperatorError, match="k_weights requires an explicit k_axis"):
+        fixed_mu_observables_from_torch(
+            _FakeTorchTensor(h),
+            _FakeTorchTensor(s),
+            detach=True,
+            mu=0.0,
+            k_weights=weight,
+        )
     result = fixed_mu_observables_from_torch(
         _FakeTorchTensor(h),
         _FakeTorchTensor(s),
         detach=True,
         mu=0.0,
-        k_weights=weight,
     )
     np.testing.assert_allclose(result.electron_count, 2.0)
