@@ -18,6 +18,8 @@ current development path.
 - LMDB-backed datasets and record/materialization pipelines.
 - Conditional flow matching, MeanFlow, block ODE, physical priors, and
   current trainer/restart/distributed workflows.
+- Independent dense operator references for fixed-mu H/S postprocessing and
+  fixed-total-charge QEq charge equilibration.
 - Current SO(2), grouped-GEMM, and optional `so2-cuda-ops` acceleration.
 
 The large, recently maintained `dptb/nnops/flow.py` implementation is kept

@@ -30,6 +30,7 @@ LEM/EMol embedding, flow, block-native, LMDB, and training routes.
    advanced/tied_irrep_gaussian_prior
    advanced/so2_compact_wigner
    advanced/dynamic_batch_oom_fallback
+   advanced/qeq_operator
 
 .. toctree::
    :maxdepth: 2
