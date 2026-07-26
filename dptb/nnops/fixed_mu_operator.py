@@ -186,6 +186,7 @@ def _prepare_weights(
     if not leading_shape:
         if k_weights is None:
             return np.asarray(1.0, dtype=np.float64)
+        _reject_torch_tensor("k_weights", k_weights)
         weights = np.asarray(k_weights, dtype=np.float64)
         if weights.shape not in [(), (1,)]:
             raise FixedMuOperatorError("single-matrix k_weights must be scalar")

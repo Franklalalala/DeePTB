@@ -304,3 +304,35 @@ def test_torch_like_weights_and_energies_do_not_silently_convert():
     )
     np.testing.assert_allclose(result.k_weights, np.array([0.25, 0.75]))
     np.testing.assert_allclose(result.electron_count, 2.0)
+
+
+def test_single_matrix_fake_torch_scalar_weight_is_rejected_before_numpy():
+    h = np.diag([-1.0, 1.0])
+    s = np.eye(2)
+    weight = _FakeTorchTensor(np.array(1.0))
+    with pytest.raises(FixedMuOperatorError, match="k_weights looks like a torch Tensor"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=weight)
+    result = fixed_mu_observables_from_torch(
+        _FakeTorchTensor(h),
+        _FakeTorchTensor(s),
+        detach=True,
+        mu=0.0,
+        k_weights=weight,
+    )
+    np.testing.assert_allclose(result.electron_count, 2.0)
+
+
+def test_single_matrix_fake_torch_shape_one_weight_is_rejected_before_numpy():
+    h = np.diag([-1.0, 1.0])
+    s = np.eye(2)
+    weight = _FakeTorchTensor(np.array([1.0]))
+    with pytest.raises(FixedMuOperatorError, match="k_weights looks like a torch Tensor"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=weight)
+    result = fixed_mu_observables_from_torch(
+        _FakeTorchTensor(h),
+        _FakeTorchTensor(s),
+        detach=True,
+        mu=0.0,
+        k_weights=weight,
+    )
+    np.testing.assert_allclose(result.electron_count, 2.0)
