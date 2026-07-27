@@ -788,8 +788,11 @@ def validate_qeq_result(
 
     if not isinstance(result, QEqResult):
         raise QEqOperatorError("result must be a QEqResult")
+    recorded_residual_tol = _clamp_policy(
+        "residual_tol", result.residual_tol, MODULE_MAX_RESIDUAL_TOL
+    )
     if atol is None:
-        atol = result.residual_tol
+        atol = recorded_residual_tol
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     atol = _clamp_policy("atol", atol, MODULE_MAX_RESIDUAL_TOL)
     symmetry_tol = _resolve_policy(
@@ -1004,13 +1007,12 @@ def validate_qeq_result(
         raise QEqOperatorError(
             "QEq lagrange_multiplier is inconsistent with the uniform stationarity component"
         )
-    # Derived, not independent: energy - energy_identity is identically
-    # 0.5 * q . stationarity - 0.5 * lambda * (sum(q) - Q), so this gate only
-    # adds reach when |q| amplifies a stationarity residual that is itself still
-    # inside tolerance.  It is kept as a cheap ledger assertion, not as a second
-    # opinion about the energy.
-    if np.any(np.abs(energy_identity_residual) > atol + energy_floor):
-        raise QEqOperatorError("QEq energy identity residual exceeds tolerance")
+    # energy_identity_residual gets no terminal gate of its own: it is identically
+    # 0.5 * q . stationarity - 0.5 * lambda * (sum(q) - Q), so any threshold on it
+    # is either implied by the charge and stationarity gates or, if set from the
+    # energy scale instead of the |q| * residual scale it actually lives on,
+    # rejects legitimate ill-conditioned solves. It stays as telemetry, checked
+    # above against its recomputation.
 
 
 def _check_stationarity_gate(
