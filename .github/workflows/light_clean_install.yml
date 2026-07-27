@@ -26,6 +26,7 @@ jobs:
         run: |
           python docs/auto_install_torch_scatter.py
           python -m pip install build
+          rm -rf dist
           python -m build --wheel
           python -m pip install dist/*.whl
       - name: Smoke-test the installed wheel outside the checkout
@@ -34,6 +35,7 @@ jobs:
           cd "$smoke_dir"
           python - <<'PY'
           import os
+          import sysconfig
           from pathlib import Path
 
           import dptb
@@ -46,6 +48,21 @@ jobs:
               raise RuntimeError(
                   f"clean-install smoke test imported the checkout instead of the wheel: {module_path}"
               )
+          purelib = Path(sysconfig.get_paths()["purelib"]).resolve()
+          if purelib not in module_path.parents:
+              raise RuntimeError(
+                  f"clean-install smoke test imported dptb from {module_path}, not from {purelib}"
+              )
+
+          # A wheel that drops non-Python payload is the failure this job exists
+          # to catch, and both files are loaded at module scope by
+          # dptb/nn/tensor_product.py -- assert them explicitly so the check
+          # survives any future move to a lazy loader.
+          package_root = module_path.parent
+          for payload in ("nn/Jd.pt", "nn/z_rot_indices_lmax12.pt"):
+              if not (package_root / payload).is_file():
+                  raise RuntimeError(f"the installed wheel is missing dptb/{payload}")
+
           print(dptb.__version__)
           print(module_path)
           PY
