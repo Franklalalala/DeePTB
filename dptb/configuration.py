@@ -673,6 +673,30 @@ _FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
 )
 
 
+# The on-the-fly DFTB-SK prior family was removed with the SK route. flow.py is
+# deliberately byte-identical to 0721-stable, so its own rejection message still
+# advertises 'dftbsk' as supported; catching the aliases here — canonicalization
+# runs first, including from HamiltonianCFM.__init__ — is what makes the error
+# truthful.
+RETIRED_DFTBSK_PRIOR_NAMES = frozenset(
+    {"dftbsk", "dftb_sk", "dftb_scf0", "dftb_on_the_fly", "skf", "skfile"}
+)
+
+
+def _reject_retired_dftbsk_prior(prior: Any) -> None:
+    if not isinstance(prior, str):
+        return
+    if _normalized_name(prior) not in RETIRED_DFTBSK_PRIOR_NAMES:
+        return
+    raise ValueError(
+        f"flow_options.prior={prior!r} selects the on-the-fly DFTB-SK prior, "
+        "which was removed together with the SK model route. Precompute the "
+        "prior and use prior='external', or choose one of 'zero', 'gaussian', "
+        "'residual_gaussian', 'te', 'projected_te', 'tied_irrep_gaussian', "
+        "'basis_onsite', 'overlap_huckel', 'haar_dm'."
+    )
+
+
 def canonicalize_flow_options(
     options: Optional[Mapping[str, Any]],
     *,
@@ -685,6 +709,7 @@ def canonicalize_flow_options(
     if not isinstance(options, Mapping):
         raise TypeError("train_options.flow_options must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
+    _reject_retired_dftbsk_prior(out.get("prior"))
     changes: List[_AliasHit] = []
     _apply_alias_registry(out, _FLOW_REGISTRY, changes=changes)
     _emit_alias_warnings(changes, enabled=warn_deprecated)
