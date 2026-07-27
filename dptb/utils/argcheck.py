@@ -2568,11 +2568,38 @@ def collect_cutoffs(jdata):
     return cutoff_options
 
 
+#: train_options keys declared as optional dicts carrying only sub_variants.
+#: dargs inserts their literal ``default={}`` without recursing, so they must be
+#: seeded before normalization (see _seed_variant_only_train_options).
+VARIANT_ONLY_TRAIN_OPTIONS = ("optimizer", "lr_scheduler")
+
+
+def _seed_variant_only_train_options(data):
+    """Make one normalize() pass produce usable optimizer/lr_scheduler defaults.
+
+    dargs 0.4.4 fills a missing optional dict Argument with the literal
+    ``default={}`` and never walks its sub_variants, so an omitted ``optimizer``
+    or ``lr_scheduler`` stayed ``{}`` and Trainer.__init__ raised
+    ``get_lr_scheduler() missing 1 required positional argument: 'type'``.
+    A present-but-empty dict *is* walked, so seeding it here yields the fully
+    populated variant defaults without a second normalize pass.
+    """
+
+    train = data.get("train_options")
+    if not isinstance(train, dict):
+        return data
+    for key in VARIANT_ONLY_TRAIN_OPTIONS:
+        if train.get(key) is None:
+            train[key] = {}
+    return data
+
+
 def normalize(data):
     # Resolve aliases and mutually dependent route switches before dargs inserts
     # defaults.  Doing this afterwards silently hides alias values behind the
     # canonical defaults (for example overlap_huckel_k behind huckel_k=1.75).
     data = canonicalize_training_config(data)
+    data = _seed_variant_only_train_options(data)
     co = common_options()
     tr = train_options()
     da = data_options()
