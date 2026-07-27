@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from dargs.dargs import ArgumentValueError
 
 from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.entrypoints.main import parse_args
@@ -88,7 +89,8 @@ def test_common_options_rejects_removed_overlap_prediction():
     normalized = schema.normalize_value(
         {"basis": {"H": ["1s"]}, "overlap": True}
     )
-    with pytest.raises(ValueError, match="common_options.overlap must be false"):
+    # dargs raises ArgumentValueError, which is NOT a ValueError subclass.
+    with pytest.raises(ArgumentValueError, match="common_options.overlap must be false"):
         schema.check_value(normalized, strict=True)
 
 
