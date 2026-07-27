@@ -63,6 +63,31 @@ def test_chi_gauge_shift_preserves_charges_and_shifts_energy_by_total_charge():
     np.testing.assert_allclose(shifted.energy - base.energy, shift * total_charge, atol=1e-12)
 
 
+@pytest.mark.parametrize("alpha", [0.0, 1.0e3, 1.0e6])
+def test_fixed_charge_solution_is_invariant_to_uniform_kernel_gauge(alpha):
+    chi = np.array([1.0, 3.0])
+    kernel = np.array([[5.0, 1.0], [1.0, 7.0]])
+    total_charge = 0.0
+    baseline = solve_qeq(chi, kernel, total_charge=total_charge)
+
+    shifted_kernel = kernel + alpha * np.ones_like(kernel)
+    shifted = solve_qeq(
+        chi,
+        shifted_kernel,
+        total_charge=total_charge,
+        max_condition=1.0e12,
+    )
+
+    # Z.T@(alpha*11.T)@Z == 0, so the physical tangent problem is identical.
+    np.testing.assert_allclose(shifted.charges, baseline.charges, atol=1e-10)
+    np.testing.assert_allclose(
+        shifted.diagnostics.constrained_condition,
+        baseline.diagnostics.constrained_condition,
+        atol=1e-12,
+    )
+    validate_qeq_result(shifted, atol=1e-8)
+
+
 def test_permutation_equivariance_for_dense_kernel():
     chi = np.array([0.2, -0.3, 0.5])
     kernel = np.array(
@@ -239,6 +264,24 @@ def test_validate_qeq_result_recomputes_current_arrays_not_stale_cache():
     )
     with pytest.raises(QEqOperatorError, match="diagnostic kernel_symmetry_error"):
         validate_qeq_result(replace(result, diagnostics=bad_symmetry_diag), atol=1e-8)
+
+
+def test_validator_preserves_solver_condition_policy_after_serialization():
+    import pickle
+
+    result = solve_qeq(
+        np.array([1.0, 2.0, 3.0]),
+        np.diag([1.0, 10.0, 100.0]),
+        max_condition=1.0e4,
+        residual_tol=1.0e-9,
+    )
+    restored = pickle.loads(pickle.dumps(result))
+    assert restored.max_condition == pytest.approx(1.0e4)
+    assert restored.residual_tol == pytest.approx(1.0e-9)
+    validate_qeq_result(restored)
+
+    with pytest.raises(QEqKernelConditionError, match="recorded constrained"):
+        validate_qeq_result(replace(restored, max_condition=1.1))
 
 
 def test_validate_qeq_result_wraps_zero_site_results():

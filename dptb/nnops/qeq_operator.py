@@ -103,8 +103,14 @@ class QEqResult:
     energy_identity: np.ndarray
     diagnostics: QEqDiagnostics
     units: QEqUnits
+    constrained_eig_floor: float = 1e-12
+    max_condition: float = 1e12
+    residual_tol: float = 1e-8
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "constrained_eig_floor", _as_float_scalar("constrained_eig_floor", self.constrained_eig_floor, positive=True))
+        object.__setattr__(self, "max_condition", _as_float_scalar("max_condition", self.max_condition, positive=True))
+        object.__setattr__(self, "residual_tol", _as_float_scalar("residual_tol", self.residual_tol, nonnegative=True))
         for field_name in (
             "charges",
             "total_charge",
@@ -341,41 +347,47 @@ def _recompute_kkt_condition(kernel: np.ndarray) -> np.ndarray:
     return np.asarray(conditions, dtype=np.float64).reshape(leading_shape)
 
 
-def _solve_kkt(
+def _solve_fixed_charge_nullspace(
     chi: np.ndarray,
     kernel: np.ndarray,
     total_charge: np.ndarray,
-    *,
-    max_condition: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Solve only on the physical sum(q)=Q tangent space.
+
+    The raw augmented KKT condition number is intentionally diagnostic-only:
+    adding alpha*11.T to J leaves the fixed-charge minimizer unchanged but can
+    make that raw condition number arbitrarily large.  Safety is already gated
+    by the eigenvalue floor and condition number of Z.T@J@Z.
+    """
+
     leading_shape = chi.shape[:-1]
     n = chi.shape[-1]
     flat_chi = chi.reshape((-1, n))
     flat_kernel = kernel.reshape((-1, n, n))
     flat_qtot = total_charge.reshape(-1)
+    basis = None if n == 1 else _sum_zero_basis(n)
     charges = []
     multipliers = []
     kkt_conditions = []
     for chi_one, kernel_one, qtot_one in zip(flat_chi, flat_kernel, flat_qtot):
-        kkt = np.zeros((n + 1, n + 1), dtype=np.float64)
-        kkt[:n, :n] = kernel_one
-        kkt[:n, n] = 1.0
-        kkt[n, :n] = 1.0
-        condition = float(np.linalg.cond(kkt))
-        if not np.isfinite(condition) or condition > max_condition:
-            raise QEqKernelConditionError(
-                f"QEq KKT system condition exceeds max_condition={max_condition:g}; condition={condition:.6g}"
-            )
-        rhs = np.empty(n + 1, dtype=np.float64)
-        rhs[:n] = -chi_one
-        rhs[n] = qtot_one
-        try:
-            solution = np.linalg.solve(kkt, rhs)
-        except np.linalg.LinAlgError as exc:
-            raise QEqKernelConditionError("QEq KKT system is singular") from exc
-        charges.append(solution[:n])
-        multipliers.append(solution[n])
-        kkt_conditions.append(condition)
+        q0 = np.full(n, qtot_one / float(n), dtype=np.float64)
+        if n == 1:
+            q = q0
+        else:
+            tangent_kernel = basis.T @ kernel_one @ basis
+            tangent_rhs = -basis.T @ (chi_one + kernel_one @ q0)
+            try:
+                tangent_coordinates = np.linalg.solve(tangent_kernel, tangent_rhs)
+            except np.linalg.LinAlgError as exc:  # defensive: spectrum was checked above
+                raise QEqKernelConditionError(
+                    "constrained QEq tangent system is singular"
+                ) from exc
+            q = q0 + basis @ tangent_coordinates
+        stationarity_without_lambda = chi_one + kernel_one @ q
+        lagrange_multiplier = -float(np.mean(stationarity_without_lambda))
+        charges.append(q)
+        multipliers.append(lagrange_multiplier)
+        kkt_conditions.append(float(_recompute_kkt_condition(kernel_one)))
     return (
         np.asarray(charges, dtype=np.float64).reshape(leading_shape + (n,)),
         np.asarray(multipliers, dtype=np.float64).reshape(leading_shape),
@@ -443,11 +455,10 @@ def solve_qeq(
         constrained_eig_floor=constrained_eig_floor,
         max_condition=max_condition,
     )
-    charges, lagrange_multiplier, kkt_condition = _solve_kkt(
+    charges, lagrange_multiplier, kkt_condition = _solve_fixed_charge_nullspace(
         chi,
         kernel,
         qtot,
-        max_condition=max_condition,
     )
 
     stationarity = chi + np.einsum("...ij,...j->...i", kernel, charges, optimize=True) + lagrange_multiplier[..., None]
@@ -486,6 +497,9 @@ def solve_qeq(
         energy_identity=energy_identity,
         diagnostics=diagnostics,
         units=units,
+        constrained_eig_floor=constrained_eig_floor,
+        max_condition=max_condition,
+        residual_tol=residual_tol,
     )
     validate_qeq_result(result, atol=residual_tol)
     return result
@@ -527,6 +541,9 @@ def validate_qeq_result(result: QEqResult, *, atol: float = 1e-8) -> None:
     if not isinstance(result, QEqResult):
         raise QEqOperatorError("result must be a QEqResult")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
+    # A consumer may tighten validation, but must not silently weaken the
+    # safety policy recorded by the solve that produced this result.
+    atol = min(atol, result.residual_tol)
     if not isinstance(result.diagnostics, QEqDiagnostics):
         raise QEqOperatorError("QEq diagnostics must be a QEqDiagnostics instance")
     if not isinstance(result.units, QEqUnits):
@@ -567,8 +584,16 @@ def validate_qeq_result(result: QEqResult, *, atol: float = 1e-8) -> None:
     )
     energy_identity_residual = energy - energy_identity
     constrained_min_eig, constrained_max_eig, constrained_condition = _recompute_constrained_kernel_diagnostics(kernel)
-    if n > 1 and np.any(constrained_min_eig <= 0.0):
-        raise QEqKernelConditionError("QEq hardness_kernel is not positive definite on the fixed-charge subspace")
+    if n > 1 and np.any(constrained_min_eig <= result.constrained_eig_floor):
+        raise QEqKernelConditionError(
+            "QEq hardness_kernel violates the recorded constrained_eig_floor"
+        )
+    if np.any(~np.isfinite(constrained_condition)) or np.any(
+        constrained_condition > result.max_condition
+    ):
+        raise QEqKernelConditionError(
+            "QEq hardness_kernel violates the recorded constrained max_condition"
+        )
     kkt_condition = _recompute_kkt_condition(kernel)
 
     _assert_recomputed_close("stationarity", _require_result_array("stationarity", result.stationarity), stationarity, atol=atol)
