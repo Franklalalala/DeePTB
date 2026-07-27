@@ -25,6 +25,17 @@ Supported embedding methods
 * ``lem_non_linear``
 * ``lem_non_linear_h0``
 
+.. note::
+
+   The ``*_openequi*`` methods build their tensor products through
+   ``dptb.nn.embedding.oeq_tp.OEQTensorProduct``, which accepts six connection
+   modes (``uvw``, ``uvu``, ``uvv``, ``uuw``, ``uuu``, ``uvuv``). Upstream
+   openequivariance 0.6.8 documents support for ``uvw`` and ``uvu`` only.
+   ``self_mix_mode`` is a free-form string, so a value containing ``uuw``
+   (together with ``self_mix_flag: true``) reaches an undocumented upstream
+   mode. DeePTB does not reject it; validate it against your installed
+   openequivariance build first.
+
 Shared embedding options
 ------------------------
 

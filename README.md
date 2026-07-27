@@ -59,6 +59,13 @@ The public `*_openequi*` embedding methods additionally require Python >=3.10,
 PyTorch >=2.4, and a Linux NVIDIA/AMD GPU toolchain. Install OpenEquivariance
 with `pip install ".[openequi]"`.
 
+`OEQTensorProduct` accepts six tensor-product connection modes (`uvw`, `uvu`,
+`uvv`, `uuw`, `uuu`, `uvuv`), but openequivariance 0.6.8 documents support for
+`uvw` and `uvu` only. Configurations that select another mode — notably
+`embedding.self_mix_flag: true` with a `self_mix_mode` containing `uuw` — are
+outside the documented upstream support surface; validate them against your
+installed openequivariance build before relying on the result.
+
 ## Commands
 
 ```bash
