@@ -74,7 +74,11 @@ def common_options():
 
     doc_seed = "The random seed used to initialize the parameters and determine the shuffling order of datasets. Default: `3982377700`"
     doc_basis = "The atomic orbitals used to construct the basis. e.p. {'A':['2s','2p','s*'],'B':'[3s','3p']}"
-    doc_overlap = "Whether to calculate the overlap matrix. Default: False"
+    doc_overlap = (
+        "Legacy overlap prediction was removed in 0726-light and this option "
+        "must remain false. To load fixed overlap tensors for a loss or physical "
+        "prior, use data_options.<split>.get_overlap=true."
+    )
     doc_train_w_charge = "Whether to train with charge info. Default: False"
     doc_has_soc = "Whether to train with SOC. Default: False"
     doc_nextham_uureal_mask = (
@@ -92,7 +96,17 @@ def common_options():
 
     args = [
         Argument("basis", dict, optional=False, doc=doc_basis),
-        Argument("overlap", bool, optional=True, default=False, doc=doc_overlap),
+        Argument(
+            "overlap",
+            bool,
+            optional=True,
+            default=False,
+            extra_check=lambda value: value is False,
+            extra_check_errmsg=(
+                "0726-light removed overlap prediction; common_options.overlap must be false."
+            ),
+            doc=doc_overlap,
+        ),
         Argument("train_polar", bool, optional=True, default=False, doc=doc_train_polar),
         Argument("wave_align", bool, optional=True, default=False, doc=doc_wave_align),
         Argument("train_dip", bool, optional=True, default=False, doc=doc_train_dip),

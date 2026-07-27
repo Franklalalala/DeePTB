@@ -120,7 +120,7 @@ def main_parser() -> argparse.ArgumentParser:
         "-i",
         "--init-model",
         type=str,
-        default=None,
+        required=True,
         help="Initialize the model by the provided checkpoint.",
     )
 
@@ -150,7 +150,7 @@ def main_parser() -> argparse.ArgumentParser:
         "-i",
         "--init-model",
         type=str,
-        default=None,
+        required=True,
         help="Initialize the model by the provided checkpoint.",
     )
 

@@ -42,13 +42,22 @@ first:
 conda create -n dptb python=3.10
 conda activate dptb
 pip install "torch>=2.0"
+python docs/auto_install_torch_scatter.py
 pip install .
 ```
+
+`torch-scatter` is a required runtime dependency of the retained LEM and loss
+paths. It is installed separately because its wheel must match the installed
+PyTorch CPU/CUDA build.
 
 The optional optimized SO(2) kernels are supplied by
 [`so2-cuda-ops`](https://github.com/Franklalalala/SO2CUDA). CPU imports and
 standard fallback routes remain usable when that extension is unavailable.
 Install them together with DeePTB using `pip install ".[so2]"`.
+
+The public `*_openequi*` embedding methods additionally require Python >=3.10,
+PyTorch >=2.4, and a Linux NVIDIA/AMD GPU toolchain. Install OpenEquivariance
+with `pip install ".[openequi]"`.
 
 ## Commands
 

@@ -7,7 +7,7 @@ readme = "README.md"
 repository = "https://github.com/deepmodeling/DeePTB"
 
 [tool.poetry.dependencies]
-python = ">=3.9, <=3.12.9"
+python = ">=3.9,<3.13"
 numpy = "*"
 scipy = "*"
 matplotlib = "*"
@@ -22,10 +22,13 @@ lmdb = "1.4.1"
 tqdm = "*"
 tensorboard = "*"
 seekpath = "*"
+torch-scatter = "2.1.2"
 so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main", optional = true }
+openequivariance = { version = "0.6.8", python = ">=3.10", optional = true }
 
 [tool.poetry.extras]
 so2 = ["so2-cuda-ops"]
+openequi = ["openequivariance"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.2.0"

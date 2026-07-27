@@ -1,3 +1,4 @@
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.nn.deeptb import NNENV
 from dptb.configuration import migrate_legacy_checkpoint_model_options
 import logging
@@ -435,12 +436,16 @@ def _build_ensemble_from_wrapper_state(
 # ======================================================================
 def build_model(
         checkpoint: str = None,
-        model_options: dict = {},
-        common_options: dict = {},
-        train_options: dict = {},
+        model_options: dict = None,
+        common_options: dict = None,
+        train_options: dict = None,
         no_check: bool = False,
         device: str = None,
 ):
+    model_options = copy.deepcopy(model_options or {})
+    common_options = copy.deepcopy(common_options or {})
+    train_options = copy.deepcopy(train_options or {})
+
     if checkpoint is not None:
         from_scratch = False
     else:
@@ -468,8 +473,11 @@ def build_model(
         if len(model_options) == 0 or model_options == ckptconfig["model_options"]:
             model_options = checkpoint_model_options
 
-        if len(common_options) == 0:
-            common_options = ckptconfig["common_options"]
+        common_options = merge_checkpoint_common_options(
+            common_options,
+            ckptconfig.get("common_options", {}),
+            common_options,
+        )
 
         if len(train_options) == 0:
             train_options = ckptconfig.get("train_options", {})

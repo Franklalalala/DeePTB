@@ -12,6 +12,57 @@ import torch
 log = logging.getLogger(__name__)
 
 
+def _validate_cutoff_coverage(name, dataset_cutoff, model_cutoff):
+    """Require the dataset graph cutoff to cover the model cutoff."""
+
+    numeric = (int, float)
+    if model_cutoff is None:
+        if dataset_cutoff is not None:
+            raise ValueError(
+                f"{name} is disabled in the model but set to {dataset_cutoff!r} "
+                "for the dataset."
+            )
+        return
+
+    if isinstance(model_cutoff, dict):
+        if not isinstance(dataset_cutoff, dict):
+            raise ValueError(
+                f"The model {name} is a dict, but the dataset {name} is "
+                f"{type(dataset_cutoff).__name__}."
+            )
+        missing = sorted(set(model_cutoff) - set(dataset_cutoff))
+        if missing:
+            raise ValueError(
+                f"Dataset {name} is missing model cutoff keys: {missing}."
+            )
+        too_small = {
+            key: (dataset_cutoff[key], required)
+            for key, required in model_cutoff.items()
+            if dataset_cutoff[key] < required
+        }
+        if too_small:
+            raise ValueError(
+                f"Dataset {name} must be greater than or equal to the model "
+                f"cutoff for every key; offending values: {too_small}."
+            )
+        return
+
+    if isinstance(model_cutoff, numeric) and not isinstance(model_cutoff, bool):
+        if not isinstance(dataset_cutoff, numeric) or isinstance(dataset_cutoff, bool):
+            raise ValueError(
+                f"The model {name} is scalar, but the dataset {name} is "
+                f"{type(dataset_cutoff).__name__}."
+            )
+        if dataset_cutoff < model_cutoff:
+            raise ValueError(
+                f"Dataset {name}={dataset_cutoff} is smaller than model "
+                f"{name}={model_cutoff}."
+            )
+        return
+
+    raise TypeError(f"Unsupported model {name} value: {model_cutoff!r}.")
+
+
 class DatasetBuilder:
     def __init__(self):
         pass
@@ -213,53 +264,19 @@ class DatasetBuilder:
 
         return dataset
 
-    def check_cutoffs(self,model:torch.nn.Module=None, **kwargs):
+    def check_cutoffs(self, model: torch.nn.Module = None, **kwargs):
         if model is None:
             self.if_check_cutoffs = False
             log.warning("No model is provided. We can not check the cutoffs used in data and model are consistent.")
-        else:
-            self.if_check_cutoffs = True
-            cutoff_options = collect_cutoffs(model.model_options)
-            if isinstance(cutoff_options['r_max'],dict):
-                assert isinstance(self.r_max,dict), "The r_max in model is a dict, but in dataset it is not."
-                for key in cutoff_options['r_max']:
-                    if key not in self.r_max:
-                        log.error(f"The key {key} in r_max is not defined in dataset")
-                        raise ValueError(f"The key {key} in r_max is not defined in dataset")
-                    assert self.r_max >=  cutoff_options['r_max'][key], f"The r_max in model shoule be  smaller than in dataset for {key}."
+            return
 
-            elif isinstance(cutoff_options['r_max'],float):
-                assert isinstance(self.r_max,float), "The r_max in model is a float, but in dataset it is not."
-                assert self.r_max >=  cutoff_options['r_max'], "The r_max in model shoule be  smaller than in dataset."        
-
-            if isinstance(cutoff_options['er_max'],dict):
-                assert isinstance(self.er_max,dict), "The er_max in model is a dict, but in dataset it is not."
-                for key in cutoff_options['er_max']:
-                    if key not in self.er_max:
-                        log.error(f"The key {key} in er_max is not defined in dataset")
-                        raise ValueError(f"The key {key} in er_max is not defined in dataset")
-
-                    assert self.er_max >=  cutoff_options['er_max'][key], f"The er_max in model shoule be  smaller than in dataset for {key}."
-
-            elif isinstance(cutoff_options['er_max'],float):
-                assert isinstance(self.er_max,float), "The er_max in model is a float, but in dataset it is not."
-                assert self.er_max >=  cutoff_options['er_max'], "The er_max in model shoule be  smaller than in dataset."
-            elif cutoff_options['er_max'] is None:
-                assert self.er_max is None, "The er_max in model is None, but in dataset it is not."
-
-
-            if isinstance(cutoff_options['oer_max'],dict):
-                assert isinstance(self.oer_max,dict), "The oer_max in model is a dict, but in dataset it is not."
-                for key in cutoff_options['oer_max']:
-                    if key not in self.oer_max:
-                        log.error(f"The key {key} in oer_max is not defined in dataset")
-                        raise ValueError(f"The key {key} in oer_max is not defined in dataset")
-
-                    assert self.oer_max >=  cutoff_options['oer_max'][key], f"The oer_max in model shoule be  smaller than in dataset for {key}."
-            elif isinstance(cutoff_options['oer_max'],float):
-                assert isinstance(self.oer_max,float), "The oer_max in model is a float, but in dataset it is not."
-                assert self.oer_max >=  cutoff_options['oer_max'], "The oer_max in model shoule be  smaller than in dataset."
-            elif cutoff_options['oer_max'] is None:
-                assert self.oer_max is None, "The oer_max in model is None, but in dataset it is not."
+        self.if_check_cutoffs = True
+        cutoff_options = collect_cutoffs(model.model_options)
+        for name in ("r_max", "er_max", "oer_max"):
+            _validate_cutoff_coverage(
+                name,
+                getattr(self, name, None),
+                cutoff_options[name],
+            )
 
 build_dataset = DatasetBuilder()

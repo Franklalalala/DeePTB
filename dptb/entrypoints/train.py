@@ -1,3 +1,4 @@
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.nnops.trainer import Trainer
 from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
 from dptb.configuration import (
@@ -417,6 +418,7 @@ def train(
     # parse the config. Since if use init, config file may not equals to current
 
     explicit_jdata = canonicalize_training_config(j_loader(INPUT))
+    explicit_common_options = copy.deepcopy(explicit_jdata.get("common_options", {}))
     explicit_train_options = copy.deepcopy(explicit_jdata.get("train_options", {}))
     explicit_model_options = explicit_jdata.get("model_options", None)
     jdata = normalize(explicit_jdata)
@@ -424,8 +426,6 @@ def train(
     # update jdata
     # this is not necessary, because if we init model from checkpoint, the build_model will load the model_options from checkpoints if not provided
     # since here we want to output jdata as a config file to inform the user what model options are used, we need to update the jdata
-
-    torch.set_default_dtype(getattr(torch, jdata["common_options"]["dtype"]))
 
     if restart or init_model:
 
@@ -445,15 +445,24 @@ def train(
             if explicit_model_options is None:
                 jdata["model_options"] = checkpoint_model_options
 
-            # update basis
-            basis = f["config"]["common_options"]["basis"]
+            # Restore checkpoint architecture without letting normalized schema
+            # defaults masquerade as explicit user overrides.
+            checkpoint_common_options = f["config"]["common_options"]
+            basis = checkpoint_common_options["basis"]
             for asym, orb in jdata["common_options"]["basis"].items():
-                assert asym in basis, f"Atom {asym} not found in model's basis"
-                assert orb == basis[asym], (
-                    f"Orbital {orb} of Atom {asym} is inconsistent with the "
-                    "checkpoint basis."
-                )
-            jdata["common_options"]["basis"] = basis
+                if asym not in basis:
+                    raise ValueError(f"Atom {asym} not found in model's basis")
+                if orb != basis[asym]:
+                    raise ValueError(
+                        f"Orbital {orb} of Atom {asym} is inconsistent with the "
+                        "checkpoint basis."
+                    )
+            jdata["common_options"] = merge_checkpoint_common_options(
+                jdata["common_options"],
+                checkpoint_common_options,
+                explicit_common_options,
+                preserve_runtime_defaults=True,
+            )
 
             # update model options and train_options
             if restart:
@@ -485,6 +494,8 @@ def train(
         j_must_have(jdata, "model_options")
         j_must_have(jdata, "train_options")
 
+    torch.set_default_dtype(getattr(torch, jdata["common_options"]["dtype"]))
+
     cutoff_options =collect_cutoffs(jdata)
     # jvp du/dt backend needs eager e3nn before any module is instantiated.
     configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
@@ -504,8 +515,6 @@ def train(
         reference_datasets = build_dataset(**cutoff_options, **jdata["data_options"]["reference"], **jdata["common_options"])
     else:
         reference_datasets = None
-
-    jdata["common_options"]["overlap"] = False
 
     if restart:
         trainer = Trainer.restart(
