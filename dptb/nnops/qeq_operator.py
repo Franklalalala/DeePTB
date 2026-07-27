@@ -525,7 +525,10 @@ def _solve_fixed_charge_nullspace(
                 ) from exc
             q = q0 + basis @ tangent_coordinates
         physical_gradient = physical_chi + physical_kernel @ q
-        uniform_gradient = float(np.mean(chi_one)) + float(np.mean(kernel_one)) * float(qtot_one)
+        # sum(q), not the requested qtot: lambda is defined by the charges that
+        # were actually produced, and mean(J) multiplies the difference by the
+        # full uniform gauge magnitude.
+        uniform_gradient = float(np.mean(chi_one)) + float(np.mean(kernel_one)) * float(np.sum(q))
         lagrange_multiplier = -float(np.mean(physical_gradient) + uniform_gradient)
         charges.append(q)
         multipliers.append(lagrange_multiplier)
@@ -597,19 +600,28 @@ def _stationarity_parts(
     physical_gradient = physical_chi + np.einsum(
         "...ij,...j->...i", physical_kernel, charges, optimize=True
     )
-    uniform_gradient = (
-        np.mean(chi, axis=-1)
-        + np.mean(kernel, axis=(-1, -2)) * np.sum(charges, axis=-1)
-    )
+    chi_mean = np.mean(chi, axis=-1)
+    kernel_mean = np.mean(kernel, axis=(-1, -2))
+    uniform_gradient = chi_mean + kernel_mean * np.sum(charges, axis=-1)
     stationarity = physical_gradient + (uniform_gradient + lagrange_multiplier)[..., None]
     tangent_max_abs, tangent_scale = _tangent_stationarity_parts(chi, kernel, charges)
     multiplier_residual = (
         np.mean(physical_gradient, axis=-1) + uniform_gradient + lagrange_multiplier
     )
+    # ``sum(q)`` is a cancelling sum for a neutral system, so ``mean(J) * sum(q)``
+    # cannot resolve below ``eps * |mean(J)| * sum|q|`` no matter how small the
+    # cancelled result is.  Scaling this floor by the post-cancellation
+    # ``|uniform_gradient|`` instead would reject a correct neutral solve as soon
+    # as a large ``alpha * 11.T`` gauge is supplied.  The physical charge
+    # certificate is unaffected: it is gated by ``tangent_scale`` alone.
+    uniform_scale = np.abs(chi_mean) + np.abs(kernel_mean) * np.sum(
+        np.abs(charges), axis=-1
+    )
     arithmetic_scale = (
-        tangent_scale + np.abs(uniform_gradient) + np.abs(lagrange_multiplier)
+        tangent_scale + uniform_scale + np.abs(lagrange_multiplier)
     )
     return stationarity, tangent_max_abs, multiplier_residual, arithmetic_scale
+
 
 def _residual_tolerance(atol: float, arithmetic_scale: np.ndarray) -> np.ndarray:
     return atol + _ARITHMETIC_FLOOR_ULPS * _MACHINE_EPS * arithmetic_scale
