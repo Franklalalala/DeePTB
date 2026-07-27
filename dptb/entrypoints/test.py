@@ -1,3 +1,4 @@
+import copy
 import heapq
 import logging
 import torch
@@ -5,6 +6,8 @@ import json
 import os
 import time
 from pathlib import Path
+from dptb.checkpoint_config import merge_checkpoint_common_options
+from dptb.configuration import migrate_legacy_checkpoint_model_options
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
 from typing import Optional
@@ -54,25 +57,36 @@ def _test(
                         "log_path": str(Path(log_path).absolute())
                         })
     
-    jdata = j_loader(INPUT)
-    jdata = normalize_test(jdata)
-    # setup seed
-    setup_seed(seed=jdata["common_options"]["seed"])
+    raw_jdata = j_loader(INPUT)
+    explicit_common_options = copy.deepcopy(raw_jdata.get("common_options", {}))
+    jdata = normalize_test(raw_jdata)
 
-    f = torch.load(init_model, weights_only=False)
-    # update basis
-    basis = f["config"]["common_options"]["basis"]
+    checkpoint = torch.load(init_model, map_location="cpu", weights_only=False)
+    checkpoint_config = checkpoint["config"]
+    checkpoint_common_options = checkpoint_config["common_options"]
+    basis = checkpoint_common_options["basis"]
     for asym, orb in jdata["common_options"]["basis"].items():
-        assert asym in basis.keys(), f"Atom {asym} not found in model's basis"
-        assert orb == basis[asym], f"Orbital {orb} of Atom {asym} not consistent with the model's basis"
+        if asym not in basis:
+            raise ValueError(f"Atom {asym} not found in model's basis")
+        if orb != basis[asym]:
+            raise ValueError(
+                f"Orbital {orb} of Atom {asym} not consistent with the model's basis"
+            )
 
-    jdata["common_options"]["basis"] = basis # use the old basis, because it will be used to build the orbital mapper for dataset
+    jdata["common_options"] = merge_checkpoint_common_options(
+        jdata["common_options"],
+        checkpoint_common_options,
+        explicit_common_options,
+        preserve_runtime_defaults=True,
+    )
+    setup_seed(seed=jdata["common_options"]["seed"])
 
     set_log_handles(log_level, Path(log_path) if log_path else None)
 
-    f = torch.load(run_opt["init_model"], weights_only=False)
-    jdata["model_options"] = f["config"]["model_options"]
-    del f
+    jdata["model_options"] = migrate_legacy_checkpoint_model_options(
+        checkpoint_config["model_options"]
+    )
+    del checkpoint
     
     cutoff_options = collect_cutoffs(jdata)
     cutoff_options = {
@@ -80,7 +94,13 @@ def _test(
         for key in ("r_max", "oer_max", "er_max")
     }
     test_datasets = build_dataset(**cutoff_options, **jdata["data_options"]["test"], **jdata["common_options"])
-    model = build_model(run_opt["init_model"], model_options=jdata["model_options"], common_options=jdata["common_options"])
+    model = build_model(
+        run_opt["init_model"],
+        model_options=jdata["model_options"],
+        common_options=jdata["common_options"],
+        explicit_common_options=explicit_common_options,
+    )
+    build_dataset.check_cutoffs(model=model)
     model.eval()
     tester = Tester(
         test_options=jdata["test_options"],

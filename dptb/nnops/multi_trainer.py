@@ -15,6 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torch.profiler import profile as torch_profile, ProfilerActivity
 
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.configuration import migrate_legacy_checkpoint_train_options
 from dptb.utils.tools import (
     get_lr_scheduler,
@@ -3797,7 +3798,8 @@ class MultiTrainer(Trainer):
 
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
-                validation_datasets=None, distributed_expert=False, rank=0, world_size=1):
+                validation_datasets=None, distributed_expert=False, rank=0, world_size=1,
+                explicit_common_options=None):
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
         validate_checkpoint_invariants(ckpt)
         validate_checkpoint_world_size(
@@ -3815,23 +3817,36 @@ class MultiTrainer(Trainer):
             logger=log,
         )
 
-        merged_common_options = copy.deepcopy(ckpt["config"]["common_options"])
-        merged_common_options.update(common_options or {})
+        ckpt_common_options = ckpt["config"]["common_options"]
 
         # Fail-safe for checkpoints written while an entrypoint hack mutated
         # common_options["overlap"]=False AFTER the model was built with the
         # pristine flag: the persisted config then contradicts the persisted
         # weights and a strict ensemble rebuild fails on unexpected
         # overlap-head keys. The weights are the ground truth — infer the flag.
+        # It travels through weights_inferred_overrides so the architecture
+        # conflict gate does not reject it as a user override.
         state_for_probe = ckpt.get("model_state_dict") or {}
-        if not merged_common_options.get("overlap", False) and _state_dict_has_overlap_head(state_for_probe):
+        weights_inferred_common_options = {}
+        probe_overlap = (common_options or {}).get(
+            "overlap", ckpt_common_options.get("overlap", False)
+        )
+        if not probe_overlap and _state_dict_has_overlap_head(state_for_probe):
             log.warning(
                 "Checkpoint config says overlap=False but the model state "
                 "contains overlap-head parameters; rebuilding with "
                 "overlap=True (config was written by a version that mutated "
                 "the flag after model construction)."
             )
-            merged_common_options["overlap"] = True
+            weights_inferred_common_options["overlap"] = True
+
+        merged_common_options = merge_checkpoint_common_options(
+            common_options or {},
+            ckpt_common_options,
+            explicit_common_options,
+            preserve_runtime_defaults=True,
+            weights_inferred_overrides=weights_inferred_common_options,
+        )
 
         build_common_options = copy.deepcopy(merged_common_options)
         if distributed_expert:
@@ -3841,7 +3856,9 @@ class MultiTrainer(Trainer):
             checkpoint=checkpoint,
             model_options=ckpt["config"]["model_options"],
             common_options=build_common_options,
-            train_options=ckpt_train_options
+            train_options=ckpt_train_options,
+            explicit_common_options=build_common_options,
+            weights_inferred_common_options=weights_inferred_common_options,
         )
 
         distance_ranges = ckpt_train_options.get(

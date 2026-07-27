@@ -21,8 +21,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+import logging
 import warnings
 
+
+log = logging.getLogger(__name__)
 
 _MISSING = object()
 
@@ -670,6 +673,30 @@ _FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
 )
 
 
+# The on-the-fly DFTB-SK prior family was removed with the SK route. flow.py is
+# deliberately byte-identical to 0721-stable, so its own rejection message still
+# advertises 'dftbsk' as supported; catching the aliases here — canonicalization
+# runs first, including from HamiltonianCFM.__init__ — is what makes the error
+# truthful.
+RETIRED_DFTBSK_PRIOR_NAMES = frozenset(
+    {"dftbsk", "dftb_sk", "dftb_scf0", "dftb_on_the_fly", "skf", "skfile"}
+)
+
+
+def _reject_retired_dftbsk_prior(prior: Any) -> None:
+    if not isinstance(prior, str):
+        return
+    if _normalized_name(prior) not in RETIRED_DFTBSK_PRIOR_NAMES:
+        return
+    raise ValueError(
+        f"flow_options.prior={prior!r} selects the on-the-fly DFTB-SK prior, "
+        "which was removed together with the SK model route. Precompute the "
+        "prior and use prior='external', or choose one of 'zero', 'gaussian', "
+        "'residual_gaussian', 'te', 'projected_te', 'tied_irrep_gaussian', "
+        "'basis_onsite', 'overlap_huckel', 'haar_dm'."
+    )
+
+
 def canonicalize_flow_options(
     options: Optional[Mapping[str, Any]],
     *,
@@ -682,6 +709,7 @@ def canonicalize_flow_options(
     if not isinstance(options, Mapping):
         raise TypeError("train_options.flow_options must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
+    _reject_retired_dftbsk_prior(out.get("prior"))
     changes: List[_AliasHit] = []
     _apply_alias_registry(out, _FLOW_REGISTRY, changes=changes)
     _emit_alias_warnings(changes, enabled=warn_deprecated)
@@ -763,6 +791,56 @@ _TRAIN_ENDPOINT_REGISTRY: Tuple[_AliasRule, ...] = (
 )
 
 
+# Schema keys the 0726-light cleanup deleted outright. Every checkpoint written
+# by 0721-stable has them baked into its saved config (dargs injected the
+# defaults), so strict validation on --restart/--init-model rejects the
+# checkpoint's own config unless they are stripped here. The value beside each
+# name is the default the deleted Argument carried; a stored value that differs
+# means the checkpoint really used the removed feature, which this branch can no
+# longer reproduce, so that case is warned about rather than dropped silently.
+REMOVED_EMBEDDING_OPTION_DEFAULTS = (
+    ("edge_message_value_gate", False),
+    ("edge_message_value_gate_hidden_dim", 0),
+)
+REMOVED_FLOW_OPTION_DEFAULTS = (
+    ("prior_skdata", ""),
+    ("dftb_prior_overlap", False),
+    ("dftb_prior_strict", True),
+    ("dftb_prior_require_geometry", True),
+)
+
+
+def _strip_removed_checkpoint_keys(
+    out: MutableMapping[str, Any],
+    removed: Sequence[Tuple[str, Any]],
+    section: str,
+) -> None:
+    dropped = []
+    diverged = []
+    for key, removed_default in removed:
+        if key not in out:
+            continue
+        value = out.pop(key)
+        if _same_value(value, removed_default):
+            dropped.append(key)
+        else:
+            diverged.append(f"{key}={value!r}")
+    if dropped:
+        log.info(
+            "Dropped schema keys removed in 0726-light from checkpoint %s: %s.",
+            section,
+            ", ".join(sorted(dropped)),
+        )
+    if diverged:
+        log.warning(
+            "Checkpoint %s carries non-default values for options removed in "
+            "0726-light (%s); the feature no longer exists and the values are "
+            "ignored.",
+            section,
+            ", ".join(sorted(diverged)),
+        )
+
+
 def migrate_legacy_checkpoint_flow_options(
     options: Optional[Mapping[str, Any]],
     *,
@@ -781,6 +859,9 @@ def migrate_legacy_checkpoint_flow_options(
     if not isinstance(options, Mapping):
         raise TypeError("checkpoint train_options.flow_options must be a mapping.")
     out: Dict[str, Any] = deepcopy(dict(options))
+    _strip_removed_checkpoint_keys(
+        out, REMOVED_FLOW_OPTION_DEFAULTS, "train_options.flow_options"
+    )
     changes: List[_AliasHit] = []
     for canonical, alias, old_default in _LEGACY_CHECKPOINT_FLOW_ALIAS_DEFAULTS:
         if canonical not in out or alias not in out:
@@ -1078,6 +1159,9 @@ def migrate_legacy_checkpoint_model_options(
     embedding = out.get("embedding")
     if isinstance(embedding, Mapping):
         embedding = deepcopy(dict(embedding))
+        _strip_removed_checkpoint_keys(
+            embedding, REMOVED_EMBEDDING_OPTION_DEFAULTS, "model_options.embedding"
+        )
         alias = "h0_fallback_to_hamiltonian"
         canonical = "fallback_to_hamiltonian"
         if alias in embedding:
@@ -1205,6 +1289,8 @@ def canonicalize_training_config(
 
 __all__ = [
     "DEPRECATED_TRAIN_OPTION_KEYS",
+    "REMOVED_EMBEDDING_OPTION_DEFAULTS",
+    "REMOVED_FLOW_OPTION_DEFAULTS",
     "canonicalize_embedding_options",
     "canonicalize_flow_options",
     "canonicalize_prediction_options",

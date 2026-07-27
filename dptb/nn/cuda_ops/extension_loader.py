@@ -7,14 +7,28 @@ extra merely for their build plumbing.
 
 from __future__ import annotations
 
+import importlib
 import os
 import site
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-try:
-    from so2_cuda_ops import _extension_loader as _backend
-except ModuleNotFoundError:
+
+def _load_external_backend():
+    try:
+        return importlib.import_module("so2_cuda_ops._extension_loader")
+    except ModuleNotFoundError as exc:
+        # Fall back only when the optional top-level package itself is absent.
+        # A missing loader submodule or transitive dependency means an installed
+        # backend is broken and must not be hidden behind an unrelated JIT build.
+        if exc.name != "so2_cuda_ops":
+            raise
+        return None
+
+
+_backend = _load_external_backend()
+
+if _backend is None:
     from torch.utils.cpp_extension import load
 
     _FALSE = {

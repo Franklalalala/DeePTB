@@ -16,12 +16,8 @@ from e3nn.o3 import (
     xyz_to_angles,
 )
 
-# Optional import for openequivariance
-try:
-    import openequivariance as oeq
-except ImportError:
-    oeq = None
-    print("Warning: openequivariance not found. OEQ modules will fail.")
+# Optional import for openequivariance (shared, silent at import time)
+from dptb.nn.embedding.oeq_backend import oeq, warn_openequivariance_missing
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
@@ -1012,6 +1008,7 @@ class OEQTensorProduct(nn.Module):
     ):
         super().__init__()
         if oeq is None:
+            warn_openequivariance_missing()
             raise ImportError("OpenEquivariance not installed.")
 
         self.irreps_in1 = o3.Irreps(irreps_in1)
@@ -1207,6 +1204,7 @@ class LemInFrameOpenequi(LemInFrame):
         super().__init__(**kwargs)
 
         if oeq is None:
+            warn_openequivariance_missing()
             raise ImportError("OpenEquivariance is not installed.")
 
         # Parallel compilation preparation

@@ -1,9 +1,9 @@
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.nn.deeptb import NNENV
 from dptb.configuration import migrate_legacy_checkpoint_model_options
 import logging
 import torch
 import torch.nn as nn
-from dptb.utils.tools import j_must_have, j_loader
 from dptb.data import AtomicDataDict
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nn.output_spec import default_output_spec, ModelOutputSpecError
@@ -430,17 +430,39 @@ def _build_ensemble_from_wrapper_state(
     return model
 
 
+JSON_MODEL_RETIRED_MESSAGE = (
+    "json model files belonged to the retired SK route; pass a .pth checkpoint."
+)
+
+
+def _reject_retired_json_model(path):
+    """The json branch never worked: it parsed the config and then handed the
+    same path to torch.load, which raised UnpicklingError."""
+    if isinstance(path, str) and path.split(".")[-1].lower() == "json":
+        raise ValueError(f"{JSON_MODEL_RETIRED_MESSAGE} Got: {path}")
+
+
 # ======================================================================
 # [核心主程序] 原版 build_model
 # ======================================================================
 def build_model(
         checkpoint: str = None,
-        model_options: dict = {},
-        common_options: dict = {},
-        train_options: dict = {},
+        model_options: dict = None,
+        common_options: dict = None,
+        train_options: dict = None,
         no_check: bool = False,
         device: str = None,
+        explicit_common_options: dict = None,
+        weights_inferred_common_options: dict = None,
 ):
+    # Keys the *user* actually wrote. Anything else in ``common_options`` is a
+    # schema default and must lose to the checkpoint's own architecture.
+    explicit_common_options = copy.deepcopy(explicit_common_options or {})
+    weights_inferred_common_options = copy.deepcopy(weights_inferred_common_options or {})
+    model_options = copy.deepcopy(model_options or {})
+    common_options = copy.deepcopy(common_options or {})
+    train_options = copy.deepcopy(train_options or {})
+
     if checkpoint is not None:
         from_scratch = False
     else:
@@ -454,13 +476,11 @@ def build_model(
     ckpt_state_dict = None
 
     if not from_scratch:
-        if checkpoint.split(".")[-1] == "json":
-            ckptconfig = j_loader(checkpoint)
-        else:
-            f = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            ckptconfig = f['config']
-            ckpt_state_dict = f.get("model_state_dict", None)
-            del f
+        _reject_retired_json_model(checkpoint)
+        f = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ckptconfig = f['config']
+        ckpt_state_dict = f.get("model_state_dict", None)
+        del f
 
         checkpoint_model_options = migrate_legacy_checkpoint_model_options(
             ckptconfig["model_options"]
@@ -468,8 +488,13 @@ def build_model(
         if len(model_options) == 0 or model_options == ckptconfig["model_options"]:
             model_options = checkpoint_model_options
 
-        if len(common_options) == 0:
-            common_options = ckptconfig["common_options"]
+        common_options = merge_checkpoint_common_options(
+            common_options,
+            ckptconfig.get("common_options", {}),
+            explicit_common_options,
+            preserve_runtime_defaults=True,
+            weights_inferred_overrides=weights_inferred_common_options,
+        )
 
         if len(train_options) == 0:
             train_options = ckptconfig.get("train_options", {})

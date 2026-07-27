@@ -74,7 +74,11 @@ def common_options():
 
     doc_seed = "The random seed used to initialize the parameters and determine the shuffling order of datasets. Default: `3982377700`"
     doc_basis = "The atomic orbitals used to construct the basis. e.p. {'A':['2s','2p','s*'],'B':'[3s','3p']}"
-    doc_overlap = "Whether to calculate the overlap matrix. Default: False"
+    doc_overlap = (
+        "Legacy overlap prediction was removed in 0726-light and this option "
+        "must remain false. To load fixed overlap tensors for a loss or physical "
+        "prior, use data_options.<split>.get_overlap=true."
+    )
     doc_train_w_charge = "Whether to train with charge info. Default: False"
     doc_has_soc = "Whether to train with SOC. Default: False"
     doc_nextham_uureal_mask = (
@@ -92,7 +96,17 @@ def common_options():
 
     args = [
         Argument("basis", dict, optional=False, doc=doc_basis),
-        Argument("overlap", bool, optional=True, default=False, doc=doc_overlap),
+        Argument(
+            "overlap",
+            bool,
+            optional=True,
+            default=False,
+            extra_check=lambda value: value is False,
+            extra_check_errmsg=(
+                "0726-light removed overlap prediction; common_options.overlap must be false."
+            ),
+            doc=doc_overlap,
+        ),
         Argument("train_polar", bool, optional=True, default=False, doc=doc_train_polar),
         Argument("wave_align", bool, optional=True, default=False, doc=doc_wave_align),
         Argument("train_dip", bool, optional=True, default=False, doc=doc_train_dip),
@@ -2554,11 +2568,38 @@ def collect_cutoffs(jdata):
     return cutoff_options
 
 
+#: train_options keys declared as optional dicts carrying only sub_variants.
+#: dargs inserts their literal ``default={}`` without recursing, so they must be
+#: seeded before normalization (see _seed_variant_only_train_options).
+VARIANT_ONLY_TRAIN_OPTIONS = ("optimizer", "lr_scheduler")
+
+
+def _seed_variant_only_train_options(data):
+    """Make one normalize() pass produce usable optimizer/lr_scheduler defaults.
+
+    dargs 0.4.4 fills a missing optional dict Argument with the literal
+    ``default={}`` and never walks its sub_variants, so an omitted ``optimizer``
+    or ``lr_scheduler`` stayed ``{}`` and Trainer.__init__ raised
+    ``get_lr_scheduler() missing 1 required positional argument: 'type'``.
+    A present-but-empty dict *is* walked, so seeding it here yields the fully
+    populated variant defaults without a second normalize pass.
+    """
+
+    train = data.get("train_options")
+    if not isinstance(train, dict):
+        return data
+    for key in VARIANT_ONLY_TRAIN_OPTIONS:
+        if train.get(key) is None:
+            train[key] = {}
+    return data
+
+
 def normalize(data):
     # Resolve aliases and mutually dependent route switches before dargs inserts
     # defaults.  Doing this afterwards silently hides alias values behind the
     # canonical defaults (for example overlap_huckel_k behind huckel_k=1.75).
     data = canonicalize_training_config(data)
+    data = _seed_variant_only_train_options(data)
     co = common_options()
     tr = train_options()
     da = data_options()

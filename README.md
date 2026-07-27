@@ -44,13 +44,29 @@ first:
 conda create -n dptb python=3.10
 conda activate dptb
 pip install "torch>=2.0"
+python docs/auto_install_torch_scatter.py
 pip install .
 ```
+
+`torch-scatter` is a required runtime dependency of the retained LEM and loss
+paths. It is installed separately because its wheel must match the installed
+PyTorch CPU/CUDA build.
 
 The optional optimized SO(2) kernels are supplied by
 [`so2-cuda-ops`](https://github.com/Franklalalala/SO2CUDA). CPU imports and
 standard fallback routes remain usable when that extension is unavailable.
 Install them together with DeePTB using `pip install ".[so2]"`.
+
+The public `*_openequi*` embedding methods additionally require Python >=3.10,
+PyTorch >=2.4, and a Linux NVIDIA/AMD GPU toolchain. Install OpenEquivariance
+with `pip install ".[openequi]"`.
+
+`OEQTensorProduct` accepts six tensor-product connection modes (`uvw`, `uvu`,
+`uvv`, `uuw`, `uuu`, `uvuv`), but openequivariance 0.6.8 documents support for
+`uvw` and `uvu` only. Configurations that select another mode — notably
+`embedding.self_mix_flag: true` with a `self_mix_mode` containing `uuw` — are
+outside the documented upstream support surface; validate them against your
+installed openequivariance build before relying on the result.
 
 ## Commands
 
@@ -66,8 +82,12 @@ configuration fields.
 ## Validation
 
 ```bash
+pip install ".[test]"
 python -m pytest dptb/tests
 ```
+
+Use `python -m pytest` rather than the bare `pytest` script: a few test modules
+import the repo-root `tools` package, which is not part of the wheel.
 
 CUDA-only kernel tests skip automatically when the required device or
 extension is unavailable.

@@ -5,6 +5,7 @@ import csv
 import math
 import copy
 import torch.nn as nn
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.configuration import migrate_legacy_checkpoint_train_options
 from dptb.utils.tools import (
     get_lr_scheduler,
@@ -1016,7 +1017,7 @@ class Trainer(BaseTrainer):
 
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options=None, common_options=None, reference_datasets=None,
-                validation_datasets=None):
+                validation_datasets=None, explicit_common_options=None):
         train_options = {} if train_options is None else train_options
         common_options = {} if common_options is None else common_options
         ckpt = torch.load(
@@ -1035,8 +1036,12 @@ class Trainer(BaseTrainer):
             ckpt_train_options,
             logger=log,
         )
-        merged_common_options = copy.deepcopy(ckpt["config"]["common_options"])
-        merged_common_options.update(common_options)
+        merged_common_options = merge_checkpoint_common_options(
+            common_options,
+            ckpt["config"]["common_options"],
+            explicit_common_options,
+            preserve_runtime_defaults=True,
+        )
         model_build_train_options = merged_train_options
         model_state = ckpt.get("model_state_dict", {})
         has_flat_distance_state = (
@@ -1057,6 +1062,7 @@ class Trainer(BaseTrainer):
             ckpt["config"]["model_options"],
             merged_common_options,
             train_options=model_build_train_options,
+            explicit_common_options=merged_common_options,
         )
         train_options = merged_train_options
         trainer = cls(model=model, train_datasets=train_datasets, reference_datasets=reference_datasets,

@@ -1,3 +1,4 @@
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.nnops.trainer import Trainer
 from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
 from dptb.configuration import (
@@ -6,7 +7,7 @@ from dptb.configuration import (
     migrate_legacy_checkpoint_train_options,
 )
 from dptb.nnops.ddp_utils import merge_restart_train_options
-from dptb.nn.build import build_model
+from dptb.nn.build import build_model, _reject_retired_json_model
 from dptb.data.build import build_dataset
 from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
 from dptb.plugins.training_monitor import register_core_training_monitors
@@ -417,6 +418,7 @@ def train(
     # parse the config. Since if use init, config file may not equals to current
 
     explicit_jdata = canonicalize_training_config(j_loader(INPUT))
+    explicit_common_options = copy.deepcopy(explicit_jdata.get("common_options", {}))
     explicit_train_options = copy.deepcopy(explicit_jdata.get("train_options", {}))
     explicit_model_options = explicit_jdata.get("model_options", None)
     jdata = normalize(explicit_jdata)
@@ -425,65 +427,72 @@ def train(
     # this is not necessary, because if we init model from checkpoint, the build_model will load the model_options from checkpoints if not provided
     # since here we want to output jdata as a config file to inform the user what model options are used, we need to update the jdata
 
-    torch.set_default_dtype(getattr(torch, jdata["common_options"]["dtype"]))
-
     if restart or init_model:
 
         f = restart if restart else init_model
 
-        if f.split(".")[-1] == "json":
-            assert not restart, "json model can not be used as restart! should be a checkpoint file"
-        else:
-            f = torch.load(f, map_location="cpu", weights_only=False)
-            checkpoint_train_options = migrate_legacy_checkpoint_train_options(
-                f["config"].get("train_options", {})
-            )
-            checkpoint_model_options = migrate_legacy_checkpoint_model_options(
-                f["config"]["model_options"]
-            )
+        _reject_retired_json_model(f)
+        f = torch.load(f, map_location="cpu", weights_only=False)
+        checkpoint_train_options = migrate_legacy_checkpoint_train_options(
+            f["config"].get("train_options", {})
+        )
+        checkpoint_model_options = migrate_legacy_checkpoint_model_options(
+            f["config"]["model_options"]
+        )
 
-            if explicit_model_options is None:
-                jdata["model_options"] = checkpoint_model_options
+        if explicit_model_options is None:
+            jdata["model_options"] = checkpoint_model_options
 
-            # update basis
-            basis = f["config"]["common_options"]["basis"]
-            for asym, orb in jdata["common_options"]["basis"].items():
-                assert asym in basis, f"Atom {asym} not found in model's basis"
-                assert orb == basis[asym], (
+        # Restore checkpoint architecture without letting normalized schema
+        # defaults masquerade as explicit user overrides.
+        checkpoint_common_options = f["config"]["common_options"]
+        basis = checkpoint_common_options["basis"]
+        for asym, orb in jdata["common_options"]["basis"].items():
+            if asym not in basis:
+                raise ValueError(f"Atom {asym} not found in model's basis")
+            if orb != basis[asym]:
+                raise ValueError(
                     f"Orbital {orb} of Atom {asym} is inconsistent with the "
                     "checkpoint basis."
                 )
-            jdata["common_options"]["basis"] = basis
+        jdata["common_options"] = merge_checkpoint_common_options(
+            jdata["common_options"],
+            checkpoint_common_options,
+            explicit_common_options,
+            preserve_runtime_defaults=True,
+        )
 
-            # update model options and train_options
-            if restart:
-                jdata["train_options"] = merge_restart_train_options(
-                    explicit_train_options,
-                    checkpoint_train_options,
-                    logger=log,
-                )
+        # update model options and train_options
+        if restart:
+            jdata["train_options"] = merge_restart_train_options(
+                explicit_train_options,
+                checkpoint_train_options,
+                logger=log,
+            )
 
-                if jdata.get("model_options", None) is None or jdata["model_options"] != checkpoint_model_options:
-                    log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
-                    jdata["model_options"] = checkpoint_model_options # restart does not allow to change model options
-            else:
-                # init model mode, allow model_options change (Would it cause some error later if the param mismatch?)
-                if not explicit_train_options:
-                    jdata["train_options"] = checkpoint_train_options
-                if explicit_model_options is None:
-                    jdata["model_options"] = checkpoint_model_options
+            if jdata.get("model_options", None) is None or jdata["model_options"] != checkpoint_model_options:
+                log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
+                jdata["model_options"] = checkpoint_model_options # restart does not allow to change model options
+        else:
+            # init model mode, allow model_options change (Would it cause some error later if the param mismatch?)
+            if not explicit_train_options:
+                jdata["train_options"] = checkpoint_train_options
+            if explicit_model_options is None:
+                jdata["model_options"] = checkpoint_model_options
 
-                ## add some warning !
-                for k, v in jdata["model_options"].items():
-                    if k not in checkpoint_model_options:
-                        log.warning(f"The model options {k} is not defined in checkpoint, set to {v}.")
-                    else:
-                        deep_dict_difference(k, v, checkpoint_model_options)
-            del f
-            jdata = normalize(jdata)
+            ## add some warning !
+            for k, v in jdata["model_options"].items():
+                if k not in checkpoint_model_options:
+                    log.warning(f"The model options {k} is not defined in checkpoint, set to {v}.")
+                else:
+                    deep_dict_difference(k, v, checkpoint_model_options)
+        del f
+        jdata = normalize(jdata)
     else:
         j_must_have(jdata, "model_options")
         j_must_have(jdata, "train_options")
+
+    torch.set_default_dtype(getattr(torch, jdata["common_options"]["dtype"]))
 
     cutoff_options =collect_cutoffs(jdata)
     # jvp du/dt backend needs eager e3nn before any module is instantiated.
@@ -505,8 +514,6 @@ def train(
     else:
         reference_datasets = None
 
-    jdata["common_options"]["overlap"] = False
-
     if restart:
         trainer = Trainer.restart(
             train_options=jdata["train_options"],
@@ -515,6 +522,7 @@ def train(
             train_datasets=train_datasets,
             reference_datasets=reference_datasets,
             validation_datasets=validation_datasets,
+            explicit_common_options=jdata["common_options"],
         )
     else:
         # include the init model and from scratch
@@ -525,6 +533,7 @@ def train(
             model_options=jdata["model_options"],
             common_options=jdata["common_options"],
             train_options=jdata["train_options"],
+            explicit_common_options=explicit_common_options,
         )
         scale_type = jdata["model_options"]["prediction"].get('scale_type', "scale_w_back_grad")
         if scale_type == 'no_scale':
@@ -540,6 +549,10 @@ def train(
             validation_datasets=validation_datasets,
             reference_datasets=reference_datasets,
         )
+
+    # Every split above was built from the same cutoff_options, so the builder's
+    # last-dataset state is representative of all of them.
+    build_dataset.check_cutoffs(model=trainer.model)
 
     # register the plugin in trainer, to tract training info
     train_options = jdata["train_options"]

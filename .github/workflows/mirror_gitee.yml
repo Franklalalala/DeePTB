@@ -8,6 +8,8 @@ concurrency:
 
 jobs:
   git-mirror:
+    # Pushes to the upstream Gitee mirror; forks have no such target.
+    if: github.repository_owner == 'deepmodeling'
     uses: deepmodeling/workflows/.github/workflows/mirror_gitee.yml@main
     secrets:
       SYNC_GITEE_PRIVATE_KEY: ${{ secrets.SYNC_GITEE_PRIVATE_KEY }}

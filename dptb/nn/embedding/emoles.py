@@ -16,12 +16,8 @@ from e3nn.o3 import (
     xyz_to_angles,
 )
 
-# Optional import for openequivariance
-try:
-    import openequivariance as oeq
-except ImportError:
-    oeq = None
-    print("Warning: openequivariance not found. OEQ modules will fail.")
+# Optional import for openequivariance (shared, silent at import time)
+from dptb.nn.embedding.oeq_backend import oeq, warn_openequivariance_missing
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
@@ -1010,120 +1006,6 @@ class EMolES(torch.nn.Module):
 # 2. OEQ Extensions
 # ==============================================================================
 
-def get_feasible_tp(
-        irreps_in1: o3.Irreps,
-        irreps_in2: o3.Irreps,
-        filter_irreps_out: o3.Irreps,
-        tp_mode: str = "uvw",
-        trainable: bool = True
-):
-    """Generate irreps_out and instructions for OpenEquivariance TP."""
-    assert tp_mode in ["uvw", "uvu", "uvv", "uuw", "uuu", "uvuv"]
-    irreps_mid = []
-    instructions = []
-
-    for i, (mul_1, ir_in1) in enumerate(irreps_in1):
-        for j, (mul_2, ir_in2) in enumerate(irreps_in2):
-            if tp_mode in ["uuw", "uuu"] and mul_1 != mul_2:
-                continue
-
-            for ir_out in ir_in1 * ir_in2:
-                if ir_out in filter_irreps_out:
-                    if tp_mode == "uvw":
-                        mul_out = filter_irreps_out.count(ir_out)
-                    elif tp_mode == "uvu":
-                        mul_out = mul_1
-                    elif tp_mode == "uvv":
-                        mul_out = mul_2
-                    elif tp_mode == "uuu":
-                        mul_out = mul_1
-                    elif tp_mode == "uuw":
-                        mul_out = filter_irreps_out.count(ir_out)
-                    elif tp_mode == "uvuv":
-                        mul_out = mul_1 * mul_2
-                    else:
-                        raise NotImplementedError(f"Unsupported TP mode: {tp_mode}")
-
-                    found_k = -1
-                    for k, (m, ir) in enumerate(irreps_mid):
-                        if ir == ir_out and m == mul_out:
-                            found_k = k
-                            break
-
-                    if found_k == -1:
-                        found_k = len(irreps_mid)
-                        irreps_mid.append((mul_out, ir_out))
-
-                    instructions.append((i, j, found_k, tp_mode, trainable))
-
-    irreps_mid_obj = o3.Irreps(irreps_mid)
-
-    final_instructions = []
-    for ins in instructions:
-        i_in1, i_in2, i_out, mode, train = ins
-        alpha = 1.0
-        final_instructions.append((i_in1, i_in2, i_out, mode, train, alpha))
-
-    return irreps_mid_obj, final_instructions
-
-
-class OEQTensorProduct(nn.Module):
-    def __init__(
-            self,
-            irreps_in1: o3.Irreps,
-            irreps_in2: o3.Irreps,
-            irreps_out: o3.Irreps,
-            tp_mode: str = "uvw",
-            internal_weights: bool = True,
-            shared_weights: bool = True
-    ):
-        super().__init__()
-        if oeq is None:
-            raise ImportError("OpenEquivariance not installed.")
-
-        self.irreps_in1 = o3.Irreps(irreps_in1)
-        self.irreps_in2 = o3.Irreps(irreps_in2)
-        self.irreps_out = o3.Irreps(irreps_out)
-        self.internal_weights_flag = internal_weights
-
-        self.irreps_mid, instructions = get_feasible_tp(
-            self.irreps_in1, self.irreps_in2, self.irreps_out, tp_mode=tp_mode
-        )
-
-        self.problem = oeq.TPProblem(
-            self.irreps_in1,
-            self.irreps_in2,
-            self.irreps_mid,
-            instructions,
-            shared_weights=shared_weights,
-            internal_weights=False
-        )
-
-        self.tp = oeq.TensorProduct(self.problem, torch_op=True)
-        self.weight_numel = self.problem.weight_numel
-
-        if self.internal_weights_flag and self.weight_numel > 0:
-            self.weights = nn.Parameter(torch.randn(self.weight_numel))
-            with torch.no_grad():
-                self.weights.div_(self.weight_numel ** 0.5)
-        else:
-            self.register_parameter('weights', None)
-
-        if self.irreps_mid != self.irreps_out:
-            self.post_linear = o3.Linear(self.irreps_mid, self.irreps_out)
-        else:
-            self.post_linear = nn.Identity()
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor, weight: Optional[torch.Tensor] = None):
-        w = self.weights if self.internal_weights_flag else weight
-        if self.weight_numel > 0:
-            out = self.tp(x, y, w)
-        else:
-            out = self.tp(x, y)
-        out = self.post_linear(out)
-        return out
-
-
 from dptb.nn.embedding.oeq_tp import (  # noqa: E402
     OEQTensorProduct as OEQTensorProduct,
     get_feasible_tp as get_feasible_tp,
@@ -1277,6 +1159,7 @@ class EMolESOpenequi(EMolES):
         super().__init__(**kwargs)
 
         if oeq is None:
+            warn_openequivariance_missing()
             raise ImportError("OpenEquivariance is not installed.")
 
         # Parallel compilation preparation

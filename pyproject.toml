@@ -7,7 +7,10 @@ readme = "README.md"
 repository = "https://github.com/deepmodeling/DeePTB"
 
 [tool.poetry.dependencies]
-python = ">=3.9, <=3.12.9"
+python = ">=3.9,<3.13"
+# Floor only: the wheel a user must install is platform/CUDA specific, so an
+# upper bound here would fight the PyTorch index rather than protect anyone.
+torch = ">=2.0"
 numpy = "*"
 scipy = "*"
 matplotlib = "*"
@@ -16,24 +19,34 @@ pyyaml = "*"
 dargs = "0.4.4"
 e3nn = ">=0.5.1"
 torch-runstats = "0.2.0"
-opt-einsum = "3.3.0"
 h5py = ">=3.7.0,<=3.11.0,!=3.10.0"
 lmdb = "1.4.1"
 tqdm = "*"
 tensorboard = "*"
 seekpath = "*"
+torch-scatter = "2.1.2"
+# dptb/postprocess/write_abacus_csr_file.py imports dftio.constants.ABACUS2DFTIO
+# at module scope; it is reachable from `dptb run` via the hrebuild route.
+dftio = ">=0.0.1"
 so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main", optional = true }
+openequivariance = { version = "0.6.8", python = ">=3.10", optional = true }
+# Poetry groups are honoured only by `poetry install`; every documented install
+# path uses pip, so the test requirements have to be a real extra.
+pytest = { version = ">=7.2.0", optional = true }
 
 [tool.poetry.extras]
 so2 = ["so2-cuda-ops"]
-
-[tool.poetry.group.dev.dependencies]
-pytest = ">=7.2.0"
-pytest-order = "1.2.0"
-e3nn = ">=0.5.1,<=0.5.3"
+openequi = ["openequivariance"]
+test = ["pytest"]
 
 [tool.poetry.scripts]
 dptb = 'dptb.__main__:main'
+
+[tool.pytest.ini_options]
+# Six test modules import the repo-root `tools` package, which is not part of
+# the wheel. Without this, the bare `pytest` console script cannot collect them
+# from an installed-package checkout.
+pythonpath = ["."]
 
 [build-system]
 requires = ["poetry-core", "poetry-dynamic-versioning"]

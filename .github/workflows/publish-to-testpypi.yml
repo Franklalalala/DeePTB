@@ -7,8 +7,12 @@ on:
 jobs:
 
   publish:
+    # The so2 extra is a direct git URL, which TestPyPI rejects in uploaded
+    # metadata. Only the upstream repository owns a releasable configuration;
+    # forks must not attempt an upload.
+    if: github.repository_owner == 'deepmodeling'
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v4
       with:

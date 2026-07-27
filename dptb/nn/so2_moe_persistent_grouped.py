@@ -44,16 +44,37 @@ _LAYOUT_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tenso
 _LAYOUT_CACHE_MAX = 32
 
 
-def _segmented_m0_backward(*args, **kwargs):
-    from dptb.nn.so2_moe_fused_p0 import _segmented_m0_backward as backend
+_SO2_BACKWARD_BACKEND_HINT = (
+    "The persistent-grouped SO(2) route needs the segmented backward kernels "
+    "from the optional so2-cuda-ops package; install it with "
+    'pip install ".[so2]". The in-repo JIT extension (dptb/nn/csrc) ships the '
+    "forward kernels only, so building it locally is not enough — disable the "
+    "persistent-grouped route to fall back to the maintained PyTorch path."
+)
 
-    return backend(*args, **kwargs)
+
+def _so2_backward_backend(name: str):
+    """Resolve a segmented backward kernel, failing with an actionable error.
+
+    dptb.nn.so2_moe_fused_p0 imports cleanly without so2_cuda_ops but then does
+    not define these names, so a bare import here leaked a raw ImportError from
+    inside backward on the exact install shape this branch advertises.
+    """
+
+    try:
+        from dptb.nn import so2_moe_fused_p0
+
+        return getattr(so2_moe_fused_p0, name)
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(f"{_SO2_BACKWARD_BACKEND_HINT} (missing {name})") from exc
+
+
+def _segmented_m0_backward(*args, **kwargs):
+    return _so2_backward_backend("_segmented_m0_backward")(*args, **kwargs)
 
 
 def _segmented_pair_backward(*args, **kwargs):
-    from dptb.nn.so2_moe_fused_p0 import _segmented_pair_backward as backend
-
-    return backend(*args, **kwargs)
+    return _so2_backward_backend("_segmented_pair_backward")(*args, **kwargs)
 
 
 def _flag(name: str, default: str = "0") -> bool:
