@@ -61,8 +61,11 @@ class GeneralizedBands:
     overlap_condition: np.ndarray
 
     def __post_init__(self) -> None:
-        for field_name in ("eigvals", "eigvecs", "min_overlap_eig", "overlap_condition"):
-            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+        _freeze_arrays(self, ("eigvals", "eigvecs", "min_overlap_eig", "overlap_condition"))
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass(frozen=True)
@@ -89,8 +92,11 @@ class EnergyLedger:
     band_grand_energy: np.ndarray
 
     def __post_init__(self) -> None:
-        for field_name in ("band_energy", "minus_t_s", "band_free_energy", "band_grand_energy"):
-            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+        _freeze_arrays(self, ("band_energy", "minus_t_s", "band_free_energy", "band_grand_energy"))
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass(frozen=True)
@@ -113,16 +119,22 @@ class ConservationLedger:
     input_s_hermiticity_error: np.ndarray
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "electron_count_from_density",
-            "band_energy_from_density",
-            "electron_count_residual",
-            "band_energy_residual",
-            "density_hermiticity_error",
-            "input_h_hermiticity_error",
-            "input_s_hermiticity_error",
-        ):
-            object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
+        _freeze_arrays(
+            self,
+            (
+                "electron_count_from_density",
+                "band_energy_from_density",
+                "electron_count_residual",
+                "band_energy_residual",
+                "density_hermiticity_error",
+                "input_h_hermiticity_error",
+                "input_s_hermiticity_error",
+            ),
+        )
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass(frozen=True)
@@ -133,8 +145,11 @@ class FixedMuValidationContext:
     overlap: np.ndarray
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "hamiltonian", _readonly_array(self.hamiltonian))
-        object.__setattr__(self, "overlap", _readonly_array(self.overlap))
+        _freeze_arrays(self, ("hamiltonian", "overlap"))
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__post_init__()
 
 
 @dataclass(frozen=True)
@@ -228,6 +243,13 @@ def _readonly_array(value: ArrayLike, *, dtype: Any = None) -> np.ndarray:
     immutable = np.frombuffer(arr.tobytes(order="C"), dtype=arr.dtype).reshape(arr.shape)
     immutable.setflags(write=False)
     return immutable
+
+
+def _freeze_arrays(obj: Any, field_names: Tuple[str, ...]) -> None:
+    # Called from both __post_init__ and __setstate__: pickle restores __dict__
+    # directly, so the read-only flags would otherwise not survive a round trip.
+    for field_name in field_names:
+        object.__setattr__(obj, field_name, _readonly_array(getattr(obj, field_name)))
 
 
 def hermitian_part(x: ArrayLike) -> np.ndarray:
@@ -555,7 +577,7 @@ def fermi_dirac(
 
     mu = _as_float_scalar("mu", mu)
     kT = _as_float_scalar("kT", kT, nonnegative=True)
-    spin_degeneracy = _as_float_scalar("spin_degeneracy", spin_degeneracy, positive=True)
+    spin_degeneracy = _validate_spin_degeneracy(spin_degeneracy)
     _reject_torch_tensor("energies", energies)
     eps = np.asarray(energies, dtype=np.float64)
     if not np.isfinite(eps).all():
@@ -880,15 +902,20 @@ def validate_conservation(
         raise FixedMuOperatorError(
             f"fixed-mu eigvals must have shape {leading_shape + (n,)}, got {eigvals.shape}"
         )
-    spectral_atol = max(
-        atol, _SPECTRAL_CONDITION_ULPS * _MACHINE_EPS * float(np.max(overlap_condition))
+    # Every identity that routes through C inherits the eps * cond(S) error of
+    # the generalized solve: C^H S C - I, H C - S C eps, and therefore
+    # Tr(D S) = sum_i f_i (C^H S C)_ii and Tr(D H) as well.
+    conditioning_floor = (
+        _SPECTRAL_CONDITION_ULPS * _MACHINE_EPS * float(np.max(overlap_condition))
     )
-    eigen_atol = max(
+    h_scale = max(float(np.max(np.abs(h_arr))), 1.0)
+    spectral_atol = max(atol, conditioning_floor)
+    eigen_atol = max(atol, conditioning_floor * h_scale)
+    count_atol = max(atol, conditioning_floor * max(float(np.max(np.abs(result.electron_count))), 1.0))
+    band_atol = max(
         atol,
-        _SPECTRAL_CONDITION_ULPS
-        * _MACHINE_EPS
-        * float(np.max(overlap_condition))
-        * float(np.max(np.abs(h_arr))),
+        conditioning_floor
+        * max(float(np.max(np.abs(result.energies.band_energy))), h_scale),
     )
     try:
         f_base, response_base = _stable_fermi(eigvals, mu=result.mu, kT=result.kT)
@@ -1130,9 +1157,9 @@ def validate_conservation(
                 f"hermitian_tol={result.hermitian_tol:g} admits"
             )
 
-    if not np.allclose(ne_from_d, result.electron_count, atol=atol, rtol=rtol):
+    if not np.allclose(ne_from_d, result.electron_count, atol=count_atol, rtol=rtol):
         raise FixedMuOperatorError("Tr(D S) does not match N(mu)")
-    if not np.allclose(band_from_d, result.energies.band_energy, atol=atol, rtol=rtol):
+    if not np.allclose(band_from_d, result.energies.band_energy, atol=band_atol, rtol=rtol):
         raise FixedMuOperatorError("Tr(D H) does not match the band-energy ledger")
     if np.any(density_hermiticity_error > atol + rtol):
         raise FixedMuOperatorError("D(mu) is not Hermitian within tolerance")

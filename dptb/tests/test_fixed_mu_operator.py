@@ -1,5 +1,5 @@
 import pickle
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 
 import numpy as np
 import pytest
@@ -572,3 +572,244 @@ def test_single_matrix_fake_torch_shape_one_weight_is_rejected_before_numpy():
         mu=0.0,
     )
     np.testing.assert_allclose(result.electron_count, 2.0)
+
+
+def _ill_conditioned_pair(n=6, cond=1.0e10, seed=0):
+    """Hermitian H and an S whose spectrum spans exactly ``cond``."""
+
+    rng = np.random.default_rng(seed)
+    q, _ = np.linalg.qr(rng.normal(size=(n, n)))
+    s = fixed_mu_module.hermitian_part(q @ np.diag(np.logspace(0.0, np.log10(cond), n)) @ q.T)
+    a = rng.normal(size=(n, n))
+    return fixed_mu_module.hermitian_part(a + a.T), s
+
+
+def test_validate_conservation_rejects_a_truncated_eigenbasis():
+    h = np.diag([-1.0, -0.5, 0.5, 1.0])
+    s = np.eye(4)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+    validate_conservation(result)
+    assert float(result.electron_count) == pytest.approx(4.0)
+
+    # Keep only the two occupied columns and rebuild every derived field from
+    # them, exactly as an external producer with a truncated solver would.
+    keep = slice(0, 2)
+    vecs = np.asarray(result.eigvecs)[:, keep]
+    vals = np.asarray(result.eigvals)[keep]
+    occ = np.asarray(result.occupations)[keep]
+    occ_response = np.asarray(result.occupation_response)[keep]
+    density = fixed_mu_module._density_from_vectors(vecs, occ)
+    density_response = fixed_mu_module._density_from_vectors(vecs, occ_response)
+    energies = fixed_mu_module._energy_ledger(
+        vals,
+        occ / 2.0,
+        np.asarray(1.0),
+        mu=0.0,
+        kT=0.0,
+        spin_degeneracy=2.0,
+        k_axis=None,
+    )
+    electron_count = float(np.sum(occ))
+    conservation = fixed_mu_module.ConservationLedger(
+        electron_count_from_density=np.asarray(np.trace(density @ s).real),
+        band_energy_from_density=np.asarray(np.trace(density @ h).real),
+        electron_count_residual=np.asarray(np.trace(density @ s).real - electron_count),
+        band_energy_residual=np.asarray(np.trace(density @ h).real - energies.band_energy),
+        density_hermiticity_error=fixed_mu_module._density_hermiticity_error(density),
+        input_h_hermiticity_error=np.asarray(0.0),
+        input_s_hermiticity_error=np.asarray(0.0),
+    )
+    truncated = _replace_result(
+        result,
+        eigvals=vals,
+        eigvecs=vecs,
+        occupations=occ,
+        occupation_response=occ_response,
+        density_k=density,
+        density_response_k=density_response,
+        density=density,
+        density_response=density_response,
+        electron_count=np.asarray(electron_count),
+        dos_like_response=np.asarray(float(np.sum(occ_response))),
+        energies=energies,
+        conservation=conservation,
+    )
+
+    with pytest.raises(FixedMuOperatorError, match="complete 4x4 eigenbasis"):
+        validate_conservation(truncated)
+
+
+def test_validate_conservation_rejects_a_truncated_eigenvalue_vector():
+    h = np.diag([-1.0, 0.5])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+    with pytest.raises(FixedMuOperatorError, match="eigvals must have shape"):
+        validate_conservation(_replace_result(result, eigvals=np.asarray(result.eigvals)[:1]))
+
+
+def test_expected_request_parameters_bind_the_result_to_the_caller():
+    h = np.diag([-1.0, 0.5])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.1, kT=0.05, spin_degeneracy=2.0)
+
+    validate_conservation(result, expected_mu=0.1, expected_kT=0.05, expected_spin_degeneracy=2.0)
+    with pytest.raises(FixedMuOperatorError, match="computed at mu="):
+        validate_conservation(result, expected_mu=0.4)
+    with pytest.raises(FixedMuOperatorError, match="computed at kT="):
+        validate_conservation(result, expected_kT=0.2)
+    with pytest.raises(FixedMuOperatorError, match="computed at spin_degeneracy="):
+        validate_conservation(result, expected_spin_degeneracy=1.0)
+
+
+def test_expected_k_weights_bind_the_brillouin_zone_request():
+    h = np.stack([np.diag([-1.0, 0.5]), np.diag([-0.8, 0.6])])
+    s = np.stack([np.eye(2), np.eye(2)])
+    result = fixed_mu_observables(
+        h, s, mu=0.0, kT=0.1, spin_degeneracy=2.0, k_weights=np.array([2.0, 1.0]), k_axis=0
+    )
+
+    validate_conservation(result, expected_k_weights=np.array([2.0 / 3.0, 1.0 / 3.0]))
+    with pytest.raises(FixedMuOperatorError, match="do not match the expected k_weights"):
+        validate_conservation(result, expected_k_weights=np.array([0.5, 0.5]))
+
+
+def test_spin_degeneracy_is_constrained_to_the_conventions_this_module_knows():
+    h = np.diag([-1.0, 0.5])
+    s = np.eye(2)
+    for good in (1.0, 2.0):
+        fixed_mu_observables(h, s, mu=0.0, spin_degeneracy=good)
+    with pytest.raises(FixedMuOperatorError, match="spin_degeneracy must be one of"):
+        fixed_mu_observables(h, s, mu=0.0, spin_degeneracy=3.0)
+    with pytest.raises(FixedMuOperatorError, match="spin_degeneracy must be one of"):
+        fermi_dirac(np.array([0.0]), mu=0.0, kT=0.0, spin_degeneracy=1.5)
+
+
+def test_untampered_ill_conditioned_result_self_validates_but_stays_strict():
+    h, s = _ill_conditioned_pair(cond=1.0e10)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.1, spin_degeneracy=2.0)
+    assert float(result.overlap_condition) > 1.0e9
+
+    # Attainable orthonormality error here is ~1e-7, unreachable for atol=1e-8.
+    validate_conservation(result)
+
+    # Strictness for genuinely wrong data survives: rotating one eigenvector
+    # breaks S-orthonormality far beyond the conditioning budget.
+    broken = np.asarray(result.eigvecs).copy()
+    broken[:, 0] *= 1.5
+    with pytest.raises(FixedMuOperatorError, match="S-orthonormality"):
+        validate_conservation(_replace_result(result, eigvecs=broken))
+
+
+def test_well_conditioned_results_keep_the_plain_absolute_tolerance():
+    h, s = _ill_conditioned_pair(cond=1.0e2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.1, spin_degeneracy=2.0)
+
+    nudged = np.asarray(result.eigvecs).copy()
+    nudged[0, 0] += 1.0e-6
+    with pytest.raises(FixedMuOperatorError, match="S-orthonormality"):
+        validate_conservation(_replace_result(result, eigvecs=nudged))
+
+
+def test_input_hermiticity_errors_are_recorded_before_symmetrization():
+    h = np.array([[0.0, 0.2 + 4.0e-10], [0.2, 1.0]])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0, hermitian_tol=1e-8)
+
+    assert float(result.conservation.input_h_hermiticity_error) == pytest.approx(4.0e-10, rel=1e-6)
+    assert float(result.conservation.input_s_hermiticity_error) == 0.0
+    # The stored snapshot is symmetrized, so this cannot be recomputed; the
+    # validator re-enforces the recorded hermitian_tol against it instead.
+    np.testing.assert_allclose(
+        np.asarray(result._validation_context.hamiltonian),
+        fixed_mu_module.hermitian_part(h),
+        atol=0.0,
+    )
+    validate_conservation(result)
+
+    forged = replace(result.conservation, input_h_hermiticity_error=np.asarray(1.0))
+    with pytest.raises(FixedMuOperatorError, match="exceeds what the recorded hermitian_tol"):
+        validate_conservation(_replace_result(result, conservation=forged))
+    negative = replace(result.conservation, input_s_hermiticity_error=np.asarray(-1.0))
+    with pytest.raises(FixedMuOperatorError, match="must be finite and nonnegative"):
+        validate_conservation(_replace_result(result, conservation=negative))
+
+
+def test_k_axis_rejects_non_integral_values():
+    h = np.stack([np.diag([-1.0, 0.5]), np.diag([-0.8, 0.6])])
+    s = np.stack([np.eye(2), np.eye(2)])
+
+    with pytest.raises(FixedMuOperatorError, match="k_axis must be an integer"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=np.array([0.25, 0.75]), k_axis=0.9)
+    with pytest.raises(FixedMuOperatorError, match="k_axis must be an integer"):
+        fixed_mu_observables(h, s, mu=0.0, k_weights=np.array([0.25, 0.75]), k_axis=True)
+    # Integral numpy scalars stay acceptable.
+    result = fixed_mu_observables(
+        h, s, mu=0.0, k_weights=np.array([0.25, 0.75]), k_axis=np.int64(0)
+    )
+    assert result.k_axis == 0
+
+
+def test_zero_length_leading_batch_fails_closed():
+    empty = np.zeros((0, 2, 2))
+    with pytest.raises(FixedMuOperatorError, match="zero-length dimension"):
+        generalized_bands(empty, empty)
+    with pytest.raises(FixedMuOperatorError, match="zero-length dimension"):
+        fixed_mu_observables(empty, empty, mu=0.0)
+
+
+def test_forged_density_is_rejected_by_the_from_vectors_route():
+    h = np.diag([-1.0, 0.5])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+
+    bad = np.asarray(result.density).copy()
+    bad[0, 0] += 1.0e-3
+    # The aggregate density is now compared against C f C^H rather than against
+    # a re-aggregation of the stored per-k density, so it no longer inherits it.
+    with pytest.raises(FixedMuOperatorError, match="stored density does not match"):
+        validate_conservation(_replace_result(result, density=bad))
+    # Forging density_k to keep the two mutually consistent is caught upstream.
+    with pytest.raises(FixedMuOperatorError, match="stored density_k"):
+        validate_conservation(_replace_result(result, density=bad, density_k=bad))
+
+
+def test_pickle_round_trip_preserves_the_read_only_invariant():
+    h = np.diag([-1.0, 0.5])
+    s = np.eye(2)
+    result = fixed_mu_observables(h, s, mu=0.0, kT=0.0, spin_degeneracy=2.0)
+    restored = pickle.loads(pickle.dumps(result))
+
+    assert restored.eigvals.flags.writeable is False
+    assert restored.density.flags.writeable is False
+    assert restored.energies.band_free_energy.flags.writeable is False
+    assert restored.conservation.input_h_hermiticity_error.flags.writeable is False
+    with pytest.raises(ValueError, match="read-only"):
+        restored.density[0, 0] = 1.0
+    # The H/S context is deliberately not serialized.
+    with pytest.raises(FixedMuOperatorError, match="missing H/S context"):
+        validate_conservation(restored)
+    validate_conservation(restored, h=h, s=s)
+
+
+def test_energy_ledger_names_state_what_the_terms_are():
+    h = np.diag([-1.0, 0.5])
+    s = np.eye(2)
+    mu = 0.1
+    result = fixed_mu_observables(h, s, mu=mu, kT=0.2, spin_degeneracy=2.0)
+    ledger = result.energies
+
+    assert float(ledger.minus_t_s) < 0.0
+    np.testing.assert_allclose(
+        ledger.band_free_energy, ledger.band_energy + ledger.minus_t_s, atol=1e-14
+    )
+    np.testing.assert_allclose(
+        ledger.band_grand_energy,
+        ledger.band_free_energy - mu * result.electron_count,
+        atol=1e-12,
+    )
+    assert {field.name for field in fields(ledger)} == {
+        "band_energy",
+        "minus_t_s",
+        "band_free_energy",
+        "band_grand_energy",
+    }
