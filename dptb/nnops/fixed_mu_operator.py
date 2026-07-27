@@ -934,12 +934,25 @@ def validate_conservation(
     )
     if expected_k_weights is not None:
         _reject_torch_tensor("expected_k_weights", expected_k_weights)
-        requested = _prepare_weights(
-            leading_shape,
-            k_weights=expected_k_weights,
-            k_axis=k_axis_c,
-            normalize_k_weights=result.normalize_k_weights,
-        )
+        if k_axis_c is None:
+            # _prepare_weights refuses weights without a k axis, so a result that
+            # legitimately carries the implicit unit weights has to be compared
+            # directly; there is no normalization to route through either.
+            requested = _validate_stored_weights(
+                leading_shape,
+                k_weights=expected_k_weights,
+                k_axis=None,
+                normalize_k_weights=False,
+                atol=atol,
+                rtol=rtol,
+            )
+        else:
+            requested = _prepare_weights(
+                leading_shape,
+                k_weights=expected_k_weights,
+                k_axis=k_axis_c,
+                normalize_k_weights=result.normalize_k_weights,
+            )
         if requested.shape != weights.shape or not np.allclose(requested, weights, atol=atol, rtol=rtol):
             raise FixedMuOperatorError("fixed-mu stored k_weights do not match the expected k_weights")
 
