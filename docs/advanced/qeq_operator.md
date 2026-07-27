@@ -44,6 +44,11 @@ orthonormal basis of `{v : sum(v) = 0}`, the physical problem is
 `(Z.T J Z) c = -Z.T (chi + J q0)` for `q = q0 + Z c`, `q0 = (Q/n) 1`. The
 Lagrange multiplier is then recovered as `lambda = -mean(chi + J q)`.
 
+Before the numerical tangent solve, the implementation removes the uniform
+components `mean(chi) * 1` and `mean(J) * 11.T`. This is an exact fixed-charge
+gauge transformation, but it avoids subtracting very large, physically
+irrelevant uniform terms inside `Z.T J Z` and the stationarity certificate.
+
 This matters because `J -> J + alpha * 11.T` is a gauge freedom: it leaves the
 fixed-charge minimizer completely unchanged (`Z.T 11.T Z == 0`) while driving
 the condition number of the raw augmented KKT matrix `[[J, 1], [1.T, 0]]` up as
@@ -126,12 +131,14 @@ recorded" — a recorded policy is re-enforced as recorded, whether it is looser
 or tighter than the shipped default. An explicit `atol` always wins.
 
 Residual gates are absolute in the caller's energy unit **plus an arithmetic
-floor**: no float64 evaluation of `chi + J q + lambda` can resolve below the
-rounding scale of its own intermediates, so each gate admits
-`atol + 64 * eps * (max|chi| + max|J| * sum|q| + |lambda|)`. This is what makes
-the gates invariant under the `alpha * 11.T` gauge — a shift of `alpha = 1e9`
-leaves the charges and every gate verdict intact — while a forged charge vector
-is still rejected by many orders of magnitude. Magnitude-carrying quantities
+floor**. The physical tangent gate is evaluated in the canonical uniform gauge,
+with `chi_perp = chi - mean(chi) * 1` and
+`J_perp = J - mean(J) * 11.T`, and admits
+`atol + 64 * eps * (max|chi_perp| + max|J_perp| * sum|q|)`. Consequently a
+physically irrelevant `alpha * 11.T` shift cannot relax the charge certificate.
+The gauge-dependent raw stationarity telemetry and the uniform multiplier
+component retain a floor based on their own full-scale intermediates, because
+`lambda` itself shifts by `-alpha * Q`. Magnitude-carrying quantities
 (condition numbers, eigenvalues, energies) are compared to their recomputation
 with a relative tolerance, because one ULP of a condition number at the `1e12`
 ceiling is `1.2e-4`, far above any absolute `atol`.
@@ -162,7 +169,9 @@ enabled, H/S Hermiticity, S positive-definiteness and condition, `C^H S C = I`,
 `H C = S C eps`, Fermi occupations from eigenvalues, density aggregation from
 the eigenvectors, the band energy ledger and its closures, `Tr(D S)`,
 `Tr(D H)`, residual ledgers, and density hermiticity from the current fixed-mu
-arrays.
+arrays. When `expected_k_weights` is supplied, it is passed through the same
+broadcasting and optional normalization path as the original request before it
+is compared with stored weights.
 
 Before any of that it requires the eigenbasis to be **complete**:
 `eigvecs.shape[-2:] == (n, n)` and `eigvals.shape[-1] == n` against the H/S
@@ -190,12 +199,14 @@ re-enforces the recorded `hermitian_tol` against them.
 Two policies are conditioning-aware. The acceptance gates admit `cond(S)` up to
 `max_condition = 1e12`, but the `C^H S C = I` and `H C = S C eps` residuals of a
 backward-stable generalized solve grow like `eps * cond(S)` — measured on a
-`6x6` stack, `~0.09 * eps * cond` and `~0.26 * eps * cond * |H|`. Those checks,
-and the `Tr(D S)` / `Tr(D H)` gates that route through the same eigenvectors,
-therefore use `max(atol, 16 * eps * cond(S) * scale)`. At the `cond(S) ~ 1e2` of
-realistic NAO overlaps that floor is `~1e-12` and the caller's `atol` is
-unchanged; at `cond(S) = 1e10` it is what lets an untampered result validate
-against itself at all.
+`6x6` stack, `~0.09 * eps * cond` and `~0.26 * eps * cond * |H|`. Those checks
+use `max(atol, 16 * eps * cond(S) * scale)` **per leading item**. The
+`Tr(D S)` / `Tr(D H)` budgets are formed per k/sample item and are aggregated
+only along the declared k axis, so one ill-conditioned member cannot relax the
+certificate for an unrelated well-conditioned member of the same batch. At the
+`cond(S) ~ 1e2` of realistic NAO overlaps the floor is `~1e-12` and the caller's
+`atol` is unchanged; at `cond(S) = 1e10` it is what lets an untampered result
+validate against itself at all.
 
 Finally, every conservation identity is homogeneous of degree one in
 `spin_degeneracy`, so a result computed at the wrong SOC/non-SOC convention
@@ -210,6 +221,11 @@ validate_conservation(
     expected_kT=kT,
     expected_spin_degeneracy=2.0,
     expected_k_weights=weights,
+    expected_k_axis=0,
+    expected_normalize_k_weights=True,
+    expected_eig_floor=1e-10,
+    expected_max_condition=1e12,
+    expected_hermitian_tol=1e-8,
 )
 ```
 

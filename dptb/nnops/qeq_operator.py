@@ -232,9 +232,12 @@ class QEqResult:
 
 def _readonly_array(name: str, value: ArrayLike, *, dtype: Any = None) -> np.ndarray:
     _reject_torch_tensor(name, value)
-    arr = np.array(value, dtype=dtype, copy=True)
-    arr.setflags(write=False)
-    return arr
+    arr = np.array(value, dtype=dtype, copy=True, order="C")
+    # OWNDATA arrays can undo ``setflags(write=False)``.  A bytes-backed view
+    # does not own a mutable buffer, matching the hardened fixed-mu boundary.
+    immutable = np.frombuffer(arr.tobytes(order="C"), dtype=arr.dtype).reshape(arr.shape)
+    immutable.setflags(write=False)
+    return immutable
 
 
 def _looks_like_torch_tensor(x: Any) -> bool:
@@ -375,6 +378,19 @@ def _sum_zero_basis(n: int) -> np.ndarray:
     return eigvecs[:, eigvals > 0.5]
 
 
+def _uniform_gauge_reduced_kernel(kernel: np.ndarray) -> np.ndarray:
+    """Remove the physically irrelevant ``alpha * 11.T`` component."""
+
+    alpha = np.mean(kernel, axis=(-1, -2), keepdims=True)
+    return kernel - alpha
+
+
+def _uniform_gauge_reduced_chi(chi: np.ndarray) -> np.ndarray:
+    """Remove the physically irrelevant uniform electronegativity shift."""
+
+    return chi - np.mean(chi, axis=-1, keepdims=True)
+
+
 def _constrained_kernel_diagnostics(
     kernel: np.ndarray,
     *,
@@ -392,7 +408,8 @@ def _constrained_kernel_diagnostics(
         )
 
     basis = _sum_zero_basis(n)
-    flat_kernel = kernel.reshape((-1, n, n))
+    physical_kernel = _uniform_gauge_reduced_kernel(kernel)
+    flat_kernel = physical_kernel.reshape((-1, n, n))
     min_eigs = []
     max_eigs = []
     conds = []
@@ -434,7 +451,8 @@ def _recompute_constrained_kernel_diagnostics(kernel: np.ndarray) -> Tuple[np.nd
         )
 
     basis = _sum_zero_basis(n)
-    flat_kernel = kernel.reshape((-1, n, n))
+    physical_kernel = _uniform_gauge_reduced_kernel(kernel)
+    flat_kernel = physical_kernel.reshape((-1, n, n))
     min_eigs = []
     max_eigs = []
     conds = []
@@ -492,11 +510,13 @@ def _solve_fixed_charge_nullspace(
     kkt_conditions = []
     for chi_one, kernel_one, qtot_one in zip(flat_chi, flat_kernel, flat_qtot):
         q0 = np.full(n, qtot_one / float(n), dtype=np.float64)
+        physical_kernel = _uniform_gauge_reduced_kernel(kernel_one)
+        physical_chi = _uniform_gauge_reduced_chi(chi_one)
         if n == 1:
             q = q0
         else:
-            tangent_kernel = basis.T @ kernel_one @ basis
-            tangent_rhs = -basis.T @ (chi_one + kernel_one @ q0)
+            tangent_kernel = basis.T @ physical_kernel @ basis
+            tangent_rhs = -basis.T @ (physical_chi + physical_kernel @ q0)
             try:
                 tangent_coordinates = np.linalg.solve(tangent_kernel, tangent_rhs)
             except np.linalg.LinAlgError as exc:  # defensive: spectrum was checked above
@@ -504,8 +524,9 @@ def _solve_fixed_charge_nullspace(
                     "constrained QEq tangent system is singular"
                 ) from exc
             q = q0 + basis @ tangent_coordinates
-        stationarity_without_lambda = chi_one + kernel_one @ q
-        lagrange_multiplier = -float(np.mean(stationarity_without_lambda))
+        physical_gradient = physical_chi + physical_kernel @ q
+        uniform_gradient = float(np.mean(chi_one)) + float(np.mean(kernel_one)) * float(qtot_one)
+        lagrange_multiplier = -float(np.mean(physical_gradient) + uniform_gradient)
         charges.append(q)
         multipliers.append(lagrange_multiplier)
         kkt_conditions.append(float(_recompute_kkt_condition(kernel_one)))
@@ -530,40 +551,65 @@ def _qeq_energies(
     return total, linear, quadratic, identity
 
 
+def _tangent_stationarity_parts(
+    chi: np.ndarray,
+    kernel: np.ndarray,
+    charges: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return tangent residual and arithmetic scale in a canonical gauge."""
+
+    n = chi.shape[-1]
+    physical_chi = _uniform_gauge_reduced_chi(chi)
+    physical_kernel = _uniform_gauge_reduced_kernel(kernel)
+    physical_gradient = physical_chi + np.einsum(
+        "...ij,...j->...i", physical_kernel, charges, optimize=True
+    )
+    if n == 1:
+        tangent_max_abs = np.zeros(chi.shape[:-1], dtype=np.float64)
+    else:
+        basis = _sum_zero_basis(n)
+        tangent = np.einsum("ik,...i->...k", basis, physical_gradient, optimize=True)
+        tangent_max_abs = np.max(np.abs(tangent), axis=-1)
+    arithmetic_scale = (
+        np.max(np.abs(physical_chi), axis=-1)
+        + np.max(np.abs(physical_kernel), axis=(-1, -2))
+        * np.sum(np.abs(charges), axis=-1)
+    )
+    return tangent_max_abs, arithmetic_scale
+
+
 def _stationarity_parts(
     chi: np.ndarray,
     kernel: np.ndarray,
     charges: np.ndarray,
     lagrange_multiplier: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split the KKT stationarity residual into its gauge-invariant components.
+    """Split KKT stationarity in a numerically stable, gauge-aware form.
 
-    Returns ``(stationarity, tangent_max_abs, multiplier_residual,
-    arithmetic_scale)``.  ``tangent_max_abs`` is the sum-zero projection
-    ``Z^T (chi + J q)``, which is invariant under ``J -> J + alpha 11^T`` because
-    ``Z^T 1 == 0``; ``multiplier_residual`` is the uniform component that defines
-    ``lambda``.  ``arithmetic_scale`` is the magnitude of the largest
-    intermediate the expression goes through, and therefore the scale below
-    which a float64 residual carries no information.
+    The tangent residual is independent of ``J -> J + alpha 11.T``.  The
+    uniform component is reconstructed from ``mean(J) * sum(q)`` instead of a
+    cancellation-prone dense matvec, so a neutral system cannot inherit a huge
+    tolerance merely because an irrelevant uniform kernel gauge was supplied.
     """
 
-    n = chi.shape[-1]
-    gradient = chi + np.einsum("...ij,...j->...i", kernel, charges, optimize=True)
-    stationarity = gradient + lagrange_multiplier[..., None]
-    if n == 1:
-        tangent_max_abs = np.zeros(chi.shape[:-1], dtype=np.float64)
-    else:
-        basis = _sum_zero_basis(n)
-        tangent = np.einsum("ik,...i->...k", basis, gradient, optimize=True)
-        tangent_max_abs = np.max(np.abs(tangent), axis=-1)
-    multiplier_residual = np.mean(gradient, axis=-1) + lagrange_multiplier
+    physical_chi = _uniform_gauge_reduced_chi(chi)
+    physical_kernel = _uniform_gauge_reduced_kernel(kernel)
+    physical_gradient = physical_chi + np.einsum(
+        "...ij,...j->...i", physical_kernel, charges, optimize=True
+    )
+    uniform_gradient = (
+        np.mean(chi, axis=-1)
+        + np.mean(kernel, axis=(-1, -2)) * np.sum(charges, axis=-1)
+    )
+    stationarity = physical_gradient + (uniform_gradient + lagrange_multiplier)[..., None]
+    tangent_max_abs, tangent_scale = _tangent_stationarity_parts(chi, kernel, charges)
+    multiplier_residual = (
+        np.mean(physical_gradient, axis=-1) + uniform_gradient + lagrange_multiplier
+    )
     arithmetic_scale = (
-        np.max(np.abs(chi), axis=-1)
-        + np.max(np.abs(kernel), axis=(-1, -2)) * np.sum(np.abs(charges), axis=-1)
-        + np.abs(lagrange_multiplier)
+        tangent_scale + np.abs(uniform_gradient) + np.abs(lagrange_multiplier)
     )
     return stationarity, tangent_max_abs, multiplier_residual, arithmetic_scale
-
 
 def _residual_tolerance(atol: float, arithmetic_scale: np.ndarray) -> np.ndarray:
     return atol + _ARITHMETIC_FLOOR_ULPS * _MACHINE_EPS * arithmetic_scale
@@ -832,8 +878,8 @@ def validate_qeq_result(
 
     asym = kernel - np.swapaxes(kernel, -1, -2)
     symmetry_error = np.max(np.abs(asym), axis=(-1, -2))
-    if np.any(symmetry_error > atol):
-        raise QEqOperatorError("QEq hardness_kernel is not symmetric within tolerance")
+    if np.any(symmetry_error > symmetry_tol):
+        raise QEqOperatorError("QEq hardness_kernel is not symmetric within symmetry_tol")
     input_symmetry_error = _require_result_array(
         "diagnostics.input_kernel_symmetry_error", result.diagnostics.input_kernel_symmetry_error
     )
@@ -855,10 +901,15 @@ def validate_qeq_result(
         charges,
         multiplier,
     )
+    _, tangent_arithmetic_scale = _tangent_stationarity_parts(chi, kernel, charges)
     stationarity_max_abs = np.max(np.abs(stationarity), axis=-1)
     stationarity_l2 = np.linalg.norm(stationarity, axis=-1)
     residual_floor = _ARITHMETIC_FLOOR_ULPS * _MACHINE_EPS * arithmetic_scale
+    tangent_residual_floor = (
+        _ARITHMETIC_FLOOR_ULPS * _MACHINE_EPS * tangent_arithmetic_scale
+    )
     stationarity_tolerance = atol + residual_floor
+    tangent_tolerance = atol + tangent_residual_floor
     energy, linear_energy, quadratic_energy, energy_identity = _qeq_energies(
         chi,
         kernel,
@@ -944,7 +995,7 @@ def validate_qeq_result(
         ),
         tangent_max_abs,
         atol=atol,
-        floor=residual_floor,
+        floor=tangent_residual_floor,
     )
     _assert_recomputed_close(
         "diagnostic multiplier_residual",
@@ -999,9 +1050,9 @@ def validate_qeq_result(
         raise QEqOperatorError("QEq charges do not satisfy sum(q) = total_charge")
     _check_stationarity_gate(
         tangent_max_abs,
-        stationarity_tolerance,
+        tangent_tolerance,
         constrained_condition,
-        arithmetic_scale,
+        tangent_arithmetic_scale,
     )
     if np.any(np.abs(multiplier_residual) > stationarity_tolerance):
         raise QEqOperatorError(

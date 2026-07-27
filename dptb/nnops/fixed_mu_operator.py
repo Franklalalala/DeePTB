@@ -37,6 +37,7 @@ _SPECTRAL_CONDITION_ULPS = 16.0
 #: Occupancy multipliers this reference understands: 2 for spin-degenerate
 #: non-SOC matrices, 1 for explicit spin/SOC spinor matrices.
 _ALLOWED_SPIN_DEGENERACY = (1.0, 2.0)
+_EXPECTED_UNSET = object()
 
 
 class FixedMuOperatorError(ValueError):
@@ -198,7 +199,11 @@ class FixedMuResult:
             "spin_degeneracy",
             _validate_spin_degeneracy(self.spin_degeneracy),
         )
-        object.__setattr__(self, "normalize_k_weights", bool(self.normalize_k_weights))
+        object.__setattr__(
+            self,
+            "normalize_k_weights",
+            _as_bool("normalize_k_weights", self.normalize_k_weights),
+        )
         object.__setattr__(self, "eig_floor", _as_float_scalar("eig_floor", self.eig_floor, positive=True))
         object.__setattr__(self, "max_condition", _as_float_scalar("max_condition", self.max_condition, positive=True))
         object.__setattr__(
@@ -273,6 +278,12 @@ def _reject_torch_tensor(name: str, x: Any) -> None:
             "Use fixed_mu_observables_from_torch(..., detach=True) explicitly "
             "or pass tensor.detach().cpu().numpy()."
         )
+
+
+def _as_bool(name: str, value: Any) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise FixedMuOperatorError(f"{name} must be a boolean, got {value!r}")
+    return bool(value)
 
 
 def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnegative: bool = False) -> float:
@@ -684,6 +695,7 @@ def fixed_mu_observables(
     mu = _as_float_scalar("mu", mu)
     kT = _as_float_scalar("kT", kT, nonnegative=True)
     spin_degeneracy = _validate_spin_degeneracy(spin_degeneracy)
+    normalize_k_weights = _as_bool("normalize_k_weights", normalize_k_weights)
     bands = generalized_bands(
         h,
         s,
@@ -770,14 +782,14 @@ def _assert_recomputed_close(
     stored: np.ndarray,
     recomputed: np.ndarray,
     *,
-    atol: float,
+    atol: ArrayLike,
     rtol: float,
 ) -> None:
     if stored.shape != recomputed.shape:
         raise FixedMuOperatorError(
             f"fixed-mu stored {name} has shape {stored.shape}, recomputed {recomputed.shape}"
         )
-    if not np.allclose(stored, recomputed, atol=atol, rtol=rtol):
+    if not np.all(np.isclose(stored, recomputed, atol=atol, rtol=rtol)):
         raise FixedMuOperatorError(f"fixed-mu stored {name} does not match recomputed value")
 
 
@@ -792,6 +804,11 @@ def validate_conservation(
     expected_kT: Optional[float] = None,
     expected_spin_degeneracy: Optional[float] = None,
     expected_k_weights: Optional[ArrayLike] = None,
+    expected_k_axis: Any = _EXPECTED_UNSET,
+    expected_normalize_k_weights: Any = _EXPECTED_UNSET,
+    expected_eig_floor: Optional[float] = None,
+    expected_max_condition: Optional[float] = None,
+    expected_hermitian_tol: Optional[float] = None,
 ) -> None:
     """Fail closed when density-matrix ledgers do not conserve N or band energy.
 
@@ -804,8 +821,10 @@ def validate_conservation(
 
     Parameters
     ----------
-    expected_mu, expected_kT, expected_spin_degeneracy, expected_k_weights
-        The request the caller actually made.  Every conservation identity here
+    expected_mu, expected_kT, expected_spin_degeneracy, expected_k_weights,
+    expected_k_axis, expected_normalize_k_weights, expected_eig_floor,
+    expected_max_condition, expected_hermitian_tol
+        The request and safety policy the caller actually made.  Every conservation identity here
         is self-consistent in the stored scalars -- N, D and the whole energy
         ledger are homogeneous of degree one in ``spin_degeneracy``, so a result
         computed at the wrong SOC/non-SOC convention validates perfectly against
@@ -848,6 +867,30 @@ def validate_conservation(
             f"expected {expected_spin_degeneracy!r}; N, D and the energy ledger all scale linearly "
             "with it, so nothing else in this validator can catch the wrong convention"
         )
+    if expected_eig_floor is not None:
+        expected = _as_float_scalar("expected_eig_floor", expected_eig_floor, positive=True)
+        if result.eig_floor != expected:
+            raise FixedMuOperatorError(
+                f"fixed-mu result used eig_floor={result.eig_floor!r}, not the expected {expected!r}"
+            )
+    if expected_max_condition is not None:
+        expected = _as_float_scalar(
+            "expected_max_condition", expected_max_condition, positive=True
+        )
+        if result.max_condition != expected:
+            raise FixedMuOperatorError(
+                f"fixed-mu result used max_condition={result.max_condition!r}, "
+                f"not the expected {expected!r}"
+            )
+    if expected_hermitian_tol is not None:
+        expected = _as_float_scalar(
+            "expected_hermitian_tol", expected_hermitian_tol, nonnegative=True
+        )
+        if result.hermitian_tol != expected:
+            raise FixedMuOperatorError(
+                f"fixed-mu result used hermitian_tol={result.hermitian_tol!r}, "
+                f"not the expected {expected!r}"
+            )
     if (h is None) != (s is None):
         raise FixedMuOperatorError("validate_conservation requires both h and s, or neither")
     if h is None and s is None:
@@ -866,6 +909,21 @@ def validate_conservation(
     )
     leading_shape = h_arr.shape[:-2]
     k_axis_c = _canonical_k_axis(result.k_axis, len(leading_shape))
+    if expected_k_axis is not _EXPECTED_UNSET:
+        requested_k_axis = _canonical_k_axis(expected_k_axis, len(leading_shape))
+        if k_axis_c != requested_k_axis:
+            raise FixedMuOperatorError(
+                f"fixed-mu result used k_axis={k_axis_c!r}, not the expected {requested_k_axis!r}"
+            )
+    if expected_normalize_k_weights is not _EXPECTED_UNSET:
+        requested_normalize = _as_bool(
+            "expected_normalize_k_weights", expected_normalize_k_weights
+        )
+        if result.normalize_k_weights != requested_normalize:
+            raise FixedMuOperatorError(
+                "fixed-mu result used normalize_k_weights="
+                f"{result.normalize_k_weights!r}, not the expected {requested_normalize!r}"
+            )
     weights = _validate_stored_weights(
         leading_shape,
         k_weights=result.k_weights,
@@ -876,13 +934,11 @@ def validate_conservation(
     )
     if expected_k_weights is not None:
         _reject_torch_tensor("expected_k_weights", expected_k_weights)
-        requested = _validate_stored_weights(
+        requested = _prepare_weights(
             leading_shape,
             k_weights=expected_k_weights,
             k_axis=k_axis_c,
-            normalize_k_weights=False,
-            atol=atol,
-            rtol=rtol,
+            normalize_k_weights=result.normalize_k_weights,
         )
         if requested.shape != weights.shape or not np.allclose(requested, weights, atol=atol, rtol=rtol):
             raise FixedMuOperatorError("fixed-mu stored k_weights do not match the expected k_weights")
@@ -902,21 +958,15 @@ def validate_conservation(
         raise FixedMuOperatorError(
             f"fixed-mu eigvals must have shape {leading_shape + (n,)}, got {eigvals.shape}"
         )
-    # Every identity that routes through C inherits the eps * cond(S) error of
-    # the generalized solve: C^H S C - I, H C - S C eps, and therefore
-    # Tr(D S) = sum_i f_i (C^H S C)_ii and Tr(D H) as well.
+    # Keep conditioning budgets local to each leading item.  A single pathological
+    # overlap matrix must not relax validation for unrelated well-conditioned
+    # samples in the same batch.
     conditioning_floor = (
-        _SPECTRAL_CONDITION_ULPS * _MACHINE_EPS * float(np.max(overlap_condition))
+        _SPECTRAL_CONDITION_ULPS * _MACHINE_EPS * np.asarray(overlap_condition)
     )
-    h_scale = max(float(np.max(np.abs(h_arr))), 1.0)
-    spectral_atol = max(atol, conditioning_floor)
-    eigen_atol = max(atol, conditioning_floor * h_scale)
-    count_atol = max(atol, conditioning_floor * max(float(np.max(np.abs(result.electron_count))), 1.0))
-    band_atol = max(
-        atol,
-        conditioning_floor
-        * max(float(np.max(np.abs(result.energies.band_energy))), h_scale),
-    )
+    h_scale = np.maximum(np.max(np.abs(h_arr), axis=(-1, -2)), 1.0)
+    spectral_atol = np.maximum(atol, conditioning_floor)[..., None, None]
+    eigen_atol = np.maximum(atol, conditioning_floor * h_scale)[..., None, None]
     try:
         f_base, response_base = _stable_fermi(eigvals, mu=result.mu, kT=result.kT)
         occupations = result.spin_degeneracy * f_base
@@ -958,6 +1008,20 @@ def validate_conservation(
         band_from_d_k = weights * _trace_last2(density_k @ h_arr)
         ne_from_d = _aggregate_matrix(ne_from_d_k, k_axis=k_axis_c)
         band_from_d = _aggregate_matrix(band_from_d_k, k_axis=k_axis_c)
+
+        count_scale_k = np.maximum(np.sum(np.abs(occupations), axis=-1), 1.0)
+        count_floor_k = weights * conditioning_floor * count_scale_k
+        count_atol = np.maximum(
+            atol, _aggregate_matrix(count_floor_k, k_axis=k_axis_c)
+        )
+        band_scale_k = np.maximum(
+            np.sum(np.abs(eigvals * occupations), axis=-1),
+            h_scale * count_scale_k,
+        )
+        band_floor_k = weights * conditioning_floor * band_scale_k
+        band_atol = np.maximum(
+            atol, _aggregate_matrix(band_floor_k, k_axis=k_axis_c)
+        )
     except (IndexError, TypeError, ValueError) as exc:
         raise FixedMuOperatorError("fixed-mu result arrays are not shape-compatible for conservation validation") from exc
 
@@ -1157,9 +1221,11 @@ def validate_conservation(
                 f"hermitian_tol={result.hermitian_tol:g} admits"
             )
 
-    if not np.allclose(ne_from_d, result.electron_count, atol=count_atol, rtol=rtol):
+    if not np.all(np.isclose(ne_from_d, result.electron_count, atol=count_atol, rtol=rtol)):
         raise FixedMuOperatorError("Tr(D S) does not match N(mu)")
-    if not np.allclose(band_from_d, result.energies.band_energy, atol=band_atol, rtol=rtol):
+    if not np.all(
+        np.isclose(band_from_d, result.energies.band_energy, atol=band_atol, rtol=rtol)
+    ):
         raise FixedMuOperatorError("Tr(D H) does not match the band-energy ledger")
     if np.any(density_hermiticity_error > atol + rtol):
         raise FixedMuOperatorError("D(mu) is not Hermitian within tolerance")
