@@ -46,8 +46,12 @@ Lagrange multiplier is then recovered as `lambda = -mean(chi + J q)`.
 
 Before the numerical tangent solve, the implementation removes the uniform
 components `mean(chi) * 1` and `mean(J) * 11.T`. This is an exact fixed-charge
-gauge transformation, but it avoids subtracting very large, physically
-irrelevant uniform terms inside `Z.T J Z` and the stationarity certificate.
+gauge transformation — `J + alpha * 11.T` and `J` reduce to the same `J_perp`,
+and `Z.T J_perp Z == Z.T J Z` because `Z.T 1 == 0` — but it avoids subtracting
+very large, physically irrelevant uniform terms inside `Z.T J Z` and the
+stationarity certificate. `lambda` and every energy are restored in the
+original gauge: `lambda = -(mean(chi_perp + J_perp q) + mean(chi)
++ mean(J) sum(q))`, and `E(q)` uses the `chi` and `J` as supplied.
 
 This matters because `J -> J + alpha * 11.T` is a gauge freedom: it leaves the
 fixed-charge minimizer completely unchanged (`Z.T 11.T Z == 0`) while driving
@@ -120,6 +124,12 @@ in-place mutation of returned arrays is intentionally rejected — and the
 read-only flag is re-applied in `__setstate__`, so it survives a pickle round
 trip.
 
+Those copies are views onto an immutable `bytes` buffer, not `OWNDATA` arrays
+with the write flag merely cleared. An array that owns its buffer can take
+`setflags(write=True)` back, which would leave the physical fields rewritable
+while the cached diagnostics kept the old values — exactly the divergence the
+read-only boundary exists to prevent.
+
 `validate_qeq_result` does not trust cached diagnostics. It recomputes charge
 conservation, KKT stationarity, total/linear/quadratic/identity energies,
 constrained-kernel diagnostics, and KKT conditioning from the current
@@ -136,9 +146,15 @@ with `chi_perp = chi - mean(chi) * 1` and
 `J_perp = J - mean(J) * 11.T`, and admits
 `atol + 64 * eps * (max|chi_perp| + max|J_perp| * sum|q|)`. Consequently a
 physically irrelevant `alpha * 11.T` shift cannot relax the charge certificate.
+
 The gauge-dependent raw stationarity telemetry and the uniform multiplier
-component retain a floor based on their own full-scale intermediates, because
-`lambda` itself shifts by `-alpha * Q`. Magnitude-carrying quantities
+component keep a floor built from their own full-scale intermediates, because
+`lambda` itself shifts by `-alpha * Q`. That floor is
+`|mean(chi)| + |mean(J)| * sum|q| + |lambda|` on top of the tangent scale — the
+magnitudes the expression passes *through*, not the value it cancels *to*. For
+a neutral system `sum(q)` cancels to roundoff, so a floor keyed to the cancelled
+`|mean(chi) + mean(J) * sum(q)|` would reject the very solve that produced it as
+soon as a large uniform gauge was supplied. Magnitude-carrying quantities
 (condition numbers, eigenvalues, energies) are compared to their recomputation
 with a relative tolerance, because one ULP of a condition number at the `1e12`
 ceiling is `1.2e-4`, far above any absolute `atol`.
@@ -148,9 +164,14 @@ large enough to explain it — roughly `eps * cond * scale >= tolerance` — the
 error raised is `QEqKernelConditionError` naming the attainable residual, not
 the generic contract-violation `QEqOperatorError`.
 
-`input_kernel_symmetry_error` cannot be recomputed, because the stored kernel is
-already symmetrized. The validator re-enforces the recorded `symmetry_tol`
-against it instead.
+Kernel asymmetry is a policy question, not a residual one, so both the stored
+kernel's residual asymmetry and the recorded `input_kernel_symmetry_error` are
+compared against the resolved `symmetry_tol` rather than the residual `atol`.
+Otherwise a payload declaring `symmetry_tol=1e-10` could carry a `5e-9`
+asymmetry and still pass under the shipped `atol=1e-8`.
+`input_kernel_symmetry_error` cannot be recomputed at all, because the stored
+kernel is already symmetrized; re-enforcing the recorded policy against it is
+the only check available.
 
 ## Fixed-mu Validator
 
@@ -171,7 +192,10 @@ the eigenvectors, the band energy ledger and its closures, `Tr(D S)`,
 `Tr(D H)`, residual ledgers, and density hermiticity from the current fixed-mu
 arrays. When `expected_k_weights` is supplied, it is passed through the same
 broadcasting and optional normalization path as the original request before it
-is compared with stored weights.
+is compared with stored weights, so a caller who asked for `[2, 1]` with
+`normalize_k_weights=True` states `[2, 1]` and not the stored `[2/3, 1/3]`. A
+result with no `k_axis` has nothing to normalize along, so its implicit unit
+weights are compared directly.
 
 Before any of that it requires the eigenbasis to be **complete**:
 `eigvecs.shape[-2:] == (n, n)` and `eigvals.shape[-1] == n` against the H/S
@@ -210,9 +234,15 @@ validate against itself at all.
 
 Finally, every conservation identity is homogeneous of degree one in
 `spin_degeneracy`, so a result computed at the wrong SOC/non-SOC convention
-validates perfectly against itself. `spin_degeneracy` is constrained to `{1, 2}`
-at construction, and the caller can bind a result to the request that was
-actually made:
+validates perfectly against itself. The same is true of the k axis: for leading
+shape `(2, 2)` and uniform `0.5` weights, `k_axis=0` and `k_axis=1` produce
+storage of identical shape *and* identical values while meaning different
+electron counts. And `eig_floor` / `max_condition` / `hermitian_tol` are
+self-declared data on a deserialized payload, which the validator would
+otherwise simply believe. `spin_degeneracy` is constrained to `{1, 2}` at
+construction, `normalize_k_weights` must be a real boolean rather than anything
+truthy (`bool("false") is True`), and the caller can bind a result to the
+request and safety policy that were actually used:
 
 ```python
 validate_conservation(

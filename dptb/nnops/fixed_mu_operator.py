@@ -157,9 +157,11 @@ class FixedMuValidationContext:
 class FixedMuResult:
     """Observable bundle for ``H, S`` evaluated at a fixed ``mu``.
 
-    Array fields are defensive read-only copies.  Solver-produced results also
-    carry private read-only H/S snapshots so conservation validation can
-    recompute ``Tr(D S)`` and ``Tr(D H)`` instead of trusting cached ledgers.
+    Array fields are defensive read-only copies backed by an immutable buffer,
+    so writes cannot be re-enabled with ``setflags(write=True)``.
+    Solver-produced results also carry private read-only H/S snapshots so
+    conservation validation can recompute ``Tr(D S)`` and ``Tr(D H)`` instead of
+    trusting cached ledgers.
     """
 
     mu: float
@@ -690,6 +692,10 @@ def fixed_mu_observables(
         normalized along that axis.  With ``k_axis=None`` no k aggregation is
         performed, batch/sample weights are rejected, and returned densities
         have the same unweighted leading shape as the input matrices.
+    normalize_k_weights
+        Must be a real ``bool``/``np.bool_``.  Anything merely truthy is
+        rejected rather than coerced, because ``bool("false") is True`` would
+        silently invert the weight convention at a JSON/YAML boundary.
     """
 
     mu = _as_float_scalar("mu", mu)
@@ -835,8 +841,13 @@ def validate_conservation(
     The S-orthonormality and eigenpair residuals of a backward-stable
     generalized solve grow like ``eps * cond(S)``, which the default
     ``max_condition=1e12`` admits far beyond what ``atol=1e-8`` can certify.
-    Those two checks therefore use ``max(atol, 16 * eps * cond(S) * scale)``;
-    every other check keeps the caller's ``atol``/``rtol`` verbatim.
+    Those two checks therefore use ``max(atol, 16 * eps * cond(S) * scale)``
+    **per leading item**, and the ``Tr(D S)`` / ``Tr(D H)`` budgets that route
+    through the same eigenvectors are formed per k/sample item and aggregated
+    only along the declared k axis.  A batch-global ``max(cond(S))`` would let
+    one pathological overlap relax the certificate of every well-conditioned
+    sample beside it, making batch composition decide whether a structure
+    validates.  Every other check keeps the caller's ``atol``/``rtol`` verbatim.
     """
 
     if not isinstance(result, FixedMuResult):

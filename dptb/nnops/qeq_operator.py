@@ -41,8 +41,11 @@ _MACHINE_EPS = float(np.finfo(np.float64).eps)
 #: Residual gates are absolute in the caller's energy unit, but no float64
 #: evaluation of ``chi + J q + lambda`` can resolve below the rounding scale of
 #: its own intermediates.  Gates therefore admit ``atol`` plus this many ULPs of
-#: that arithmetic scale, which is what makes them invariant under the physical
-#: gauge freedom ``J -> J + alpha * 11^T``.
+#: that arithmetic scale.  The physical charge certificate takes its scale from
+#: the canonical uniform gauge alone, so ``J -> J + alpha * 11^T`` cannot relax
+#: it; the gauge-dependent uniform component keeps a scale built from its own
+#: pre-cancellation intermediates, because ``lambda`` genuinely shifts by
+#: ``-alpha * Q``.
 _ARITHMETIC_FLOOR_ULPS = 64.0
 #: Relative agreement required when a stored magnitude-carrying diagnostic
 #: (condition number, eigenvalue, energy) is compared against its recomputation.
@@ -116,7 +119,10 @@ class QEqDiagnostics:
     every intermediate.  The gauge-invariant split is
     ``stationarity_tangent_max_abs`` (the sum-zero component ``Z^T (chi + J q)``,
     i.e. the equation the solve actually enforces) and ``multiplier_residual``
-    (the uniform component, i.e. the equation that *defines* ``lambda``).
+    (the uniform component, i.e. the equation that *defines* ``lambda``).  Only
+    the tangent component certifies the charges, and only it is gated on a
+    gauge-independent floor; ``multiplier_residual`` is gated on a floor built
+    from the full uniform magnitudes it is computed through.
 
     ``input_kernel_symmetry_error`` is the asymmetry of the kernel as supplied,
     measured before symmetrization; ``kernel_symmetry_error`` is the residual
@@ -180,8 +186,10 @@ _RESULT_ARRAY_FIELDS = (
 class QEqResult:
     """Observable bundle for the dense constrained QEq solve.
 
-    Array fields are defensive read-only copies.  This prevents in-place alias
-    mutations from making cached diagnostics disagree with the physical fields.
+    Array fields are defensive read-only copies backed by an immutable buffer,
+    so writes cannot be re-enabled with ``setflags(write=True)``.  This prevents
+    in-place alias mutations from making cached diagnostics disagree with the
+    physical fields.
 
     ``symmetry_tol`` / ``constrained_eig_floor`` / ``max_condition`` /
     ``residual_tol`` persist the safety policy of the solve that produced this
@@ -491,7 +499,15 @@ def _solve_fixed_charge_nullspace(
     kernel: np.ndarray,
     total_charge: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Solve only on the physical sum(q)=Q tangent space.
+    """Solve only on the physical sum(q)=Q tangent space, in a canonical gauge.
+
+    ``chi`` and ``J`` are first reduced to ``chi - mean(chi) 1`` and
+    ``J - mean(J) 11.T``.  That is an exact fixed-charge gauge transformation --
+    ``Z.T 1 == 0`` makes ``Z.T J Z`` and ``Z.T (chi + J q0)`` identical either
+    way -- but it keeps a large uniform ``alpha * 11.T`` out of the float64
+    cancellation inside ``Z.T J Z``.  ``lambda`` is returned in the *original*
+    gauge, reconstructed from the uniform part instead of a cancellation-prone
+    dense matvec.
 
     The raw augmented KKT condition number is intentionally diagnostic-only:
     adding alpha*11.T to J leaves the fixed-charge minimizer unchanged but can
@@ -830,8 +846,9 @@ def validate_qeq_result(
         result carrying a looser *or* tighter recorded policy is re-enforced as
         recorded.  An explicit value always wins.  Every residual gate admits
         ``atol`` plus a float64 arithmetic floor derived from the magnitude of
-        the intermediates, which is what makes the gates invariant under the
-        gauge freedom ``J -> J + alpha 11^T``.
+        the intermediates.  The tangent gate -- the one that certifies the
+        charges -- derives that floor from the canonical uniform gauge only, so
+        ``J -> J + alpha 11^T`` cannot loosen it.
     expected_symmetry_tol, expected_constrained_eig_floor, expected_max_condition
         Caller-supplied safety policy.  Each overrides the value recorded on
         ``result`` — use them when the result came from an untrusted producer
