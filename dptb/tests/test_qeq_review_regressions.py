@@ -1,7 +1,13 @@
+import pickle
+
 import numpy as np
 import pytest
 
 import dptb.nnops.qeq_operator as qeq
+
+#: Uniform gauge amplitudes the SHIP gate requires solve and validate to be
+#: adversarially exercised at.
+GAUGE_ALPHAS = (1.0e9, 1.0e12, 1.0e14)
 
 
 def _self_consistent_qeq_result(
@@ -95,6 +101,58 @@ def test_uniform_kernel_gauge_does_not_relax_tangent_gate():
         qeq.validate_qeq_result(forged)
 
 
+@pytest.mark.parametrize("alpha", GAUGE_ALPHAS)
+@pytest.mark.parametrize("total_charge", [0.0, 1.25])
+def test_gauge_sweep_solves_exactly_and_rejects_a_forged_charge_vector(alpha, total_charge):
+    chi = np.array([1.0, 3.0])
+    base_kernel = np.array([[5.0, 1.0], [1.0, 7.0]])
+    baseline = qeq.solve_qeq(chi, base_kernel, total_charge=total_charge)
+    shifted = qeq.solve_qeq(
+        chi, base_kernel + alpha * np.ones((2, 2)), total_charge=total_charge
+    )
+    np.testing.assert_allclose(shifted.charges, baseline.charges, atol=1.0e-12)
+    qeq.validate_qeq_result(shifted)
+
+    forged = _self_consistent_qeq_result(
+        chi,
+        base_kernel + alpha * np.ones((2, 2)),
+        np.asarray(shifted.charges) + np.array([0.1, -0.1]),
+        total_charge,
+    )
+    with pytest.raises(qeq.QEqOperatorError, match="stationarity residual"):
+        qeq.validate_qeq_result(forged)
+
+
+@pytest.mark.parametrize("alpha", GAUGE_ALPHAS)
+@pytest.mark.parametrize("total_charge", [0.0, 1.25])
+def test_neutral_gauge_shift_does_not_reject_a_correct_solve(alpha, total_charge):
+    """The uniform component's floor must cover its own cancellation.
+
+    ``mean(J) * sum(q)`` cancels to roundoff for a neutral system, so a floor
+    keyed to the cancelled result rejects the solve that produced it.
+    """
+
+    chi = np.array([0.5, -1.0, 2.0, 0.25, -0.75])
+    kernel = np.diag([4.0, 5.0, 6.0, 7.0, 8.0]) + 0.2
+    baseline = qeq.solve_qeq(chi, kernel, total_charge=total_charge)
+    shifted = qeq.solve_qeq(
+        chi, kernel + alpha * np.ones((5, 5)), total_charge=total_charge
+    )
+    np.testing.assert_allclose(shifted.charges, baseline.charges, atol=1.0e-9)
+
+
+@pytest.mark.parametrize("alpha", GAUGE_ALPHAS)
+def test_externally_computed_multiplier_survives_a_large_gauge(alpha):
+    """An external producer spelling ``lambda = -mean(chi + J q)`` directly pays
+    ``eps * max|J| * sum|q|`` for the dense matvec; the uniform gate must admit it."""
+
+    chi = np.array([1.0, 3.0])
+    kernel = np.array([[5.0, 1.0], [1.0, 7.0]]) + alpha * np.ones((2, 2))
+    solved = qeq.solve_qeq(chi, kernel)
+    external = _self_consistent_qeq_result(chi, kernel, np.asarray(solved.charges), 0.0)
+    qeq.validate_qeq_result(external)
+
+
 def test_stored_kernel_uses_symmetry_policy_not_residual_atol():
     chi = np.array([1.0, 3.0])
     kernel = np.array([[5.0, 1.0 + 5.0e-9], [1.0, 7.0]])
@@ -117,3 +175,15 @@ def test_result_arrays_cannot_reenable_writes():
     result = qeq.solve_qeq(chi, kernel)
     with pytest.raises(ValueError):
         result.charges.setflags(write=True)
+
+
+def test_result_arrays_stay_frozen_across_a_pickle_round_trip():
+    result = qeq.solve_qeq(np.array([1.0, 3.0]), np.array([[5.0, 1.0], [1.0, 7.0]]))
+    restored = pickle.loads(pickle.dumps(result))
+    for field_name in qeq._RESULT_ARRAY_FIELDS:
+        with pytest.raises(ValueError):
+            getattr(restored, field_name).setflags(write=True)
+    for field_name in qeq._DIAGNOSTIC_ARRAY_FIELDS:
+        with pytest.raises(ValueError):
+            getattr(restored.diagnostics, field_name).setflags(write=True)
+    qeq.validate_qeq_result(restored)
