@@ -1383,7 +1383,10 @@ def test_named_external_prior_alias_ignores_physical_zero_fallback():
 
 
 def test_dftbsk_prior_alias_is_retired():
-    with pytest.raises(ValueError, match=r"Unsupported flow_options\.prior"):
+    # Rejected during flow-option canonicalization (which runs first inside
+    # HamiltonianCFM.__init__) so the message does not still list 'dftbsk'
+    # among the supported priors, as flow.py's own message does.
+    with pytest.raises(ValueError, match="removed together with the SK model route"):
         _flow("dftbsk", device=torch.device("cpu"), dtype=torch.float32)
 
 
