@@ -100,6 +100,7 @@ def _test(
         common_options=jdata["common_options"],
         explicit_common_options=explicit_common_options,
     )
+    build_dataset.check_cutoffs(model=model)
     model.eval()
     tester = Tester(
         test_options=jdata["test_options"],

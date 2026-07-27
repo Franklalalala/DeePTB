@@ -550,6 +550,10 @@ def train(
             reference_datasets=reference_datasets,
         )
 
+    # Every split above was built from the same cutoff_options, so the builder's
+    # last-dataset state is representative of all of them.
+    build_dataset.check_cutoffs(model=trainer.model)
+
     # register the plugin in trainer, to tract training info
     train_options = jdata["train_options"]
     log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]

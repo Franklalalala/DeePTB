@@ -3,7 +3,6 @@ import glob
 from typing import Union
 from dptb.data.dataset.lmdb_dataset import LMDBDataset
 from dptb.data.transforms import OrbitalMapper
-from dptb.utils.argcheck import collect_cutoffs
 from dptb.utils.argcheck import get_cutoffs_from_model_options
 import logging
 import torch
@@ -270,13 +269,13 @@ class DatasetBuilder:
             log.warning("No model is provided. We can not check the cutoffs used in data and model are consistent.")
             return
 
+        # collect_cutoffs() indexes jdata["model_options"]; passing
+        # model.model_options directly raised KeyError: 'model_options' on the
+        # first statement, which is why this guard never ran.
+        r_max, er_max, oer_max = get_cutoffs_from_model_options(model.model_options)
+        model_cutoffs = {"r_max": r_max, "er_max": er_max, "oer_max": oer_max}
+        for name, model_cutoff in model_cutoffs.items():
+            _validate_cutoff_coverage(name, getattr(self, name, None), model_cutoff)
         self.if_check_cutoffs = True
-        cutoff_options = collect_cutoffs(model.model_options)
-        for name in ("r_max", "er_max", "oer_max"):
-            _validate_cutoff_coverage(
-                name,
-                getattr(self, name, None),
-                cutoff_options[name],
-            )
 
 build_dataset = DatasetBuilder()
