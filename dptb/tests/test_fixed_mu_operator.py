@@ -203,8 +203,8 @@ def test_positive_unnormalized_k_weights_are_preserved_with_provenance():
     np.testing.assert_allclose(result.k_weights, weights, atol=1e-12)
     validate_conservation(result, atol=1e-10)
     np.testing.assert_allclose(
-        result.energies.grand_energy,
-        result.energies.free_energy - result.mu * result.electron_count,
+        result.energies.band_grand_energy,
+        result.energies.band_free_energy - result.mu * result.electron_count,
         atol=1e-12,
     )
 
@@ -276,7 +276,7 @@ def test_validate_conservation_recomputes_fixed_mu_occupations_and_energy_closur
     with pytest.raises(FixedMuOperatorError, match="generalized eigen residual"):
         validate_conservation(_replace_result(result, eigvals=bad_eigvals), atol=1e-10)
 
-    for field_name in ("entropy_term", "free_energy", "grand_energy"):
+    for field_name in ("minus_t_s", "band_free_energy", "band_grand_energy"):
         bad_energies = replace(result.energies, **{field_name: getattr(result.energies, field_name) + 0.25})
         with pytest.raises(FixedMuOperatorError, match=f"energy {field_name}"):
             validate_conservation(_replace_result(result, energies=bad_energies), atol=1e-10)
@@ -296,17 +296,17 @@ def test_finite_temperature_dos_and_density_response_match_finite_difference():
     np.testing.assert_allclose(result.density_response, fd_d, rtol=1e-6, atol=1e-8)
 
 
-def test_grand_potential_uses_free_energy_minus_mu_n_without_double_subtraction():
+def test_band_grand_energy_uses_band_free_energy_minus_mu_n_without_double_subtraction():
     h = np.diag([-0.4, 0.1, 0.7])
     s = np.eye(3)
     mu = 0.23
     result = fixed_mu_observables(h, s, mu=mu, kT=0.15, spin_degeneracy=2.0)
     np.testing.assert_allclose(
-        result.energies.grand_energy,
-        result.energies.free_energy - mu * result.electron_count,
+        result.energies.band_grand_energy,
+        result.energies.band_free_energy - mu * result.electron_count,
         atol=1e-12,
     )
-    assert result.energies.entropy_term < 0.0
+    assert result.energies.minus_t_s < 0.0
 
 
 def test_batch_kpoint_weights_aggregate_only_over_requested_k_axis():
@@ -445,8 +445,8 @@ def test_nonorthogonal_kweighted_grand_ledger_matches_mu_legendre_transform():
     validate_conservation(result, atol=1e-10)
     np.testing.assert_allclose(result.k_weights, np.array([2.0 / 3.0, 1.0 / 3.0]))
     np.testing.assert_allclose(
-        result.energies.grand_energy,
-        result.energies.band_energy + result.energies.entropy_term - mu * result.electron_count,
+        result.energies.band_grand_energy,
+        result.energies.band_energy + result.energies.minus_t_s - mu * result.electron_count,
         atol=1e-12,
     )
 

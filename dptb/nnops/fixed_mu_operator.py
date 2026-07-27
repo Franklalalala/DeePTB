@@ -5,6 +5,14 @@ They take predicted dense DPTB Hamiltonian/overlap matrices, solve the
 generalized eigenproblem, evaluate fixed-mu Fermi occupations, and return
 density-matrix and energy ledgers suitable for downstream conservation checks.
 They do not preserve PyTorch autograd graphs.
+
+Units
+-----
+``mu``, ``kT`` and ``h`` must share one caller-chosen energy unit; nothing in
+this module converts between units or records which one was meant.  Every
+energy this module returns -- eigenvalues, the band/entropy/free/grand ledger,
+``Tr(D H)`` -- comes back in that same unit, and ``density``/``electron_count``
+are unitless occupancy quantities.
 """
 from __future__ import annotations
 
@@ -19,6 +27,16 @@ except Exception:  # pragma: no cover - exercised only in minimal runtimes.
     _scipy_linalg = None
 
 ArrayLike = Any
+
+_MACHINE_EPS = float(np.finfo(np.float64).eps)
+#: The S-orthonormality and eigenpair residuals of a backward-stable generalized
+#: solve grow like ``eps * cond(S)``, so an absolute atol alone cannot certify
+#: the conditioning the acceptance gates admit.  Spectral checks therefore use
+#: ``max(atol, this many ULPs of eps * cond(S) * scale)``.
+_SPECTRAL_CONDITION_ULPS = 16.0
+#: Occupancy multipliers this reference understands: 2 for spin-degenerate
+#: non-SOC matrices, 1 for explicit spin/SOC spinor matrices.
+_ALLOWED_SPIN_DEGENERACY = (1.0, 2.0)
 
 
 class FixedMuOperatorError(ValueError):
@@ -49,31 +67,50 @@ class GeneralizedBands:
 
 @dataclass(frozen=True)
 class EnergyLedger:
-    """Band/free/grand-energy bookkeeping at fixed chemical potential.
+    """Single-particle band energetics at fixed chemical potential.
 
-    ``entropy_term`` is the finite-temperature ``-T*S`` contribution:
-    ``g * sum_k w_k * kT * [f log f + (1-f) log(1-f)]``.
+    Every term is a *band-structure* quantity: it comes from the occupied
+    single-particle spectrum only, with no double-counting correction and no
+    ion-ion contribution, and it carries whatever energy unit ``h`` and ``mu``
+    were given in.  The names say so explicitly:
+
+    ``minus_t_s``
+        The finite-temperature ``-T*S`` contribution
+        ``g * sum_k w_k * kT * [f log f + (1-f) log(1-f)]``, which is ``<= 0``.
+    ``band_free_energy``
+        ``band_energy + minus_t_s``.
+    ``band_grand_energy``
+        ``band_free_energy - mu * N``, the Legendre transform of the above.
     """
 
     band_energy: np.ndarray
-    entropy_term: np.ndarray
-    free_energy: np.ndarray
-    grand_energy: np.ndarray
+    minus_t_s: np.ndarray
+    band_free_energy: np.ndarray
+    band_grand_energy: np.ndarray
 
     def __post_init__(self) -> None:
-        for field_name in ("band_energy", "entropy_term", "free_energy", "grand_energy"):
+        for field_name in ("band_energy", "minus_t_s", "band_free_energy", "band_grand_energy"):
             object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
 
 
 @dataclass(frozen=True)
 class ConservationLedger:
-    """Hamiltonian/DM downstream conservation diagnostics."""
+    """Hamiltonian/DM downstream conservation diagnostics.
+
+    ``input_h_hermiticity_error`` / ``input_s_hermiticity_error`` are the raw
+    ``max |X - X^H|`` of the matrices as supplied, recorded before
+    symmetrization.  They cannot be recomputed from the stored H/S snapshot,
+    which is already Hermitian by construction; the validator re-checks them
+    against the recorded ``hermitian_tol`` instead.
+    """
 
     electron_count_from_density: np.ndarray
     band_energy_from_density: np.ndarray
     electron_count_residual: np.ndarray
     band_energy_residual: np.ndarray
     density_hermiticity_error: np.ndarray
+    input_h_hermiticity_error: np.ndarray
+    input_s_hermiticity_error: np.ndarray
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -82,6 +119,8 @@ class ConservationLedger:
             "electron_count_residual",
             "band_energy_residual",
             "density_hermiticity_error",
+            "input_h_hermiticity_error",
+            "input_s_hermiticity_error",
         ):
             object.__setattr__(self, field_name, _readonly_array(getattr(self, field_name)))
 
@@ -142,7 +181,7 @@ class FixedMuResult:
         object.__setattr__(
             self,
             "spin_degeneracy",
-            _as_float_scalar("spin_degeneracy", self.spin_degeneracy, positive=True),
+            _validate_spin_degeneracy(self.spin_degeneracy),
         )
         object.__setattr__(self, "normalize_k_weights", bool(self.normalize_k_weights))
         object.__setattr__(self, "eig_floor", _as_float_scalar("eig_floor", self.eig_floor, positive=True))
@@ -229,12 +268,22 @@ def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnega
     return out
 
 
+def _validate_spin_degeneracy(spin_degeneracy: float) -> float:
+    value = _as_float_scalar("spin_degeneracy", spin_degeneracy, positive=True)
+    if value not in _ALLOWED_SPIN_DEGENERACY:
+        raise FixedMuOperatorError(
+            f"spin_degeneracy must be one of {_ALLOWED_SPIN_DEGENERACY} (2 for spin-degenerate "
+            f"non-SOC matrices, 1 for explicit spin/SOC spinor matrices), got {value!r}"
+        )
+    return value
+
+
 def _validate_matrix_stack(
     h: ArrayLike,
     s: ArrayLike,
     *,
     hermitian_tol: float = 1e-8,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     _reject_torch_tensor("H", h)
     _reject_torch_tensor("S", s)
     h_arr = np.asarray(h)
@@ -245,6 +294,10 @@ def _validate_matrix_stack(
         raise FixedMuOperatorError(f"H/S must be square matrices or stacks, got shape {h_arr.shape}")
     if h_arr.shape[-1] == 0:
         raise FixedMuOperatorError("H/S matrix size must be positive")
+    if 0 in h_arr.shape[:-2]:
+        raise FixedMuOperatorError(
+            f"H/S leading shape {h_arr.shape[:-2]} must not contain a zero-length dimension"
+        )
     if not np.issubdtype(h_arr.dtype, np.number) or not np.issubdtype(s_arr.dtype, np.number):
         raise FixedMuOperatorError("H and S must be numeric arrays")
     dtype = np.result_type(h_arr, s_arr, np.float64)
@@ -253,6 +306,9 @@ def _validate_matrix_stack(
     if not np.isfinite(h_arr).all() or not np.isfinite(s_arr).all():
         raise FixedMuOperatorError("H and S must contain only finite values")
     hermitian_tol = _as_float_scalar("hermitian_tol", hermitian_tol, nonnegative=True)
+    # Recorded before symmetrization: hermitian_part() below destroys it.
+    h_asymmetry = np.max(np.abs(h_arr - np.swapaxes(h_arr.conj(), -1, -2)), axis=(-1, -2)).real
+    s_asymmetry = np.max(np.abs(s_arr - np.swapaxes(s_arr.conj(), -1, -2)), axis=(-1, -2)).real
     if hermitian_tol == 0.0:
         h_ok = np.array_equal(h_arr, np.swapaxes(h_arr.conj(), -1, -2))
         s_ok = np.array_equal(s_arr, np.swapaxes(s_arr.conj(), -1, -2))
@@ -263,7 +319,19 @@ def _validate_matrix_stack(
         raise FixedMuOperatorError("H must be Hermitian within hermitian_tol")
     if not s_ok:
         raise FixedMuOperatorError("S must be Hermitian within hermitian_tol")
-    return hermitian_part(h_arr), hermitian_part(s_arr)
+    return (
+        hermitian_part(h_arr),
+        hermitian_part(s_arr),
+        np.asarray(h_asymmetry, dtype=np.float64),
+        np.asarray(s_asymmetry, dtype=np.float64),
+    )
+
+
+def _hermiticity_budget(matrix: np.ndarray, hermitian_tol: float) -> np.ndarray:
+    """Largest asymmetry ``np.allclose(X, X^H, atol=tol, rtol=tol)`` can admit."""
+
+    scale = np.max(np.abs(matrix), axis=(-1, -2)).real
+    return hermitian_tol * (1.0 + np.asarray(scale, dtype=np.float64))
 
 
 def _canonical_k_axis(k_axis: Optional[int], leading_ndim: int) -> Optional[int]:
@@ -271,6 +339,8 @@ def _canonical_k_axis(k_axis: Optional[int], leading_ndim: int) -> Optional[int]
         return None
     if leading_ndim == 0:
         raise FixedMuOperatorError("k_axis is invalid for a single matrix with no leading k dimension")
+    if isinstance(k_axis, bool) or not isinstance(k_axis, (int, np.integer)):
+        raise FixedMuOperatorError(f"k_axis must be an integer, got {k_axis!r}")
     try:
         axis = int(k_axis)
     except (TypeError, ValueError) as exc:
@@ -447,7 +517,7 @@ def generalized_bands(
 
     eig_floor = _as_float_scalar("eig_floor", eig_floor, positive=True)
     max_condition = _as_float_scalar("max_condition", max_condition, positive=True)
-    h_arr, s_arr = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
+    h_arr, s_arr, _, _ = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
     min_eig, cond = _check_overlap(s_arr, eig_floor=eig_floor, max_condition=max_condition)
     n = h_arr.shape[-1]
     leading_shape = h_arr.shape[:-2]
@@ -492,12 +562,6 @@ def fermi_dirac(
         raise FixedMuOperatorError("energies must be finite")
     f, response = _stable_fermi(eps, mu=mu, kT=kT)
     return spin_degeneracy * f, spin_degeneracy * response
-
-
-def _weighted_sum(values: np.ndarray, weights: np.ndarray, *, k_axis: Optional[int]) -> np.ndarray:
-    if k_axis is None:
-        return weights * values
-    return np.sum(weights * values, axis=k_axis)
 
 
 def _density_from_vectors(vecs: np.ndarray, occ: np.ndarray) -> np.ndarray:
@@ -551,9 +615,9 @@ def _energy_ledger(
     free_k = band_k + entropy_k
     return EnergyLedger(
         band_energy=_aggregate_matrix(band_k, k_axis=k_axis),
-        entropy_term=_aggregate_matrix(entropy_k, k_axis=k_axis),
-        free_energy=_aggregate_matrix(free_k, k_axis=k_axis),
-        grand_energy=_aggregate_matrix(grand_k, k_axis=k_axis),
+        minus_t_s=_aggregate_matrix(entropy_k, k_axis=k_axis),
+        band_free_energy=_aggregate_matrix(free_k, k_axis=k_axis),
+        band_grand_energy=_aggregate_matrix(grand_k, k_axis=k_axis),
     )
 
 
@@ -597,7 +661,7 @@ def fixed_mu_observables(
 
     mu = _as_float_scalar("mu", mu)
     kT = _as_float_scalar("kT", kT, nonnegative=True)
-    spin_degeneracy = _as_float_scalar("spin_degeneracy", spin_degeneracy, positive=True)
+    spin_degeneracy = _validate_spin_degeneracy(spin_degeneracy)
     bands = generalized_bands(
         h,
         s,
@@ -605,7 +669,7 @@ def fixed_mu_observables(
         max_condition=max_condition,
         hermitian_tol=hermitian_tol,
     )
-    h_arr, s_arr = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
+    h_arr, s_arr, h_asymmetry, s_asymmetry = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
     leading_shape = h_arr.shape[:-2]
     k_axis_c = _canonical_k_axis(k_axis, len(leading_shape))
     weights = _prepare_weights(
@@ -647,6 +711,8 @@ def fixed_mu_observables(
         electron_count_residual=ne_from_d - electron_count,
         band_energy_residual=band_from_d - energies.band_energy,
         density_hermiticity_error=_density_hermiticity_error(density),
+        input_h_hermiticity_error=h_asymmetry,
+        input_s_hermiticity_error=s_asymmetry,
     )
 
     return FixedMuResult(
@@ -700,6 +766,10 @@ def validate_conservation(
     s: Optional[ArrayLike] = None,
     atol: float = 1e-8,
     rtol: float = 1e-8,
+    expected_mu: Optional[float] = None,
+    expected_kT: Optional[float] = None,
+    expected_spin_degeneracy: Optional[float] = None,
+    expected_k_weights: Optional[ArrayLike] = None,
 ) -> None:
     """Fail closed when density-matrix ledgers do not conserve N or band energy.
 
@@ -709,6 +779,23 @@ def validate_conservation(
     either caller-supplied H/S arrays or the non-serialized private context
     carried by solver-produced results.  Externally constructed or deserialized
     results without H/S context must pass ``h=`` and ``s=`` explicitly.
+
+    Parameters
+    ----------
+    expected_mu, expected_kT, expected_spin_degeneracy, expected_k_weights
+        The request the caller actually made.  Every conservation identity here
+        is self-consistent in the stored scalars -- N, D and the whole energy
+        ledger are homogeneous of degree one in ``spin_degeneracy``, so a result
+        computed at the wrong SOC/non-SOC convention validates perfectly against
+        itself.  Supplying these binds the result to the request instead.
+
+    Notes
+    -----
+    The S-orthonormality and eigenpair residuals of a backward-stable
+    generalized solve grow like ``eps * cond(S)``, which the default
+    ``max_condition=1e12`` admits far beyond what ``atol=1e-8`` can certify.
+    Those two checks therefore use ``max(atol, 16 * eps * cond(S) * scale)``;
+    every other check keeps the caller's ``atol``/``rtol`` verbatim.
     """
 
     if not isinstance(result, FixedMuResult):
@@ -719,6 +806,26 @@ def validate_conservation(
         raise FixedMuOperatorError("conservation must be a ConservationLedger")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     rtol = _as_float_scalar("rtol", rtol, nonnegative=True)
+    if expected_mu is not None and not np.isclose(
+        result.mu, _as_float_scalar("expected_mu", expected_mu), atol=atol, rtol=rtol
+    ):
+        raise FixedMuOperatorError(
+            f"fixed-mu result was computed at mu={result.mu!r}, not the expected {expected_mu!r}"
+        )
+    if expected_kT is not None and not np.isclose(
+        result.kT, _as_float_scalar("expected_kT", expected_kT, nonnegative=True), atol=atol, rtol=rtol
+    ):
+        raise FixedMuOperatorError(
+            f"fixed-mu result was computed at kT={result.kT!r}, not the expected {expected_kT!r}"
+        )
+    if expected_spin_degeneracy is not None and result.spin_degeneracy != _validate_spin_degeneracy(
+        expected_spin_degeneracy
+    ):
+        raise FixedMuOperatorError(
+            f"fixed-mu result was computed at spin_degeneracy={result.spin_degeneracy!r}, not the "
+            f"expected {expected_spin_degeneracy!r}; N, D and the energy ledger all scale linearly "
+            "with it, so nothing else in this validator can catch the wrong convention"
+        )
     if (h is None) != (s is None):
         raise FixedMuOperatorError("validate_conservation requires both h and s, or neither")
     if h is None and s is None:
@@ -729,7 +836,7 @@ def validate_conservation(
             )
         h = context.hamiltonian
         s = context.overlap
-    h_arr, s_arr = _validate_matrix_stack(h, s, hermitian_tol=result.hermitian_tol)
+    h_arr, s_arr, _, _ = _validate_matrix_stack(h, s, hermitian_tol=result.hermitian_tol)
     min_overlap_eig, overlap_condition = _check_overlap(
         s_arr,
         eig_floor=result.eig_floor,
@@ -745,16 +852,50 @@ def validate_conservation(
         atol=atol,
         rtol=rtol,
     )
+    if expected_k_weights is not None:
+        _reject_torch_tensor("expected_k_weights", expected_k_weights)
+        requested = _validate_stored_weights(
+            leading_shape,
+            k_weights=expected_k_weights,
+            k_axis=k_axis_c,
+            normalize_k_weights=False,
+            atol=atol,
+            rtol=rtol,
+        )
+        if requested.shape != weights.shape or not np.allclose(requested, weights, atol=atol, rtol=rtol):
+            raise FixedMuOperatorError("fixed-mu stored k_weights do not match the expected k_weights")
 
+    n = h_arr.shape[-1]
     eigvals = np.asarray(result.eigvals)
     eigvecs = np.asarray(result.eigvecs)
     density_k = np.asarray(result.density_k)
+    # Without this the S-orthonormality identity below is sized from the stored
+    # eigenvector column count, so a truncated m < n basis certifies itself.
+    if eigvecs.shape != leading_shape + (n, n):
+        raise FixedMuOperatorError(
+            f"fixed-mu eigvecs must be a complete {n}x{n} eigenbasis matching H/S, "
+            f"got shape {eigvecs.shape}"
+        )
+    if eigvals.shape != leading_shape + (n,):
+        raise FixedMuOperatorError(
+            f"fixed-mu eigvals must have shape {leading_shape + (n,)}, got {eigvals.shape}"
+        )
+    spectral_atol = max(
+        atol, _SPECTRAL_CONDITION_ULPS * _MACHINE_EPS * float(np.max(overlap_condition))
+    )
+    eigen_atol = max(
+        atol,
+        _SPECTRAL_CONDITION_ULPS
+        * _MACHINE_EPS
+        * float(np.max(overlap_condition))
+        * float(np.max(np.abs(h_arr))),
+    )
     try:
         f_base, response_base = _stable_fermi(eigvals, mu=result.mu, kT=result.kT)
         occupations = result.spin_degeneracy * f_base
         occupation_response = result.spin_degeneracy * response_base
         s_orthonormal = np.swapaxes(eigvecs.conj(), -1, -2) @ s_arr @ eigvecs
-        identity = np.broadcast_to(np.eye(eigvecs.shape[-1], dtype=s_orthonormal.dtype), s_orthonormal.shape)
+        identity = np.broadcast_to(np.eye(n, dtype=s_orthonormal.dtype), s_orthonormal.shape)
         h_c = h_arr @ eigvecs
         s_c_eps = (s_arr @ eigvecs) * eigvals[..., None, :]
         density_k_from_vectors = _density_from_vectors(eigvecs, occupations)
@@ -786,7 +927,6 @@ def validate_conservation(
             spin_degeneracy=result.spin_degeneracy,
             k_axis=k_axis_c,
         )
-        aggregated_density = _aggregate_matrix(density_k, k_axis=k_axis_c, weights=weights)
         ne_from_d_k = weights * _trace_last2(density_k @ s_arr)
         band_from_d_k = weights * _trace_last2(density_k @ h_arr)
         ne_from_d = _aggregate_matrix(ne_from_d_k, k_axis=k_axis_c)
@@ -812,14 +952,14 @@ def validate_conservation(
         "generalized S-orthonormality",
         s_orthonormal,
         identity,
-        atol=atol,
+        atol=spectral_atol,
         rtol=rtol,
     )
     _assert_recomputed_close(
         "generalized eigen residual",
         h_c,
         s_c_eps,
-        atol=atol,
+        atol=eigen_atol,
         rtol=rtol,
     )
     _assert_recomputed_close(
@@ -886,37 +1026,37 @@ def validate_conservation(
         rtol=rtol,
     )
     _assert_recomputed_close(
-        "energy entropy_term",
-        np.asarray(result.energies.entropy_term),
-        energy_ledger.entropy_term,
+        "energy minus_t_s",
+        np.asarray(result.energies.minus_t_s),
+        energy_ledger.minus_t_s,
         atol=atol,
         rtol=rtol,
     )
     _assert_recomputed_close(
-        "energy free_energy",
-        np.asarray(result.energies.free_energy),
-        energy_ledger.free_energy,
+        "energy band_free_energy",
+        np.asarray(result.energies.band_free_energy),
+        energy_ledger.band_free_energy,
         atol=atol,
         rtol=rtol,
     )
     _assert_recomputed_close(
-        "energy grand_energy",
-        np.asarray(result.energies.grand_energy),
-        energy_ledger.grand_energy,
+        "energy band_grand_energy",
+        np.asarray(result.energies.band_grand_energy),
+        energy_ledger.band_grand_energy,
         atol=atol,
         rtol=rtol,
     )
     _assert_recomputed_close(
-        "energy free_energy closure",
-        np.asarray(result.energies.free_energy),
-        np.asarray(result.energies.band_energy) + np.asarray(result.energies.entropy_term),
+        "energy band_free_energy closure",
+        np.asarray(result.energies.band_free_energy),
+        np.asarray(result.energies.band_energy) + np.asarray(result.energies.minus_t_s),
         atol=atol,
         rtol=rtol,
     )
     _assert_recomputed_close(
-        "energy grand_energy closure",
-        np.asarray(result.energies.grand_energy),
-        np.asarray(result.energies.free_energy) - result.mu * np.asarray(result.electron_count),
+        "energy band_grand_energy closure",
+        np.asarray(result.energies.band_grand_energy),
+        np.asarray(result.energies.band_free_energy) - result.mu * np.asarray(result.electron_count),
         atol=atol,
         rtol=rtol,
     )
@@ -925,10 +1065,12 @@ def validate_conservation(
     band_residual = band_from_d - result.energies.band_energy
     density_hermiticity_error = _density_hermiticity_error(result.density)
 
+    # Compared against the from-eigenvector route, so this does not inherit the
+    # stored density_k the way a re-aggregation of it would.
     _assert_recomputed_close(
         "density",
         np.asarray(result.density),
-        aggregated_density,
+        aggregated_density_from_vectors,
         atol=atol,
         rtol=rtol,
     )
@@ -968,6 +1110,25 @@ def validate_conservation(
         atol=atol,
         rtol=rtol,
     )
+
+    # The stored H/S snapshot is already Hermitian, so the raw input asymmetry
+    # is unrecoverable here; the policy it was accepted under is re-enforced.
+    for name, recorded, budget in (
+        ("input_h_hermiticity_error", cons.input_h_hermiticity_error, _hermiticity_budget(h_arr, result.hermitian_tol)),
+        ("input_s_hermiticity_error", cons.input_s_hermiticity_error, _hermiticity_budget(s_arr, result.hermitian_tol)),
+    ):
+        recorded_arr = np.asarray(recorded, dtype=np.float64)
+        if recorded_arr.shape != leading_shape:
+            raise FixedMuOperatorError(
+                f"fixed-mu {name} has shape {recorded_arr.shape}, expected {leading_shape}"
+            )
+        if np.any(~np.isfinite(recorded_arr)) or np.any(recorded_arr < 0.0):
+            raise FixedMuOperatorError(f"fixed-mu {name} must be finite and nonnegative")
+        if np.any(recorded_arr > budget):
+            raise FixedMuOperatorError(
+                f"fixed-mu {name} {float(np.max(recorded_arr)):.6g} exceeds what the recorded "
+                f"hermitian_tol={result.hermitian_tol:g} admits"
+            )
 
     if not np.allclose(ne_from_d, result.electron_count, atol=atol, rtol=rtol):
         raise FixedMuOperatorError("Tr(D S) does not match N(mu)")
