@@ -7,7 +7,7 @@ from dptb.configuration import (
     migrate_legacy_checkpoint_train_options,
 )
 from dptb.nnops.ddp_utils import merge_restart_train_options
-from dptb.nn.build import build_model
+from dptb.nn.build import build_model, _reject_retired_json_model
 from dptb.data.build import build_dataset
 from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
 from dptb.plugins.training_monitor import register_core_training_monitors
@@ -431,65 +431,63 @@ def train(
 
         f = restart if restart else init_model
 
-        if f.split(".")[-1] == "json":
-            assert not restart, "json model can not be used as restart! should be a checkpoint file"
-        else:
-            f = torch.load(f, map_location="cpu", weights_only=False)
-            checkpoint_train_options = migrate_legacy_checkpoint_train_options(
-                f["config"].get("train_options", {})
-            )
-            checkpoint_model_options = migrate_legacy_checkpoint_model_options(
-                f["config"]["model_options"]
+        _reject_retired_json_model(f)
+        f = torch.load(f, map_location="cpu", weights_only=False)
+        checkpoint_train_options = migrate_legacy_checkpoint_train_options(
+            f["config"].get("train_options", {})
+        )
+        checkpoint_model_options = migrate_legacy_checkpoint_model_options(
+            f["config"]["model_options"]
+        )
+
+        if explicit_model_options is None:
+            jdata["model_options"] = checkpoint_model_options
+
+        # Restore checkpoint architecture without letting normalized schema
+        # defaults masquerade as explicit user overrides.
+        checkpoint_common_options = f["config"]["common_options"]
+        basis = checkpoint_common_options["basis"]
+        for asym, orb in jdata["common_options"]["basis"].items():
+            if asym not in basis:
+                raise ValueError(f"Atom {asym} not found in model's basis")
+            if orb != basis[asym]:
+                raise ValueError(
+                    f"Orbital {orb} of Atom {asym} is inconsistent with the "
+                    "checkpoint basis."
+                )
+        jdata["common_options"] = merge_checkpoint_common_options(
+            jdata["common_options"],
+            checkpoint_common_options,
+            explicit_common_options,
+            preserve_runtime_defaults=True,
+        )
+
+        # update model options and train_options
+        if restart:
+            jdata["train_options"] = merge_restart_train_options(
+                explicit_train_options,
+                checkpoint_train_options,
+                logger=log,
             )
 
+            if jdata.get("model_options", None) is None or jdata["model_options"] != checkpoint_model_options:
+                log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
+                jdata["model_options"] = checkpoint_model_options # restart does not allow to change model options
+        else:
+            # init model mode, allow model_options change (Would it cause some error later if the param mismatch?)
+            if not explicit_train_options:
+                jdata["train_options"] = checkpoint_train_options
             if explicit_model_options is None:
                 jdata["model_options"] = checkpoint_model_options
 
-            # Restore checkpoint architecture without letting normalized schema
-            # defaults masquerade as explicit user overrides.
-            checkpoint_common_options = f["config"]["common_options"]
-            basis = checkpoint_common_options["basis"]
-            for asym, orb in jdata["common_options"]["basis"].items():
-                if asym not in basis:
-                    raise ValueError(f"Atom {asym} not found in model's basis")
-                if orb != basis[asym]:
-                    raise ValueError(
-                        f"Orbital {orb} of Atom {asym} is inconsistent with the "
-                        "checkpoint basis."
-                    )
-            jdata["common_options"] = merge_checkpoint_common_options(
-                jdata["common_options"],
-                checkpoint_common_options,
-                explicit_common_options,
-                preserve_runtime_defaults=True,
-            )
-
-            # update model options and train_options
-            if restart:
-                jdata["train_options"] = merge_restart_train_options(
-                    explicit_train_options,
-                    checkpoint_train_options,
-                    logger=log,
-                )
-
-                if jdata.get("model_options", None) is None or jdata["model_options"] != checkpoint_model_options:
-                    log.warning("model_options in config file is not consistent with the checkpoint, using the one in checkpoint")
-                    jdata["model_options"] = checkpoint_model_options # restart does not allow to change model options
-            else:
-                # init model mode, allow model_options change (Would it cause some error later if the param mismatch?)
-                if not explicit_train_options:
-                    jdata["train_options"] = checkpoint_train_options
-                if explicit_model_options is None:
-                    jdata["model_options"] = checkpoint_model_options
-
-                ## add some warning !
-                for k, v in jdata["model_options"].items():
-                    if k not in checkpoint_model_options:
-                        log.warning(f"The model options {k} is not defined in checkpoint, set to {v}.")
-                    else:
-                        deep_dict_difference(k, v, checkpoint_model_options)
-            del f
-            jdata = normalize(jdata)
+            ## add some warning !
+            for k, v in jdata["model_options"].items():
+                if k not in checkpoint_model_options:
+                    log.warning(f"The model options {k} is not defined in checkpoint, set to {v}.")
+                else:
+                    deep_dict_difference(k, v, checkpoint_model_options)
+        del f
+        jdata = normalize(jdata)
     else:
         j_must_have(jdata, "model_options")
         j_must_have(jdata, "train_options")

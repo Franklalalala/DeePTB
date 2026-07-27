@@ -4,7 +4,6 @@ from dptb.configuration import migrate_legacy_checkpoint_model_options
 import logging
 import torch
 import torch.nn as nn
-from dptb.utils.tools import j_must_have, j_loader
 from dptb.data import AtomicDataDict
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nn.output_spec import default_output_spec, ModelOutputSpecError
@@ -431,6 +430,18 @@ def _build_ensemble_from_wrapper_state(
     return model
 
 
+JSON_MODEL_RETIRED_MESSAGE = (
+    "json model files belonged to the retired SK route; pass a .pth checkpoint."
+)
+
+
+def _reject_retired_json_model(path):
+    """The json branch never worked: it parsed the config and then handed the
+    same path to torch.load, which raised UnpicklingError."""
+    if isinstance(path, str) and path.split(".")[-1].lower() == "json":
+        raise ValueError(f"{JSON_MODEL_RETIRED_MESSAGE} Got: {path}")
+
+
 # ======================================================================
 # [核心主程序] 原版 build_model
 # ======================================================================
@@ -465,13 +476,11 @@ def build_model(
     ckpt_state_dict = None
 
     if not from_scratch:
-        if checkpoint.split(".")[-1] == "json":
-            ckptconfig = j_loader(checkpoint)
-        else:
-            f = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            ckptconfig = f['config']
-            ckpt_state_dict = f.get("model_state_dict", None)
-            del f
+        _reject_retired_json_model(checkpoint)
+        f = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ckptconfig = f['config']
+        ckpt_state_dict = f.get("model_state_dict", None)
+        del f
 
         checkpoint_model_options = migrate_legacy_checkpoint_model_options(
             ckptconfig["model_options"]

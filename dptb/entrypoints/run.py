@@ -59,7 +59,7 @@ def run(
         assert jdata['task_options']["task"] == "band", "No Input json is provided, then only band task is supported."
         jdata = normalize_run(jdata)
 
-        if not(init_model.endswith(".pth") or init_model.endswith(".json")):
+        if not init_model.endswith(".pth"):
             raise ValueError(f'init_model {init_model} is not supported.')
         run_opt.update({'init_model': init_model})
             
