@@ -73,8 +73,12 @@ configuration fields.
 ## Validation
 
 ```bash
+pip install ".[test]"
 python -m pytest dptb/tests
 ```
+
+Use `python -m pytest` rather than the bare `pytest` script: a few test modules
+import the repo-root `tools` package, which is not part of the wheel.
 
 CUDA-only kernel tests skip automatically when the required device or
 extension is unavailable.

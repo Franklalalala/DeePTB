@@ -43,3 +43,25 @@ def test_required_runtime_dependency_is_declared():
     assert 'openequivariance = { version = "0.6.8", python = ">=3.10", optional = true }' in text
     # module-scope import in dptb/postprocess/write_abacus_csr_file.py
     assert re.search(r'^dftio = ">=', text, flags=re.M)
+    # a torch bound must reach the resolver, not only e3nn's transitive >=1.8.0
+    assert re.search(r'^torch = ">=', text, flags=re.M)
+
+
+def test_test_requirements_are_pip_visible():
+    """Poetry groups are invisible to `pip install .`, so the documented
+    validation command needs a real extra."""
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    assert re.search(r'^test = \["pytest"\]', text, flags=re.M)
+    assert "[tool.poetry.group.dev.dependencies]" not in text
+    # repo-root `tools` package must be importable however pytest is invoked
+    assert 'pythonpath = ["."]' in text
+
+    ut = (Path(__file__).resolve().parents[2] / "ut.sh").read_text(encoding="utf-8")
+    assert 'pip install ".[test]"' in ut
+    assert "python -m pytest" in ut
+
+
+def test_unused_dependency_is_not_declared():
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    assert "opt-einsum" not in pyproject.read_text(encoding="utf-8")
