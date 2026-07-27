@@ -21,6 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from pathlib import Path
 
+from dptb.checkpoint_config import merge_checkpoint_common_options
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
 from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
@@ -322,6 +323,7 @@ def _multi_train_impl(
 
     jdata, explicit_jdata = load_multi_train_config(INPUT, include_explicit=True)
     explicit_train_options = copy.deepcopy(explicit_jdata.get("train_options", {}))
+    explicit_common_options = copy.deepcopy(explicit_jdata.get("common_options", {}))
     explicit_model_options = explicit_jdata.get("model_options", None)
 
     configure_debug_env(jdata.get("train_options", {}))
@@ -342,9 +344,6 @@ def _multi_train_impl(
         jdata["train_options"]["ddp_world_size"] = world_size
         jdata["train_options"]["ddp_rank"] = rank
 
-    with entry_tagger.tag("set_default_dtype"):
-        torch.set_default_dtype(getattr(torch, jdata["common_options"]["dtype"]))
-
     with entry_tagger.tag("merge_config_from_ckpt_or_restart"):
         if restart or init_model:
             f = restart if restart else init_model
@@ -361,14 +360,23 @@ def _multi_train_impl(
                 if explicit_model_options is None:
                     jdata["model_options"] = checkpoint_model_options
 
-                basis = f["config"]["common_options"]["basis"]
+                checkpoint_common_options = f["config"]["common_options"]
+                basis = checkpoint_common_options["basis"]
                 for asym, orb in jdata["common_options"]["basis"].items():
                     assert asym in basis, f"Atom {asym} not found in model's basis"
                     assert orb == basis[asym], (
                         f"Orbital {orb} of Atom {asym} is inconsistent with "
                         "the checkpoint basis."
                     )
-                jdata["common_options"]["basis"] = basis
+                # Restore checkpoint architecture (has_soc / dtype / layout
+                # flags) instead of letting normalize()'s schema defaults
+                # masquerade as user overrides.
+                jdata["common_options"] = merge_checkpoint_common_options(
+                    jdata["common_options"],
+                    checkpoint_common_options,
+                    explicit_common_options,
+                    preserve_runtime_defaults=True,
+                )
 
                 if restart:
                     jdata["train_options"] = merge_restart_train_options(
@@ -401,6 +409,11 @@ def _multi_train_impl(
         jdata["train_options"]["use_ddp"] = True
         jdata["train_options"]["ddp_world_size"] = world_size
         jdata["train_options"]["ddp_rank"] = rank
+
+    # Must follow the checkpoint merge: on restart/init-model the effective
+    # dtype comes from the checkpoint, not from the schema default.
+    with entry_tagger.tag("set_default_dtype"):
+        torch.set_default_dtype(getattr(torch, jdata["common_options"]["dtype"]))
 
     # jvp du/dt backend needs eager e3nn before ANY dataset/model-side module is
     # imported or constructed (review finding 6). Do it here, before
@@ -511,6 +524,7 @@ def _multi_train_impl(
                 distributed_expert=distributed_expert,
                 rank=rank,
                 world_size=world_size,
+                explicit_common_options=jdata["common_options"],
             )
     else:
         checkpoint = init_model if init_model else None
@@ -520,7 +534,8 @@ def _multi_train_impl(
                 checkpoint=checkpoint,
                 model_options=jdata["model_options"],
                 common_options=build_common_options,
-                train_options=jdata["train_options"]
+                train_options=jdata["train_options"],
+                explicit_common_options=explicit_common_options,
             )
 
         scale_type = jdata["model_options"]["prediction"].get('scale_type', "scale_w_back_grad")

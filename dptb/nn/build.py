@@ -441,7 +441,13 @@ def build_model(
         train_options: dict = None,
         no_check: bool = False,
         device: str = None,
+        explicit_common_options: dict = None,
+        weights_inferred_common_options: dict = None,
 ):
+    # Keys the *user* actually wrote. Anything else in ``common_options`` is a
+    # schema default and must lose to the checkpoint's own architecture.
+    explicit_common_options = copy.deepcopy(explicit_common_options or {})
+    weights_inferred_common_options = copy.deepcopy(weights_inferred_common_options or {})
     model_options = copy.deepcopy(model_options or {})
     common_options = copy.deepcopy(common_options or {})
     train_options = copy.deepcopy(train_options or {})
@@ -476,7 +482,9 @@ def build_model(
         common_options = merge_checkpoint_common_options(
             common_options,
             ckptconfig.get("common_options", {}),
-            common_options,
+            explicit_common_options,
+            preserve_runtime_defaults=True,
+            weights_inferred_overrides=weights_inferred_common_options,
         )
 
         if len(train_options) == 0:

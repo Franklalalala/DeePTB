@@ -23,6 +23,7 @@ def merge_checkpoint_common_options(
     explicit_common_options: Optional[dict] = None,
     *,
     preserve_runtime_defaults: bool = False,
+    weights_inferred_overrides: Optional[dict] = None,
 ) -> dict:
     """Merge checkpoint architecture with explicit runtime/config overrides.
 
@@ -30,6 +31,12 @@ def merge_checkpoint_common_options(
     written by the user. Existing checkpoint values win over those defaults.
     Only keys present in ``explicit_common_options`` are restored afterwards;
     device/seed defaults may also be preserved for CLI evaluation/training.
+
+    ``weights_inferred_overrides`` carries values derived from the saved
+    *weights* rather than from the saved config. Weights outrank both the
+    checkpoint config and the user config, so those keys bypass the
+    architecture-conflict gate and are applied last. Callers must only use it
+    for values they read out of ``model_state_dict``.
     """
 
     normalized = copy.deepcopy(normalized_common_options or {})
@@ -37,8 +44,11 @@ def merge_checkpoint_common_options(
     explicit = copy.deepcopy(
         normalized if explicit_common_options is None else explicit_common_options
     )
+    weights_inferred = copy.deepcopy(weights_inferred_overrides or {})
 
     for key in ARCHITECTURE_COMMON_KEYS:
+        if key in weights_inferred:
+            continue
         if (
             key in explicit
             and key in checkpoint
@@ -62,4 +72,5 @@ def merge_checkpoint_common_options(
             merged[key] = copy.deepcopy(normalized[key])
     if "basis" in checkpoint:
         merged["basis"] = copy.deepcopy(checkpoint["basis"])
+    merged.update(weights_inferred)
     return merged

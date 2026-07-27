@@ -524,6 +524,7 @@ def train(
             train_datasets=train_datasets,
             reference_datasets=reference_datasets,
             validation_datasets=validation_datasets,
+            explicit_common_options=jdata["common_options"],
         )
     else:
         # include the init model and from scratch
@@ -534,6 +535,7 @@ def train(
             model_options=jdata["model_options"],
             common_options=jdata["common_options"],
             train_options=jdata["train_options"],
+            explicit_common_options=explicit_common_options,
         )
         scale_type = jdata["model_options"]["prediction"].get('scale_type', "scale_w_back_grad")
         if scale_type == 'no_scale':

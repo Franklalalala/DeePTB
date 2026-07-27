@@ -94,7 +94,12 @@ def _test(
         for key in ("r_max", "oer_max", "er_max")
     }
     test_datasets = build_dataset(**cutoff_options, **jdata["data_options"]["test"], **jdata["common_options"])
-    model = build_model(run_opt["init_model"], model_options=jdata["model_options"], common_options=jdata["common_options"])
+    model = build_model(
+        run_opt["init_model"],
+        model_options=jdata["model_options"],
+        common_options=jdata["common_options"],
+        explicit_common_options=explicit_common_options,
+    )
     model.eval()
     tester = Tester(
         test_options=jdata["test_options"],

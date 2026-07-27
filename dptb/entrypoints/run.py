@@ -76,7 +76,13 @@ def run(
     if jdata.get("dtype", None):
         in_common_options.update({"dtype": jdata["dtype"]})
 
-    model = build_model(checkpoint=init_model, common_options=in_common_options)
+    # in_common_options only ever holds keys the user wrote in the run config,
+    # so every one of them is an explicit override of the checkpoint.
+    model = build_model(
+        checkpoint=init_model,
+        common_options=in_common_options,
+        explicit_common_options=in_common_options,
+    )
     
     if  run_opt['structure'] is None:
         log.warning(msg="Warning! structure is not set in run option, read from input config file.")
