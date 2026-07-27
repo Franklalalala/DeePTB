@@ -11,6 +11,14 @@ The API is intentionally independent from `fixed_mu_operator`. QEq solves a
 fixed-total-charge finite-site charge vector; fixed-mu postprocessing solves
 Fermi occupations and density matrices from dense Hamiltonian/overlap matrices.
 
+## Downstream consumers
+
+The maintained EMolStudio branch depends on this branch (`0726-qeq`) for both
+operator APIs, including the result dataclasses, the validator entry points,
+and the `minus_t_s` / `band_free_energy` / `band_grand_energy` ledger names.
+`0726-qeq` is developed independently and is not merged into `main`; any
+breaking change to these contracts must be coordinated with EMolStudio.
+
 ```python
 from dptb.nnops.qeq_operator import solve_qeq
 
