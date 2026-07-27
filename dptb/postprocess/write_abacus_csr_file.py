@@ -1,14 +1,40 @@
 import os
 import re
 import numpy as np
+from functools import lru_cache
 from scipy.sparse import csr_matrix, coo_matrix
 from collections import defaultdict
 import ase.data
 from scipy.linalg import block_diag
-from dftio.constants import ABACUS2DFTIO
 
-# DFTIO -> ABACUS Transform Matrices (Spatial Only)
-DFTIO2ABACUS = {l: M.T.astype(np.float32) for l, M in ABACUS2DFTIO.items()}
+# dftio supplies the per-l ABACUS <-> DFTIO orbital-ordering matrices. It has no
+# PyPI release (its only install path is a source build), so importing it at
+# module scope would make `pip install dptb` unresolvable for every user rather
+# than only for the ones who export ABACUS CSR files. Resolved on first use.
+DFTIO_MISSING_MESSAGE = (
+    "dftio is required for the ABACUS CSR export / hrebuild routes "
+    "(dptb.postprocess.write_abacus_csr_file, dptb.postprocess.hrebuild): it "
+    "supplies the ABACUS<->DFTIO orbital-ordering matrices. dftio has no PyPI "
+    "release, so install it from source: "
+    "pip install git+https://github.com/deepmodeling/dftio.git"
+)
+
+
+@lru_cache(maxsize=None)
+def abacus2dftio_matrices():
+    """ABACUS -> DFTIO per-l transform matrices, imported on first use."""
+    try:
+        from dftio.constants import ABACUS2DFTIO
+    except ImportError as exc:
+        raise ImportError(DFTIO_MISSING_MESSAGE) from exc
+    return ABACUS2DFTIO
+
+
+@lru_cache(maxsize=None)
+def dftio2abacus_matrices():
+    """DFTIO -> ABACUS per-l transform matrices (spatial only)."""
+    return {l: M.T.astype(np.float32) for l, M in abacus2dftio_matrices().items()}
+
 
 ORBITAL_MAP = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5}
 KEY_RE = re.compile(r'^\s*(-?\d+)[ _](-?\d+)[ _](-?\d+)[ _](-?\d+)[ _](-?\d+)\s*$')
@@ -63,8 +89,9 @@ def transform_2_ABACUS(mat, l_lefts, l_rights, is_soc=False):
         raise NotImplementedError("Only support l = s..h.")
 
     # Construct Spatial Transform Matrices
-    left_mats = [DFTIO2ABACUS[l] for l in l_lefts]
-    right_mats = [DFTIO2ABACUS[l] for l in l_rights]
+    dftio2abacus = dftio2abacus_matrices()
+    left_mats = [dftio2abacus[l] for l in l_lefts]
+    right_mats = [dftio2abacus[l] for l in l_rights]
 
     spatial_left = block_diag(*left_mats) if left_mats else np.eye(0, dtype=np.float32)
     spatial_right = block_diag(*right_mats) if right_mats else np.eye(0, dtype=np.float32)

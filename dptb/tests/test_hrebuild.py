@@ -12,6 +12,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+# The CSR write/read pair needs the ABACUS<->DFTIO orbital-ordering matrices,
+# and dftio is an optional source-only install (see DFTIO_MISSING_MESSAGE in
+# dptb/postprocess/write_abacus_csr_file.py). Nine of the ten tests below go
+# through that transform.
+pytest.importorskip("dftio", reason="dftio supplies the ABACUS<->DFTIO transforms")
+
 from dptb.postprocess import hrebuild as hb
 
 

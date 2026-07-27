@@ -57,6 +57,16 @@ The optional optimized SO(2) kernels are supplied by
 standard fallback routes remain usable when that extension is unavailable.
 Install them together with DeePTB using `pip install ".[so2]"`.
 
+The ABACUS CSR export and `hrebuild` routes additionally need
+[`dftio`](https://github.com/deepmodeling/dftio) for the ABACUS/DFTIO
+orbital-ordering matrices. It is not declared as a dependency or an extra
+because it has no PyPI release; install it from source when you need those
+routes, and every other route keeps working without it:
+
+```bash
+pip install git+https://github.com/deepmodeling/dftio.git
+```
+
 The public `*_openequi*` embedding methods additionally require Python >=3.10,
 PyTorch >=2.4, and a Linux NVIDIA/AMD GPU toolchain. Install OpenEquivariance
 with `pip install ".[openequi]"`.

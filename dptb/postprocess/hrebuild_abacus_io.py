@@ -29,6 +29,7 @@ from scipy.sparse import csr_matrix
 from scipy.linalg import block_diag
 
 from dptb.postprocess.write_abacus_csr_file import (
+    abacus2dftio_matrices,
     write_blocks_to_abacus_csr,
     parse_basis_to_l_list,
     find_basis_for_Z_or_symbol,
@@ -136,7 +137,7 @@ def read_hr_csr(
     depending on the heavyweight ``Parser``/``dpdata`` machinery, which
     expects a whole raw-data directory tree rather than a single CSR file.
     """
-    from dftio.constants import ABACUS2DFTIO
+    abacus2dftio = abacus2dftio_matrices()
 
     if unit not in EV_PER_UNIT:
         raise ValueError(f"Unknown unit {unit!r}; expected one of {sorted(EV_PER_UNIT)}")
@@ -212,9 +213,9 @@ def read_hr_csr(
                 if is_soc:
                     ni, nj = site_norbits_spatial[si], site_norbits_spatial[sj]
                     sub = sub.reshape(ni, 2, nj, 2).transpose(1, 0, 3, 2).reshape(2 * ni, 2 * nj)
-                    dftio_block = _abacus_to_dftio(sub, l_lefts * 2, l_rights * 2, ABACUS2DFTIO)
+                    dftio_block = _abacus_to_dftio(sub, l_lefts * 2, l_rights * 2, abacus2dftio)
                 else:
-                    dftio_block = _abacus_to_dftio(sub, l_lefts, l_rights, ABACUS2DFTIO)
+                    dftio_block = _abacus_to_dftio(sub, l_lefts, l_rights, abacus2dftio)
                 blocks[f"{si}_{sj}_{Rx}_{Ry_}_{Rz}"] = dftio_block * ry_to_unit
         i += 4
 

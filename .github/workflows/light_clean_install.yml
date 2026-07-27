@@ -22,20 +22,53 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "torch==2.5.1" --index-url https://download.pytorch.org/whl/cpu
-      - name: Install torch-scatter and DeePTB from a clean environment
+      - name: Build and install the wheel in a clean environment
         run: |
           python docs/auto_install_torch_scatter.py
-          python -m pip install .
-      - name: Smoke-test retained import and CLI surfaces
+          python -m pip install build
+          rm -rf dist
+          python -m build --wheel
+          python -m pip install dist/*.whl
+      - name: Smoke-test the installed wheel outside the checkout
         run: |
-          python -m dptb --help
+          smoke_dir="$(mktemp -d)"
+          cd "$smoke_dir"
           python - <<'PY'
+          import os
+          import sysconfig
+          from pathlib import Path
+
           import dptb
           import dptb.nn.embedding
           import dptb.nnops.loss
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          module_path = Path(dptb.__file__).resolve()
+          if module_path == workspace or workspace in module_path.parents:
+              raise RuntimeError(
+                  f"clean-install smoke test imported the checkout instead of the wheel: {module_path}"
+              )
+          purelib = Path(sysconfig.get_paths()["purelib"]).resolve()
+          if purelib not in module_path.parents:
+              raise RuntimeError(
+                  f"clean-install smoke test imported dptb from {module_path}, not from {purelib}"
+              )
+
+          # A wheel that drops non-Python payload is the failure this job exists
+          # to catch, and both files are loaded at module scope by
+          # dptb/nn/tensor_product.py -- assert them explicitly so the check
+          # survives any future move to a lazy loader.
+          package_root = module_path.parent
+          for payload in ("nn/Jd.pt", "nn/z_rot_indices_lmax12.pt"):
+              if not (package_root / payload).is_file():
+                  raise RuntimeError(f"the installed wheel is missing dptb/{payload}")
+
           print(dptb.__version__)
+          print(module_path)
           PY
-      - name: Run the lightweight contract test suite
+          python -m dptb --help
+          dptb --help
+      - name: Run the lightweight source contract test suite
         run: |
-          python -m pip install ".[test]"
+          python -m pip install pytest
           python -m pytest -q dptb/tests/test_light_*.py

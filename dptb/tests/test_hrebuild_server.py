@@ -177,6 +177,11 @@ def test_repair_request_failure_is_reported_not_fatal(running_server):
     """A request pointing at a nonexistent ABACUS binary must come back as
     a clean error response, and the server/connection must stay usable
     afterwards (two ping round trips bracketing the failing call)."""
+    # Without dftio the repair would fail on the optional CSR-transform import
+    # long before it ever launched a binary, so this test would pass for the
+    # wrong reason. The other tests in this file are dftio-independent.
+    pytest.importorskip("dftio", reason="dftio supplies the ABACUS<->DFTIO transforms")
+
     client = hs.Client(**running_server)
     try:
         assert client.ping()["ok"] is True
