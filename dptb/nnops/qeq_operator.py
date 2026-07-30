@@ -803,6 +803,7 @@ def solve_qeq(
         expected_electronegativity=electronegativity,
         expected_hardness_kernel=hardness_kernel,
         expected_total_charge=total_charge,
+        expected_units=units,
     )
     return result
 
@@ -872,9 +873,12 @@ def validate_qeq_result(
     result: QEqResult,
     *,
     atol: Optional[float] = None,
+    request_atol: float = 0.0,
+    request_rtol: float = 0.0,
     expected_electronegativity: Optional[ArrayLike] = None,
     expected_hardness_kernel: Optional[ArrayLike] = None,
     expected_total_charge: Optional[ArrayLike] = None,
+    expected_units: Optional[QEqUnits] = None,
     expected_symmetry_tol: Optional[float] = None,
     expected_constrained_eig_floor: Optional[float] = None,
     expected_max_condition: Optional[float] = None,
@@ -900,12 +904,19 @@ def validate_qeq_result(
         the one that certifies the minimizing charge distribution -- derives
         its floor from the canonical uniform gauge, so
         ``J -> J + alpha 11^T`` cannot loosen it.
+    request_atol, request_rtol
+        Independent tolerances used only to compare caller-supplied request
+        arrays with the request recorded in ``result``.  Both default to zero:
+        stationarity tolerance is not an authorization to substitute a nearby
+        QEq problem.  Nonzero values are an explicit caller opt-in.
     expected_electronegativity, expected_hardness_kernel, expected_total_charge
         Optional caller-supplied request fields.  Supplying them binds a
         self-consistent result to the problem the caller actually submitted;
         without them, validation can only certify the arrays stored inside
         ``result``.  Leading dimensions may broadcast exactly as in
         :func:`solve_qeq`.
+    expected_units
+        Optional exact declarative-unit contract for the submitted request.
     expected_symmetry_tol, expected_constrained_eig_floor, expected_max_condition
         Caller-supplied safety policy.  Each overrides the value recorded on
         ``result`` — use them when the result came from an untrusted producer
@@ -927,6 +938,10 @@ def validate_qeq_result(
         atol = recorded_residual_tol
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     atol = _clamp_policy("atol", atol, MODULE_MAX_RESIDUAL_TOL)
+    request_atol = _as_float_scalar(
+        "request_atol", request_atol, nonnegative=True
+    )
+    request_rtol = _as_float_scalar("request_rtol", request_rtol, nonnegative=True)
     symmetry_tol = _resolve_policy(
         "symmetry_tol", result.symmetry_tol, expected_symmetry_tol, MODULE_MAX_SYMMETRY_TOL
     )
@@ -944,6 +959,13 @@ def validate_qeq_result(
         raise QEqOperatorError("QEq diagnostics must be a QEqDiagnostics instance")
     if not isinstance(result.units, QEqUnits):
         raise QEqOperatorError("QEq units must be a QEqUnits instance")
+    if expected_units is not None:
+        if not isinstance(expected_units, QEqUnits):
+            raise QEqOperatorError("expected_units must be a QEqUnits instance")
+        if result.units != expected_units:
+            raise QEqOperatorError(
+                "QEq units do not match the caller-supplied request"
+            )
 
     charges = _require_result_array("charges", result.charges)
     qtot = _require_result_array("total_charge", result.total_charge)
@@ -972,8 +994,8 @@ def validate_qeq_result(
             "electronegativity request",
             chi,
             expected_chi,
-            atol=atol,
-            rtol=_RECOMPUTE_RTOL,
+            atol=request_atol,
+            rtol=request_rtol,
         )
     if expected_total_charge is not None:
         expected_qtot = _prepare_total_charge(expected_total_charge, leading_shape)
@@ -981,8 +1003,8 @@ def validate_qeq_result(
             "total_charge request",
             qtot,
             expected_qtot,
-            atol=0.0,
-            floor=_charge_residual_floor(expected_qtot[..., None], qtot),
+            atol=request_atol,
+            rtol=request_rtol,
         )
 
     asym = kernel - np.swapaxes(kernel, -1, -2)
@@ -1026,15 +1048,15 @@ def validate_qeq_result(
             "hardness_kernel request",
             kernel,
             expected_kernel,
-            atol=atol,
-            rtol=_RECOMPUTE_RTOL,
+            atol=request_atol,
+            rtol=request_rtol,
         )
         _assert_recomputed_close(
             "input hardness_kernel asymmetry request",
             input_symmetry_error,
             expected_input_symmetry_error,
-            atol=atol,
-            rtol=_RECOMPUTE_RTOL,
+            atol=request_atol,
+            rtol=request_rtol,
         )
 
     charge_residual = np.sum(charges, axis=-1) - qtot

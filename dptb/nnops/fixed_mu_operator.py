@@ -1075,6 +1075,8 @@ def validate_conservation(
     s: Optional[ArrayLike] = None,
     atol: float = 1e-8,
     rtol: float = 1e-8,
+    request_atol: float = 0.0,
+    request_rtol: float = 0.0,
     expected_mu: Optional[float] = None,
     expected_kT: Optional[float] = None,
     expected_spin_degeneracy: Optional[float] = None,
@@ -1096,6 +1098,9 @@ def validate_conservation(
 
     Parameters
     ----------
+    request_atol, request_rtol
+        Independent tolerances used only to compare caller-supplied request
+        values with the request recorded in ``result``.  Both default to zero.
     expected_mu, expected_kT, expected_spin_degeneracy, expected_k_weights,
     expected_k_axis, expected_normalize_k_weights, expected_eig_floor,
     expected_max_condition, expected_hermitian_tol
@@ -1127,19 +1132,31 @@ def validate_conservation(
         raise FixedMuOperatorError("conservation must be a ConservationLedger")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     rtol = _as_float_scalar("rtol", rtol, nonnegative=True)
+    request_atol = _as_float_scalar(
+        "request_atol", request_atol, nonnegative=True
+    )
+    request_rtol = _as_float_scalar(
+        "request_rtol", request_rtol, nonnegative=True
+    )
     eig_floor, max_condition, hermitian_tol = _validate_safety_policy(
         eig_floor=result.eig_floor,
         max_condition=result.max_condition,
         hermitian_tol=result.hermitian_tol,
     )
     if expected_mu is not None and not np.isclose(
-        result.mu, _as_float_scalar("expected_mu", expected_mu), atol=atol, rtol=rtol
+        result.mu,
+        _as_float_scalar("expected_mu", expected_mu),
+        atol=request_atol,
+        rtol=request_rtol,
     ):
         raise FixedMuOperatorError(
             f"fixed-mu result was computed at mu={result.mu!r}, not the expected {expected_mu!r}"
         )
     if expected_kT is not None and not np.isclose(
-        result.kT, _as_float_scalar("expected_kT", expected_kT, nonnegative=True), atol=atol, rtol=rtol
+        result.kT,
+        _as_float_scalar("expected_kT", expected_kT, nonnegative=True),
+        atol=request_atol,
+        rtol=request_rtol,
     ):
         raise FixedMuOperatorError(
             f"fixed-mu result was computed at kT={result.kT!r}, not the expected {expected_kT!r}"
@@ -1248,7 +1265,9 @@ def validate_conservation(
                 k_axis=k_axis_c,
                 normalize_k_weights=result.normalize_k_weights,
             )
-        if requested.shape != weights.shape or not np.allclose(requested, weights, atol=atol, rtol=rtol):
+        if requested.shape != weights.shape or not np.allclose(
+            requested, weights, atol=request_atol, rtol=request_rtol
+        ):
             raise FixedMuOperatorError("fixed-mu stored k_weights do not match the expected k_weights")
 
     n = h_arr.shape[-1]
