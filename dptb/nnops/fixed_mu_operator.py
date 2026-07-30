@@ -1196,6 +1196,342 @@ def _assert_recomputed_close(
         raise FixedMuOperatorError(f"fixed-mu stored {name} does not match recomputed value")
 
 
+def validate_fixed_mu_scan(
+    result: FixedMuScanResult,
+    *,
+    h: ArrayLike,
+    s: ArrayLike,
+    atol: float = 1e-8,
+    rtol: float = 1e-8,
+    request_atol: float = 0.0,
+    request_rtol: float = 0.0,
+    expected_mu_grid: Optional[ArrayLike] = None,
+    expected_kT: Optional[float] = None,
+    expected_spin_degeneracy: Optional[float] = None,
+    expected_k_weights: Optional[ArrayLike] = None,
+    expected_k_axis: Any = _EXPECTED_UNSET,
+    expected_normalize_k_weights: Any = _EXPECTED_UNSET,
+    expected_eig_floor: Optional[float] = None,
+    expected_max_condition: Optional[float] = None,
+    expected_hermitian_tol: Optional[float] = None,
+) -> None:
+    """Bind a self-consistent scan payload to caller-supplied H/S.
+
+    Scan construction validates every observable against the stored eigenvalues,
+    but stored eigenvalues alone do not prove which Hamiltonian and overlap
+    produced them. This validator reruns the generalized eigensolve and the
+    complete scan from ``h`` and ``s``, then compares that externally anchored
+    result with the stored spectrum, overlap telemetry, occupations, response,
+    electron count, and single-particle band-energy ledger.
+
+    Parameters
+    ----------
+    h, s
+        The Hamiltonian and overlap the consumer expects to be the source of
+        ``result``. They are always required because scan results deliberately
+        do not serialize H/S validation context.
+    request_atol, request_rtol
+        Independent tolerances used only for optional ``expected_*`` request
+        binding. Both default to zero, so a numerical validation tolerance is
+        not permission to substitute a nearby request.
+    expected_mu_grid, expected_kT, expected_spin_degeneracy,
+    expected_k_weights, expected_k_axis, expected_normalize_k_weights,
+    expected_eig_floor, expected_max_condition, expected_hermitian_tol
+        Optional caller-side request and safety-policy identity. Weight
+        requests pass through the same broadcasting and normalization route as
+        :func:`fixed_mu_scan` before comparison.
+
+    Notes
+    -----
+    Generalized eigenvalue comparison uses a per-leading-item absolute floor
+    ``16 * eps * cond(S) * max(max(abs(H)), 1)``. This mirrors
+    :func:`validate_conservation`: an ill-conditioned overlap receives the
+    numerical budget admitted by its own safety policy without relaxing other
+    items in the same batch.
+    """
+
+    if not isinstance(result, FixedMuScanResult):
+        raise FixedMuOperatorError("result must be a FixedMuScanResult")
+    if not isinstance(result.energies, EnergyLedger):
+        raise FixedMuOperatorError("energies must be an EnergyLedger")
+    atol = _as_float_scalar("atol", atol, nonnegative=True)
+    rtol = _as_float_scalar("rtol", rtol, nonnegative=True)
+    request_atol = _as_float_scalar(
+        "request_atol", request_atol, nonnegative=True
+    )
+    request_rtol = _as_float_scalar(
+        "request_rtol", request_rtol, nonnegative=True
+    )
+    eig_floor, max_condition, hermitian_tol = _validate_safety_policy(
+        eig_floor=result.eig_floor,
+        max_condition=result.max_condition,
+        hermitian_tol=result.hermitian_tol,
+    )
+
+    # Re-run patch 0002's payload-only certificate at the evidence-consumption
+    # boundary before adding the external H/S anchor.
+    _validate_fixed_mu_scan_payload(result)
+
+    if expected_mu_grid is not None:
+        requested_mu_grid = _prepare_mu_grid(expected_mu_grid)
+        if (
+            requested_mu_grid.shape != result.mu_grid.shape
+            or not np.all(
+                np.isclose(
+                    result.mu_grid,
+                    requested_mu_grid,
+                    atol=request_atol,
+                    rtol=request_rtol,
+                )
+            )
+        ):
+            raise FixedMuOperatorError(
+                "fixed-mu scan mu_grid does not match the expected mu_grid"
+            )
+    if expected_kT is not None and not np.isclose(
+        result.kT,
+        _as_float_scalar("expected_kT", expected_kT, nonnegative=True),
+        atol=request_atol,
+        rtol=request_rtol,
+    ):
+        raise FixedMuOperatorError(
+            f"fixed-mu scan was computed at kT={result.kT!r}, "
+            f"not the expected {expected_kT!r}"
+        )
+    if (
+        expected_spin_degeneracy is not None
+        and result.spin_degeneracy
+        != _validate_spin_degeneracy(expected_spin_degeneracy)
+    ):
+        raise FixedMuOperatorError(
+            "fixed-mu scan was computed at spin_degeneracy="
+            f"{result.spin_degeneracy!r}, not the expected "
+            f"{expected_spin_degeneracy!r}; N, response and the energy ledger "
+            "all scale linearly with it"
+        )
+    if expected_eig_floor is not None:
+        expected = _bounded_policy(
+            "expected_eig_floor",
+            expected_eig_floor,
+            positive=True,
+        )
+        if eig_floor != expected:
+            raise FixedMuOperatorError(
+                f"fixed-mu scan used eig_floor={eig_floor!r}, "
+                f"not the expected {expected!r}"
+            )
+    if expected_max_condition is not None:
+        expected = _bounded_policy(
+            "expected_max_condition",
+            expected_max_condition,
+            positive=True,
+            maximum=MODULE_MAX_CONDITION,
+        )
+        if max_condition != expected:
+            raise FixedMuOperatorError(
+                f"fixed-mu scan used max_condition={max_condition!r}, "
+                f"not the expected {expected!r}"
+            )
+    if expected_hermitian_tol is not None:
+        expected = _bounded_policy(
+            "expected_hermitian_tol",
+            expected_hermitian_tol,
+            nonnegative=True,
+            maximum=MODULE_MAX_HERMITIAN_TOL,
+        )
+        if hermitian_tol != expected:
+            raise FixedMuOperatorError(
+                f"fixed-mu scan used hermitian_tol={hermitian_tol!r}, "
+                f"not the expected {expected!r}"
+            )
+
+    h_arr, s_arr, _, _ = _validate_matrix_stack(
+        h,
+        s,
+        hermitian_tol=hermitian_tol,
+    )
+    leading_shape = h_arr.shape[:-2]
+    k_axis_c = _canonical_k_axis(result.k_axis, len(leading_shape))
+    if expected_k_axis is not _EXPECTED_UNSET:
+        requested_k_axis = _canonical_k_axis(
+            expected_k_axis,
+            len(leading_shape),
+        )
+        if k_axis_c != requested_k_axis:
+            raise FixedMuOperatorError(
+                f"fixed-mu scan used k_axis={k_axis_c!r}, "
+                f"not the expected {requested_k_axis!r}"
+            )
+    if expected_normalize_k_weights is not _EXPECTED_UNSET:
+        requested_normalize = _as_bool(
+            "expected_normalize_k_weights",
+            expected_normalize_k_weights,
+        )
+        if result.normalize_k_weights != requested_normalize:
+            raise FixedMuOperatorError(
+                "fixed-mu scan used normalize_k_weights="
+                f"{result.normalize_k_weights!r}, not the expected "
+                f"{requested_normalize!r}"
+            )
+
+    weights = _validate_stored_weights(
+        leading_shape,
+        k_weights=result.k_weights,
+        k_axis=k_axis_c,
+        normalize_k_weights=result.normalize_k_weights,
+        atol=atol,
+        rtol=rtol,
+    )
+    if k_axis_c is None and not np.array_equal(
+        weights,
+        np.ones_like(weights),
+    ):
+        raise FixedMuOperatorError(
+            "fixed-mu scan k_weights must be implicit unit weights when "
+            "k_axis is None"
+        )
+    if expected_k_weights is not None:
+        _reject_torch_tensor("expected_k_weights", expected_k_weights)
+        if k_axis_c is None:
+            requested_weights = _validate_stored_weights(
+                leading_shape,
+                k_weights=expected_k_weights,
+                k_axis=None,
+                normalize_k_weights=False,
+                atol=request_atol,
+                rtol=request_rtol,
+            )
+        else:
+            requested_weights = _prepare_weights(
+                leading_shape,
+                k_weights=expected_k_weights,
+                k_axis=k_axis_c,
+                normalize_k_weights=result.normalize_k_weights,
+            )
+        if (
+            requested_weights.shape != weights.shape
+            or not np.allclose(
+                requested_weights,
+                weights,
+                atol=request_atol,
+                rtol=request_rtol,
+            )
+        ):
+            raise FixedMuOperatorError(
+                "fixed-mu scan stored k_weights do not match the expected "
+                "k_weights"
+            )
+
+    recomputed = fixed_mu_scan(
+        h_arr,
+        s_arr,
+        result.mu_grid,
+        kT=result.kT,
+        spin_degeneracy=result.spin_degeneracy,
+        k_weights=None if k_axis_c is None else weights,
+        k_axis=k_axis_c,
+        normalize_k_weights=result.normalize_k_weights,
+        eig_floor=eig_floor,
+        max_condition=max_condition,
+        hermitian_tol=hermitian_tol,
+    )
+    stored_eigvals = np.asarray(result.eigvals)
+    recomputed_eigvals = np.asarray(recomputed.eigvals)
+    if stored_eigvals.shape != recomputed_eigvals.shape:
+        raise FixedMuOperatorError(
+            "fixed-mu scan eigvals must have shape "
+            f"{recomputed_eigvals.shape} matching caller-supplied H/S, "
+            f"got {stored_eigvals.shape}"
+        )
+
+    # Keep the generalized-spectrum budget local to each sample/k item.
+    conditioning_floor = (
+        _SPECTRAL_CONDITION_ULPS
+        * _MACHINE_EPS
+        * np.asarray(recomputed.overlap_condition)
+    )
+    h_scale = np.maximum(
+        np.max(np.abs(h_arr), axis=(-1, -2)),
+        1.0,
+    )
+    eigen_atol = np.maximum(
+        atol,
+        conditioning_floor * h_scale,
+    )[..., None]
+    if not np.all(
+        np.isclose(
+            stored_eigvals,
+            recomputed_eigvals,
+            atol=eigen_atol,
+            rtol=rtol,
+        )
+    ):
+        raise FixedMuOperatorError(
+            "fixed-mu scan stored eigvals do not match caller-supplied H/S"
+        )
+
+    for name, stored, anchored in (
+        (
+            "scan min_overlap_eig from caller-supplied S",
+            result.min_overlap_eig,
+            recomputed.min_overlap_eig,
+        ),
+        (
+            "scan overlap_condition from caller-supplied S",
+            result.overlap_condition,
+            recomputed.overlap_condition,
+        ),
+        ("scan k_weights", result.k_weights, recomputed.k_weights),
+        (
+            "scan occupations from caller-supplied H/S",
+            result.occupations,
+            recomputed.occupations,
+        ),
+        (
+            "scan occupation_response from caller-supplied H/S",
+            result.occupation_response,
+            recomputed.occupation_response,
+        ),
+        (
+            "scan electron_count from caller-supplied H/S",
+            result.electron_count,
+            recomputed.electron_count,
+        ),
+        (
+            "scan dos_like_response from caller-supplied H/S",
+            result.dos_like_response,
+            recomputed.dos_like_response,
+        ),
+        (
+            "scan energy band_energy from caller-supplied H/S",
+            result.energies.band_energy,
+            recomputed.energies.band_energy,
+        ),
+        (
+            "scan energy minus_t_s from caller-supplied H/S",
+            result.energies.minus_t_s,
+            recomputed.energies.minus_t_s,
+        ),
+        (
+            "scan energy band_free_energy from caller-supplied H/S",
+            result.energies.band_free_energy,
+            recomputed.energies.band_free_energy,
+        ),
+        (
+            "scan energy band_grand_energy from caller-supplied H/S",
+            result.energies.band_grand_energy,
+            recomputed.energies.band_grand_energy,
+        ),
+    ):
+        _assert_recomputed_close(
+            name,
+            np.asarray(stored),
+            np.asarray(anchored),
+            atol=atol,
+            rtol=rtol,
+        )
+
+
 def validate_conservation(
     result: FixedMuResult,
     *,

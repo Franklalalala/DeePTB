@@ -13,6 +13,7 @@ from dptb.nnops.fixed_mu_operator import (
     generalized_bands,
     hermitian_part,
     validate_conservation,
+    validate_fixed_mu_scan,
 )
 from dptb.nnops.orbital_descriptors import (
     BondEnergyResult,
@@ -115,5 +116,6 @@ __all__ = [
     "solve_qeq",
     "solve_qeq_from_geometry",
     "validate_conservation",
+    "validate_fixed_mu_scan",
     "validate_qeq_result",
 ]
