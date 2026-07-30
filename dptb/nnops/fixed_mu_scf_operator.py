@@ -65,9 +65,10 @@ class FixedMuSCFResult:
 
     ``q`` is the Mulliken net charge measured from the terminal
     :class:`FixedMuResult`, and ``phi`` is ``coulomb_kernel @ q``.  The final
-    Hamiltonian was built from the preceding SCF input charge; the maximum
-    difference between that input and ``q`` is the last entry of
-    ``residual_history`` and is bounded by ``charge_tol``.
+    Hamiltonian was built from the preceding SCF input charge.  The last
+    ``residual_history`` entry bounds the charge mismatch, while
+    ``potential_residual = max(abs(K @ (q_out - q_in)))`` bounds the mismatch
+    between the Hamiltonian-building potential and returned ``phi``.
 
     Array fields are defensive read-only copies backed by immutable byte
     buffers.  Pickle restoration calls :meth:`__post_init__` and restores the
@@ -93,6 +94,8 @@ class FixedMuSCFResult:
     eig_floor: float
     max_condition: float
     hermitian_tol: float
+    potential_residual: float = 0.0
+    potential_tol: float = 1e-8
 
     def __post_init__(self) -> None:
         if not isinstance(self.fixed_mu_result, FixedMuResult):
@@ -134,6 +137,16 @@ class FixedMuSCFResult:
             raise FixedMuSCFError(
                 "a converged result must end at residual <= charge_tol"
             )
+        potential_residual = _as_float_scalar(
+            "potential_residual", self.potential_residual, nonnegative=True
+        )
+        potential_tol = _as_float_scalar(
+            "potential_tol", self.potential_tol, positive=True
+        )
+        if potential_residual > potential_tol:
+            raise FixedMuSCFError(
+                "a converged result must end at potential_residual <= potential_tol"
+            )
 
         object.__setattr__(self, "q", q)
         object.__setattr__(self, "phi", phi)
@@ -153,6 +166,8 @@ class FixedMuSCFResult:
         )
         object.__setattr__(self, "max_iter", max_iter)
         object.__setattr__(self, "charge_tol", charge_tol)
+        object.__setattr__(self, "potential_residual", potential_residual)
+        object.__setattr__(self, "potential_tol", potential_tol)
         object.__setattr__(
             self,
             "divergence_tol",
@@ -195,6 +210,25 @@ class FixedMuSCFResult:
                 "hermitian_tol", self.hermitian_tol, nonnegative=True
             ),
         )
+
+        nested = self.fixed_mu_result
+        if nested.k_axis is not None or np.asarray(nested.eigvals).ndim != 1:
+            raise FixedMuSCFError(
+                "fixed_mu_result must come from the single-matrix, no-k-axis SCF path"
+            )
+        for field_name in (
+            "mu",
+            "kT",
+            "spin_degeneracy",
+            "normalize_k_weights",
+            "eig_floor",
+            "max_condition",
+            "hermitian_tol",
+        ):
+            if getattr(self, field_name) != getattr(nested, field_name):
+                raise FixedMuSCFError(
+                    f"{field_name} does not match fixed_mu_result.{field_name}"
+                )
 
     def __getstate__(self) -> Dict[str, Any]:
         return {
@@ -496,6 +530,7 @@ def fixed_mu_electrostatic_scf(
     mixing_period: int = 3,
     max_iter: int = 100,
     charge_tol: float = 1e-8,
+    potential_tol: float = 1e-8,
     divergence_tol: float = 1e6,
     spin_degeneracy: float = 2.0,
     k_weights: Optional[ArrayLike] = None,
@@ -521,8 +556,11 @@ def fixed_mu_electrostatic_scf(
     rejects k stacks and leading batches, and does not implement periodic
     Ewald/PME or electrode boundary conditions.
 
-    Convergence is certified only when
-    ``max(abs(q_out - q_in)) <= charge_tol``.  Non-finite iterates, residuals
+    Convergence is certified only when both
+    ``max(abs(q_out - q_in)) <= charge_tol`` and
+    ``max(abs(coulomb_kernel @ (q_out - q_in))) <= potential_tol``.  The second
+    gate prevents a small charge residual from hiding a large Hamiltonian shift
+    when the supplied kernel has a large norm.  Non-finite iterates, residuals
     above ``divergence_tol``, and exhaustion of ``max_iter`` raise
     :class:`FixedMuSCFConvergenceError` with the iteration count and residual
     history.
@@ -534,6 +572,9 @@ def fixed_mu_electrostatic_scf(
     mixing_period = _as_positive_int("mixing_period", mixing_period)
     max_iter = _as_positive_int("max_iter", max_iter)
     charge_tol = _as_float_scalar("charge_tol", charge_tol, positive=True)
+    potential_tol = _as_float_scalar(
+        "potential_tol", potential_tol, positive=True
+    )
     divergence_tol = _as_float_scalar(
         "divergence_tol", divergence_tol, positive=True
     )
@@ -599,12 +640,20 @@ def fixed_mu_electrostatic_scf(
         )
         residual_vector = q_out - q
         residual = float(np.max(np.abs(residual_vector)))
+        with np.errstate(over="ignore", invalid="ignore"):
+            potential_residual = float(
+                np.max(np.abs(kernel @ residual_vector))
+            )
         residual_history.append(residual)
 
-        if not np.isfinite(residual) or not np.isfinite(q_out).all():
+        if (
+            not np.isfinite(residual)
+            or not np.isfinite(potential_residual)
+            or not np.isfinite(q_out).all()
+        ):
             raise FixedMuSCFConvergenceError(
-                "fixed-mu electrostatic SCF produced a non-finite charge "
-                "or residual",
+                "fixed-mu electrostatic SCF produced a non-finite charge, "
+                "charge residual, or potential residual",
                 iterations=iteration,
                 residual_history=residual_history,
             )
@@ -615,7 +664,7 @@ def fixed_mu_electrostatic_scf(
                 iterations=iteration,
                 residual_history=residual_history,
             )
-        if residual <= charge_tol:
+        if residual <= charge_tol and potential_residual <= potential_tol:
             terminal_result = fixed_mu_observables(
                 h_final, s_arr, **fixed_mu_kwargs
             )
@@ -658,6 +707,8 @@ def fixed_mu_electrostatic_scf(
                 eig_floor=terminal_result.eig_floor,
                 max_condition=terminal_result.max_condition,
                 hermitian_tol=terminal_result.hermitian_tol,
+                potential_residual=potential_residual,
+                potential_tol=potential_tol,
             )
 
         if previous_q is not None and previous_residual is not None:
@@ -691,7 +742,8 @@ def fixed_mu_electrostatic_scf(
         q = q_next
 
     raise FixedMuSCFConvergenceError(
-        f"fixed-mu electrostatic SCF did not converge within max_iter={max_iter}",
+        f"fixed-mu electrostatic SCF did not converge within max_iter={max_iter}; "
+        f"last_potential_residual={potential_residual:.6g}",
         iterations=max_iter,
         residual_history=residual_history,
     )
