@@ -270,3 +270,57 @@ validate_conservation(
 These checks are deliberately dense-reference checks over the returned arrays
 and validation H/S; the validator is for fail-closed postprocess validation, not
 a cheap training-loop assertion.
+
+## Fixed-mu Scan Source Validation
+
+`FixedMuScanResult` deliberately stores eigenvalues but not eigenvectors or an
+H/S snapshot. Its construction and pickle boundary recompute occupations,
+occupation responses, `N(mu)`, the DOS-like response, and every band-ledger
+field from those stored eigenvalues. That proves the scan payload is internally
+self-consistent; it does **not** prove which Hamiltonian and overlap produced
+the eigenvalues.
+
+Use `validate_fixed_mu_scan` wherever a cached, deserialized, or external scan
+becomes scientific evidence:
+
+```python
+from dptb.nnops import validate_fixed_mu_scan
+
+validate_fixed_mu_scan(
+    scan,
+    h=hamiltonian,
+    s=overlap,
+    expected_mu_grid=mu_grid,
+    expected_kT=kT,
+    expected_spin_degeneracy=2.0,
+    expected_k_weights=weights,
+    expected_k_axis=0,
+    expected_normalize_k_weights=True,
+    expected_eig_floor=1e-10,
+    expected_max_condition=1e12,
+    expected_hermitian_tol=1e-8,
+)
+```
+
+The validator first reruns the scan's internal payload certificate. It then
+reapplies the module-level H/S Hermiticity, positive-definiteness, overlap
+eigenvalue, and condition-number gates; solves the generalized eigenproblem
+again from caller-supplied H/S; and recomputes the complete scan. Stored
+eigenvalues are compared level by level with a per-item
+`16 * eps * cond(S) * max(max(abs(H)), 1)` numerical floor. All derived scan
+arrays and overlap telemetry are compared with the caller's ordinary
+`atol`/`rtol`.
+
+Optional `expected_*` fields bind the result to the request that the consumer
+actually intended. Their `request_atol` and `request_rtol` both default to zero,
+independently of numerical validation tolerances. In particular, relaxing
+`atol` to accommodate a conservation or eigensolver residual does not authorize
+a nearby temperature, chemical-potential grid, spin convention, or k-weight
+request.
+
+The source check is gauge covariant when the evidence itself is transformed
+consistently: shifting `H -> H + c S` and every `mu -> mu + c` shifts the stored
+spectrum and band/free energy by `c`, while `N(mu)`, the occupation response,
+and band grand energy remain unchanged. A scan from the unshifted request is
+not silently relabelled as the shifted request; request identity remains exact
+unless the caller explicitly opts into a nonzero request tolerance.
