@@ -332,6 +332,7 @@ class FixedMuScanResult:
                 "scan occupation_response must have shape "
                 f"{expected_occupation_shape}, got {self.occupation_response.shape}"
             )
+        _validate_fixed_mu_scan_payload(self)
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
@@ -353,6 +354,128 @@ def _freeze_arrays(obj: Any, field_names: Tuple[str, ...]) -> None:
     # directly, so the read-only flags would otherwise not survive a round trip.
     for field_name in field_names:
         object.__setattr__(obj, field_name, _readonly_array(getattr(obj, field_name)))
+
+
+def _scan_real_array(name: str, value: ArrayLike) -> np.ndarray:
+    arr = np.asarray(value)
+    if not np.issubdtype(arr.dtype, np.number) or np.iscomplexobj(arr):
+        raise FixedMuOperatorError(f"scan {name} must be a real numeric array")
+    arr = np.asarray(arr, dtype=np.float64)
+    if not np.isfinite(arr).all():
+        raise FixedMuOperatorError(f"scan {name} must contain only finite values")
+    return arr
+
+
+def _validate_fixed_mu_scan_payload(result: FixedMuScanResult) -> None:
+    """Recompute every scan observable that does not require H/S eigenvectors."""
+
+    eigvals = _scan_real_array("eigvals", result.eigvals)
+    if eigvals.ndim < 1 or eigvals.shape[-1] == 0:
+        raise FixedMuOperatorError(
+            f"scan eigvals must have shape [..., norb] with norb > 0, got {eigvals.shape}"
+        )
+    leading_shape = eigvals.shape[:-1]
+    if 0 in leading_shape:
+        raise FixedMuOperatorError(
+            f"scan eigvals leading shape {leading_shape} must not contain zero"
+        )
+
+    k_axis = _canonical_k_axis(result.k_axis, len(leading_shape))
+    object.__setattr__(result, "k_axis", k_axis)
+    stored_weights = _scan_real_array("k_weights", result.k_weights)
+    weights = _validate_stored_weights(
+        leading_shape,
+        k_weights=stored_weights,
+        k_axis=k_axis,
+        normalize_k_weights=result.normalize_k_weights,
+        atol=64.0 * _MACHINE_EPS,
+        rtol=64.0 * _MACHINE_EPS,
+    )
+    if k_axis is None and not np.array_equal(weights, np.ones_like(weights)):
+        raise FixedMuOperatorError(
+            "scan k_weights must be implicit unit weights when k_axis is None"
+        )
+
+    min_overlap_eig = _scan_real_array(
+        "min_overlap_eig", result.min_overlap_eig
+    )
+    overlap_condition = _scan_real_array(
+        "overlap_condition", result.overlap_condition
+    )
+    if min_overlap_eig.shape != leading_shape:
+        raise FixedMuOperatorError(
+            "scan min_overlap_eig must have shape "
+            f"{leading_shape}, got {min_overlap_eig.shape}"
+        )
+    if overlap_condition.shape != leading_shape:
+        raise FixedMuOperatorError(
+            "scan overlap_condition must have shape "
+            f"{leading_shape}, got {overlap_condition.shape}"
+        )
+    if np.any(min_overlap_eig <= result.eig_floor):
+        raise OverlapConditionError(
+            "scan min_overlap_eig violates the recorded eig_floor"
+        )
+    if np.any(overlap_condition < 1.0 - 64.0 * _MACHINE_EPS):
+        raise OverlapConditionError(
+            "scan overlap_condition must be at least one"
+        )
+    if np.any(overlap_condition > result.max_condition):
+        raise OverlapConditionError(
+            "scan overlap_condition violates the recorded max_condition"
+        )
+
+    scan_shape = (result.mu_grid.size,) + (1,) * eigvals.ndim
+    mu_broadcast = result.mu_grid.reshape(scan_shape)
+    eps_scan = eigvals[None, ...]
+    f_base, response_base = _stable_fermi(
+        eps_scan, mu=mu_broadcast, kT=result.kT
+    )
+    occupations = result.spin_degeneracy * f_base
+    occupation_response = result.spin_degeneracy * response_base
+    scan_weights = weights[None, ...]
+    scan_k_axis = None if k_axis is None else k_axis + 1
+    electron_count = _aggregate_matrix(
+        scan_weights * np.sum(occupations, axis=-1), k_axis=scan_k_axis
+    )
+    dos_like_response = _aggregate_matrix(
+        scan_weights * np.sum(occupation_response, axis=-1),
+        k_axis=scan_k_axis,
+    )
+    energies = _energy_ledger(
+        eps_scan,
+        f_base,
+        scan_weights,
+        mu=mu_broadcast,
+        kT=result.kT,
+        spin_degeneracy=result.spin_degeneracy,
+        k_axis=scan_k_axis,
+    )
+
+    atol = 64.0 * _MACHINE_EPS
+    rtol = 1.0e-12
+    for name, stored, recomputed in (
+        ("occupations", result.occupations, occupations),
+        ("occupation_response", result.occupation_response, occupation_response),
+        ("electron_count", result.electron_count, electron_count),
+        ("dos_like_response", result.dos_like_response, dos_like_response),
+        ("energy band_energy", result.energies.band_energy, energies.band_energy),
+        ("energy minus_t_s", result.energies.minus_t_s, energies.minus_t_s),
+        (
+            "energy band_free_energy",
+            result.energies.band_free_energy,
+            energies.band_free_energy,
+        ),
+        (
+            "energy band_grand_energy",
+            result.energies.band_grand_energy,
+            energies.band_grand_energy,
+        ),
+    ):
+        stored_arr = _scan_real_array(name, stored)
+        _assert_recomputed_close(
+            name, stored_arr, recomputed, atol=atol, rtol=rtol
+        )
 
 
 def hermitian_part(x: ArrayLike) -> np.ndarray:
@@ -661,14 +784,19 @@ def _stable_fermi(eps: np.ndarray, mu: float, kT: float) -> Tuple[np.ndarray, np
         response = np.zeros_like(f, dtype=np.float64)
         return f, response
 
-    x = (eps - mu) / kT
-    f = np.empty_like(x, dtype=np.float64)
-    pos = x >= 0.0
-    exp_neg = np.exp(-np.clip(x[pos], 0.0, 745.0))
-    f[pos] = exp_neg / (1.0 + exp_neg)
-    exp_pos = np.exp(np.clip(x[~pos], -745.0, 0.0))
-    f[~pos] = 1.0 / (1.0 + exp_pos)
-    response = f * (1.0 - f) / kT
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        x = (eps - mu) / kT
+        f = np.empty_like(x, dtype=np.float64)
+        pos = x >= 0.0
+        exp_neg = np.exp(-np.clip(x[pos], 0.0, 745.0))
+        f[pos] = exp_neg / (1.0 + exp_neg)
+        exp_pos = np.exp(np.clip(x[~pos], -745.0, 0.0))
+        f[~pos] = 1.0 / (1.0 + exp_pos)
+        response = f * (1.0 - f) / kT
+    if not np.isfinite(response).all():
+        raise FixedMuOperatorError(
+            "kT is too small for a finite float64 occupation response"
+        )
     return f, response
 
 
