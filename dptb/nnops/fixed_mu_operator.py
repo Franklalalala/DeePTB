@@ -28,6 +28,11 @@ except Exception:  # pragma: no cover - exercised only in minimal runtimes.
 
 ArrayLike = Any
 
+#: A serialized result may tighten these safety policies, but never loosen
+#: them.
+MODULE_MAX_CONDITION = 1.0e12
+MODULE_MAX_HERMITIAN_TOL = 1.0e-6
+
 _MACHINE_EPS = float(np.finfo(np.float64).eps)
 #: The S-orthonormality and eigenpair residuals of a backward-stable generalized
 #: solve grow like ``eps * cond(S)``, so an absolute atol alone cannot certify
@@ -206,13 +211,14 @@ class FixedMuResult:
             "normalize_k_weights",
             _as_bool("normalize_k_weights", self.normalize_k_weights),
         )
-        object.__setattr__(self, "eig_floor", _as_float_scalar("eig_floor", self.eig_floor, positive=True))
-        object.__setattr__(self, "max_condition", _as_float_scalar("max_condition", self.max_condition, positive=True))
-        object.__setattr__(
-            self,
-            "hermitian_tol",
-            _as_float_scalar("hermitian_tol", self.hermitian_tol, nonnegative=True),
+        eig_floor, max_condition, hermitian_tol = _validate_safety_policy(
+            eig_floor=self.eig_floor,
+            max_condition=self.max_condition,
+            hermitian_tol=self.hermitian_tol,
         )
+        object.__setattr__(self, "eig_floor", eig_floor)
+        object.__setattr__(self, "max_condition", max_condition)
+        object.__setattr__(self, "hermitian_tol", hermitian_tol)
         for field_name in (
             "eigvals",
             "eigvecs",
@@ -303,6 +309,56 @@ def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnega
     return out
 
 
+def _bounded_policy(
+    name: str,
+    value: float,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+    maximum: Optional[float] = None,
+) -> float:
+    out = _as_float_scalar(
+        name,
+        value,
+        positive=positive,
+        nonnegative=nonnegative,
+    )
+    if maximum is not None and out > maximum:
+        raise FixedMuOperatorError(
+            f"{name}={out:g} exceeds the module ceiling {maximum:g}; this dense "
+            "reference does not certify results at that policy"
+        )
+    return out
+
+
+def _validate_safety_policy(
+    *,
+    eig_floor: float,
+    max_condition: float,
+    hermitian_tol: float,
+    prefix: str = "",
+) -> Tuple[float, float, float]:
+    return (
+        _bounded_policy(
+            f"{prefix}eig_floor",
+            eig_floor,
+            positive=True,
+        ),
+        _bounded_policy(
+            f"{prefix}max_condition",
+            max_condition,
+            positive=True,
+            maximum=MODULE_MAX_CONDITION,
+        ),
+        _bounded_policy(
+            f"{prefix}hermitian_tol",
+            hermitian_tol,
+            nonnegative=True,
+            maximum=MODULE_MAX_HERMITIAN_TOL,
+        ),
+    )
+
+
 def _validate_spin_degeneracy(spin_degeneracy: float) -> float:
     value = _as_float_scalar("spin_degeneracy", spin_degeneracy, positive=True)
     if value not in _ALLOWED_SPIN_DEGENERACY:
@@ -340,7 +396,12 @@ def _validate_matrix_stack(
     s_arr = np.asarray(s_arr, dtype=dtype)
     if not np.isfinite(h_arr).all() or not np.isfinite(s_arr).all():
         raise FixedMuOperatorError("H and S must contain only finite values")
-    hermitian_tol = _as_float_scalar("hermitian_tol", hermitian_tol, nonnegative=True)
+    hermitian_tol = _bounded_policy(
+        "hermitian_tol",
+        hermitian_tol,
+        nonnegative=True,
+        maximum=MODULE_MAX_HERMITIAN_TOL,
+    )
     # Recorded before symmetrization: hermitian_part() below destroys it.
     h_asymmetry = np.max(np.abs(h_arr - np.swapaxes(h_arr.conj(), -1, -2)), axis=(-1, -2)).real
     s_asymmetry = np.max(np.abs(s_arr - np.swapaxes(s_arr.conj(), -1, -2)), axis=(-1, -2)).real
@@ -550,8 +611,11 @@ def generalized_bands(
     conditioned S raises :class:`OverlapConditionError`.
     """
 
-    eig_floor = _as_float_scalar("eig_floor", eig_floor, positive=True)
-    max_condition = _as_float_scalar("max_condition", max_condition, positive=True)
+    eig_floor, max_condition, hermitian_tol = _validate_safety_policy(
+        eig_floor=eig_floor,
+        max_condition=max_condition,
+        hermitian_tol=hermitian_tol,
+    )
     h_arr, s_arr, _, _ = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
     min_eig, cond = _check_overlap(s_arr, eig_floor=eig_floor, max_condition=max_condition)
     n = h_arr.shape[-1]
@@ -858,6 +922,11 @@ def validate_conservation(
         raise FixedMuOperatorError("conservation must be a ConservationLedger")
     atol = _as_float_scalar("atol", atol, nonnegative=True)
     rtol = _as_float_scalar("rtol", rtol, nonnegative=True)
+    eig_floor, max_condition, hermitian_tol = _validate_safety_policy(
+        eig_floor=result.eig_floor,
+        max_condition=result.max_condition,
+        hermitian_tol=result.hermitian_tol,
+    )
     if expected_mu is not None and not np.isclose(
         result.mu, _as_float_scalar("expected_mu", expected_mu), atol=atol, rtol=rtol
     ):
@@ -879,27 +948,37 @@ def validate_conservation(
             "with it, so nothing else in this validator can catch the wrong convention"
         )
     if expected_eig_floor is not None:
-        expected = _as_float_scalar("expected_eig_floor", expected_eig_floor, positive=True)
-        if result.eig_floor != expected:
+        expected = _bounded_policy(
+            "expected_eig_floor",
+            expected_eig_floor,
+            positive=True,
+        )
+        if eig_floor != expected:
             raise FixedMuOperatorError(
-                f"fixed-mu result used eig_floor={result.eig_floor!r}, not the expected {expected!r}"
+                f"fixed-mu result used eig_floor={eig_floor!r}, not the expected {expected!r}"
             )
     if expected_max_condition is not None:
-        expected = _as_float_scalar(
-            "expected_max_condition", expected_max_condition, positive=True
+        expected = _bounded_policy(
+            "expected_max_condition",
+            expected_max_condition,
+            positive=True,
+            maximum=MODULE_MAX_CONDITION,
         )
-        if result.max_condition != expected:
+        if max_condition != expected:
             raise FixedMuOperatorError(
-                f"fixed-mu result used max_condition={result.max_condition!r}, "
+                f"fixed-mu result used max_condition={max_condition!r}, "
                 f"not the expected {expected!r}"
             )
     if expected_hermitian_tol is not None:
-        expected = _as_float_scalar(
-            "expected_hermitian_tol", expected_hermitian_tol, nonnegative=True
+        expected = _bounded_policy(
+            "expected_hermitian_tol",
+            expected_hermitian_tol,
+            nonnegative=True,
+            maximum=MODULE_MAX_HERMITIAN_TOL,
         )
-        if result.hermitian_tol != expected:
+        if hermitian_tol != expected:
             raise FixedMuOperatorError(
-                f"fixed-mu result used hermitian_tol={result.hermitian_tol!r}, "
+                f"fixed-mu result used hermitian_tol={hermitian_tol!r}, "
                 f"not the expected {expected!r}"
             )
     if (h is None) != (s is None):
@@ -912,11 +991,11 @@ def validate_conservation(
             )
         h = context.hamiltonian
         s = context.overlap
-    h_arr, s_arr, _, _ = _validate_matrix_stack(h, s, hermitian_tol=result.hermitian_tol)
+    h_arr, s_arr, _, _ = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
     min_overlap_eig, overlap_condition = _check_overlap(
         s_arr,
-        eig_floor=result.eig_floor,
-        max_condition=result.max_condition,
+        eig_floor=eig_floor,
+        max_condition=max_condition,
     )
     leading_shape = h_arr.shape[:-2]
     k_axis_c = _canonical_k_axis(result.k_axis, len(leading_shape))
@@ -1229,8 +1308,8 @@ def validate_conservation(
     # The stored H/S snapshot is already Hermitian, so the raw input asymmetry
     # is unrecoverable here; the policy it was accepted under is re-enforced.
     for name, recorded, budget in (
-        ("input_h_hermiticity_error", cons.input_h_hermiticity_error, _hermiticity_budget(h_arr, result.hermitian_tol)),
-        ("input_s_hermiticity_error", cons.input_s_hermiticity_error, _hermiticity_budget(s_arr, result.hermitian_tol)),
+        ("input_h_hermiticity_error", cons.input_h_hermiticity_error, _hermiticity_budget(h_arr, hermitian_tol)),
+        ("input_s_hermiticity_error", cons.input_s_hermiticity_error, _hermiticity_budget(s_arr, hermitian_tol)),
     ):
         recorded_arr = np.asarray(recorded, dtype=np.float64)
         if recorded_arr.shape != leading_shape:
@@ -1242,7 +1321,7 @@ def validate_conservation(
         if np.any(recorded_arr > budget):
             raise FixedMuOperatorError(
                 f"fixed-mu {name} {float(np.max(recorded_arr)):.6g} exceeds what the recorded "
-                f"hermitian_tol={result.hermitian_tol:g} admits"
+                f"hermitian_tol={hermitian_tol:g} admits"
             )
 
     if not np.all(np.isclose(ne_from_d, result.electron_count, atol=count_atol, rtol=rtol)):

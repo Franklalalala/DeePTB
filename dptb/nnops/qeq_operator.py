@@ -318,6 +318,23 @@ def _prepare_total_charge(total_charge: ArrayLike, leading_shape: Tuple[int, ...
         ) from exc
 
 
+def _prepare_expected_array(
+    name: str,
+    value: ArrayLike,
+    expected_shape: Tuple[int, ...],
+) -> np.ndarray:
+    """Normalize and broadcast one caller-supplied request field."""
+
+    arr = _as_real_numeric_array(name, value)
+    try:
+        return np.broadcast_to(arr, expected_shape).astype(np.float64, copy=True)
+    except ValueError as exc:
+        raise QEqOperatorError(
+            f"{name} shape {arr.shape} cannot broadcast to expected result shape "
+            f"{expected_shape}"
+        ) from exc
+
+
 def _clamp_policy(name: str, value: float, ceiling: float) -> float:
     """Return the tighter of a self-declared policy value and the module ceiling."""
 
@@ -777,7 +794,13 @@ def solve_qeq(
         max_condition=max_condition,
         residual_tol=residual_tol,
     )
-    validate_qeq_result(result, atol=residual_tol)
+    validate_qeq_result(
+        result,
+        atol=residual_tol,
+        expected_electronegativity=electronegativity,
+        expected_hardness_kernel=hardness_kernel,
+        expected_total_charge=total_charge,
+    )
     return result
 
 
@@ -846,6 +869,9 @@ def validate_qeq_result(
     result: QEqResult,
     *,
     atol: Optional[float] = None,
+    expected_electronegativity: Optional[ArrayLike] = None,
+    expected_hardness_kernel: Optional[ArrayLike] = None,
+    expected_total_charge: Optional[ArrayLike] = None,
     expected_symmetry_tol: Optional[float] = None,
     expected_constrained_eig_floor: Optional[float] = None,
     expected_max_condition: Optional[float] = None,
@@ -871,6 +897,12 @@ def validate_qeq_result(
         the one that certifies the minimizing charge distribution -- derives
         its floor from the canonical uniform gauge, so
         ``J -> J + alpha 11^T`` cannot loosen it.
+    expected_electronegativity, expected_hardness_kernel, expected_total_charge
+        Optional caller-supplied request fields.  Supplying them binds a
+        self-consistent result to the problem the caller actually submitted;
+        without them, validation can only certify the arrays stored inside
+        ``result``.  Leading dimensions may broadcast exactly as in
+        :func:`solve_qeq`.
     expected_symmetry_tol, expected_constrained_eig_floor, expected_max_condition
         Caller-supplied safety policy.  Each overrides the value recorded on
         ``result`` — use them when the result came from an untrusted producer
@@ -927,6 +959,29 @@ def validate_qeq_result(
     _require_same_shape("hardness_kernel", kernel, leading_shape + (n, n))
     _require_same_shape("lagrange_multiplier", multiplier, leading_shape)
 
+    if expected_electronegativity is not None:
+        expected_chi = _prepare_expected_array(
+            "expected_electronegativity",
+            expected_electronegativity,
+            leading_shape + (n,),
+        )
+        _assert_recomputed_close(
+            "electronegativity request",
+            chi,
+            expected_chi,
+            atol=atol,
+            rtol=_RECOMPUTE_RTOL,
+        )
+    if expected_total_charge is not None:
+        expected_qtot = _prepare_total_charge(expected_total_charge, leading_shape)
+        _assert_recomputed_close(
+            "total_charge request",
+            qtot,
+            expected_qtot,
+            atol=atol,
+            rtol=_RECOMPUTE_RTOL,
+        )
+
     asym = kernel - np.swapaxes(kernel, -1, -2)
     symmetry_error = np.max(np.abs(asym), axis=(-1, -2))
     if np.any(symmetry_error > symmetry_tol):
@@ -943,6 +998,40 @@ def validate_qeq_result(
         raise QEqOperatorError(
             f"QEq input hardness_kernel asymmetry {float(np.max(input_symmetry_error)):.6g} "
             f"exceeds the recorded symmetry_tol={symmetry_tol:g}"
+        )
+    if expected_hardness_kernel is not None:
+        expected_kernel_raw = _prepare_expected_array(
+            "expected_hardness_kernel",
+            expected_hardness_kernel,
+            leading_shape + (n, n),
+        )
+        expected_asymmetry = expected_kernel_raw - np.swapaxes(
+            expected_kernel_raw, -1, -2
+        )
+        expected_input_symmetry_error = np.max(
+            np.abs(expected_asymmetry), axis=(-1, -2)
+        )
+        if np.any(expected_input_symmetry_error > symmetry_tol):
+            raise QEqOperatorError(
+                "expected_hardness_kernel is not symmetric within the enforced "
+                f"symmetry_tol={symmetry_tol:g}"
+            )
+        expected_kernel = 0.5 * (
+            expected_kernel_raw + np.swapaxes(expected_kernel_raw, -1, -2)
+        )
+        _assert_recomputed_close(
+            "hardness_kernel request",
+            kernel,
+            expected_kernel,
+            atol=atol,
+            rtol=_RECOMPUTE_RTOL,
+        )
+        _assert_recomputed_close(
+            "input hardness_kernel asymmetry request",
+            input_symmetry_error,
+            expected_input_symmetry_error,
+            atol=atol,
+            rtol=_RECOMPUTE_RTOL,
         )
 
     charge_residual = np.sum(charges, axis=-1) - qtot
