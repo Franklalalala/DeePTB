@@ -15,10 +15,10 @@ Units
 No conversion is performed anywhere in this module.  ``electronegativity`` and
 ``hardness_kernel`` are consumed exactly as given, and every derived quantity
 (energies, Lagrange multiplier, residuals) comes out in the energy unit implied
-by those inputs.  :class:`QEqUnits` is a *declarative label only*: it records
-the canonical eV/e convention the DeePTB callers use and is never checked
-against the numbers, so passing Hartree-valued inputs yields Hartree-valued
-energies still labelled ``eV``.  Convert before calling if you need eV.
+by those inputs.  :class:`QEqUnits` is a *declarative label only*: its defaults
+record the canonical eV/e convention used by DeePTB callers, while callers in
+another consistent unit system must supply matching labels explicitly.  Labels
+are preserved in the result but are never cross-checked against the numbers.
 """
 from __future__ import annotations
 
@@ -65,10 +65,9 @@ class QEqUnits:
     """Declarative unit labels for the dense QEq reference kernel.
 
     This type performs no conversion and is never cross-checked against the
-    numbers.  It exists to state, in the result payload, that DeePTB feeds this
-    reference eV/e-valued electronegativities and eV/e^2-valued hardness
-    kernels; callers working in another consistent energy unit get their own
-    unit back with this label unchanged.
+    numbers.  The defaults state the eV/e convention used by DeePTB; callers
+    working in another internally consistent unit system may replace every
+    label, and the result preserves those labels unchanged.
     """
 
     charge: str = "e"
@@ -78,18 +77,17 @@ class QEqUnits:
     lagrange_multiplier: str = "eV/e"
 
     def __post_init__(self) -> None:
-        expected = {
-            "charge": "e",
-            "energy": "eV",
-            "electronegativity": "eV/e",
-            "hardness_kernel": "eV/e^2",
-            "lagrange_multiplier": "eV/e",
-        }
-        for field_name, canonical in expected.items():
-            if getattr(self, field_name) != canonical:
+        for field_name in (
+            "charge",
+            "energy",
+            "electronegativity",
+            "hardness_kernel",
+            "lagrange_multiplier",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
                 raise QEqOperatorError(
-                    "QEqUnits only records the canonical unscaled operator "
-                    f"units; {field_name} must be {canonical!r}"
+                    f"QEqUnits.{field_name} must be a non-empty string"
                 )
 
 
@@ -643,6 +641,20 @@ def _residual_tolerance(atol: float, arithmetic_scale: np.ndarray) -> np.ndarray
     return atol + _ARITHMETIC_FLOOR_ULPS * _MACHINE_EPS * arithmetic_scale
 
 
+def _charge_residual_floor(charges: np.ndarray, total_charge: np.ndarray) -> np.ndarray:
+    """Float64 summation floor for ``sum(charges) - total_charge``.
+
+    Charge conservation has charge units, whereas ``residual_tol`` / ``atol``
+    have the units of the QEq stationarity equation.  Keeping this floor
+    separate prevents an energy tolerance from silently authorizing a charge
+    leak in an otherwise self-consistent serialized result.
+    """
+
+    scale = np.sum(np.abs(charges), axis=-1) + np.abs(total_charge)
+    summation_ulps = max(_ARITHMETIC_FLOOR_ULPS, float(charges.shape[-1] + 1))
+    return summation_ulps * _MACHINE_EPS * scale
+
+
 def solve_qeq(
     electronegativity: ArrayLike,
     hardness_kernel: ArrayLike,
@@ -659,23 +671,30 @@ def solve_qeq(
     Parameters
     ----------
     electronegativity
-        Real ``[..., natom]`` array in ``eV/e``.
+        Real ``[..., natom]`` array in the unit named by
+        ``units.electronegativity``.
     hardness_kernel
-        Real symmetric ``[..., natom, natom]`` kernel in ``eV/e^2``.
+        Real symmetric ``[..., natom, natom]`` kernel in the unit named by
+        ``units.hardness_kernel``.
     total_charge
-        Scalar or broadcastable ``[...]`` total charge in ``e``.
+        Scalar or broadcastable ``[...]`` total charge in the unit named by
+        ``units.charge``.
+    units
+        Declarative labels preserved in the result.  No conversion or numerical
+        unit verification is performed.
 
     Returns
     -------
     QEqResult
-        Charges in ``e``, energies in ``eV``, and fail-closed diagnostics for
-        the KKT stationarity equation ``chi + J q + lambda 1 = 0``.
+        Charges and energies in the caller's labelled units, plus fail-closed
+        diagnostics for the KKT stationarity equation
+        ``chi + J q + lambda 1 = 0``.
 
     Notes
     -----
-    ``eV`` here is the DeePTB convention only; the solve is unit-agnostic and
-    returns whatever consistent energy unit ``electronegativity`` and
-    ``hardness_kernel`` were expressed in.
+    The default labels use DeePTB's eV/e convention, but the solve itself is
+    unit-agnostic and returns the internally consistent unit system supplied by
+    the caller.
 
     ``max_condition``, ``residual_tol`` and ``symmetry_tol`` are capped by the
     module-level ``MODULE_MAX_*`` ceilings so that every accepted policy is one
@@ -841,13 +860,16 @@ def validate_qeq_result(
     Parameters
     ----------
     atol
-        Absolute residual tolerance in the caller's energy unit.  ``None``
-        (the default) adopts the ``residual_tol`` recorded by the solve, so a
-        result carrying a looser *or* tighter recorded policy is re-enforced as
-        recorded.  An explicit value always wins.  Every residual gate admits
-        ``atol`` plus a float64 arithmetic floor derived from the magnitude of
-        the intermediates.  The tangent gate -- the one that certifies the
-        charges -- derives that floor from the canonical uniform gauge only, so
+        Absolute tolerance in the units of the QEq stationarity equation.
+        ``None`` (the default) adopts the ``residual_tol`` recorded by the
+        solve, so a result carrying a looser *or* tighter recorded policy is
+        re-enforced as recorded.  An explicit value always wins.  Energy-unit
+        gates admit ``atol`` plus a float64 arithmetic floor derived from the
+        magnitude of their intermediates.  Charge conservation is certified
+        independently against only its float64 summation floor; changing an
+        energy tolerance cannot authorize a charge leak.  The tangent gate --
+        the one that certifies the minimizing charge distribution -- derives
+        its floor from the canonical uniform gauge, so
         ``J -> J + alpha 11^T`` cannot loosen it.
     expected_symmetry_tol, expected_constrained_eig_floor, expected_max_condition
         Caller-supplied safety policy.  Each overrides the value recorded on
@@ -924,6 +946,7 @@ def validate_qeq_result(
         )
 
     charge_residual = np.sum(charges, axis=-1) - qtot
+    charge_residual_floor = _charge_residual_floor(charges, qtot)
     stationarity, tangent_max_abs, multiplier_residual, arithmetic_scale = _stationarity_parts(
         chi,
         kernel,
@@ -1001,7 +1024,8 @@ def validate_qeq_result(
         "diagnostic charge_residual",
         _require_result_array("diagnostics.charge_residual", diagnostics.charge_residual),
         charge_residual,
-        atol=atol,
+        atol=0.0,
+        floor=charge_residual_floor,
     )
     _assert_recomputed_close(
         "diagnostic stationarity_max_abs",
@@ -1075,7 +1099,7 @@ def validate_qeq_result(
         rtol=_RECOMPUTE_RTOL,
     )
 
-    if np.any(np.abs(charge_residual) > atol):
+    if np.any(np.abs(charge_residual) > charge_residual_floor):
         raise QEqOperatorError("QEq charges do not satisfy sum(q) = total_charge")
     _check_stationarity_gate(
         tangent_max_abs,

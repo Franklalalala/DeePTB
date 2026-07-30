@@ -250,9 +250,23 @@ def test_public_export_does_not_require_fixed_mu_api():
     np.testing.assert_allclose(fixed_mu.electron_count, 1.0, atol=1e-12)
 
 
-def test_qeq_units_reject_unimplemented_unit_relabeling():
-    with pytest.raises(QEqOperatorError, match="canonical unscaled"):
-        QEqUnits(charge="coulomb")
+def test_qeq_units_preserve_explicit_declarative_labels():
+    units = QEqUnits(
+        charge="|e|",
+        energy="Ha",
+        electronegativity="Ha/|e|",
+        hardness_kernel="Ha/|e|^2",
+        lagrange_multiplier="Ha/|e|",
+    )
+    result = solve_qeq(
+        np.array([0.1, 0.3]),
+        np.array([[1.0, 0.2], [0.2, 1.5]]),
+        units=units,
+    )
+
+    assert result.units == units
+    with pytest.raises(QEqOperatorError, match="non-empty string"):
+        QEqUnits(energy="  ")
 
 
 def test_validate_qeq_result_fails_for_mutated_result():
@@ -441,23 +455,32 @@ def test_torch_like_inputs_are_rejected_without_silent_detach():
         solve_qeq(np.array([1.0, 2.0]), np.eye(2), total_charge=_FakeTorchTensor(np.array(0.0)))
 
 
-def test_validate_adopts_recorded_residual_tol_and_lets_explicit_atol_win():
+def test_energy_residual_policy_never_relaxes_charge_conservation():
     chi = np.array([1.0, 3.0, -2.0])
     kernel = np.array([[5.0, 1.0, 0.2], [1.0, 7.0, -0.3], [0.2, -0.3, 4.0]])
     loose = solve_qeq(chi, kernel, residual_tol=1.0e-6)
     assert loose.residual_tol == pytest.approx(1.0e-6)
 
-    # Charge residual 1e-7: inside the recorded 1e-6 policy, outside 1e-8.
+    # Every recomputed energy/stationarity field is self-consistent; only the
+    # claimed total charge differs by 1e-7.  Energy-unit tolerances must not
+    # authorize that charge-unit violation.
     drifted = _self_consistent_result(chi, kernel, loose.charges, -1.0e-7)
-    validate_qeq_result(drifted, atol=1.0e-6)
-    with pytest.raises(QEqOperatorError, match=r"sum\(q\) = total_charge"):
-        validate_qeq_result(drifted, atol=1.0e-8)
+    for explicit_atol in (1.0e-6, 1.0e-8):
+        with pytest.raises(QEqOperatorError, match=r"sum\(q\) = total_charge"):
+            validate_qeq_result(drifted, atol=explicit_atol)
 
-    # The sentinel default re-enforces exactly what the payload recorded, in
-    # both directions: 1e-6 accepts, 1e-9 rejects.
-    validate_qeq_result(replace(drifted, residual_tol=1.0e-6))
-    with pytest.raises(QEqOperatorError, match=r"sum\(q\) = total_charge"):
-        validate_qeq_result(replace(drifted, residual_tol=1.0e-9))
+    for recorded_tol in (1.0e-6, 1.0e-9):
+        with pytest.raises(QEqOperatorError, match=r"sum\(q\) = total_charge"):
+            validate_qeq_result(replace(drifted, residual_tol=recorded_tol))
+
+
+@pytest.mark.parametrize("n,total_charge", [(1, 0.0), (2, 1.0), (16, -3.0), (64, 1.0e6)])
+def test_solver_outputs_pass_the_independent_charge_certificate(n, total_charge):
+    chi = np.linspace(-0.5, 0.5, n)
+    kernel = np.diag(np.linspace(1.0, 2.0, n))
+    result = solve_qeq(chi, kernel, total_charge=total_charge)
+
+    validate_qeq_result(result)
 
 
 def test_recorded_policy_cannot_loosen_the_module_ceilings():
