@@ -251,6 +251,96 @@ class FixedMuResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class FixedMuScanResult:
+    """Incremental fixed-μ observables evaluated on a one-dimensional μ grid.
+
+    The leading axis of ``occupations``, ``occupation_response``,
+    ``electron_count``, ``dos_like_response``, and every ``energies`` field is
+    the μ-grid axis.  The generalized eigensystem is solved once per input
+    H/S item and reused across that axis.
+
+    Density matrices are deliberately not materialized because their
+    ``n_mu * norb**2`` storage can dominate a scan.  When a density is needed
+    for one selected μ, call :func:`fixed_mu_observables` with that scalar μ
+    and the same H/S and policy arguments.
+    """
+
+    mu_grid: np.ndarray
+    kT: float
+    spin_degeneracy: float
+    eigvals: np.ndarray
+    occupations: np.ndarray
+    occupation_response: np.ndarray
+    electron_count: np.ndarray
+    dos_like_response: np.ndarray
+    energies: EnergyLedger
+    k_weights: np.ndarray
+    k_axis: Optional[int]
+    min_overlap_eig: np.ndarray
+    overlap_condition: np.ndarray
+    normalize_k_weights: bool = True
+    eig_floor: float = 1e-10
+    max_condition: float = 1e12
+    hermitian_tol: float = 1e-8
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.energies, EnergyLedger):
+            raise FixedMuOperatorError("energies must be an EnergyLedger")
+        mu_grid = _prepare_mu_grid(self.mu_grid)
+        object.__setattr__(self, "mu_grid", _readonly_array(mu_grid))
+        object.__setattr__(self, "kT", _as_float_scalar("kT", self.kT, nonnegative=True))
+        object.__setattr__(
+            self,
+            "spin_degeneracy",
+            _validate_spin_degeneracy(self.spin_degeneracy),
+        )
+        object.__setattr__(
+            self,
+            "normalize_k_weights",
+            _as_bool("normalize_k_weights", self.normalize_k_weights),
+        )
+        eig_floor, max_condition, hermitian_tol = _validate_safety_policy(
+            eig_floor=self.eig_floor,
+            max_condition=self.max_condition,
+            hermitian_tol=self.hermitian_tol,
+        )
+        object.__setattr__(self, "eig_floor", eig_floor)
+        object.__setattr__(self, "max_condition", max_condition)
+        object.__setattr__(self, "hermitian_tol", hermitian_tol)
+        _freeze_arrays(
+            self,
+            (
+                "eigvals",
+                "occupations",
+                "occupation_response",
+                "electron_count",
+                "dos_like_response",
+                "k_weights",
+                "min_overlap_eig",
+                "overlap_condition",
+            ),
+        )
+        expected_occupation_shape = (mu_grid.size,) + self.eigvals.shape
+        if self.occupations.shape != expected_occupation_shape:
+            raise FixedMuOperatorError(
+                "scan occupations must have shape "
+                f"{expected_occupation_shape}, got {self.occupations.shape}"
+            )
+        if self.occupation_response.shape != expected_occupation_shape:
+            raise FixedMuOperatorError(
+                "scan occupation_response must have shape "
+                f"{expected_occupation_shape}, got {self.occupation_response.shape}"
+            )
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__post_init__()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def _readonly_array(value: ArrayLike, *, dtype: Any = None) -> np.ndarray:
     arr = np.array(value, dtype=dtype, copy=True, order="C")
     immutable = np.frombuffer(arr.tobytes(order="C"), dtype=arr.dtype).reshape(arr.shape)
@@ -307,6 +397,25 @@ def _as_float_scalar(name: str, value: float, *, positive: bool = False, nonnega
     if nonnegative and out < 0.0:
         raise FixedMuOperatorError(f"{name} must be nonnegative, got {value!r}")
     return out
+
+
+def _prepare_mu_grid(mu_grid: ArrayLike) -> np.ndarray:
+    _reject_torch_tensor("mu_grid", mu_grid)
+    raw = np.asarray(mu_grid)
+    if not np.issubdtype(raw.dtype, np.number):
+        raise FixedMuOperatorError("mu_grid must be a one-dimensional numeric array")
+    if np.iscomplexobj(raw):
+        raise FixedMuOperatorError("mu_grid must be real")
+    values = np.asarray(raw, dtype=np.float64)
+    if values.ndim != 1:
+        raise FixedMuOperatorError(
+            f"mu_grid must be one-dimensional, got shape {values.shape}"
+        )
+    if values.size == 0:
+        raise FixedMuOperatorError("mu_grid must contain at least one value")
+    if not np.isfinite(values).all():
+        raise FixedMuOperatorError("mu_grid must contain only finite values")
+    return values
 
 
 def _bounded_policy(
@@ -844,6 +953,102 @@ def fixed_mu_observables(
         max_condition=max_condition,
         hermitian_tol=hermitian_tol,
         validation_context=FixedMuValidationContext(h_arr, s_arr),
+    )
+
+
+def fixed_mu_scan(
+    h: ArrayLike,
+    s: ArrayLike,
+    mu_grid: ArrayLike,
+    *,
+    kT: float = 0.0,
+    spin_degeneracy: float = 2.0,
+    k_weights: Optional[ArrayLike] = None,
+    k_axis: Optional[int] = None,
+    normalize_k_weights: bool = True,
+    eig_floor: float = 1e-10,
+    max_condition: float = 1e12,
+    hermitian_tol: float = 1e-8,
+) -> FixedMuScanResult:
+    """Scan frozen-H/S observables while diagonalizing each structure once.
+
+    ``mu_grid`` must be a finite, non-empty one-dimensional array in the same
+    caller-chosen energy unit as ``h`` and ``kT``.  Returned scan-valued arrays
+    place this μ axis first.  All remaining batch/k semantics and safety policy
+    arguments are identical to :func:`fixed_mu_observables`.
+
+    The result contains ``N``, ``dN/dmu``, occupations, occupation responses,
+    and the band-energy ledger for every μ.  It intentionally contains no
+    density matrices; use :func:`fixed_mu_observables` for a selected scalar μ
+    when ``D`` or ``dD/dmu`` is required.
+    """
+
+    mu_values = _prepare_mu_grid(mu_grid)
+    kT = _as_float_scalar("kT", kT, nonnegative=True)
+    spin_degeneracy = _validate_spin_degeneracy(spin_degeneracy)
+    normalize_k_weights = _as_bool("normalize_k_weights", normalize_k_weights)
+    bands = generalized_bands(
+        h,
+        s,
+        eig_floor=eig_floor,
+        max_condition=max_condition,
+        hermitian_tol=hermitian_tol,
+    )
+    h_arr, _, _, _ = _validate_matrix_stack(h, s, hermitian_tol=hermitian_tol)
+    leading_shape = h_arr.shape[:-2]
+    k_axis_c = _canonical_k_axis(k_axis, len(leading_shape))
+    weights = _prepare_weights(
+        leading_shape,
+        k_weights=k_weights,
+        k_axis=k_axis_c,
+        normalize_k_weights=normalize_k_weights,
+    )
+
+    scan_shape = (mu_values.size,) + (1,) * bands.eigvals.ndim
+    mu_broadcast = mu_values.reshape(scan_shape)
+    eps_scan = bands.eigvals[None, ...]
+    f_base, response_base = _stable_fermi(
+        eps_scan,
+        mu=mu_broadcast,
+        kT=kT,
+    )
+    occupations = spin_degeneracy * f_base
+    occupation_response = spin_degeneracy * response_base
+
+    scan_weights = weights[None, ...]
+    scan_k_axis = None if k_axis_c is None else k_axis_c + 1
+    n_k = scan_weights * np.sum(occupations, axis=-1)
+    dos_k = scan_weights * np.sum(occupation_response, axis=-1)
+    electron_count = _aggregate_matrix(n_k, k_axis=scan_k_axis)
+    dos_like_response = _aggregate_matrix(dos_k, k_axis=scan_k_axis)
+    energies = _energy_ledger(
+        eps_scan,
+        f_base,
+        scan_weights,
+        mu=mu_broadcast,
+        kT=kT,
+        spin_degeneracy=spin_degeneracy,
+        k_axis=scan_k_axis,
+    )
+
+    return FixedMuScanResult(
+        mu_grid=mu_values,
+        kT=kT,
+        spin_degeneracy=spin_degeneracy,
+        eigvals=bands.eigvals,
+        occupations=occupations,
+        occupation_response=occupation_response,
+        electron_count=electron_count,
+        dos_like_response=dos_like_response,
+        energies=energies,
+        k_weights=weights,
+        k_axis=k_axis_c,
+        min_overlap_eig=bands.min_overlap_eig,
+        overlap_condition=bands.overlap_condition,
+        normalize_k_weights=normalize_k_weights,
+        eig_floor=eig_floor,
+        max_condition=max_condition,
+        hermitian_tol=hermitian_tol,
     )
 
 
