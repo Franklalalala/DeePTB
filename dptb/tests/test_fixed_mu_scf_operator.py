@@ -289,6 +289,26 @@ def test_pdiis_and_linear_converge_to_same_fixed_point():
     )
 
 
+def test_pdiis_rejects_a_residual_increasing_pulay_candidate():
+    # This rounded one-level case previously stagnated above residual 0.27
+    # through 200 iterations, while the same linear iteration converges in 19.
+    result = _one_level_scf(
+        epsilon=1.67,
+        mu=-0.04,
+        kT=0.012,
+        gamma=1.72,
+        reference_population=1.0,
+        mixing="pdiis",
+        mixing_step=0.2,
+        charge_tol=1e-8,
+        max_iter=200,
+    )
+
+    assert result.iterations < 200
+    assert result.residual_history[-1] <= result.charge_tol
+    assert result.potential_residual <= result.potential_tol
+
+
 def test_max_iter_failure_carries_iterations_and_residual_history():
     with pytest.raises(FixedMuSCFConvergenceError) as caught:
         _one_level_scf(
