@@ -29,6 +29,7 @@ ArrayLike = Any
 
 _KERNEL_SYMMETRY_TOL = 1e-12
 _ALLOWED_MIXING = ("pdiis", "linear")
+_PDIIS_PINV_RCOND = 1e-12
 
 
 class FixedMuSCFError(FixedMuOperatorError):
@@ -96,6 +97,13 @@ class FixedMuSCFResult:
     hermitian_tol: float
     potential_residual: float = 0.0
     potential_tol: float = 1e-8
+    pdiis_safeguard: bool = True
+    pdiis_gram_condition_threshold: float = 1e10
+    pdiis_step_ratio_threshold: float = 40.0
+    pdiis_residual_growth_threshold: float = 1.0
+    pdiis_gram_fallbacks: int = 0
+    pdiis_step_ratio_fallbacks: int = 0
+    pdiis_residual_growth_fallbacks: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.fixed_mu_result, FixedMuResult):
@@ -168,6 +176,46 @@ class FixedMuSCFResult:
         object.__setattr__(self, "charge_tol", charge_tol)
         object.__setattr__(self, "potential_residual", potential_residual)
         object.__setattr__(self, "potential_tol", potential_tol)
+        object.__setattr__(
+            self,
+            "pdiis_safeguard",
+            _as_bool("pdiis_safeguard", self.pdiis_safeguard),
+        )
+        for field_name in (
+            "pdiis_gram_condition_threshold",
+            "pdiis_step_ratio_threshold",
+            "pdiis_residual_growth_threshold",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _as_float_scalar(
+                    field_name, getattr(self, field_name), positive=True
+                ),
+            )
+        fallback_fields = (
+            "pdiis_gram_fallbacks",
+            "pdiis_step_ratio_fallbacks",
+            "pdiis_residual_growth_fallbacks",
+        )
+        for field_name in fallback_fields:
+            object.__setattr__(
+                self,
+                field_name,
+                _as_nonnegative_int(field_name, getattr(self, field_name)),
+            )
+        fallback_total = sum(getattr(self, name) for name in fallback_fields)
+        if fallback_total > iterations:
+            raise FixedMuSCFError(
+                "the total number of PDIIS fallbacks cannot exceed iterations"
+            )
+        if (
+            mixing != "pdiis" or not self.pdiis_safeguard
+        ) and fallback_total:
+            raise FixedMuSCFError(
+                "PDIIS fallback counts must be zero when safeguarded PDIIS "
+                "is not active"
+            )
         object.__setattr__(
             self,
             "divergence_tol",
@@ -247,6 +295,21 @@ class FixedMuSCFResult:
                 "serialized fixed-mu SCF result lacks the potential-closure "
                 f"certificate fields: {missing}"
             )
+        missing_strategy = {
+            "pdiis_safeguard",
+            "pdiis_gram_condition_threshold",
+            "pdiis_step_ratio_threshold",
+            "pdiis_residual_growth_threshold",
+            "pdiis_gram_fallbacks",
+            "pdiis_step_ratio_fallbacks",
+            "pdiis_residual_growth_fallbacks",
+        }.difference(state)
+        if missing_strategy:
+            missing = ", ".join(sorted(missing_strategy))
+            raise FixedMuSCFError(
+                "serialized fixed-mu SCF result lacks the safeguarded-PDIIS "
+                f"strategy fields: {missing}"
+            )
         for key, value in state.items():
             object.__setattr__(self, key, value)
         self.__post_init__()
@@ -316,6 +379,21 @@ def _as_positive_int(name: str, value: Any) -> int:
     out = int(value)
     if out <= 0:
         raise FixedMuSCFError(f"{name} must be a positive integer, got {value!r}")
+    return out
+
+
+def _as_nonnegative_int(name: str, value: Any) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise FixedMuSCFError(
+            f"{name} must be a nonnegative integer, got {value!r}"
+        )
+    out = int(value)
+    if out < 0:
+        raise FixedMuSCFError(
+            f"{name} must be a nonnegative integer, got {value!r}"
+        )
     return out
 
 
@@ -516,13 +594,48 @@ def _pdiis_step(
     f_history = np.stack(residual_differences, axis=0)
     r_history = np.stack(state_differences, axis=0)
     gram = f_history @ f_history.T
-    coefficients = np.linalg.pinv(gram, rcond=1e-12) @ (
+    coefficients = np.linalg.pinv(gram, rcond=_PDIIS_PINV_RCOND) @ (
         f_history @ residual
     )
     correction = (
         r_history.T + mixing_step * f_history.T
     ) @ coefficients
     return q + mixing_step * residual - correction
+
+
+def _pdiis_gram_condition(
+    residual_differences: list[np.ndarray],
+) -> float:
+    """Condition number of the numerical Gram range used by PDIIS.
+
+    The history Gram matrix is structurally rank deficient whenever history
+    length exceeds charge-state dimension.  In particular, every mature
+    one-level history has this property.  The safeguard therefore measures
+    the eigenvalue range retained by the same relative cutoff as the legacy
+    pseudoinverse instead of treating structural null directions as physical
+    ill-conditioning.
+    """
+
+    if not residual_differences:
+        return 1.0
+    f_history = np.stack(residual_differences, axis=0)
+    with np.errstate(over="ignore", invalid="ignore"):
+        gram = f_history @ f_history.T
+    if not np.isfinite(gram).all():
+        return float("inf")
+    try:
+        eigenvalues = np.linalg.eigvalsh(0.5 * (gram + gram.T))
+    except np.linalg.LinAlgError:
+        return float("inf")
+    largest = float(np.max(np.abs(eigenvalues)))
+    if not np.isfinite(largest) or largest <= 0.0:
+        return float("inf")
+    retained = np.abs(eigenvalues)[
+        np.abs(eigenvalues) > _PDIIS_PINV_RCOND * largest
+    ]
+    if retained.size == 0:
+        return float("inf")
+    return largest / float(np.min(retained))
 
 
 def fixed_mu_electrostatic_scf(
@@ -538,6 +651,10 @@ def fixed_mu_electrostatic_scf(
     mixing_step: float = 0.2,
     n_history: int = 6,
     mixing_period: int = 3,
+    pdiis_safeguard: bool = True,
+    pdiis_gram_condition_threshold: float = 1e10,
+    pdiis_step_ratio_threshold: float = 40.0,
+    pdiis_residual_growth_threshold: float = 1.0,
     max_iter: int = 100,
     charge_tol: float = 1e-8,
     potential_tol: float = 1e-8,
@@ -574,12 +691,36 @@ def fixed_mu_electrostatic_scf(
     above ``divergence_tol``, and exhaustion of ``max_iter`` raise
     :class:`FixedMuSCFConvergenceError` with the iteration count and residual
     history.
+
+    Periodic Pulay keeps a linear candidate at every step.  By default a
+    Pulay proposal is rejected in favor of that candidate when the numerical
+    Gram range is ill-conditioned, its step is too large relative to the
+    linear step, or an independent trial evaluation worsens the charge
+    residual.  Rejection clears the Pulay history.  Set
+    ``pdiis_safeguard=False`` to reproduce the historical unsafeguarded PDIIS
+    update exactly.
     """
 
     mixing = _validate_mixing(mixing)
     mixing_step = _validate_mixing_step(mixing_step)
     n_history = _as_positive_int("n_history", n_history)
     mixing_period = _as_positive_int("mixing_period", mixing_period)
+    pdiis_safeguard = _as_bool("pdiis_safeguard", pdiis_safeguard)
+    pdiis_gram_condition_threshold = _as_float_scalar(
+        "pdiis_gram_condition_threshold",
+        pdiis_gram_condition_threshold,
+        positive=True,
+    )
+    pdiis_step_ratio_threshold = _as_float_scalar(
+        "pdiis_step_ratio_threshold",
+        pdiis_step_ratio_threshold,
+        positive=True,
+    )
+    pdiis_residual_growth_threshold = _as_float_scalar(
+        "pdiis_residual_growth_threshold",
+        pdiis_residual_growth_threshold,
+        positive=True,
+    )
     max_iter = _as_positive_int("max_iter", max_iter)
     charge_tol = _as_float_scalar("charge_tol", charge_tol, positive=True)
     potential_tol = _as_float_scalar(
@@ -658,6 +799,9 @@ def fixed_mu_electrostatic_scf(
     state_differences: list[np.ndarray] = []
     previous_q: Optional[np.ndarray] = None
     previous_residual: Optional[np.ndarray] = None
+    pdiis_gram_fallbacks = 0
+    pdiis_step_ratio_fallbacks = 0
+    pdiis_residual_growth_fallbacks = 0
 
     for iteration in range(1, max_iter + 1):
         with np.errstate(over="ignore", invalid="ignore"):
@@ -750,6 +894,19 @@ def fixed_mu_electrostatic_scf(
                 hermitian_tol=terminal_result.hermitian_tol,
                 potential_residual=potential_residual,
                 potential_tol=potential_tol,
+                pdiis_safeguard=pdiis_safeguard,
+                pdiis_gram_condition_threshold=(
+                    pdiis_gram_condition_threshold
+                ),
+                pdiis_step_ratio_threshold=pdiis_step_ratio_threshold,
+                pdiis_residual_growth_threshold=(
+                    pdiis_residual_growth_threshold
+                ),
+                pdiis_gram_fallbacks=pdiis_gram_fallbacks,
+                pdiis_step_ratio_fallbacks=pdiis_step_ratio_fallbacks,
+                pdiis_residual_growth_fallbacks=(
+                    pdiis_residual_growth_fallbacks
+                ),
             )
 
         if previous_q is not None and previous_residual is not None:
@@ -763,17 +920,67 @@ def fixed_mu_electrostatic_scf(
             break
         linear_candidate = q + mixing_step * residual_vector
         if mixing == "pdiis" and iteration % mixing_period == 0:
-            pdiis_candidate = _pdiis_step(
-                q,
-                residual_vector,
-                residual_differences,
-                state_differences,
-                mixing_step=mixing_step,
-            )
-            if _trial_residual_norm(pdiis_candidate) < residual:
-                q_next = pdiis_candidate
-            else:
+            if not pdiis_safeguard:
+                q_next = _pdiis_step(
+                    q,
+                    residual_vector,
+                    residual_differences,
+                    state_differences,
+                    mixing_step=mixing_step,
+                )
+            elif not residual_differences:
                 q_next = linear_candidate
+            else:
+                gram_condition = _pdiis_gram_condition(
+                    residual_differences
+                )
+                fallback = False
+                if (
+                    not np.isfinite(gram_condition)
+                    or gram_condition > pdiis_gram_condition_threshold
+                ):
+                    pdiis_gram_fallbacks += 1
+                    fallback = True
+                else:
+                    try:
+                        pdiis_candidate = _pdiis_step(
+                            q,
+                            residual_vector,
+                            residual_differences,
+                            state_differences,
+                            mixing_step=mixing_step,
+                        )
+                    except np.linalg.LinAlgError:
+                        pdiis_gram_fallbacks += 1
+                        fallback = True
+                    else:
+                        linear_step_norm = float(
+                            np.max(np.abs(linear_candidate - q))
+                        )
+                        pdiis_step_norm = float(
+                            np.max(np.abs(pdiis_candidate - q))
+                        )
+                        step_ratio = pdiis_step_norm / max(
+                            linear_step_norm, 1e-300
+                        )
+                        if (
+                            not np.isfinite(step_ratio)
+                            or step_ratio > pdiis_step_ratio_threshold
+                        ):
+                            pdiis_step_ratio_fallbacks += 1
+                            fallback = True
+                        elif (
+                            _trial_residual_norm(pdiis_candidate)
+                            > pdiis_residual_growth_threshold * residual
+                        ):
+                            pdiis_residual_growth_fallbacks += 1
+                            fallback = True
+                if fallback:
+                    q_next = linear_candidate
+                    residual_differences.clear()
+                    state_differences.clear()
+                else:
+                    q_next = pdiis_candidate
         else:
             q_next = linear_candidate
         if not np.isfinite(q_next).all():
