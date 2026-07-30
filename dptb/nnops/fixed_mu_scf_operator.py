@@ -622,6 +622,37 @@ def fixed_mu_electrostatic_scf(
         initial_result.density, s_arr, ao, reference
     )
 
+    def _trial_residual_norm(candidate: np.ndarray) -> float:
+        """Return the fixed-point residual of a mixing candidate.
+
+        Periodic Pulay is accepted only after this independent merit-function
+        evaluation.  Candidate-specific numerical failures map to infinity so
+        the caller can safely fall back to the linear step.
+        """
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            trial_phi = kernel @ candidate
+            trial_h = _electrostatic_hamiltonian(
+                h0_arr, s_arr, ao, trial_phi
+            )
+        if not np.isfinite(trial_phi).all() or not np.isfinite(trial_h).all():
+            return float("inf")
+        try:
+            trial_result = fixed_mu_observables(
+                trial_h, s_arr, **fixed_mu_kwargs
+            )
+        except (FixedMuOperatorError, np.linalg.LinAlgError):
+            return float("inf")
+        trial_q_out = _mulliken_net_charges(
+            trial_result.density, s_arr, ao, reference
+        )
+        trial_residual = trial_q_out - candidate
+        if not np.isfinite(trial_q_out).all() or not np.isfinite(
+            trial_residual
+        ).all():
+            return float("inf")
+        return float(np.max(np.abs(trial_residual)))
+
     residual_history: list[float] = []
     residual_differences: list[np.ndarray] = []
     state_differences: list[np.ndarray] = []
@@ -730,16 +761,21 @@ def fixed_mu_electrostatic_scf(
 
         if iteration == max_iter:
             break
+        linear_candidate = q + mixing_step * residual_vector
         if mixing == "pdiis" and iteration % mixing_period == 0:
-            q_next = _pdiis_step(
+            pdiis_candidate = _pdiis_step(
                 q,
                 residual_vector,
                 residual_differences,
                 state_differences,
                 mixing_step=mixing_step,
             )
+            if _trial_residual_norm(pdiis_candidate) < residual:
+                q_next = pdiis_candidate
+            else:
+                q_next = linear_candidate
         else:
-            q_next = q + mixing_step * residual_vector
+            q_next = linear_candidate
         if not np.isfinite(q_next).all():
             raise FixedMuSCFConvergenceError(
                 "fixed-mu electrostatic SCF mixing produced a non-finite "
