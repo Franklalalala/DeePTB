@@ -668,7 +668,10 @@ def _charge_residual_floor(charges: np.ndarray, total_charge: np.ndarray) -> np.
     """
 
     scale = np.sum(np.abs(charges), axis=-1) + np.abs(total_charge)
-    summation_ulps = max(_ARITHMETIC_FLOOR_ULPS, float(charges.shape[-1] + 1))
+    # Summing n sites and subtracting Q takes at most n + 1 rounded scalar
+    # operations.  Do not reuse the much looser stationarity ULP budget here:
+    # for n == 1 and a large Q that would certify a macroscopic charge leak.
+    summation_ulps = float(charges.shape[-1] + 1)
     return summation_ulps * _MACHINE_EPS * scale
 
 
@@ -978,8 +981,8 @@ def validate_qeq_result(
             "total_charge request",
             qtot,
             expected_qtot,
-            atol=atol,
-            rtol=_RECOMPUTE_RTOL,
+            atol=0.0,
+            floor=_charge_residual_floor(expected_qtot[..., None], qtot),
         )
 
     asym = kernel - np.swapaxes(kernel, -1, -2)
