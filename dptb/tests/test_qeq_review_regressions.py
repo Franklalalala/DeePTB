@@ -101,6 +101,35 @@ def test_uniform_kernel_gauge_does_not_relax_tangent_gate():
         qeq.validate_qeq_result(forged)
 
 
+def test_single_site_large_charge_does_not_inherit_stationarity_ulp_budget():
+    """A one-site charge certificate has no 64-ULP stationarity allowance."""
+
+    total_charge = 1.0e16
+    leaked_charge = total_charge + 128.0
+    forged = _self_consistent_qeq_result(
+        [0.0],
+        [[1.0]],
+        [leaked_charge],
+        total_charge,
+        multiplier=-leaked_charge,
+    )
+
+    with pytest.raises(qeq.QEqOperatorError, match=r"sum\(q\) = total_charge"):
+        qeq.validate_qeq_result(forged)
+
+
+def test_charge_floor_is_per_batch_item_and_rejects_all_zero_large_q():
+    charges = np.array([[0.0], [1.0e16 + 128.0], [1.0]])
+    total_charge = np.array([1.0e16, 1.0e16, 1.0])
+    residual = np.sum(charges, axis=-1) - total_charge
+    floor = qeq._charge_residual_floor(charges, total_charge)
+
+    np.testing.assert_array_equal(
+        np.abs(residual) <= floor,
+        np.array([False, False, True]),
+    )
+
+
 @pytest.mark.parametrize("alpha", GAUGE_ALPHAS)
 @pytest.mark.parametrize("total_charge", [0.0, 1.25])
 def test_gauge_sweep_solves_exactly_and_rejects_a_forged_charge_vector(alpha, total_charge):
