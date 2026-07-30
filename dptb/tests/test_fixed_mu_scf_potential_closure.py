@@ -1,4 +1,5 @@
 from dataclasses import replace
+import pickle
 
 import numpy as np
 import pytest
@@ -50,6 +51,7 @@ def test_default_charge_tolerance_cannot_hide_amplified_potential_mismatch():
         _one_level(
             reference_populations=[3.0],
             coulomb_kernel=np.array([[1.0e12]]),
+            mixing_step=0.2,
             charge_tol=1.0e-8,
             potential_tol=0.1,
             max_iter=100,
@@ -80,3 +82,18 @@ def test_scf_result_metadata_cannot_be_relabelled():
 
     with pytest.raises(FixedMuSCFError, match="spin_degeneracy does not match"):
         replace(result, spin_degeneracy=1.0)
+
+
+def test_pickle_roundtrip_preserves_certificate_and_legacy_payload_fails_closed():
+    result = _one_level()
+    restored = pickle.loads(pickle.dumps(result))
+
+    assert restored.potential_residual == result.potential_residual
+    assert restored.potential_tol == result.potential_tol
+
+    legacy_state = result.__getstate__()
+    del legacy_state["potential_residual"]
+    del legacy_state["potential_tol"]
+    legacy = object.__new__(type(result))
+    with pytest.raises(FixedMuSCFError, match="lacks the potential-closure"):
+        legacy.__setstate__(legacy_state)

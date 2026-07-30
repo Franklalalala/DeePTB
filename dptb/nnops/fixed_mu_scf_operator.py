@@ -237,6 +237,16 @@ class FixedMuSCFResult:
         }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
+        missing_certificate = {
+            "potential_residual",
+            "potential_tol",
+        }.difference(state)
+        if missing_certificate:
+            missing = ", ".join(sorted(missing_certificate))
+            raise FixedMuSCFError(
+                "serialized fixed-mu SCF result lacks the potential-closure "
+                f"certificate fields: {missing}"
+            )
         for key, value in state.items():
             object.__setattr__(self, key, value)
         self.__post_init__()
