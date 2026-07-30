@@ -12,6 +12,12 @@ from dptb.nnops.fixed_mu_operator import (
     hermitian_part,
     validate_conservation,
 )
+from dptb.nnops.fixed_mu_scf_operator import (
+    FixedMuSCFConvergenceError,
+    FixedMuSCFError,
+    FixedMuSCFResult,
+    fixed_mu_electrostatic_scf,
+)
 from dptb.nnops.qeq_operator import (
     QEqDiagnostics,
     QEqKernelConditionError,
@@ -27,6 +33,9 @@ __all__ = [
     "EnergyLedger",
     "FixedMuOperatorError",
     "FixedMuResult",
+    "FixedMuSCFConvergenceError",
+    "FixedMuSCFError",
+    "FixedMuSCFResult",
     "GeneralizedBands",
     "OverlapConditionError",
     "QEqDiagnostics",
@@ -37,6 +46,7 @@ __all__ = [
     "fermi_dirac",
     "fixed_mu_observables",
     "fixed_mu_observables_from_torch",
+    "fixed_mu_electrostatic_scf",
     "generalized_bands",
     "hermitian_part",
     "solve_qeq",
