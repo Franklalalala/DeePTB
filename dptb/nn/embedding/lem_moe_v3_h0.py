@@ -16,7 +16,12 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
-from .lem_moe_v3 import LemMoEV3
+from .lem_moe_v3 import (
+    LemMoEV3,
+    COMMITTEE_EXTRA_EDGE_HAMILTONIAN_KEY,
+    COMMITTEE_EXTRA_NODE_HAMILTONIAN_KEY,
+    unpack_block_native_head_outputs,
+)
 from .lem_moe_v3_h0_helpers import H0InitLayer
 from .flow_time import FlowTimeConditioner
 from .late_block_expansion_cg import LateBlockExpansionCGHead
@@ -102,9 +107,25 @@ class LemMoEV3H0(LemMoEV3):
                 raise ValueError(
                     "condition_source='endpoints' requires output_route='h_b0'."
                 )
-            self.out_edge.configure_condition_source(
-                "endpoints", node_irreps=self.layers[-1].irreps_out
-            )
+            # Committee heads (self.out_edge is a ModuleList when enabled)
+            # must ALL be reconfigured -- not just a representative head, as
+            # with the read-only irreps_in lookups elsewhere -- because this
+            # call mutates per-head state (`condition_source` /
+            # `_node_scalar_indices`) that `_apply_one_output_head` reads
+            # back per head during forward(). Leaving heads 1..K-1 on the
+            # default 'edge_0e' source while head 0 uses 'endpoints' would
+            # silently make the heads structurally inconsistent instead of
+            # differing only by random init, defeating the committee's
+            # single-architecture premise without ever raising an error.
+            if getattr(self, "committee_enabled", False):
+                for _committee_edge_head in self.out_edge:
+                    _committee_edge_head.configure_condition_source(
+                        "endpoints", node_irreps=self.layers[-1].irreps_out
+                    )
+            else:
+                self.out_edge.configure_condition_source(
+                    "endpoints", node_irreps=self.layers[-1].irreps_out
+                )
         self.log_head_input_rms = bool(log_head_input_rms)
         if self.log_head_input_rms and self.output_route_name != "h_b0":
             raise ValueError(
@@ -472,16 +493,22 @@ class LemMoEV3H0(LemMoEV3):
                 active_edges,
                 **head_kwargs,
             )
-            if getattr(self, "log_head_input_rms", False):
-                out_node_blocks, out_edge_blocks, head_input_rms = head_outputs
+            committee_enabled = getattr(self, "committee_enabled", False)
+            (
+                out_node_blocks,
+                out_edge_blocks,
+                extra_node_blocks,
+                extra_edge_blocks,
+                head_input_rms,
+            ) = unpack_block_native_head_outputs(head_outputs, committee_enabled)
+            if head_input_rms is not None:
                 data["head_input_rms"] = head_input_rms
-            else:
-                out_node_blocks, out_edge_blocks = head_outputs
+            edge_head_for_shape = self.out_edge[0] if committee_enabled else self.out_edge
             data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
             data[_keys.EDGE_HAMILTONIAN_KEY] = torch.zeros(
                 edge_index.shape[1],
-                self.out_edge.max_norb,
-                self.out_edge.max_norb,
+                edge_head_for_shape.max_norb,
+                edge_head_for_shape.max_norb,
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -491,6 +518,19 @@ class LemMoEV3H0(LemMoEV3):
                 active_edges,
                 out_edge_blocks,
             )
+            if committee_enabled:
+                data[COMMITTEE_EXTRA_NODE_HAMILTONIAN_KEY] = extra_node_blocks
+                num_extra = extra_edge_blocks.shape[0]
+                full_extra_edge = extra_edge_blocks.new_zeros(
+                    (
+                        num_extra,
+                        edge_index.shape[1],
+                        edge_head_for_shape.max_norb,
+                        edge_head_for_shape.max_norb,
+                    )
+                )
+                full_extra_edge = full_extra_edge.index_copy(1, active_edges, extra_edge_blocks)
+                data[COMMITTEE_EXTRA_EDGE_HAMILTONIAN_KEY] = full_extra_edge
             node_shapes, edge_shapes = infer_block_shapes(
                 data, self.idp, device=out_node_blocks.device
             )

@@ -52,6 +52,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     strict_reverse_edge_index,
 )
 from dptb.nnops.block_flow_codec import project_block_state
+from dptb.nnops.block_ode.committee_endpoint_stats import committee_auxiliary_loss
 from dptb.nnops.flow_context import CFMContext
 
 
@@ -239,4 +240,27 @@ def block_ode_endpoint_loss(
         state["train_compatible_directed_onsite_loss"] = directed_node_stats[0].detach()
         state["train_compatible_directed_hopping_loss"] = directed_edge_stats[0].detach()
         state["train_compatible_directed_loss"] = directed_total.detach()
+
+    # Optional committee (multi-head) auxiliary loss -- strict no-op unless the
+    # embedding's committee_num_heads > 1 AND
+    # flow_options.committee_aux_loss_weight > 0 (see
+    # committee_endpoint_stats.committee_auxiliary_loss docstring). Deliberately
+    # added to `total` (the value `_finalize_loss` turns into train_flow_loss),
+    # not into the `_compatible_clean_stats` payload above: the compatible/
+    # endpoint telemetry (train_compatible_*, validation_onsite_loss, etc.)
+    # must keep reflecting the primary head ONLY, so committee and non-committee
+    # runs stay comparable on that channel.
+    total, state = committee_auxiliary_loss(
+        owner,
+        pred_data,
+        ref_data,
+        ctx,
+        total=total,
+        state=state,
+        target_projected=target_projected,
+        node_shapes=node_shapes,
+        edge_shapes=edge_shapes,
+        node_mask=node_mask,
+        edge_mask=edge_mask,
+    )
     return owner._finalize_loss(total, state, pred_data)

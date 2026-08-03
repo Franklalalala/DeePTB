@@ -171,6 +171,12 @@ class HamiltonianCFM:
     ) -> None:
         options = canonicalize_flow_options(options)
         self.enabled = bool(options.get("enabled", False))
+        self.loop_enabled = bool(options.get("loop_enabled", False))
+        self.loop_min_circles = int(options.get("loop_min_circles", 1))
+        self.loop_max_circles = int(options.get("loop_max_circles", 3))
+        self.loop_gradient_mode = str(
+            options.get("loop_gradient_mode", "detach")
+        ).strip().lower()
         self.options = options
         self.idp = idp
         self.dtype = _to_torch_dtype(dtype)
@@ -202,6 +208,20 @@ class HamiltonianCFM:
         self.residual_ao_block_ode = self.output_space == "residual_ao_block_ode"
         if self.residual_ao_block_ode:
             self.block_ode = True
+        if self.loop_min_circles < 1 or self.loop_max_circles < self.loop_min_circles:
+            raise ValueError(
+                "flow_options loop circle range must satisfy "
+                "1 <= loop_min_circles <= loop_max_circles."
+            )
+        if self.loop_gradient_mode not in {"detach", "bptt2"}:
+            raise ValueError(
+                "flow_options.loop_gradient_mode must be 'detach' or 'bptt2'."
+            )
+        if self.loop_enabled and not self.residual_ao_block_ode:
+            raise ValueError(
+                "flow_options.loop_enabled=true currently requires "
+                "output_space='residual_ao_block_ode'."
+            )
         if self.output_space not in {"rme", "ao_block", "ao_block_ode", "uureal_block_ode", "residual_ao_block_ode"}:
             raise ValueError(
                 "flow_options.output_space must be 'rme', 'ao_block', or "
@@ -834,6 +854,19 @@ class HamiltonianCFM:
         self.node_weight = float(options.get("node_weight", 1.0))
         self.edge_weight = float(options.get("edge_weight", 1.0))
         self.router_z_loss_coef = float(options.get("z_loss_coef", 0.0))
+        # Optional multi-head committee auxiliary loss (flag-gated; default 0.0
+        # is a strict no-op). Consumed by
+        # dptb.nnops.block_ode.committee_endpoint_stats.committee_auxiliary_loss,
+        # which is itself a no-op unless the embedding also wrote committee
+        # extra-head prediction keys (committee_num_heads > 1).
+        self.committee_aux_loss_weight = float(
+            options.get("committee_aux_loss_weight", 0.0)
+        )
+        if not math.isfinite(self.committee_aux_loss_weight) or self.committee_aux_loss_weight < 0.0:
+            raise ValueError(
+                "flow_options.committee_aux_loss_weight must be finite and "
+                f"non-negative, got {self.committee_aux_loss_weight!r}."
+            )
 
         # Safety switches.
         self.overwrite_feature_keys = bool(options.get("overwrite_feature_keys", True))
@@ -2873,6 +2906,193 @@ class HamiltonianCFM:
             block_target_semantics=self.target_semantics if self.block_ode else None,
         )
 
+    @staticmethod
+    def _loop_detach_block_state(state: BlockTensorResult) -> BlockTensorResult:
+        return BlockTensorResult(
+            state.node_blocks.detach(),
+            state.edge_blocks.detach(),
+            state.node_shapes,
+            state.edge_shapes,
+        )
+
+    def _loop_write_authority(
+        self,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        h0: BlockTensorResult,
+        residual: BlockTensorResult,
+    ) -> None:
+        """Write one loop circle's authoritative H0 and residual AO blocks."""
+        for target in (data, ref_data):
+            target[self.node_h0_block_key] = h0.node_blocks
+            target[self.edge_h0_block_key] = h0.edge_blocks
+            target[self.node_h0_block_shape_key] = h0.node_shapes
+            target[self.edge_h0_block_shape_key] = h0.edge_shapes
+            target[self.node_block_target_key] = residual.node_blocks
+            target[self.edge_block_target_key] = residual.edge_blocks
+            target[self.node_block_shape_key] = residual.node_shapes
+            target[self.edge_block_shape_key] = residual.edge_shapes
+
+    def loop_loss_with_model(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        ref_data: AtomicDataDict.Type,
+        *,
+        num_circles: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Run shared-weight residual refinement and supervise only the last circle.
+
+        The physical Hamiltonian and remaining label residual stay in authoritative
+        AO-block space between circles. ``prepare_batch`` regenerates the model-facing
+        H0 RME channel on every pass instead of recycling a cached feature tensor.
+        """
+        if not self.loop_enabled:
+            raise RuntimeError("loop_loss_with_model called while loop is disabled.")
+        if not self.residual_ao_block_ode:
+            raise RuntimeError(
+                "Shared-weight loop is implemented only for residual_ao_block_ode."
+            )
+        if num_circles is None:
+            num_circles = int(
+                torch.randint(
+                    self.loop_min_circles,
+                    self.loop_max_circles + 1,
+                    (),
+                ).item()
+            )
+        num_circles = int(num_circles)
+        if not self.loop_min_circles <= num_circles <= self.loop_max_circles:
+            raise ValueError(
+                f"num_circles={num_circles} is outside configured range "
+                f"[{self.loop_min_circles}, {self.loop_max_circles}]."
+            )
+
+        self._require_spatial_residual_block_contract(data)
+        self._require_spatial_residual_block_contract(ref_data)
+        current_h0, _ = self._physical_h0_blocks(
+            data, device=self.device, dtype=self.dtype
+        )
+        current_residual, _ = self._block_state_from_fields(
+            ref_data,
+            ref_data,
+            node_key=self.node_block_target_key,
+            edge_key=self.edge_block_target_key,
+            node_shape_key=self.node_block_shape_key,
+            edge_shape_key=self.edge_block_shape_key,
+            label="loop residual endpoint",
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        base_data = data.copy()
+        base_ref = ref_data.copy()
+        update_abs_max = torch.zeros((), device=self.device, dtype=self.dtype)
+        endpoint_change_abs_max = torch.zeros(
+            (), device=self.device, dtype=self.dtype
+        )
+        previous_endpoint = None
+        final_loss = None
+        final_state = None
+
+        for circle_index in range(num_circles):
+            circle_data = base_data.copy()
+            circle_ref = base_ref.copy()
+            self._loop_write_authority(
+                circle_data, circle_ref, current_h0, current_residual
+            )
+            prepared, prepared_ref, ctx = self.prepare_batch(circle_data, circle_ref)
+            prediction = model(prepared)
+            self._require_fresh_block_ode_outputs(
+                prediction, step=circle_index + 1
+            )
+
+            current = BlockTensorResult(
+                torch.as_tensor(ctx.node_current),
+                torch.as_tensor(ctx.edge_current),
+                torch.as_tensor(
+                    prepared[_keys.NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY]
+                ),
+                torch.as_tensor(
+                    prepared[_keys.EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY]
+                ),
+            )
+            endpoint = self._route_adapters.residual.decode_endpoint(
+                self, prediction, prediction, current, ctx
+            )
+            if previous_endpoint is not None:
+                endpoint_change_abs_max = torch.maximum(
+                    endpoint_change_abs_max,
+                    torch.maximum(
+                        (
+                            endpoint.node_blocks.detach()
+                            - previous_endpoint.node_blocks
+                        ).abs().max(),
+                        (
+                            endpoint.edge_blocks.detach()
+                            - previous_endpoint.edge_blocks
+                        ).abs().max(),
+                    ),
+                )
+            previous_endpoint = self._loop_detach_block_state(endpoint)
+
+            if circle_index == num_circles - 1:
+                final_loss, final_state = self.loss(
+                    prediction, prepared_ref, ctx
+                )
+                break
+
+            detach_transition = self.loop_gradient_mode == "detach" or (
+                self.loop_gradient_mode == "bptt2"
+                and circle_index < num_circles - 2
+            )
+            if detach_transition:
+                endpoint = self._loop_detach_block_state(endpoint)
+
+            update_abs_max = torch.maximum(
+                update_abs_max,
+                torch.maximum(
+                    endpoint.node_blocks.detach().abs().max(),
+                    endpoint.edge_blocks.detach().abs().max(),
+                ),
+            )
+            current_h0 = project_block_state(
+                prediction,
+                self.idp,
+                BlockTensorResult(
+                    current_h0.node_blocks + endpoint.node_blocks,
+                    current_h0.edge_blocks + endpoint.edge_blocks,
+                    current_h0.node_shapes,
+                    current_h0.edge_shapes,
+                ),
+            )
+            current_residual = project_block_state(
+                prediction,
+                self.idp,
+                BlockTensorResult(
+                    current_residual.node_blocks - endpoint.node_blocks,
+                    current_residual.edge_blocks - endpoint.edge_blocks,
+                    current_residual.node_shapes,
+                    current_residual.edge_shapes,
+                ),
+            )
+
+        if final_loss is None or final_state is None:
+            raise RuntimeError("Shared-weight loop failed to produce a final loss.")
+        final_state["train_loop_circles"] = torch.as_tensor(
+            float(num_circles), device=self.device, dtype=self.dtype
+        )
+        final_state["train_loop_bptt2"] = torch.as_tensor(
+            float(self.loop_gradient_mode == "bptt2"),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        final_state["train_loop_update_abs_max"] = update_abs_max.detach()
+        final_state["train_loop_endpoint_change_abs_max"] = (
+            endpoint_change_abs_max.detach()
+        )
+        return final_loss, final_state
+
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
@@ -3745,6 +3965,58 @@ class HamiltonianCFM:
         state[self.flow_time_key] = torch.ones(num_graphs, device=like.device, dtype=like.dtype)
         return state
 
+    def sample_loop(
+        self,
+        model: torch.nn.Module,
+        data: AtomicDataDict.Type,
+        *,
+        num_circles: int,
+        prior_seed: Optional[int] = None,
+    ) -> list[AtomicDataDict.Type]:
+        """Run sequential one-step residual refinements with shared model weights.
+
+        Each circle uses the previous Full-H prediction as the next authoritative
+        physical-H0 block input.  Reusing ``prior_seed`` gives each structure the
+        same deterministic residual latent across circles.
+        """
+        if not self.residual_ao_block_ode:
+            raise RuntimeError(
+                "sample_loop is implemented only for residual_ao_block_ode."
+            )
+        num_circles = int(num_circles)
+        if num_circles < 1:
+            raise ValueError("num_circles must be >= 1.")
+
+        template = data.copy()
+        current_h0, _ = self._physical_h0_blocks(
+            template, device=self.device, dtype=self.dtype
+        )
+        outputs = []
+        for _circle_index in range(num_circles):
+            circle_data = template.copy()
+            circle_data[self.node_h0_block_key] = current_h0.node_blocks
+            circle_data[self.edge_h0_block_key] = current_h0.edge_blocks
+            circle_data[self.node_h0_block_shape_key] = current_h0.node_shapes
+            circle_data[self.edge_h0_block_shape_key] = current_h0.edge_shapes
+            sampled = self.sample(
+                model,
+                circle_data,
+                num_steps=1,
+                prior_seed=prior_seed,
+            )
+            outputs.append(sampled)
+            current_h0 = project_block_state(
+                sampled,
+                self.idp,
+                BlockTensorResult(
+                    sampled[self.node_output_key],
+                    sampled[self.edge_output_key],
+                    current_h0.node_shapes,
+                    current_h0.edge_shapes,
+                ),
+            )
+        return outputs
+
 
 def build_hamiltonian_flow(
     options: Optional[Dict[str, Any]],
@@ -4052,6 +4324,15 @@ def resolve_flow_log_fields(flow: Optional[HamiltonianCFM]) -> Tuple[list, bool]
         "train_flow_t",
         "train_flow_weight",
     ]
+    if getattr(flow, "loop_enabled", False):
+        fields.extend(
+            [
+                "train_loop_circles",
+                "train_loop_bptt2",
+                "train_loop_update_abs_max",
+                "train_loop_endpoint_change_abs_max",
+            ]
+        )
     if model_in_loss:
         fields.extend(
             [
