@@ -174,6 +174,10 @@ def flow_options():
     )
     args = [
         Argument("enabled", bool, optional=True, default=False),
+        Argument("loop_enabled", bool, optional=True, default=False),
+        Argument("loop_min_circles", int, optional=True, default=1),
+        Argument("loop_max_circles", int, optional=True, default=3),
+        Argument("loop_gradient_mode", str, optional=True, default="detach"),
         Argument("objective", str, optional=True, default="cfm"),
         Argument("mode", str, optional=True, default="residual"),
         Argument("prior", str, optional=True, default="zero"),
@@ -279,6 +283,13 @@ def flow_options():
                  doc="Finite non-negative edge loss multiplier. CFM global_elements "
                      "requires 1.0; use equal_components for node/edge multipliers."),
         Argument("z_loss_coef", (int, float), optional=True, default=0.0),
+        Argument("committee_aux_loss_weight", (int, float), optional=True, default=0.0,
+                 doc="Weight for the optional multi-head committee auxiliary loss "
+                     "(mean block_ode endpoint loss over the embedding's extra "
+                     "committee heads, added to the primary total). Strict no-op "
+                     "at the default 0.0 unless the embedding also sets "
+                     "committee_num_heads > 1; see "
+                     "dptb.nn.embedding.lem_moe_v3.LemMoEV3.committee_num_heads."),
         Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
         Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
         Argument("component_reduction", str, optional=True, default="global_elements",
@@ -1618,6 +1629,23 @@ def slem():
         Argument("norm_use_node_onehot", bool, optional=True, default=True, doc=doc_norm_use_node_onehot),
         Argument("norm_build_edge_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_edge_condition_branch),
         Argument("norm_use_edge_onehot", bool, optional=True, default=True, doc=doc_norm_use_edge_onehot),
+
+        # ---- Committee (multi-head) output heads ----
+        Argument("committee_num_heads", int, optional=True, default=1,
+                 doc="Number of independently-initialized output heads sharing "
+                     "one embedding trunk (cheap committee: only the final "
+                     "CG-expansion head is repeated, not the message-passing "
+                     "trunk). Default 1 reproduces the pre-committee "
+                     "single-head architecture bit-exactly -- same state_dict "
+                     "keys as before this feature existed, so old checkpoints "
+                     "keep strict-loading. Only output_contract='ao_block' "
+                     "routes (e.g. h_b0) currently support values > 1."),
+        Argument("committee_head_seed", int, optional=True, default=0,
+                 doc="Base RNG seed for committee heads 1..committee_num_heads-1 "
+                     "(head 0 keeps whatever seed state naturally reaches the "
+                     "single-head construction call, unchanged from before this "
+                     "feature existed). Head k is seeded with "
+                     "committee_head_seed+k. Ignored when committee_num_heads==1."),
     ]
 
 

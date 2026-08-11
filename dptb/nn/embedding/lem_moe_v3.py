@@ -913,6 +913,39 @@ def _apply_onehot_tp(tp: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, mode
     return _scalar_onehot_tp_fast(tp, x, y)
 
 
+# --- Committee (multi-head) output heads: shared data-dict keys -----------
+# Written only when committee_num_heads > 1 (default 1 = feature entirely
+# absent). Consumed by dptb.nnops.block_ode.committee_endpoint_stats for the
+# optional auxiliary training loss, and by offline analysis scripts.
+COMMITTEE_EXTRA_NODE_HAMILTONIAN_KEY = "committee_extra_node_hamiltonian_blocks"
+COMMITTEE_EXTRA_EDGE_HAMILTONIAN_KEY = "committee_extra_edge_hamiltonian_blocks"
+
+
+def unpack_block_native_head_outputs(head_outputs, committee_enabled: bool):
+    """Normalize the variable-length ``_apply_block_native_output_heads`` return.
+
+    Non-committee return shape is UNCHANGED from before this feature existed
+    (2-tuple, or 3-tuple when ``log_head_input_rms`` is set) -- this function
+    only exists to give the two ``forward()`` call sites (base class and the
+    H0 subclass) one shared unpacking implementation instead of two copies
+    that could drift. Always returns a 5-tuple:
+    ``(node_blocks, edge_blocks, extra_node_blocks_or_None, extra_edge_blocks_or_None, head_input_rms_or_None)``.
+    """
+    if committee_enabled:
+        if len(head_outputs) == 5:
+            node_blocks, edge_blocks, extra_node, extra_edge, head_input_rms = head_outputs
+        else:
+            node_blocks, edge_blocks, extra_node, extra_edge = head_outputs
+            head_input_rms = None
+        return node_blocks, edge_blocks, extra_node, extra_edge, head_input_rms
+    if len(head_outputs) == 3:
+        node_blocks, edge_blocks, head_input_rms = head_outputs
+    else:
+        node_blocks, edge_blocks = head_outputs
+        head_input_rms = None
+    return node_blocks, edge_blocks, None, None, head_input_rms
+
+
 @Embedding.register("lem_moe_v3")
 class LemMoEV3(torch.nn.Module):
     @staticmethod
@@ -1006,6 +1039,11 @@ class LemMoEV3(torch.nn.Module):
             num_shared_experts: int = 1,
             top_k: Optional[int] = 1,
             mole_full_expert_fast_path: bool = True,
+            # Committee output heads (flag-gated; default committee_num_heads=1
+            # reproduces the single-head architecture bit-exactly -- see the
+            # construction block near build_output_heads below).
+            committee_num_heads: int = 1,
+            committee_head_seed: int = 0,
             **kwargs,
     ):
 
@@ -1015,7 +1053,7 @@ class LemMoEV3(torch.nn.Module):
         lmax = irreps_hidden.lmax
         self.num_experts = num_experts
 
-        # 使用 log.info 打印参数
+        # ʹ�� log.info ��ӡ����
         log.info(f'[LemMoEV3] Initialized DeepSeek-V3 Style MoE.')
         log.info(f'  - Num Shared Experts: {num_shared_experts}')
         log.info(f'  - Num Routed Experts: {self.num_experts}')
@@ -1031,7 +1069,7 @@ class LemMoEV3(torch.nn.Module):
         else:
             log.info("  - EqV3 SO3 Grid FFN: disabled")
         mean_max_prob_lower_bound = 1.0 / self.num_experts
-        # 上界：One-Hot 分布，max为 1.0，平方为 1.0
+        # �Ͻ磺One-Hot �ֲ���maxΪ 1.0��ƽ��Ϊ 1.0
         mean_max_prob_upper_bound = 1.0
 
         log.info(f"[LemMoEV3] Theoretical mean_max_prob Bounds -> "
@@ -1196,7 +1234,7 @@ class LemMoEV3(torch.nn.Module):
             in_features=self.n_atom,
             num_experts=num_experts,
             top_k=top_k,
-            aux_loss_free=True,  # 开启 DeepSeek 负载均衡
+            aux_loss_free=True,  # ���� DeepSeek ���ؾ���
             bias_update_speed=0.005,
             full_expert_fast_path=mole_full_expert_fast_path,
         )
@@ -1347,6 +1385,64 @@ class LemMoEV3(torch.nn.Module):
             self.output_route_spec, head_context
         )
 
+        # --- Committee heads (flag-gated; default committee_num_heads=1 is a
+        # strict no-op: self.out_edge/self.out_node stay the single modules
+        # built above, with the exact same state_dict keys as before this
+        # feature existed, so old checkpoints keep strict-loading and forward()
+        # takes the unchanged single-head code path). ---
+        self.committee_num_heads = int(committee_num_heads)
+        self.committee_head_seed = int(committee_head_seed)
+        if self.committee_num_heads < 1:
+            raise ValueError(
+                f"committee_num_heads must be >= 1, got {self.committee_num_heads}."
+            )
+        self.committee_enabled = self.committee_num_heads > 1
+        if self.committee_enabled:
+            if self.output_head_contract != "ao_block":
+                raise ValueError(
+                    "committee_num_heads > 1 currently supports only "
+                    f"output_contract='ao_block' routes, got {self.output_head_contract!r}."
+                )
+            extra_edge_heads = [self.out_edge]
+            extra_node_heads = [self.out_node]
+            _committee_cpu_rng_state = torch.random.get_rng_state()
+            _committee_device = torch.device(self.device)
+            _committee_cuda_rng_state = (
+                torch.cuda.get_rng_state(_committee_device)
+                if torch.cuda.is_available() and _committee_device.type == "cuda"
+                else None
+            )
+            try:
+                for _committee_head_idx in range(1, self.committee_num_heads):
+                    # Explicit per-head seed so committee diversity comes from a
+                    # documented, reproducible source (different random init),
+                    # not from incidental RNG-stream position.
+                    torch.manual_seed(self.committee_head_seed + _committee_head_idx)
+                    _committee_edge_k, _committee_node_k = build_output_heads(
+                        self.output_route_spec, head_context
+                    )
+                    extra_edge_heads.append(_committee_edge_k)
+                    extra_node_heads.append(_committee_node_k)
+            finally:
+                # Restore the pre-committee RNG state so committee_num_heads=1
+                # vs >1 never perturbs any OTHER module's initialization that
+                # might run later in a subclass __init__.
+                torch.random.set_rng_state(_committee_cpu_rng_state)
+                if _committee_cuda_rng_state is not None:
+                    torch.cuda.set_rng_state(_committee_cuda_rng_state, _committee_device)
+            self.out_edge = torch.nn.ModuleList(extra_edge_heads)
+            self.out_node = torch.nn.ModuleList(extra_node_heads)
+            log.info(
+                "  - Committee heads: ENABLED num_heads=%d seed_base=%d "
+                "(head 0 is the primary/backward-compatible output written to "
+                "the standard prediction keys; heads 1..K-1 are exposed under "
+                "extra committee keys for auxiliary loss + disagreement scoring)",
+                self.committee_num_heads,
+                self.committee_head_seed,
+            )
+        else:
+            log.info("  - Committee heads: disabled (committee_num_heads=1)")
+
     @property
     def out_edge_irreps(self):
         return (
@@ -1474,8 +1570,16 @@ class LemMoEV3(torch.nn.Module):
         node_features: torch.Tensor,
         edge_features: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        node_irreps = o3.Irreps(self.out_node.irreps_in)
-        edge_irreps = o3.Irreps(self.out_edge.irreps_in)
+        # Committee heads share one architecture (only random init differs),
+        # so irreps_in is identical across all K heads -- head 0 is
+        # representative. See the identical `self.out_edge[0] if
+        # committee_enabled else self.out_edge` pattern already used in
+        # `forward`/`_apply_block_native_output_heads` for the same reason.
+        committee_enabled = getattr(self, "committee_enabled", False)
+        out_node_for_irreps = self.out_node[0] if committee_enabled else self.out_node
+        out_edge_for_irreps = self.out_edge[0] if committee_enabled else self.out_edge
+        node_irreps = o3.Irreps(out_node_for_irreps.irreps_in)
+        edge_irreps = o3.Irreps(out_edge_for_irreps.irreps_in)
         return {
             "node": self._head_input_rms_by_irreps(node_features, node_irreps),
             "edge": self._head_input_rms_by_irreps(edge_features, edge_irreps),
@@ -1491,16 +1595,26 @@ class LemMoEV3(torch.nn.Module):
             ),
         }
 
-    def _apply_block_native_output_heads(
+    def _apply_one_output_head(
         self,
+        out_node_head: torch.nn.Module,
+        out_edge_head: torch.nn.Module,
         node_features: torch.Tensor,
         edge_features: torch.Tensor,
         atom_type: torch.Tensor,
         edge_index: torch.Tensor,
         active_edges: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        out_node_blocks = self.out_node(node_features)
-        if getattr(self.out_edge, "condition_source", "edge_0e") == "endpoints":
+        """Apply ONE (node_head, edge_head) pair to shared trunk features.
+
+        Pure code-motion of the pre-committee ``_apply_block_native_output_heads``
+        body, parameterized over which head pair to use.
+        ``_apply_block_native_output_heads`` calls this exactly once when the
+        committee is disabled and once per committee head when enabled, so the
+        two paths share one implementation and cannot numerically drift apart.
+        """
+        out_node_blocks = out_node_head(node_features)
+        if getattr(out_edge_head, "condition_source", "edge_0e") == "endpoints":
             active_edges_for_condition = active_edges.to(
                 device=edge_index.device, dtype=torch.long
             ).reshape(-1)
@@ -1508,7 +1622,7 @@ class LemMoEV3(torch.nn.Module):
                 1, active_edges_for_condition
             ).to(device=node_features.device)
             node_0e = node_features.index_select(
-                -1, self.out_edge._node_scalar_indices
+                -1, out_edge_head._node_scalar_indices
             )
             extra_condition = torch.cat(
                 [
@@ -1517,11 +1631,11 @@ class LemMoEV3(torch.nn.Module):
                 ],
                 dim=-1,
             )
-            out_edge_blocks = self.out_edge(
+            out_edge_blocks = out_edge_head(
                 edge_features, extra_condition=extra_condition
             )
         else:
-            out_edge_blocks = self.out_edge(edge_features)
+            out_edge_blocks = out_edge_head(edge_features)
 
         # Heads emit union full-basis slot canvases; blockwise targets/loss use
         # the species-contiguous layout, so translate at this boundary.
@@ -1546,13 +1660,75 @@ class LemMoEV3(torch.nn.Module):
             out_edge_blocks = self._hermitian_average_hb0_edge_blocks(
                 out_edge_blocks, edge_index, active_edges
             )
-        if getattr(self, "log_head_input_rms", False):
+        return out_node_blocks, out_edge_blocks
+
+    def _apply_block_native_output_heads(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+        atom_type: torch.Tensor,
+        edge_index: torch.Tensor,
+        active_edges: torch.Tensor,
+    ):
+        committee_enabled = getattr(self, "committee_enabled", False)
+        log_rms = getattr(self, "log_head_input_rms", False)
+
+        if not committee_enabled:
+            out_node_blocks, out_edge_blocks = self._apply_one_output_head(
+                self.out_node,
+                self.out_edge,
+                node_features,
+                edge_features,
+                atom_type,
+                edge_index,
+                active_edges,
+            )
+            if log_rms:
+                return (
+                    out_node_blocks,
+                    out_edge_blocks,
+                    self._head_input_rms(node_features, edge_features),
+                )
+            return out_node_blocks, out_edge_blocks
+
+        # Committee path: the trunk (node_features/edge_features) was already
+        # computed once by the caller; each of the K heads below only repeats
+        # the cheap final CG-expansion projection, never the message-passing
+        # trunk. Head 0's blocks are returned as the primary output, identical
+        # in shape/meaning to the non-committee case, so every downstream
+        # consumer that only reads the primary keys (loss, block-ODE,
+        # checkpoints, eval scripts) is unaffected. Heads 1..K-1 are returned
+        # as an extra stacked tensor for the caller to expose under separate
+        # keys.
+        per_head_node = []
+        per_head_edge = []
+        for head_idx in range(self.committee_num_heads):
+            node_blocks_k, edge_blocks_k = self._apply_one_output_head(
+                self.out_node[head_idx],
+                self.out_edge[head_idx],
+                node_features,
+                edge_features,
+                atom_type,
+                edge_index,
+                active_edges,
+            )
+            per_head_node.append(node_blocks_k)
+            per_head_edge.append(edge_blocks_k)
+
+        primary_node_blocks = per_head_node[0]
+        primary_edge_blocks = per_head_edge[0]
+        extra_node_blocks = torch.stack(per_head_node[1:], dim=0)
+        extra_edge_blocks = torch.stack(per_head_edge[1:], dim=0)
+
+        if log_rms:
             return (
-                out_node_blocks,
-                out_edge_blocks,
+                primary_node_blocks,
+                primary_edge_blocks,
+                extra_node_blocks,
+                extra_edge_blocks,
                 self._head_input_rms(node_features, edge_features),
             )
-        return out_node_blocks, out_edge_blocks
+        return primary_node_blocks, primary_edge_blocks, extra_node_blocks, extra_edge_blocks
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         preserved_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
@@ -1581,12 +1757,12 @@ class LemMoEV3(torch.nn.Module):
         global_feat = scatter_mean(node_one_hot, batch, dim=0)  # [Batch, n_atom]
 
         # 2. Compute Routing Coefficients
-        # 返回: coeffs [Batch, Num_Experts], monitor_val (mean max prob)
+        # ����: coeffs [Batch, Num_Experts], monitor_val (mean max prob)
         coeffs, monitor_val, expert_load_cv = self.router(global_feat)
         topk_indices, topk_values = self.router.last_topk()
 
-        # 不再记录 z_loss，改为记录监控指标 mean_max_prob
-        # 这个值越接近 1.0 表示路由越自信，接近 0.5 (TopK=1时) 表示犹豫
+        # ���ټ�¼ z_loss����Ϊ��¼���ָ�� mean_max_prob
+        # ���ֵԽ�ӽ� 1.0 ��ʾ·��Խ���ţ��ӽ� 0.5 (TopK=1ʱ) ��ʾ��ԥ
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
         # 3. Prepare MOLEGlobals
@@ -1665,26 +1841,40 @@ class LemMoEV3(torch.nn.Module):
             )
             node_features = torch.cat([node_features, pad], dim=0)
         if self.use_block_native_output:
-            if getattr(self, "log_head_input_rms", False):
-                (
-                    out_node_blocks,
-                    out_edge_blocks,
-                    head_input_rms,
-                ) = self._apply_block_native_output_heads(
-                    node_features, edge_features, atom_type, edge_index, active_edges
-                )
+            committee_enabled = getattr(self, "committee_enabled", False)
+            head_outputs = self._apply_block_native_output_heads(
+                node_features, edge_features, atom_type, edge_index, active_edges
+            )
+            (
+                out_node_blocks,
+                out_edge_blocks,
+                extra_node_blocks,
+                extra_edge_blocks,
+                head_input_rms,
+            ) = unpack_block_native_head_outputs(head_outputs, committee_enabled)
+            if head_input_rms is not None:
                 data["head_input_rms"] = head_input_rms
-            else:
-                out_node_blocks, out_edge_blocks = self._apply_block_native_output_heads(
-                    node_features, edge_features, atom_type, edge_index, active_edges
-                )
+            edge_head_for_shape = self.out_edge[0] if committee_enabled else self.out_edge
             data[_keys.NODE_HAMILTONIAN_KEY] = out_node_blocks
             data[_keys.EDGE_HAMILTONIAN_KEY] = out_edge_blocks.new_zeros(
-                (edge_index.shape[1], self.out_edge.max_norb, self.out_edge.max_norb)
+                (edge_index.shape[1], edge_head_for_shape.max_norb, edge_head_for_shape.max_norb)
             )
             data[_keys.EDGE_HAMILTONIAN_KEY] = torch.index_copy(
                 data[_keys.EDGE_HAMILTONIAN_KEY], 0, active_edges, out_edge_blocks
             )
+            if committee_enabled:
+                data[COMMITTEE_EXTRA_NODE_HAMILTONIAN_KEY] = extra_node_blocks
+                num_extra = extra_edge_blocks.shape[0]
+                full_extra_edge = extra_edge_blocks.new_zeros(
+                    (
+                        num_extra,
+                        edge_index.shape[1],
+                        edge_head_for_shape.max_norb,
+                        edge_head_for_shape.max_norb,
+                    )
+                )
+                full_extra_edge = full_extra_edge.index_copy(1, active_edges, extra_edge_blocks)
+                data[COMMITTEE_EXTRA_EDGE_HAMILTONIAN_KEY] = full_extra_edge
             node_shapes, edge_shapes = infer_block_shapes(
                 data, self.idp, device=out_node_blocks.device
             )
@@ -2335,7 +2525,7 @@ class UpdateNode(torch.nn.Module):
             if self.use_identity_res:
                 node_features = coefficient_old * node_features + coefficient_new * new_node_features
             else:
-                # 维度不同，必须经过 linear_res
+                # ά�Ȳ�ͬ�����뾭�� linear_res
                 node_features = coefficient_old * self.linear_res(node_features) + coefficient_new * new_node_features
 
         else:
@@ -2607,7 +2797,7 @@ class UpdateEdge(torch.nn.Module):
             if self.use_identity_res:
                 edge_features = coefficient_old * edge_features + coefficient_new * new_edge_features
             else:
-                # 维度不同，必须经过 linear_res
+                # ά�Ȳ�ͬ�����뾭�� linear_res
                 edge_features = coefficient_old * self.linear_res(edge_features) + coefficient_new * new_edge_features
 
             latents = torch.index_copy(
