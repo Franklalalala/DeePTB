@@ -559,7 +559,25 @@ class HybridMuon(Optimizer):
         if transposed:
             x = x.transpose(-2, -1)
 
-        x = x / x.norm(dim=(-2, -1), keepdim=True).clamp_min(1.0e-30)
+        # Additive epsilon, matching the reference Muon implementation
+        # (KellerJordan/Muon: ``X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)``).
+        #
+        # A ``clamp_min`` floor instead of an additive epsilon lets a degenerate
+        # block be amplified by up to 1/floor. That is unbounded in practice: in
+        # float32 ``x * x`` underflows to zero for |x| < ~1.1e-19, so a block whose
+        # entries are tiny but non-zero has ``norm() == 0`` exactly. With a 1e-30
+        # floor such a block is scaled by 1e30, ``gram = x @ x.mT`` overflows to
+        # inf, and the quintic ``a*x + b*(gram@x) + c*(gram@gram@x)`` evaluates
+        # inf - inf -> NaN. The NaN is then written into that block's parameters.
+        #
+        # This is reachable whenever a batched (n_blocks, m, n) update contains a
+        # block with a vanishing-but-non-zero gradient -- e.g. a sparsely routed
+        # MoE expert (top_k << num_experts) that received almost no tokens. An
+        # exactly-zero gradient is safe either way (0 / eps == 0); only the
+        # underflow window is affected. The additive epsilon caps the
+        # amplification at 1e7, so degenerate blocks simply receive a
+        # near-zero update.
+        x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1.0e-7)
         for a, b, c in [self._FAST_COEFF] * 8 + [self._POLISH_COEFF] * 2:
             gram = x @ x.transpose(-2, -1)
             x = a * x + b * (gram @ x) + c * ((gram @ gram) @ x)
