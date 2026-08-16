@@ -3905,10 +3905,26 @@ class HamiltonianCFM:
                 num_graphs=num_graphs,
                 prior_seed=prior_seed,
             )
-        if prior_seed is not None:
-            raise ValueError("prior_seed is supported only by block_ode.")
         if prior_state is not None:
             raise ValueError("prior_state is supported only by block_ode.")
+        if prior_seed is not None:
+            # Non-ODE routes draw their prior through the ambient RNG rather
+            # than an explicit per-graph substream, so honor a requested seed by
+            # sampling inside a forked, deterministically seeded RNG scope.
+            # Without this a stochastic prior would make every validation pass
+            # start from a different point, adding pure jitter to the metric.
+            devices = [state[k].device for k in (self.node_h0_key, self.edge_h0_key)
+                       if isinstance(state.get(k), torch.Tensor)
+                       and state[k].device.type == "cuda"]
+            with torch.random.fork_rng(devices=devices, enabled=True):
+                torch.manual_seed(int(prior_seed))
+                return self.sample(
+                    model,
+                    state,
+                    num_steps=num_steps,
+                    prior_seed=None,
+                    prior_state=None,
+                )
         node_current = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
         edge_current = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_current is None and edge_current is None:

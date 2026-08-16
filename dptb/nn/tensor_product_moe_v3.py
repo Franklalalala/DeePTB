@@ -1896,7 +1896,13 @@ class SO2_Linear(torch.nn.Module):
         out = torch.zeros((n, self.irreps_out.dim), dtype=dtype, device=device)
         for entry in self._out_entry_plans:
             group_view = out_groups[entry.l][:, entry.group_start:entry.group_start + entry.mul, :]
-            out[:, entry.slice_info] = group_view.reshape(n, -1)
+            # Spell the trailing extent out instead of inferring it: with n == 0
+            # (an empty node/edge stream, e.g. a single-atom record whose active
+            # set is empty for some l) reshape(0, -1) is ambiguous and raises.
+            # mul * dims is exactly what -1 resolves to whenever n > 0.
+            out[:, entry.slice_info] = group_view.reshape(
+                n, int(entry.mul) * int(group_view.shape[-1])
+            )
         return out
 
     def _pack_group_m0(self, x_group: torch.Tensor, l: int, rot_block: Optional[torch.Tensor]) -> torch.Tensor:
