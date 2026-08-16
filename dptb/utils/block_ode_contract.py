@@ -272,33 +272,9 @@ def validate_block_ode_contract(data):
             raise ValueError(
                 "tied_irrep_gaussian requires tied_irrep_mode='so3_tied'"
             )
-        configured_irreps = str(flow.get("tied_irrep_irreps", ""))
-        # Compare via o3.Irreps equivalence, not a literal string diff, so
-        # this schema-time gate agrees exactly with flow.py's runtime
-        # validate_tied_irrep_options (tied_irrep_gaussian_prior.py): e.g.
-        # "3x0e + 2x1e + 2e" and "3x0e + 2x1e + 1x2e" parse to the same
-        # o3.Irreps object (bare "2e" is e3nn shorthand for "1x2e") but
-        # differ as strings -- PR#31 review finding P2-1. e3nn/torch are
-        # imported lazily here rather than at module scope: see
-        # dptb/nnops/tied_irrep_constants.py's module docstring for why
-        # dptb.utils.argcheck must stay importable without that weight for
-        # callers who never validate a tied_irrep_gaussian config.
-        from e3nn import o3 as _tied_irrep_o3
-
-        try:
-            irreps_match = _tied_irrep_o3.Irreps(
-                configured_irreps
-            ) == _tied_irrep_o3.Irreps(TIED_IRREP_CANONICAL_IRREPS)
-        except Exception as exc:
-            raise ValueError(
-                "tied_irrep_gaussian requires a valid tied_irrep_irreps "
-                f"string; got {configured_irreps!r}"
-            ) from exc
-        if not irreps_match:
-            raise ValueError(
-                "tied_irrep_gaussian currently supports exactly "
-                f"tied_irrep_irreps={TIED_IRREP_CANONICAL_IRREPS!r}"
-            )
+        # tied_irrep_irreps is deprecated: the latent layout is derived
+        # from the target's own orbpair_irreps at runtime, so this key no
+        # longer selects anything.  Historical configs keep validating.
         raw_scales = {
             "node_sigma": flow.get("node_sigma", 1.0),
             "edge_sigma": flow.get("edge_sigma", 1.0),

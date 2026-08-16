@@ -16,6 +16,7 @@ from dptb.data.interfaces.blockwise_tensor import (
 )
 from dptb.nnops.block_flow_codec import project_block_state
 from dptb.nnops.tied_irrep_gaussian_prior import (
+    tied_irrep_layout_from_slices,
     TIED_IRREP_EFFECTIVE_VARIANCES,
     dense_all_one_irrep_expansion,
     effective_tied_irrep_latent,
@@ -414,7 +415,14 @@ def test_effective_latent_variances_match_multiplicity_sums():
         )
 
 
-def test_rme_draw_is_degree_tied_low_rank_and_zeros_high_l():
+def test_rme_draw_is_degree_tied_low_rank_and_covers_every_target_degree():
+    """The latent layout is derived from the TARGET, not frozen at water's
+    3x0e+2x1e+1x2e.  Water's orbpair_irreps reach l=4, so the draw must be
+    (a) exactly tied within every degree, (b) low rank -- at most one
+    (2l+1)-vector per degree -- and (c) non-zero on EVERY degree the target
+    carries, including l>=3 which the frozen canonical layout left at the
+    deterministic zero start state.
+    """
     mapper = _water_mapper()
     flow = _b_tied_flow(mapper)
     dim = mapper.orbpair_irreps.dim
@@ -433,24 +441,25 @@ def test_rme_draw_is_degree_tied_low_rank_and_zeros_high_l():
         num_graphs=1,
         generator=generator,
     )
-    assert int(torch.linalg.matrix_rank(noise, tol=1e-10).item()) <= 9
+
+    slices = flow._te_irrep_slices(dim)
+    layout = tied_irrep_layout_from_slices(slices)
+    assert layout.degrees == (0, 1, 2, 3, 4)
+    assert layout.width == sum(2 * d + 1 for d in layout.degrees)
+    assert int(torch.linalg.matrix_rank(noise, tol=1e-10).item()) <= layout.width
 
     first_by_degree = {}
-    for start, end, degree in flow._te_irrep_slices(dim):
+    for start, end, degree in slices:
         segment = noise[:, start:end]
-        if degree >= 3:
-            assert torch.count_nonzero(segment) == 0
-            continue
         if degree not in first_by_degree:
             first_by_degree[degree] = segment
         else:
             torch.testing.assert_close(
-                segment,
-                first_by_degree[degree],
-                rtol=0.0,
-                atol=0.0,
+                segment, first_by_degree[degree], rtol=0.0, atol=0.0
             )
-
+    assert set(first_by_degree) == set(layout.degrees)
+    for degree, segment in first_by_degree.items():
+        assert torch.count_nonzero(segment) > 0, degree
 
 def test_partial_irrep_mask_rejects_instead_of_component_truncating():
     like = torch.zeros(1, 4, dtype=torch.float64)
@@ -797,7 +806,10 @@ def test_tied_prior_constructor_rejects_unsupported_contracts():
         )
     with pytest.raises(ValueError, match="tied_irrep_mode"):
         _b_tied_flow(mapper, tied_irrep_mode="split_parity")
-    with pytest.raises(ValueError, match="tied_irrep_irreps"):
+    # tied_irrep_irreps no longer selects anything (the latent layout is
+    # derived from the target's own orbpair_irreps), so a stale non-canonical
+    # value must warn and be ignored rather than hard-fail a historical config.
+    with pytest.warns(FutureWarning, match="tied_irrep_irreps"):
         _b_tied_flow(mapper, tied_irrep_irreps="1x0e")
     with pytest.raises(ValueError, match="tied_irrep_validation_seed"):
         _b_tied_flow(mapper, tied_irrep_validation_seed=True)

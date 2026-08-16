@@ -3,7 +3,9 @@ from __future__ import annotations
 """Helpers for a rowwise multiplicity-tied irreducible Gaussian prior."""
 
 import math
-from typing import Iterable, Tuple
+import warnings
+from dataclasses import dataclass
+from typing import Iterable, Optional, Tuple
 
 import torch
 from e3nn import o3
@@ -24,28 +26,131 @@ TIED_IRREP_LATENT_WIDTH = 9
 TIED_IRREP_EFFECTIVE_VARIANCES = {0: 3.0, 1: 2.0, 2: 1.0}
 
 
+@dataclass(frozen=True)
+class TiedIrrepLayout:
+    """One independent standard-normal ``(2l+1)``-vector per SO(3) degree.
+
+    ``multiplicities[i]`` is how many whole irrep slices of ``degrees[i]`` the
+    TARGET representation contains.  It is the per-degree variance factor, which
+    is exactly what the historical hardcoded ``{0: 3.0, 1: 2.0, 2: 1.0}``
+    encoded: the canonical ``3x0e + 2x1e + 1x2e`` noise tensor is "a sum of 3
+    scalar copies, 2 vector copies and 1 rank-2 copy", so each degree's draw
+    carries the variance of that many independent copies.  Deriving the same
+    quantity from the target's own ``orbpair_irreps`` generalizes the rule to
+    any basis instead of freezing water's.
+
+    Multiplicity is counted GLOBALLY (over the mapper's whole irrep layout),
+    not per row: a per-row live-slice count would make the prior's amplitude
+    element-dependent, which is a physical bias the fixed-constant version
+    never had.
+    """
+
+    degrees: Tuple[int, ...]
+    multiplicities: Tuple[int, ...]
+    offsets: Tuple[int, ...]
+    width: int
+
+    def offset_of(self, degree: int) -> Optional[int]:
+        try:
+            return self.offsets[self.degrees.index(int(degree))]
+        except ValueError:
+            return None
+
+    def multiplicity_of(self, degree: int) -> int:
+        try:
+            return self.multiplicities[self.degrees.index(int(degree))]
+        except ValueError:
+            return 0
+
+
+def _build_layout(counts: dict) -> TiedIrrepLayout:
+    degrees = tuple(sorted(int(d) for d in counts))
+    offsets, offset = [], 0
+    for degree in degrees:
+        offsets.append(offset)
+        offset += 2 * degree + 1
+    return TiedIrrepLayout(
+        degrees=degrees,
+        multiplicities=tuple(int(counts[d]) for d in degrees),
+        offsets=tuple(offsets),
+        width=offset,
+    )
+
+
+# Water's frozen layout, kept as the default so every caller that does not opt
+# into a target-derived layout keeps byte-identical behavior (degrees 0/1/2 with
+# variance factors 3/2/1, and every degree >= 3 left exactly zero).
+CANONICAL_TIED_IRREP_LAYOUT = _build_layout({0: 3, 1: 2, 2: 1})
+
+
+def tied_irrep_layout_from_slices(
+    slices: Iterable[Tuple[int, int, int]]
+) -> TiedIrrepLayout:
+    """Derive the latent layout from the TARGET's own irrep slices.
+
+    Every SO(3) degree the target representation contains gets its own
+    independent ``(2l+1)``-vector, so no degree is silently left at the
+    deterministic zero start state.  There is deliberately no configuration
+    entry for this: the noise tensor's irrep content is a property of what is
+    being transported, not a free hyper-parameter.
+    """
+    counts: dict = {}
+    for start, end, degree in tuple(slices):
+        start, end, degree = int(start), int(end), int(degree)
+        width = end - start
+        if degree < 0 or width <= 0:
+            raise ValueError(
+                "tied_irrep_gaussian received an invalid irrep slice "
+                f"({start}, {end}, {degree})."
+            )
+        if width != 2 * degree + 1:
+            raise ValueError(
+                "tied_irrep_gaussian requires whole SO(3) irrep slices; "
+                f"degree {degree} expects width {2 * degree + 1}, got {width}."
+            )
+        counts[degree] = counts.get(degree, 0) + 1
+    if not counts:
+        raise ValueError(
+            "tied_irrep_gaussian cannot derive a latent layout from an empty "
+            "irrep slice list."
+        )
+    return _build_layout(counts)
+
+
 def normalize_tied_irrep_mode(value: object) -> str:
     return str(value).strip().lower().replace("-", "_")
 
 
-def validate_tied_irrep_options(*, mode: object, irreps: object) -> None:
+def validate_tied_irrep_options(*, mode: object, irreps: object = None) -> None:
+    """Validate the sampler mode; ``irreps`` is deprecated and ignored.
+
+    The latent layout is now derived from the target representation
+    (:func:`tied_irrep_layout_from_slices`), so ``tied_irrep_irreps`` is no
+    longer an input.  Historical configurations that still carry the canonical
+    string keep loading; anything else warns rather than hard-failing, because
+    the value no longer selects anything.
+    """
     mode_name = normalize_tied_irrep_mode(mode)
     if mode_name != TIED_IRREP_SUPPORTED_MODE:
         raise ValueError(
             "tied_irrep_gaussian requires tied_irrep_mode='so3_tied'; "
             f"got {mode!r}."
         )
+    if irreps is None or str(irreps).strip() == "":
+        return
     try:
         parsed = o3.Irreps(str(irreps))
     except Exception as exc:
         raise ValueError(
             "tied_irrep_gaussian requires a valid tied_irrep_irreps string."
         ) from exc
-    expected = o3.Irreps(TIED_IRREP_CANONICAL_IRREPS)
-    if parsed != expected:
-        raise ValueError(
-            "tied_irrep_gaussian currently supports exactly "
-            f"tied_irrep_irreps={TIED_IRREP_CANONICAL_IRREPS!r}; got {irreps!r}."
+    if parsed != o3.Irreps(TIED_IRREP_CANONICAL_IRREPS):
+        warnings.warn(
+            "flow_options.tied_irrep_irreps is deprecated and ignored: the "
+            "tied-irrep latent layout is derived from the target's own "
+            f"orbpair_irreps. Got {irreps!r}; remove the key.",
+            FutureWarning,
+            stacklevel=2,
         )
 
 
@@ -55,32 +160,43 @@ def draw_standard_tied_irrep_latent(
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
+    layout: TiedIrrepLayout = CANONICAL_TIED_IRREP_LAYOUT,
 ) -> torch.Tensor:
-    """Draw the nine independent standard-normal total-L variables per row."""
+    """Draw the independent standard-normal total-L variables per row."""
     return torch.randn(
         int(row_count),
-        TIED_IRREP_LATENT_WIDTH,
+        int(layout.width),
         device=device,
         dtype=dtype,
         generator=generator,
     )
 
 
-def effective_tied_irrep_latent(standard: torch.Tensor) -> torch.Tensor:
-    """Apply all-one multiplicity factors before any public sigma scale.
+def effective_tied_irrep_latent(
+    standard: torch.Tensor,
+    *,
+    layout: TiedIrrepLayout = CANONICAL_TIED_IRREP_LAYOUT,
+) -> torch.Tensor:
+    """Apply per-degree multiplicity factors before any public sigma scale.
 
-    Layout is ``[L0, L1_m0, L1_m1, L1_m2, L2_m0, ..., L2_m4]``.  The factors make
-    component variances 3, 2, and 1 respectively, matching sums of 3 scalar
-    copies, 2 vector copies, and 1 rank-2 copy.
+    Layout is the concatenation, in ascending degree order, of one
+    ``(2l+1)``-vector per degree present in the target.  Component variance for
+    degree ``l`` is that degree's global slice multiplicity, matching a sum of
+    that many independent copies.  For the default (water) layout this is the
+    historical ``[L0, L1_m0..m2, L2_m0..m4]`` with variances 3, 2 and 1.
     """
-    if standard.ndim != 2 or int(standard.shape[-1]) != TIED_IRREP_LATENT_WIDTH:
+    if standard.ndim != 2 or int(standard.shape[-1]) != int(layout.width):
         raise ValueError(
             "tied_irrep_gaussian latent must have shape "
-            f"[rows, {TIED_IRREP_LATENT_WIDTH}]."
+            f"[rows, {int(layout.width)}]."
         )
     out = standard.clone()
-    out[:, 0:1] *= math.sqrt(TIED_IRREP_EFFECTIVE_VARIANCES[0])
-    out[:, 1:4] *= math.sqrt(TIED_IRREP_EFFECTIVE_VARIANCES[1])
+    for degree, multiplicity, offset in zip(
+        layout.degrees, layout.multiplicities, layout.offsets
+    ):
+        if multiplicity == 1:
+            continue
+        out[:, offset:offset + 2 * degree + 1] *= math.sqrt(float(multiplicity))
     return out
 
 
@@ -101,11 +217,15 @@ def fill_tied_irrep_rme(
     effective_latent: torch.Tensor,
     *,
     sigma: float,
+    layout: TiedIrrepLayout = CANONICAL_TIED_IRREP_LAYOUT,
 ) -> torch.Tensor:
     """Broadcast one rowwise total-L field into every compatible RME slice.
 
     All slices with the same SO(3) degree receive the same rowwise component.
-    Slices with degree >= 3 are exactly zero before any block projection.
+    Degrees absent from ``layout`` stay exactly zero before any block
+    projection -- with the default (water) layout that is every degree >= 3;
+    with a target-derived layout (:func:`tied_irrep_layout_from_slices`) it is
+    none of them.
     """
     if like.ndim < 2:
         raise ValueError(
@@ -119,10 +239,10 @@ def fill_tied_irrep_rme(
         raise ValueError(
             "tied_irrep_gaussian latent row count must match feature rows."
         )
-    if int(latent.shape[-1]) != TIED_IRREP_LATENT_WIDTH:
+    if int(latent.shape[-1]) != int(layout.width):
         raise ValueError(
             "tied_irrep_gaussian latent width must be "
-            f"{TIED_IRREP_LATENT_WIDTH}."
+            f"{int(layout.width)}."
         )
     if not math.isfinite(float(sigma)):
         raise ValueError("tied_irrep_gaussian sigma must be finite.")
@@ -151,14 +271,10 @@ def fill_tied_irrep_rme(
                 "tied_irrep_gaussian requires masks that keep or drop each "
                 "whole irrep slice per row; partial component masks are unsupported."
             )
-        if degree == 0:
-            source = latent[:, 0:1]
-        elif degree == 1:
-            source = latent[:, 1:4]
-        elif degree == 2:
-            source = latent[:, 4:9]
-        else:
+        offset = layout.offset_of(degree)
+        if offset is None:
             continue
+        source = latent[:, offset:offset + expected_width]
         if int(source.shape[-1]) != width:
             raise ValueError(
                 "tied_irrep_gaussian latent degree width does not match slice "

@@ -80,6 +80,7 @@ from dptb.nnops.flow_priors import (
 )
 from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 from dptb.nnops.tied_irrep_gaussian_prior import (
+    tied_irrep_layout_from_slices,
     TIED_IRREP_CANONICAL_IRREPS,
     TIED_IRREP_GAUSSIAN_PRIOR,
     TIED_IRREP_LATENT_WIDTH,
@@ -613,15 +614,11 @@ class HamiltonianCFM:
                     f"te_prior_validation_seed in [0, {_MAX_TORCH_SEED}]."
                 )
         if self.prior in self._tied_irrep_gaussian_prior_names:
-            if not self.residual_ao_block_ode and not (
-                self.mode == "full"
-                and self.output_space == "ao_block_ode"
-                and self.target_semantics == "absolute_full_h"
-            ):
-                raise ValueError(
-                    "prior='tied_irrep_gaussian' is supported only by "
-                    "residual_ao_block_ode or absolute ao_block_ode."
-                )
+            # No output_space gate: the sampler is RME-native (it draws on the
+            # mapper's own orbpair_irreps slices and never builds a block
+            # tensor), so 'rme' and the block-ODE spaces are equally valid
+            # hosts.  The block spaces additionally project the draw, which is
+            # a downstream step, not a precondition.
             validate_tied_irrep_options(
                 mode=options.get("tied_irrep_mode", ""),
                 irreps=self.tied_irrep_irreps,
@@ -678,14 +675,29 @@ class HamiltonianCFM:
                     f"tied_irrep_validation_seed in [0, {_MAX_TORCH_SEED}]."
                 )
             self.prior_validation_seed = seed
+            # Report the layout the TARGET actually induces, not a frozen
+            # literal: the per-degree variance factors are that degree's
+            # global slice multiplicity in idp.orbpair_irreps.
+            try:
+                _tied_layout = tied_irrep_layout_from_slices(
+                    self._te_irrep_slices(int(self.idp.orbpair_irreps.dim))
+                )
+                _tied_layout_repr = ",".join(
+                    "L%d:%d" % (d, m)
+                    for d, m in zip(
+                        _tied_layout.degrees, _tied_layout.multiplicities
+                    )
+                )
+            except Exception:  # pragma: no cover - logging must never fail
+                _tied_layout_repr = "derived-at-draw-time"
             log.info(
-                "tied_irrep_gaussian prior enabled: mode=%s irreps=%s "
+                "tied_irrep_gaussian prior enabled: mode=%s "
                 "effective_node_sigma=%.6g effective_edge_sigma=%.6g "
-                "latent_component_variances={L0:3,L1:2,L2:1}",
+                "latent_component_variances={%s}",
                 self.tied_irrep_mode,
-                self.tied_irrep_irreps,
                 self.node_sigma * self.tied_irrep_sigma,
                 self.edge_sigma * self.tied_irrep_sigma,
+                _tied_layout_repr,
             )
 
         # Physical prior families each own their option keys (parsed in
@@ -2357,6 +2369,12 @@ class HamiltonianCFM:
                 f"spans to match {label or 'unknown'} feature_dim={like.shape[-1]}."
             )
         mask = self._prior_mask(data, like, label)
+        # One independent (2l+1)-vector per degree the TARGET actually carries,
+        # with that degree's global slice multiplicity as its variance factor.
+        # Freezing water's 3x0e+2x1e+1x2e here would leave every l >= 3 slice
+        # of a richer basis at the deterministic zero start state (54.1% of the
+        # RME width for the 68-element f-orbital crystal basis).
+        layout = tied_irrep_layout_from_slices(slices)
 
         seeded = generator is not None
         if seeded:
@@ -2373,7 +2391,7 @@ class HamiltonianCFM:
             row_slices = self._graph_row_slices(graph_index, num_graphs)
             standard_latent = self._seeded_rows_by_graph(
                 like.shape[0],
-                TIED_IRREP_LATENT_WIDTH,
+                layout.width,
                 row_slices,
                 per_graph_generators,
                 device=like.device,
@@ -2385,15 +2403,19 @@ class HamiltonianCFM:
                 device=like.device,
                 dtype=like.dtype,
                 generator=generator,
+                layout=layout,
             )
 
-        effective_latent = effective_tied_irrep_latent(standard_latent)
+        effective_latent = effective_tied_irrep_latent(
+            standard_latent, layout=layout
+        )
         return fill_tied_irrep_rme(
             like,
             slices,
             mask,
             effective_latent,
             sigma=float(sigma) * self.tied_irrep_sigma,
+            layout=layout,
         )
 
     def _prior_like(
