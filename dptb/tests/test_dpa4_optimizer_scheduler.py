@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from dptb.utils.argcheck import chk_avg_per_iter, train_options
+from dptb.utils.dpa4_optim import HybridMuon
 from dptb.utils.tools import get_lr_scheduler, get_optimizer, lr_scheduler_can_step_without_metric
 
 
@@ -397,6 +398,82 @@ def test_hybrid_muon_loads_legacy_tensor_adam_step():
     restored_param.grad = torch.ones_like(restored_param)
     restored.step()
     assert restored.state[restored_param]["step"] == 4
+
+
+def _newton_schulz_normalize(x: torch.Tensor, additive: bool) -> torch.Tensor:
+    x = x.clone()
+    norm = x.norm(dim=(-2, -1), keepdim=True)
+    x = x / (norm + 1.0e-7) if additive else x / norm.clamp_min(1.0e-30)
+    for a, b, c in [HybridMuon._FAST_COEFF] * 8 + [HybridMuon._POLISH_COEFF] * 2:
+        gram = x @ x.transpose(-2, -1)
+        x = a * x + b * (gram @ x) + c * ((gram @ gram) @ x)
+    return x
+
+
+def test_newton_schulz_clamp_min_floor_nans_on_float32_underflow_block():
+    # 8x8 of 1e-24: float32 squares vanish, so Frobenius norm is exactly 0 while
+    # the block is still nonzero. clamp_min(1e-30) then amplifies into inf-inf.
+    x = torch.full((1, 8, 8), 1.0e-24, dtype=torch.float32)
+    assert float(x.norm(dim=(-2, -1))) == 0.0
+    old = _newton_schulz_normalize(x, additive=False)
+    new = _newton_schulz_normalize(x, additive=True)
+    assert not torch.isfinite(old).all()
+    assert torch.isfinite(new).all()
+    assert float(new.abs().max()) < 1.0e-10
+
+
+def test_hybrid_muon_orthogonalize_keeps_underflow_expert_block_finite():
+    param = torch.nn.Parameter(torch.ones(2, 8, 8))
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[("layers.0.edge_tp.weight_experts", param)],
+        lr=0.1,
+        weight_decay=0.0,
+        muon_beta=0.0,
+        magma_lite=False,
+        muon_clip=False,
+    )
+    update = torch.zeros_like(param)
+    update[0] = torch.randn(8, 8)
+    update[1] = 1.0e-24
+
+    out = optimizer._orthogonalize(update, param, optimizer.param_groups[0])
+
+    assert optimizer.route_counts == {"muon": 1, "adam": 0}
+    assert torch.isfinite(out).all()
+    assert float(out[0].abs().sum()) > 0.0
+    assert float(out[1].abs().max()) < 1.0e-10
+
+
+def test_hybrid_muon_step_keeps_dead_expert_replica_finite():
+    stacked = torch.nn.Parameter(torch.ones(2, 8, 8))
+    replica = torch.nn.Parameter(torch.ones(8, 8))
+    stacked.grad = torch.zeros_like(stacked)
+    stacked.grad[0] = torch.ones(8, 8)
+    stacked.grad[1] = 1.0e-24
+    replica.grad = torch.full_like(replica, 1.0e-24)
+
+    optimizer = get_optimizer(
+        type="HybridMuon",
+        model_param=[
+            ("layers.0.edge_tp.weight_experts", stacked),
+            ("layers.0.experts.1.weight", replica),
+        ],
+        lr=0.1,
+        weight_decay=0.0,
+        muon_beta=0.0,
+        magma_lite=False,
+        muon_clip=False,
+    )
+
+    optimizer.step()
+
+    assert optimizer.route_counts == {"muon": 2, "adam": 0}
+    assert torch.isfinite(stacked).all()
+    assert torch.isfinite(replica).all()
+    assert not torch.allclose(stacked[0], torch.ones(8, 8))
+    assert torch.allclose(stacked[1], torch.ones(8, 8), atol=1.0e-6)
+    assert torch.allclose(replica, torch.ones(8, 8), atol=1.0e-6)
 
 
 def test_train_options_accepts_hybrid_muon_optimizer_and_wsd_scheduler():
