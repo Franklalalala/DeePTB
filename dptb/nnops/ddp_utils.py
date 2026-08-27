@@ -28,6 +28,13 @@ RESTART_LOCKED_TRAIN_OPTION_KEYS = (
     "expert_lr_scheduler_overrides",
 )
 
+# Injected after normalize in the DDP entrypoint. Persisting them into the
+# checkpoint and merging back on restart trips strict argcheck.
+RUNTIME_TRAIN_OPTION_KEYS = (
+    "ddp_world_size",
+    "ddp_rank",
+)
+
 
 def is_dist_ready() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -218,5 +225,11 @@ def merge_restart_train_options(
                 key,
             )
         merged_train_options[key] = copy.deepcopy(ckpt_train_options[key])
+
+    stripped = [key for key in RUNTIME_TRAIN_OPTION_KEYS if key in merged_train_options]
+    for key in stripped:
+        merged_train_options.pop(key, None)
+    if stripped:
+        logger.info("Stripped runtime train_options keys on restart: %s", stripped)
 
     return merged_train_options

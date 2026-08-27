@@ -1,6 +1,8 @@
+import copy
 import gc
 import json
 import shutil
+from collections import OrderedDict
 from dptb.plugins.base_plugin import Plugin
 from dptb.plugins.checkpoint_state import StatefulPlugin
 from dptb.nnops.training_state import (
@@ -543,6 +545,12 @@ class Saver(Plugin, StatefulPlugin):
         if torch.is_tensor(obj):
             return obj.detach().cpu()
         if isinstance(obj, dict):
+            keep_meta = getattr(obj, "_metadata", None)
+            if isinstance(obj, OrderedDict) or keep_meta is not None:
+                out = OrderedDict((k, self._to_cpu_obj(v)) for k, v in obj.items())
+                if keep_meta is not None:
+                    out._metadata = copy.deepcopy(keep_meta)
+                return out
             return {k: self._to_cpu_obj(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [self._to_cpu_obj(v) for v in obj]
@@ -782,16 +790,31 @@ class Saver(Plugin, StatefulPlugin):
             raw_base_state = self.trainer.model.state_dict()
         with self._profile_stage("base_model_state_to_cpu"):
             base_state = self._to_cpu_obj(raw_base_state)
-        full_state = {}
+        full_state = OrderedDict()
+        metadata = {}
+        base_meta = getattr(base_state, "_metadata", None) or {}
+        for meta_key, meta_val in base_meta.items():
+            if meta_key == "" or not str(meta_key).startswith("experts."):
+                metadata[meta_key] = copy.deepcopy(meta_val)
 
         for k, v in base_state.items():
             if not k.startswith("experts."):
                 full_state[k] = v
 
         for i, expert_state in enumerate(expert_states):
-            for k, v in expert_state.items():
-                full_state[f"experts.{i}.{k}"] = v
+            prefix = f"experts.{i}."
+            expert_cpu = self._to_cpu_obj(expert_state) if expert_state is not None else {}
+            expert_meta = getattr(expert_cpu, "_metadata", None) or {}
+            for meta_key, meta_val in expert_meta.items():
+                copied = copy.deepcopy(meta_val)
+                if meta_key == "":
+                    metadata[prefix[:-1]] = copied
+                else:
+                    metadata[prefix + meta_key] = copied
+            for k, v in expert_cpu.items():
+                full_state[f"{prefix}{k}"] = v
 
+        full_state._metadata = metadata
         return full_state
 
     def iteration(self, **kwargs):

@@ -414,6 +414,18 @@ def test_restart_merge_uses_checkpoint_as_base_and_locks_optimizer_contract():
     assert merged["lr_scheduler"] == checkpoint["lr_scheduler"]
 
 
+def test_restart_merge_strips_runtime_ddp_keys():
+    checkpoint = {
+        "optimizer": {"type": "AdamW", "lr": 1.0e-3},
+        "ddp_world_size": 2,
+        "ddp_rank": 1,
+    }
+    merged = merge_restart_train_options({}, checkpoint)
+    assert "ddp_world_size" not in merged
+    assert "ddp_rank" not in merged
+    assert merged["optimizer"]["lr"] == 1.0e-3
+
+
 @pytest.mark.parametrize(
     ("enabled", "node", "edge", "expected"),
     [

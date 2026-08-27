@@ -654,16 +654,25 @@ class H0InitLayer(torch.nn.Module):
         error_msgs,
     ):
         version = local_metadata.get("version")
-        if self._legacy_unsorted_h0_checkpoint_is_unsafe() and (
-            version is None or int(version) < self._version
-        ):
-            module_name = prefix[:-1] if prefix.endswith(".") else prefix
-            error_msgs.append(
-                f"{module_name or '<root>'}: checkpoint H0 layout version "
-                f"{version!r} predates the H0 raw-to-sorted RME layout fix "
-                f"(required version {self._version}). This high-l non-uu_real "
-                "checkpoint cannot be resumed safely; retrain from initialization."
-            )
+        module_name = prefix[:-1] if prefix.endswith(".") else prefix
+        if self._legacy_unsorted_h0_checkpoint_is_unsafe():
+            # Explicit pre-v2 markers are still fail-closed. Missing metadata is
+            # the ensemble saver flattening state_dict into a plain dict; those
+            # weights were trained under the current sorted-irrep contract.
+            if version is not None and int(version) < self._version:
+                error_msgs.append(
+                    f"{module_name or '<root>'}: checkpoint H0 layout version "
+                    f"{version!r} predates the H0 raw-to-sorted RME layout fix "
+                    f"(required version {self._version}). This high-l non-uu_real "
+                    "checkpoint cannot be resumed safely; retrain from initialization."
+                )
+            elif version is None:
+                log.warning(
+                    "%s: H0 layout version metadata missing; loading the current "
+                    "sorted-irrep contract. Explicit version < %s still fails closed.",
+                    module_name or "<root>",
+                    self._version,
+                )
         super()._load_from_state_dict(
             state_dict,
             prefix,

@@ -131,15 +131,52 @@ def test_legacy_highl_non_uureal_checkpoint_fails_closed():
         target.load_state_dict(state, strict=True)
 
 
-def test_stripped_highl_checkpoint_metadata_fails_closed():
+def test_to_cpu_obj_preserves_h0_version_metadata():
+    from dptb.plugins.saver import Saver
+
+    source = _h0_layer({"H": "1s", "C": "1s1p"})
+    state = source.state_dict()
+    assert state._metadata[""]["version"] == H0InitLayer._version
+    saver = Saver(interval=1)
+    copied = saver._to_cpu_obj(state)
+    assert copied._metadata[""]["version"] == H0InitLayer._version
+
+
+def test_assemble_full_model_state_prefixes_h0_version_metadata():
+    from dptb.plugins.saver import Saver
+
+    class _Expert(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Module()
+            self.embedding.init_layer = _h0_layer({"H": "1s", "C": "1s1p"})
+
+    class _Ensemble(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = torch.nn.ModuleList([_Expert(), _Expert()])
+
+    class _Trainer:
+        def __init__(self, model):
+            self.model = model
+
+    model = _Ensemble()
+    saver = Saver(interval=1)
+    saver.trainer = _Trainer(model)
+    expert_states = [expert.state_dict() for expert in model.experts]
+    full = saver._assemble_full_model_state(expert_states)
+    assert full._metadata["experts.0.embedding.init_layer"]["version"] == H0InitLayer._version
+    assert full._metadata["experts.1.embedding.init_layer"]["version"] == H0InitLayer._version
+
+
+def test_stripped_highl_checkpoint_metadata_is_loadable():
+    """Ensemble saver used to flatten state_dict into a plain dict, dropping
+    ``_metadata``. Those tensors were still trained under the current contract.
+    """
     source = _h0_layer({"H": "1s", "C": "1s1p"})
     target = _h0_layer({"H": "1s", "C": "1s1p"})
     stripped = dict(source.state_dict())
-    with pytest.raises(
-        RuntimeError,
-        match="predates the H0 raw-to-sorted RME layout fix",
-    ):
-        target.load_state_dict(stripped, strict=True)
+    target.load_state_dict(stripped, strict=True)
 
 
 def test_legacy_scalar_only_checkpoint_remains_loadable():
