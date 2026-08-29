@@ -2450,11 +2450,38 @@ def loss_options():
         Argument("eps", float, optional=True, default=1e-12),
     ]
 
+    eig_ham_h0res = [
+        Argument("coeff_ham", float, optional=True, default=0.9, doc="Weight on the H-matrix (residual-space) term; the band term gets 1-coeff_ham."),
+        Argument("band_overlap", bool, optional=True, default=True, doc="Solve the generalized eigenproblem with the dataset overlap S. Named band_overlap rather than overlap so common_options.overlap cannot clobber it."),
+        Argument("band_emin", [float, None], optional=True, default=None, doc="Lower edge of the in-window band mask, measured from the lowest eigenvalue of each structure."),
+        Argument("band_emax", [float, None], optional=True, default=None, doc="Upper edge of the in-window band mask, measured from the lowest eigenvalue of each structure. Out-of-window bands are down-weighted to eout_weight, not dropped."),
+        Argument("band_min", int, optional=True, default=0, doc="First band index used by the band term."),
+        Argument("band_max", [int, None], optional=True, default=None, doc="Last band index used by the band term."),
+    ]
+
+    hamil_gauged = [
+        Argument("gauge", bool, optional=True, default=True, doc="Remove the H -> H + mu*S gauge freedom before comparing."),
+        Argument("gauge_clip", float, optional=True, default=1.0, doc="Clamp on |mu| in eV; a solve far outside this is an anomaly, not a gauge."),
+    ]
+
+    nextham_k = [
+        Argument("w_p", float, optional=True, default=2e-4, doc="Weight of the PP block (NextHAM: factor_pspace)."),
+        Argument("w_q", float, optional=True, default=1e-4, doc="Weight of the QQ block (NextHAM: factor_qspace)."),
+        Argument("w_pq", float, optional=True, default=1.5e-4, doc="Weight of the PQ block; this is the ghost-state term."),
+        Argument("gauge", bool, optional=True, default=True, doc="Remove the H -> H + mu*S gauge freedom before comparing."),
+        Argument("gauge_clip", float, optional=True, default=1.0, doc="Clamp on |mu| in eV."),
+        Argument("band_window", float, optional=True, default=10.0, doc="P subspace half-width around E_F, in eV."),
+        Argument("q_window", [float, None], optional=True, default=30.0, doc="How far above the P window Q reaches, in eV. None reproduces NextHAM's Q = everything else, which pulls near-singular high-energy states into the loss."),
+        Argument("n_kpoints", int, optional=True, default=1, doc="Random k-points per step. NextHAM uses 1: there are far more k than can be learned, so steps accumulate coverage."),
+    ]
+
     loss_args = Variant("method", [
         # Argument("hamil", dict, sub_fields=hamil),
         Argument("eigvals", dict, sub_fields=eigvals),
         Argument("skints", dict, sub_fields=skints),
         Argument("hamil_abs", dict, sub_fields=hamil),
+        Argument("hamil_abs_gauged", dict, sub_fields=hamil+hamil_gauged),
+        Argument("nextham_kspace", dict, sub_fields=hamil+nextham_k),
         Argument("hamil_abs_element_avg", dict, sub_fields=hamil),
         Argument("hamil_abs_mae", dict, sub_fields=hamil),
         Argument("hamil_w_num_e", dict, sub_fields=property_aux),
@@ -2464,6 +2491,7 @@ def loss_options():
         Argument("hamil_blas", dict, sub_fields=hamil),
         Argument("hamil_wt", dict, sub_fields=hamil+wt),
         Argument("eig_ham", dict, sub_fields=hamil+eigvals+eig_ham),
+        Argument("eig_ham_h0res", dict, sub_fields=hamil+eigvals+eig_ham_h0res),
         Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
         Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
     ], optional=False, doc=doc_method)

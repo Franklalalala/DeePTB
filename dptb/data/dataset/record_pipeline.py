@@ -1420,6 +1420,54 @@ class RecordPipeline:
         self.prior_decoder = PriorDecoder()
         self.target_decoder = TargetDecoder()
 
+    @staticmethod
+    def _decode_band_targets(dataset, ctx, atomicdata) -> None:
+        """Attach overlap / k-points / reference eigenvalues from the record.
+
+        LMDBDataset has always accepted ``get_overlap`` and ``get_eigenvalues``
+        but never decoded them, so both flags were silently inert. Anything a
+        flag asks for and the record does not carry is a hard error here: a
+        missing overlap would otherwise be read as an orthogonal basis and a
+        missing eigenvalue would drop the band term to zero, both without a
+        single warning.
+        """
+        data_dict = ctx.data_dict
+
+        if getattr(dataset, "get_overlap", False):
+            for src_key, out_key in (
+                ("node_overlap", AtomicDataDict.NODE_OVERLAP_KEY),
+                ("edge_overlap", AtomicDataDict.EDGE_OVERLAP_KEY),
+            ):
+                value = data_dict.get(src_key, None)
+                if value is None:
+                    raise KeyError(
+                        f"get_overlap=True but the LMDB record has no {src_key!r}. "
+                        "Build the dataset with overlap blocks first."
+                    )
+                atomicdata[out_key] = torch.as_tensor(
+                    value, dtype=torch.get_default_dtype()
+                )
+
+        if getattr(dataset, "get_eigenvalues", False):
+            kpoint = data_dict.get("kpoint", None)
+            eigenvalue = data_dict.get("eigenvalue", None)
+            if kpoint is None or eigenvalue is None:
+                raise KeyError(
+                    "get_eigenvalues=True but the LMDB record has no 'kpoint'/"
+                    "'eigenvalue'. Build the dataset with band targets first."
+                )
+            kpoint = torch.as_tensor(kpoint, dtype=torch.get_default_dtype())
+            eigenvalue = torch.as_tensor(eigenvalue, dtype=torch.get_default_dtype())
+            if kpoint.reshape(-1, 3).shape[0] != eigenvalue.shape[-2]:
+                raise ValueError(
+                    f"kpoint count {kpoint.reshape(-1, 3).shape[0]} does not match "
+                    f"eigenvalue k-axis {eigenvalue.shape[-2]}."
+                )
+            atomicdata[AtomicDataDict.KPOINT_KEY] = kpoint.reshape(-1, 3)
+            atomicdata[AtomicDataDict.ENERGY_EIGENVALUE_KEY] = eigenvalue.reshape(
+                1, eigenvalue.shape[-2], eigenvalue.shape[-1]
+            )
+
     def build(self, dataset: Any, idx: int) -> Any:
         data_dict = self.reader.read(dataset, idx)
         ctx = build_sample_context(dataset, idx, data_dict, self.schema_validator)
@@ -1440,6 +1488,7 @@ class RecordPipeline:
         self.target_decoder.assemble_block_tensors(ctx, atomicdata, num_nodes, num_edges)
         self.prior_decoder.validate_blocks(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.validate_full_h(ctx, atomicdata)
+        self._decode_band_targets(dataset, ctx, atomicdata)
         self.schema_validator.mark_validated(ctx, graph)
 
         # Attach a stable, composition-independent per-graph record identity for

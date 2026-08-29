@@ -612,6 +612,7 @@ log = logging.getLogger(__name__)
 
 import torch.nn as nn
 from typing import Dict, Union
+import math
 
 
 @Loss.register("hamil_abs")
@@ -1790,3 +1791,538 @@ try:
     from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss  # noqa: F401
 except Exception as _blockwise_exc:  # pragma: no cover
     log.warning("Could not register hamil_blockwise_nextham: %s", _blockwise_exc)
+
+
+def _unnest(t):
+    """Unwrap a single-graph nested tensor; pass anything else through."""
+    if torch.is_tensor(t) and t.is_nested:
+        return t[0]
+    return t
+
+
+@Loss.register("eig_ham_h0res")
+class EigHamH0ResLoss(nn.Module):
+    """Joint H-matrix + band loss for an arm whose target is an H0 residual.
+
+    ``eig_ham`` assumes NODE/EDGE_FEATURES already hold the physical
+    Hamiltonian. The h0dh arm predicts dH against a stored H0 prior, so the
+    band term has to diagonalize H0 + dH while the matrix term keeps scoring
+    the residual exactly as pretraining did -- otherwise the two halves of the
+    objective disagree about what the model outputs.
+
+    total = coeff_ham * L_ham(residual) + (1 - coeff_ham) * L_eig(H0 + residual)
+
+    Keeping L_ham in the mix is what makes 138 band labels survivable: it
+    anchors the model to the matrix it already fits, so the band term only
+    steers rather than redefines the target.
+    """
+
+    def __init__(
+        self,
+        basis: Dict[str, Union[str, list]] = None,
+        idp: Union[OrbitalMapper, None] = None,
+        band_overlap: bool = True,
+        coeff_ham: float = 0.9,
+        band_emin: float = None,
+        band_emax: float = None,
+        band_min: int = 0,
+        band_max: int = None,
+        eout_weight: float = 0.01,
+        diff_on: bool = False,
+        diff_weight: float = 0.01,
+        diff_valence: dict = None,
+        spin_deg: int = 2,
+        dtype: Union[str, torch.dtype] = torch.float32,
+        device: Union[str, torch.device] = torch.device("cpu"),
+        **kwargs,
+    ):
+        super(EigHamH0ResLoss, self).__init__()
+        if not 0.0 <= coeff_ham <= 1.0:
+            raise ValueError(f"coeff_ham must be in [0, 1], got {coeff_ham}.")
+        self.coeff_ham = float(coeff_ham)
+        self.device = device
+
+        if basis is not None:
+            self.idp = OrbitalMapper(basis, method="e3tb", device=device)
+            if idp is not None:
+                assert idp == self.idp, "The basis of idp and basis should be the same."
+        else:
+            assert idp is not None, "Either basis or idp should be provided."
+            self.idp = idp
+
+        # Same matrix loss the pretraining run used, so the anchor term is
+        # numerically comparable to the checkpoint's own train_loss.
+        # Trainer merges common_options into every loss kwargs, so basis /
+        # overlap / dtype / device arrive twice; drop the copies passed
+        # explicitly. overlap stays False: this model predicts no S, and the
+        # matrix term must score exactly what pretraining scored.
+        ham_kwargs = {k: v for k, v in kwargs.items()
+                      if k not in ("basis", "overlap", "dtype", "device", "idp")}
+        self.ham_loss = HamilLossAbs(
+            idp=self.idp, overlap=False, dtype=dtype, device=device, **ham_kwargs
+        )
+        # Direct eigensolver rather than EigLoss: see module note on the
+        # Batch.from_dict/to_data_list mis-slice.
+        self.eigen = Eigenvalues(
+            idp=self.idp,
+            h_edge_field=AtomicDataDict.EDGE_FEATURES_KEY,
+            h_node_field=AtomicDataDict.NODE_FEATURES_KEY,
+            h_out_field=AtomicDataDict.HAMILTONIAN_KEY,
+            out_field=AtomicDataDict.ENERGY_EIGENVALUE_KEY,
+            s_edge_field=AtomicDataDict.EDGE_OVERLAP_KEY if band_overlap else None,
+            s_node_field=AtomicDataDict.NODE_OVERLAP_KEY if band_overlap else None,
+            s_out_field=AtomicDataDict.OVERLAP_KEY if band_overlap else None,
+            dtype=dtype,
+            device=device,
+        )
+        self.eout_weight = eout_weight
+
+        self.band_emin = band_emin
+        self.band_emax = band_emax
+        self.band_min = band_min
+        self.band_max = band_max
+        self._last_parts = {}
+
+    def _add_h0(self, src: AtomicDataDict) -> dict:
+        """Shallow copy with the physical Hamiltonian in the feature fields."""
+        for key in (AtomicDataDict.NODE_H0_KEY, AtomicDataDict.EDGE_H0_KEY):
+            if src.get(key, None) is None:
+                raise KeyError(
+                    f"eig_ham_h0res needs {key!r} to rebuild the physical "
+                    "Hamiltonian; run the dataset with get_H0=true."
+                )
+        out = dict(src)
+        out[AtomicDataDict.NODE_FEATURES_KEY] = (
+            src[AtomicDataDict.NODE_FEATURES_KEY] + src[AtomicDataDict.NODE_H0_KEY]
+        )
+        out[AtomicDataDict.EDGE_FEATURES_KEY] = (
+            src[AtomicDataDict.EDGE_FEATURES_KEY] + src[AtomicDataDict.EDGE_H0_KEY]
+        )
+        return out
+
+
+
+    # Only these reach the eigensolver. A collated batch also carries nested
+    # k-point/eigenvalue tensors and batch bookkeeping, which HR2HK cannot size.
+    _SOLVER_FIELDS = (
+        AtomicDataDict.EDGE_INDEX_KEY,
+        AtomicDataDict.EDGE_CELL_SHIFT_KEY,
+        AtomicDataDict.POSITIONS_KEY,
+        AtomicDataDict.CELL_KEY,
+        AtomicDataDict.PBC_KEY,
+        AtomicDataDict.ATOM_TYPE_KEY,
+        AtomicDataDict.EDGE_TYPE_KEY,
+        AtomicDataDict.ATOMIC_NUMBERS_KEY,
+        AtomicDataDict.NODE_FEATURES_KEY,
+        AtomicDataDict.EDGE_FEATURES_KEY,
+    )
+
+    def _solver_dict(self, src: dict, ref: dict) -> dict:
+        """Assemble the eigensolver input.
+
+        Hamiltonian RMEs come from ``src`` (the model output); the overlap and
+        the k-points come from ``ref`` (the untouched batch). The model
+        overwrites EDGE_OVERLAP_KEY with internal 128-dim latents during
+        forward, so reading S from the prediction gives garbage of the wrong
+        width.
+        """
+        out = {}
+        for key in self._SOLVER_FIELDS:
+            value = src.get(key, None)
+            if value is not None:
+                out[key] = _unnest(value)
+
+        n_rme = self.idp.reduced_matrix_element
+        for key in (AtomicDataDict.NODE_OVERLAP_KEY,
+                    AtomicDataDict.EDGE_OVERLAP_KEY):
+            value = _unnest(ref.get(key, None))
+            if value is None:
+                raise KeyError(
+                    f"band term needs {key!r} on the reference batch; run the "
+                    "dataset with get_overlap=true."
+                )
+            if value.shape[-1] != n_rme:
+                raise ValueError(
+                    f"{key} has width {value.shape[-1]}, expected the RME width "
+                    f"{n_rme}. A width of 128 means the model overwrote this "
+                    "field with internal latents -- read S from the reference "
+                    "batch, not the prediction."
+                )
+            out[key] = value
+
+        kpoint = _unnest(ref.get(AtomicDataDict.KPOINT_KEY, None))
+        if kpoint is None:
+            kpoint = _unnest(src.get(AtomicDataDict.KPOINT_KEY, None))
+        if kpoint is None:
+            raise KeyError("band term needs k-points on the batch.")
+        out[AtomicDataDict.KPOINT_KEY] = kpoint.reshape(-1, 3)
+        return out
+
+    def _band_loss(self, pred_phys: dict, ref_phys: dict):
+        """Windowed MSE between predicted and reference bands, one graph.
+
+        Follows EigLoss's conventions so the number stays comparable: each side
+        is shifted by its own minimum, the window is measured in that
+        bottom-relative coordinate, and bands outside it are down-weighted to
+        eout_weight rather than dropped.
+        """
+        n_graph = 1
+        ptr = pred_phys.get(AtomicDataDict.BATCH_PTR_KEY, None)
+        if ptr is not None:
+            n_graph = int(ptr.numel()) - 1
+        if n_graph != 1:
+            raise RuntimeError(
+                f"eig_ham_h0res band term expects one graph per batch, got "
+                f"{n_graph}. k-points and band counts are ragged across "
+                f"structures, so set batch_size=1."
+            )
+
+        solver_input = self._solver_dict(pred_phys, ref_phys)
+        out = self.eigen(solver_input)
+        eig_pred = out[AtomicDataDict.ENERGY_EIGENVALUE_KEY]
+        if eig_pred.dim() == 3:
+            eig_pred = eig_pred[0]
+        eig_ref = _unnest(ref_phys[AtomicDataDict.ENERGY_EIGENVALUE_KEY])
+        if torch.is_tensor(eig_ref) and eig_ref.dim() == 3:
+            eig_ref = eig_ref[0]
+        eig_ref = eig_ref.to(device=eig_pred.device, dtype=eig_pred.dtype)
+
+        if eig_pred.shape[0] != eig_ref.shape[0]:
+            raise RuntimeError(
+                f"k-point count differs: pred {eig_pred.shape[0]} vs ref "
+                f"{eig_ref.shape[0]}."
+            )
+        nb = min(eig_pred.shape[1], eig_ref.shape[1])
+        lo = int(self.band_min)
+        hi = int(self.band_max) if self.band_max is not None else nb
+        hi = min(hi, nb)
+        if lo >= hi:
+            raise RuntimeError(f"empty band window: band_min={lo} band_max={hi}.")
+
+        p = eig_pred[:, lo:hi]
+        r = eig_ref[:, lo:hi]
+        p = p - p.reshape(-1).min()
+        r = r - r.reshape(-1).min()
+
+        diff2 = (p - r) ** 2
+        if self.band_emin is None and self.band_emax is None:
+            return diff2.mean()
+
+        mask = torch.ones_like(r, dtype=torch.bool)
+        if self.band_emin is not None:
+            mask &= r > self.band_emin
+        if self.band_emax is not None:
+            mask &= r < self.band_emax
+        n_in = int(mask.sum())
+        n_out = mask.numel() - n_in
+        loss = diff2.new_zeros(())
+        if n_in:
+            loss = loss + diff2[mask].mean()
+        if n_out:
+            loss = loss + self.eout_weight * diff2[~mask].mean()
+        return loss
+
+    def forward(self, data: AtomicDataDict, ref_data: AtomicDataDict):
+        ham_loss = self.ham_loss(data, ref_data)
+
+        if self.coeff_ham >= 1.0:
+            self._last_parts = {
+                "ham": float(ham_loss.detach()), "eig": 0.0}
+            return ham_loss
+
+        pred_phys = self._add_h0(data)
+        ref_phys = self._add_h0(ref_data)
+
+        # The window lives on the loss, not in the dataset: it is a training
+        # knob, and putting it here keeps the LMDB records reusable.
+        if self.band_emin is not None or self.band_emax is not None:
+            ref_phys[AtomicDataDict.ENERGY_WINDOWS_KEY] = (
+                self.band_emin, self.band_emax)
+        if self.band_max is not None:
+            ref_phys[AtomicDataDict.BAND_WINDOW_KEY] = (
+                self.band_min, self.band_max)
+
+        eig_loss = self._band_loss(pred_phys, ref_phys)
+        self._last_parts = {
+            "ham": float(ham_loss.detach()), "eig": float(eig_loss.detach())}
+        return self.coeff_ham * ham_loss + (1.0 - self.coeff_ham) * eig_loss
+
+
+@Loss.register("hamil_abs_gauged")
+class HamilAbsGaugedLoss(nn.Module):
+    """hamil_abs, with the H -> H + mu*S gauge freedom removed first.
+
+    Arm A of the NextHAM port: no k-space term, no eigendecomposition, no band
+    labels. Only the overlap is needed beyond what pretraining used.
+    """
+
+    def __init__(
+        self,
+        basis: Dict[str, Union[str, list]] = None,
+        idp: Union[OrbitalMapper, None] = None,
+        gauge: bool = True,
+        gauge_clip: float = 1.0,
+        **kwargs,
+    ):
+        super(HamilAbsGaugedLoss, self).__init__()
+        if basis is not None:
+            self.idp = OrbitalMapper(basis, method="e3tb",
+                                     device=kwargs.get("device", torch.device("cpu")))
+            if idp is not None:
+                assert idp == self.idp, "The basis of idp and basis should be the same."
+        else:
+            assert idp is not None, "Either basis or idp should be provided."
+            self.idp = idp
+
+        inner = {k: v for k, v in kwargs.items() if k not in ("basis", "overlap", "idp")}
+        self.ham_loss = HamilLossAbs(idp=self.idp, overlap=False, **inner)
+        self.gauge = bool(gauge)
+        self.gauge_clip = float(gauge_clip)
+        self._last_parts = {}
+
+    def _solve_mu(self, data, ref_data):
+        """Closed-form mu on the real-space projection, detached.
+
+        mu = <dH_pred - dH_ref, S> / <S, S>, summed over the valid RME entries
+        of both node and edge blocks. Detached so no gradient flows through the
+        gauge solve itself.
+        """
+        num = den = 0.0
+        for feat_key, ovp_key in (
+            (AtomicDataDict.NODE_FEATURES_KEY, AtomicDataDict.NODE_OVERLAP_KEY),
+            (AtomicDataDict.EDGE_FEATURES_KEY, AtomicDataDict.EDGE_OVERLAP_KEY),
+        ):
+            s = ref_data.get(ovp_key, None)
+            if s is None:
+                raise KeyError(
+                    f"hamil_abs_gauged needs {ovp_key!r} on the reference batch; "
+                    "run the dataset with get_overlap=true."
+                )
+            if torch.is_tensor(s) and s.is_nested:
+                s = s[0]
+            n_rme = self.idp.reduced_matrix_element
+            if s.shape[-1] != n_rme:
+                raise ValueError(
+                    f"{ovp_key} has width {s.shape[-1]}, expected {n_rme}. "
+                    "A width of 128 means the model overwrote this field -- "
+                    "read S from the reference batch, not the prediction."
+                )
+            d = (data[feat_key].detach() - ref_data[feat_key].detach())
+            num = num + (d * s).sum()
+            den = den + (s * s).sum()
+        mu = num / den.clamp_min(1e-30)
+        return float(mu.clamp(-self.gauge_clip, self.gauge_clip))
+
+    def forward(self, data: AtomicDataDict, ref_data: AtomicDataDict):
+        if not self.gauge:
+            loss = self.ham_loss(data, ref_data)
+            self._last_parts = {"mu": 0.0, "ham": float(loss.detach()),
+                                "ham_ungauged": float(loss.detach())}
+            return loss
+
+        with torch.no_grad():
+            ungauged = float(self.ham_loss(data, ref_data).detach())
+
+        mu = self._solve_mu(data, ref_data)
+
+        # Shift the TARGET, not the prediction: the gauge belongs to the label.
+        shifted = dict(ref_data)
+        for feat_key, ovp_key in (
+            (AtomicDataDict.NODE_FEATURES_KEY, AtomicDataDict.NODE_OVERLAP_KEY),
+            (AtomicDataDict.EDGE_FEATURES_KEY, AtomicDataDict.EDGE_OVERLAP_KEY),
+        ):
+            s = ref_data[ovp_key]
+            if torch.is_tensor(s) and s.is_nested:
+                s = s[0]
+            shifted[feat_key] = ref_data[feat_key] + mu * s
+
+        loss = self.ham_loss(data, shifted)
+        self._last_parts = {"mu": mu, "ham": float(loss.detach()),
+                            "ham_ungauged": ungauged,
+                            "gauge_gain": ungauged / max(float(loss.detach()), 1e-30)}
+        return loss
+
+
+@Loss.register("nextham_kspace")
+class NextHAMKSpaceLoss(nn.Module):
+    """Real-space H loss plus NextHAM's P/Q/PQ projection loss."""
+
+    def __init__(
+        self,
+        basis: Dict[str, Union[str, list]] = None,
+        idp: Union[OrbitalMapper, None] = None,
+        w_p: float = 2e-4,
+        w_q: float = 1e-4,
+        w_pq: float = 1.5e-4,
+        gauge: bool = True,
+        gauge_clip: float = 1.0,
+        band_window: float = 10.0,
+        q_window: float = 30.0,
+        n_kpoints: int = 1,
+        dtype: Union[str, torch.dtype] = torch.float32,
+        device: Union[str, torch.device] = torch.device("cpu"),
+        **kwargs,
+    ):
+        super(NextHAMKSpaceLoss, self).__init__()
+        if basis is not None:
+            self.idp = OrbitalMapper(basis, method="e3tb", device=device)
+            if idp is not None:
+                assert idp == self.idp, "The basis of idp and basis should be the same."
+        else:
+            assert idp is not None, "Either basis or idp should be provided."
+            self.idp = idp
+
+        inner = {k: v for k, v in kwargs.items()
+                 if k not in ("basis", "overlap", "idp", "dtype", "device")}
+        self.ham_loss = HamilLossAbs(idp=self.idp, overlap=False,
+                                     dtype=dtype, device=device, **inner)
+        self.w_p, self.w_q, self.w_pq = float(w_p), float(w_q), float(w_pq)
+        self.w_r = 1.0 - (self.w_p + self.w_q + self.w_pq)
+        if self.w_r <= 0:
+            raise ValueError("k-space weights sum to >= 1; nothing left for H(R).")
+        self.gauge = bool(gauge)
+        self.gauge_clip = float(gauge_clip)
+        self.band_window = band_window
+        self.q_window = q_window
+        self.n_kpoints = int(n_kpoints)
+        self.device = device
+        self._dtype = dtype
+        self.l1 = nn.L1Loss(reduction="mean")
+        self._last_parts = {}
+
+        self.h2k = HR2HK(idp=self.idp, edge_field=AtomicDataDict.EDGE_FEATURES_KEY,
+                         node_field=AtomicDataDict.NODE_FEATURES_KEY,
+                         out_field=AtomicDataDict.HAMILTONIAN_KEY,
+                         dtype=dtype, device=device)
+        self.s2k = HR2HK(idp=self.idp, overlap=True,
+                         edge_field=AtomicDataDict.EDGE_OVERLAP_KEY,
+                         node_field=AtomicDataDict.NODE_OVERLAP_KEY,
+                         out_field=AtomicDataDict.OVERLAP_KEY,
+                         dtype=dtype, device=device)
+
+    # ---- gauge -----------------------------------------------------------
+    def _solve_mu(self, data, ref_data):
+        num = den = 0.0
+        for fk, ok in ((AtomicDataDict.NODE_FEATURES_KEY, AtomicDataDict.NODE_OVERLAP_KEY),
+                       (AtomicDataDict.EDGE_FEATURES_KEY, AtomicDataDict.EDGE_OVERLAP_KEY)):
+            s = _unnest(ref_data.get(ok, None))
+            if s is None:
+                raise KeyError("nextham_kspace needs %r; run with get_overlap=true." % ok)
+            if s.shape[-1] != self.idp.reduced_matrix_element:
+                raise ValueError(
+                    "%s width %d != RME width %d (128 means the model overwrote it)"
+                    % (ok, s.shape[-1], self.idp.reduced_matrix_element))
+            d = data[fk].detach() - ref_data[fk].detach()
+            num = num + (d * s).sum()
+            den = den + (s * s).sum()
+        return float((num / den.clamp_min(1e-30)).clamp(-self.gauge_clip, self.gauge_clip))
+
+    # ---- k-space ---------------------------------------------------------
+    def _base_fields(self, ref_data):
+        keys = (AtomicDataDict.EDGE_INDEX_KEY, AtomicDataDict.EDGE_CELL_SHIFT_KEY,
+                AtomicDataDict.POSITIONS_KEY, AtomicDataDict.CELL_KEY,
+                AtomicDataDict.PBC_KEY, AtomicDataDict.ATOM_TYPE_KEY,
+                AtomicDataDict.EDGE_TYPE_KEY, AtomicDataDict.ATOMIC_NUMBERS_KEY)
+        return {k: _unnest(ref_data[k]) for k in keys if k in ref_data}
+
+    def _split_pq(self, eigvals, nelec):
+        """P/Q by energy window around E_F, estimated from the electron count."""
+        n_occ = max(1, int(math.ceil(float(nelec) / 2.0)))
+        n_occ = min(n_occ, eigvals.numel() - 1)
+        e_f = float(eigvals[n_occ - 1])
+        rel = eigvals - e_f
+        p_mask = (rel >= -self.band_window) & (rel <= self.band_window)
+        if self.q_window is None:
+            q_mask = rel > self.band_window
+        else:
+            q_mask = (rel > self.band_window) & (rel <= self.band_window + self.q_window)
+        return p_mask, q_mask
+
+    def _kspace_terms(self, data, ref_data, mu):
+        self._empty_pq = 0
+        for key in (AtomicDataDict.NODE_H0_KEY, AtomicDataDict.EDGE_H0_KEY):
+            if ref_data.get(key, None) is None:
+                raise KeyError("nextham_kspace needs %r to rebuild the physical "
+                               "Hamiltonian; run the dataset with get_H0=true." % key)
+        base = self._base_fields(ref_data)
+        n_orb_probe = None
+        acc = {"p": [], "q": [], "pq": []}
+
+        for _ in range(self.n_kpoints):
+            kpt = torch.rand(1, 3, device=data[AtomicDataDict.EDGE_FEATURES_KEY].device,
+                             dtype=torch.get_default_dtype())
+            d_lab = dict(base)
+            d_lab[AtomicDataDict.KPOINT_KEY] = kpt
+            # The eigenbasis must come from the physical H = H0 + dH. H0 cancels
+            # in the difference terms but not inside the diagonalisation.
+            nh0 = _unnest(ref_data[AtomicDataDict.NODE_H0_KEY])
+            eh0 = _unnest(ref_data[AtomicDataDict.EDGE_H0_KEY])
+            d_lab[AtomicDataDict.NODE_FEATURES_KEY] = _unnest(ref_data[AtomicDataDict.NODE_FEATURES_KEY]) + nh0
+            d_lab[AtomicDataDict.EDGE_FEATURES_KEY] = _unnest(ref_data[AtomicDataDict.EDGE_FEATURES_KEY]) + eh0
+            d_lab[AtomicDataDict.NODE_OVERLAP_KEY] = _unnest(ref_data[AtomicDataDict.NODE_OVERLAP_KEY])
+            d_lab[AtomicDataDict.EDGE_OVERLAP_KEY] = _unnest(ref_data[AtomicDataDict.EDGE_OVERLAP_KEY])
+
+            with torch.no_grad():
+                sk = self.s2k(dict(d_lab))[AtomicDataDict.OVERLAP_KEY][0]
+                hk_lab = self.h2k(dict(d_lab))[AtomicDataDict.HAMILTONIAN_KEY][0]
+                # Generalised eigenproblem in the label's own gauge.
+                lo = torch.linalg.cholesky(sk)
+                lo_inv = torch.linalg.inv(lo)
+                heff = lo_inv @ hk_lab @ lo_inv.conj().transpose(-1, -2)
+                evals, evecs = torch.linalg.eigh(heff)
+                u = lo_inv.conj().transpose(-1, -2) @ evecs      # columns: eigenvectors
+                nelec = float(ref_data.get("nelec", evals.numel()))
+                p_mask, q_mask = self._split_pq(evals.real, nelec)
+                u_p = u[:, p_mask]
+                u_q = u[:, q_mask]
+            if u_p.shape[1] == 0 or u_q.shape[1] == 0:
+                # Not a silent skip: a spectrum that cannot fill both windows
+                # means the split (or the Hamiltonian) is wrong.
+                self._empty_pq += 1
+                continue
+            n_orb_probe = sk.shape[0]
+
+            d_pred = dict(d_lab)
+            d_pred[AtomicDataDict.NODE_FEATURES_KEY] = data[AtomicDataDict.NODE_FEATURES_KEY] + nh0
+            d_pred[AtomicDataDict.EDGE_FEATURES_KEY] = data[AtomicDataDict.EDGE_FEATURES_KEY] + eh0
+            hk_pred = self.h2k(d_pred)[AtomicDataDict.HAMILTONIAN_KEY][0]
+
+            eye_p = torch.eye(u_p.shape[1], device=hk_pred.device, dtype=hk_pred.dtype)
+            eye_q = torch.eye(u_q.shape[1], device=hk_pred.device, dtype=hk_pred.dtype)
+            for tag, ua, ub, eye in (("p", u_p, u_p, eye_p),
+                                     ("q", u_q, u_q, eye_q),
+                                     ("pq", u_p, u_q, None)):
+                a = ua.conj().transpose(-1, -2) @ hk_lab @ ub
+                b = ua.conj().transpose(-1, -2) @ hk_pred @ ub
+                if eye is not None:
+                    a = a + mu * eye
+                acc[tag].append(self.l1(a.real, b.real) + self.l1(a.imag, b.imag))
+
+        def red(v):
+            return torch.stack(v).mean() if v else torch.zeros((), device=self.device)
+        return red(acc["p"]), red(acc["q"]), red(acc["pq"]), n_orb_probe
+
+    # ---- forward ---------------------------------------------------------
+    def forward(self, data: AtomicDataDict, ref_data: AtomicDataDict):
+        mu = self._solve_mu(data, ref_data) if self.gauge else 0.0
+
+        shifted = dict(ref_data)
+        if mu:
+            for fk, ok in ((AtomicDataDict.NODE_FEATURES_KEY, AtomicDataDict.NODE_OVERLAP_KEY),
+                           (AtomicDataDict.EDGE_FEATURES_KEY, AtomicDataDict.EDGE_OVERLAP_KEY)):
+                shifted[fk] = ref_data[fk] + mu * _unnest(ref_data[ok])
+        l_r = self.ham_loss(data, shifted)
+
+        l_p, l_q, l_pq, n_orb = self._kspace_terms(data, ref_data, mu)
+        total = self.w_r * l_r + self.w_p * l_p + self.w_q * l_q + self.w_pq * l_pq
+
+        self._last_parts = {
+            "mu": mu, "n_orb": n_orb, "empty_pq": getattr(self, "_empty_pq", 0),
+            "R": float(l_r.detach()), "P": float(l_p.detach()),
+            "Q": float(l_q.detach()), "PQ": float(l_pq.detach()),
+            "wR": self.w_r * float(l_r.detach()),
+            "wP": self.w_p * float(l_p.detach()),
+            "wQ": self.w_q * float(l_q.detach()),
+            "wPQ": self.w_pq * float(l_pq.detach()),
+        }
+        return total

@@ -1877,7 +1877,9 @@ class Validationer(Monitor):
 
     def _get_value(self, **kwargs):
         if kwargs.get('field') == "iteration":
-            val = self.trainer.validation(fast=True)
+            # Was hardcoded True: every iteration-level validation_loss came
+            # from a single structure. Honour the configured flag instead.
+            val = self.trainer.validation(fast=self.fast_mode)
             self._sync_flow_metrics(epoch=False, time=kwargs.get("time"))
             flow_state = getattr(self.trainer, "_last_flow_validation_state", {})
             return flow_state.get("validation_loss", val)
