@@ -921,7 +921,7 @@ class MOLELinear(nn.Module):
 
     def _apply_expert_with_layout(self, x, layout, weight, bias):
         """One expert pass using a precomputed sort order and segment pointer."""
-        order, inverse, ptr, _ = layout
+        order, inverse, ptr, sorted_index = layout
         flat_x = x.reshape(-1, self.in_features)
         rows = flat_x.shape[0]
         if order.numel() != rows:
@@ -935,36 +935,35 @@ class MOLELinear(nn.Module):
                 0, order,
                 torch.arange(rows, device=order.device, dtype=order.dtype))
             ptr = ptr * repeat
+            sorted_index = sorted_index.repeat_interleave(repeat)
+        # Everything below is in SORTED row order and the single index_select at
+        # the end puts it back.  Mixing the two orders silently routes rows to
+        # the wrong expert, so no intermediate may be indexed with anything but
+        # a sorted-space index.
+        xs = flat_x.index_select(0, order).contiguous()
         use_cublas = (
             self.mole_linear_mode == "cublas_grouped"
             and x.device.type == "cuda"
-            and flat_x.dtype == torch.float32
+            and xs.dtype == torch.float32
             and weight.dtype == torch.float32
         )
         if use_cublas:
             from dptb.nn.cublas_grouped_gemm import grouped_gemm
 
-            out = grouped_gemm(flat_x.index_select(0, order).contiguous(),
-                               ptr, weight.contiguous())
-            out = out.index_select(0, inverse)
+            ys = grouped_gemm(xs, ptr, weight.contiguous())
         else:
-            eidx = _expand_route_index_for_leading_dims(layout[3], x) \
-                if layout[3].numel() != rows else layout[3]
-            out = None
-            for e in range(self.num_experts):
-                sel = (eidx == e).nonzero(as_tuple=True)[0]
-                if sel.numel() == 0:
-                    continue
-                part = F.linear(flat_x.index_select(0, sel), weight[e], None)
-                if out is None:
-                    out = part.new_zeros(rows, self.out_features)
-                out = out.index_add(0, sel, part)
-            if out is None:
-                out = flat_x.new_zeros(rows, self.out_features)
+            # ptr is a CPU tensor, so these bounds cost no device sync -- unlike
+            # the num_experts nonzero() calls they replace.
+            bounds = ptr.tolist()
+            parts = [F.linear(xs[bounds[e]:bounds[e + 1]], weight[e], None)
+                     for e in range(self.num_experts)
+                     if bounds[e + 1] > bounds[e]]
+            ys = (torch.cat(parts, 0) if parts
+                  else xs.new_zeros(rows, self.out_features))
         if bias is not None:
-            out = out + bias.index_select(0, layout[3] if layout[3].numel() == rows
-                                          else _expand_route_index_for_leading_dims(layout[3], x))
-        return out.reshape(*x.shape[:-1], self.out_features)
+            ys = ys + bias.index_select(0, sorted_index)
+        return ys.index_select(0, inverse).reshape(
+            *x.shape[:-1], self.out_features)
 
     def _apply_expert_sorted_loop(self, x, expert_index):
         """One matmul per expert over its own rows; no per-row weight is built.
