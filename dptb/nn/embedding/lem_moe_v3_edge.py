@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import torch
@@ -27,12 +28,31 @@ class LemMoEV3Edge(LemMoEV3):
         self.edge_one_hot_dim = edge_one_hot_dim
         self.edge_router_in_features = edge_one_hot_dim
         top_k = kwargs.get("top_k", 1)
+        prev_so2_env = None
         if self.edge_router_prior_activate:
             # 'staged' is the only SO2 route that reaches every MOLELinear through
             # MOLELinear.forward; the fused routes call _mix_expert_parameters,
             # which activation space forbids (it would build per-edge weights).
             kwargs["so2_fusion_mode"] = "staged"
-        super().__init__(**kwargs)
+            # SO2_Linear lets DPTB_SO2_FUSION_MODE override exactly the value
+            # "staged", so the kwarg alone is not enough wherever the deployment
+            # exports one.  Suppress it across construction, then verify.
+            prev_so2_env = os.environ.pop("DPTB_SO2_FUSION_MODE", None)
+        try:
+            super().__init__(**kwargs)
+        finally:
+            if prev_so2_env is not None:
+                os.environ["DPTB_SO2_FUSION_MODE"] = prev_so2_env
+        if self.edge_router_prior_activate:
+            stray = [name for name, mod in self.named_modules()
+                     if getattr(mod, "so2_fusion_mode", "staged") != "staged"]
+            if stray:
+                raise RuntimeError(
+                    "edge_router_prior_activate needs every SO2 layer on the "
+                    "'staged' route so each MOLELinear is reached through "
+                    "MOLELinear.forward, but %d are not: %s"
+                    % (len(stray), stray[:4])
+                )
 
         self._prior_chunks = []
         self._prior_source_dim = 0
