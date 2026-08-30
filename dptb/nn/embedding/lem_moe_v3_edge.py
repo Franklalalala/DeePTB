@@ -367,6 +367,10 @@ class LemMoEV3Edge(LemMoEV3):
                     topk_indices=topk_indices,
                     topk_values=topk_values,
                     activation_space=True,
+                    # MOLERouterV3 normalises the selected top-k logits with a
+                    # softmax, so these sum to 1 exactly and the shared expert
+                    # can be folded into the routed weights.
+                    coefficients_sum_to_one=True,
                 ),
                 monitor_val,
                 expert_load_cv,

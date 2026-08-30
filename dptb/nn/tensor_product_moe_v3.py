@@ -321,11 +321,19 @@ class MOLEGlobals:
             topk_indices=None,
             topk_values=None,
             activation_space=False,
+            coefficients_sum_to_one=False,
     ):
         # Activation-space dispatch: mix experts as sum_e c_e (x W_e) rather than
         # materialising one [out, in] weight per route token.  Set by the caller
         # when routing is per-edge, where the weight-space path cannot fit.
         self.activation_space = bool(activation_space)
+        # Only set where the router contract guarantees it (softmax over the
+        # gathered top-k logits).  It licenses folding the shared expert into the
+        # routed weights, which is exact only when the coefficients sum to 1.
+        self.coefficients_sum_to_one = bool(coefficients_sum_to_one)
+        # Keyed on the slot index explicitly: the other caches on this object are
+        # content-blind and would alias slot 1 onto slot 0's permutation.
+        self._expert_slot_layout_cache = {}
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.topk_indices = topk_indices
         self.topk_values = topk_values
@@ -339,6 +347,31 @@ class MOLEGlobals:
         self._indexed_flat_permutation_cache = {}
         self._indexed_segment_ptr_cache = {}
         self._indexed_inputs_are_sorted = False
+
+    def expert_slot_layout(self, slot: int, expert_index, num_experts: int):
+        """Sort order, inverse, and segment pointer for one top-k slot.
+
+        Derived once per forward and shared by every MOLELinear, since
+        topk_indices[:, slot] does not vary across modules.
+        """
+        key = (int(slot), str(expert_index.device), int(expert_index.numel()),
+               int(num_experts))
+        cached = self._expert_slot_layout_cache.get(key)
+        if cached is not None:
+            return cached
+        eidx = expert_index.reshape(-1).to(dtype=torch.long)
+        order = torch.argsort(eidx, stable=True)
+        inverse = torch.empty_like(order)
+        inverse.scatter_(
+            0, order,
+            torch.arange(order.numel(), device=order.device, dtype=order.dtype),
+        )
+        counts = torch.bincount(eidx, minlength=int(num_experts))
+        ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long)
+        ptr[1:] = torch.cumsum(counts.to("cpu"), dim=0)
+        cached = (order, inverse, ptr.contiguous(), eidx.index_select(0, order))
+        self._expert_slot_layout_cache[key] = cached
+        return cached
 
     @staticmethod
     def _normalize_split_sizes(sizes, split_sizes):
@@ -872,6 +905,67 @@ class MOLELinear(nn.Module):
             out = out + F.linear(x, shared_weight, shared_bias)
         return out
 
+    def _routed_weight_and_bias(self, fold_shared: bool):
+        """Expert weights, with the shared expert folded in when licensed.
+
+        sum_j c_j (W_ej + W_sh) == sum_j c_j W_ej + W_sh requires sum_j c_j == 1.
+        """
+        weight = self.weight_experts
+        bias = self.bias_experts
+        if fold_shared and self.num_shared_experts > 0:
+            weight = weight + self.weight_shared.sum(0).unsqueeze(0)
+            if self.bias_shared is not None:
+                shared_b = self.bias_shared.sum(0).unsqueeze(0)
+                bias = shared_b if bias is None else bias + shared_b
+        return weight, bias
+
+    def _apply_expert_with_layout(self, x, layout, weight, bias):
+        """One expert pass using a precomputed sort order and segment pointer."""
+        order, inverse, ptr, _ = layout
+        flat_x = x.reshape(-1, self.in_features)
+        rows = flat_x.shape[0]
+        if order.numel() != rows:
+            # leading dims expand one route row into several matrix rows
+            repeat = rows // order.numel()
+            base = order.unsqueeze(1) * repeat + torch.arange(
+                repeat, device=order.device, dtype=order.dtype).unsqueeze(0)
+            order = base.reshape(-1)
+            inverse = torch.empty_like(order)
+            inverse.scatter_(
+                0, order,
+                torch.arange(rows, device=order.device, dtype=order.dtype))
+            ptr = ptr * repeat
+        use_cublas = (
+            self.mole_linear_mode == "cublas_grouped"
+            and x.device.type == "cuda"
+            and flat_x.dtype == torch.float32
+            and weight.dtype == torch.float32
+        )
+        if use_cublas:
+            from dptb.nn.cublas_grouped_gemm import grouped_gemm
+
+            out = grouped_gemm(flat_x.index_select(0, order).contiguous(),
+                               ptr, weight.contiguous())
+            out = out.index_select(0, inverse)
+        else:
+            eidx = _expand_route_index_for_leading_dims(layout[3], x) \
+                if layout[3].numel() != rows else layout[3]
+            out = None
+            for e in range(self.num_experts):
+                sel = (eidx == e).nonzero(as_tuple=True)[0]
+                if sel.numel() == 0:
+                    continue
+                part = F.linear(flat_x.index_select(0, sel), weight[e], None)
+                if out is None:
+                    out = part.new_zeros(rows, self.out_features)
+                out = out.index_add(0, sel, part)
+            if out is None:
+                out = flat_x.new_zeros(rows, self.out_features)
+        if bias is not None:
+            out = out + bias.index_select(0, layout[3] if layout[3].numel() == rows
+                                          else _expand_route_index_for_leading_dims(layout[3], x))
+        return out.reshape(*x.shape[:-1], self.out_features)
+
     def _apply_expert_sorted_loop(self, x, expert_index):
         """One matmul per expert over its own rows; no per-row weight is built.
 
@@ -931,14 +1025,18 @@ class MOLELinear(nn.Module):
             )
         idx = idx.to(device=x.device, dtype=torch.long)
         val = val.to(device=x.device, dtype=x.dtype)
+        fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False))
+        weight, bias = self._routed_weight_and_bias(fold)
         view = [idx.shape[0]] + [1] * (x.dim() - 1)
         out = None
         for j in range(idx.shape[1]):
-            part = self._apply_expert_no_materialize(x, idx[:, j]) * val[:, j].reshape(view)
+            layout = mole_globals.expert_slot_layout(j, idx[:, j], self.num_experts)
+            part = self._apply_expert_with_layout(x, layout, weight, bias)
+            part = part * val[:, j].reshape(view)
             out = part if out is None else out + part
         if out is None:
             out = x.new_zeros(*x.shape[:-1], self.out_features)
-        if self.num_shared_experts > 0:
+        if not fold and self.num_shared_experts > 0:
             shared_bias = self.bias_shared.sum(0) if self.bias_shared is not None else None
             out = out + F.linear(x, self.weight_shared.sum(0), shared_bias)
         return out
