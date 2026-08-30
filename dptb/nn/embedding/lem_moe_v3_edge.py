@@ -9,7 +9,7 @@ from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLERouterV3
 
 from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
-from .lem_moe_v3_h0_helpers import H0InitLayer
+from .lem_moe_v3_h0_helpers import H0InitLayer, _sorted_irrep_coordinate_index
 
 
 @Embedding.register("lem_moe_v3_edge")
@@ -21,17 +21,73 @@ class LemMoEV3Edge(LemMoEV3):
         self.edge_router_unique_types = bool(kwargs.pop("edge_router_unique_types", True))
         self.edge_moe_compact_dispatch = bool(kwargs.pop("edge_moe_compact_dispatch", True))
         self.edge_moe_compact_min_edges = int(kwargs.pop("edge_moe_compact_min_edges", 16384))
+        self.edge_router_prior_activate = bool(kwargs.pop("edge_router_prior_activate", False))
+        self.edge_router_prior_stats = str(kwargs.pop("edge_router_prior_stats", "") or "")
         edge_one_hot_dim = int(edge_router_in_features or kwargs.get("edge_one_hot_dim", 128))
+        self.edge_one_hot_dim = edge_one_hot_dim
         self.edge_router_in_features = edge_one_hot_dim
         top_k = kwargs.get("top_k", 1)
+        if self.edge_router_prior_activate:
+            # 'staged' is the only SO2 route that reaches every MOLELinear through
+            # MOLELinear.forward; the fused routes call _mix_expert_parameters,
+            # which activation space forbids (it would build per-edge weights).
+            kwargs["so2_fusion_mode"] = "staged"
         super().__init__(**kwargs)
+
+        self._prior_chunks = []
+        self._prior_source_dim = 0
+        self.edge_router_prior_dim = 0
+        if self.edge_router_prior_activate:
+            prior_irreps, sort_index = _sorted_irrep_coordinate_index(self.idp)
+            self.register_buffer("_prior_sort_index", sort_index, persistent=False)
+            offset = 0
+            desc_dim = 0
+            for mul, ir in prior_irreps:
+                mul, ir_dim = int(mul), int(ir.dim)
+                width = mul * ir_dim
+                self._prior_chunks.append((offset, offset + width, mul, ir_dim))
+                offset += width
+                # l=0 is already invariant: keep every channel, signed.
+                # l>0 needs a quadratic invariant, and the complete
+                # Clebsch-Gordan-free one is the whole Gram matrix of the block,
+                # not just its diagonal.  Same (l, parity) only -- a cross-parity
+                # contraction is a pseudoscalar and would break inversion
+                # equivariance.
+                desc_dim += mul if ir_dim == 1 else mul * (mul + 1) // 2
+            self._prior_source_dim = offset
+            self.edge_router_prior_dim = desc_dim
+            self.edge_router_in_features = edge_one_hot_dim + desc_dim
+            mean = torch.zeros(desc_dim, dtype=self.dtype, device=self.device)
+            std = torch.ones(desc_dim, dtype=self.dtype, device=self.device)
+            if self.edge_router_prior_stats:
+                blob = torch.load(self.edge_router_prior_stats, map_location="cpu")
+                loaded_mean = blob["mean"].reshape(-1)
+                loaded_std = blob["std"].reshape(-1)
+                if loaded_mean.numel() != desc_dim or loaded_std.numel() != desc_dim:
+                    raise ValueError(
+                        "edge_router_prior_stats has "
+                        f"{loaded_mean.numel()} channels, descriptor has {desc_dim}."
+                    )
+                mean = loaded_mean.to(dtype=self.dtype, device=self.device)
+                std = loaded_std.to(dtype=self.dtype, device=self.device)
+            # Frozen on purpose: standardisation is a property of the dataset,
+            # not something the routing loss gets to move.
+            self.register_buffer("_prior_mean", mean, persistent=True)
+            self.register_buffer("_prior_std", std, persistent=True)
+
         self.router = MOLERouterV3(
-            in_features=edge_one_hot_dim,
+            in_features=self.edge_router_in_features,
             num_experts=self.num_experts,
             top_k=top_k,
             aux_loss_free=True,
             bias_update_speed=0.005,
         )
+        if self.edge_router_prior_dim:
+            # Step 0 is then bit-identical to the one-hot-only baseline: the
+            # descriptor can earn influence but cannot inject a scale shock into
+            # the sigmoid gate.  Gradients still flow into these columns.
+            with torch.no_grad():
+                self.router.net[0].weight[:, edge_one_hot_dim:].zero_()
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         data = with_edge_vectors(data, with_lengths=True)
@@ -99,8 +155,16 @@ class LemMoEV3Edge(LemMoEV3):
 
         active_edge_one_hot = edge_one_hot[active_edges]
         active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
+        router_input = active_edge_one_hot
+        if self.edge_router_prior_activate:
+            descriptor = self._gram_descriptor(
+                self._raw_prior_source(data, bond_type, active_edges)
+            )
+            router_input = torch.cat(
+                [active_edge_one_hot, descriptor.to(active_edge_one_hot.dtype)], dim=-1
+            )
         mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
-            active_edge_one_hot,
+            router_input,
             active_bond_type,
         )
         data["mean_max_prob"] = monitor_val
@@ -166,6 +230,57 @@ class LemMoEV3Edge(LemMoEV3):
 
         return data
 
+    def _raw_prior_source(
+        self,
+        data: AtomicDataDict.Type,
+        bond_type: torch.Tensor,
+        active_edges: torch.Tensor,
+    ) -> torch.Tensor:
+        """The frozen edge prior, masked and permuted into sorted-irrep order.
+
+        Read straight from the data dict, with no fallback: H0InitLayer's
+        fallback chain can reach the target Hamiltonian, and routing on the
+        target is label leakage.  Missing key is a hard error.
+        """
+        key = getattr(getattr(self, "init_layer", None), "h0_edge_key", None)
+        if key is None:
+            key = getattr(self, "h0_edge_key", None)
+        if key is None or key not in data:
+            raise KeyError(
+                "edge_router_prior_activate needs the frozen edge prior at "
+                f"data[{key!r}]; it exists only on lem_moe_v3_edge_h0 with a "
+                "dataset that carries edge_h0."
+            )
+        source = data[key].to(dtype=self.dtype)
+        mask = self.idp.mask_to_erme.to(source.device)[bond_type.flatten()]
+        source = source * mask.to(dtype=source.dtype)
+        source = source.index_select(1, self._prior_sort_index.to(source.device))
+        return source.index_select(0, active_edges)
+
+    def _gram_descriptor(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotation-invariant descriptor: l=0 signed, l>0 the full Gram matrix.
+
+        signed-log is applied per channel purely for conditioning; it is
+        strictly monotone, so no ordering information is lost.
+        """
+        if x.shape[-1] != self._prior_source_dim:
+            raise ValueError(
+                "edge prior descriptor expects a source of width "
+                f"{self._prior_source_dim}, got {x.shape[-1]}."
+            )
+        parts = []
+        for start, stop, mul, ir_dim in self._prior_chunks:
+            block = x[:, start:stop].reshape(x.shape[0], mul, ir_dim)
+            if ir_dim == 1:
+                parts.append(block.reshape(x.shape[0], mul))
+                continue
+            gram = torch.einsum("nam,nbm->nab", block, block)
+            iu = torch.triu_indices(mul, mul, offset=0, device=x.device)
+            parts.append(gram[:, iu[0], iu[1]])
+        desc = torch.cat(parts, dim=-1)
+        desc = torch.sign(desc) * torch.log1p(desc.abs()).clamp(max=20.0)
+        return (desc - self._prior_mean) / self._prior_std.clamp_min(1e-6)
+
     def _make_edge_moe_globals(
         self,
         active_edge_one_hot: torch.Tensor,
@@ -182,6 +297,33 @@ class LemMoEV3Edge(LemMoEV3):
             coeffs = active_edge_one_hot.new_zeros((0, self.num_experts))
             zero = active_edge_one_hot.new_zeros(())
             return MOLEGlobals(coefficients=coeffs, sizes=None), zero, zero, zero
+
+        if self.edge_router_prior_activate:
+            # One routing decision per edge.  No dedup: the whole point of this
+            # mode is that pooling by any function of (bond type, r) would make
+            # the coefficients a function of (bond type, r) too, no matter what
+            # the descriptor carries.
+            coeffs, monitor_val, expert_load_cv = self.router(active_edge_one_hot)
+            topk_indices, topk_values = self.router.last_topk()
+            if topk_indices is None or topk_values is None:
+                raise RuntimeError(
+                    "edge_router_prior_activate requires top_k < num_experts so "
+                    "the router exposes top-k metadata for activation-space "
+                    "dispatch."
+                )
+            num_route_tokens = coeffs.new_tensor(float(coeffs.shape[0]))
+            return (
+                MOLEGlobals(
+                    coefficients=coeffs,
+                    sizes=None,
+                    topk_indices=topk_indices,
+                    topk_values=topk_values,
+                    activation_space=True,
+                ),
+                monitor_val,
+                expert_load_cv,
+                num_route_tokens,
+            )
 
         if self.edge_router_unique_types:
             unique_bond_type, inverse, counts = torch.unique(

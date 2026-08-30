@@ -2000,12 +2000,16 @@ def slem_edge():
     doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
     doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, enable grouped compact dispatch for large-edge batches. Default: `True`."
     doc_edge_moe_compact_min_edges = "Minimum active-edge count before grouped compact dispatch is used. Default: `16384`."
+    doc_edge_router_prior_activate = "Route every active edge individually on a frozen Gram descriptor of the edge prior, dispatched in activation space. Widens the router input and disables bond-type dedup. Requires the lem_moe_v3_edge_h0 variant and top_k < num_experts. Default: `False`."
+    doc_edge_router_prior_stats = "Path to a frozen per-channel mean/std file for the prior descriptor (torch.save of {'mean': ..., 'std': ...}). Empty means identity. Never trained. Default: `\"\"`."
 
     return slem() + [
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
         Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
         Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
+        Argument("edge_router_prior_activate", bool, optional=True, default=False, doc=doc_edge_router_prior_activate),
+        Argument("edge_router_prior_stats", str, optional=True, default="", doc=doc_edge_router_prior_stats),
     ]
 
 
@@ -2014,12 +2018,16 @@ def slem_edge_h0():
     doc_edge_router_unique_types = "For edge-wise MoE, route unique active bond types once and map them back to active edges. Default: `True`."
     doc_edge_moe_compact_dispatch = "For edge-wise MoE with unique-type routing, enable grouped compact dispatch for large-edge batches. Default: `True`."
     doc_edge_moe_compact_min_edges = "Minimum active-edge count before grouped compact dispatch is used. Default: `16384`."
+    doc_edge_router_prior_activate = "Route every active edge individually on a frozen Gram descriptor of the edge prior, dispatched in activation space. Widens the router input and disables bond-type dedup. Requires the lem_moe_v3_edge_h0 variant and top_k < num_experts. Default: `False`."
+    doc_edge_router_prior_stats = "Path to a frozen per-channel mean/std file for the prior descriptor (torch.save of {'mean': ..., 'std': ...}). Empty means identity. Never trained. Default: `\"\"`."
 
     return slem_h0() + [
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
         Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
         Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
+        Argument("edge_router_prior_activate", bool, optional=True, default=False, doc=doc_edge_router_prior_activate),
+        Argument("edge_router_prior_stats", str, optional=True, default="", doc=doc_edge_router_prior_stats),
     ]
 
 

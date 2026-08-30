@@ -320,7 +320,12 @@ class MOLEGlobals:
             graph_index=None,
             topk_indices=None,
             topk_values=None,
+            activation_space=False,
     ):
+        # Activation-space dispatch: mix experts as sum_e c_e (x W_e) rather than
+        # materialising one [out, in] weight per route token.  Set by the caller
+        # when routing is per-edge, where the weight-space path cannot fit.
+        self.activation_space = bool(activation_space)
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.topk_indices = topk_indices
         self.topk_values = topk_values
@@ -867,7 +872,81 @@ class MOLELinear(nn.Module):
             out = out + F.linear(x, shared_weight, shared_bias)
         return out
 
+    def _apply_expert_sorted_loop(self, x, expert_index):
+        """One matmul per expert over its own rows; no per-row weight is built.
+
+        The reference indexed path gathers weight_experts per row, which costs
+        n_rows * out * in -- the very thing activation space exists to avoid.
+        """
+        flat_x = x.reshape(-1, self.in_features)
+        eidx = _expand_route_index_for_leading_dims(expert_index, x)
+        out = flat_x.new_zeros(flat_x.shape[0], self.out_features)
+        for e in range(self.num_experts):
+            rows = (eidx == e).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            bias = self.bias_experts[e] if self.bias_experts is not None else None
+            out = out.index_add(
+                0, rows,
+                F.linear(flat_x.index_select(0, rows), self.weight_experts[e], bias),
+            )
+        return out.reshape(*x.shape[:-1], self.out_features)
+
+    def _apply_expert_no_materialize(self, x, expert_index):
+        if (
+            self.mole_linear_mode == "cublas_grouped"
+            and x.device.type == "cuda"
+            and x.dtype == torch.float32
+            and self.weight_experts.dtype == torch.float32
+        ):
+            return self._apply_expert_cublas_grouped(x, expert_index)
+        return self._apply_expert_sorted_loop(x, expert_index)
+
+    def _apply_activation_space(self, x, mole_globals: MOLEGlobals):
+        """x (sum_e c_e W_e) == sum_e c_e (x W_e).
+
+        Same arithmetic as _mix_expert_parameters followed by a grouped GEMM,
+        but the resident tensor is k copies of the OUTPUT instead of one
+        [out, in] weight per route token: n_tokens * out * in becomes
+        k * n_rows * out.  That is what makes per-edge routing affordable.
+        Summation order differs, so results agree to float rounding, not bitwise.
+        """
+        idx = getattr(mole_globals, "topk_indices", None)
+        val = getattr(mole_globals, "topk_values", None)
+        if idx is None or val is None:
+            raise ValueError(
+                "activation-space MoLE needs top-k routing metadata, but "
+                "router.last_topk() returned None. It is unset when top_k >= "
+                "num_experts and mole_full_expert_fast_path is on."
+            )
+        if idx.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"activation-space MoLE got {idx.shape[0]} route rows for "
+                f"{x.shape[0]} input rows; routing must be per-row here."
+            )
+        idx = idx.to(device=x.device, dtype=torch.long)
+        val = val.to(device=x.device, dtype=x.dtype)
+        view = [idx.shape[0]] + [1] * (x.dim() - 1)
+        out = None
+        for j in range(idx.shape[1]):
+            part = self._apply_expert_no_materialize(x, idx[:, j]) * val[:, j].reshape(view)
+            out = part if out is None else out + part
+        if out is None:
+            out = x.new_zeros(*x.shape[:-1], self.out_features)
+        if self.num_shared_experts > 0:
+            shared_bias = self.bias_shared.sum(0) if self.bias_shared is not None else None
+            out = out + F.linear(x, self.weight_shared.sum(0), shared_bias)
+        return out
+
     def _mix_expert_parameters(self, mole_globals: MOLEGlobals):
+        if getattr(mole_globals, "activation_space", False):
+            raise RuntimeError(
+                "activation-space MoLE reached the weight-space path, which "
+                "would materialise one [out_features, in_features] weight per "
+                "route token -- exactly what per-edge routing cannot afford. "
+                "Set so2_fusion_mode='staged' so every MOLELinear is reached "
+                "through MOLELinear.forward."
+            )
         coefficients = mole_globals.coefficients
         topk_indices = getattr(mole_globals, "topk_indices", None)
         topk_values = getattr(mole_globals, "topk_values", None)
@@ -1108,6 +1187,9 @@ class MOLELinear(nn.Module):
                 if self.num_shared_experts > 0 and self.bias_shared is not None:
                     b_avg = b_avg + self.bias_shared.sum(0)
             return F.linear(x, w_avg, b_avg)
+
+        if getattr(mole_globals, "activation_space", False):
+            return self._apply_activation_space(x, mole_globals)
 
         # === 核心逻辑: 权重融合 (Weight Merging) ===
         # 1. 混合路由专家权重
