@@ -13,6 +13,13 @@ from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
 from .lem_moe_v3_h0_helpers import H0InitLayer, _sorted_irrep_coordinate_index
 
 
+
+# SO2 routes that reach every MOLELinear through MOLELinear.forward, which is what
+# activation-space (per-edge) dispatch requires.  The SO2CUDA fused routes are absent
+# on purpose: they consume fc._mix_expert_parameters() and would build one
+# [out_features, in_features] weight per edge.
+_PRIOR_ACTIVATE_ROUTES = ("staged", "streamed_m_major_cueq")
+
 @Embedding.register("lem_moe_v3_edge")
 class LemMoEV3Edge(LemMoEV3):
     """LEM MoE v3 variant with per-active-edge routing coefficients."""
@@ -53,10 +60,39 @@ class LemMoEV3Edge(LemMoEV3):
                     "dispatches through apply_experts and would materialise one "
                     "weight per edge." % (mixing,)
                 )
-            # 'staged' is the only SO2 route that reaches every MOLELinear through
-            # MOLELinear.forward; the fused routes call _mix_expert_parameters,
+            # Activation space needs exactly one thing: every MOLELinear reached
+            # through MOLELinear.forward.  Two routes do that -- 'staged', and the
+            # grouped streaming route, which reaches the m-linears through
+            # SO2_m_Linear.forward -> self.fc(x_m, mole_globals).  Only the SO2CUDA
+            # fused routes take the weights themselves via _mix_expert_parameters,
             # which activation space forbids (it would build per-edge weights).
-            kwargs["so2_fusion_mode"] = "staged"
+            # L40S, bs=24, 16,610 edges, fwd+bwd: grouped 960.9 ms vs staged
+            # 1169.2 ms (1.22x), same loss to the bit and worst gradient 1.9e-6
+            # relative, so the grouped route is the default here.
+            requested_route = kwargs.get("so2_fusion_mode")
+            if requested_route is None:
+                kwargs["so2_fusion_mode"] = "streamed_m_major_cueq"
+            elif requested_route not in _PRIOR_ACTIVATE_ROUTES:
+                # Silently rewriting this used to let a config claim a fused route
+                # and train on a different one with nothing in the log.
+                raise ValueError(
+                    "edge_router_prior_activate is incompatible with "
+                    "so2_fusion_mode=%r: that route consumes "
+                    "fc._mix_expert_parameters(), which builds one "
+                    "[out_features, in_features] weight per route token -- with "
+                    "per-edge routing that is one weight per edge. Use one of %s "
+                    "(omit the key for the faster default, %r)."
+                    % (requested_route, list(_PRIOR_ACTIVATE_ROUTES), "streamed_m_major_cueq")
+                )
+            # The m-linear cuBLAS fusion inside the grouped route is the one part
+            # of it that DOES call _mix_expert_parameters, so it has to stay off.
+            if os.environ.get("DPTB_SO2_FUSE_M_CUBLAS", "0") not in ("", "0", "false", "False", "FALSE"):
+                raise RuntimeError(
+                    "edge_router_prior_activate is incompatible with "
+                    "DPTB_SO2_FUSE_M_CUBLAS=1: that path fuses the m-linears by "
+                    "calling fc._mix_expert_parameters(), which would materialise "
+                    "one weight per edge."
+                )
             # SO2_Linear lets DPTB_SO2_FUSION_MODE override exactly the value
             # "staged", so the kwarg alone is not enough wherever the deployment
             # exports one.  Suppress it across construction, then verify.
@@ -68,13 +104,13 @@ class LemMoEV3Edge(LemMoEV3):
                 os.environ["DPTB_SO2_FUSION_MODE"] = prev_so2_env
         if self.edge_router_prior_activate:
             stray = [name for name, mod in self.named_modules()
-                     if getattr(mod, "so2_fusion_mode", "staged") != "staged"]
+                     if getattr(mod, "so2_fusion_mode", "staged") not in _PRIOR_ACTIVATE_ROUTES]
             if stray:
                 raise RuntimeError(
-                    "edge_router_prior_activate needs every SO2 layer on the "
-                    "'staged' route so each MOLELinear is reached through "
-                    "MOLELinear.forward, but %d are not: %s"
-                    % (len(stray), stray[:4])
+                    "edge_router_prior_activate needs every SO2 layer on a route "
+                    "that reaches MOLELinear.forward (one of %s) so the per-edge "
+                    "coefficients are applied to activations, but %d are not: %s"
+                    % (list(_PRIOR_ACTIVATE_ROUTES), len(stray), stray[:4])
                 )
 
         self._prior_chunks = []
