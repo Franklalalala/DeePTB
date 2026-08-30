@@ -685,9 +685,15 @@ class MOLERouterV3(nn.Module):
                     self.expert_bias -= self.expert_bias.mean()
 
             # 修改2: 强制 L1 归一化 (防止路由专家被共享专家 "饿死")
-            topk_scores_original = torch.gather(scores, 1, topk_indices)
-            denominators = topk_scores_original.sum(dim=-1, keepdim=True) + 1e-8
-            topk_probs = topk_scores_original / denominators
+            # normfix arm: normalise in logit space, not on the sigmoid scores.
+            # sigmoid(z) underflows to 0 in float32 below z ~ -104, and past that
+            # the 1e-8 epsilon becomes the whole denominator, so the gate row sums
+            # to ~1e-24 instead of 1 and the routed branch contributes nothing.
+            # softmax over the gathered logits is scale-free, needs no epsilon,
+            # sums to 1 by construction and keeps a usable gradient. Selection and
+            # the load statistics above deliberately still use `scores`.
+            topk_logits = torch.gather(logits, 1, topk_indices)
+            topk_probs = torch.softmax(topk_logits, dim=-1)
             self._last_topk_indices = topk_indices
             self._last_topk_values = topk_probs
 
