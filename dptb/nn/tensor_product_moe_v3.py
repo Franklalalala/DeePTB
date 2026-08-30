@@ -880,16 +880,21 @@ class MOLELinear(nn.Module):
         """
         flat_x = x.reshape(-1, self.in_features)
         eidx = _expand_route_index_for_leading_dims(expert_index, x)
-        out = flat_x.new_zeros(flat_x.shape[0], self.out_features)
+        out = None
         for e in range(self.num_experts):
             rows = (eidx == e).nonzero(as_tuple=True)[0]
             if rows.numel() == 0:
                 continue
             bias = self.bias_experts[e] if self.bias_experts is not None else None
-            out = out.index_add(
-                0, rows,
-                F.linear(flat_x.index_select(0, rows), self.weight_experts[e], bias),
-            )
+            part = F.linear(flat_x.index_select(0, rows), self.weight_experts[e], bias)
+            if out is None:
+                # Take dtype from the matmul, not from x: under autocast F.linear
+                # returns bf16/fp16 while x stays fp32, and index_add requires
+                # self and source to agree.
+                out = part.new_zeros(flat_x.shape[0], self.out_features)
+            out = out.index_add(0, rows, part)
+        if out is None:
+            out = flat_x.new_zeros(flat_x.shape[0], self.out_features)
         return out.reshape(*x.shape[:-1], self.out_features)
 
     def _apply_expert_no_materialize(self, x, expert_index):

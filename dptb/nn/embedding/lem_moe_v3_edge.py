@@ -30,6 +30,29 @@ class LemMoEV3Edge(LemMoEV3):
         top_k = kwargs.get("top_k", 1)
         prev_so2_env = None
         if self.edge_router_prior_activate:
+            # softmax over a single gathered logit is the constant 1, so with
+            # top_k=1 the routing coefficient carries no gradient at all: the
+            # zero-initialised descriptor columns would stay zero forever and the
+            # whole mode would be a silent no-op that still pays for staged SO2.
+            if int(top_k) < 2:
+                raise ValueError(
+                    "edge_router_prior_activate needs top_k >= 2; got %r. With "
+                    "top_k=1 the gate is constant and the router receives no "
+                    "gradient, so the descriptor could never earn any influence."
+                    % (top_k,)
+                )
+            # post_activation mixing reaches the experts through apply_experts,
+            # whose reference backend gathers one [out, in] weight per row -- the
+            # very cost activation space exists to avoid, and the weight-space
+            # guard does not sit on that path.
+            mixing = kwargs.get("so2_expert_mixing_mode", "pre_activation")
+            if mixing != "pre_activation":
+                raise ValueError(
+                    "edge_router_prior_activate requires "
+                    "so2_expert_mixing_mode='pre_activation'; got %r, which "
+                    "dispatches through apply_experts and would materialise one "
+                    "weight per edge." % (mixing,)
+                )
             # 'staged' is the only SO2 route that reaches every MOLELinear through
             # MOLELinear.forward; the fused routes call _mix_expert_parameters,
             # which activation space forbids (it would build per-edge weights).
@@ -91,9 +114,11 @@ class LemMoEV3Edge(LemMoEV3):
                 mean = loaded_mean.to(dtype=self.dtype, device=self.device)
                 std = loaded_std.to(dtype=self.dtype, device=self.device)
             # Frozen on purpose: standardisation is a property of the dataset,
-            # not something the routing loss gets to move.
-            self.register_buffer("_prior_mean", mean, persistent=True)
-            self.register_buffer("_prior_std", std, persistent=True)
+            # not something the routing loss gets to move.  Non-persistent so a
+            # resume takes the stats named by the current config instead of
+            # silently restoring whatever the checkpoint was written with.
+            self.register_buffer("_prior_mean", mean, persistent=False)
+            self.register_buffer("_prior_std", std, persistent=False)
 
         self.router = MOLERouterV3(
             in_features=self.edge_router_in_features,
@@ -103,9 +128,12 @@ class LemMoEV3Edge(LemMoEV3):
             bias_update_speed=0.005,
         )
         if self.edge_router_prior_dim:
-            # Step 0 is then bit-identical to the one-hot-only baseline: the
-            # descriptor can earn influence but cannot inject a scale shock into
-            # the sigmoid gate.  Gradients still flow into these columns.
+            # The descriptor contributes exactly zero at step 0, so it can earn
+            # influence without injecting a scale shock into the gate, and
+            # gradients still flow into these columns.  Note this is NOT a
+            # bit-identical baseline: widening the router input also rescales
+            # nn.Linear's fan_in initialisation, so the surviving one-hot columns
+            # are redrawn and narrower than in the 128-wide model.
             with torch.no_grad():
                 self.router.net[0].weight[:, edge_one_hot_dim:].zero_()
 
