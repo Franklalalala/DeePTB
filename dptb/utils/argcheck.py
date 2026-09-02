@@ -1352,6 +1352,7 @@ def train_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -1398,6 +1399,7 @@ def validation_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -1444,6 +1446,7 @@ def reference_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -1489,6 +1492,7 @@ def test_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -2579,6 +2583,36 @@ def _validate_p2_prior_full_h_contract(data):
         if isinstance(data_options_value.get(split), dict)
     }
     loss_options_value = data.get("train_options", {}).get("loss_options", {})
+    residual_rme_flags = {
+        split: bool(options.get("require_prior_residual_rme_target", False))
+        for split, options in configured_splits.items()
+    }
+    uses_prior_residual_rme = any(residual_rme_flags.values())
+    if uses_prior_residual_rme and not all(residual_rme_flags.values()):
+        raise ValueError(
+            "require_prior_residual_rme_target must be identical across every "
+            "configured data split."
+        )
+    if uses_prior_residual_rme:
+        if prediction_options.get("method") != "e3tb":
+            raise ValueError(
+                "Prior residual-RME training requires prediction.method='e3tb'; "
+                "block-native Full-H heads use a different target contract."
+            )
+        if add_prior:
+            raise ValueError(
+                "Prior residual-RME targets are already H-prior; AO prior "
+                "add-back/reconstruction='prior_residual' is forbidden."
+            )
+        for split in ("train", "validation"):
+            if split not in configured_splits:
+                continue
+            split_loss = loss_options_value.get(split, {})
+            if split_loss.get("method") != "hamil_abs":
+                raise ValueError(
+                    f"train_options.loss_options.{split}.method must be "
+                    "'hamil_abs' for compact prior residual-RME targets."
+                )
     required_target_keys = {
         "target_node_block_key": "node_full_hamil_target_blocks",
         "target_edge_block_key": "edge_full_hamil_target_blocks",
@@ -2686,7 +2720,16 @@ def _validate_p2_prior_full_h_contract(data):
                 "both direct and prior-plus-correction heads are supervised "
                 "against explicit absolute Full H."
             )
-        if not bool(split_options.get("require_full_h_target", False)):
+        prior_residual_rme = bool(
+            split_options.get("require_prior_residual_rme_target", False)
+        )
+        if prior_residual_rme:
+            if bool(split_options.get("require_full_h_target", False)):
+                raise ValueError(
+                    f"data_options.{split}.require_full_h_target must be false "
+                    "for compact prior residual-RME training."
+                )
+        elif not bool(split_options.get("require_full_h_target", False)):
             raise ValueError(
                 f"data_options.{split}.require_full_h_target must be true for "
                 "prior-conditioned direct or residual Full-H training."
@@ -2722,6 +2765,14 @@ def _validate_p2_prior_full_h_contract(data):
                 f"data_options.{split}.require_p2_blocks must be false for the "
                 "direct Full-H head; AO prior blocks are not consumed."
             )
+
+    if uses_prior_residual_rme:
+        # This versioned route predicts the already materialized H-prior RME
+        # target directly.  The checks above bind its prior kind, source
+        # fingerprint, target flag, direct e3tb head, and hamil_abs loss.
+        # Full-H block keys and AO reconstruction below belong exclusively to
+        # the historical absolute-Full-H routes.
+        return
 
     full_node_key = prediction_options.get(
         "full_output_node_field", "node_full_hamil_blocks"
