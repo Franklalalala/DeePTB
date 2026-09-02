@@ -48,6 +48,9 @@ from dptb.data.interfaces.p2_contract import (
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
+    NONSOC_DM_RME_SAMPLE_SCHEMA,
+    NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,
+    NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
     P2_BUNDLE_FINGERPRINT_KEY,
     P2_SAMPLE_SCHEMA,
     P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
@@ -58,6 +61,7 @@ from dptb.data.interfaces.p2_contract import (
     ROW_ALIGNED_FIELD_CANDIDATES,
     SAMPLE_SCHEMA_KEY,
     TARGET_SOURCE_KEY,
+    assert_nonsoc_rme_sample_contract,
 )
 
 # The ``lmdb_dataset`` module hosts the patch-sensitive helpers (``block_to_feature``,
@@ -214,6 +218,19 @@ class RecordSchemaValidator:
         the downstream graph/prior fingerprint checks.
         """
         sample_schema = data_dict.get(SAMPLE_SCHEMA_KEY)
+        assert_nonsoc_rme_sample_contract(data_dict)
+        if getattr(dataset, "require_prior_residual_rme_target", False):
+            expected_schema = (
+                NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA
+                if dataset.prior_kind == "p2"
+                else NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA
+            )
+            if sample_schema != expected_schema:
+                raise ValueError(
+                    "Prior residual-RME target schema differs: "
+                    f"prior_kind={dataset.prior_kind!r} requires "
+                    f"{expected_schema!r}; got {sample_schema!r}."
+                )
         if (
             sample_schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA
             and getattr(dataset, "get_prior", False)
@@ -952,7 +969,7 @@ class PriorDecoder:
                 ctx.expected_prior_source_fingerprint,
                 prior_spec=prior_spec,
             )
-            if prior_spec.kind == "p23":
+            if prior_spec.kind in ("p23", "na_cf"):
                 parent_p2_bundle = _host.require_sha256(
                     ctx.data_dict.get(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY),
                     field=P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
@@ -968,15 +985,51 @@ class PriorDecoder:
                         f"record={record_p2_bundle}."
                     )
             if not ctx.record_contract_already_validated:
-                actual_rme_fingerprint = _host.fingerprint_fields(
-                    atomicdata,
-                    prior_spec.rme_fields,
-                )
-                _host.assert_record_fingerprint(
-                    ctx.data_dict,
-                    field=prior_spec.rme_fingerprint_key,
-                    actual=actual_rme_fingerprint,
-                )
+                # A composed family (na_cf = node_p23 + edge_p2) has no stored
+                # joint hash of its mixed pair. Validate every parent family
+                # in full, matching Hopper 577048 / 0820 nacf.
+                from dptb.data.interfaces.p2_contract import build_prior_spec
+
+                if not prior_spec.is_composed:
+                    actual_rme_fingerprint = _host.fingerprint_fields(
+                        atomicdata,
+                        prior_spec.rme_fields,
+                    )
+                    _host.assert_record_fingerprint(
+                        ctx.data_dict,
+                        field=prior_spec.rme_fingerprint_key,
+                        actual=actual_rme_fingerprint,
+                    )
+                else:
+                    for _vkind in prior_spec.validation_kinds:
+                        _vspec = build_prior_spec(_vkind)
+                        _host.assert_record_fingerprint(
+                            ctx.data_dict,
+                            field=_vspec.rme_fingerprint_key,
+                            actual=_host.fingerprint_fields(
+                                ctx.data_dict, _vspec.rme_fields
+                            ),
+                        )
+                    import numpy as _np
+
+                    for _key in prior_spec.rme_fields:
+                        _loaded = atomicdata[_key]
+                        _loaded = (
+                            _loaded.detach().cpu().numpy()
+                            if hasattr(_loaded, "detach")
+                            else _np.asarray(_loaded)
+                        )
+                        _stored = _np.asarray(ctx.data_dict[_key])
+                        if _loaded.shape != _stored.shape or not _np.array_equal(
+                            _loaded, _stored
+                        ):
+                            raise ValueError(
+                                "Composed prior "
+                                f"{prior_spec.kind!r}: loaded tensor {_key!r} "
+                                "is not bit-identical to the stored field "
+                                f"(loaded {_loaded.shape}, stored "
+                                f"{_stored.shape})."
+                            )
 
     def validate_blocks(
         self, ctx: SampleContext, atomicdata: Any, num_nodes: int, num_edges: int
@@ -1199,7 +1252,13 @@ def build_sample_context(
     ]
     schema_v2_row_aligned = bool(
         data_dict.get(SAMPLE_SCHEMA_KEY)
-        in {P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA}
+        in {
+            P2_SAMPLE_SCHEMA,
+            DUAL_PRIOR_SAMPLE_SCHEMA,
+            NONSOC_DM_RME_SAMPLE_SCHEMA,
+            NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,
+            NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
+        }
         and any(field in data_dict for field in ROW_ALIGNED_FIELD_CANDIDATES)
     )
     p2_feature_present = (node_p2 is not None, edge_p2 is not None)
@@ -1420,54 +1479,6 @@ class RecordPipeline:
         self.prior_decoder = PriorDecoder()
         self.target_decoder = TargetDecoder()
 
-    @staticmethod
-    def _decode_band_targets(dataset, ctx, atomicdata) -> None:
-        """Attach overlap / k-points / reference eigenvalues from the record.
-
-        LMDBDataset has always accepted ``get_overlap`` and ``get_eigenvalues``
-        but never decoded them, so both flags were silently inert. Anything a
-        flag asks for and the record does not carry is a hard error here: a
-        missing overlap would otherwise be read as an orthogonal basis and a
-        missing eigenvalue would drop the band term to zero, both without a
-        single warning.
-        """
-        data_dict = ctx.data_dict
-
-        if getattr(dataset, "get_overlap", False):
-            for src_key, out_key in (
-                ("node_overlap", AtomicDataDict.NODE_OVERLAP_KEY),
-                ("edge_overlap", AtomicDataDict.EDGE_OVERLAP_KEY),
-            ):
-                value = data_dict.get(src_key, None)
-                if value is None:
-                    raise KeyError(
-                        f"get_overlap=True but the LMDB record has no {src_key!r}. "
-                        "Build the dataset with overlap blocks first."
-                    )
-                atomicdata[out_key] = torch.as_tensor(
-                    value, dtype=torch.get_default_dtype()
-                )
-
-        if getattr(dataset, "get_eigenvalues", False):
-            kpoint = data_dict.get("kpoint", None)
-            eigenvalue = data_dict.get("eigenvalue", None)
-            if kpoint is None or eigenvalue is None:
-                raise KeyError(
-                    "get_eigenvalues=True but the LMDB record has no 'kpoint'/"
-                    "'eigenvalue'. Build the dataset with band targets first."
-                )
-            kpoint = torch.as_tensor(kpoint, dtype=torch.get_default_dtype())
-            eigenvalue = torch.as_tensor(eigenvalue, dtype=torch.get_default_dtype())
-            if kpoint.reshape(-1, 3).shape[0] != eigenvalue.shape[-2]:
-                raise ValueError(
-                    f"kpoint count {kpoint.reshape(-1, 3).shape[0]} does not match "
-                    f"eigenvalue k-axis {eigenvalue.shape[-2]}."
-                )
-            atomicdata[AtomicDataDict.KPOINT_KEY] = kpoint.reshape(-1, 3)
-            atomicdata[AtomicDataDict.ENERGY_EIGENVALUE_KEY] = eigenvalue.reshape(
-                1, eigenvalue.shape[-2], eigenvalue.shape[-1]
-            )
-
     def build(self, dataset: Any, idx: int) -> Any:
         data_dict = self.reader.read(dataset, idx)
         ctx = build_sample_context(dataset, idx, data_dict, self.schema_validator)
@@ -1488,7 +1499,6 @@ class RecordPipeline:
         self.target_decoder.assemble_block_tensors(ctx, atomicdata, num_nodes, num_edges)
         self.prior_decoder.validate_blocks(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.validate_full_h(ctx, atomicdata)
-        self._decode_band_targets(dataset, ctx, atomicdata)
         self.schema_validator.mark_validated(ctx, graph)
 
         # Attach a stable, composition-independent per-graph record identity for

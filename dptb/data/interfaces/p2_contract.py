@@ -22,12 +22,31 @@ import torch
 
 P2_SAMPLE_SCHEMA = "deeptb.p2_training_sample/v2"
 DUAL_PRIOR_SAMPLE_SCHEMA = "deeptb.physical_prior_training_sample/v3"
+NONSOC_DM_RME_SAMPLE_SCHEMA = "deeptb.nonsoc_dm_rme_training_sample/v1"
+NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA = (
+    "deeptb.nonsoc_p2_residual_rme_training_sample/v1"
+)
+NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA = (
+    "deeptb.nonsoc_p23_residual_rme_training_sample/v1"
+)
 # Generic raw-block records use a separate schema from P2/P23 caches.  It
 # states only that the authoritative target is the raw ``hamiltonian`` block
 # dictionary; it must not be used to bless independently prepacked targets.
 RAW_HAMILTONIAN_SAMPLE_SCHEMA = "deeptb.raw_hamiltonian_training_sample/v1"
 ABSOLUTE_FULL_H_SEMANTICS = "absolute_full_h"
 H0_RESIDUAL_SEMANTICS = "h0_residual"
+NACF_RESIDUAL_RME_SCHEMA = "deeptb.nonsoc_na_cf_residual_rme_training_sample/v1"
+H0_RESIDUAL_RME_SCHEMA = "deeptb.nonsoc_h0_residual_rme_training_sample/v1"
+NACF_RESIDUAL_RME_SEMANTICS = "residual_na_cf_rme"
+DENSITY_MATRIX_RME_SEMANTICS = "density_matrix_rme"
+P2_RESIDUAL_RME_SEMANTICS = "residual_p2_rme"
+P23_RESIDUAL_RME_SEMANTICS = "residual_p23_rme"
+
+NONSOC_RME_SCHEMA_SEMANTICS = {
+    NONSOC_DM_RME_SAMPLE_SCHEMA: DENSITY_MATRIX_RME_SEMANTICS,
+    NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA: P2_RESIDUAL_RME_SEMANTICS,
+    NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA: P23_RESIDUAL_RME_SEMANTICS,
+}
 
 SAMPLE_SCHEMA_KEY = "hamiltonian_schema"
 TARGET_SEMANTICS_KEY = "hamiltonian_target_semantics"
@@ -126,6 +145,18 @@ class PriorSpec:
     bundle_fingerprint_key: str
     allowed_sample_schemas: tuple[str, ...]
     bundle_dependency_fields: tuple[str, ...] = ()
+    # Composed family: kinds whose fingerprints must ALL validate before this
+    # family's mixed node/edge selection is trusted. Empty for p2/p23.
+    composed_of: tuple[str, ...] = ()
+
+    @property
+    def validation_kinds(self) -> tuple[str, ...]:
+        """Kinds whose record fingerprints must all pass for this family."""
+        return self.composed_of or (self.kind,)
+
+    @property
+    def is_composed(self) -> bool:
+        return bool(self.composed_of)
 
     @property
     def label(self) -> str:
@@ -165,7 +196,11 @@ PRIOR_FIELD_SPECS = {
         rme_fingerprint_key=P2_RME_FINGERPRINT_KEY,
         block_fingerprint_key=P2_BLOCK_FINGERPRINT_KEY,
         bundle_fingerprint_key=P2_BUNDLE_FINGERPRINT_KEY,
-        allowed_sample_schemas=(P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA),
+        allowed_sample_schemas=(
+            P2_SAMPLE_SCHEMA,
+            DUAL_PRIOR_SAMPLE_SCHEMA,
+            NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,
+        ),
     ),
     "p23": PriorSpec(
         kind="p23",
@@ -180,8 +215,33 @@ PRIOR_FIELD_SPECS = {
         rme_fingerprint_key=P23_RME_FINGERPRINT_KEY,
         block_fingerprint_key=P23_BLOCK_FINGERPRINT_KEY,
         bundle_fingerprint_key=P23_BUNDLE_FINGERPRINT_KEY,
-        allowed_sample_schemas=(DUAL_PRIOR_SAMPLE_SCHEMA,),
+        allowed_sample_schemas=(
+            DUAL_PRIOR_SAMPLE_SCHEMA,
+            NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
+        ),
         bundle_dependency_fields=(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,),
+    ),
+    "na_cf": PriorSpec(
+        kind="na_cf",
+        raw_key="hamiltonian_p23",
+        node_rme_key="node_p23",
+        edge_rme_key="edge_p2",
+        node_blocks_key="node_p23_blocks",
+        edge_blocks_key="edge_p2_blocks",
+        node_shape_key="node_p23_block_shape",
+        edge_shape_key="edge_p2_block_shape",
+        source_fingerprint_key=P2_SOURCE_FINGERPRINT_KEY,
+        rme_fingerprint_key=P2_RME_FINGERPRINT_KEY,
+        block_fingerprint_key=P2_BLOCK_FINGERPRINT_KEY,
+        bundle_fingerprint_key=P2_BUNDLE_FINGERPRINT_KEY,
+        allowed_sample_schemas=(
+            DUAL_PRIOR_SAMPLE_SCHEMA,
+            NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
+            NACF_RESIDUAL_RME_SCHEMA,
+            H0_RESIDUAL_RME_SCHEMA,
+        ),
+        bundle_dependency_fields=(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,),
+        composed_of=("p23", "p2"),
     ),
 }
 
@@ -207,6 +267,278 @@ def build_prior_spec(kind: Any) -> PriorSpec:
     """
 
     return resolve_prior_field_spec(kind)
+
+
+def assert_nonsoc_rme_sample_contract(record: Mapping[str, Any]) -> None:
+    """Validate the slim, graph-bound non-SOC RME cache schemas.
+
+    These views deliberately omit AO blocks from the training hot path.  Their
+    labels, H0/prior side channels, and canonical graph therefore have to be
+    explicit and complete; otherwise the loader could silently rebuild a graph
+    and reinterpret edge rows.
+    """
+
+    schema = record.get(SAMPLE_SCHEMA_KEY)
+    expected_semantics = NONSOC_RME_SCHEMA_SEMANTICS.get(schema)
+    if expected_semantics is None:
+        return
+    forbidden_block_fields = (
+        "node_delta_hamil_blocks",
+        "edge_delta_hamil_blocks",
+        "node_delta_hamil_block_shape",
+        "edge_delta_hamil_block_shape",
+        "node_full_hamil_target_blocks",
+        "edge_full_hamil_target_blocks",
+        "node_full_hamil_target_block_shape",
+        "edge_full_hamil_target_block_shape",
+        "node_h0_blocks",
+        "edge_h0_blocks",
+        "node_h0_block_shape",
+        "edge_h0_block_shape",
+        "node_p2_blocks",
+        "edge_p2_blocks",
+        "node_p2_block_shape",
+        "edge_p2_block_shape",
+        "node_p23_blocks",
+        "edge_p23_blocks",
+        "node_p23_block_shape",
+        "edge_p23_block_shape",
+    )
+    present_block_fields = [
+        field for field in forbidden_block_fields if field in record
+    ]
+    if present_block_fields:
+        raise ValueError(
+            f"{schema} is a compact residual-RME view and forbids persisted "
+            f"AO/block-native fields {present_block_fields}."
+        )
+    actual_semantics = record.get(TARGET_SEMANTICS_KEY)
+    if actual_semantics != expected_semantics:
+        raise ValueError(
+            f"{schema} requires {TARGET_SEMANTICS_KEY}={expected_semantics!r}; "
+            f"got {actual_semantics!r}."
+        )
+
+    required = [
+        "atomic_numbers",
+        "edge_index",
+        "edge_cell_shift",
+        "node_features",
+        "edge_features",
+        TARGET_SOURCE_KEY,
+        "raw_case_source_fingerprint",
+        BASIS_FINGERPRINT_KEY,
+        EDGE_GRAPH_FINGERPRINT_KEY,
+        ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+        ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+    ]
+    if schema == NONSOC_DM_RME_SAMPLE_SCHEMA:
+        required.extend(("node_h0", "edge_h0"))
+    elif schema == NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA:
+        required.extend(
+            (
+                "node_p2",
+                "edge_p2",
+                P2_SOURCE_FINGERPRINT_KEY,
+                P2_RME_FINGERPRINT_KEY,
+                P2_BLOCK_FINGERPRINT_KEY,
+                P2_BUNDLE_FINGERPRINT_KEY,
+            )
+        )
+    else:
+        required.extend(
+            (
+                "node_p23",
+                "edge_p23",
+                P2_SOURCE_FINGERPRINT_KEY,
+                P2_RME_FINGERPRINT_KEY,
+                P2_BLOCK_FINGERPRINT_KEY,
+                P2_BUNDLE_FINGERPRINT_KEY,
+                P23_SOURCE_FINGERPRINT_KEY,
+                P23_RME_FINGERPRINT_KEY,
+                P23_BLOCK_FINGERPRINT_KEY,
+                P23_BUNDLE_FINGERPRINT_KEY,
+                P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+            )
+        )
+    missing = [field for field in required if field not in record]
+    if missing:
+        raise ValueError(f"{schema} is incomplete; missing fields {missing}.")
+    if not str(record[TARGET_SOURCE_KEY]).strip():
+        raise ValueError(f"{schema} requires a non-empty {TARGET_SOURCE_KEY}.")
+
+    feature_fields = ["node_features", "edge_features"]
+    if schema == NONSOC_DM_RME_SAMPLE_SCHEMA:
+        feature_fields.extend(("node_h0", "edge_h0"))
+    elif schema == NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA:
+        feature_fields.extend(("node_p2", "edge_p2"))
+    else:
+        feature_fields.extend(("node_p23", "edge_p23"))
+    for field in feature_fields:
+        value = torch.as_tensor(record[field])
+        if value.ndim != 2:
+            raise ValueError(
+                f"{schema} field {field} must be a rank-2 RME tensor; "
+                f"got {tuple(value.shape)}."
+            )
+        if torch.is_complex(value):
+            raise NotImplementedError(
+                f"{schema} is non-SOC and rejects complex field {field}."
+            )
+        if not torch.is_floating_point(value):
+            raise TypeError(
+                f"{schema} field {field} must be floating point; got {value.dtype}."
+            )
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{schema} field {field} contains NaN or infinity.")
+
+    edge, shift = canonical_edge_graph(
+        record["atomic_numbers"], record["edge_index"], record["edge_cell_shift"]
+    )
+    node_count = int(_numpy(record["atomic_numbers"]).reshape(-1).shape[0])
+    edge_count = int(edge.shape[1])
+    for field in feature_fields:
+        rows = int(torch.as_tensor(record[field]).shape[0])
+        expected_rows = node_count if field.startswith("node_") else edge_count
+        if rows != expected_rows:
+            raise ValueError(
+                f"{schema} field {field} has {rows} rows, expected {expected_rows}."
+            )
+    partner = (
+        ("node_h0", "edge_h0")
+        if schema == NONSOC_DM_RME_SAMPLE_SCHEMA
+        else ("node_p2", "edge_p2")
+        if schema == NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA
+        else ("node_p23", "edge_p23")
+    )
+    for target_field, partner_field in zip(
+        ("node_features", "edge_features"), partner
+    ):
+        if tuple(torch.as_tensor(record[target_field]).shape) != tuple(
+            torch.as_tensor(record[partner_field]).shape
+        ):
+            raise ValueError(
+                f"{schema} fields {target_field} and {partner_field} must have "
+                "identical RME shapes."
+            )
+
+    for field in (
+        "raw_case_source_fingerprint",
+        BASIS_FINGERPRINT_KEY,
+        EDGE_GRAPH_FINGERPRINT_KEY,
+        ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+        ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+    ):
+        require_sha256(record[field], field=field)
+    actual_graph_fingerprint = edge_graph_fingerprint(
+        record["atomic_numbers"],
+        edge,
+        shift,
+        basis_fingerprint=record[BASIS_FINGERPRINT_KEY],
+    )
+    assert_record_fingerprint(
+        record,
+        field=EDGE_GRAPH_FINGERPRINT_KEY,
+        actual=actual_graph_fingerprint,
+    )
+    actual_row_fingerprint = fingerprint_present_row_aligned_fields(record)
+    assert_record_fingerprint(
+        record,
+        field=ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+        actual=actual_row_fingerprint,
+    )
+    actual_row_bundle = fingerprint_text_fields(
+        {
+            BASIS_FINGERPRINT_KEY: record[BASIS_FINGERPRINT_KEY],
+            EDGE_GRAPH_FINGERPRINT_KEY: actual_graph_fingerprint,
+            ROW_ALIGNED_DATA_FINGERPRINT_KEY: actual_row_fingerprint,
+        },
+        (
+            BASIS_FINGERPRINT_KEY,
+            EDGE_GRAPH_FINGERPRINT_KEY,
+            ROW_ALIGNED_DATA_FINGERPRINT_KEY,
+        ),
+    )
+    assert_record_fingerprint(
+        record,
+        field=ROW_ALIGNED_BUNDLE_FINGERPRINT_KEY,
+        actual=actual_row_bundle,
+    )
+    if schema == NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA:
+        for field in (
+            P2_SOURCE_FINGERPRINT_KEY,
+            P2_RME_FINGERPRINT_KEY,
+            P2_BLOCK_FINGERPRINT_KEY,
+            P2_BUNDLE_FINGERPRINT_KEY,
+        ):
+            require_sha256(record[field], field=field)
+        actual_p2_bundle = fingerprint_text_fields(
+            record,
+            (
+                BASIS_FINGERPRINT_KEY,
+                EDGE_GRAPH_FINGERPRINT_KEY,
+                P2_SOURCE_FINGERPRINT_KEY,
+                P2_RME_FINGERPRINT_KEY,
+                P2_BLOCK_FINGERPRINT_KEY,
+            ),
+        )
+        assert_record_fingerprint(
+            record,
+            field=P2_BUNDLE_FINGERPRINT_KEY,
+            actual=actual_p2_bundle,
+        )
+    elif schema == NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA:
+        for field in (
+            P2_SOURCE_FINGERPRINT_KEY,
+            P2_RME_FINGERPRINT_KEY,
+            P2_BLOCK_FINGERPRINT_KEY,
+            P2_BUNDLE_FINGERPRINT_KEY,
+            P23_SOURCE_FINGERPRINT_KEY,
+            P23_RME_FINGERPRINT_KEY,
+            P23_BLOCK_FINGERPRINT_KEY,
+            P23_BUNDLE_FINGERPRINT_KEY,
+            P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+        ):
+            require_sha256(record[field], field=field)
+        actual_p2_bundle = fingerprint_text_fields(
+            record,
+            (
+                BASIS_FINGERPRINT_KEY,
+                EDGE_GRAPH_FINGERPRINT_KEY,
+                P2_SOURCE_FINGERPRINT_KEY,
+                P2_RME_FINGERPRINT_KEY,
+                P2_BLOCK_FINGERPRINT_KEY,
+            ),
+        )
+        assert_record_fingerprint(
+            record,
+            field=P2_BUNDLE_FINGERPRINT_KEY,
+            actual=actual_p2_bundle,
+        )
+        actual_p23_bundle = fingerprint_text_fields(
+            record,
+            (
+                BASIS_FINGERPRINT_KEY,
+                EDGE_GRAPH_FINGERPRINT_KEY,
+                P23_SOURCE_FINGERPRINT_KEY,
+                P23_RME_FINGERPRINT_KEY,
+                P23_BLOCK_FINGERPRINT_KEY,
+                P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+            ),
+        )
+        assert_record_fingerprint(
+            record,
+            field=P23_BUNDLE_FINGERPRINT_KEY,
+            actual=actual_p23_bundle,
+        )
+        if (
+            record[P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY]
+            != record[P2_BUNDLE_FINGERPRINT_KEY]
+        ):
+            raise ValueError(
+                "P23 RME residual record parent P2 bundle does not match the "
+                "recorded P2 bundle."
+            )
 
 
 # Explicit constructor/config field name -> the PriorSpec attribute it must
@@ -527,13 +859,19 @@ def assert_record_fingerprint(
 __all__ = [
     "ABSOLUTE_FULL_H_SEMANTICS",
     "BASIS_FINGERPRINT_KEY",
+    "DENSITY_MATRIX_RME_SEMANTICS",
     "DUAL_PRIOR_SAMPLE_SCHEMA",
     "EDGE_GRAPH_FINGERPRINT_KEY",
     "FULL_H_TARGET_FINGERPRINT_KEY",
     "H0_RESIDUAL_SEMANTICS",
+    "NONSOC_DM_RME_SAMPLE_SCHEMA",
+    "NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA",
+    "NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA",
+    "NONSOC_RME_SCHEMA_SEMANTICS",
     "P2_BLOCK_FINGERPRINT_KEY",
     "P2_BUNDLE_FINGERPRINT_KEY",
     "P2_RME_FINGERPRINT_KEY",
+    "P2_RESIDUAL_RME_SEMANTICS",
     "P2_SAMPLE_SCHEMA",
     "P2_SOURCE_FINGERPRINT_KEY",
     "PHYSICAL_H0_SOURCE_FINGERPRINT_KEY",
@@ -546,6 +884,7 @@ __all__ = [
     "P23_BUNDLE_FINGERPRINT_KEY",
     "P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY",
     "P23_RME_FINGERPRINT_KEY",
+    "P23_RESIDUAL_RME_SEMANTICS",
     "P23_SOURCE_FINGERPRINT_KEY",
     "PRIOR_FIELD_SPECS",
     "PriorFieldSpec",
@@ -557,6 +896,7 @@ __all__ = [
     "TARGET_SEMANTICS_KEY",
     "TARGET_SOURCE_KEY",
     "assert_record_fingerprint",
+    "assert_nonsoc_rme_sample_contract",
     "build_prior_spec",
     "canonical_edge_graph",
     "edge_graph_fingerprint",

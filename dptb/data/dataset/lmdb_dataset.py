@@ -75,6 +75,35 @@ register_fields(
 )
 
 
+class _NumpyTwoPickleCompat(pickle.Unpickler):
+    """Resolve NumPy 2.x ``numpy._core.*`` module paths under NumPy 1.x.
+
+    NumPy 2 renamed the private ``numpy.core`` package to ``numpy._core``.
+    Records written by a NumPy 2 process therefore reference module paths a
+    NumPy 1.26 reader cannot import, even though the referenced
+    reconstruction callables are identical.  Only the module prefix is
+    remapped; any other missing module still propagates.
+    """
+
+    def find_class(self, module, name):
+        if module == "numpy._core" or module.startswith("numpy._core."):
+            module = "numpy.core" + module[len("numpy._core"):]
+        return super().find_class(module, name)
+
+
+def _loads_with_numpy2_compat(serialized):
+    """``pickle.loads`` with a NumPy 2 -> NumPy 1 module-path fallback."""
+    try:
+        return pickle.loads(serialized)
+    except ModuleNotFoundError as exc:
+        if "numpy._core" not in str(exc):
+            raise
+        import io
+
+        return _NumpyTwoPickleCompat(io.BytesIO(serialized)).load()
+
+
+
 def _shard_content_fingerprint(lmdb_path: str) -> str:
     """Hex-digest fingerprint of an LMDB shard's *content*, independent of its path.
 
@@ -1100,6 +1129,7 @@ class LMDBDataset(AtomicDataset):
     prior_raw_key = "hamiltonian_p2"
     prefer_precomputed_prior = True
     require_full_h_target = False
+    require_prior_residual_rme_target = False
     require_residual_h_target = False
     require_uureal_block_ode = False
     require_residual_from_full_h_target = False
@@ -1185,6 +1215,7 @@ class LMDBDataset(AtomicDataset):
             prior_raw_key: Optional[str] = None,
             prefer_precomputed_prior: Optional[bool] = None,
             require_full_h_target: bool = False,
+            require_prior_residual_rme_target: bool = False,
             require_residual_h_target: bool = False,
             require_uureal_block_ode: bool = False,
             require_residual_from_full_h_target: bool = False,
@@ -1302,6 +1333,9 @@ class LMDBDataset(AtomicDataset):
             )
         self.prefer_precomputed_prior = bool(prefer_precomputed_prior)
         self.require_full_h_target = bool(require_full_h_target)
+        self.require_prior_residual_rme_target = bool(
+            require_prior_residual_rme_target
+        )
         self.require_residual_h_target = bool(require_residual_h_target)
         self.require_uureal_block_ode = bool(require_uureal_block_ode)
         self.require_residual_from_full_h_target = bool(
@@ -1321,6 +1355,23 @@ class LMDBDataset(AtomicDataset):
         self.require_prior_blocks = bool(require_prior_blocks)
         if self.require_full_h_target and not self.get_Hamiltonian:
             raise ValueError("require_full_h_target=True requires get_Hamiltonian=True.")
+        if self.require_prior_residual_rme_target:
+            if not self.get_Hamiltonian or not self.get_prior:
+                raise ValueError(
+                    "require_prior_residual_rme_target=True requires "
+                    "get_Hamiltonian=True and get_P2/get_prior=True."
+                )
+            if self.residual_hamiltonian:
+                raise ValueError(
+                    "Prior residual-RME records are already H-prior targets; "
+                    "residual_hamiltonian must stay false."
+                )
+            if self.require_prior_blocks:
+                raise ValueError(
+                    "Compact prior residual-RME training does not persist AO "
+                    "prior blocks; require_p2_blocks/require_prior_blocks must "
+                    "stay false."
+                )
         if self.require_residual_h_target:
             if not self.get_Hamiltonian or not self.get_H0:
                 raise ValueError(
@@ -1335,6 +1386,17 @@ class LMDBDataset(AtomicDataset):
         if self.require_full_h_target and self.require_residual_h_target:
             raise ValueError(
                 "Full-H and residual-H target contracts are mutually exclusive."
+            )
+        if self.require_prior_residual_rme_target and (
+            self.require_full_h_target
+            or self.require_residual_h_target
+            or self.require_uureal_block_ode
+            or self.require_residual_from_full_h_target
+        ):
+            raise ValueError(
+                "require_prior_residual_rme_target is mutually exclusive with "
+                "the Full-H, H0-residual, uu_real, and residual-from-Full-H "
+                "target contracts."
             )
         if self.require_uureal_block_ode:
             if not self.get_Hamiltonian or not self.get_H0:
@@ -1681,7 +1743,7 @@ class LMDBDataset(AtomicDataset):
                         os.path.realpath(lmdb_path),
                         int(self.index_map[int(idx)]),
                     )
-                    return pickle.loads(serialized)
+                    return _loads_with_numpy2_compat(serialized)
         raise IndexError(f"LMDB entry {self.index_map[int(idx)]} not found for dataset index {idx}")
 
     def get_dynamic_batch_cost_parts(self, idx: int) -> Dict[str, int]:
