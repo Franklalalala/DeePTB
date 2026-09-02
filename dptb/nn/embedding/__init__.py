@@ -25,6 +25,7 @@ from .lem_charge import LemCharge
 from .lem_moe_v3_h0 import LemMoEV3H0
 from .lem_pair import LemPair
 from .lem_moe_v3_prior import LemMoEV3Prior
+from .lem_moe_v3_prior_2b import LemMoEV3Prior2b
 from .lem_in_frame import LemInFrame, LemInFrameOpenequi
 from .lem_moe_charge import LemMoECharge
 from .lem_in_frame_heavy import LemInFrameHeavy
@@ -69,6 +70,7 @@ __all__ = [
     "LemMoEV3H0",
     "LemPair",
     "LemMoEV3Prior",
+    "LemMoEV3Prior2b",
     "LemNonLinear",
     "LemNonLinearH0",
     "LemMoETopK",

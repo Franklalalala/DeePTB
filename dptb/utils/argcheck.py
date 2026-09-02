@@ -1578,6 +1578,7 @@ def embedding():
             Argument("lem_moe_v3_h0", dict, slem_h0()),
             Argument("lem_pair", dict, slem_pair()),
             Argument("lem_moe_v3_prior", dict, slem_prior()),
+            Argument("lem_moe_v3_prior_2b", dict, slem_prior_2b()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_non_linear", dict, slem()),
             Argument("lem_non_linear_h0", dict, slem_h0()),
@@ -2176,6 +2177,45 @@ def slem_prior():
         Argument("prior_validate_inputs", bool, optional=True, default=False, doc="Debug-only finite checks for P2 tensors during every forward; production LMDBs are validated at ingest."),
     ]
 
+
+def slem_prior_2b():
+    """Concat-P two-stage residual embedding (Full-H − P labels)."""
+    return slem() + [
+        Argument(
+            "only2b",
+            bool,
+            optional=True,
+            default=False,
+            doc="Stage 1 (true): train concat-P SO2 layers and the 2b RME skip. "
+            "Stage 2 (false): freeze the 2b skip (P projectors + geo InitLayer + "
+            "2b Linear) and train GNN residual. Both stages predict Full-H − P.",
+        ),
+        Argument(
+            "prior_init_scope",
+            str,
+            optional=True,
+            default="both",
+            doc="Must not be none: stage 1 already consumes P RME.",
+        ),
+        Argument(
+            "prior_kind",
+            str,
+            optional=True,
+            default="na_cf",
+            doc="p2, p23, or na_cf (node_p23 + edge_p2).",
+        ),
+        Argument("prior_node_key", str, optional=True, default=""),
+        Argument("prior_edge_key", str, optional=True, default=""),
+        Argument("prior_node_mode", str, optional=True, default="direct"),
+        Argument(
+            "prior_merge_mode",
+            str,
+            optional=True,
+            default="concat",
+            doc="Must be concat: first SO2 layer input is cat(geo InitLayer, P map).",
+        ),
+        Argument("prior_self_edge_tol", float, optional=True, default=1e-8),
+    ]
 
 
 def model_options():
@@ -3519,7 +3559,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_pair", "lem_moe_v3_prior", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_pair", "lem_moe_v3_prior", "lem_moe_v3_prior_2b", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")

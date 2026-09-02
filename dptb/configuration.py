@@ -884,6 +884,50 @@ def _embedding_h0_scope(
             changes.append(_AliasHit(name, "h0_init_scope", rv))
 
 
+def _embedding_prior_2b(
+    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
+) -> None:
+    method = _normalized_name(out.get("method", ""))
+    if method != "lem_moe_v3_prior_2b":
+        return
+    prior_kind = _normalized_name(out.get("prior_kind", "na_cf"))
+    if prior_kind not in {"p2", "p23", "na_cf"}:
+        raise ValueError(
+            "lem_moe_v3_prior_2b supports prior_kind='p2', 'p23', or 'na_cf'; "
+            f"got {prior_kind!r}."
+        )
+    out["prior_kind"] = prior_kind
+    merge = _normalized_name(out.get("prior_merge_mode", "concat"))
+    if merge != "concat":
+        raise ValueError(
+            "lem_moe_v3_prior_2b requires prior_merge_mode='concat'; "
+            f"got {out.get('prior_merge_mode')!r}."
+        )
+    out["prior_merge_mode"] = "concat"
+    legacy = (
+        out.pop("use_prior_init", None),
+        out.pop("use_prior_node_init", None),
+        out.pop("use_prior_edge_init", None),
+    )
+    scope, *_ = resolve_init_scope(
+        out.get("prior_init_scope"),
+        enabled=legacy[0],
+        node=legacy[1],
+        edge=legacy[2],
+        option_name="model_options.embedding.prior_init_scope",
+    )
+    if scope == "none":
+        raise ValueError(
+            "lem_moe_v3_prior_2b requires prior_init_scope != 'none'."
+        )
+    out["prior_init_scope"] = scope
+    for name, value in zip(
+        ("use_prior_init", "use_prior_node_init", "use_prior_edge_init"), legacy
+    ):
+        if value is not None:
+            changes.append(_AliasHit(name, "prior_init_scope", rv))
+
+
 def _embedding_prior(
     out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
 ) -> None:
@@ -949,6 +993,7 @@ _EMBEDDING_REGISTRY: Tuple[_AliasRule, ...] = (
     _Rename("fallback_to_hamiltonian", ("h0_fallback_to_hamiltonian",)),
     _Transform(_embedding_h0_scope),
     _Transform(_embedding_prior),
+    _Transform(_embedding_prior_2b),
 )
 
 

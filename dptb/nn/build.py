@@ -435,6 +435,7 @@ def _maybe_enable_legacy_swiglu_s2_compat(model_options: dict, state_dict: dict)
         "lem_moe_v3_h0",
         "lem_pair",
         "lem_moe_v3_prior",
+        "lem_moe_v3_prior_2b",
     }:
         return model_options
     if embedding.get("swiglu_s2_compat_mode", "modern") != "modern":
