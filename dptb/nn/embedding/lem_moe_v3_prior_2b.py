@@ -1,19 +1,32 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Two-stage prior embedding: concat(P-mapped, geo) into the first SO2 layer.
+"""only2b-style two-stage embedding on prior residual labels (y = Full-H - P).
 
-Stage 1 (``only2b=true``) and stage 2 (``only2b=false``) both:
+Both stages consume the prior RME (na_cf: node_p23 / edge_p2) through the same
+projector design as ``lem_moe_v3_prior`` (mask -> sorted-irrep permutation ->
+``e3nn.Linear``), and *concat* it with the geometric InitLayer features instead
+of replacing them:  phi = [h_geo ; Pi(P)].
 
-- map P RME with the same ``H0InitLayer`` projectors as ``lem_moe_v3_prior``
-- **concat** (not replace) those features with geometric InitLayer features
-- run SO2 + scatter layers on the concatenated tensor
-- predict residual RME whose label is Full-H − P (the dataset, not an add-back)
+Two parallel branches share nothing but the geometry:
 
-Stage 2 freezes the 2b skip (concat-init Linear plus P projectors and geo
-InitLayer) so ``ŷ = ŷ_2b + ŷ_GNN`` keeps a stable H-space baseline.
+* ``two_b_*``  - the cheap pairwise branch (Trinity's ``Twoness`` analogue):
+  its own geometric InitLayer clone, its own P projectors and a linear RME
+  readout  y_2b = W_2b phi_2b.  No message passing.
+* the GNN     - ``h0_init`` (InitLayer + P projectors) -> first SO2 layer with
+  ``irreps_in = 2 x geo`` -> remaining layers -> RME heads  y_gnn.
+
+``only2b=true``  (stage 1): y = y_2b.  The GNN is not executed and gets no
+                            gradient, so stage 1 is a pairwise fit of H - P.
+``only2b=false`` (stage 2): y = y_2b* + y_gnn.  The 2b branch is frozen (a fixed
+                            H-space baseline); InitLayer, projectors and all
+                            layers train.  When a stage-1 checkpoint is loaded
+                            the GNN InitLayer/projectors are seeded once from
+                            the trained 2b branch (``two_b_seed_gnn``).
 """
 
 from __future__ import annotations
 
+import copy
+import inspect
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -27,6 +40,7 @@ from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
+from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0 import LemMoEV3H0
 from .lem_moe_v3_h0_helpers import H0InitLayer, _get_feature_source_with_key
 
@@ -36,6 +50,45 @@ PRIOR_2B_KINDS = {
     "p23": (_keys.NODE_P23_KEY, _keys.EDGE_P23_KEY),
     "na_cf": (_keys.NODE_P23_KEY, _keys.EDGE_P2_KEY),
 }
+
+# Layer kwargs the base class forwards verbatim from its own __init__ arguments.
+_LAYER_PASSTHROUGH = (
+    "tp_radial_emb",
+    "tp_radial_channels",
+    "use_layer_onehot_tp",
+    "edge_one_hot_dim",
+    "latent_channels",
+    "res_update",
+    "res_update_ratios",
+    "res_update_ratios_learnable",
+    "equivariant_norm_type",
+    "swiglu_s2_grid_resolution",
+    "swiglu_s2_compat_mode",
+    "ffn_hidden_factor",
+    "so2_wigner_apply_mode",
+    "so2_fusion_mode",
+    "mole_linear_mode",
+    "so2_expert_route_chunk_size",
+    "so2_expert_route_checkpoint",
+    "so2_output_router_hidden_dim",
+    "focus_attention_dim",
+    "num_shared_experts",
+)
+# Layer kwargs the base class forwards from its normalised attributes.
+_LAYER_FROM_SELF = (
+    "so2_expert_mixing_mode",
+    "onehot_tp_mode",
+    "node_message_aggregation",
+    "num_focus",
+    "edge_aggregation_gated_attention",
+    "edge_attention_key_source",
+    "edge_attention_envelope_power",
+    "edge_attention_use_latent_bias",
+    "edge_attention_key_layer_norm",
+    "edge_attention_query_layer_norm",
+    "edge_attention_qk_layer_norm",
+    "edge_message_env_weight",
+)
 
 
 def resolve_prior_2b_keys(prior_kind: str) -> Tuple[str, str]:
@@ -60,14 +113,35 @@ def _unwrap_h0_init(init_layer: torch.nn.Module) -> H0InitLayer:
     )
 
 
+def _clone_module(module: torch.nn.Module) -> torch.nn.Module:
+    """Deep-copy a module but share the (large, read-only) OrbitalMapper."""
+    idp = getattr(module, "idp", None)
+    if idp is not None:
+        module.idp = None
+    try:
+        clone = copy.deepcopy(module)
+    finally:
+        if idp is not None:
+            module.idp = idp
+    if idp is not None:
+        clone.idp = idp
+    return clone
+
+
+@torch.no_grad()
+def _copy_params(src: torch.nn.Module, dst: torch.nn.Module) -> None:
+    dst.load_state_dict(src.state_dict(), strict=True)
+
+
 @Embedding.register("lem_moe_v3_prior_2b")
 class LemMoEV3Prior2b(LemMoEV3H0):
-    """Concat-P first SO2 layer + frozen 2b RME skip for two-stage training."""
+    """Frozen pairwise 2b branch + concat-P GNN for only2b two-stage training."""
 
     def __init__(
         self,
         *,
         only2b: bool = False,
+        two_b_seed_gnn: bool = True,
         prior_kind: str = "na_cf",
         prior_init_scope: Optional[str] = None,
         use_prior_init: Optional[bool] = None,
@@ -81,125 +155,37 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         **kwargs: Any,
     ) -> None:
         merge = str(prior_merge_mode).strip().lower()
-        if merge not in {"concat", "add"}:
+        if merge != "concat":
             raise ValueError(
-                "lem_moe_v3_prior_2b requires prior_merge_mode='concat' "
-                f"(or 'add'); got {prior_merge_mode!r}. replace is refused."
+                "lem_moe_v3_prior_2b feeds concat(geo, P-map) into the first SO2 "
+                f"layer; prior_merge_mode must be 'concat', got {prior_merge_mode!r}."
             )
-        if merge == "add":
-            raise ValueError(
-                "lem_moe_v3_prior_2b uses concat(geo, P-map) as the first "
-                "SO2-layer input; prior_merge_mode='add' is not this route. "
-                "Use 'concat'."
-            )
-
         node_key, edge_key = resolve_prior_2b_keys(prior_kind)
-        if prior_node_key not in (None, "") and str(prior_node_key) != node_key:
-            raise ValueError(
-                f"prior_kind={prior_kind!r} requires prior_node_key={node_key!r}; "
-                f"got {prior_node_key!r}."
-            )
-        if prior_edge_key not in (None, "") and str(prior_edge_key) != edge_key:
-            raise ValueError(
-                f"prior_kind={prior_kind!r} requires prior_edge_key={edge_key!r}; "
-                f"got {prior_edge_key!r}."
-            )
-
-        (
-            self.prior_init_scope,
-            use_prior_init,
-            use_prior_node_init,
-            use_prior_edge_init,
-        ) = resolve_init_scope(
+        for given, expect, label in (
+            (prior_node_key, node_key, "prior_node_key"),
+            (prior_edge_key, edge_key, "prior_edge_key"),
+        ):
+            if given not in (None, "") and str(given) != expect:
+                raise ValueError(
+                    f"prior_kind={prior_kind!r} requires {label}={expect!r}; got {given!r}."
+                )
+        scope, use_init, _, _ = resolve_init_scope(
             prior_init_scope,
             enabled=use_prior_init,
             node=use_prior_node_init,
             edge=use_prior_edge_init,
             option_name="prior_init_scope",
         )
-        if not use_prior_init:
+        if not use_init or scope != "both":
             raise ValueError(
-                "lem_moe_v3_prior_2b requires prior_init_scope != 'none' "
-                "so stage 1 already consumes P RME."
+                "lem_moe_v3_prior_2b needs prior_init_scope='both': both the 2b "
+                "branch and the GNN read node and edge prior RME."
             )
-
-        self._prior2b_layer_kwargs = {
-            "tp_radial_emb": kwargs.get("tp_radial_emb", False),
-            "tp_radial_channels": kwargs.get("tp_radial_channels", [128, 128]),
-            "latent_channels": kwargs.get("latent_channels", [128, 128]),
-            "use_layer_onehot_tp": kwargs.get("use_layer_onehot_tp", True),
-            "edge_one_hot_dim": kwargs.get("edge_one_hot_dim", 128),
-            "res_update": kwargs.get("res_update", True),
-            "res_update_ratios": kwargs.get("res_update_ratios", None),
-            "res_update_ratios_learnable": kwargs.get(
-                "res_update_ratios_learnable", False
-            ),
-            "equivariant_norm_type": kwargs.get("equivariant_norm_type", "none"),
-            "swiglu_s2_grid_resolution": kwargs.get(
-                "swiglu_s2_grid_resolution", (14, 14)
-            ),
-            "swiglu_s2_compat_mode": kwargs.get("swiglu_s2_compat_mode", "modern"),
-            "ffn_hidden_factor": kwargs.get("ffn_hidden_factor", 0.0),
-            "so2_wigner_apply_mode": kwargs.get(
-                "so2_wigner_apply_mode", "compact_blocks"
-            ),
-            "so2_fusion_mode": kwargs.get(
-                "so2_fusion_mode", "streamed_m_major_cueq"
-            ),
-            "mole_linear_mode": kwargs.get(
-                "mole_linear_mode", "cueq_indexed_linear"
-            ),
-            "so2_expert_mixing_mode": kwargs.get(
-                "so2_expert_mixing_mode", "pre_activation"
-            ),
-            "so2_expert_route_chunk_size": kwargs.get(
-                "so2_expert_route_chunk_size", None
-            ),
-            "so2_expert_route_checkpoint": kwargs.get(
-                "so2_expert_route_checkpoint", False
-            ),
-            "so2_output_router_hidden_dim": kwargs.get(
-                "so2_output_router_hidden_dim", 32
-            ),
-            "onehot_tp_mode": kwargs.get("onehot_tp_mode", None),
-            "node_message_aggregation": kwargs.get(
-                "node_message_aggregation", "scatter"
-            ),
-            "num_focus": kwargs.get("num_focus", 1),
-            "focus_attention_dim": kwargs.get("focus_attention_dim", 32),
-            "edge_aggregation_gated_attention": kwargs.get(
-                "edge_aggregation_gated_attention", False
-            ),
-            "edge_attention_key_source": kwargs.get(
-                "edge_attention_key_source", "message"
-            ),
-            "edge_attention_envelope_power": kwargs.get(
-                "edge_attention_envelope_power", 1.0
-            ),
-            "edge_attention_use_latent_bias": kwargs.get(
-                "edge_attention_use_latent_bias", True
-            ),
-            "edge_attention_key_layer_norm": kwargs.get(
-                "edge_attention_key_layer_norm", False
-            ),
-            "edge_attention_query_layer_norm": kwargs.get(
-                "edge_attention_query_layer_norm", False
-            ),
-            "edge_attention_qk_layer_norm": kwargs.get(
-                "edge_attention_qk_layer_norm", False
-            ),
-            "edge_message_env_weight": kwargs.get("edge_message_env_weight", True),
-            "norm_eps": kwargs.get("norm_eps", 1e-8),
-            "num_shared_experts": kwargs.get("num_shared_experts", 1),
-        }
-        n_layers = int(kwargs.get("n_layers", 3))
-        self._prior2b_first_is_last = n_layers == 1
-        self._prior2b_use_interpolation = bool(
-            kwargs.get("use_interpolation_out", True)
-        )
+        self.prior_init_scope = scope
+        self._prior2b_raw_kwargs: Dict[str, Any] = dict(kwargs)
 
         super().__init__(
-            h0_init_scope=self.prior_init_scope,
+            h0_init_scope=scope,
             h0_node_key=node_key,
             h0_edge_key=edge_key,
             h0_node_mode=prior_node_mode,
@@ -211,10 +197,11 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         )
         if bool(getattr(self.idp, "has_soc", False)):
             raise NotImplementedError(
-                "lem_moe_v3_prior_2b is non-SOC; residual Full-H − P is real RME."
+                "lem_moe_v3_prior_2b is non-SOC; residual Full-H - P is real RME."
             )
 
         self.only2b = bool(only2b)
+        self.two_b_seed_gnn = bool(two_b_seed_gnn)
         self.prior_kind = str(prior_kind).strip().lower()
         self.prior_node_key = node_key
         self.prior_edge_key = edge_key
@@ -223,115 +210,124 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         geo_irreps = o3.Irreps(self.h0_init.irreps_out)
         self.concat_irreps = geo_irreps + geo_irreps
         self._rebuild_first_layer_for_concat()
-        self.two_b_out_node = Linear(
-            self.concat_irreps,
-            self.idp.orbpair_irreps,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
-        )
-        self.two_b_out_edge = Linear(
-            self.concat_irreps,
-            self.idp.orbpair_irreps,
-            shared_weights=True,
-            internal_weights=True,
-            biases=True,
-        )
+
+        # Independent pairwise branch (Trinity Twoness analogue).
+        self.two_b_init = _clone_module(self.h0_init.base_init)
+        self.two_b_node_proj = _clone_module(self.h0_init.node_projector)
+        self.two_b_edge_proj = _clone_module(self.h0_init.edge_projector)
+        linear_kwargs = dict(shared_weights=True, internal_weights=True, biases=True)
+        self.two_b_out_node = Linear(self.concat_irreps, self.idp.orbpair_irreps, **linear_kwargs)
+        self.two_b_out_edge = Linear(self.concat_irreps, self.idp.orbpair_irreps, **linear_kwargs)
+        self.register_buffer("two_b_gnn_seeded", torch.zeros((), dtype=torch.bool))
+        self.register_load_state_dict_post_hook(self._seed_gnn_from_two_b_hook)
+
         if not self.only2b:
-            self._freeze_two_b_skip()
+            for module in self._two_b_modules():
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    # ------------------------------------------------------------------ build
+    def _layer_option(self, name: str) -> Any:
+        """Value the base __init__ saw for ``name`` (explicit kwarg or its default)."""
+        if name in self._prior2b_raw_kwargs:
+            return self._prior2b_raw_kwargs[name]
+        return inspect.signature(LemMoEV3.__init__).parameters[name].default
 
     def _rebuild_first_layer_for_concat(self) -> None:
+        """Rebuild layers[0] with doubled input irreps, mirroring the base loop for i == 0."""
         old = self.layers[0]
-        hidden_act = "gate" if self._prior2b_first_is_last else "gate"
+        n_layers = int(self._layer_option("n_layers"))
+        is_last = n_layers == 1
+        if is_last:
+            edge_act = node_act = "gate"
+        else:
+            edge_act = self._layer_option("hidden_edge_activation_type")
+            node_act = self._layer_option("hidden_node_activation_type")
+        ffn_hidden_factor = float(self._layer_option("ffn_hidden_factor"))
+        use_node_ffn = ffn_hidden_factor > 1.0 and (
+            (not is_last) or bool(self._layer_option("ffn_apply_to_last"))
+        )
         use_interpolation_tp = bool(
-            self._prior2b_first_is_last
-            and self._prior2b_use_interpolation
+            is_last
+            and self._layer_option("use_interpolation_out")
             and getattr(self.output_route_spec, "final_irreps_kind", "") == "orbpair"
         )
-        ffn_hidden_factor = float(self._prior2b_layer_kwargs["ffn_hidden_factor"])
-        use_node_ffn = ffn_hidden_factor > 1.0 and self._prior2b_first_is_last
-        new_layer = self._layer_type()(
+        layer_kwargs = {name: self._layer_option(name) for name in _LAYER_PASSTHROUGH}
+        layer_kwargs.update({name: getattr(self, name) for name in _LAYER_FROM_SELF})
+        self.layers[0] = self._layer_type()(
             num_types=self.n_atom,
             avg_num_neighbors=old.avg_num_neighbors,
             irreps_in=self.concat_irreps,
             irreps_out=old.irreps_out,
             latent_dim=self.latent_dim,
-            use_interpolation_tp=use_interpolation_tp,
-            edge_activation_type=hidden_act,
-            node_activation_type=hidden_act,
+            edge_activation_type=edge_act,
+            node_activation_type=node_act,
             use_node_ffn=use_node_ffn,
+            use_interpolation_tp=use_interpolation_tp,
+            num_experts=self.num_experts,
             dtype=self.dtype,
             device=self.device,
-            num_experts=self.num_experts,
-            **{
-                k: v
-                for k, v in self._prior2b_layer_kwargs.items()
-                if k != "ffn_hidden_factor"
-            },
-            ffn_hidden_factor=ffn_hidden_factor,
+            **layer_kwargs,
         )
-        self.layers[0] = new_layer
 
-    def _freeze_two_b_skip(self) -> None:
-        for module in (
+    def _two_b_modules(self) -> Tuple[torch.nn.Module, ...]:
+        return (
+            self.two_b_init,
+            self.two_b_node_proj,
+            self.two_b_edge_proj,
             self.two_b_out_node,
             self.two_b_out_edge,
-            self.h0_init.node_projector,
-            self.h0_init.edge_projector,
-            self.h0_init.base_init,
-        ):
-            for param in module.parameters():
-                param.requires_grad = False
+        )
 
+    @staticmethod
+    def _seed_gnn_from_two_b_hook(module: "LemMoEV3Prior2b", incompatible_keys: Any) -> None:
+        """Stage-2 start: copy the trained 2b InitLayer/projectors into the GNN once."""
+        if module.only2b or not module.two_b_seed_gnn or bool(module.two_b_gnn_seeded):
+            return
+        _copy_params(module.two_b_init, module.h0_init.base_init)
+        _copy_params(module.two_b_node_proj, module.h0_init.node_projector)
+        _copy_params(module.two_b_edge_proj, module.h0_init.edge_projector)
+        module.two_b_gnn_seeded.fill_(True)
+
+    # ---------------------------------------------------------------- forward
     def _project_prior(
         self,
         data: AtomicDataDict.Type,
-        edge_index: torch.Tensor,
         atom_type: torch.Tensor,
         bond_type: torch.Tensor,
         active_edges: torch.Tensor,
         n_nodes: int,
         n_active: int,
+        node_proj: torch.nn.Module,
+        edge_proj: torch.nn.Module,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Same mask -> sorted-irrep -> Linear path as H0InitLayer, with explicit projectors."""
         h0 = self.h0_init
-        node_source, node_key = _get_feature_source_with_key(
-            data=data,
-            candidate_keys=[self.prior_node_key],
-            expected_dim=h0.h0_dim,
-            dtype=self.dtype,
-            device=self.device,
-            label="node prior",
-        )
-        if node_source is None:
-            raise KeyError(
-                f"lem_moe_v3_prior_2b requires node field {self.prior_node_key!r}."
+        out = []
+        for key, expected, label, mask, proj, rows in (
+            (self.prior_node_key, h0.h0_dim, "node prior", h0._mask_node_source, node_proj, n_nodes),
+            (self.prior_edge_key, h0.h0_dim, "edge prior", h0._mask_edge_source, edge_proj, n_active),
+        ):
+            source, found_key = _get_feature_source_with_key(
+                data=data,
+                candidate_keys=[key],
+                expected_dim=expected,
+                dtype=self.dtype,
+                device=self.device,
+                label=label,
             )
-        h0._guard_target_fallback(node_key, self.prior_node_key, "node prior")
-        node_source = h0._mask_node_source(node_source, atom_type)
-        node_source = node_source.index_select(1, h0._h0_sort_index)
-        node_p = h0.node_projector(node_source)
-        if node_p.shape[0] != n_nodes:
-            node_p = h0._align_feature_rows(node_p, n_nodes)
-
-        edge_source, edge_key = _get_feature_source_with_key(
-            data=data,
-            candidate_keys=[self.prior_edge_key],
-            expected_dim=h0.h0_dim,
-            dtype=self.dtype,
-            device=self.device,
-            label="edge prior",
-        )
-        if edge_source is None:
-            raise KeyError(
-                f"lem_moe_v3_prior_2b requires edge field {self.prior_edge_key!r}."
-            )
-        h0._guard_target_fallback(edge_key, self.prior_edge_key, "edge prior")
-        edge_source = h0._mask_edge_source(edge_source, bond_type)
-        edge_source = edge_source.index_select(1, h0._h0_sort_index)
-        edge_p = h0.edge_projector(edge_source[active_edges])
-        if edge_p.shape[0] != n_active:
-            edge_p = h0._align_feature_rows(edge_p, n_active)
-        return node_p, edge_p
+            if source is None:
+                raise KeyError(f"lem_moe_v3_prior_2b requires field {key!r} in the batch.")
+            h0._guard_target_fallback(found_key, key, label)
+            source = mask(source, atom_type if label == "node prior" else bond_type)
+            source = source.index_select(1, h0._h0_sort_index)
+            if label == "edge prior":
+                source = source[active_edges]
+            feat = proj(source)
+            if feat.shape[0] != rows:
+                feat = h0._align_feature_rows(feat, rows)
+            out.append(feat)
+        return out[0], out[1]
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         preserved_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
@@ -345,7 +341,7 @@ class LemMoEV3Prior2b(LemMoEV3H0):
 
         edge_index = data[_keys.EDGE_INDEX_KEY]
         edge_vector = data[_keys.EDGE_VECTORS_KEY]
-        edge_sh = self.sh(data[_keys.EDGE_VECTORS_KEY][:, [1, 2, 0]])
+        edge_sh = self.sh(edge_vector[:, [1, 2, 0]])
         edge_length = data[_keys.EDGE_LENGTH_KEY]
 
         data = self.onehot(data)
@@ -354,144 +350,138 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         atom_type = data[_keys.ATOM_TYPE_KEY].flatten()
         bond_type = data[_keys.EDGE_TYPE_KEY].flatten()
         batch = data[_keys.BATCH_KEY]
+        num_nodes_total = node_one_hot.shape[0]
 
+        precomputed_active_edges = data.get(_keys.LEM_ACTIVE_EDGES_KEY, None)
+        precomputed_cutoff_coeffs = data.get(_keys.LEM_CUTOFF_COEFFS_KEY, None)
+        if precomputed_cutoff_coeffs is not None and edge_length.requires_grad:
+            raise RuntimeError(
+                "Precomputed LEM cutoff coefficients cannot be used when "
+                "edge_length requires gradients."
+            )
+        init_args = (
+            edge_index,
+            atom_type,
+            bond_type,
+            edge_sh,
+            edge_length,
+            edge_one_hot,
+            precomputed_active_edges,
+            precomputed_cutoff_coeffs,
+        )
+
+        # Router runs in both stages so the monitor keys always exist.
         global_feat = scatter_mean(node_one_hot, batch, dim=0)
         coeffs, monitor_val, expert_load_cv = self.router(global_feat)
         topk_indices, topk_values = self.router.last_topk()
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
 
-        num_nodes_total = node_one_hot.shape[0]
-        precomputed_active_edges = data.get(_keys.LEM_ACTIVE_EDGES_KEY, None)
-        precomputed_cutoff_coeffs = data.get(_keys.LEM_CUTOFF_COEFFS_KEY, None)
-        precomputed_split_sizes = data.get(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
-        if precomputed_cutoff_coeffs is not None and edge_length.requires_grad:
-            raise RuntimeError(
-                "Precomputed LEM cutoff coefficients cannot be used when "
-                "edge_length requires gradients."
-            )
-
-        latents, geo_node, geo_edge, cutoff_coeffs, active_edges = (
-            self.h0_init.base_init(
-                edge_index,
-                atom_type,
-                bond_type,
-                edge_sh,
-                edge_length,
-                edge_one_hot,
-                precomputed_active_edges,
-                precomputed_cutoff_coeffs,
-            )
-        )
+        # --- pairwise 2b branch: y_2b = W_2b [h_geo ; Pi(P)], no message passing
+        latents, geo_node, geo_edge, cutoff_coeffs, active_edges = self.two_b_init(*init_args)
         prior_node, prior_edge = self._project_prior(
-            data,
-            edge_index,
-            atom_type,
-            bond_type,
-            active_edges,
-            geo_node.shape[0],
-            geo_edge.shape[0],
+            data, atom_type, bond_type, active_edges, geo_node.shape[0], geo_edge.shape[0],
+            self.two_b_node_proj, self.two_b_edge_proj,
         )
-        node_features = torch.cat([geo_node, prior_node], dim=-1)
-        edge_features = torch.cat([geo_edge, prior_edge], dim=-1)
-        if node_features.shape[-1] != self.concat_irreps.dim:
-            raise RuntimeError(
-                "concat(geo, P) width "
-                f"{node_features.shape[-1]} != concat_irreps.dim "
-                f"{self.concat_irreps.dim}."
+        y2b_node = self.two_b_out_node(torch.cat([geo_node, prior_node], dim=-1))
+        y2b_edge = self.two_b_out_edge(torch.cat([geo_edge, prior_edge], dim=-1))
+        out_node, out_edge = y2b_node, y2b_edge
+
+        # --- GNN branch (stage 2 only): first SO2 layer eats concat(geo, P-map)
+        if not self.only2b:
+            latents, geo_node, geo_edge, cutoff_coeffs, gnn_active = self.h0_init.base_init(*init_args)
+            if gnn_active.shape != active_edges.shape or not torch.equal(gnn_active, active_edges):
+                raise RuntimeError("2b branch and GNN InitLayer disagree on the active edge set.")
+            prior_node, prior_edge = self._project_prior(
+                data, atom_type, bond_type, active_edges, geo_node.shape[0], geo_edge.shape[0],
+                self.h0_init.node_projector, self.h0_init.edge_projector,
             )
+            node_features = torch.cat([geo_node, prior_node], dim=-1)
+            edge_features = torch.cat([geo_edge, prior_edge], dim=-1)
+            if node_features.shape[-1] != self.concat_irreps.dim:
+                raise RuntimeError(
+                    f"concat(geo, P) width {node_features.shape[-1]} != "
+                    f"concat_irreps.dim {self.concat_irreps.dim}."
+                )
 
-        y2b_node = self.two_b_out_node(node_features)
-        y2b_edge = self.two_b_out_edge(edge_features)
-
-        node_batch = batch[: node_features.shape[0]]
-        if node_features.shape[0] < num_nodes_total:
+            node_batch = batch[: node_features.shape[0]]
             safe_node_one_hot = node_one_hot[: node_features.shape[0]]
-        else:
-            safe_node_one_hot = node_one_hot
-        edge_one_hot = edge_one_hot[active_edges]
-        if precomputed_split_sizes is not None:
-            mole_globals = MOLEGlobals(
-                coefficients=coeffs,
-                split_sizes=precomputed_split_sizes,
-                topk_indices=topk_indices,
-                topk_values=topk_values,
-            )
-        else:
-            edge_batch = batch[edge_index[0][active_edges]]
-            num_systems = coeffs.shape[0]
-            edge_sizes = torch.bincount(edge_batch, minlength=num_systems)
-            mole_globals = MOLEGlobals(
-                coefficients=coeffs,
-                sizes=edge_sizes,
-                graph_index=edge_batch,
-                topk_indices=topk_indices,
-                topk_values=topk_values,
-            )
+            active_edge_one_hot = edge_one_hot[active_edges]
+            if preserved_split_sizes is not None:
+                mole_globals = MOLEGlobals(
+                    coefficients=coeffs,
+                    split_sizes=preserved_split_sizes,
+                    topk_indices=topk_indices,
+                    topk_values=topk_values,
+                )
+            else:
+                edge_batch = batch[edge_index[0][active_edges]]
+                mole_globals = MOLEGlobals(
+                    coefficients=coeffs,
+                    sizes=torch.bincount(edge_batch, minlength=coeffs.shape[0]),
+                    graph_index=edge_batch,
+                    topk_indices=topk_indices,
+                    topk_values=topk_values,
+                )
 
-        data[_keys.EDGE_OVERLAP_KEY] = latents
-        wigner_D_all = None
-        for layer in self.layers:
-            latents, node_features, edge_features, wigner_D_all = layer(
-                latents,
-                node_features,
-                edge_features,
-                safe_node_one_hot,
-                edge_index,
-                edge_vector,
-                atom_type,
-                cutoff_coeffs,
-                active_edges,
-                edge_one_hot,
-                wigner_D_all,
-                mole_globals,
-                node_batch,
+            wigner_D_all = None
+            for layer in self.layers:
+                latents, node_features, edge_features, wigner_D_all = layer(
+                    latents,
+                    node_features,
+                    edge_features,
+                    safe_node_one_hot,
+                    edge_index,
+                    edge_vector,
+                    atom_type,
+                    cutoff_coeffs,
+                    active_edges,
+                    active_edge_one_hot,
+                    wigner_D_all,
+                    mole_globals,
+                    node_batch,
+                )
+            if node_features.shape[0] < num_nodes_total:
+                node_features = torch.cat(
+                    [
+                        node_features,
+                        node_features.new_zeros(
+                            num_nodes_total - node_features.shape[0], node_features.shape[1]
+                        ),
+                    ],
+                    dim=0,
+                )
+            if getattr(self, "use_block_native_output", False):
+                raise NotImplementedError(
+                    "lem_moe_v3_prior_2b writes e3tb residual RME (Full-H - P labels); "
+                    "do not set output_route='h_b0'."
+                )
+            gnn_node, gnn_edge = self._apply_rme_output_heads(
+                node_features, edge_features, node_one_hot, active_edge_one_hot
             )
+            if y2b_node.shape[0] < gnn_node.shape[0]:
+                y2b_node = torch.cat(
+                    [y2b_node, y2b_node.new_zeros(gnn_node.shape[0] - y2b_node.shape[0], y2b_node.shape[1])],
+                    dim=0,
+                )
+            out_node = y2b_node + gnn_node
+            out_edge = y2b_edge + gnn_edge
 
-        if node_features.shape[0] < num_nodes_total:
-            pad_num = num_nodes_total - node_features.shape[0]
-            pad = torch.zeros(
-                pad_num,
-                node_features.shape[1],
-                device=node_features.device,
-                dtype=node_features.dtype,
-            )
-            node_features = torch.cat([node_features, pad], dim=0)
-        if y2b_node.shape[0] < num_nodes_total:
-            pad_num = num_nodes_total - y2b_node.shape[0]
-            y2b_node = torch.cat(
-                [
-                    y2b_node,
-                    y2b_node.new_zeros(pad_num, y2b_node.shape[1]),
-                ],
+        if out_node.shape[0] < num_nodes_total:
+            out_node = torch.cat(
+                [out_node, out_node.new_zeros(num_nodes_total - out_node.shape[0], out_node.shape[1])],
                 dim=0,
             )
 
-        if getattr(self, "use_block_native_output", False):
-            raise NotImplementedError(
-                "lem_moe_v3_prior_2b writes e3tb residual RME "
-                "(Full-H − P labels). Do not set output_route='h_b0'."
-            )
-
-        gnn_node, gnn_edge = self._apply_rme_output_heads(
-            node_features, edge_features, node_one_hot, edge_one_hot
-        )
-        out_node = y2b_node + gnn_node
-        out_edge = y2b_edge + gnn_edge
-
+        data[_keys.EDGE_OVERLAP_KEY] = latents
         data[_keys.NODE_FEATURES_KEY] = out_node
-        data[_keys.EDGE_FEATURES_KEY] = torch.zeros(
+        full_edge = torch.zeros(
             edge_index.shape[1],
             self.idp.orbpair_irreps.dim,
-            dtype=self.dtype,
-            device=self.device,
+            dtype=out_edge.dtype,
+            device=out_edge.device,
         )
-        data[_keys.EDGE_FEATURES_KEY] = torch.index_copy(
-            data[_keys.EDGE_FEATURES_KEY],
-            0,
-            active_edges,
-            out_edge,
-        )
+        data[_keys.EDGE_FEATURES_KEY] = torch.index_copy(full_edge, 0, active_edges, out_edge)
         data.pop(_keys.LEM_ACTIVE_EDGES_KEY, None)
         data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
         data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)

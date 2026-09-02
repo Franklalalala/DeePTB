@@ -2186,16 +2186,26 @@ def slem_prior_2b():
             bool,
             optional=True,
             default=False,
-            doc="Stage 1 (true): train concat-P SO2 layers and the 2b RME skip. "
-            "Stage 2 (false): freeze the 2b skip (P projectors + geo InitLayer + "
-            "2b Linear) and train GNN residual. Both stages predict Full-H − P.",
+            doc="Stage 1 (true): only the pairwise 2b branch (own InitLayer clone + P "
+            "projectors + linear RME readout) trains; the GNN is not executed. "
+            "Stage 2 (false): the 2b branch is frozen and added to the output, the GNN "
+            "(InitLayer, P projectors, concat-P SO2 layers, heads) trains. Both stages "
+            "predict Full-H - P.",
+        ),
+        Argument(
+            "two_b_seed_gnn",
+            bool,
+            optional=True,
+            default=True,
+            doc="Stage 2 only: when a stage-1 checkpoint is loaded, copy the trained 2b "
+            "InitLayer/P projectors into the GNN InitLayer/projectors once.",
         ),
         Argument(
             "prior_init_scope",
             str,
             optional=True,
             default="both",
-            doc="Must not be none: stage 1 already consumes P RME.",
+            doc="Must be 'both': the 2b branch and the GNN both read node and edge prior RME.",
         ),
         Argument(
             "prior_kind",

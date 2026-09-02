@@ -916,9 +916,10 @@ def _embedding_prior_2b(
         edge=legacy[2],
         option_name="model_options.embedding.prior_init_scope",
     )
-    if scope == "none":
+    if scope != "both":
         raise ValueError(
-            "lem_moe_v3_prior_2b requires prior_init_scope != 'none'."
+            "lem_moe_v3_prior_2b requires prior_init_scope='both'; "
+            f"got {scope!r}."
         )
     out["prior_init_scope"] = scope
     for name, value in zip(
