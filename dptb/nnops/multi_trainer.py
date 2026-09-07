@@ -46,6 +46,11 @@ from dptb.nnops.training_state import (
     validate_checkpoint_invariants,
     validate_checkpoint_world_size,
 )
+from dptb.nnops.distance_expert_mask import (
+    clip_last_expert_range_from_options,
+    edge_mask_for_distance_expert,
+    node_mask_for_distance_expert,
+)
 from dptb.nnops.expert_parallel_layout import (
     rank_to_expert_parallel,
     resolve_expert_parallel_layout,
@@ -1509,17 +1514,16 @@ class MultiTrainer(Trainer):
     def _prepare_expert_masks(self, batch_dict, range_dis, expert_idx):
         d_min, d_max = range_dis
         dist_edge = batch_dict['edge_lengths']
-
-        if expert_idx == self.num_experts - 1:
-            expert_edge_mask = (dist_edge >= d_min)
-        else:
-            expert_edge_mask = (dist_edge >= d_min) & (dist_edge < d_max)
-
+        clip_last = clip_last_expert_range_from_options(self.train_options)
+        expert_edge_mask = edge_mask_for_distance_expert(
+            dist_edge, d_min, d_max,
+            is_last_expert=(expert_idx == self.num_experts - 1),
+            clip_last_expert_range=clip_last,
+        )
         num_nodes = batch_dict["node_features"].shape[0]
-        expert_node_mask = torch.ones(num_nodes, dtype=torch.bool, device=self._device_obj())
-        if d_min > 0:
-            expert_node_mask.fill_(False)
-
+        expert_node_mask = node_mask_for_distance_expert(
+            num_nodes, d_min, device=self._device_obj(),
+        )
         return expert_edge_mask, expert_node_mask
 
     @staticmethod

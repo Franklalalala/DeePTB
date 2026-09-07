@@ -9,6 +9,11 @@ from dptb.utils.tools import j_must_have, j_loader
 from dptb.data import AtomicDataDict
 from dptb.data.AtomicDataDict import with_edge_vectors
 from dptb.nn.output_spec import default_output_spec, ModelOutputSpecError
+from dptb.nnops.distance_expert_mask import (
+    clip_last_expert_range_from_options,
+    edge_mask_for_distance_expert,
+    node_mask_for_distance_expert,
+)
 import copy
 import random
 import numpy as np
@@ -71,13 +76,14 @@ class DistanceEnsembleWrapper(nn.Module):
     ``_build_expert_masks``; the stitch path honors whatever masks it returns.
     """
 
-    def __init__(self, experts, distance_ranges, strict_output_spec=False):
+    def __init__(self, experts, distance_ranges, strict_output_spec=False, clip_last_expert_range=False):
         super().__init__()
         assert len(experts) == len(distance_ranges), \
             f"len(experts) != len(distance_ranges): {len(experts)} vs {len(distance_ranges)}"
 
         self.distance_ranges = distance_ranges
         self.num_experts = len(distance_ranges)
+        self.clip_last_expert_range = bool(clip_last_expert_range)
         self.experts = nn.ModuleList(experts)
 
         base_model = self.experts[0]
@@ -121,19 +127,16 @@ class DistanceEnsembleWrapper(nn.Module):
 
     def _build_expert_masks(self, batch, expert_idx):
         dist = batch["edge_lengths"]
-
         d_min, d_max = self.distance_ranges[expert_idx]
-        if expert_idx == self.num_experts - 1:
-            edge_mask = (dist >= d_min)
-        else:
-            edge_mask = (dist >= d_min) & (dist < d_max)
-
+        edge_mask = edge_mask_for_distance_expert(
+            dist, d_min, d_max,
+            is_last_expert=(expert_idx == self.num_experts - 1),
+            clip_last_expert_range=self.clip_last_expert_range,
+        )
         num_nodes = self._get_safe_num_nodes(batch)
-
-        node_mask = torch.ones(num_nodes, dtype=torch.bool, device=dist.device)
-        if d_min > 0:
-            node_mask.fill_(False)
-
+        node_mask = node_mask_for_distance_expert(
+            num_nodes, d_min, device=dist.device,
+        )
         return edge_mask, node_mask
 
     @staticmethod
@@ -394,7 +397,7 @@ def _construct_single_model_from_reference(checkpoint, init_nnenv, init_nnsk, in
 
 
 def _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk, init_mixed, init_dftbsk,
-                                     model_options, common_options):
+                                     model_options, common_options, clip_last_expert_range=False):
     proto_state = prototype_model.state_dict()
     experts = [prototype_model]
     for i in range(1, len(distance_ranges)):
@@ -403,7 +406,11 @@ def _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnen
                                         ref_state_dict=proto_state)
         m.load_state_dict(proto_state, strict=True)
         experts.append(m)
-    return DistanceEnsembleWrapper(experts=experts, distance_ranges=distance_ranges)
+    return DistanceEnsembleWrapper(
+        experts=experts,
+        distance_ranges=distance_ranges,
+        clip_last_expert_range=clip_last_expert_range,
+    )
 
 
 def _count_experts_in_state_dict(state_dict: dict):
@@ -454,7 +461,7 @@ def _maybe_enable_legacy_swiglu_s2_compat(model_options: dict, state_dict: dict)
 
 
 def _build_ensemble_from_wrapper_state(wrapper_state_dict, distance_ranges, init_nnenv, init_nnsk, init_mixed,
-                                       init_dftbsk, model_options, common_options):
+                                       init_dftbsk, model_options, common_options, clip_last_expert_range=False):
     ckpt_num_experts = _count_experts_in_state_dict(wrapper_state_dict)
     if ckpt_num_experts != len(distance_ranges):
         raise ValueError(f"Checkpoint has {ckpt_num_experts} experts, but requires {len(distance_ranges)}.")
@@ -464,7 +471,11 @@ def _build_ensemble_from_wrapper_state(wrapper_state_dict, distance_ranges, init
             m = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options, common_options,
                                         ref_state_dict=wrapper_state_dict)
         experts.append(m)
-    model = DistanceEnsembleWrapper(experts=experts, distance_ranges=distance_ranges)
+    model = DistanceEnsembleWrapper(
+        experts=experts,
+        distance_ranges=distance_ranges,
+        clip_last_expert_range=clip_last_expert_range,
+    )
     model.load_state_dict(wrapper_state_dict, strict=True)
     return model
 
@@ -578,29 +589,34 @@ def build_model(
 
     if use_distance_ensemble:
         log.info(f"Wrapping model with DistanceEnsembleWrapper ({len(distance_ranges)} experts)")
+        clip_last = clip_last_expert_range_from_options(train_options)
         if from_scratch:
             with DeterministicExpertSeed(1):
                 prototype_model = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk, model_options,
                                                           common_options, ref_state_dict=None)
             model = _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk,
-                                                     init_mixed, init_dftbsk, model_options, common_options)
+                                                     init_mixed, init_dftbsk, model_options, common_options,
+                                                     clip_last_expert_range=clip_last)
         else:
             if ckpt_state_dict is None:
                 with DeterministicExpertSeed(1):
                     prototype_model = _construct_single_model(init_nnenv, init_nnsk, init_mixed, init_dftbsk,
                                                               model_options, common_options, ref_state_dict=None)
                 model = _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk,
-                                                         init_mixed, init_dftbsk, model_options, common_options)
+                                                         init_mixed, init_dftbsk, model_options, common_options,
+                                                         clip_last_expert_range=clip_last)
             elif _is_multi_expert_state_dict(ckpt_state_dict):
                 model = _build_ensemble_from_wrapper_state(ckpt_state_dict, distance_ranges, init_nnenv, init_nnsk,
-                                                           init_mixed, init_dftbsk, model_options, common_options)
+                                                           init_mixed, init_dftbsk, model_options, common_options,
+                                                           clip_last_expert_range=clip_last)
             else:
                 with DeterministicExpertSeed(1):
                     prototype_model = _construct_single_model_from_reference(checkpoint, init_nnenv, init_nnsk,
                                                                              init_mixed, init_dftbsk, model_options,
                                                                              common_options)
                 model = _replicate_prototype_to_ensemble(prototype_model, distance_ranges, init_nnenv, init_nnsk,
-                                                         init_mixed, init_dftbsk, model_options, common_options)
+                                                         init_mixed, init_dftbsk, model_options, common_options,
+                                                         clip_last_expert_range=clip_last)
 
     else:
         with DeterministicExpertSeed(1):

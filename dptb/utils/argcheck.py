@@ -505,6 +505,13 @@ def train_options():
         "inherits max_ckpt."
     )
     doc_distance_ranges = "The ranges split for distance-based MoE / expert parallelism. Default: `[[0.0, 1.0], [1.0, 2.0], [2.0, 4.0], [4.0, 6.0]]`"
+    doc_clip_last_expert_range = (
+        "If true, the last distance expert also uses a closed-open interval [d_min, d_max) "
+        "instead of the historical open-ended dist >= d_min. Required when training a single "
+        "onsite expert such as [[0, 1e-6]] on one GPU; otherwise that expert is treated as last "
+        "and sees all edges. Leave false for the original 2-GPU onsite+hopping job and for a "
+        "hopping-only job [[1e-6, 10]]. Default: `False`"
+    )
 
     # ================= 分布式 / DDP / expert-parallel =================
     doc_use_ddp = (
@@ -721,6 +728,7 @@ def train_options():
 
         # expert / MoE split
         Argument("distance_ranges", list, optional=True, doc=doc_distance_ranges),
+        Argument("clip_last_expert_range", bool, optional=True, default=False, doc=doc_clip_last_expert_range),
         Argument("parallel_multi", bool, optional=True, default=False, doc=doc_parallel_multi),
 
         # data / batch

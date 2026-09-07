@@ -23,6 +23,7 @@ RESTART_LOCKED_TRAIN_OPTION_KEYS = (
     "lr_scheduler",
     "update_lr_per_iter",
     "distance_ranges",
+    "clip_last_expert_range",
     "expert_lrs",
     "expert_optimizer_overrides",
     "expert_lr_scheduler_overrides",
