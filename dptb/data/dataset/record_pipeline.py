@@ -48,6 +48,7 @@ from dptb.data.interfaces.p2_contract import (
     DUAL_PRIOR_SAMPLE_SCHEMA,
     EDGE_GRAPH_FINGERPRINT_KEY,
     FULL_H_TARGET_FINGERPRINT_KEY,
+    NAMED_SLOTS_RME_SCHEMA,
     NONSOC_DM_RME_SAMPLE_SCHEMA,
     NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,
     NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
@@ -60,8 +61,13 @@ from dptb.data.interfaces.p2_contract import (
     ROW_ALIGNED_DATA_FINGERPRINT_KEY,
     ROW_ALIGNED_FIELD_CANDIDATES,
     SAMPLE_SCHEMA_KEY,
+    SOC_NAMED_SLOTS_RME_SCHEMA,
     TARGET_SOURCE_KEY,
+    resolve_target_keys,
     assert_nonsoc_rme_sample_contract,
+    build_target_spec,
+    residual_rme_schemas_for_prior,
+    schema_requires_prior_table_provenance,
 )
 
 # The ``lmdb_dataset`` module hosts the patch-sensitive helpers (``block_to_feature``,
@@ -220,16 +226,27 @@ class RecordSchemaValidator:
         sample_schema = data_dict.get(SAMPLE_SCHEMA_KEY)
         assert_nonsoc_rme_sample_contract(data_dict)
         if getattr(dataset, "require_prior_residual_rme_target", False):
-            expected_schema = (
-                NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA
-                if dataset.prior_kind == "p2"
-                else NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA
-            )
-            if sample_schema != expected_schema:
+            target_kind = str(getattr(dataset, "target_kind", "") or "").strip().lower()
+            prior_kind = getattr(dataset, "prior_kind", "p2")
+            prior_allowed = set(residual_rme_schemas_for_prior(prior_kind))
+            if target_kind:
+                allowed = tuple(
+                    prior_allowed
+                    & set(build_target_spec(target_kind).allowed_sample_schemas)
+                )
+            else:
+                allowed = tuple(prior_allowed)
+            if sample_schema not in allowed:
                 raise ValueError(
                     "Prior residual-RME target schema differs: "
-                    f"prior_kind={dataset.prior_kind!r} requires "
-                    f"{expected_schema!r}; got {sample_schema!r}."
+                    f"prior_kind={prior_kind!r} "
+                    f"target_kind={target_kind or 'default'!r} requires one of "
+                    f"{allowed!r}; got {sample_schema!r}."
+                )
+            if sample_schema in {NAMED_SLOTS_RME_SCHEMA, SOC_NAMED_SLOTS_RME_SCHEMA} and not target_kind:
+                raise ValueError(
+                    f"{sample_schema} stores more than one residual; set "
+                    "target_kind to 'h0res' or 'nacfres'."
                 )
         if (
             sample_schema == RAW_HAMILTONIAN_SAMPLE_SCHEMA
@@ -964,27 +981,37 @@ class PriorDecoder:
                     f"{prior_spec.allowed_sample_schemas!r}; got "
                     f"{sample_schema!r}."
                 )
-            _host._assert_expected_prior_source(
-                ctx.data_dict,
-                ctx.expected_prior_source_fingerprint,
-                prior_spec=prior_spec,
+            check_table = (
+                prior_spec.requires_table_provenance
+                and schema_requires_prior_table_provenance(sample_schema)
             )
-            if prior_spec.kind in ("p23", "na_cf"):
-                parent_p2_bundle = _host.require_sha256(
-                    ctx.data_dict.get(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY),
-                    field=P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
+            if check_table:
+                _host._assert_expected_prior_source(
+                    ctx.data_dict,
+                    ctx.expected_prior_source_fingerprint,
+                    prior_spec=prior_spec,
                 )
-                record_p2_bundle = _host.require_sha256(
-                    ctx.data_dict.get(P2_BUNDLE_FINGERPRINT_KEY),
-                    field=P2_BUNDLE_FINGERPRINT_KEY,
-                )
-                if parent_p2_bundle != record_p2_bundle:
-                    raise ValueError(
-                        "P23 parent P2 bundle does not match this dual-prior "
-                        f"record: parent={parent_p2_bundle}, "
-                        f"record={record_p2_bundle}."
+                if prior_spec.kind in ("p23", "na_cf"):
+                    parent_p2_bundle = _host.require_sha256(
+                        ctx.data_dict.get(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY),
+                        field=P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,
                     )
-            if not ctx.record_contract_already_validated:
+                    record_p2_bundle = _host.require_sha256(
+                        ctx.data_dict.get(P2_BUNDLE_FINGERPRINT_KEY),
+                        field=P2_BUNDLE_FINGERPRINT_KEY,
+                    )
+                    if parent_p2_bundle != record_p2_bundle:
+                        raise ValueError(
+                            "P23 parent P2 bundle does not match this dual-prior "
+                            f"record: parent={parent_p2_bundle}, "
+                            f"record={record_p2_bundle}."
+                        )
+            fp_key = prior_spec.rme_fingerprint_key
+            if (
+                not ctx.record_contract_already_validated
+                and fp_key
+                and (check_table or fp_key in ctx.data_dict)
+            ):
                 # A composed family (na_cf = node_p23 + edge_p2) has no stored
                 # joint hash of its mixed pair. Validate every parent family
                 # in full, matching Hopper 577048 / 0820 nacf.
@@ -1078,7 +1105,12 @@ class PriorDecoder:
                 expensive_checks=not ctx.record_contract_already_validated,
             )
 
-            if ctx.requires_stored_p2_graph and not ctx.record_contract_already_validated:
+            if (
+                ctx.requires_stored_p2_graph
+                and not ctx.record_contract_already_validated
+                and prior_spec.requires_table_provenance
+                and prior_spec.block_fingerprint_key
+            ):
                 actual_block_fingerprint = _host.fingerprint_fields(
                     atomicdata, ctx.p2_blockwise_keys
                 )
@@ -1182,6 +1214,7 @@ def build_sample_context(
         schema_validator.resolve_contract_state(dataset, idx)
     )
     record_contract_already_validated = record_contract_key in validated_record_contracts
+    target_kind = str(getattr(dataset, "target_kind", "") or "").strip().lower()
     prior_spec = getattr(
         dataset,
         "prior_spec",
@@ -1236,13 +1269,21 @@ def build_sample_context(
 
     pre_node_features = data_dict.get(AtomicDataDict.NODE_FEATURES_KEY, None)
     pre_edge_features = data_dict.get(AtomicDataDict.EDGE_FEATURES_KEY, None)
+    if target_kind:
+        node_key, edge_key = resolve_target_keys(data_dict, target_kind)
+        pre_node_features = data_dict.get(node_key, None)
+        pre_edge_features = data_dict.get(edge_key, None)
     pre_node_overlap = data_dict.get(AtomicDataDict.NODE_OVERLAP_KEY, None)
     pre_edge_overlap = data_dict.get(AtomicDataDict.EDGE_OVERLAP_KEY, None)
 
     h0_blocks = data_dict.get(h0_key, None) if get_H0 else None
     node_h0 = data_dict.get(AtomicDataDict.NODE_H0_KEY, None) if get_H0 else None
     edge_h0 = data_dict.get(AtomicDataDict.EDGE_H0_KEY, None) if get_H0 else None
-    p2_blocks = data_dict.get(prior_raw_key, None) if get_prior else None
+    p2_blocks = (
+        data_dict.get(prior_raw_key, None)
+        if get_prior and prior_raw_key
+        else None
+    )
     node_p2 = data_dict.get(prior_spec.node_rme_key, None) if get_prior else None
     edge_p2 = data_dict.get(prior_spec.edge_rme_key, None) if get_prior else None
     p2_blockwise_keys = prior_spec.block_fields

@@ -37,7 +37,18 @@ ABSOLUTE_FULL_H_SEMANTICS = "absolute_full_h"
 H0_RESIDUAL_SEMANTICS = "h0_residual"
 NACF_RESIDUAL_RME_SCHEMA = "deeptb.nonsoc_na_cf_residual_rme_training_sample/v1"
 H0_RESIDUAL_RME_SCHEMA = "deeptb.nonsoc_h0_residual_rme_training_sample/v1"
+NAMED_SLOTS_RME_SCHEMA = "deeptb.named_slots_rme_training_sample/v1"
+SOC_NAMED_SLOTS_RME_SCHEMA = (
+    "deeptb.soc_uureal_named_slots_rme_training_sample/v1"
+)
+SOC_H0_RESIDUAL_RME_SCHEMA = (
+    "deeptb.soc_uureal_h0_residual_nacf_prior_rme_training_sample/v1"
+)
+SOC_NACF_RESIDUAL_RME_SCHEMA = (
+    "deeptb.soc_uureal_na_cf_residual_rme_training_sample/v1"
+)
 NACF_RESIDUAL_RME_SEMANTICS = "residual_na_cf_rme"
+NAMED_SLOTS_RME_SEMANTICS = "named_slots"
 DENSITY_MATRIX_RME_SEMANTICS = "density_matrix_rme"
 P2_RESIDUAL_RME_SEMANTICS = "residual_p2_rme"
 P23_RESIDUAL_RME_SEMANTICS = "residual_p23_rme"
@@ -94,6 +105,10 @@ ROW_ALIGNED_FIELD_CANDIDATES = (
     "edge_p2",
     "node_p23",
     "edge_p23",
+    "node_delta_h0",
+    "edge_delta_h0",
+    "node_delta_nacf",
+    "edge_delta_nacf",
     "node_delta_hamil_blocks",
     "edge_delta_hamil_blocks",
     "node_delta_hamil_block_shape",
@@ -148,6 +163,10 @@ class PriorSpec:
     # Composed family: kinds whose fingerprints must ALL validate before this
     # family's mixed node/edge selection is trusted. Empty for p2/p23.
     composed_of: tuple[str, ...] = ()
+    # Table/source fingerprints are a non-SOC P2/P23 cache property. Compact
+    # SOC uu-real residuals and named-slot records bind the prior to the stored
+    # graph instead and leave these keys empty.
+    requires_table_provenance: bool = True
 
     @property
     def validation_kinds(self) -> tuple[str, ...]:
@@ -239,9 +258,34 @@ PRIOR_FIELD_SPECS = {
             NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
             NACF_RESIDUAL_RME_SCHEMA,
             H0_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+            SOC_H0_RESIDUAL_RME_SCHEMA,
+            SOC_NACF_RESIDUAL_RME_SCHEMA,
         ),
         bundle_dependency_fields=(P23_PARENT_P2_BUNDLE_FINGERPRINT_KEY,),
         composed_of=("p23", "p2"),
+    ),
+    "h0": PriorSpec(
+        kind="h0",
+        raw_key="",
+        node_rme_key="node_h0",
+        edge_rme_key="edge_h0",
+        node_blocks_key="node_h0_blocks",
+        edge_blocks_key="edge_h0_blocks",
+        node_shape_key="node_h0_block_shape",
+        edge_shape_key="edge_h0_block_shape",
+        source_fingerprint_key="",
+        rme_fingerprint_key="",
+        block_fingerprint_key="",
+        bundle_fingerprint_key="",
+        allowed_sample_schemas=(
+            H0_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_H0_RESIDUAL_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+        ),
+        requires_table_provenance=False,
     ),
 }
 
@@ -267,6 +311,149 @@ def build_prior_spec(kind: Any) -> PriorSpec:
     """
 
     return resolve_prior_field_spec(kind)
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """Loss-target slot: which residual tensor pair the model regresses.
+
+    ``named_*`` keys are preferred when present (one-record dual residual).
+    Otherwise a view schema may keep the target in ``node_features`` /
+    ``edge_features`` — that is the old two-directory layout.
+    """
+
+    kind: str
+    semantics: str
+    named_node_key: str
+    named_edge_key: str
+    view_schemas: tuple[str, ...]
+    allowed_sample_schemas: tuple[str, ...]
+
+
+TARGET_FIELD_SPECS = {
+    "h0res": TargetSpec(
+        kind="h0res",
+        semantics=H0_RESIDUAL_SEMANTICS,
+        named_node_key="node_delta_h0",
+        named_edge_key="edge_delta_h0",
+        view_schemas=(
+            H0_RESIDUAL_RME_SCHEMA,
+            SOC_H0_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+        ),
+        allowed_sample_schemas=(
+            H0_RESIDUAL_RME_SCHEMA,
+            SOC_H0_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+        ),
+    ),
+    "nacfres": TargetSpec(
+        kind="nacfres",
+        semantics=NACF_RESIDUAL_RME_SEMANTICS,
+        named_node_key="node_delta_nacf",
+        named_edge_key="edge_delta_nacf",
+        view_schemas=(
+            NACF_RESIDUAL_RME_SCHEMA,
+            SOC_NACF_RESIDUAL_RME_SCHEMA,
+        ),
+        allowed_sample_schemas=(
+            NACF_RESIDUAL_RME_SCHEMA,
+            SOC_NACF_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+        ),
+    ),
+    "p2res": TargetSpec(
+        kind="p2res",
+        semantics=P2_RESIDUAL_RME_SEMANTICS,
+        named_node_key="",
+        named_edge_key="",
+        view_schemas=(NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,),
+        allowed_sample_schemas=(NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,),
+    ),
+    "p23res": TargetSpec(
+        kind="p23res",
+        semantics=P23_RESIDUAL_RME_SEMANTICS,
+        named_node_key="",
+        named_edge_key="",
+        view_schemas=(NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,),
+        allowed_sample_schemas=(NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,),
+    ),
+}
+
+_FULL_H_PRIOR_SCHEMAS = frozenset({P2_SAMPLE_SCHEMA, DUAL_PRIOR_SAMPLE_SCHEMA})
+_TABLE_PROVENANCE_SCHEMAS = frozenset(
+    {
+        P2_SAMPLE_SCHEMA,
+        DUAL_PRIOR_SAMPLE_SCHEMA,
+        NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA,
+        NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA,
+        NACF_RESIDUAL_RME_SCHEMA,
+        H0_RESIDUAL_RME_SCHEMA,
+    }
+)
+
+
+def build_target_spec(kind: Any) -> TargetSpec:
+    normalized = str(kind).strip().lower()
+    try:
+        return TARGET_FIELD_SPECS[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"target_kind must be one of {tuple(TARGET_FIELD_SPECS)}, got {kind!r}."
+        ) from exc
+
+
+def residual_rme_schemas_for_prior(prior_kind: Any) -> tuple[str, ...]:
+    """Schemas that may host a compact residual-RME target for this prior."""
+    spec = build_prior_spec(prior_kind)
+    return tuple(
+        schema
+        for schema in spec.allowed_sample_schemas
+        if schema not in _FULL_H_PRIOR_SCHEMAS
+    )
+
+
+def schema_requires_prior_table_provenance(schema: Any) -> bool:
+    return str(schema or "") in _TABLE_PROVENANCE_SCHEMAS
+
+
+def resolve_target_keys(
+    record: Mapping[str, Any], target_kind: Any
+) -> tuple[str, str]:
+    """Return the node/edge keys that hold the selected residual."""
+    spec = build_target_spec(target_kind)
+    named_node, named_edge = spec.named_node_key, spec.named_edge_key
+    if (
+        named_node
+        and named_edge
+        and named_node in record
+        and named_edge in record
+    ):
+        return named_node, named_edge
+    schema = record.get(SAMPLE_SCHEMA_KEY)
+    if schema in spec.view_schemas and "node_features" in record and "edge_features" in record:
+        return "node_features", "edge_features"
+    raise ValueError(
+        f"target_kind={spec.kind!r} needs {named_node}/{named_edge} or a view "
+        f"schema in {spec.view_schemas!r} with node_features/edge_features; "
+        f"got schema={schema!r}."
+    )
+
+
+def apply_target_slot(record: dict, target_kind: Any) -> tuple[str, str]:
+    """Point ``node_features``/``edge_features`` at the selected residual.
+
+    The rest of the training stack still reads those two keys.  Named-slot
+    records keep the unused residual under its own name.
+    """
+    node_key, edge_key = resolve_target_keys(record, target_kind)
+    if node_key != "node_features":
+        record["node_features"] = record[node_key]
+        record["edge_features"] = record[edge_key]
+    return node_key, edge_key
 
 
 def assert_nonsoc_rme_sample_contract(record: Mapping[str, Any]) -> None:
@@ -864,6 +1051,14 @@ __all__ = [
     "EDGE_GRAPH_FINGERPRINT_KEY",
     "FULL_H_TARGET_FINGERPRINT_KEY",
     "H0_RESIDUAL_SEMANTICS",
+    "H0_RESIDUAL_RME_SCHEMA",
+    "NACF_RESIDUAL_RME_SCHEMA",
+    "NACF_RESIDUAL_RME_SEMANTICS",
+    "NAMED_SLOTS_RME_SCHEMA",
+    "NAMED_SLOTS_RME_SEMANTICS",
+    "SOC_H0_RESIDUAL_RME_SCHEMA",
+    "SOC_NACF_RESIDUAL_RME_SCHEMA",
+    "SOC_NAMED_SLOTS_RME_SCHEMA",
     "NONSOC_DM_RME_SAMPLE_SCHEMA",
     "NONSOC_P2_RESIDUAL_RME_SAMPLE_SCHEMA",
     "NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA",
@@ -893,11 +1088,18 @@ __all__ = [
     "ROW_ALIGNED_DATA_FINGERPRINT_KEY",
     "ROW_ALIGNED_FIELD_CANDIDATES",
     "SAMPLE_SCHEMA_KEY",
+    "TARGET_FIELD_SPECS",
     "TARGET_SEMANTICS_KEY",
     "TARGET_SOURCE_KEY",
+    "TargetSpec",
+    "apply_target_slot",
     "assert_record_fingerprint",
     "assert_nonsoc_rme_sample_contract",
     "build_prior_spec",
+    "build_target_spec",
+    "residual_rme_schemas_for_prior",
+    "resolve_target_keys",
+    "schema_requires_prior_table_provenance",
     "canonical_edge_graph",
     "edge_graph_fingerprint",
     "fingerprint_fields",

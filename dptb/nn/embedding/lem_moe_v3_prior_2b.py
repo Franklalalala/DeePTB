@@ -37,6 +37,8 @@ from torch_scatter import scatter_mean
 from dptb.configuration import resolve_init_scope
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
+from dptb.data.interfaces.blockwise_tensor import is_soc_uureal_mapper
+from dptb.data.interfaces.p2_contract import PRIOR_FIELD_SPECS
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
@@ -46,9 +48,7 @@ from .lem_moe_v3_h0_helpers import H0InitLayer, _get_feature_source_with_key
 
 
 PRIOR_2B_KINDS = {
-    "p2": (_keys.NODE_P2_KEY, _keys.EDGE_P2_KEY),
-    "p23": (_keys.NODE_P23_KEY, _keys.EDGE_P23_KEY),
-    "na_cf": (_keys.NODE_P23_KEY, _keys.EDGE_P2_KEY),
+    kind: spec.rme_fields for kind, spec in PRIOR_FIELD_SPECS.items()
 }
 
 # Layer kwargs the base class forwards verbatim from its own __init__ arguments.
@@ -95,8 +95,8 @@ def resolve_prior_2b_keys(prior_kind: str) -> Tuple[str, str]:
     kind = str(prior_kind).strip().lower()
     if kind not in PRIOR_2B_KINDS:
         raise ValueError(
-            "lem_moe_v3_prior_2b supports prior_kind='p2', 'p23', or 'na_cf'; "
-            f"got {prior_kind!r}."
+            "lem_moe_v3_prior_2b supports prior_kind in "
+            f"{tuple(PRIOR_2B_KINDS)}; got {prior_kind!r}."
         )
     return PRIOR_2B_KINDS[kind]
 
@@ -195,9 +195,11 @@ class LemMoEV3Prior2b(LemMoEV3H0):
             h0_self_edge_tol=prior_self_edge_tol,
             **kwargs,
         )
-        if bool(getattr(self.idp, "has_soc", False)):
+        if bool(getattr(self.idp, "has_soc", False)) and not is_soc_uureal_mapper(
+            self.idp
+        ):
             raise NotImplementedError(
-                "lem_moe_v3_prior_2b is non-SOC; residual Full-H - P is real RME."
+                "lem_moe_v3_prior_2b is non-SOC except compact uu-real residual-RME."
             )
 
         self.only2b = bool(only2b)

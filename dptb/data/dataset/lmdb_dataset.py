@@ -1126,6 +1126,8 @@ class LMDBDataset(AtomicDataset):
     # single ``prior_kind`` derives every field name (see PriorSpec).
     get_prior = False
     prior_kind = "p2"
+    target_kind = ""
+    target_spec = None
     prior_raw_key = "hamiltonian_p2"
     prefer_precomputed_prior = True
     require_full_h_target = False
@@ -1212,6 +1214,7 @@ class LMDBDataset(AtomicDataset):
             h0_key: str = "hamiltonian_0",
             prefer_precomputed_h0: bool = True,
             prior_kind: str = "p2",
+            target_kind: str = "",
             prior_raw_key: Optional[str] = None,
             prefer_precomputed_prior: Optional[bool] = None,
             require_full_h_target: bool = False,
@@ -1283,10 +1286,18 @@ class LMDBDataset(AtomicDataset):
         self.get_Hamiltonian = get_Hamiltonian
         self.get_H0 = get_H0
         self.get_prior = bool(get_prior)
+        self.target_kind = str(target_kind or "").strip().lower()
         if self.get_prior and bool(getattr(type_mapper, "has_soc", False)):
-            raise NotImplementedError(
-                "The first-class P2/P23 physical-prior route is non-SOC only."
+            compact_residual = bool(require_prior_residual_rme_target) and not bool(
+                require_full_h_target
             )
+            if not compact_residual:
+                raise NotImplementedError(
+                    "The first-class P2/P23 physical-prior route is non-SOC "
+                    "only except compact residual-RME "
+                    "(require_prior_residual_rme_target=true, "
+                    "require_full_h_target=false)."
+                )
         self.residual_hamiltonian = residual_hamiltonian
         if self.residual_hamiltonian and not self.get_Hamiltonian:
             raise ValueError(
@@ -1317,6 +1328,12 @@ class LMDBDataset(AtomicDataset):
         self.prefer_precomputed_h0 = prefer_precomputed_h0
         self.prior_spec = resolve_prior_field_spec(prior_kind)
         self.prior_kind = self.prior_spec.kind
+        if self.target_kind:
+            from dptb.data.interfaces.p2_contract import build_target_spec
+
+            self.target_spec = build_target_spec(self.target_kind)
+        else:
+            self.target_spec = None
         # The raw LMDB prior key is DERIVED from prior_kind; an explicit
         # prior_raw_key/p2_key is accepted only as a deprecated echo that must
         # match the derived value, so a single prior_kind selects everything.

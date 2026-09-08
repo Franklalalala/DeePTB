@@ -113,6 +113,12 @@ NODE_P2_KEY: Final[str] = "node_p2"
 # separate from P2 so one immutable LMDB record can expose both priors.
 EDGE_P23_KEY: Final[str] = "edge_p23"
 NODE_P23_KEY: Final[str] = "node_p23"
+# Named residual targets for a single-record prior/target slot layout.
+# H-H0 may also live in node_features on h0res / named-slot records.
+EDGE_DELTA_H0_KEY: Final[str] = "edge_delta_h0"
+NODE_DELTA_H0_KEY: Final[str] = "node_delta_h0"
+EDGE_DELTA_NACF_KEY: Final[str] = "edge_delta_nacf"
+NODE_DELTA_NACF_KEY: Final[str] = "node_delta_nacf"
 # Dedicated offline DFT H[rho0] features.  Keep these separate from legacy
 # H0/Hueckel fields so provenance and fallback semantics cannot mix.
 EDGE_PHYSICAL_H0_KEY: Final[str] = "edge_physical_h0"

@@ -294,9 +294,13 @@ class DatasetBuilder:
                 h0_key=kwargs.get("h0_key", "hamiltonian_0"),
                 prefer_precomputed_h0=kwargs.get("prefer_precomputed_h0", True),
                 prior_kind=kwargs.get("prior_kind", "p2"),
+                target_kind=kwargs.get("target_kind", ""),
                 # Deprecated config aliases (p2_key/prefer_precomputed_p2/...) are
                 # still honored; the raw key is otherwise derived from prior_kind.
                 prior_raw_key=kwargs.get("prior_raw_key", kwargs.get("p2_key", None)),
+                require_prior_residual_rme_target=kwargs.get(
+                    "require_prior_residual_rme_target", False
+                ),
                 prefer_precomputed_prior=kwargs.get(
                     "prefer_precomputed_prior",
                     kwargs.get("prefer_precomputed_p2", True),

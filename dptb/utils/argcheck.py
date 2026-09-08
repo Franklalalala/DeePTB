@@ -1351,7 +1351,8 @@ def train_data_sub():
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
-        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Prior slot: p2, p23, na_cf (node_p23+edge_p2), or h0 (node_h0/edge_h0)."),
+        Argument("target_kind", str, optional=True, default="", doc="Target slot: h0res (H-H0), nacfres (H-P_na_cf), p2res, or p23res. Empty keeps node_features as stored. Named-slot LMDBs keep both residuals in one record."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
         Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
@@ -1360,7 +1361,7 @@ def train_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
-        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require a compact residual-RME sample. The allowed schemas are the residual views of prior_kind, or target_kind when that slot is set. Direct e3tb + hamil_abs, no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -1398,7 +1399,8 @@ def validation_data_sub():
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
-        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Prior slot: p2, p23, na_cf (node_p23+edge_p2), or h0 (node_h0/edge_h0)."),
+        Argument("target_kind", str, optional=True, default="", doc="Target slot: h0res (H-H0), nacfres (H-P_na_cf), p2res, or p23res. Empty keeps node_features as stored. Named-slot LMDBs keep both residuals in one record."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
         Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
@@ -1407,7 +1409,7 @@ def validation_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
-        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require a compact residual-RME sample. The allowed schemas are the residual views of prior_kind, or target_kind when that slot is set. Direct e3tb + hamil_abs, no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -1445,7 +1447,8 @@ def reference_data_sub():
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
-        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Prior slot: p2, p23, na_cf (node_p23+edge_p2), or h0 (node_h0/edge_h0)."),
+        Argument("target_kind", str, optional=True, default="", doc="Target slot: h0res (H-H0), nacfres (H-P_na_cf), p2res, or p23res. Empty keeps node_features as stored. Named-slot LMDBs keep both residuals in one record."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
         Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
@@ -1454,7 +1457,7 @@ def reference_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
-        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require a compact residual-RME sample. The allowed schemas are the residual views of prior_kind, or target_kind when that slot is set. Direct e3tb + hamil_abs, no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -1491,7 +1494,8 @@ def test_data_sub():
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
         Argument("get_P2", bool, optional=True, default=False, doc="Backward-compatible enable switch for the selected first-class non-SOC P2/P23 physical prior."),
-        Argument("prior_kind", str, optional=True, default="p2", doc="Selected first-class non-SOC physical prior: p2 or p23. P23 requires p2_key=hamiltonian_p23 and the dual-prior sample schema."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Prior slot: p2, p23, na_cf (node_p23+edge_p2), or h0 (node_h0/edge_h0)."),
+        Argument("target_kind", str, optional=True, default="", doc="Target slot: h0res (H-H0), nacfres (H-P_na_cf), p2res, or p23res. Empty keeps node_features as stored. Named-slot LMDBs keep both residuals in one record."),
         Argument("residual_hamiltonian", bool, optional=True, default=False, doc="If true (with get_Hamiltonian), subtract H0 (raw LMDB key h0_key, default hamiltonian_0) from the Hamiltonian target so the block-native loss regresses the residual dH = H - H0. The MAE stays on the same error scale as the absolute-H target."),
         Argument("residual_shrink_policy", str, optional=True, default="error", doc="H0-quality shrink-heuristic policy for residual_hamiltonian targets: 'error' (default, byte-identical to the historical gate) fails closed when subtracting H0 does not shrink the target by min_residual_shrink; 'warn' logs the same diagnostics and proceeds; 'off' skips the heuristic. Magnitude proves neither provenance nor correctness, so this is a configurable quality gate (the frozen source/shape provenance contracts always apply, independent of this policy)."),
         Argument("min_residual_shrink", [float, int], optional=True, default=1.2, doc="Required magnitude shrink ratio (mean|H| must exceed min_residual_shrink * mean|H-H0|) for the residual_shrink_policy H0-quality heuristic. Default 1.2."),
@@ -1500,7 +1504,7 @@ def test_data_sub():
         Argument("p2_key", str, optional=True, default="", doc="Deprecated/optional raw LMDB AO-block dictionary key for the physical prior. Leave empty to derive from prior_kind (hamiltonian_p2/hamiltonian_p23); an explicit value must match the derived one."),
         Argument("prefer_precomputed_p2", bool, optional=True, default=True, doc="Prefer precomputed node_p2/edge_p2 RME features while retaining P2 AO blocks for Full-H reconstruction."),
         Argument("require_full_h_target", bool, optional=True, default=False, doc="Require versioned absolute Full-H target fields/metadata; never infer Full H from historical delta-named targets."),
-        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require the versioned compact non-SOC H-P2 or H-P23 residual-RME sample contract selected by prior_kind. This route is only valid for direct e3tb RME prediction with hamil_abs loss and no AO prior add-back."),
+        Argument("require_prior_residual_rme_target", bool, optional=True, default=False, doc="Require a compact residual-RME sample. The allowed schemas are the residual views of prior_kind, or target_kind when that slot is set. Direct e3tb + hamil_abs, no AO prior add-back."),
         Argument("require_residual_h_target", bool, optional=True, default=False, doc="Require a versioned raw-H/raw-H0 residual target declaration; never infer H-H0 provenance from field names."),
         Argument("require_uureal_block_ode", bool, optional=True, default=False, doc="Require the fail-closed compact uu_real already-delta block contract."),
         Argument("require_residual_from_full_h_target", bool, optional=True, default=False, doc="Require the absolute-Full-H raw record whose residual dH = H - H0 is materialized online (residual_ao_block_ode); mutually exclusive with the full-H/residual-H/uu_real target contracts."),
@@ -2167,7 +2171,7 @@ def slem_prior():
             default="both",
             doc="Physical-prior initialization scope: both, node, edge, auxiliary, or none.",
         ),
-        Argument("prior_kind", str, optional=True, default="p2", doc="Physical prior family: p2 or p23. This single value derives the node/edge RME fields, AO-block fields and label."),
+        Argument("prior_kind", str, optional=True, default="p2", doc="Prior slot: p2, p23, na_cf, or h0. This single value derives the node/edge RME keys."),
         Argument("prior_node_key", str, optional=True, default="", doc="Deprecated/optional: node-wise selected-prior RME field. Leave empty to derive from prior_kind (node_p2/node_p23); an explicit value must match the derived one."),
         Argument("prior_edge_key", str, optional=True, default="", doc="Deprecated/optional: edge-wise selected-prior RME field. Leave empty to derive from prior_kind (edge_p2/edge_p23); an explicit value must match the derived one."),
         Argument("prior_node_mode", str, optional=True, default="direct", doc="Supported: direct or self_edge."),
@@ -2601,8 +2605,8 @@ def _validate_p2_prior_full_h_contract(data):
     ).strip().lower()
     if embedding_is_prior and embedding_prior_kind not in PRIOR_FIELD_SPECS:
         raise ValueError(
-            "model_options.embedding.prior_kind must be 'p2' or 'p23'; "
-            f"got {embedding_prior_kind!r}."
+            "model_options.embedding.prior_kind must be one of "
+            f"{tuple(PRIOR_FIELD_SPECS)}; got {embedding_prior_kind!r}."
         )
     prior_spec = build_prior_spec(
         embedding_prior_kind if embedding_prior_kind in PRIOR_FIELD_SPECS else "p2"
@@ -2650,6 +2654,15 @@ def _validate_p2_prior_full_h_contract(data):
         raise ValueError(
             "require_prior_residual_rme_target must be identical across every "
             "configured data split."
+        )
+    target_kinds = {
+        split: str(options.get("target_kind", "") or "").strip().lower()
+        for split, options in configured_splits.items()
+    }
+    if any(target_kinds.values()) and len(set(target_kinds.values())) != 1:
+        raise ValueError(
+            "target_kind must be identical across every configured data split; "
+            f"got {target_kinds}."
         )
     if uses_prior_residual_rme:
         if prediction_options.get("method") != "e3tb":
@@ -2715,10 +2728,11 @@ def _validate_p2_prior_full_h_contract(data):
     if not route_uses_prior:
         return
 
-    if bool(common.get("has_soc", False)):
+    if bool(common.get("has_soc", False)) and not uses_prior_residual_rme:
         raise ValueError(
-            "lem_moe_v3_prior/prior_residual reconstruction is non-SOC only; "
-            "set common_options.has_soc=false."
+            "lem_moe_v3_prior AO Full-H reconstruction is non-SOC only; "
+            "compact residual-RME requires "
+            "require_prior_residual_rme_target=true."
         )
     if (
         add_prior
@@ -2752,7 +2766,7 @@ def _validate_p2_prior_full_h_contract(data):
         if not bool(split_options.get("get_P2", False)):
             raise ValueError(
                 f"data_options.{split}.get_P2 must be true for the "
-                f"{prior_spec['label']} prior route."
+                f"{prior_spec.label} prior route."
             )
         split_prior_kind = str(split_options.get("prior_kind", "p2")).strip().lower()
         if split_prior_kind != embedding_prior_kind:

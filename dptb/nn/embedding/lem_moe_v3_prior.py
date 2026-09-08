@@ -15,7 +15,8 @@ import torch
 
 from dptb.configuration import resolve_init_scope
 from dptb.data import AtomicDataDict
-from dptb.data.interfaces.p2_contract import build_prior_spec
+from dptb.data.interfaces.blockwise_tensor import is_soc_uureal_mapper
+from dptb.data.interfaces.p2_contract import PRIOR_FIELD_SPECS, build_prior_spec
 from dptb.nn.embedding.emb import Embedding
 
 from .lem_moe_v3_h0 import LemMoEV3H0
@@ -229,8 +230,8 @@ class LemMoEV3Prior(LemMoEV3H0):
             prior_spec = build_prior_spec(prior_kind)
         except ValueError as exc:
             raise ValueError(
-                "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
-                f"got {prior_kind!r}."
+                "lem_moe_v3_prior supports prior_kind in "
+                f"{tuple(PRIOR_FIELD_SPECS)}; got {prior_kind!r}."
             ) from exc
         # The node/edge RME keys are DERIVED from the single prior kind.  An
         # explicit key is accepted only as a deprecated echo that must match the
@@ -308,9 +309,11 @@ class LemMoEV3Prior(LemMoEV3H0):
             h0_self_edge_tol=prior_self_edge_tol,
             **kwargs,
         )
-        if bool(getattr(self.idp, "has_soc", False)):
+        if bool(getattr(self.idp, "has_soc", False)) and not is_soc_uureal_mapper(
+            self.idp
+        ):
             raise NotImplementedError(
-                "lem_moe_v3_prior is intentionally non-SOC in the first implementation."
+                "lem_moe_v3_prior is non-SOC except compact uu-real residual-RME."
             )
 
         self.prior_kind = prior_kind

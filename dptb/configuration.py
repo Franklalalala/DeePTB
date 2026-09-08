@@ -891,9 +891,9 @@ def _embedding_prior_2b(
     if method != "lem_moe_v3_prior_2b":
         return
     prior_kind = _normalized_name(out.get("prior_kind", "na_cf"))
-    if prior_kind not in {"p2", "p23", "na_cf"}:
+    if prior_kind not in {"p2", "p23", "na_cf", "h0"}:
         raise ValueError(
-            "lem_moe_v3_prior_2b supports prior_kind='p2', 'p23', or 'na_cf'; "
+            "lem_moe_v3_prior_2b supports prior_kind='p2', 'p23', 'na_cf', or 'h0'; "
             f"got {prior_kind!r}."
         )
     out["prior_kind"] = prior_kind
@@ -936,9 +936,9 @@ def _embedding_prior(
     if method != "lem_moe_v3_prior":
         return
     prior_kind = _normalized_name(out.get("prior_kind", "p2"))
-    if prior_kind not in {"p2", "p23"}:
+    if prior_kind not in {"p2", "p23", "na_cf", "h0"}:
         raise ValueError(
-            "lem_moe_v3_prior supports prior_kind='p2' or 'p23'; "
+            "lem_moe_v3_prior supports prior_kind='p2', 'p23', 'na_cf', or 'h0'; "
             f"got {prior_kind!r}."
         )
     out["prior_kind"] = prior_kind
