@@ -183,6 +183,9 @@ NODE_SOC_SWITCH_KEY: Final[str] = "node_soc_switch"
 # value per graph. See ``LMDBDataset._compute_sample_uid`` for the packing.
 SAMPLE_UID_KEY: Final[str] = "sample_uid"
 
+# Explicit electron count per graph; fractional occupation is allowed.
+NELEC_KEY: Final[str] = "nelec"
+
 PER_ATOM_ENERGY_KEY: Final[str] = "atomic_energy"
 TOTAL_ENERGY_KEY: Final[str] = "total_energy"
 FORCE_KEY: Final[str] = "forces"

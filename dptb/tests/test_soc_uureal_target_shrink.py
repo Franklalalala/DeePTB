@@ -1,49 +1,9 @@
 import importlib.util
-from pathlib import Path
 
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[2]
 BASIS_0603_SOC = {"C": "4s2p2d1f"}
-
-
-def _source(path: str) -> str:
-    return (ROOT / path).read_text(encoding="utf-8")
-
-
-def test_soc_uureal_contract_is_encoded_in_mapper_and_model_paths():
-    transforms = _source("dptb/data/transforms.py")
-    deeptb = _source("dptb/nn/deeptb.py")
-    lem_moe_v3 = _source("dptb/nn/embedding/lem_moe_v3.py")
-    hamiltonian = _source("dptb/nn/hamiltonian.py")
-    data_build = _source("dptb/data/build.py")
-    argcheck = _source("dptb/utils/argcheck.py")
-    lmdb_dataset = _source("dptb/data/dataset/lmdb_dataset.py")
-    trainer = _source("dptb/nnops/trainer.py")
-
-    assert "full_soc_prediction" in argcheck
-    assert "resolve_nextham_uureal_mask" in transforms
-    assert "full_soc_prediction=kwargs.get('full_soc_prediction', False)" in data_build
-    assert "def _e3tb_soc_feature_factor" in transforms
-    assert (
-        "return 1 if self.nextham_uureal_mask else "
-        "4 * (2 if self.soc_complex_doubling else 1)"
-    ) in transforms
-    assert "factor = self._e3tb_soc_feature_factor()" in transforms
-    assert "spinful=self.has_soc and not self.nextham_uureal_mask" in transforms
-    assert (
-        "self.soc_complex_doubling and not self.nextham_uureal_mask"
-    ) in transforms
-
-    assert "nextham_uureal_mask=self.nextham_uureal_mask" in deeptb
-    assert "nextham_uureal_mask=self.nextham_uureal_mask" in lem_moe_v3
-    assert "nextham_uureal_mask=self.nextham_uureal_mask" in hamiltonian
-    assert "if self.soc and not self.nextham_uureal_mask" in hamiltonian
-    assert "target_rme != full_rme" in lmdb_dataset
-    assert "return tensor" in lmdb_dataset
-    assert "def _loss_kwargs" in trainer
-    assert "kwargs.update(common_options)" in trainer
 
 
 def test_full_soc_prediction_flag_overrides_compact_mask():

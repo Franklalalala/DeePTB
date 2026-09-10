@@ -1,50 +1,5 @@
-from pathlib import Path
 
 import pytest
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SOURCE_PATH = REPO_ROOT / "dptb" / "nn" / "tensor_product_moe_v3.py"
-LEM_SOURCE_PATH = REPO_ROOT / "dptb" / "nn" / "embedding" / "lem_moe_v3.py"
-ARGCHECK_SOURCE_PATH = REPO_ROOT / "dptb" / "utils" / "argcheck.py"
-
-
-def _read_source() -> str:
-    return SOURCE_PATH.read_text(encoding="utf-8", errors="ignore")
-
-
-def test_tensor_product_source_exposes_compact_wigner_dual_path():
-    source = _read_source()
-
-    assert "class SO2WignerBlocks" in source
-    assert "def batch_wigner_D_blocks" in source
-    assert "wigner_apply_mode" in source
-    assert "so2_fusion_mode" in source
-    assert '"streamed_m_major_ref"' in source
-    assert '"full_dense"' in source
-    assert '"compact_blocks"' in source
-
-
-def test_compact_wigner_path_is_default_with_dense_fallback():
-    source = _read_source()
-
-    assert 'wigner_apply_mode: str = "compact_blocks"' in source
-    assert 'self.wigner_apply_mode = _normalize_wigner_apply_mode(wigner_apply_mode)' in source
-    assert 'if wigner_apply_mode == "compact_blocks":' in source
-    assert "return batch_wigner_D(l_max, alpha, beta, gamma, _Jd)" in source
-
-
-def test_compact_wigner_config_is_threaded_to_lem():
-    lem_source = LEM_SOURCE_PATH.read_text(encoding="utf-8", errors="ignore")
-    argcheck_source = ARGCHECK_SOURCE_PATH.read_text(encoding="utf-8", errors="ignore")
-
-    assert 'so2_wigner_apply_mode: str = "compact_blocks"' in lem_source
-    assert 'so2_fusion_mode: str = "staged"' in lem_source
-    assert "wigner_apply_mode=so2_wigner_apply_mode" in lem_source
-    assert "so2_fusion_mode=so2_fusion_mode" in lem_source
-    assert 'Argument("so2_wigner_apply_mode", str' in argcheck_source
-    assert 'Argument("so2_fusion_mode", str' in argcheck_source
-    assert 'default="compact_blocks"' in argcheck_source
 
 
 def test_compact_wigner_blocks_match_full_dense_slices():

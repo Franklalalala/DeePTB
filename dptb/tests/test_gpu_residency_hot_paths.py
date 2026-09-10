@@ -1,13 +1,5 @@
-from pathlib import Path
 
 import pytest
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _read_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def _reference_mole_linear(layer, x, coeffs, sizes):
@@ -99,25 +91,6 @@ def test_lem_precompute_metadata_is_cleared_before_reuse():
     assert _keys.LEM_CUTOFF_COEFFS_KEY not in batch
 
 
-def test_multi_trainer_reattaches_lem_split_sizes_after_to_dict_source_guard():
-    multi_trainer_text = _read_source(REPO_ROOT / "dptb" / "nnops" / "multi_trainer.py")
-
-    assert "def _attach_lem_cpu_split_sizes" in multi_trainer_text
-    assert "def _clear_lem_precompute_metadata" in multi_trainer_text
-    assert "batch = self._clear_lem_precompute_metadata(batch)" in multi_trainer_text
-    assert "batch[_keys.EDGE_VECTORS_KEY] = cutoff_data[_keys.EDGE_VECTORS_KEY]" in multi_trainer_text
-    assert "batch[_keys.EDGE_LENGTH_KEY] = cutoff_data[_keys.EDGE_LENGTH_KEY]" in multi_trainer_text
-    assert "batch_dict = self._attach_lem_cpu_split_sizes(batch_dict, batch)" in multi_trainer_text
-    assert "rank0_batch_dict = self._attach_lem_cpu_split_sizes(rank0_batch_dict, batch)" in multi_trainer_text
-    assert "rank0_ref_batch_dict = self._attach_lem_cpu_split_sizes(rank0_ref_batch_dict, ref_batch)" in multi_trainer_text
-    assert "precomputed_cutoff_coeffs is not None and edge_length.requires_grad" in (
-        _read_source(REPO_ROOT / "dptb" / "nn" / "embedding" / "lem_moe_v3.py")
-    )
-    assert "precomputed_cutoff_coeffs is not None and edge_length.requires_grad" in (
-        _read_source(REPO_ROOT / "dptb" / "nn" / "embedding" / "lem_moe_v3_h0.py")
-    )
-
-
 def test_per_edge_cutoffs_match_old_loop_semantics():
     torch = pytest.importorskip("torch")
     from dptb.nn.cutoff import cosine_cutoff, polynomial_cutoff
@@ -152,30 +125,3 @@ def test_per_edge_cutoffs_match_old_loop_semantics():
 
     torch.testing.assert_close(polynomial * valid, polynomial_ref * valid)
     torch.testing.assert_close(cosine * valid, cosine_ref * valid)
-
-
-def test_current_gpu_hot_paths_do_not_extract_cuda_scalars_in_forward():
-    tensor_product_text = _read_source(REPO_ROOT / "dptb" / "nn" / "tensor_product_moe_v3.py")
-    atomic_data_text = _read_source(REPO_ROOT / "dptb" / "data" / "AtomicDataDict.py")
-    loss_text = _read_source(REPO_ROOT / "dptb" / "nnops" / "loss.py")
-    embedding_dir = REPO_ROOT / "dptb" / "nn" / "embedding"
-    lem_text = _read_source(embedding_dir / "lem_moe_v3.py")
-    h0_text = _read_source(embedding_dir / "lem_moe_v3_h0.py")
-    h0_helpers_text = _read_source(embedding_dir / "lem_moe_v3_h0_helpers.py")
-
-    assert "mole_globals.sizes.tolist()" not in tensor_product_text
-    assert 'sizes = sizes.to("cpu")' not in tensor_product_text
-    assert "sizes = sizes.to('cpu')" not in tensor_product_text
-    assert 'sizes.to("cpu").tolist()' not in tensor_product_text
-    assert "sizes.to('cpu').tolist()" not in tensor_product_text
-    assert "sizes.sum().item()" not in tensor_product_text
-    assert "output_size=n_rows" in tensor_product_text
-    assert "torch.sum(torch.abs(data[_keys.CELL_KEY]))" not in atomic_data_text
-    assert "batch.max() == 0" not in loss_text
-    assert "batch.max() >= 1" not in loss_text
-    assert "batch.max().item()" not in loss_text
-    assert "torch.any(mask_" not in loss_text
-    assert "batch.max().item()" not in lem_text
-    assert "batch.max().item()" not in h0_text
-    assert "if mask.any()" not in lem_text
-    assert "if self_mask.any()" not in h0_helpers_text

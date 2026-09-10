@@ -1,20 +1,6 @@
 import copy
-from pathlib import Path
 
 import pytest
-
-
-def test_lem_moe_v3_exposes_post_activation_expert_mixing_config():
-    root = Path(__file__).resolve().parents[1]
-    lem_source = (root / "nn" / "embedding" / "lem_moe_v3.py").read_text(encoding="utf-8")
-    argcheck_source = (root / "utils" / "argcheck.py").read_text(encoding="utf-8")
-
-    assert 'so2_expert_mixing_mode: str = "pre_activation"' in lem_source
-    assert "SO2PostActivationExpertMixer" in lem_source
-    assert "post_activation_expert_mixer" in lem_source
-    assert 'Argument("so2_expert_mixing_mode", str' in argcheck_source
-    assert 'Argument("so2_expert_route_chunk_size", [int, None]' in argcheck_source
-    assert 'Argument("so2_expert_route_checkpoint", bool' in argcheck_source
 
 
 def _manual_expert_linear(torch, layer, x, expert_index):

@@ -1509,6 +1509,9 @@ def build_sample_context(
     )
 
 
+from .spectral_targets import attach_spectral_targets
+
+
 class RecordPipeline:
     """Threads the immutable context through the decode collaborators in order."""
 
@@ -1540,6 +1543,7 @@ class RecordPipeline:
         self.target_decoder.assemble_block_tensors(ctx, atomicdata, num_nodes, num_edges)
         self.prior_decoder.validate_blocks(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.validate_full_h(ctx, atomicdata)
+        attach_spectral_targets(dataset, data_dict, atomicdata)
         self.schema_validator.mark_validated(ctx, graph)
 
         # Attach a stable, composition-independent per-graph record identity for

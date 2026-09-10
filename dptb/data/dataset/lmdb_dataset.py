@@ -75,33 +75,7 @@ register_fields(
 )
 
 
-class _NumpyTwoPickleCompat(pickle.Unpickler):
-    """Resolve NumPy 2.x ``numpy._core.*`` module paths under NumPy 1.x.
-
-    NumPy 2 renamed the private ``numpy.core`` package to ``numpy._core``.
-    Records written by a NumPy 2 process therefore reference module paths a
-    NumPy 1.26 reader cannot import, even though the referenced
-    reconstruction callables are identical.  Only the module prefix is
-    remapped; any other missing module still propagates.
-    """
-
-    def find_class(self, module, name):
-        if module == "numpy._core" or module.startswith("numpy._core."):
-            module = "numpy.core" + module[len("numpy._core"):]
-        return super().find_class(module, name)
-
-
-def _loads_with_numpy2_compat(serialized):
-    """``pickle.loads`` with a NumPy 2 -> NumPy 1 module-path fallback."""
-    try:
-        return pickle.loads(serialized)
-    except ModuleNotFoundError as exc:
-        if "numpy._core" not in str(exc):
-            raise
-        import io
-
-        return _NumpyTwoPickleCompat(io.BytesIO(serialized)).load()
-
+from .record_codec import loads_record as _loads_with_numpy2_compat
 
 
 def _shard_content_fingerprint(lmdb_path: str) -> str:
@@ -785,7 +759,7 @@ def _read_lmdb_entry(path: str, index: int):
             data = txn.get(int(index).to_bytes(length=4, byteorder='big'))
             if data is None:
                 raise IndexError(f"LMDB entry {index} not found in {path}")
-            return pickle.loads(bytes(data))
+            return _loads_with_numpy2_compat(data)
     finally:
         db_env.close()
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -44,6 +45,7 @@ from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
 
 from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0 import LemMoEV3H0
+from .lem_moe_v3_edge import LemMoEV3EdgeH0
 from .lem_moe_v3_h0_helpers import H0InitLayer, _get_feature_source_with_key
 
 
@@ -133,8 +135,7 @@ def _copy_params(src: torch.nn.Module, dst: torch.nn.Module) -> None:
     dst.load_state_dict(src.state_dict(), strict=True)
 
 
-@Embedding.register("lem_moe_v3_prior_2b")
-class LemMoEV3Prior2b(LemMoEV3H0):
+class _Prior2bMixin:
     """Frozen pairwise 2b branch + concat-P GNN for only2b two-stage training."""
 
     def __init__(
@@ -211,7 +212,19 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         self.h0_init = _unwrap_h0_init(self.init_layer)
         geo_irreps = o3.Irreps(self.h0_init.irreps_out)
         self.concat_irreps = geo_irreps + geo_irreps
-        self._rebuild_first_layer_for_concat()
+        # The first layer is constructed a second time for concat features.
+        # Apply the PA constructor guard here too, and restore the caller env.
+        use_pa = bool(getattr(self, "edge_router_prior_activate", False))
+        if use_pa:
+            self._prior2b_raw_kwargs["so2_fusion_mode"] = (
+                kwargs.get("so2_fusion_mode") or "streamed_m_major_cueq"
+            )
+        previous_route = os.environ.pop("DPTB_SO2_FUSION_MODE", None) if use_pa else None
+        try:
+            self._rebuild_first_layer_for_concat()
+        finally:
+            if previous_route is not None:
+                os.environ["DPTB_SO2_FUSION_MODE"] = previous_route
 
         # Independent pairwise branch (Trinity Twoness analogue).
         self.two_b_init = _clone_module(self.h0_init.base_init)
@@ -372,13 +385,6 @@ class LemMoEV3Prior2b(LemMoEV3H0):
             precomputed_cutoff_coeffs,
         )
 
-        # Router runs in both stages so the monitor keys always exist.
-        global_feat = scatter_mean(node_one_hot, batch, dim=0)
-        coeffs, monitor_val, expert_load_cv = self.router(global_feat)
-        topk_indices, topk_values = self.router.last_topk()
-        data["mean_max_prob"] = monitor_val
-        data["expert_load_cv"] = expert_load_cv
-
         # --- pairwise 2b branch: y_2b = W_2b [h_geo ; Pi(P)], no message passing
         latents, geo_node, geo_edge, cutoff_coeffs, active_edges = self.two_b_init(*init_args)
         prior_node, prior_edge = self._project_prior(
@@ -388,6 +394,34 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         y2b_node = self.two_b_out_node(torch.cat([geo_node, prior_node], dim=-1))
         y2b_edge = self.two_b_out_edge(torch.cat([geo_edge, prior_edge], dim=-1))
         out_node, out_edge = y2b_node, y2b_edge
+
+        use_pa = bool(getattr(self, "edge_router_prior_activate", False))
+        active_edge_one_hot = edge_one_hot[active_edges]
+        mole_pa = None
+        if use_pa:
+            descriptor = self._gram_descriptor(
+                self._raw_prior_source(data, bond_type, active_edges)
+            )
+            router_input = torch.cat(
+                [active_edge_one_hot, descriptor.to(dtype=active_edge_one_hot.dtype)],
+                dim=-1,
+            )
+            active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
+            mole_pa, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
+                router_input, active_bond_type
+            )
+            data["mean_max_prob"] = monitor_val
+            data["expert_load_cv"] = expert_load_cv
+            data["edge_moe_num_route_tokens"] = num_route_tokens
+            coeffs = mole_pa.coefficients
+            topk_indices = mole_pa.topk_indices
+            topk_values = mole_pa.topk_values
+        else:
+            global_feat = scatter_mean(node_one_hot, batch, dim=0)
+            coeffs, monitor_val, expert_load_cv = self.router(global_feat)
+            topk_indices, topk_values = self.router.last_topk()
+            data["mean_max_prob"] = monitor_val
+            data["expert_load_cv"] = expert_load_cv
 
         # --- GNN branch (stage 2 only): first SO2 layer eats concat(geo, P-map)
         if not self.only2b:
@@ -409,7 +443,9 @@ class LemMoEV3Prior2b(LemMoEV3H0):
             node_batch = batch[: node_features.shape[0]]
             safe_node_one_hot = node_one_hot[: node_features.shape[0]]
             active_edge_one_hot = edge_one_hot[active_edges]
-            if preserved_split_sizes is not None:
+            if use_pa:
+                mole_globals = mole_pa
+            elif preserved_split_sizes is not None:
                 mole_globals = MOLEGlobals(
                     coefficients=coeffs,
                     split_sizes=preserved_split_sizes,
@@ -490,4 +526,18 @@ class LemMoEV3Prior2b(LemMoEV3H0):
         return data
 
 
-__all__ = ["LemMoEV3Prior2b", "resolve_prior_2b_keys", "PRIOR_2B_KINDS"]
+class LemMoEV3Prior2b(_Prior2bMixin, LemMoEV3H0):
+    """Legacy graph-router architecture; retains serial checkpoint shapes."""
+
+
+class LemMoEV3Prior2bPA(_Prior2bMixin, LemMoEV3EdgeH0):
+    """Per-edge prior-activate router with the same pairwise/GNN contract."""
+
+
+@Embedding.register("lem_moe_v3_prior_2b")
+def build_prior_2b(**kwargs):
+    cls = LemMoEV3Prior2bPA if kwargs.get("edge_router_prior_activate", False) else LemMoEV3Prior2b
+    return cls(**kwargs)
+
+
+__all__ = ["LemMoEV3Prior2b", "LemMoEV3Prior2bPA", "resolve_prior_2b_keys", "PRIOR_2B_KINDS"]

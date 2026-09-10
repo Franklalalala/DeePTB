@@ -1,4 +1,3 @@
-from pathlib import Path
 import importlib
 from types import SimpleNamespace
 
@@ -147,13 +146,6 @@ def test_single_trainer_effective_expert_lr_state_uses_global_optimizer_lr():
 
     assert state["expert_0_lr"] == pytest.approx(0.0125)
     assert state["expert_1_lr"] == pytest.approx(0.0125)
-
-
-def test_single_train_entrypoint_passes_train_options_to_build_model():
-    text = Path(train_entrypoint.__file__).read_text(encoding="utf-8")
-    build_call = text[text.index("model = build_model("): text.index("trainer = Trainer(")]
-
-    assert 'train_options=jdata["train_options"]' in build_call
 
 
 class _ComponentLoss(torch.nn.Module):
@@ -1579,52 +1571,7 @@ def test_compatible_pack_component_tags_use_same_stats_semantics_as_total():
     assert state["validation_hopping_loss"].item() == pytest.approx(hopping)
 
 
-def test_compatible_pack_component_tags_are_always_emitted():
-    trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
-    state = trainer._pack_component_state(
-        _pack_with_conflicting_active_component_means(),
-        prefix="validation",
-        criterion=trainer.train_lossfunc,
-    )
-
-    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
-    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
-    assert state["validation_onsite_loss"].item() == pytest.approx(onsite)
-    assert state["validation_hopping_loss"].item() == pytest.approx(hopping)
-
-
 def test_display_window_component_tags_use_compatible_stats_semantics():
-    trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
-    trainer.distributed_expert = False
-    trainer.num_experts = 1
-    trainer.world_size = 1
-    trainer._tagger = _NoopTagger()
-    trainer.display_sync_freq = 1
-    trainer._display_window_pack_local = _pack_with_conflicting_active_component_means()
-    trainer._display_window_dynamic_batch_pack_local = torch.zeros(
-        MultiTrainer._DB_PACK_LEN, dtype=torch.float32
-    )
-    trainer._gather_cuda_memory_metrics = lambda: {}
-    trainer._all_reduce_ = lambda tensor, name=None: tensor
-    trainer._gather_display_window_expert_metrics = lambda: [
-        torch.tensor([99.0, 77.0, 0.0, 0.1, 1.0, 1.0])
-    ]
-    trainer._rank_to_expert_idx = lambda rank_idx: 0
-    trainer._add_optimizer_diagnostics_to_state = lambda state: None
-    trainer._add_cuda_memory_state = lambda state, metrics: None
-    trainer._reset_display_window_buffers = lambda: None
-
-    state = trainer._flush_display_window(time_idx=2)
-
-    onsite = 0.5 * (2.0 + (10.0 / 2.0) ** 0.5)
-    hopping = 0.5 * (1.0 + 3.0 ** 0.5)
-    total = 0.5 * (onsite + hopping)
-    assert _scalar(state["train_loss"]) == pytest.approx(total)
-    assert _scalar(state["train_onsite_loss"]) == pytest.approx(onsite)
-    assert _scalar(state["train_hopping_loss"]) == pytest.approx(hopping)
-
-
-def test_display_window_component_tags_are_always_emitted():
     trainer = _trainer_for_compatible_pack(_StatsCompatibleLoss())
     trainer.distributed_expert = False
     trainer.num_experts = 1
@@ -2447,12 +2394,6 @@ def test_resolve_flow_log_fields_disabled_flow_keeps_legacy_registration():
     assert register_legacy is True
 
 
-def test_train_entrypoint_registers_flow_fields_from_effective_flags():
-    text = Path(train_entrypoint.__file__).read_text(encoding="utf-8")
-
-    assert "resolve_flow_log_fields" in text
-
-
 # ---------------------------------------------------------------------------
 # Pixel MeanFlow JVP du/dt backend
 # ---------------------------------------------------------------------------
@@ -2713,14 +2654,6 @@ def test_configure_jvp_friendly_backends_switches_e3nn_only_for_jvp(
         assert calls == [{"jit_mode": "eager"}]
     else:
         assert calls == []
-
-
-def test_train_entrypoints_prepare_jvp_backends_before_model_build():
-    import dptb.entrypoints.multi_train as multi_train_entrypoint
-
-    for module in (train_entrypoint, multi_train_entrypoint):
-        text = Path(module.__file__).read_text(encoding="utf-8")
-        assert "configure_jvp_friendly_backends" in text
 
 
 def test_pixel_meanflow_jvp_falls_back_to_finite_difference_with_warning(

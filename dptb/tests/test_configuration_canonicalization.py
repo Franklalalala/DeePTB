@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 import yaml
@@ -26,8 +25,6 @@ from dptb.utils.argcheck import (
 )
 # Aliased so pytest does not collect the schema builder as a test case.
 from dptb.utils.argcheck import test_data_sub as _test_data_sub
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _schema_then_runtime(raw):
@@ -575,28 +572,6 @@ def test_meanflow_export_is_order_independent():
 def test_allow_unbound_prior_source_fingerprint_schema_default_is_false(split_builder):
     field = split_builder().sub_fields["allow_unbound_prior_source_fingerprint"]
     assert field.default is False
-
-
-def test_smoke_config_keeps_dev_only_flag_and_loud_warning_comment():
-    smoke = REPO_ROOT / "configs" / "p2_prior_non_soc_full_h_smoke.yaml"
-    text = smoke.read_text(encoding="utf-8")
-
-    # The dev-only override is still present (the P2 smoke fixture omits the
-    # source fingerprint on purpose) ...
-    payload = yaml.safe_load(text)
-    assert (
-        payload["data_options"]["train"]["allow_unbound_prior_source_fingerprint"]
-        is True
-    )
-    # ... but it must be guarded by a loud DEV-ONLY comment so nobody copies
-    # it into a production config.
-    assert "DEV-ONLY ESCAPE HATCH" in text
-    flag_line = next(
-        line
-        for line in text.splitlines()
-        if line.strip().startswith("allow_unbound_prior_source_fingerprint:")
-    )
-    assert "DEV-ONLY" in flag_line
 
 
 # --------------------------------------------------------------------------

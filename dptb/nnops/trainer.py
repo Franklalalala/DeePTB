@@ -900,6 +900,14 @@ class Trainer(BaseTrainer):
             if counts is not None:
                 counts[key] = counts.get(key, 0) + 1
 
+    def _backward_loss(self, loss):
+        """Honor only explicitly completed interleaved LoopSCF backwards."""
+        if getattr(loss, "_loopscf_backward_done", False):
+            if loss.requires_grad:
+                raise RuntimeError("completed LoopSCF loss must be detached")
+            return
+        loss.backward()
+
     def iteration(self, batch, ref_batch=None):
         '''
         conduct one step forward computation, used in train, test and validation.
@@ -932,7 +940,7 @@ class Trainer(BaseTrainer):
                 )
             loss_for_log = main_endpoint_state["train_loss"].detach()
         loss_opt_for_log = loss.detach()
-        loss.backward()
+        self._backward_loss(loss)
         del loss
 
         ref_component_state = {}
@@ -948,7 +956,7 @@ class Trainer(BaseTrainer):
                 allow_self_consistency=False,
             )
             loss_opt_for_log = loss_opt_for_log + ref_loss.detach()
-            ref_loss.backward()
+            self._backward_loss(ref_loss)
             if apply_flow_to_reference:
                 ref_flow_state = dict(getattr(self, "_last_flow_state", {}))
                 for suffix in ("loss", "onsite_loss", "hopping_loss"):

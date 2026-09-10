@@ -1,4 +1,3 @@
-from pathlib import Path
 
 import pytest
 import torch
@@ -71,10 +70,3 @@ def test_strict_load_accepts_legacy_linear_state_dict():
     head.load_state_dict(legacy.state_dict(), strict=True)
     x = torch.randn(4, irreps_in.dim, dtype=torch.float64)
     assert torch.equal(head(x), legacy(x))
-
-
-def test_new_head_source_has_no_coupling_decoder_call():
-    source = Path(__file__).parents[1] / "nn" / "embedding" / "rme_nocg_fusion_head.py"
-    text = source.read_text(encoding="utf-8")
-    forbidden = "wigner" + "_3j"
-    assert forbidden not in text

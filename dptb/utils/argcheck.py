@@ -2192,7 +2192,7 @@ def slem_prior():
 
 def slem_prior_2b():
     """Concat-P two-stage residual embedding (Full-H − P labels)."""
-    return slem() + [
+    return slem() + [a for a in slem_edge_h0() if a.name.startswith("edge_router_") or a.name.startswith("edge_moe_")] + [
         Argument(
             "only2b",
             bool,
@@ -2547,6 +2547,33 @@ def loss_options():
         Argument("band_window", float, optional=True, default=10.0, doc="P subspace half-width around E_F, in eV."),
         Argument("q_window", [float, None], optional=True, default=30.0, doc="How far above the P window Q reaches, in eV. None reproduces NextHAM's Q = everything else, which pulls near-singular high-energy states into the loss."),
         Argument("n_kpoints", int, optional=True, default=1, doc="Random k-points per step. NextHAM uses 1: there are far more k than can be learned, so steps accumulate coverage."),
+        Argument("pq_align", str, optional=True, default="nextham", doc="nextham: P=[floor, EF+band_window], Q above that. fw10: P=[EF-band_window, EF], Q=(EF, EF+band_window]."),
+    ]
+
+    band_stage2 = [
+        Argument("band_weight", float, optional=True, default=1e-2, doc="lambda on the band MAE; HamGNN 2023 used 1e-3, Uni-HamGNN 2026 used 1e-2."),
+        Argument("n_kpoints", int, optional=True, default=5, doc="Random k-points per step (HamGNN: 5)."),
+        Argument("band_window", float, optional=True, default=10.0, doc="Half-width in eV around the reference VBM for window_mode=fermi."),
+        Argument("window_mode", str, optional=True, default="fermi", doc="fermi: bands within +-band_window of the VBM; lowest: the first n_bands (HamGNN band_num_control)."),
+        Argument("n_bands", [int, None], optional=True, default=None, doc="Number of lowest bands for window_mode=lowest."),
+        Argument("align", str, optional=True, default="none", doc="none: raw eigenvalues (literature); vbm: shift each side by its own VBM (fw_10 convention)."),
+        Argument("gauge", bool, optional=True, default=False, doc="Remove the H -> H + mu*S gauge from the real-space term (NextHAM); off in HamGNN."),
+        Argument("gauge_clip", float, optional=True, default=1.0, doc="Clamp on |mu| in eV."),
+        Argument("ill_threshold", [float, None], optional=True, default=1e-5, doc="Eigenvalues ill-conditioned-S fallback; None = plain Cholesky."),
+        Argument("solver_float64", bool, optional=True, default=True, doc="Solve the eigenproblem in float64."),
+        Argument("k_seed", int, optional=True, default=20260902, doc="Seed of the private k-point generator."),
+    ]
+
+    fw10_eig = [
+        Argument("coeff_ham", float, optional=True, default=0.9,
+                 doc="Weight on the real-space H term; the band term gets 1 - coeff_ham."),
+        Argument("band_window", float, optional=True, default=10.0,
+                 doc="Half-width in eV around the VBM, matching the fw_10 metric."),
+        Argument("band_overlap", bool, optional=True, default=True, doc=""),
+        Argument("band_min", int, optional=True, default=0, doc=""),
+        Argument("band_max", [int, None], optional=True, default=None, doc=""),
+        Argument("band_emin", [float, None], optional=True, default=None, doc=""),
+        Argument("band_emax", [float, None], optional=True, default=None, doc=""),
     ]
 
     loss_args = Variant("method", [
@@ -2566,6 +2593,8 @@ def loss_options():
         Argument("hamil_wt", dict, sub_fields=hamil+wt),
         Argument("eig_ham", dict, sub_fields=hamil+eigvals+eig_ham),
         Argument("eig_ham_h0res", dict, sub_fields=hamil+eigvals+eig_ham_h0res),
+        Argument("fw10_eig", dict, sub_fields=hamil+eigvals+fw10_eig),
+        Argument("band_stage2", dict, sub_fields=hamil+band_stage2),
         Argument("hamil_blockwise_nextham", dict, sub_fields=hamil_blockwise),
         Argument("hamil_block_abs", dict, sub_fields=hamil_blockwise),
     ], optional=False, doc=doc_method)

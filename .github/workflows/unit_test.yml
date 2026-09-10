@@ -8,9 +8,6 @@ on:
 jobs: 
   build:
     runs-on: ubuntu-latest
-    outputs:
-      output1: ${{ steps.s1.outputs.test }}
-      output2: ${{ steps.s2.outputs.test }}
     if: github.repository_owner == 'deepmodeling'
     container: ghcr.io/deepmodeling/deeptb:latest
     steps: 
@@ -23,17 +20,7 @@ jobs:
       - name: Add safe directory
         run: |
           git config --global --add safe.directory ${GITHUB_WORKSPACE}
-      - name: Install DeePTB & Run Test
+      - name: Run behavioral smoke suite
         id: s2
         run: |
          bash ut.sh
-          
-          
-  job2:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - env:
-          OUTPUT2: ${{needs.build.outputs.output2}}
-          OUTPUT3: ${{needs.build.outputs.output3}}
-        run: echo "$OUTPUT1 $OUTPUT2"

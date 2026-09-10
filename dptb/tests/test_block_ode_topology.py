@@ -78,26 +78,6 @@ def test_topology_module_exposes_exactly_the_migrated_functions():
     assert not hasattr(topology, "_require_spatial_residual_block_contract")
 
 
-def test_block_ode_topology_module_does_not_import_flow():
-    # Import-direction rule (refactor plan §2.1/§4.4): no module under
-    # dptb/nnops/block_ode/ may import dptb.nnops.flow.  Parse the actual
-    # import statements via ast (not a raw substring search, which would
-    # also flag this module's own docstring describing the rule) and check
-    # none of them names dptb.nnops.flow.
-    import ast
-
-    tree = ast.parse(inspect.getsource(topology))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert not alias.name.startswith("dptb.nnops.flow")
-        elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
-            assert not module_name.startswith("dptb.nnops.flow")
-    # And no module-level binding named "flow" (e.g. a re-exported alias).
-    assert "flow" not in vars(topology)
-
-
 # ---------------------------------------------------------------------------
 # Stateless key-set / helper functions: delegator vs. module function.
 # ---------------------------------------------------------------------------

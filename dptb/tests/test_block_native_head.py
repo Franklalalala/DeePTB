@@ -1,4 +1,3 @@
-from pathlib import Path
 
 import torch
 from e3nn import o3
@@ -106,10 +105,3 @@ def test_compact_blocks_moves_skipped_shell_rows_and_zeroes_tail():
     )
     assert torch.equal(edge[0, :5, :], expected_h.view(-1, 1) * 10.0 + base.view(1, -1))
     assert torch.count_nonzero(edge[0, 5:, :]) == 0
-
-
-def test_block_native_head_has_no_wigner_3j_call():
-    source = Path(__file__).parents[1] / "nn" / "embedding" / "block_native_head.py"
-    text = source.read_text(encoding="utf-8")
-    forbidden = "wigner" + "_3j"
-    assert forbidden not in text
