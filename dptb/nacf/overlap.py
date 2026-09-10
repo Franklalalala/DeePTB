@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .p2_table import RadialBlockTable
+from dptb.data.interfaces.p2_table import RadialBlockTable
 
 
 class OverlapTableStore:

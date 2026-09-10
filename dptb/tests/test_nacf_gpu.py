@@ -6,7 +6,7 @@ import torch
 
 from dptb.data.interfaces.p2_table import RadialBlockTable, P2TableAssembler
 from dptb.data.interfaces.p23_table import P23VNAFactorAssembler
-from dptb.data.interfaces.nacf_gpu import NACFTableBank, NACFFeaturePlan, NACFBatchAssemblyPlan
+from dptb.nacf.assembly import NACFTableBank, NACFFeaturePlan, NACFBatchAssemblyPlan
 
 
 def stores():
@@ -124,7 +124,7 @@ def test_geometry_api_ignores_labels_and_adds_nacf_once():
     from ase import Atoms
     from ase.calculators.singlepoint import SinglePointCalculator
     from dptb.data.transforms import OrbitalMapper
-    from dptb.postprocess.nacf_geometry import NACFGeometryPredictor
+    from dptb.nacf.inference import NACFGeometryPredictor
     p2,p23=stores()
     p2.species={s:p2.species['X'] for s in ('H','C')}
     p23.species={s:p23.species['X'] for s in ('H','C')}
@@ -151,7 +151,7 @@ def test_geometry_api_ignores_labels_and_adds_nacf_once():
     atoms.calc=SinglePointCalculator(atoms,energy=-100,forces=np.ones((2,3)))
     atoms.new_array('node_h0',np.ones((2,1))*999)
     prepared=predictor.prepare([atoms,atoms.copy()])
-    prior=prepared.plans[0]()
+    prior=prepared.plan()
     actual=prepared()
     torch.testing.assert_close(actual['node_features'],prior['node_p23']+2)
     torch.testing.assert_close(actual['edge_features'],prior['edge_p2']+3)

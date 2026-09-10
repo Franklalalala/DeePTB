@@ -7,12 +7,18 @@ enumeration on CPU. Numerical prior assembly and the model execute on device.
 from __future__ import annotations
 
 import torch
+import copy
+from pathlib import Path
 
 from dptb.data import AtomicData
 from dptb.data.dataloader import Collater
-from dptb.data.interfaces.nacf_gpu import NACFFeaturePlan, NACFBatchAssemblyPlan
+from dptb.nacf.assembly import NACFFeaturePlan, NACFBatchAssemblyPlan
 from dptb.utils.argcheck import get_cutoffs_from_model_options
 from dptb.utils.constants import Bohr2Ang
+from dptb.data.interfaces.p2_table import P2TableStore
+from dptb.data.interfaces.p23_table import P23VNAFactorTableStore
+from .overlap import OverlapTableStore
+from .assembly import NACFTableBank
 
 
 class NACFGeometryPredictor:
@@ -59,8 +65,8 @@ class NACFGeometryPredictor:
         batch = Collater()(data).to(self.device)
         geometry = AtomicData.to_AtomicDataDict(batch)
         assembly = assemblies[0] if len(assemblies) == 1 else NACFBatchAssemblyPlan(assemblies)
-        plans = [NACFFeaturePlan(assembly, self.idp, output_dtype=self.dtype)]
-        return PreparedNACFInference(self.model, plans, geometry)
+        plan = NACFFeaturePlan(assembly, self.idp, output_dtype=self.dtype)
+        return PreparedNACFInference(self.model, plan, geometry)
 
     def __call__(self, structures):
         return self.prepare(structures)()
@@ -73,15 +79,15 @@ class PreparedNACFInference:
     Returned H is absolute Full-H in eV and S is dimensionless, both in the
     checkpoint's triangular non-SOC RME layout. ``ptr`` separates structures.
     """
-    def __init__(self, model, plans, geometry):
-        self.model, self.plans, self.geometry = model, plans, geometry
+    def __init__(self, model, plan, geometry):
+        self.model, self.plan, self.geometry = model, plan, geometry
 
     @torch.inference_mode()
     def __call__(self):
-        features = [plan() for plan in self.plans]
+        features = self.plan()
         inputs = {key: value.clone() for key, value in self.geometry.items()}
         for key in ('node_p23', 'edge_p2', 'node_overlap', 'edge_overlap'):
-            inputs[key] = torch.cat([item[key] for item in features], dim=0)
+            inputs[key] = features[key]
         # Preserve an independent prior before a model that mutates its dict.
         node_prior, edge_prior = inputs['node_p23'].clone(), inputs['edge_p2'].clone()
         node_s, edge_s = inputs['node_overlap'].clone(), inputs['edge_overlap'].clone()
@@ -94,3 +100,26 @@ class PreparedNACFInference:
 
 
 __all__ = ['NACFGeometryPredictor', 'PreparedNACFInference']
+
+
+def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cuda', backend='auto'):
+    from dptb.nn import build_model
+    checkpoint = Path(checkpoint)
+    payload = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    state = payload['model_state_dict']
+    for name, tensor in state.items():
+        if torch.is_tensor(tensor) and (tensor.is_floating_point() or tensor.is_complex()):
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f'nonfinite checkpoint model tensor: {name}')
+    options = copy.deepcopy(payload['config']['model_options'])
+    del payload, state
+    options['embedding'].update(so2_fusion_mode='streamed_m_major_ref', mole_linear_mode='split_loop')
+    bank = NACFTableBank(P2TableStore(p2), P23VNAFactorTableStore(p23),
+                         overlap_store=OverlapTableStore(overlap), device=device, backend=backend)
+    if bank.p2_manifest_sha256 != expected_p2_sha256:
+        raise ValueError('P2 manifest does not match supplied training fingerprint')
+    model = build_model(checkpoint=str(checkpoint), model_options=options,
+                        common_options={}).eval().to(device)
+    predictor = NACFGeometryPredictor(model, bank, options, target='full_h_minus_nacf',
+                                      expected_p2_source_fingerprint=expected_p2_sha256)
+    return predictor

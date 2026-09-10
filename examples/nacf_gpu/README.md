@@ -11,6 +11,13 @@ output. Do not add it again, and do not add physical H0.
 
 ## What runs where
 
+All NACF-specific implementation lives in `dptb/nacf`: `radial.py` and
+`csrc/radial.cu` evaluate tables; `assembly.py` builds P2/P23/S and packs RME;
+`overlap.py` reads the S sidecar; `inference.py` loads and runs the checkpoint.
+CLI, offline S construction and benchmarking are optional modules in this same
+package. The three scripts under `tools/` are five-line compatibility launchers.
+The pre-existing generic P2/P23 readers and qualified SBT builder are reused.
+
 1. Once per table bank, load and checksum required P2/P23/S shards, copy the
    original cubic spline coefficients to device, and build harmonic transforms.
    Tables are lazy, shared across structures, and kept as PyTorch module buffers.
@@ -23,9 +30,38 @@ output. Do not add it again, and do not add physical H0.
 4. Batches merge queries by table. Separate atom, query, output-block and cell
    offsets prevent cross-structure interactions.
 
-This is a PyTorch implementation with GPU-resident tables. It does **not** yet
-implement GPU neighbour construction or a custom fused CUDA kernel. Default
-prior precision is float64 and the verified model precision is float32.
+The native CUDA kernel fuses distance evaluation, interval lookup, Horner
+evaluation, real harmonics and sparse AO rotation in one launch per table batch.
+Projector contractions and RME packing remain PyTorch GPU operations. Neighbour
+construction remains CPU work. Default prior precision is float64 and the
+verified model precision is float32.
+
+### Native CUDA backend
+
+`backend='auto'` selects the fused CUDA inference kernel on CUDA tensors and
+uses the torch reference on CPU or for autograd inputs. `backend='cuda'` is
+strictly CUDA inference; `backend='torch'` explicitly selects the reference.
+The optional native extension is compiled lazily at first use, then cached.
+That first compilation performs source-file I/O and is excluded from warm
+timings. Compilation failures are reported; they do not silently switch to the
+torch backend. No kernel is compiled merely by importing `dptb.nacf`.
+
+A CUDA toolkit, C++ compiler and Ninja are required. Set `CUDA_HOME` and place
+the environment's `bin` plus `$CUDA_HOME/bin` on PATH. Keep compiler/cache paths
+on the intended workspace filesystem using `TORCH_EXTENSIONS_DIR`, `TEMP`,
+`TMP`, and `TMPDIR`. Limit build parallelism with `MAX_JOBS=2` when sharing a host.
+Use `TORCH_CUDA_ARCH_LIST` appropriate to the installed compiler and device.
+The verified PRO6000 host has CUDA 12.4 nvcc and a CUDA 12.8 PyTorch runtime;
+`TORCH_CUDA_ARCH_LIST='8.9+PTX'` supplies forward-compatible PTX for Blackwell.
+This kernel uses no architecture-specific tensor-core instructions.
+
+One CUDA block owns each displacement query. It locates the nonuniform interval
+once, computes real harmonics and small rotation matrices in shared memory, and
+evaluates only structurally nonzero canonical channels while rotating to AO
+output. The source cubic coefficients and support mask remain unchanged.
+There is no dense canonical intermediate or Python shell loop in this path.
+The generic fused kernel allows up to 48 KiB shared-memory angular metadata;
+larger bases raise an explicit error and can use the torch backend.
 
 ## Python interface
 
@@ -33,9 +69,7 @@ prior precision is float64 and the verified model precision is float32.
 from ase.build import bulk
 from dptb.data.interfaces.p2_table import P2TableStore
 from dptb.data.interfaces.p23_table import P23VNAFactorTableStore
-from dptb.data.interfaces.overlap_table import OverlapTableStore
-from dptb.data.interfaces.nacf_gpu import NACFTableBank
-from dptb.postprocess.nacf_geometry import NACFGeometryPredictor
+from dptb.nacf import OverlapTableStore, NACFTableBank, NACFGeometryPredictor
 
 # model and model_options must come from the same verified checkpoint.
 bank = NACFTableBank(P2TableStore(p2_dir), P23VNAFactorTableStore(p23_dir),
@@ -74,6 +108,9 @@ python tools/infer_nacf_geometry.py \
   --geometry structures.extxyz --batch-size 8 --output predictions.pt
 ```
 
+The equivalent package entry is `python -m dptb.nacf.cli`. Add `--backend cuda`
+to require the native path, or `--backend torch` for the previous GPU reference.
+
 The CLI uses `streamed_m_major_ref` and `split_loop` inference implementations,
 scans model weights for nonfinite values, and writes CPU tensor batches plus a
 JSON provenance record. Model loading and file writes are outside reported
@@ -111,6 +148,9 @@ dependency. `complete=true` means construction finished, not that a new basis or
 quadrature has passed an independent numerical qualification. Validate a new
 sidecar against direct AO integration or an independently sourced ABACUS S.
 Original P2 and P23 tables are never modified.
+Offline construction requires the source checkout's existing
+`tools.build_nonsoc_p2_tables` SBT implementation. The inference package does not
+import this builder or `h0rebuild`.
 
 ## Tests and matched timing
 
@@ -129,6 +169,22 @@ legacy CPU oracle supports fully periodic cells only. GPU prepared timings
 exclude topology compilation; `gpu_geometry_to_output` includes it. Neither
 route includes checkpoint loading or output serialization. Shared GPU/CPU load
 can materially change timings, so retain individual samples and hardware state.
+
+Add `--compare-native` (or run `python -m dptb.nacf.benchmark`) to compare CUDA
+and torch table backends on identical cached tables, geometry and checkpoint.
+Each repetition alternates backend order. Both primitive table times and full
+prior/model timings are reported. The verified C/Si run with 600773 measured:
+
+| Geometry | Torch GPU NACF+S+packing | Native CUDA NACF+S+packing | Prepared full inference, torch → native |
+|---|---:|---:|---:|
+| Si, 2 atoms / 172 edges | 12.52 ms | 1.19 ms | 285.5 → 273.8 ms |
+| SiC, 2 atoms / 316 edges | 51.80 ms | 3.58 ms | 355.1 → 304.4 ms |
+
+Native-vs-torch Full-H RME differences were at most 3.82 micro-eV. Individual
+radial blocks differed by at most 1.68e-15 in their source units. These are
+implementation-agreement measurements on C/Si, not DFT prediction accuracy or
+an all-element qualification. Tests additionally cover float32, CUDA Graph
+replay, nonuniform grids, support boundaries, zero channels, and autograd routing.
 
 ## DPA4C relationship and scope
 

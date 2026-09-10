@@ -15,8 +15,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from .p2_batch import VectorizedNearbyImageEnumerator
-from .p2_gpu import TorchRadialBlockTable
+from dptb.data.interfaces.p2_batch import VectorizedNearbyImageEnumerator
+from .radial import TorchRadialBlockTable
 
 
 class NACFTableBank(nn.Module):
@@ -27,8 +27,9 @@ class NACFTableBank(nn.Module):
     Tables are loaded/checksummed once during preparation, never in forward.
     """
 
-    def __init__(self, p2_store, p23_store, *, overlap_store=None, device='cuda', dtype=torch.float64):
+    def __init__(self, p2_store, p23_store, *, overlap_store=None, device='cuda', dtype=torch.float64, backend='auto'):
         super().__init__()
+        self.backend = backend
         self.p2_manifest_sha256 = (hashlib.sha256((p2_store.root / 'manifest.json').read_bytes()).hexdigest()
                                    if hasattr(p2_store, 'root') else None)
         if hasattr(p23_store, 'manifest'):
@@ -55,7 +56,7 @@ class NACFTableBank(nn.Module):
                 source = self.overlap.base_component(left, right, kind)
             else:
                 source = self.p2.base_component(left, right, kind)
-            self.tables[key] = TorchRadialBlockTable(source, device=self._anchor.device, dtype=self._anchor.dtype)
+            self.tables[key] = TorchRadialBlockTable(source, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
         return key
 
     def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True)):
@@ -354,7 +355,7 @@ class NACFFeaturePlan(nn.Module):
 
     def __init__(self, assembly: NACFAssemblyPlan, idp, *, output_dtype=torch.float32):
         super().__init__()
-        from .blockwise_tensor import ensure_spatial_block_mapper, onsite_feature_slices, edge_feature_slices
+        from dptb.data.interfaces.blockwise_tensor import ensure_spatial_block_mapper, onsite_feature_slices, edge_feature_slices
         from dptb.utils.constants import ABACUS2DeePTB, anglrMId
         from scipy.linalg import block_diag
         ensure_spatial_block_mapper(idp)

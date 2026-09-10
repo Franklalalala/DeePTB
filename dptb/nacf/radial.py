@@ -1,7 +1,9 @@
 """Device-resident evaluation of the qualified P2/P23 radial tables.
 
-Table compilation is a one-time CPU operation. Forward uses only torch tensors:
-no SciPy, NumPy, file reads, tensor-to-host copies, or per-displacement loops.
+Table compilation is a one-time CPU operation. Warm forward uses device tensors
+and either a fused CUDA kernel or the torch reference: no SciPy/NumPy, table
+reads, tensor-to-host copies, or Python per-displacement loops. The native
+extension is compiled lazily at first CUDA use, outside the warm path.
 It preserves the source cubic spline (including its boundary conditions), rather
 than refitting a different interpolant. Units and the ABACUS real harmonic gauge
 are inherited unchanged from :class:`RadialBlockTable`.
@@ -15,7 +17,7 @@ import torch
 from scipy.linalg import qr
 from torch import nn
 
-from .p2_table import RadialBlockTable
+from dptb.data.interfaces.p2_table import RadialBlockTable
 
 
 def _harmonics(l: int, vectors: torch.Tensor) -> torch.Tensor:
@@ -68,8 +70,11 @@ class TorchRadialBlockTable(nn.Module):
     this class does not promise smoothness across a source table's hard cutoff.
     """
 
-    def __init__(self, table: RadialBlockTable, *, device=None, dtype=torch.float64):
+    def __init__(self, table: RadialBlockTable, *, device=None, dtype=torch.float64, backend='auto'):
         super().__init__()
+        if backend not in ('auto', 'torch', 'cuda'):
+            raise ValueError('backend must be auto, torch, or cuda')
+        self.backend = backend
         if dtype not in (torch.float32, torch.float64):
             raise ValueError('radial evaluation requires float32 or float64')
         if not np.isfinite(table.distances).all() or not np.isfinite(table.support_bohr):
@@ -83,7 +88,7 @@ class TorchRadialBlockTable(nn.Module):
         self.angular_degrees = tuple(sorted(set(self.left_shells + self.right_shells)))
 
         def buffer(name, array):
-            self.register_buffer(name, torch.as_tensor(np.array(array, copy=True), device=device, dtype=dtype))
+            self.register_buffer(name, torch.as_tensor(np.array(array, copy=True), device=device, dtype=dtype).contiguous())
 
         buffer('knots', table.distances)
         if table._spline is not None:
@@ -98,6 +103,9 @@ class TorchRadialBlockTable(nn.Module):
         active = np.flatnonzero(np.any(coefficients != 0, axis=(0, 1)))
         self.register_buffer('active_columns', torch.as_tensor(active, dtype=torch.long, device=device))
         buffer('coefficients', coefficients[:, :, active].transpose(1, 0, 2))
+        degree_info, directions, inverses, scales = [], [], [], []
+        rotation_offsets = {}
+        direction_offset = rotation_offset = 0
         for l in self.angular_degrees:
             base = table._rotator._base[l]
             # Select a well-conditioned square collocation grid once. Harmonic
@@ -106,6 +114,40 @@ class TorchRadialBlockTable(nn.Module):
             rows = pivots[:2 * l + 1]
             buffer(f'directions_{l}', table._rotator.directions[rows])
             buffer(f'inverse_{l}', np.linalg.inv(base[rows]))
+            degree_info.append((l, direction_offset, rotation_offset))
+            rotation_offsets[l] = rotation_offset
+            directions.extend(table._rotator.directions[rows])
+            inverses.extend(np.linalg.inv(base[rows]).ravel())
+            for a in range(2*l+1):
+                m = (a+1)//2
+                scales.append(math.sqrt((2*l+1)/(4*math.pi)*math.factorial(l-m)/math.factorial(l+m)) * (math.sqrt(2) if m else 1))
+            direction_offset += 2*l+1
+            rotation_offset += (2*l+1)**2
+        # Compile shell-local contractions once. Forward has no shell loops or
+        # sparse-to-dense canonical intermediate in the native backend.
+        def ao_layout(shells):
+            return [(shell,l,m) for shell,l in enumerate(shells) for m in range(2*l+1)]
+        left, right = ao_layout(self.left_shells), ao_layout(self.right_shells)
+        ptr, terms = [0], []
+        for i,(si,li,mi) in enumerate(left):
+            for j,(sj,lj,mj) in enumerate(right):
+                for channel, column in enumerate(active):
+                    ai,aj = divmod(int(column),self.shape[1])
+                    ci,_,mc = left[ai]
+                    cj,_,md = right[aj]
+                    if ci == si and cj == sj:
+                        terms.append((channel,rotation_offsets[li]+mi*(2*li+1)+mc,
+                                      rotation_offsets[lj]+mj*(2*lj+1)+md))
+                ptr.append(len(terms))
+        canonical = np.full(math.prod(self.shape),-1,dtype=np.int64)
+        canonical[active] = np.arange(len(active))
+        for name, data in [('cuda_degrees',np.array(degree_info).reshape(-1,3)),
+                           ('cuda_ptr',ptr),('cuda_terms',np.array(terms,dtype=np.int64).reshape(-1,3)),
+                           ('cuda_canonical',canonical)]:
+            self.register_buffer(name,torch.as_tensor(data,dtype=torch.long,device=device).contiguous())
+        buffer('cuda_directions',np.asarray(directions).reshape(-1,3))
+        buffer('cuda_inverse',inverses)
+        buffer('cuda_scales',scales)
 
     def _check(self, vectors):
         if vectors.ndim != 2 or vectors.shape[-1] != 3:
@@ -126,6 +168,15 @@ class TorchRadialBlockTable(nn.Module):
 
     def forward(self, displacements_bohr: torch.Tensor) -> torch.Tensor:
         self._check(displacements_bohr)
+        requires_grad = torch.is_grad_enabled() and displacements_bohr.requires_grad
+        if self.backend == 'cuda' and (not displacements_bohr.is_cuda or requires_grad):
+            raise ValueError('explicit CUDA backend requires CUDA inference tensors; use torch for autograd')
+        if self.backend != 'torch' and displacements_bohr.is_cuda and not requires_grad:
+            from ._cuda import evaluate
+            return evaluate(self,displacements_bohr)
+        return self._forward_torch(displacements_bohr)
+
+    def _forward_torch(self, displacements_bohr):
         if displacements_bohr.shape[0] == 0:
             return displacements_bohr.new_empty((0, *self.shape))
         distances = torch.linalg.vector_norm(displacements_bohr, dim=-1)
