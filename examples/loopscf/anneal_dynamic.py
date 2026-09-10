@@ -84,6 +84,9 @@ def main():
     ap.add_argument('--bridge-lr', type=float, default=3e-4)
     ap.add_argument('--warmup', type=int, default=30)
     ap.add_argument('--schedule', choices=['cosine', 'wsd'], default='cosine')
+    ap.add_argument('--schedule-clock', choices=['deadline', 'steps'], default='deadline')
+    ap.add_argument('--total-steps', type=int,
+                    help='total committed updates including the resume parent; steps clock only')
     ap.add_argument('--warmup-lr', type=float, default=1e-6)
     ap.add_argument('--min-lr', type=float, default=1e-6)
     ap.add_argument('--decay-ratio', type=float, default=.65,
@@ -96,9 +99,17 @@ def main():
     ap.add_argument('--initial-validation-limit', type=int, default=None,
                     help='optional smaller initial probe; final validation uses validation-limit')
     ap.add_argument('--checkpoint-every', type=int, default=100)
+    ap.add_argument('--keep-checkpoints', type=int, default=3)
     ap.add_argument('--stop-after', type=int, default=0, help='diagnostic update cap without compressing the LR schedule')
     ap.add_argument('--inject-oom-once', action='store_true', help='smoke-only retry verification')
     args = ap.parse_args()
+    if args.schedule_clock == 'steps' and (args.schedule != 'wsd' or args.deadline is not None):
+        ap.error('steps clock requires WSD and no wall-clock deadline')
+    if args.total_steps is not None and (args.schedule_clock != 'steps' or args.total_steps < 1):
+        ap.error('total-steps requires a positive total with steps clock')
+    if args.keep_checkpoints < 1:
+        ap.error('keep-checkpoints must be positive')
+    schedule_total=args.total_steps or args.steps
     update_limit=min(args.steps,args.stop_after) if args.stop_after>0 else args.steps
     if min(args.K,args.steps,args.batch_size,args.initial_microbatch,args.max_microbatch,args.warmup,args.checkpoint_every)<1 or min(args.lr,args.bridge_lr,args.hours,args.memory_target_gib)<=0:
         ap.error('positive budgets required')
@@ -106,7 +117,7 @@ def main():
         if not (0 <= args.warmup_lr <= min(args.lr,args.bridge_lr) and
                 0 <= args.min_lr <= min(args.lr,args.bridge_lr) and
                 0 < args.decay_ratio < 1 and
-                args.warmup < round(args.steps*args.decay_ratio) < args.steps):
+                args.warmup < round(schedule_total*args.decay_ratio) < schedule_total):
             ap.error('invalid WSD phase boundaries or LR bounds')
     root=Path(args.output)
     root.mkdir(parents=True,exist_ok=True)
@@ -116,8 +127,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32=False
     torch.backends.cudnn.allow_tf32=False
     torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
-    begin=time.time(); deadline=args.deadline or begin+args.hours*3600
-    if deadline <= begin+60:
+    begin=time.time()
+    deadline=None if args.schedule_clock == 'steps' else args.deadline or begin+args.hours*3600
+    if deadline is not None and deadline <= begin+60:
         raise ValueError('insufficient remaining wall-clock budget')
     cfg=normalize(json.loads(Path(args.input).read_text()))
     common=dict(cfg['common_options'],device='cuda:0'); data=cfg['data_options']
@@ -159,17 +171,27 @@ def main():
             random.setstate(resume_state['python_rng']);np.random.set_state(resume_state['numpy_rng'])
         del raw
     # load_state_dict also restores old optimizer hyperparameters; explicitly override.
+    resume_group_lrs=[float(g['lr']) for g in optimizer.param_groups]
     for g,name in zip(optimizer.param_groups,groups):
         g['group_name']=name;g['foreach']=False
         g['peak_lr']=args.bridge_lr if name=='bridge' else args.lr
         g['warmup_start_lr']=min(g['peak_lr'],float(g['lr'])) if args.resume else .03*g['peak_lr']
+    if args.schedule_clock == 'steps':
+        remaining=schedule_total-parent_cumulative_step
+        if remaining <= 0:
+            raise ValueError('resume checkpoint already reached the requested total updates')
+        update_limit=min(update_limit,remaining)
+    # A parent already on the same plateau must not repeat warmup after changing
+    # the horizon. Its optimizer moments and committed sampler are preserved.
+    warmup_completed=bool(args.resume and all(math.isclose(lr,g['peak_lr'],rel_tol=1e-6)
+                          for lr,g in zip(resume_group_lrs,optimizer.param_groups)))
     wsd = None
     if args.schedule == 'wsd':
         for g in optimizer.param_groups:
             g['lr'] = g['peak_lr']
             g['initial_lr'] = g['peak_lr']
             g['warmup_start_lr'] = args.warmup_lr
-        wsd = WarmupStableDecayLR(optimizer,total_steps=args.steps,warmup_steps=args.warmup,
+        wsd = WarmupStableDecayLR(optimizer,total_steps=schedule_total,warmup_steps=args.warmup,
             warmup_lr=args.warmup_lr,min_lr=args.min_lr,decay_ratio=args.decay_ratio)
     sampler=CommittedBatches(train_indices,args.batch_size,args.seed+10000,resume_state['sampler'] if resume_state else None)
     target=min(int(args.memory_target_gib*1024**3),torch.cuda.get_device_properties(0).total_memory-6*1024**3)
@@ -188,7 +210,11 @@ def main():
         mutable_buffer_snapshot_bytes=sum(b.numel()*b.element_size() for b in model.buffers()),
         warmup_start_lrs={g['group_name']:g['warmup_start_lr'] for g in optimizer.param_groups},
         optimizer='AdamW',
-        lr_clock=('max(committed updates, elapsed training fraction * total steps); clock starts after initial validation'
+        schedule_total_steps=schedule_total,planned_new_updates=update_limit,
+        resume_group_lrs=resume_group_lrs,resume_warmup_completed=warmup_completed,
+        lr_clock=('cumulative committed optimizer updates only; no time-based training stop'
+                  if args.schedule_clock == 'steps' else
+                  'max(committed updates, elapsed training fraction * total steps); clock starts after initial validation'
                   if wsd else 'legacy max(update fraction, elapsed runner fraction)'),
         loss='graph mean: 0.8*expected_H+0.2*mean_depth_H-0.0005*entropy',
         source_sha256={str(p.relative_to(Path(__file__).resolve().parents[2])):file_sha256(p) for p in [Path(__file__),Path(sys.modules[CostController.__module__].__file__),Path(sys.modules[install_stack_loop.__module__].__file__)]})
@@ -196,18 +222,20 @@ def main():
     print('PROTOCOL',json.dumps(metadata),flush=True)
     exclude=[A.KPOINT_KEY,A.ENERGY_EIGENVALUE_KEY]
     step=0; stopping=[False]; estimator=AtomicDataCostEstimator('edge')
+    schedule_step=parent_cumulative_step
     signal.signal(signal.SIGUSR1,lambda *unused:stopping.__setitem__(0,True))
 
     def save(name,stage='joint'):
         tmp=root/(name+'.tmp')
         torch.save(dict(model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),
             step=step,parent_step=parent_step,cumulative_step=parent_cumulative_step+step,stage=stage,stack_protocol={**vars(args),'strategy':'bptt'},config=cfg,
+            schedule_state=dict(clock=args.schedule_clock,step=schedule_step,total_steps=schedule_total),
             torch_rng_state=torch.get_rng_state(),cuda_rng_state=torch.cuda.get_rng_state_all(),
             dynamic_state=dict(sampler=sampler.state_dict(),controller=controller.state_dict(),
                                python_rng=random.getstate(),numpy_rng=np.random.get_state())),tmp)
         tmp.replace(root/(name+'.pth'))
         if name.startswith('step_'):
-            for old in sorted(root.glob('step_*.pth'))[:-3]:old.unlink()
+            for old in sorted(root.glob('step_*.pth'))[:-args.keep_checkpoints]:old.unlink()
 
     @torch.no_grad()
     def validate(tag):
@@ -229,28 +257,32 @@ def main():
     atomic_json(root/'protocol.json',metadata)
     injected=[False]
     with (root/'history.jsonl').open('a',buffering=1) as history:
-        while step<update_limit and time.time()<deadline and not stopping[0]:
+        while step<update_limit and (deadline is None or time.time()<deadline) and not stopping[0]:
             # Dataset returns CPU records. Prefetch uses a separate RNG and cannot commit sampler state.
             loader=torch.utils.data.DataLoader(datasets['train'],batch_sampler=sampler,num_workers=1,
                 collate_fn=identity_collate,generator=torch.Generator().manual_seed(args.seed+sampler.epoch),pin_memory=False)
             accepted_batches=edge_budget_batches(loader,controller,estimator,args.initial_microbatch,not initialized)
             for items in accepted_batches:
-                if step>=update_limit or time.time()>=deadline or stopping[0]:break
+                if step>=update_limit or (deadline is not None and time.time()>=deadline) or stopping[0]:break
                 tick=time.monotonic();model.train()
                 indices=sampler.order[sampler.cursor:sampler.cursor+len(items)]
                 costs=[estimator(x) for x in items]
                 initialized=True
-                progress=max((step+1)/args.steps,(time.time()-begin)/(deadline-begin))
                 if wsd:
                     # Reuse the established WSD curve, with a virtual step clock
                     # so a slow run still completes the final decay by deadline.
-                    elapsed_fraction=(time.time()-schedule_begin)/max(1.,deadline-schedule_begin)
-                    schedule_step=min(args.steps,max(step,int(elapsed_fraction*args.steps)))
+                    if args.schedule_clock == 'steps':
+                        schedule_step=parent_cumulative_step+step
+                        if warmup_completed:schedule_step=max(schedule_step,args.warmup)
+                    else:
+                        elapsed_fraction=(time.time()-schedule_begin)/max(1.,deadline-schedule_begin)
+                        schedule_step=min(schedule_total,max(step,int(elapsed_fraction*schedule_total)))
                     for g,lr in zip(optimizer.param_groups,wsd.get_lr_at_step(schedule_step)):
                         g['lr']=lr
                     lr_phase=('warmup' if schedule_step<wsd.warmup_steps else
                               'stable' if schedule_step<wsd.decay_start_step else 'decay')
                 else:
+                    progress=max((step+1)/args.steps,(time.time()-begin)/(deadline-begin))
                     schedule_step=step
                     lr_phase='cosine'
                     warm=min(1.,(step+1)/args.warmup)
@@ -308,7 +340,7 @@ def main():
                 print('TRAIN',json.dumps(row),flush=True)
                 del results,items,micros
                 optimizer.zero_grad(set_to_none=True)
-                if step%args.checkpoint_every==0:save('step_%06d'%step)
+                if step==1 or step%args.checkpoint_every==0:save('step_%06d'%step)
             del accepted_batches,loader
             if sampler.cursor==len(sampler.order):sampler.next_epoch()
     save('joint_final')

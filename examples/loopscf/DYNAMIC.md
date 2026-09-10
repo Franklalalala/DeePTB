@@ -37,6 +37,26 @@ cosine decay to `--min-lr`. WSD progress uses the greater of committed updates
 and elapsed training time mapped to the step budget. Its clock starts after
 initial validation. `--deadline` can replace the relative `--hours` budget.
 
+For a fixed update budget without time-based LR progress or a training deadline,
+use `--schedule-clock steps`. `--total-steps` counts committed optimizer updates
+including the resume parent; `--steps` still caps updates in this invocation.
+Do not combine this clock with `--deadline`. For example:
+
+```bash
+python examples/loopscf/anneal_dynamic.py \
+  --input train.json --base-model PRETRAINED.pth --resume PARENT.pth \
+  --output RUN/continuation --K 3 --steps 4800 --total-steps 4800 \
+  --batch-size 8 --initial-graphs 4 --max-graphs 8 \
+  --schedule wsd --schedule-clock steps --warmup 96 \
+  --lr 1e-2 --bridge-lr 1e-2 --warmup-lr 1e-6 --min-lr 1e-6 \
+  --decay-ratio 0.65 --checkpoint-every 250 --keep-checkpoints 1
+```
+
+A parent at cumulative update 100 performs at most 4700 new updates in this
+example. A parent already at the same peak skips repeated warmup; the remaining
+plateau and decay use the new cumulative horizon. Scheduler allocation walltime
+is a separate resource limit and must allow training plus final evaluation.
+
 Fresh runs load only the base weights and initialize adapters, optimizer and
 sampler. `--resume` restores joint-stage weights and AdamW state at matching
 depth, seed and data configuration. Dynamic checkpoints also restore the
@@ -47,5 +67,9 @@ checkpoints without sampler state start a new seeded sampling phase.
 Use a fresh output directory for each phase. Protocols, histories, checkpoints,
 validation results and calibration outputs belong there, outside the source
 tree. `direct_batch=true` and one microbatch entry indicate direct execution;
-multiple entries identify OOM replay. The last three periodic checkpoints are
-retained. Completion of the LR schedule is not proof of convergence.
+multiple entries identify OOM replay. A checkpoint is saved after the first
+successful update, then every `--checkpoint-every` updates. `--keep-checkpoints`
+sets periodic retention (default three); old files are removed only after the
+new checkpoint has been atomically installed. Keep capacity for the next full
+checkpoint and final outputs. Completion of the LR schedule is not proof of
+convergence.
