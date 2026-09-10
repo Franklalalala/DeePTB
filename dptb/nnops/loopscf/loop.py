@@ -12,7 +12,8 @@ from .occupations import (
     compute_mulliken_fast,
     _eval_occupation_kpoints,
 )
-from .adapters import _iter_embeddings, _attach_adapters, _wrap_embedding, _gather_0e
+from .adapters import _iter_embeddings, _attach_adapters, _wrap_embedding
+from .representation import AOScalarFeedback, AOPriorToRME
 
 
 def install_working_memory_true_diag(
@@ -25,6 +26,8 @@ def install_working_memory_true_diag(
     max_k: int = 5,
     n_k_train: int = 5,
     collect_diagnostics: bool = False,
+    feedback: bool = True,
+    overlap_cutoff: float = 1e-5,
 ) -> nn.Module:
     """Wraps model forward with True Diagonalization Working Memory loop.
 
@@ -39,6 +42,10 @@ def install_working_memory_true_diag(
     if bool(getattr(idp, "has_soc", False)):
         raise NotImplementedError(
             "LoopSCF occupations require a non-SOC spin-degenerate model"
+        )
+    if getattr(model, "transform", None) is not True:
+        raise ValueError(
+            "LoopSCF requires transform=True: model outputs must be AO blocks"
         )
     print(
         "[WM-TrueDiag] correctness=%s occupations=global-zero-T eval_k=Sobol-BZ seed=20260910"
@@ -57,10 +64,16 @@ def install_working_memory_true_diag(
     )
     for name, emb in embs:
         print("[WM-TrueDiag] wrap", name, type(emb).__name__, flush=True)
-        _attach_adapters(emb)
+        _attach_adapters(emb, mode)
         _wrap_embedding(emb, mode)
 
-    out_slices = embs[0][1]._wm_out_slices
+    ao_scalars = AOScalarFeedback(idp)
+    reference_parameter = next(model.parameters())
+    prior_to_rme = AOPriorToRME(
+        idp, dtype=reference_parameter.dtype, device=reference_parameter.device
+    )
+    if any(emb._wm_n_out != ao_scalars.n_scalars for _, emb in embs):
+        raise ValueError("embedding and LoopSCF orbital bases do not match")
     orig_fwd = model.forward
 
     def _get_field(obj, key, default=None):
@@ -140,7 +153,14 @@ def install_working_memory_true_diag(
             s_node = batch[AtomicDataDict.NODE_OVERLAP_KEY]
             s_edge = batch[AtomicDataDict.EDGE_OVERLAP_KEY]
             buf_S = assemble_flat(plan, s_node, s_edge, phase, torch.complex128)
-            factors = [factor_overlap_robust(S) for S in plan.blocks(buf_S)]
+            overlap_diagnostics = []
+            factors = []
+            for S in plan.blocks(buf_S):
+                diag = {} if collect_diagnostics else None
+                factors.append(
+                    factor_overlap_robust(S, overlap_cutoff, diagnostics=diag)
+                )
+                overlap_diagnostics.append(diag)
             nh0 = batch[AtomicDataDict.NODE_H0_KEY]
             eh0 = batch[AtomicDataDict.EDGE_H0_KEY]
             buf_H0 = assemble_flat(plan, nh0, eh0, phase, torch.complex128)
@@ -150,6 +170,8 @@ def install_working_memory_true_diag(
                 "plan": plan,
                 "factors": factors,
                 "nelec_t": nelec_t,
+                "overlap_diagnostics": overlap_diagnostics,
+                "h0_features": prior_to_rme(batch),
             }
             q0 = _occupy_all(buf_H0, state)
             del buf_S, buf_H0
@@ -187,8 +209,14 @@ def install_working_memory_true_diag(
         # Forward replaces feature/overlap fields; retain pristine inputs for
         # every step, including the first. Tensor data are not copied here.
         b = dict(batch)
+        # Physical assembly/losses require AO H0, but H0InitLayer's linear
+        # projectors consume RME irreps. Never overload one tensor with both.
+        model_h0 = state.get("h0_features")
+        if model_h0 is None:
+            model_h0 = prior_to_rme(batch)
+        b[AtomicDataDict.NODE_H0_KEY], b[AtomicDataDict.EDGE_H0_KEY] = model_h0
         for name, emb in embs:
-            if k > 1 and wm_node is not None and wm_edge is not None:
+            if feedback and k > 1 and wm_node is not None and wm_edge is not None:
                 emb._wm_ctx = {
                     "wm_n": wm_node.clone(),
                     "wm_e": wm_edge.clone(),
@@ -201,6 +229,8 @@ def install_working_memory_true_diag(
         finally:
             for name, emb in embs:
                 emb._wm_ctx = None
+        out[AtomicDataDict.NODE_H0_KEY] = batch[AtomicDataDict.NODE_H0_KEY]
+        out[AtomicDataDict.EDGE_H0_KEY] = batch[AtomicDataDict.EDGE_H0_KEY]
         if model.training:
             out["_loop_kpts"] = state["kpts"]
         out["_loop_K"] = K
@@ -219,8 +249,8 @@ def install_working_memory_true_diag(
             )
             q_k = _occupy_all(buf_Hk, state)
             dq_k = q_k - state["q0"]
-            rn_0e = _gather_0e(dH_node, out_slices).detach().clone()
-            re_0e = _gather_0e(dH_edge, out_slices).detach().clone()
+            rn_0e = ao_scalars(dH_node).detach()
+            re_0e = ao_scalars(dH_edge).detach()
             wm_node = (
                 torch.cat([dq_k.unsqueeze(-1), q_k.unsqueeze(-1), rn_0e], dim=-1)
                 .detach()
@@ -248,12 +278,14 @@ def install_working_memory_true_diag(
             out["_loop_kpts"] = state["kpts"]
         if collect_diagnostics:
             out["_loop_q"] = state["q_history"]
+            out["_loop_overlap"] = state["overlap_diagnostics"]
         return out
 
     model.forward = looped_forward
     model._wm_mode = mode
     model._wm_K = K
     model._wm_n_k_train = int(n_k_train)
+    model._wm_feedback = bool(feedback)
     model._wm_prepare = _prepare
     model._wm_one_k = _one_k
     model._wm_update = _update

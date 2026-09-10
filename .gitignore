@@ -175,3 +175,7 @@ dmypy.json
 _date.py
 _version.py
 /.idea/
+
+# LoopSCF experiment outputs are archived outside the source tree.
+/examples/loopscf/*_20[0-9][0-9][0-9][0-9][0-9][0-9]/
+/examples/loopscf/validation_*.json

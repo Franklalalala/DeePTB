@@ -103,10 +103,18 @@ def patch_stepwise_loss(
         batch_info = self._batch_info(batch)
         batch = AtomicData.to_AtomicDataDict(batch)
         batch_for_loss = batch.copy()
-        train_stepwise = bool(getattr(self.model, "training", False)) and hasattr(
-            self.model, "_wm_one_k"
+        train_stepwise = (
+            bool(getattr(self.model, "training", False))
+            and hasattr(self.model, "_wm_one_k")
+            and not getattr(self.model, "_loopscf_full_bptt", False)
         )
         if train_stepwise:
+            if allow_self_consistency and getattr(
+                self, "self_consistency_enabled", False
+            ):
+                raise NotImplementedError(
+                    "stepwise LoopSCF does not support the asynchronous self-consistency loss"
+                )
             # Do not merge pyg batch_info (__slices__/__data_class__) into the
             # model dict; TorchScript with_edge_vectors cannot cast those keys.
             loss, logs = stepwise_train_loss(

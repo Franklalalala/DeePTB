@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import re
 import types
 from typing import List, Sequence, Tuple
 import torch
 from torch import nn
-from dptb.data import AtomicDataDict
+from .representation import AOScalarFeedback
 
 
 def _irreps(obj):
@@ -34,6 +33,7 @@ def _zeroe_slices(irreps) -> Tuple[int, List[slice]]:
 
 
 def _gather_0e(feat: torch.Tensor, slices: Sequence[slice]) -> torch.Tensor:
+    """Select scalars from irreps coordinates; never use on packed AO output."""
     parts = [feat[:, sl] for sl in slices]
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
@@ -81,22 +81,31 @@ class ZeroInitWM(nn.Module):
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
+        # Persist the input representation, not just a same-shaped weight.
+        self.register_buffer("feedback_version", torch.tensor(3, dtype=torch.int64))
         self.proj = nn.Linear(in_dim, out_dim, bias=False)
         nn.init.zeros_(self.proj.weight)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        version = state_dict.get(prefix + "feedback_version")
+        if version is None or version.numel() != 1 or int(version) != 3:
+            raise RuntimeError(
+                "incompatible LoopSCF feedback checkpoint: AO trace feedback v3 "
+                "requires newly trained adapters; initialize from a base checkpoint"
+            )
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, wm_feat: torch.Tensor) -> torch.Tensor:
         return self.proj(wm_feat)
 
 
-def _attach_adapters(emb: nn.Module) -> None:
-    hidden_ir = getattr(emb.layers[-1], "irreps_out", None)
-    if hidden_ir is None:
-        hidden_ir = getattr(emb, "irreps_hidden", None)
+def _attach_adapters(emb: nn.Module, mode: str = "head") -> None:
+    if mode not in ("head", "moe"):
+        raise ValueError("unknown feedback injection mode")
+    injection_layer = emb.init_layer if mode == "moe" else emb.layers[-1]
+    hidden_ir = getattr(injection_layer, "irreps_out", None)
     n_hid, hid_sl = _zeroe_slices(hidden_ir)
-    out_ir = getattr(getattr(emb, "idp", None), "orbpair_irreps", None)
-    if out_ir is None:
-        out_ir = getattr(emb.out_node, "irreps_out", None)
-    n_out, out_sl = _zeroe_slices(out_ir)
+    n_out = AOScalarFeedback(emb.idp).n_scalars
 
     reference = next(emb.parameters())
     emb.wm_node = ZeroInitWM(2 + n_out, n_hid).to(
@@ -106,7 +115,7 @@ def _attach_adapters(emb: nn.Module) -> None:
         device=reference.device, dtype=reference.dtype
     )
     emb._wm_hid_slices = hid_sl
-    emb._wm_out_slices = out_sl
+    emb._wm_hidden_dim = _irreps(hidden_ir).dim
     emb._wm_n_hid = n_hid
     emb._wm_n_out = n_out
     print(
@@ -123,22 +132,29 @@ def _inject(
     wm_e = ctx.get("wm_e")
     if wm_n is None or wm_e is None:
         return node_h, edge_h
+    expected_dim = getattr(emb, "_wm_hidden_dim", node_h.shape[-1])
+    if node_h.shape[-1] != expected_dim or edge_h.shape[-1] != expected_dim:
+        raise RuntimeError(
+            "feedback injection irreps do not match hidden feature width"
+        )
     n_use = node_h.shape[0]
-    if wm_n.shape[0] < n_use:
-        raise RuntimeError("node WM %d < hidden nodes %d" % (wm_n.shape[0], n_use))
-    node_h = _add_0e(node_h, emb.wm_node(wm_n[:n_use]), emb._wm_hid_slices)
+    if wm_n.shape[0] != n_use:
+        raise RuntimeError("node WM count does not match hidden nodes")
+    node_h = _add_0e(node_h, emb.wm_node(wm_n), emb._wm_hid_slices)
 
     ae = ctx.get("active_edges")
-    if ae is not None and wm_e.shape[0] != edge_h.shape[0]:
+    if ae is not None:
+        if ae.ndim != 1 or ae.numel() != edge_h.shape[0]:
+            raise RuntimeError("active edge mapping does not match hidden edges")
+        # The hidden rows follow this order even when every edge is active.
         wm_e = wm_e.index_select(0, ae)
     elif wm_e.shape[0] != edge_h.shape[0]:
-        wm_e = wm_e[: edge_h.shape[0]]
+        raise RuntimeError("missing active edge mapping for feedback")
     edge_h = _add_0e(edge_h, emb.wm_edge(wm_e), emb._wm_hid_slices)
     return node_h, edge_h
 
 
 def _wrap_embedding(emb: nn.Module, mode: str) -> None:
-    orig_fwd = emb.forward
     orig_init = emb.init_layer.forward
     orig_heads = emb._apply_rme_output_heads
 

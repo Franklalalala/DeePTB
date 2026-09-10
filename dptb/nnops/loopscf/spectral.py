@@ -108,8 +108,9 @@ def patch_fw10_per_graph():
 
     Dataset DFT meshes (144-244 k) are evaluation-only. Training matches
     band_stage2: same n_k for every graph, so collate padding is unused.
-    Reference bands are recomputed from label RMEs at those k (labels are
-    full H when residual_hamiltonian is false).
+    Reference bands are recomputed from physical AO blocks at those k.
+    FW10EigLoss adds H0 to residual labels before calling this method. The
+    loader's residual_hamiltonian flag alone does not identify stored targets.
     """
     from dptb.nnops.loss import FW10EigLoss
 

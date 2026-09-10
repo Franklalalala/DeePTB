@@ -35,3 +35,8 @@ Run a new GPU/real-data check when a changed kernel, device path, data contract,
 or unresolved numerical issue requires it. Reuse prior evidence when its
 relevant code, data, and environment are unchanged. Code validation and claims
 about held-out prediction quality require different evidence.
+
+Commit reusable code, feature documentation and focused behavioral regressions.
+Keep job manifests, run logs, benchmark snapshots, copied source trees and
+one-off diagnostic outputs outside the repository. Summarize validation in
+the change description; do not upload an evidence directory for each run.

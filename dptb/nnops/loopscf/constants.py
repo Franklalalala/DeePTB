@@ -1,7 +1,7 @@
 """Version and trainable-parameter contracts."""
 
 K_DEFAULT = 2
-CORRECTNESS_VERSION = "loopscf-correctness-v2"
+CORRECTNESS_VERSION = "loopscf-ao-feedback-v3"
 WM_KEYS = ("_wm_node_feat", "_wm_edge_feat")
 ARM1_PATTERNS = (
     "embedding.out_node",

@@ -7,22 +7,45 @@ import torch
 
 
 def factor_overlap_robust(
-    S_k: torch.Tensor, ill_threshold: float = 1e-5, work_dtype=None
+    S_k: torch.Tensor, ill_threshold: float = 1e-5, work_dtype=None, *, diagnostics=None
 ):
-    """Batched overlap factorization with positive-subspace projection fallback.
+    """Factor overlap, retaining only eigenmodes above a fixed absolute cutoff.
 
-    Occupy keeps the default complex128/float64 work dtype. The fw10 loss path
-    must pass the model dtype (complex64 for float32) or every [n_k,N,N]
-    tensor doubles and bs>1 OOMs for a non-physical reason.
+    Check conditioning even when Cholesky succeeds. Projection changes the
+    problem and its electron capacity; optional per-k diagnostics make this
+    explicit. The default cutoff preserves the previous fallback convention.
+    Occupations default to double precision; spectral training may pass c64.
     """
+    if not math.isfinite(ill_threshold) or ill_threshold <= 0:
+        raise ValueError("overlap cutoff must be finite and positive")
     n_k, dim, _ = S_k.shape
     if work_dtype is None:
         work_dtype = torch.complex128 if S_k.is_complex() else torch.float64
     S_k64 = S_k.to(work_dtype)
     S_k64 = 0.5 * (S_k64 + S_k64.mH)
+    if not bool(torch.isfinite(S_k64).all()):
+        raise ValueError("nonfinite overlap")
 
+    eig = torch.linalg.eigvalsh(S_k64)
+    retained = (eig > ill_threshold).sum(-1)
+    if bool((retained == 0).any()):
+        raise ValueError("overlap has an empty retained subspace")
     L, info = torch.linalg.cholesky_ex(S_k64)
-    bad = (info != 0).nonzero().reshape(-1)
+    bad = ((info != 0) | (retained < dim)).nonzero().reshape(-1)
+    if diagnostics is not None:
+        diagnostics.update(
+            min_eig_S=eig[:, 0].detach(),
+            max_eig_S=eig[:, -1].detach(),
+            condition_S=torch.where(
+                eig[:, 0] > 0,
+                eig[:, -1] / eig[:, 0],
+                torch.full_like(eig[:, 0], float("inf")),
+            ).detach(),
+            retained_rank=retained.detach(),
+            dropped_modes=(dim - retained).detach(),
+            spin_degenerate_capacity=(2 * retained).detach(),
+            cutoff=ill_threshold,
+        )
 
     proj_cache = {}
     if len(bad) > 0:

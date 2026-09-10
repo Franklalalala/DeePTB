@@ -152,10 +152,17 @@ def build_k_plan(idp, atom_types, edge_index, batch, ptr, device, edge_chunk=655
             if want_row:
                 rows.append(item.expand(-1, op.row.numel())[ok])
 
-        def _cat(xs):
+        def _cat(xs, dtype=torch.long):
+            if not xs:
+                return torch.empty(0, device=device, dtype=dtype)
             return xs[0] if len(xs) == 1 else torch.cat(xs)
 
-        return (_cat(dsts), _cat(srcs), _cat(facs), _cat(rows) if want_row else None)
+        return (
+            _cat(dsts),
+            _cat(srcs),
+            _cat(facs, torch.float32),
+            _cat(rows) if want_row else None,
+        )
 
     idx_atom = torch.arange(n_atom, device=device, dtype=torch.long)
     n_dst, n_src, n_fac, _ = _scatter_for(idx_atom, idx_atom, batch, n_atom, False)
@@ -192,19 +199,22 @@ def bloch_phase(kpts, shift, graph_of_edge):
 
 
 def assemble_flat(plan, feats_node, feats_edge, phase, ctype):
+    """Assemble packed AO blocks; ctype controls accumulation precision."""
     if feats_node.shape[-1] != plan.n_rme or feats_edge.shape[-1] != plan.n_rme:
         raise ValueError(
-            "feature width %s/%s != RME width %d"
+            "feature width %s/%s != packed AO width %d"
             % (feats_node.shape[-1], feats_edge.shape[-1], plan.n_rme)
         )
     n_k = phase.shape[0]
-    nv = feats_node.reshape(-1).index_select(0, plan.node_src).to(torch.float32)
+    nv = feats_node.reshape(-1).index_select(0, plan.node_src).to(ctype)
     nv = (nv * plan.node_fac).to(ctype)
-    ev = feats_edge.reshape(-1).index_select(0, plan.edge_src).to(torch.float32)
+    ev = feats_edge.reshape(-1).index_select(0, plan.edge_src).to(ctype)
     ev = (ev * plan.edge_fac).to(ctype)
     buf = torch.zeros(n_k, plan.total_flat, dtype=ctype, device=plan.device)
     buf = buf.index_add(1, plan.node_dst, nv.unsqueeze(0).expand(n_k, -1))
     buf = buf.index_add(
-        1, plan.edge_dst, ev.unsqueeze(0) * phase.index_select(1, plan.edge_row)
+        1,
+        plan.edge_dst,
+        ev.unsqueeze(0) * phase.index_select(1, plan.edge_row).to(ctype),
     )
     return buf
