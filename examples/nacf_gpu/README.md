@@ -186,6 +186,28 @@ implementation-agreement measurements on C/Si, not DFT prediction accuracy or
 an all-element qualification. Tests additionally cover float32, CUDA Graph
 replay, nonuniform grids, support boundaries, zero channels, and autograd routing.
 
+For single-structure versus multi-structure AI forward timing, pass a geometry
+file containing at least 16 distinct structures and add:
+
+```bash
+python -m dptb.nacf.benchmark \
+  --checkpoint /path/to/checkpoint --p2 /path/to/p2 --p23 /path/to/p23 \
+  --overlap /path/to/overlap --expected-p2-sha256 TRAINING_P2_MANIFEST_SHA256 \
+  --geometry distinct_structures.extxyz --forward-batches 1 2 4 8 16 \
+  --warmup 3 --repeats 7 --output forward.json
+```
+
+Each batch uses an ordered prefix of the input file. `ai_forward` measures only
+`model(inputs)` with graph and NACF/S already on GPU. Every call gets fresh input
+clones, completed and synchronized before its timer; table lookup, input copying
+and NACF add-back are excluded. Synchronized wall time includes Python dispatch
+as well as GPU execution. `prepared_full` recomputes priors and includes packing,
+copies, model and add-back; `geometry_to_full` also includes CPU graph/topology
+preparation and transfers. All three exclude initial loading/compilation and disk
+output. JSON contains raw samples, medians per batch and per structure, throughput
+and residual/Full-H/S agreement against independently prepared singleton runs.
+It rejects cross-structure neighbours and nonfinite or inconsistent predictions.
+
 ## DPA4C relationship and scope
 
 The reference is deepmd-kit commit `28b7d068801716765ab8119257f814596e49a10c`:

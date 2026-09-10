@@ -114,8 +114,13 @@ def main():
     ap.add_argument('--device',default='cuda')
     ap.add_argument('--repeats',type=int,default=5)
     ap.add_argument('--compare-native',action='store_true',help='Compare fused CUDA against the torch table backend')
+    ap.add_argument('--forward-batches',type=int,nargs='+',help='Measure pure AI forward on ordered geometry prefixes, e.g. 1 2 4 8 16')
+    ap.add_argument('--warmup',type=int,default=3)
     args=ap.parse_args()
     if args.repeats < 3: ap.error('use at least three repeats')
+    if args.warmup < 1: ap.error('use at least one warmup')
+    if args.forward_batches and (args.compare_native or min(args.forward_batches)<1):
+        ap.error('forward batch sizes must be positive and cannot combine with compare-native')
     output=Path(args.output)
     if output.exists(): raise FileExistsError(output)
     predictor=load_predictor(args.checkpoint,args.p2,args.p23,args.overlap,args.expected_p2_sha256,args.device)
@@ -127,12 +132,106 @@ def main():
                 checkpoint=args.checkpoint,geometry=args.geometry,
                 mode='cuda_vs_torch' if args.compare_native else 'cpu_vs_gpu',
                 timing_scope=benchmark_native.__doc__ if args.compare_native else __doc__,cases=[])
-    for atoms in read(args.geometry,index=':'):
+    structures=read(args.geometry,index=':')
+    if args.forward_batches:
+        if max(args.forward_batches)>len(structures):
+            ap.error('geometry file must contain at least the largest requested batch')
+        report.update(mode='ai_forward_batches',timing_scope=benchmark_forward_batches.__doc__)
+        report['cases']=benchmark_forward_batches(predictor,structures,args.forward_batches,args.repeats,args.warmup)
+    for atoms in ([] if args.forward_batches else structures):
         row=(benchmark_native if args.compare_native else benchmark)(predictor,atoms,args.repeats)
         report['cases'].append(row)
         print('MATCHED',json.dumps(row),flush=True)
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(report,indent=2)+'\n')
+
+
+@torch.inference_mode()
+def benchmark_forward_batches(predictor, structures, batch_sizes=(1,2,4,8,16), repeats=5, warmup=3):
+    """Warm synchronized wall-clock latency on ordered prefixes of geometries.
+
+    ai_forward times only model(inputs), including its Python dispatch and GPU
+    execution. Geometry, graph and NACF/S tensors are resident on device; fresh
+    input clones and synchronization happen before its timer. No table assembly
+    or NACF add-back is inside ai_forward. prepared_full includes recomputing
+    priors, packing, input copies, model, add-back and output copies on a fixed
+    prepared graph. geometry_to_full additionally includes CPU preparation and
+    transfer. Model/table loading and CUDA compilation are excluded from all.
+    Each batch uses the same ordered prefix; compare throughput only for this
+    geometry family. Parity uses independently prepared singleton predictions.
+    """
+    if repeats < 1 or warmup < 1 or not batch_sizes or min(batch_sizes)<1 or max(batch_sizes)>len(structures):
+        raise ValueError('invalid batch sizes, repeat count or warmup')
+    def sync():
+        if predictor.device.type=='cuda': torch.cuda.synchronize(predictor.device)
+    def clone(data):
+        return {k:v.clone() for k,v in data.items()}
+    def residual_input(prepared):
+        return {**clone(prepared.geometry),**clone(prepared.plan())}
+    def values(prepared):
+        inputs=residual_input(prepared)
+        pn,pe=inputs['node_p23'].clone(),inputs['edge_p2'].clone()
+        sn,se=inputs['node_overlap'].clone(),inputs['edge_overlap'].clone()
+        result=predictor.model(inputs)
+        return dict(node_residual=result['node_features'].clone(),edge_residual=result['edge_features'].clone(),
+                    node_full=result['node_features']+pn,edge_full=result['edge_features']+pe,
+                    node_overlap=sn,edge_overlap=se)
+    # Keep validation references on CPU so they do not inflate batch GPU memory.
+    reference=[]
+    for atoms in structures[:max(batch_sizes)]:
+        reference.append({k:v.cpu() for k,v in values(predictor.prepare(atoms)).items()})
+    rows=[]
+    for size in batch_sizes:
+        subset=structures[:size]
+        prepared=predictor.prepare(subset)
+        # Validate every neighbour relation against the collated graph ownership.
+        owner=prepared.geometry['batch'].reshape(-1)
+        for key in ('edge_index','env_index','onsitenv_index'):
+            if key in prepared.geometry:
+                i,j=prepared.geometry[key]
+                if not torch.equal(owner[i],owner[j]): raise AssertionError(f'cross-structure {key}')
+        actual=values(prepared)
+        errors={}
+        for key,value in actual.items():
+            target=torch.cat([item[key] for item in reference[:size]],dim=0)
+            value=value.cpu()
+            if not torch.isfinite(value).all(): raise AssertionError(f'nonfinite {key}')
+            errors[key]=float((value-target).abs().max()) if value.numel() else 0.
+            torch.testing.assert_close(value,target,atol=2e-4 if 'overlap' not in key else 2e-6,rtol=1e-5)
+        del actual
+        baseline=residual_input(prepared)
+        def ai_forward():
+            # This setup is deliberately outside the model-only timed region.
+            inputs=clone(baseline)
+            sync()
+            start=time.perf_counter()
+            result=predictor.model(inputs)
+            sync()
+            return time.perf_counter()-start,result
+        def timed(fn):
+            sync(); start=time.perf_counter(); result=fn(); sync()
+            return time.perf_counter()-start,result
+        functions=dict(ai_forward=ai_forward,prepared_full=lambda:timed(prepared),
+                       geometry_to_full=lambda:timed(lambda:predictor(subset)))
+        for _ in range(warmup):
+            for fn in functions.values(): fn()
+        samples={k:[] for k in functions}
+        for repeat in range(repeats):
+            names=list(functions)
+            if repeat%2: names.reverse()
+            for name in names:
+                duration,result=functions[name]()
+                samples[name].append(duration)
+                del result
+        medians={k:float(np.median(v)) for k,v in samples.items()}
+        row=dict(structures=size,atoms=sum(map(len,subset)),edges=prepared.geometry['edge_index'].shape[1],
+                 warmup=warmup,repeats=repeats,batch_vs_singleton_max_abs=errors,
+                 samples_seconds=samples,median_seconds=medians,
+                 median_seconds_per_structure={k:v/size for k,v in medians.items()},
+                 structures_per_second={k:size/v for k,v in medians.items()})
+        rows.append(row)
+        print('FORWARD_BATCH',json.dumps(row),flush=True)
+    return rows
 
 
 @torch.inference_mode()
