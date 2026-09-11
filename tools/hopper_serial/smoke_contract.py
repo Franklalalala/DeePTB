@@ -145,20 +145,30 @@ def worker():
                 if bool(g.abs().sum()>0):seen.add(name)
             return record
         handles=[p.register_hook(hook(n)) for n,p in t.model.named_parameters() if p.requires_grad]
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
-            result=orig_run(t,*a,**kw)
+        dispatch={'cuda_fused_calls':0,'interpolation_fallback_calls':0}
+        import dptb.nn.so2_moe_fused_p0 as fused
+        original_fused=fused.try_forward_so2_moe_fused_p0
+        def traced_fused(module,x,*args,**kwargs):
+            result=original_fused(module,x,*args,**kwargs)
+            if result is None:dispatch['interpolation_fallback_calls']+=1
+            else:
+                assert x.is_cuda and result[0].is_cuda
+                dispatch['cuda_fused_calls']+=1
+            return result
+        fused.try_forward_so2_moe_fused_p0=traced_fused
+        try:result=orig_run(t,*a,**kw)
+        finally:fused.try_forward_so2_moe_fused_p0=original_fused
         for h in handles:h.remove()
         assert t.iter==4,t.iter
         assert report['mask_checks']
         assert all(torch.equal(dict(t.model.named_parameters())[n],p) for n,p in frozen.items())
         assert any('two_b_' in n for n in seen) if stage==1 else any('layers.' in n for n in seen)
         if stage==2:assert any('router.' in n for n in seen)
-        names=sorted({event.name for event in prof.events()})
-        (CONTROL/f'smoke_s{stage}_dispatch.json').write_text(json.dumps(names))
-        if stage==2:assert any('FusedM0Function' in n or 'FusedPairFunction' in n or 'Sandwich' in n for n in names),names[:40]
+        (CONTROL/f'smoke_s{stage}_dispatch.json').write_text(json.dumps(dispatch))
+        if stage==2:assert dispatch['cuda_fused_calls']>0,dispatch
         mapped=[line.split()[-1] for line in Path('/proc/self/maps').read_text().splitlines() if '/scratch/' in line and ('.so' in line or 'data.mdb' in line)]
         assert not mapped,mapped
-        report.update(stage=stage,final_next_step=t.iter,gradient_parameters=sorted(seen),dispatch_events=names,peak_allocated_bytes=torch.cuda.max_memory_allocated(),scratch_mappings=mapped)
+        report.update(stage=stage,final_next_step=t.iter,gradient_parameters=sorted(seen),dispatch=dispatch,peak_allocated_bytes=torch.cuda.max_memory_allocated(),scratch_mappings=mapped)
         (CONTROL/f'smoke_s{stage}_evidence.json').write_text(json.dumps(report,indent=2))
         print('SMOKE_STAGE_CONTRACT_OK',stage,flush=True)
         return result
