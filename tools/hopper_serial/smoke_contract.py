@@ -154,7 +154,8 @@ def worker():
         assert any('two_b_' in n for n in seen) if stage==1 else any('layers.' in n for n in seen)
         if stage==2:assert any('router.' in n for n in seen)
         names=sorted({event.name for event in prof.events()})
-        if stage==2:assert any('fused' in n.lower() or 'cublas' in n.lower() or 'segmented' in n.lower() for n in names),names[:40]
+        (CONTROL/f'smoke_s{stage}_dispatch.json').write_text(json.dumps(names))
+        if stage==2:assert any('FusedM0Function' in n or 'FusedPairFunction' in n or 'Sandwich' in n for n in names),names[:40]
         mapped=[line.split()[-1] for line in Path('/proc/self/maps').read_text().splitlines() if '/scratch/' in line and ('.so' in line or 'data.mdb' in line)]
         assert not mapped,mapped
         report.update(stage=stage,final_next_step=t.iter,gradient_parameters=sorted(seen),dispatch_events=names,peak_allocated_bytes=torch.cuda.max_memory_allocated(),scratch_mappings=mapped)
@@ -185,7 +186,13 @@ def main(mode):
     parent=CONTROL/(mode+'_'+stamp);parent.mkdir()
     (CONTROL/(mode+'_current.json')).write_text(json.dumps(dict(output=str(parent))))
     ckpt=None
-    for stage in (1,2):
+    stages=(1,2)
+    resume=CONTROL/'resume_smoke_s1.json'
+    if mode=='smoke' and resume.exists():
+        ckpt=checkpoint(Path(json.loads(resume.read_text())['output']),3)
+        resume.unlink()
+        stages=(2,)
+    for stage in stages:
         cfg=json.loads((CONTROL/f'production_s{stage}.json').read_text())
         cfg['train_options']['display_freq']=100
         if mode=='smoke':
