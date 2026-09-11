@@ -289,6 +289,14 @@ ownership. Failures are retained. Shared-GPU rows are excluded from the primary
 aggregate; `--allow-shared-gpu` permits a separately labelled diagnostic aggregate.
 Presence snapshots cannot prove that no transient interference occurred.
 
+For an interrupted production benchmark, rerun the same command with `--resume`.
+It verifies checkpoint, geometry, source hashes, runtime and timing settings,
+retains completed eligible cases, and records superseded failed/shared attempts.
+Device occupancy becoming unavailable stops further singleton work so it can be
+resumed later. An output report alone is not a completion marker: inspect all
+requested singleton and batch rows. After resuming, the final resident table
+cache can cover only the remaining structures, as recorded in its scope field.
+
 The separate fresh-process memory probe records CUDA context, extension import,
 table/input allocation, and first/second native launch after output deallocation.
 PyTorch allocated bytes measure live tensors, reserved bytes include its cache,

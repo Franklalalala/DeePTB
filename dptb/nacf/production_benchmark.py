@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import uuid
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,6 +24,10 @@ from ase.io import read
 from dptb.data import AtomicData
 from .benchmark import cpu_features
 from .inference import load_predictor
+
+
+class GPUUnavailable(RuntimeError):
+    """A benchmark cannot establish the requested unshared device condition."""
 
 
 def json_default(value):
@@ -74,7 +79,7 @@ def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False):
     select('cuda')
     before=memory_snapshot(device)
     if before['other_processes'] != [] and not allow_shared_gpu:
-        raise RuntimeError('GPU is occupied by another process; choose an idle device')
+        raise GPUUnavailable('GPU is occupied or occupancy is unknown; retry on an idle device')
     prepared=predictor.prepare(atoms)
     # Retain the original CPU graphs: a CPU lookup never needs a GPU-to-CPU
     # graph round trip. The numerical CPU assembler batches queries internally.
@@ -188,16 +193,21 @@ def main():
     ap.add_argument('--allow-shared-gpu',action='store_true',help='Diagnostic run only; shared rows remain excluded from the primary aggregate')
     ap.add_argument('--batch-sizes',type=int,nargs='+',default=[])
     ap.add_argument('--skip-singletons',action='store_true',help='Run only the explicitly requested mixed batches')
+    ap.add_argument('--resume',action='store_true',help='Resume matching output, preserving earlier failed attempts')
     args=ap.parse_args()
     if args.repeats<3 or args.warmup<1: ap.error('at least 3 repeats and 1 warmup required')
     out=Path(args.output)
-    if out.exists(): raise FileExistsError(out)
-    out.mkdir(parents=True)
+    previous=None
+    if out.exists():
+        if not args.resume: raise FileExistsError(out)
+        previous=json.loads((out/'report.json').read_text())
+    elif args.resume: ap.error('resume requires an existing report')
+    else: out.mkdir(parents=True)
     device=torch.device(args.device)
     torch.cuda.init(); torch.cuda.synchronize(device)
     stages={'context':memory_snapshot(device)}
     if stages['context']['other_processes'] != [] and not args.allow_shared_gpu:
-        raise RuntimeError('requested GPU is already occupied')
+        raise GPUUnavailable('requested GPU is occupied or occupancy is unknown')
     from ._cuda import extension
     extension()
     stages['extension_imported']=memory_snapshot(device)
@@ -219,6 +229,27 @@ def main():
                 p2_sha256=predictor.bank.p2_manifest_sha256,p23_sha256=predictor.bank.p23.manifest_sha256,
                 overlap_sha256=predictor.bank.overlap.manifest_sha256,model_bytes=model_bytes,
                 memory_stages=stages,repeats=args.repeats,warmup=args.warmup,requested=len(structures),rows=[],batches=[])
+    run_id=uuid.uuid4().hex
+    invocation=dict(run_id=run_id,started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+                    allow_shared_gpu=args.allow_shared_gpu,source_sha256=report['source_sha256'])
+    if previous is not None:
+        for key in ('checkpoint_sha256','geometry_sha256','gpu','torch_version','threads','p2_sha256','p23_sha256','overlap_sha256',
+                    'model_dtype','prior_dtype','runtime_model_overrides','repeats','warmup','requested','source_sha256'):
+            if previous.get(key)!=report[key]: raise ValueError('resume provenance mismatch: '+key)
+        report['rows']=previous['rows']
+        report['batches']=previous.get('batches',[])
+        report['attempt_history']=previous.get('attempt_history',[])
+        report['invocations']=previous.get('invocations',[])
+    report.setdefault('invocations',[]).append(invocation)
+    def accepted(row):
+        return row['status']=='ok' and (args.allow_shared_gpu or not row.get('interference',True))
+    def replace_row(collection,row,key):
+        old=next((r for r in collection if r[key]==row[key]),None)
+        if old is not None:
+            report.setdefault('attempt_history',[]).append(old)
+            collection.remove(old)
+        collection.append(row)
+        collection.sort(key=lambda r:r[key])
     def save():
         report['aggregate']=aggregate(report['rows'])
         report['shared_diagnostic_aggregate']=aggregate(report['rows'],include_shared=True)
@@ -226,15 +257,21 @@ def main():
         temporary.replace(out/'report.json')
     save()
     for i,atoms in enumerate([] if args.skip_singletons else structures):
+        if any(r['index']==i and accepted(r) for r in report['rows']): continue
+        unavailable=False
         try:
             row=measure_case(predictor,atoms,args.repeats,args.warmup,args.allow_shared_gpu)
             row.update(status='ok',index=i,identity=dict(atoms.info))
         except Exception as exc:
             row=dict(status='failed',index=i,identity=dict(atoms.info),error=repr(exc))
+            unavailable=isinstance(exc,GPUUnavailable)
             gc.collect(); torch.cuda.empty_cache()
-        report['rows'].append(row); save()
+        row['run_id']=run_id
+        replace_row(report['rows'],row,'index'); save()
         print(json.dumps({k:row[k] for k in ('index','status','atoms','edges','median_seconds','error') if k in row},default=json_default),flush=True)
+        if unavailable: raise GPUUnavailable('stopped before further cases; resume when the device is idle')
     for size in args.batch_sizes:
+        if any(r['structures']==size and accepted(r) for r in report['batches']): continue
         try:
             errors=validate_batch(predictor,structures[:size])
             row=measure_case(predictor,structures[:size],args.repeats,args.warmup,args.allow_shared_gpu)
@@ -242,10 +279,12 @@ def main():
         except Exception as exc:
             row=dict(status='failed',structures=size,error=repr(exc))
             gc.collect(); torch.cuda.empty_cache()
-        report['batches'].append(row); save()
+        row['run_id']=run_id
+        replace_row(report['batches'],row,'structures'); save()
         print('BATCH '+json.dumps({k:row[k] for k in ('structures','status','atoms','edges','median_seconds','error') if k in row}),flush=True)
     report['memory_stages']['finished']=memory_snapshot(device)
     report['table_cache_bytes']=storage_bytes(predictor.bank.tables.buffers())
+    report['table_cache_scope']='resident cache of final invocation; after resume this may cover only remaining structures'
     save()
     checked=report['shared_diagnostic_aggregate'] if args.allow_shared_gpu else report['aggregate']
     if checked['failed'] or any(r['status']!='ok' or (r.get('interference') and not args.allow_shared_gpu) for r in report['batches']):
