@@ -96,22 +96,15 @@ def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False):
     def cpu_prior(): return cpu_from_graphs(cpu_graphs)
     def cpu_fresh():
         return cpu_from_graphs([graph_for(item) for item in structures])
-    def gpu_prior(backend):
-        select(backend)
-        return prepared.plan()
-    def gpu_fresh(backend):
-        select(backend)
-        return predictor.prepare(atoms).plan()
-    def gpu_full(backend):
-        select(backend)
-        return predictor(atoms)
     functions=dict(ai_forward=lambda:predictor.model(current_inputs),cpu_prior=cpu_prior,
-                   torch_prior=lambda:gpu_prior('torch'),cuda_prior=lambda:gpu_prior('cuda'),
-                   cpu_fresh_prior=cpu_fresh,torch_fresh_prior=lambda:gpu_fresh('torch'),cuda_fresh_prior=lambda:gpu_fresh('cuda'),
-                   cuda_geometry_to_full=lambda:gpu_full('cuda'))
+                   torch_prior=prepared.plan,cuda_prior=prepared.plan,
+                   cpu_fresh_prior=cpu_fresh,torch_fresh_prior=lambda:predictor.prepare(atoms).plan(),
+                   cuda_fresh_prior=lambda:predictor.prepare(atoms).plan(),
+                   cuda_geometry_to_full=lambda:predictor(atoms))
     errors={}
     # Validate prior features independently before reporting any timing ratio.
-    for backend,fn in [('cpu',cpu_prior),('torch',lambda:gpu_prior('torch'))]:
+    for backend,fn in [('cpu',cpu_prior),('torch',prepared.plan)]:
+        if backend=='torch': select('torch')
         value=fn()
         errors[backend]={}
         for key in native:
@@ -123,6 +116,8 @@ def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False):
         names=list(functions)
         if repeat%2: names.reverse()
         for name in names:
+            # Backend switching is benchmark instrumentation, not inference.
+            if name.startswith(('torch_','cuda_')): select(name.split('_',1)[0])
             current_inputs=ai_input() if name=='ai_forward' else None
             sync()
             torch.cuda.reset_peak_memory_stats(device)
