@@ -888,7 +888,7 @@ def _embedding_prior_2b(
     out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
 ) -> None:
     method = _normalized_name(out.get("method", ""))
-    if method != "lem_moe_v3_prior_2b":
+    if method not in {"lem_moe_v3_prior_2b", "lem_moe_v3_edge_prior_2b"}:
         return
     prior_kind = _normalized_name(out.get("prior_kind", "na_cf"))
     if prior_kind not in {"p2", "p23", "na_cf", "h0"}:

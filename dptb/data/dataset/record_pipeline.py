@@ -310,6 +310,23 @@ class RecordSchemaValidator:
                     "A fingerprinted Hamiltonian record requires a configured "
                     "OrbitalMapper/basis."
                 )
+            stored_s = str(stored_basis_fingerprint)
+            schema_s = str(data_dict.get("hamiltonian_schema") or "")
+            # Compact SOC uu_real named-slot records use a named basis token,
+            # not a 64-hex mapper digest. Do not reject them as malformed SHA256.
+            if stored_s == "nextham_uureal_729_orbpair_v1" or "soc_uureal_named_slots" in schema_s:
+                mapper = dataset.type_mapper
+                if (stored_s != "nextham_uureal_729_orbpair_v1"
+                    or schema_s != "deeptb.soc_uureal_named_slots_rme_training_sample/v1"
+                    or not bool(getattr(mapper, "has_soc", False))
+                    or not bool(getattr(mapper, "nextham_uureal_mask", False))
+                    or int(mapper.reduced_matrix_element) != 729):
+                    raise ValueError("SOC named basis token/schema/mapper mismatch")
+                expected = "dcc39e397efb11b1cfb4d56e64720964791418dbf3c06544c02cee0a6758ecce"
+                actual = _host.mapper_basis_fingerprint(mapper)
+                if actual != expected:
+                    raise ValueError("SOC named-token basis differs from canonical NexTHAM basis")
+                return actual, actual
             basis_fingerprint = _host.mapper_basis_fingerprint(dataset.type_mapper)
             stored_basis_fingerprint = _host.require_sha256(
                 stored_basis_fingerprint, field=BASIS_FINGERPRINT_KEY
@@ -424,6 +441,31 @@ class GraphResolver:
                         canonical_stored_shift,
                         basis_fingerprint=ctx.basis_fingerprint,
                     )
+                    if (ctx.data_dict.get("hamiltonian_schema") == "deeptb.soc_uureal_named_slots_rme_training_sample/v1"
+                        and ctx.data_dict.get("basis_fingerprint") == "nextham_uureal_729_orbpair_v1"):
+                        # Exact join_nacf_to_soc_lmdb.graph_fp v1 on RAW stored
+                        # edge_index [2,E] and rint int64 shifts [E,3]. Canonical
+                        # graph order/dtype would miss the stored hash.
+                        import hashlib as _hashlib
+                        import numpy as _np
+                        def _as_np(x):
+                            if hasattr(x, "detach"):
+                                x = x.detach().cpu().numpy()
+                            return x
+                        _z = _np.asarray(_as_np(ctx.atomic_numbers), dtype=_np.int64)
+                        _ei = _np.asarray(_as_np(ctx.stored_edge_index), dtype=_np.int64)
+                        _ecs = _np.asarray(_as_np(ctx.stored_edge_shift), dtype=_np.float64)
+                        if _ecs.ndim != 2 or _ecs.shape[1] != 3:
+                            raise ValueError("SOC named-slot edge_cell_shift shape %s" % (_ecs.shape,))
+                        _sh = _np.rint(_ecs).astype(_np.int64)
+                        if not _np.allclose(_ecs, _sh, atol=1e-4):
+                            raise ValueError("SOC named-slot edge_cell_shift is not integer")
+                        _digest = _hashlib.sha256()
+                        _digest.update(_z.tobytes())
+                        _digest.update(_ei.tobytes())
+                        _digest.update(_sh.tobytes())
+                        _digest.update(b"nextham_uureal_729_orbpair_v1")
+                        actual_graph_fingerprint = _digest.hexdigest()
                     _host.assert_record_fingerprint(
                         ctx.data_dict,
                         field=EDGE_GRAPH_FINGERPRINT_KEY,

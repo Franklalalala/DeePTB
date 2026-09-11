@@ -2726,11 +2726,19 @@ class MultiTrainer(Trainer):
                 _step_one_scheduler(sch, expert_idx=expert_idx)
 
     def run(self, epochs=1):
+        limit = self.train_options.get("max_steps")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+            raise ValueError("max_steps must be a positive integer or None")
         for q in self.plugin_queues.values():
             heapq.heapify(q)
 
         for i in range(self.ep, epochs + 1):
+            if self._max_steps_reached():
+                return
             self.epoch()
+            if self._max_steps_reached():
+                self._finish_max_steps()
+                return
             self.call_plugins(queue_name='epoch', time=i)
 
             if not self.update_lr_per_iter:
@@ -2738,6 +2746,31 @@ class MultiTrainer(Trainer):
 
             self.update()
             self.ep += 1
+
+    def _max_steps_reached(self):
+        limit = self.train_options.get("max_steps")
+        # iter is the next optimizer step outside iteration(), including restart.
+        return limit is not None and self.iter > limit
+
+    def _finish_max_steps(self):
+        from dptb.plugins.saver import Saver
+        committed = self.iter - 1
+        if self.distributed_expert and self._has_pending_display_window():
+            state = self._flush_display_window(time_idx=committed)
+            if state is not None:
+                self.call_plugins(queue_name='iteration', time=committed,
+                                  event_clock='display_window', **state)
+        # Saver.iteration expects the just-committed update. Do not mark a
+        # truncated epoch complete: that would corrupt its resume cursor.
+        next_iter = self.iter
+        try:
+            self.iter = committed
+            for plugin in getattr(self, "_registered_plugins", []):
+                if isinstance(plugin, Saver) and plugin._last_iteration_checkpoint_iter != committed:
+                    plugin.iteration()
+        finally:
+            self.iter = next_iter
+        log.info("MAX_STEPS_COMPLETE committed_steps=%s; normal exit", committed)
 
     # ---------------------------------------------------------------------
     # distributed expert iteration
@@ -3249,6 +3282,8 @@ class MultiTrainer(Trainer):
                     ref_batch = None
 
                 self.iteration(batch, ref_batch)
+                if self._max_steps_reached():
+                    break
 
             if self._has_pending_display_window():
                 flush_time = max(self.iter - 1, 1)
@@ -3269,9 +3304,13 @@ class MultiTrainer(Trainer):
                     ref_iter = iter(self.reference_loader)
                     ref_batch = next(ref_iter)
                 self.iteration(ibatch, ref_batch)
+                if self._max_steps_reached():
+                    break
         else:
             for ibatch in self.train_loader:
                 self.iteration(ibatch)
+                if self._max_steps_reached():
+                    break
 
         if self.distributed_expert and self._has_pending_display_window():
             flush_time = max(self.iter - 1, 1)

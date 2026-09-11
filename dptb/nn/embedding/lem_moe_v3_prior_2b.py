@@ -398,14 +398,16 @@ class _Prior2bMixin:
         use_pa = bool(getattr(self, "edge_router_prior_activate", False))
         active_edge_one_hot = edge_one_hot[active_edges]
         mole_pa = None
-        if use_pa:
-            descriptor = self._gram_descriptor(
-                self._raw_prior_source(data, bond_type, active_edges)
-            )
-            router_input = torch.cat(
-                [active_edge_one_hot, descriptor.to(dtype=active_edge_one_hot.dtype)],
-                dim=-1,
-            )
+        use_edge_router = isinstance(self, LemMoEV3EdgeH0)
+        if use_edge_router:
+            router_input = active_edge_one_hot
+            if use_pa:
+                descriptor = self._gram_descriptor(
+                    self._raw_prior_source(data, bond_type, active_edges)
+                )
+                router_input = torch.cat(
+                    [router_input, descriptor.to(dtype=router_input.dtype)], dim=-1
+                )
             active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
             mole_pa, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
                 router_input, active_bond_type
@@ -443,7 +445,7 @@ class _Prior2bMixin:
             node_batch = batch[: node_features.shape[0]]
             safe_node_one_hot = node_one_hot[: node_features.shape[0]]
             active_edge_one_hot = edge_one_hot[active_edges]
-            if use_pa:
+            if use_edge_router:
                 mole_globals = mole_pa
             elif preserved_split_sizes is not None:
                 mole_globals = MOLEGlobals(
@@ -534,10 +536,25 @@ class LemMoEV3Prior2bPA(_Prior2bMixin, LemMoEV3EdgeH0):
     """Per-edge prior-activate router with the same pairwise/GNN contract."""
 
 
+@Embedding.register("lem_moe_v3_edge_prior_2b")
+class LemMoEV3EdgePrior2b(_Prior2bMixin, LemMoEV3EdgeH0):
+    """Serial pairwise/GNN stages with stable edge-router checkpoint shapes.
+
+    Without prior activation, the edge router supports fused SO2 CUDA. H0
+    still conditions both branches through their node/edge projectors.
+    """
+
+    def _two_b_modules(self) -> Tuple[torch.nn.Module, ...]:
+        # The pairwise InitLayer consumes this learned edge-type embedding.
+        # Freezing only its private modules would still move the S1 baseline
+        # whenever the GNN/router updates the shared embedding in stage 2.
+        return super()._two_b_modules() + (self.edge_one_hot,)
+
+
 @Embedding.register("lem_moe_v3_prior_2b")
 def build_prior_2b(**kwargs):
     cls = LemMoEV3Prior2bPA if kwargs.get("edge_router_prior_activate", False) else LemMoEV3Prior2b
     return cls(**kwargs)
 
 
-__all__ = ["LemMoEV3Prior2b", "LemMoEV3Prior2bPA", "resolve_prior_2b_keys", "PRIOR_2B_KINDS"]
+__all__ = ["LemMoEV3Prior2b", "LemMoEV3Prior2bPA", "LemMoEV3EdgePrior2b", "resolve_prior_2b_keys", "PRIOR_2B_KINDS"]

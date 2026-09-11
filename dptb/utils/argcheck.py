@@ -725,6 +725,8 @@ def train_options():
 
     args = [
         Argument("num_epoch", int, optional=False, doc=doc_num_epoch),
+        Argument("max_steps", [int, type(None)], optional=True, default=None,
+                 doc="Optional positive absolute optimizer-step limit for multi-train. Saves the final iteration checkpoint and exits normally, without a partial-epoch checkpoint or an external kill."),
 
         # expert / MoE split
         Argument("distance_ranges", list, optional=True, doc=doc_distance_ranges),
@@ -1591,6 +1593,7 @@ def embedding():
             Argument("lem_pair", dict, slem_pair()),
             Argument("lem_moe_v3_prior", dict, slem_prior()),
             Argument("lem_moe_v3_prior_2b", dict, slem_prior_2b()),
+            Argument("lem_moe_v3_edge_prior_2b", dict, slem_prior_2b()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
             Argument("lem_non_linear", dict, slem()),
             Argument("lem_non_linear_h0", dict, slem_h0()),
@@ -3620,7 +3623,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_pair", "lem_moe_v3_prior", "lem_moe_v3_prior_2b", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_pair", "lem_moe_v3_prior", "lem_moe_v3_prior_2b", "lem_moe_v3_edge_prior_2b", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")

@@ -254,6 +254,11 @@ def main_parser() -> argparse.ArgumentParser:
         help="The output files in training.",
     )
 
+    subparsers.add_parser(
+        "multi-train", parents=[parser_train], add_help=False,
+        help="train distance experts with MultiTrainer",
+    )
+
     parser_test = subparsers.add_parser(
         "test",
         parents=[parser_log],
@@ -463,7 +468,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    if args.command not in (None, "train", "test", "run"):
+    if args.command not in (None, "train", "multi-train", "test", "run"):
         set_log_handles(args.log_level, Path(args.log_path) if args.log_path else None)
 
     dict_args = vars(args)
@@ -477,6 +482,10 @@ def main():
     elif args.command == 'train':
         check_config_train(**dict_args)
         train(**dict_args)
+
+    elif args.command == 'multi-train':
+        from dptb.entrypoints.multi_train import multi_train
+        multi_train(**dict_args)
 
     elif args.command == 'test':
         _test(**dict_args)
