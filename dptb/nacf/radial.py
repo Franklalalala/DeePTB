@@ -80,7 +80,7 @@ class TorchRadialBlockTable(nn.Module):
         if not np.isfinite(table.distances).all() or not np.isfinite(table.support_bohr):
             raise ValueError('radial knots and support must be finite')
         if np.iscomplexobj(table.values):
-            raise ValueError('only real non-SOC radial tables are supported')
+            raise ValueError('radial tables must be real; SOC belongs in the complex projector D matrix')
         self.left_shells = table.left_shells
         self.right_shells = table.right_shells
         self.support_bohr = float(table.support_bohr)

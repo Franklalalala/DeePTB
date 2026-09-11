@@ -1,4 +1,4 @@
-"""Geometry-only inference for non-SOC models trained on Full-H minus NACF.
+"""Geometry-only inference for models trained on Full-H minus NACF.
 
 The public input is ASE geometry (species, positions, cell and PBC), never H0,
 DFT labels or precomputed structure priors. Preparation currently runs neighbour
@@ -34,8 +34,10 @@ class NACFGeometryPredictor:
         self.model = model.eval()
         self.bank = table_bank
         self.idp = model.hamiltonian.idp if hasattr(model, 'hamiltonian') else model.idp
-        if self.idp.has_soc:
-            raise ValueError('spinor SOC requires a separate assembly and packing contract')
+        if self.idp.has_soc and not self.idp.nextham_uureal_mask and table_bank.soc is None:
+            raise ValueError('full SOC requires a source-bound spinor projector store')
+        if not self.idp.has_soc and table_bank.soc is not None:
+            raise ValueError('SOC projector store cannot be used with a non-SOC checkpoint')
         self.cutoffs = get_cutoffs_from_model_options(model_options)
         parameter = next(model.parameters())
         self.device, self.dtype = parameter.device, parameter.dtype
@@ -44,32 +46,39 @@ class NACFGeometryPredictor:
 
     def prepare(self, structures):
         """Prepare a geometry or list of geometries; call again after any edit."""
-        if hasattr(structures, 'get_positions'):
-            structures = [structures]
-        structures = list(structures)
-        if not structures:
-            raise ValueError('empty structure batch')
-        assemblies, data = [], []
-        rmax, ermax, oermax = self.cutoffs
-        for atoms in structures:
-            # from_points avoids importing any calculator or arbitrary arrays
-            # attached to ASE Atoms; this is deliberately geometry-only input.
-            graph = AtomicData.from_points(pos=atoms.get_positions(), cell=atoms.cell.array,
-                                           pbc=atoms.pbc, atomic_numbers=atoms.get_atomic_numbers(),
-                                           r_max=rmax, er_max=ermax, oer_max=oermax)
-            assembly = self.bank.prepare(atoms.get_chemical_symbols(), atoms.get_positions() / Bohr2Ang,
-                                         atoms.cell.array / Bohr2Ang, graph['edge_index'].numpy(),
-                                         graph['edge_cell_shift'].numpy(), pbc=atoms.pbc)
-            assemblies.append(assembly)
-            data.append(self.idp(graph))
-        batch = Collater()(data).to(self.device)
-        geometry = AtomicData.to_AtomicDataDict(batch)
-        assembly = assemblies[0] if len(assemblies) == 1 else NACFBatchAssemblyPlan(assemblies)
-        plan = NACFFeaturePlan(assembly, self.idp, output_dtype=self.dtype)
+        plan, geometry = prepare_geometry(self.bank, self.idp, structures, self.cutoffs, output_dtype=self.dtype)
         return PreparedNACFInference(self.model, plan, geometry)
 
     def __call__(self, structures):
         return self.prepare(structures)()
+
+
+def prepare_geometry(bank, idp, structures, cutoffs, *, output_dtype=torch.float32):
+    """Prepare NACF/S inputs independently of a learned model, including full SOC.
+
+    Returns a callable feature plan and the geometry graph on the bank's device.
+    Only species, coordinates, cell and PBC are read from the ASE objects.
+    """
+    if hasattr(structures, 'get_positions'):
+        structures = [structures]
+    structures = list(structures)
+    if not structures:
+        raise ValueError('empty structure batch')
+    assemblies, data = [], []
+    rmax, ermax, oermax = cutoffs
+    for atoms in structures:
+        graph = AtomicData.from_points(pos=atoms.get_positions(), cell=atoms.cell.array,
+                                       pbc=atoms.pbc, atomic_numbers=atoms.get_atomic_numbers(),
+                                       r_max=rmax, er_max=ermax, oer_max=oermax)
+        assembly = bank.prepare(atoms.get_chemical_symbols(), atoms.get_positions() / Bohr2Ang,
+                                atoms.cell.array / Bohr2Ang, graph['edge_index'].numpy(),
+                                graph['edge_cell_shift'].numpy(), pbc=atoms.pbc)
+        assemblies.append(assembly)
+        data.append(idp(graph))
+    batch = Collater()(data).to(bank._anchor.device)
+    geometry = AtomicData.to_AtomicDataDict(batch)
+    assembly = assemblies[0] if len(assemblies) == 1 else NACFBatchAssemblyPlan(assemblies)
+    return NACFFeaturePlan(assembly, idp, output_dtype=output_dtype), geometry
 
 
 class PreparedNACFInference:
@@ -77,7 +86,9 @@ class PreparedNACFInference:
 
     Repeated calls recompute priors on GPU, which allows honest warm timing.
     Returned H is absolute Full-H in eV and S is dimensionless, both in the
-    checkpoint's triangular non-SOC RME layout. ``ptr`` separates structures.
+    checkpoint's declared RME layout. ``ptr`` separates structures. Full SOC
+    retains all four spin blocks and real/imaginary channels; uu-real models
+    return only their explicitly reduced target and cannot predict full SOC H.
     """
     def __init__(self, model, plan, geometry):
         self.model, self.plan, self.geometry = model, plan, geometry
@@ -99,10 +110,10 @@ class PreparedNACFInference:
         return output
 
 
-__all__ = ['NACFGeometryPredictor', 'PreparedNACFInference']
+__all__ = ['NACFGeometryPredictor', 'PreparedNACFInference', 'prepare_geometry', 'load_predictor']
 
 
-def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cuda', backend='auto'):
+def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cuda', backend='auto', soc=None):
     from dptb.nn import build_model
     checkpoint = Path(checkpoint)
     payload = torch.load(checkpoint, map_location='cpu', weights_only=False)
@@ -114,8 +125,11 @@ def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cud
     options = copy.deepcopy(payload['config']['model_options'])
     del payload, state
     options['embedding'].update(so2_fusion_mode='streamed_m_major_ref', mole_linear_mode='split_loop')
-    bank = NACFTableBank(P2TableStore(p2), P23VNAFactorTableStore(p23),
-                         overlap_store=OverlapTableStore(overlap), device=device, backend=backend)
+    from .soc import SOCProjectorStore
+    p2_store = P2TableStore(p2)
+    soc_store = None if soc is None else SOCProjectorStore(soc, p2_store)
+    bank = NACFTableBank(p2_store, P23VNAFactorTableStore(p23),
+                         overlap_store=OverlapTableStore(overlap), soc_store=soc_store, device=device, backend=backend)
     if bank.p2_manifest_sha256 != expected_p2_sha256:
         raise ValueError('P2 manifest does not match supplied training fingerprint')
     model = build_model(checkpoint=str(checkpoint), model_options=options,

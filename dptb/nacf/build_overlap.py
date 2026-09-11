@@ -8,11 +8,24 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
 from tools.build_nonsoc_p2_tables import _as_orbital_like, _sbt_context, _build_values, _distance_grid
 from h0rebuild.orb import read_abacus_orb
+
+
+def _build_pair(task):
+    left, right, a, b, sbt, step, output = task
+    support = a.rcut + b.rcut
+    distances = _distance_grid(support, step)
+    values = _build_values(_sbt_context(a, b, **sbt), distances)
+    path = output / f'{left}__{right}.npz'
+    np.savez_compressed(path, distances=distances, values=values.astype(np.float32), left_shells=a.shells,
+                        right_shells=b.shells, support_bohr=support,
+                        onsite_overlap=values[0] if left == right else np.empty((0, 0)))
+    return f'{left}|{right}', dict(path=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
 
 
 def main():
@@ -22,7 +35,10 @@ def main():
     ap.add_argument('--species', nargs='+', required=True)
     ap.add_argument('--output', required=True)
     ap.add_argument('--distance-step', type=float, default=.02)
+    ap.add_argument('--pairs-json', help='Optional JSON pair list, or selection manifest with a pairs list')
+    ap.add_argument('--workers', type=int, default=1)
     args = ap.parse_args()
+    if args.workers < 1: ap.error('workers must be positive')
     raw = Path(args.p2_manifest).read_bytes()
     p2 = json.loads(raw)
     output = Path(args.output)
@@ -42,15 +58,25 @@ def main():
     settings = p2['build_settings']
     sbt = dict(kmax=settings['kmax_bohr_inv'], n_k=settings['n_k'], n_mu=settings['n_mu'], n_phi=settings['n_phi'])
     tables = {}
-    for left, a in orbitals.items():
-        for right, b in orbitals.items():
-            support = a.rcut + b.rcut
-            distances = _distance_grid(support, args.distance_step)
-            values = _build_values(_sbt_context(a, b, **sbt), distances)
-            path = output / f'{left}__{right}.npz'
-            np.savez_compressed(path, distances=distances, values=values.astype(np.float32), left_shells=a.shells, right_shells=b.shells, support_bohr=support, onsite_overlap=values[0] if left == right else np.empty((0, 0)))
-            tables[f'{left}|{right}'] = dict(path=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-            print('BUILT', left, right, values.shape, flush=True)
+    pairs = [f'{a}|{b}' for a in orbitals for b in orbitals]
+    if args.pairs_json:
+        payload = json.loads(Path(args.pairs_json).read_text())
+        pairs = payload['pairs'] if isinstance(payload, dict) else payload
+        pairs = sorted(set(pairs) | {f'{s}|{s}' for s in orbitals})
+    tasks = []
+    for pair in pairs:
+        left, right = pair.split('|')
+        tasks.append((left, right, orbitals[left], orbitals[right], sbt, args.distance_step, output))
+    if args.workers == 1:
+        results = map(_build_pair, tasks)
+        for pair, record in results:
+            tables[pair] = record
+            print('BUILT', pair, flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for pair, record in pool.map(_build_pair, tasks):
+                tables[pair] = record
+                print('BUILT', pair, flush=True)
     manifest = dict(schema='deeptb.overlap_radial_table/v1', complete=True,
                     source_p2_manifest_sha256=hashlib.sha256(raw).hexdigest(),
                     length_unit='bohr', value_unit='dimensionless', harmonic_convention='deeptb_abacus_real',

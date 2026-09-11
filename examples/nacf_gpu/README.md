@@ -2,8 +2,10 @@
 
 `NACFGeometryPredictor` builds NACF and overlap from species, Cartesian positions,
 cell and periodic flags. Its input requires no DFT calculation, H0, structure
-prior file or training labels. It supports non-SOC `lem_moe_v3_prior` and
-`lem_moe_v3_prior_2b` models whose **output is Full H minus NACF**.
+prior file or training labels. It supports `lem_moe_v3_prior` and
+`lem_moe_v3_prior_2b` models whose **output is Full H minus NACF**. Full SOC
+requires an additional source-bound SOC projector sidecar and a checkpoint
+trained for the full spinor target.
 
 This path reconstructs `H = residual + NACF`. NACF means P23 onsite and P2
 hopping; the model's learned 2b contribution is already part of its residual
@@ -84,8 +86,9 @@ batch = predict([atoms, atoms.copy()])
 
 The output is a dictionary with `node_features`, `edge_features` (absolute H in
 eV), `node_overlap`, `edge_overlap` (dimensionless S), geometry and graph keys.
-Features use the checkpoint's triangular non-SOC RME layout, not a dense global
-Hamiltonian. `ptr` and `batch` separate structures; edge rows follow `edge_index`
+Features use the checkpoint's RME layout, not a dense global Hamiltonian:
+triangular non-SOC, explicitly reduced uu-real, or full SOC as configured.
+`ptr` and `batch` separate structures; edge rows follow `edge_index`
 and `edge_cell_shift`. Use the existing DeePTB reconstruction tools for AO blocks
 or H(k)/S(k). No band eigensolve occurs in this interface.
 
@@ -155,7 +158,7 @@ import this builder or `h0rebuild`.
 ## Tests and matched timing
 
 ```bash
-python -m pytest dptb/tests/test_p2_gpu.py dptb/tests/test_nacf_gpu.py -q
+python -m pytest dptb/tests/test_p2_gpu.py dptb/tests/test_nacf_gpu.py dptb/tests/test_nacf_soc.py -q
 python tools/benchmark_nacf_gpu.py \
   --checkpoint /path/to/checkpoint --p2 /path/to/p2 --p23 /path/to/p23 \
   --overlap /path/to/overlap --expected-p2-sha256 TRAINING_P2_MANIFEST_SHA256 \
@@ -218,8 +221,77 @@ GPU-resident coefficients and batched evaluation, while retaining the qualified
 DeePTB **cubic** interpolant and cutoff semantics. It is not a port of the DPA4C
 descriptor or a claim to match DPA4C kernel performance.
 
-SOC requires its own spinor nonlocal assembly and output packing contract.
-Scalar P2/P23 radial assets are reusable ingredients, but copying scalar blocks
-or padding 425 features to the SOC 729 layout does not implement SOC. This API
-rejects SOC mappers. Existing SOC materialization and production data are kept
-separate from this non-SOC model deployment.
+## Full SOC lookup
+
+The scalar radial functions remain real and use the same fused CUDA kernel.
+`soc.py` builds complex spinor projector D matrices from the exact source UPFs,
+including both j channels and matching off-diagonal radial couplings. Assembly
+contracts all four spin blocks (uu, ud, du, dd); scalar base, VNA and overlap
+contribute to spin diagonal blocks. Hermitian projection uses conjugate transpose.
+
+Build a new immutable sidecar, bound to the original P2 manifest and UPF hashes:
+
+```bash
+python -m dptb.nacf.build_soc \
+  --p2 /path/to/p2 --upf-root /path/to/PP_ORB \
+  --gate1-script /path/to/qualified_gate1.py --species C Si \
+  --output /new/path/soc
+```
+
+Pass `soc_store=SOCProjectorStore(soc_dir, p2_store)` to `NACFTableBank`, or
+`soc=soc_dir` to `load_predictor`, or `--soc /path/to/soc` to the inference CLI.
+Full real-valued SOC features are ordered per orbital pair as
+`[Re(uu,ud,du,dd), Im(uu,ud,du,dd)]`. A 27-spatial-AO canvas has 5832 features,
+whereas its uu-real reduction has 729. Complex features are also supported.
+The ABACUS padded AO layout is spin-major, with spin offset equal to the largest
+AO width in the structure/batch. Copying scalar blocks or padding 729 features
+does not recover spin-flip or imaginary channels.
+
+`prepare_geometry(bank, idp, structures, cutoffs)` returns a feature plan and
+geometry graph without loading a learned model. This supports independent full
+SOC lookup validation. A uu-real checkpoint remains a reduced predictor even
+when supplied a full SOC sidecar; it cannot produce full spinor H. The verified
+600773 checkpoint above is non-SOC. Full-SOC lookup results alone are not evidence
+of a trained full-SOC model's speed or prediction accuracy.
+
+## Production timing and memory
+
+```bash
+python -m dptb.nacf.production_benchmark \
+  --checkpoint /path/to/checkpoint --p2 /path/to/p2 --p23 /path/to/p23 \
+  --overlap /path/to/overlap --expected-p2-sha256 TRAINING_P2_MANIFEST_SHA256 \
+  --geometry production100.extxyz --batch-sizes 2 4 8 16 --output /new/report
+python -m dptb.nacf.soc_benchmark \
+  --config /path/to/train_config.json --p2 /path/to/p2 --p23 /path/to/p23 \
+  --overlap /path/to/overlap --soc /path/to/soc \
+  --geometry production100.extxyz --output /new/soc_report
+python -m dptb.nacf.memory_probe --p2 /path/to/p2 --species Si --output /new/memory.json
+```
+
+The production benchmark compares original CPU/SciPy assembly, torch GPU tables,
+and fused native CUDA. The CPU reference retains the production assembler's
+internal query batching and original CPU graph; it does not copy the graph back
+from GPU. Mixed CPU batches call that assembler per structure and concatenate
+features. GPU batches group radial queries across structures by table.
+
+`ai_forward` includes only the model on resident graph/prior inputs, with fresh
+clones and synchronization outside its timer. `*_prior` includes numerical NACF,
+S, packing and any transfer on a prepared geometry; `*_fresh_prior` additionally
+includes new geometry preparation. `cuda_geometry_to_full` includes the entire
+geometry-to-H/S path and NACF add-back. Cold loading, hashes, JIT and output file
+writes are excluded. No DFT labels enter any forward call.
+
+Ratios are **prior time / pure AI forward time**, not prior fractions of total
+inference latency. Report both the ratio of summed per-structure median times
+and the distribution of per-structure ratios. Batch sizes use ordered prefixes;
+each is validated against independent singleton H/S predictions and graph
+ownership. Failures are retained. Shared-GPU rows are excluded from the primary
+aggregate; `--allow-shared-gpu` permits a separately labelled diagnostic aggregate.
+Presence snapshots cannot prove that no transient interference occurred.
+
+The separate fresh-process memory probe records CUDA context, extension import,
+table/input allocation, and first/second native launch after output deallocation.
+PyTorch allocated bytes measure live tensors, reserved bytes include its cache,
+and NVIDIA process MiB additionally includes CUDA runtime/module memory with
+driver rounding. Table buffers, model tensors, geometry-plan tensors, outputs and
+operation peaks are different quantities; do not call their sum kernel size.

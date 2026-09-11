@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Geometry-only non-SOC inference with a source-bound NACF residual model.
+"""Geometry-only inference with a source-bound NACF residual model.
 
 Run from an installed DeePTB checkout (or with PYTHONPATH set to its root).
 Checkpoint deserialization is intended for trusted, locally produced models.
@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--p2', required=True)
     parser.add_argument('--p23', required=True)
     parser.add_argument('--overlap', required=True)
+    parser.add_argument('--soc', help='Source-bound full spinor projector sidecar')
     parser.add_argument('--expected-p2-sha256', required=True,
                         help='Trusted fingerprint from the checkpoint training config')
     parser.add_argument('--target', required=True, choices=['full_h_minus_nacf'])
@@ -41,7 +42,7 @@ def main():
     if output.exists() or manifest.exists():
         raise FileExistsError('use new output paths')
     predictor = load_predictor(args.checkpoint, args.p2, args.p23, args.overlap,
-                               args.expected_p2_sha256, args.device, args.backend)
+                               args.expected_p2_sha256, args.device, args.backend, soc=args.soc)
     structures = read(args.geometry, index=':')
     if not structures:
         raise ValueError('geometry file contains no structures')
@@ -65,8 +66,11 @@ def main():
                   p2_sha256=predictor.bank.p2_manifest_sha256,
                   p23_sha256=predictor.bank.p23.manifest_sha256,
                   overlap_sha256=predictor.bank.overlap.manifest_sha256,
+                  soc_sha256=None if predictor.bank.soc is None else predictor.bank.soc.manifest_sha256,
+                  has_soc=bool(predictor.idp.has_soc),
+                  reduced_matrix_element=int(predictor.idp.reduced_matrix_element),
                   geometry=str(Path(args.geometry).resolve()), structures=len(structures),
-                  target='full_h_minus_nacf', output='absolute Full-H triangular non-SOC RME in eV; S dimensionless',
+                  target='full_h_minus_nacf', output='absolute Full-H checkpoint RME in eV; S dimensionless',
                   device=str(predictor.device), backend=args.backend, torch_version=torch.__version__,
                   model_dtype=str(predictor.dtype), prior_dtype=str(predictor.bank._anchor.dtype),
                   runtime_overrides={'so2_fusion_mode':'streamed_m_major_ref','mole_linear_mode':'split_loop'},

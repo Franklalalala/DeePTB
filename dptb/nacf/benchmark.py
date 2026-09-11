@@ -70,7 +70,7 @@ def cpu_features(predictor, atoms, prepared):
 
 
 @torch.inference_mode()
-def benchmark(predictor, atoms, repeats=5):
+def benchmark(predictor, atoms, repeats=5, warmup=1):
     prepared = predictor.prepare(atoms)
     def cpu_prior():
         return cpu_features(predictor,atoms,prepared)
@@ -95,6 +95,8 @@ def benchmark(predictor, atoms, repeats=5):
         if not np.isfinite(value) or value > (2e-5 if 'features' in key else 2e-6):
             raise AssertionError(f'CPU/GPU disagreement: {key}={value}')
     samples = {k:[] for k in functions}
+    for _ in range(max(0,warmup-1)):
+        for fn in functions.values(): fn()
     # Alternate order to reduce directional bias from shared-machine load.
     for repeat in range(repeats):
         names = list(functions)
@@ -139,7 +141,7 @@ def main():
         report.update(mode='ai_forward_batches',timing_scope=benchmark_forward_batches.__doc__)
         report['cases']=benchmark_forward_batches(predictor,structures,args.forward_batches,args.repeats,args.warmup)
     for atoms in ([] if args.forward_batches else structures):
-        row=(benchmark_native if args.compare_native else benchmark)(predictor,atoms,args.repeats)
+        row=(benchmark_native if args.compare_native else benchmark)(predictor,atoms,args.repeats,args.warmup)
         report['cases'].append(row)
         print('MATCHED',json.dumps(row),flush=True)
     output.parent.mkdir(parents=True,exist_ok=True)
@@ -235,7 +237,7 @@ def benchmark_forward_batches(predictor, structures, batch_sizes=(1,2,4,8,16), r
 
 
 @torch.inference_mode()
-def benchmark_native(predictor, atoms, repeats=5):
+def benchmark_native(predictor, atoms, repeats=5, warmup=1):
     """Alternate backends on the exact same tables, plan and checkpoint."""
     prepared = predictor.prepare(atoms)
     original = {key:table.backend for key,table in predictor.bank.tables.items()}
@@ -256,6 +258,10 @@ def benchmark_native(predictor, atoms, repeats=5):
                 for k in ('node_features','edge_features','node_overlap','edge_overlap')}
         if any(not np.isfinite(v) or v>2e-5 for v in errors.values()):
             raise AssertionError(errors)
+        for _ in range(max(0,warmup-1)):
+            for backend in ('torch','cuda'):
+                select(backend)
+                timed(prepared.plan); timed(prepared)
         for repeat in range(repeats):
             order=['torch','cuda'] if repeat%2==0 else ['cuda','torch']
             for backend in order:

@@ -27,7 +27,7 @@ class NACFTableBank(nn.Module):
     Tables are loaded/checksummed once during preparation, never in forward.
     """
 
-    def __init__(self, p2_store, p23_store, *, overlap_store=None, device='cuda', dtype=torch.float64, backend='auto'):
+    def __init__(self, p2_store, p23_store, *, overlap_store=None, soc_store=None, device='cuda', dtype=torch.float64, backend='auto'):
         super().__init__()
         self.backend = backend
         self.p2_manifest_sha256 = (hashlib.sha256((p2_store.root / 'manifest.json').read_bytes()).hexdigest()
@@ -38,6 +38,9 @@ class NACFTableBank(nn.Module):
                 raise ValueError('P23 manifest does not bind the supplied P2 table')
         self.p2 = p2_store
         self.p23 = p23_store
+        self.soc = soc_store
+        if soc_store is not None and soc_store.manifest['source_p2_manifest_sha256'] != self.p2_manifest_sha256:
+            raise ValueError('SOC sidecar does not bind the supplied P2 manifest')
         self.overlap = p2_store if overlap_store is None else overlap_store
         if overlap_store is not None:
             if overlap_store.manifest['source_p2_manifest_sha256'] != self.p2_manifest_sha256:
@@ -113,7 +116,10 @@ class NACFAssemblyPlan(nn.Module):
         device, dtype = bank._anchor.device, bank._anchor.dtype
 
         def reg(name, data, integer=False):
-            self.register_buffer(name, torch.as_tensor(np.array(data, copy=True), dtype=torch.long if integer else dtype, device=device))
+            value_dtype = torch.long if integer else dtype
+            if np.iscomplexobj(data):
+                value_dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
+            self.register_buffer(name, torch.as_tensor(np.array(data, copy=True), dtype=value_dtype, device=device))
 
         reg('positions', positions)
         reg('cell', cell)
@@ -205,6 +211,10 @@ class NACFAssemblyPlan(nn.Module):
         for number, ((kind, si, sj, sk), raw) in enumerate(contractions.items()):
             reg(f'terms_{number}', raw, True)
             matrix = bank.p2.d_eff(sk) if kind == 'projector' else np.diag(bank.p23.epsilon(sk))
+            if kind == 'projector' and bank.soc is not None:
+                matrix = bank.soc.d_spinor(sk)
+                n = matrix.shape[0] // 2
+                matrix = matrix.reshape(2, n, 2, n).transpose(0, 2, 1, 3).reshape(4, n, n)
             reg(f'matrix_{number}', matrix)
             self.contraction_specs.append((number, kind, self.pair_ids[(kind, sk, si)], self.pair_ids[(kind, sk, sj)], int(bank.p2.species[si]['orbital_norb']), int(bank.p2.species[sj]['orbital_norb'])))
 
@@ -228,19 +238,36 @@ class NACFAssemblyPlan(nn.Module):
             target = p2 if pair[0] == 'p2_base' else overlap
             target[rows[:, 0], :ni, :nj] = values[self.pair_ids[pair]][rows[:, 1]]
         vna = torch.zeros_like(p2)
+        spinor = (torch.zeros((p2.shape[0], 4, self.width, self.width), device=p2.device,
+                             dtype=torch.complex128 if p2.dtype == torch.float64 else torch.complex64)
+                  if self.bank.soc is not None else None)
         for number, kind, left, right, ni, nj in self.contraction_specs:
             rows = getattr(self, f'terms_{number}')
             target = p2 if kind == 'projector' else vna
             for start in range(0, rows.shape[0], 2048):
                 part = rows[start:start + 2048]
                 a, b = values[left][part[:, 1]], values[right][part[:, 2]]
-                contribution = a.transpose(-1, -2) @ getattr(self, f'matrix_{number}') @ b
-                target[:, :ni, :nj].index_add_(0, part[:, 0], contribution)
+                matrix = getattr(self, f'matrix_{number}')
+                if kind == 'projector' and spinor is not None:
+                    contribution = a[:, None].transpose(-1, -2).to(matrix.dtype) @ matrix @ b[:, None].to(matrix.dtype)
+                    spinor[:, :, :ni, :nj].index_add_(0, part[:, 0], contribution)
+                else:
+                    contribution = a.transpose(-1, -2) @ matrix @ b
+                    target[:, :ni, :nj].index_add_(0, part[:, 0], contribution)
         # This is the exact non-SOC projection used by materialization: onsite
         # symmetric, reverse edges averaged before conversion to model gauge.
         def hermitian(blocks):
             node, edge = blocks[:self.natoms], blocks[self.natoms:]
-            return (node + node.transpose(-1, -2)) * .5, (edge + edge[self.reverse].transpose(-1, -2)) * .5
+            return (node + node.transpose(-1, -2).conj()) * .5, (edge + edge[self.reverse].transpose(-1, -2).conj()) * .5
+        if spinor is not None:
+            spinor[:, 0] += p2
+            spinor[:, 3] += p2
+            # Padded spin-major AO blocks: both spin offsets use self.width.
+            p2 = spinor.reshape(-1, 2, 2, self.width, self.width).transpose(2, 3).reshape(-1, 2*self.width, 2*self.width)
+            def lift(blocks):
+                eye = torch.eye(2, dtype=blocks.dtype, device=blocks.device)
+                return (blocks[:, None, :, None, :] * eye[None, :, None, :, None]).reshape(-1, 2*self.width, 2*self.width)
+            vna, overlap = lift(vna), lift(overlap)
         node_p2, edge_p2 = hermitian(p2)
         node_vna = (vna[:self.natoms] + vna[:self.natoms].transpose(-1, -2)) * .5
         node_s, edge_s = hermitian(overlap)
@@ -350,7 +377,8 @@ class NACFFeaturePlan(nn.Module):
 
     Mapping is compiled once from the same ``OrbitalMapper`` used by the
     checkpoint. The hot path has no orbital loops or host synchronizations.
-    Outputs are raw, triangular non-SOC RME, as expected by prior_2b input.
+    Outputs follow the mapper: triangular non-SOC, directed uu-real, or full
+    SOC orbital-pair-major [Re(uu,ud,du,dd), Im(uu,ud,du,dd)] features.
     """
 
     def __init__(self, assembly: NACFAssemblyPlan, idp, *, output_dtype=torch.float32):
@@ -358,14 +386,24 @@ class NACFFeaturePlan(nn.Module):
         from dptb.data.interfaces.blockwise_tensor import ensure_spatial_block_mapper, onsite_feature_slices, edge_feature_slices
         from dptb.utils.constants import ABACUS2DeePTB, anglrMId
         from scipy.linalg import block_diag
-        ensure_spatial_block_mapper(idp)
-        if getattr(idp, 'has_soc', False):
-            raise ValueError('NACF GPU features support non-SOC only')
+        self.full_soc = bool(getattr(idp, 'has_soc', False) and not getattr(idp, 'nextham_uureal_mask', False))
+        self.spinor_input = getattr(assembly.bank, 'soc', None) is not None
+        self.soc_doubling = bool(getattr(idp, 'soc_complex_doubling', False))
+        if self.full_soc:
+            if not self.spinor_input:
+                raise ValueError('full SOC requires a source-bound spinor projector store')
+            if self.soc_doubling == output_dtype.is_complex:
+                raise ValueError('SOC output dtype disagrees with real/imag doubling')
+        else:
+            ensure_spatial_block_mapper(idp)
+            if self.spinor_input and not getattr(idp, 'has_soc', False):
+                raise ValueError('spinor tables require a SOC mapper')
         idp.get_orbital_maps()
         idp.get_orbpair_maps()
         self.assembly = assembly
         self.output_dtype = output_dtype
         width, nfeatures = assembly.width, int(idp.reduced_matrix_element)
+        block_width = width * (2 if self.spinor_input else 1)
         permutations = {}
         for symbol in set(assembly.symbols):
             shells = tuple(map(int, assembly.bank.p2.species[symbol]['orbital_shells']))
@@ -383,19 +421,42 @@ class NACFFeaturePlan(nn.Module):
         for name, pairs in specs:
             indices = np.zeros((len(pairs), nfeatures), dtype=np.int64)
             signs = np.zeros((len(pairs), nfeatures))
+            imaginary = np.zeros((len(pairs), nfeatures), dtype=bool)
             for row_id, (left, right) in enumerate(pairs):
                 li, ls = permutations[left]
                 ri, rs = permutations[right]
-                slices = onsite_feature_slices(idp, left) if name == 'node' else edge_feature_slices(idp, left, right)
+                if self.full_soc:
+                    slices = [(idp.orbital_maps[left][a], idp.orbital_maps[right][b],
+                               idp.orbpair_maps[idp.basis_to_full_basis[left][a]+'-'+idp.basis_to_full_basis[right][b]])
+                              for a in idp.basis[left] for b in idp.basis[right]]
+                else:
+                    slices = onsite_feature_slices(idp, left) if name == 'node' else edge_feature_slices(idp, left, right)
                 for row, col, feature in slices:
-                    indices[row_id, feature] = (li[row, None] * width + ri[None, col]).ravel()
-                    signs[row_id, feature] = (ls[row, None] * rs[None, col]).ravel()
+                    if self.full_soc:
+                        spatial_signs = (ls[row, None] * rs[None, col]).ravel()
+                        spin_indices = np.concatenate([((li[row, None]+u*width)*block_width + ri[None, col]+v*width).ravel()
+                                                       for u,v in ((0,0),(0,1),(1,0),(1,1))])
+                        copies = 2 if self.soc_doubling else 1
+                        indices[row_id, feature] = np.tile(spin_indices, copies)
+                        signs[row_id, feature] = np.tile(spatial_signs, 4*copies)
+                        if self.soc_doubling:
+                            imaginary[row_id, feature.start+len(spin_indices):feature.stop] = True
+                    else:
+                        indices[row_id, feature] = (li[row, None] * block_width + ri[None, col]).ravel()
+                        signs[row_id, feature] = (ls[row, None] * rs[None, col]).ravel()
             self.register_buffer(f'{name}_indices', torch.as_tensor(indices, device=assembly.positions.device))
             self.register_buffer(f'{name}_signs', torch.as_tensor(signs, device=assembly.positions.device, dtype=assembly.positions.dtype))
+            if self.full_soc and self.soc_doubling:
+                self.register_buffer(f'{name}_imaginary', torch.as_tensor(imaginary, device=assembly.positions.device))
 
     def pack(self, node, edge):
         nrme = node.flatten(1).gather(1, self.node_indices) * self.node_signs
         erme = edge.flatten(1).gather(1, self.edge_indices) * self.edge_signs
+        if self.full_soc and self.soc_doubling:
+            nrme = torch.where(self.node_imaginary, nrme.imag if nrme.is_complex() else torch.zeros_like(nrme), nrme.real)
+            erme = torch.where(self.edge_imaginary, erme.imag if erme.is_complex() else torch.zeros_like(erme), erme.real)
+        elif not self.full_soc:
+            nrme, erme = nrme.real, erme.real
         return nrme.to(self.output_dtype), erme.to(self.output_dtype)
 
     def forward(self):
