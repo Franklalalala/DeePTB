@@ -1,6 +1,1 @@
-继续审查本分支相对 72f3cb6 的修复，先读 README.md 和 SOURCE_MANIFEST.json。
-当前修复版的有限 100 结构验收已启动；不要依据历史 PAUSED 文件恢复已退役的 v3 进程，也不要修改正在运行的源码。
-重点仍是未通过的 Mn 13.244664 meV：共自旋 s 块近低秩误差还没有参考分项归因；AO 插值诊断没有解决它。
-先核对最新 attempt/identity/return-code 回执和实际进程。区分制表完成、已完成案例、数值失败、整个验收完成和端到端性能。
-缓存和 native 边界的原反例已修复并做针对性检查；复核新实现是否引入新的缺陷，不要把合成缓存测试当作 NACF 真实标签验收。
-原始 50 SOC + 50 non-SOC cohort 和 Hmax<5 meV、Smax<1e-6 门限不得替换或放宽。关键结论需要独立参考分项，不能从 H 矩阵反拟合。
+先读 ONLINE_REVIEW_BRIEF_CN.md 和 SCALE68_REVIEW.md。用户要求当前远端长测保持暂停，先进行独立审查。v4 已结束76/100：73 PASS、2 NUMERICAL_FAIL、1预算ERROR；2 worker在途暂停，22未开始。不要恢复或修改冻结运行；不要把68元素历史P2清单当作H0表已覆盖。按证据分别审查数值、缓存、native边界和全量扩展方案。

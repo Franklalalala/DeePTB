@@ -100,3 +100,7 @@ channels and lmax=3. The legacy local-grid kernel has a fixed 16-channel stack
 array and insufficient arbitrary-input validation. This does not affect this
 cohort, but general-purpose local-grid native API hardening remains open; do not
 advertise support for >16-channel bases or unvalidated raw native tensors.
+
+## Latest paused snapshot (2026-09-13)
+
+At user request, the v4 dispatcher and two workers are paused after 76/100 completed: 73 PASS, 2 NUMERICAL_FAIL, 1 budget ERROR; 22 cases have not started. Source identity was reverified unchanged. Mn Hmax is 13.2446639 meV and Ca (SOC_mp-19824 atom 0) is 7.5399653 meV. SOC_mp-23435 requires an estimated 5143.45 MiB versus the configured 4096 MiB; it was not retried. The queued correlation-mask diagnostic was cancelled without producing results. See ONLINE_REVIEW_BRIEF_CN.md and SCALE68_REVIEW.md for the online review and full68 expansion scope.
