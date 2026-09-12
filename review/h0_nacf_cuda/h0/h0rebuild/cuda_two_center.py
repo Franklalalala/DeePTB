@@ -42,6 +42,8 @@ class CUDATwoCenter:
         if any(c.l > 4 for d in species_data.values() for c in d.orb.channels) or any(p.l > 4 for d in species_data.values() for p in d.upf.projectors):
             raise NotImplementedError("CUDA two-center supports orbital/projector l <= 4; unsupported channels must not be silently truncated")
         self.device = torch.device(device)
+        if self.device.type != 'cuda': raise ValueError('CUDATwoCenter requires a CUDA device')
+        if self.device.index is None: self.device = torch.device('cuda', torch.cuda.current_device())
         with torch.cuda.device(self.device):
             verify('_cuda_two_center', check_device=True)
         self.nspin = nspin
@@ -288,15 +290,15 @@ class CUDATwoCenter:
             (out_S, out_T): PyTorch tensors of shape [N_pairs, max_norb, max_norb] on GPU.
         """
         n_pairs = len(pair_symbols)
-        if n_pairs == 0:
-            empty = torch.empty((0, self.max_norb, self.max_norb), dtype=torch.float64, device=self.device)
-            return empty, empty
-
         if not isinstance(displacements, torch.Tensor):
             disp_tensor = torch.tensor(displacements, dtype=torch.float64, device=self.device)
         else:
             disp_tensor = displacements.to(dtype=torch.float64, device=self.device)
 
+        if disp_tensor.shape != (n_pairs, 3):
+            raise ValueError('displacements must have shape [len(pair_symbols), 3]')
+        disp_tensor = disp_tensor.contiguous()
+        if not torch.isfinite(disp_tensor).all(): raise ValueError('Nonfinite displacements')
         s1_indices = [self._check_species(s1) for s1, s2 in pair_symbols]
         s2_indices = [self._check_species(s2) for s1, s2 in pair_symbols]
         pair_s1 = torch.tensor(s1_indices, dtype=torch.int32, device=self.device)

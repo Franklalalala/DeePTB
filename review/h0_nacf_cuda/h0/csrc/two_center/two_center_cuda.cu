@@ -1,6 +1,7 @@
 #include "two_center_cuda.cuh"
 #include "sph_harm_cuda.cuh"
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 namespace two_center {
 
@@ -394,6 +395,7 @@ void launch_eval_two_center_batch_cuda(
         out_S.data_ptr<double>(),
         out_T.data_ptr<double>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_eval_projector_overlap_batch_cuda(
@@ -456,6 +458,7 @@ void launch_eval_projector_overlap_batch_cuda(
         max_norb,
         out_Q.data_ptr<double>()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void launch_assemble_nonlocal_candidates_cuda(
@@ -488,6 +491,7 @@ void launch_assemble_nonlocal_candidates_cuda(
             norb_j,
             out_Vnl.data_ptr<double>()
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
         int full_ni = 2 * norb_i;
         int full_nj = 2 * norb_j;
@@ -516,6 +520,7 @@ void launch_assemble_nonlocal_candidates_cuda(
             out_real.data_ptr<double>(),
             out_imag.data_ptr<double>()
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         
         out_Vnl.copy_(torch::complex(out_real, out_imag));
     }

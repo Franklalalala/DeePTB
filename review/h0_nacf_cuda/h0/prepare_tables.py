@@ -1,5 +1,6 @@
 """Explicit offline preparation for an immutable cohort; no H/S oracle reads."""
 import argparse, json, time, traceback
+from acceptance import write
 from pathlib import Path
 from h0rebuild.offline import prepare_species, load_species, prepared_two_center
 from h0rebuild.models import SpeciesData
@@ -8,8 +9,8 @@ from h0rebuild.precompiled import sha256
 
 def prepare(raw, store):
     raw, store = Path(raw), Path(store); store.mkdir(parents=True, exist_ok=True)
-    from h0rebuild.table_contract import current, verify_contract, write_contract
-    if (store/'source_contract.json').exists(): verify_contract(store)
+    from h0rebuild.table_contract import current, verify_contract, write_contract, ensure_store
+    ensure_store(store)
     numerical_sources = current()
     catalog = {'schema': 1, 'raw': str(raw), 'store': str(store), 'cases': {}, 'errors': {}}
     memo = {}
@@ -32,7 +33,7 @@ def prepare(raw, store):
             print(folder.name, 'PREPARED', flush=True)
         except Exception:
             catalog['errors'][folder.name] = traceback.format_exc(); print(folder.name, catalog['errors'][folder.name], flush=True)
-        (store/'catalog.json').write_text(json.dumps(catalog,indent=2)+'\n')
+        write(store/'catalog.json',catalog)
     print(json.dumps({'prepared':len(catalog['cases']), 'errors':len(catalog['errors']), 'unique_species_inputs':len(memo)}),flush=True)
     if current() != numerical_sources: raise RuntimeError('Numerical source changed during offline preparation')
     write_contract(store)

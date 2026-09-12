@@ -77,7 +77,7 @@ def lda_pz81_torch(rho):
     return t.where(active,2*(vx+t.where(rs<1,high,low)),t.zeros_like(rho))
 
 
-def pbe_torch_hybrid(rho,grad,gvec,*,density_threshold):
+def pbe_torch_hybrid(rho,grad,gvec,*,density_threshold,pw_mask=None):
     """LibXC CPU derivatives, torch spectral divergence; explicit transfers."""
     import torch as t
     from .xc import pbe_libxc_derivatives
@@ -85,11 +85,10 @@ def pbe_torch_hybrid(rho,grad,gvec,*,density_threshold):
     vrho,vsigma=pbe_libxc_derivatives(to_numpy(rho),to_numpy(sigma),density_threshold=density_threshold)
     vrho=t.as_tensor(vrho,dtype=t.float64,device=rho.device)
     vsigma=t.as_tensor(vsigma,dtype=t.float64,device=rho.device)
-    div=t.zeros_like(rho,dtype=t.complex128)
-    for axis in range(3):
-        coeff=t.fft.fftn(2*vsigma*grad[axis])/rho.numel()
-        div+=1j*gvec[...,axis]*coeff
-    return 2*(vrho-(t.fft.ifftn(div)*rho.numel()).real)
+    from .pw_derivatives import derivative
+    mask=t.ones_like(rho,dtype=t.bool) if pw_mask is None else pw_mask
+    div=sum(derivative(2*vsigma*grad[axis],gvec,mask,axis) for axis in range(3))
+    return 2*(vrho-div)
 
 
 def build_periodic_field_torch(structure,species_data,*,ecutrho_ry,fft_shape,
@@ -165,7 +164,7 @@ def build_periodic_field_torch(structure,species_data,*,ecutrho_ry,fft_shape,
             vxc=lda_pz81_torch(rho_xc);xc_backend="torch_lda_pz81"
         elif xc_upper in {"PBE","GGA_PBE"}:
             grad=tuple(ifft(1j*gvec[...,axis]*(rg+cg)) for axis in range(3))
-            vxc=pbe_torch_hybrid(rho_xc,grad,gvec,density_threshold=pbe_density_threshold)
+            vxc=pbe_torch_hybrid(rho_xc,grad,gvec,density_threshold=pbe_density_threshold,pw_mask=mask)
             xc_backend="libxc_cpu_derivatives_torch_spectral_divergence"
         else:
             vxc=t.zeros_like(rho);xc_backend="none"

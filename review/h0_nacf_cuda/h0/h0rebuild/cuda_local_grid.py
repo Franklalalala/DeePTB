@@ -244,10 +244,15 @@ class CudaPeriodicFFTGridAOCache:
         dr = float(orb.dr)
         rcut = float(orb.rcut)
 
-        c_arr = np.zeros((num_ch, 4, n_int), dtype=np.float64)
-        for ic, ch in enumerate(orb.channels):
-            cs = CubicSpline(orb.r, ch.radial, bc_type="not-a-knot", extrapolate=False)
-            c_arr[ic] = cs.c
+        stored = orb.metadata.get('offline_spline_coefficients')
+        if stored is None:
+            if 'offline_source_sha256' in orb.metadata:
+                raise ValueError('Offline AO spline coefficients missing; explicitly prepare species')
+            c_arr = np.stack([CubicSpline(orb.r, ch.radial, bc_type="not-a-knot", extrapolate=False).c for ch in orb.channels])
+        else:
+            c_arr = np.asarray(stored, dtype=np.float64)
+            if c_arr.shape != (num_ch, 4, n_int) or not np.isfinite(c_arr).all():
+                raise ValueError('Invalid offline AO spline coefficients')
 
         descriptors = orb.descriptors()
         descs = np.array([[d.channel_index, d.l, d.m] for d in descriptors], dtype=np.int32)

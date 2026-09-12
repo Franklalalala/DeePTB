@@ -69,9 +69,8 @@ def pbe_libxc_derivatives(rho, sigma, *, density_threshold=1.0e-6):
     if sigma.shape != n.shape:
         raise ValueError("sigma and rho must have identical shapes")
     active = n.ravel() >= float(density_threshold)
-    # pylibxc bindings do not expose a stable cross-version threshold setter.
-    # Evaluate inactive points at the threshold, then apply the same zero mask
-    # that LibXC's density threshold produces in the audited ABACUS path.
+    # The installed, pinned pylibxc exposes the same LibXC threshold setter
+    # used by ABACUS. Keep external masking only for negative/inactive points.
     rho_eval = np.where(active, n.ravel(), float(density_threshold))
     sigma_eval = np.where(active, sigma.ravel(), 0.0)
     inp = {"rho": rho_eval, "sigma": sigma_eval}
@@ -79,7 +78,9 @@ def pbe_libxc_derivatives(rho, sigma, *, density_threshold=1.0e-6):
     vrho = np.zeros(n.size, dtype=float)
     vsigma = np.zeros(n.size, dtype=float)
     for name in ("GGA_X_PBE", "GGA_C_PBE"):
-        result = pylibxc.LibXCFunctional(name, "unpolarized").compute(inp, do_vxc=True)
+        functional = pylibxc.LibXCFunctional(name, "unpolarized")
+        functional.set_dens_threshold(density_threshold)
+        result = functional.compute(inp, do_vxc=True)
         vrho += np.asarray(result["vrho"], dtype=float).reshape(-1)
         vsigma += np.asarray(result["vsigma"], dtype=float).reshape(-1)
 
@@ -94,6 +95,7 @@ def pbe_vxc_ry(
     gvec: np.ndarray,
     *,
     density_threshold: float = 1.0e-6,
+    pw_mask=None,
 ) -> np.ndarray:
     """Unpolarized PBE multiplicative potential through optional LibXC.
 
@@ -111,5 +113,7 @@ def pbe_vxc_ry(
     sigma = sum(np.asarray(g, dtype=float) ** 2 for g in grad_rho)
     vrho, vsigma_grid = pbe_libxc_derivatives(n, sigma, density_threshold=density_threshold)
     flux = tuple(2.0 * vsigma_grid * np.asarray(g, dtype=float) for g in grad_rho)
-    v_hartree = vrho - _periodic_divergence(flux, gvec)
+    from .pw_derivatives import derivative
+    mask=np.ones(n.shape,dtype=bool) if pw_mask is None else pw_mask
+    v_hartree = vrho - sum(derivative(f,gvec,mask,axis) for axis,f in enumerate(flux))
     return 2.0 * v_hartree  # hartree -> rydberg

@@ -5,8 +5,11 @@ from .radial_quadrature import simpson_rab
 
 def prepare_field_upf(upf, cutoff_bohr=15.0):
     if not np.isfinite(cutoff_bohr) or cutoff_bohr<=0:raise ValueError('pseudo_rcut_bohr must be finite and positive')
-    above=np.flatnonzero(upf.r>cutoff_bohr)
-    n=(2*((int(above[0])+2)//2)-1) if len(above) else len(upf.r)
+    # UPF v2 reader first drops the last sample of even meshes. This is
+    # a field-only view: full projector inputs remain separate in assemble_h0.
+    reader_n=len(upf.r)-(len(upf.r)%2 == 0)
+    above=np.flatnonzero(upf.r[:reader_n]>cutoff_bohr)
+    n=min(reader_n, 2*((int(above[0])+2)//2)-1) if len(above) else reader_n
     if n<3:raise ValueError('Pseudopotential field cutoff leaves fewer than 3 samples')
     r=upf.r[:n];rab=upf.rab[:n];q=upf.rhoatom_q[:n].copy()
     charge=float(simpson_rab(q,rab))

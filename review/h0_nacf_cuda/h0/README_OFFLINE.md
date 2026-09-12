@@ -1,6 +1,6 @@
-# Reviewed H0 offline runtime, revision 3
+# Reviewed H0 offline runtime, revision 4; offline schema v2
 
-The Liyue installation is `/home/mingkang_nt/codex/h0_cuda_production_gemini_20260912/review_candidate`.
+The Liyue installation is `/home/mingkang_nt/codex/h0_review_fixes_20260913/h0`.
 Source `env.sh` to select the pinned Python/Torch/CUDA environment and `H0_OFFLINE_TABLE_DIR`.
 `python precompile.py --check` verifies existing binaries without importing a compiler helper.
 The installed kernels contain sm80/86/89/90 cubins. Numerical verification is on L40S (sm89).
@@ -41,13 +41,14 @@ are immutable. Runtime does not silently regenerate or repair them.
   valence density before superposition. Preserve the full projector/orbital two-center inputs.
   Keep the requested total-electron rescaling afterward.
 
-The former 100-case CPU/direct versus hybrid campaign is stopped and preserved. `new100_v3.py`
-is the current finite two-GPU, new-only campaign over the identical 100 structures. Its result
-directory is `new100_v3`; each result records source identities, table identity, binary hashes,
-input moments and cutoff. Acceptance remains Hmax < 5 meV and Smax < 1e-6. Full independent
-FP64 parity is representative prior evidence, not a newly measured 100-case result.
+The old campaigns are preserved as historical evidence. `acceptance.py` is the
+current finite two-GPU runner; new100/new100_v3 main entries delegate to it.
+Results live under acceptance_v4/<identity>/cases/<case>/<attempt>. Only an accepted
+terminal receipt plus a matching zero child return code can be reused. Source,
+input, binary or table identity changes select a new run. Paused workers are
+excluded from active timeout accounting. Hmax < 5 meV and Smax < 1e-6 are unchanged.
 
-`check_offline.py` verified exact fresh/disk coefficients for four scalar/SOC compositions,
-reordered-species reuse, radial mutation rejection and a full H0 with UPF/ORB reads and
-tabulation forbidden. Current acceptance still has unresolved failures; do not call this
-100/100 scientific acceptance or complete SOC/non-SOC coverage before the campaign finishes.
+The current focused verifier is tests_h0fast/test_review_boundaries.py. The older
+check_offline.py is historical and asserts the superseded shared-object behavior.
+Current cache hits deliberately return private buffers. Mn remains a numerical
+failure; see the parent README for exact evidence and the running cohort status.

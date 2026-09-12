@@ -106,11 +106,13 @@ def _indexed_elements(
         if attr is None:
             continue
         try:
-            attr_index = int(float(attr))
+            if not re.fullmatch(r"[+]?[0-9]+", str(attr).strip()):
+                raise ValueError("index must be a decimal integer")
+            attr_index = int(attr)
         except (TypeError, ValueError):
             # Legacy Fortran I1 output overflows at projector 10 (index="*").
             # Numbered tags, already checked above, remain the authoritative slots.
-            if str(attr).strip() == '*' and all(has_suffix):
+            if str(attr).strip() == '*' and all(has_suffix) and slot + 1 >= 10:
                 mismatches.append({'slot': int(slot + 1), 'index_attribute': str(attr)})
                 continue
             raise ValueError(f"Non-numeric index attribute on {prefix} slot {slot + 1}: {attr!r}")

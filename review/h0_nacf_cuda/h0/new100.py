@@ -2,7 +2,7 @@
 import os, sys, json, time, traceback, subprocess, gc
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
-RUN=ROOT/'new100'; RUN.mkdir(exist_ok=True)
+RUN=ROOT/'new100'
 
 def write(path,data):
     tmp=path.with_suffix('.pending');tmp.write_text(json.dumps(data,indent=2,default=str)+'\n');tmp.replace(path)
@@ -32,11 +32,11 @@ def worker(cid):
             return real_popen(args,*a,**k)
         subprocess.Popen=guarded
         folder=Path(cat['raw'])/cid
-        assert sha256(folder/'STRU')==entry['STRU_sha256']
+        if sha256(folder/'STRU')!=entry['STRU_sha256']: raise ValueError('STRU changed after preparation')
         st,sd,opts,contract=production_io.load_case(folder,prepared_species=sd)
         counts=[sd[a.species].orb.norb*(2 if opts['nspin']==4 else 1) for a in st.atoms]
         report.update(atoms=len(st.atoms),nspin=opts['nspin'],species=list(sd),table_key=entry['table_key'])
-        report.update(reader_revision='atomic-mag/v2', field_revision='ABACUS-msh-atomic-normalization/v3',
+        report.update(reader_revision='atomic-mag/v2', field_revision='ABACUS-reader-odd-PW-libxc-threshold/v4',
             initial_moments_z=opts.get('initial_moments_z'), pseudo_rcut_bohr=opts['pseudo_rcut_bohr'],
             reader_sha256=sha256(ROOT/'production_io.py'),assembly_sha256=sha256(ROOT/'h0rebuild/assemble.py'),field_preparation_sha256=sha256(ROOT/'h0rebuild/field_inputs.py'))
         write(out,report)
@@ -70,33 +70,6 @@ def worker(cid):
         report['status']='ERROR';report['error']=traceback.format_exc()
     report['finished']=time.time();write(out,report);print(cid,report['status'],report.get('assembly_seconds'),flush=True)
 
-def supervise():
-    cat=json.loads((ROOT/'offline_tables/catalog.json').read_text())
-    # Same staged cohort; failures first, no sample replacement.
-    all_ids=sorted(p.name for p in Path(cat['raw']).iterdir() if (p/'STRU').exists())
-    first=['nonSOC_db_seq_id_10868','nonSOC_db_seq_id_1773','SOC_mp-561353','SOC_mp-510294','nonSOC_db_seq_id_2251','nonSOC_db_seq_id_9278']
-    order=first+[x for x in all_ids if x not in first];assert len(order)==100 and len(set(order))==100
-    state={'status':'RUNNING','total':100,'completed':0,'cases':[],'old_version_execution':False,
-           'thresholds':{'Hmax_eV':.005,'Smax':1e-6},'FP64_parity':'Prior representative component/full tests; not measured afresh for all 100'}
-    for cid in order:
-        state['current']=cid;write(RUN/'status.json',state)
-        existing=RUN/(cid+'.json')
-        previous=json.loads(existing.read_text()) if existing.exists() else {}
-        reusable=previous.get('status') in ('PASS','NUMERICAL_FAIL') and (previous.get('reader_revision')=='atomic-mag/v2' or cid.startswith('nonSOC_'))
-        if reusable:
-            row=previous
-        elif cid not in cat['cases']:
-            row={'id':cid,'status':'PREPARATION_ERROR','error':cat['errors'].get(cid)};write(RUN/(cid+'.json'),row)
-        else:
-            with (RUN/(cid+'.log')).open('w') as log:
-                try:r=subprocess.run([sys.executable,__file__,cid],stdout=log,stderr=subprocess.STDOUT,timeout=1200)
-                except subprocess.TimeoutExpired:r=None
-            path=RUN/(cid+'.json');row=json.loads(path.read_text()) if path.exists() else {'id':cid,'status':'ERROR'}
-            if row['status']=='RUNNING':row.update(status='ERROR',error='worker timeout or process failure');write(path,row)
-        state['cases'].append({'id':cid,'status':row['status']});state['completed']=len(state['cases']);write(RUN/'status.json',state)
-        print(cid,row['status'],state['completed'],flush=True)
-    state['status']='COMPLETE';state['current']=None;write(RUN/'status.json',state)
-
 if __name__=='__main__':
-    if len(sys.argv)>1:worker(sys.argv[1])
-    else:supervise()
+    from acceptance import main
+    raise SystemExit(main())

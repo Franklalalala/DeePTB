@@ -5,7 +5,7 @@ This candidate combines the corrected atom-cell-gauge core with the reviewed two
 On Liyue, use the existing Python 3.10 / Torch 2.8.0+cu128 environment:
 
 ```bash
-cd /home/mingkang_nt/codex/h0_cuda_production_gemini_20260912/review_candidate
+cd /home/mingkang_nt/codex/h0_review_fixes_20260913/h0
 source env.sh
 python precompile.py --check
 ```

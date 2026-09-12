@@ -1,12 +1,14 @@
-# Source snapshot scope
+# Scope of this continuation
 
-`h0/` and `nacf_overlay/` preserve the task's reviewed code under a review-only directory.
-The existing repository production tree is unchanged. This is not an installable merged release.
-The NACF overlay is based on the task's SOC integration source; do not overlay it blindly onto
-an arbitrary DeePTB revision. The local handoff identifies that exact parent and installed environment.
-The focused NACF patch isolates this task's seven runtime/cache changes from inherited SOC code.
+Changes are confined to review/h0_nacf_cuda. The original reviewed parent is
+72f3cb6f51fdee54143847982665d203194eea0d. No production model/training tree is changed.
+The NACF overlay still requires its original SOC integration parent; do not copy
+it blindly into another checkout. This continuation preserves prior/residual,
+P23-onsite/P2-edge, unit and spin conventions.
 
-GitHub contains source, tests, focused diffs, checksums and aggregate review context. It contains no
-credentials, raw H/S/UPF/ORB datasets, paused process inventory, installed 8.9 GiB tables or binaries.
-The separate local handoff includes numerical result records and ABI-specific prebuilt artifacts.
-It is not necessary to rebuild the existing installed binaries to review or resume that environment.
+The historical patches against Gemini and the SOC parent are retained as evidence
+of the preceding snapshot. Use the Git diff against 72f3cb6 for this repair set.
+The installed H0 runtime was frozen before full-cohort dispatch; repository-only
+review documentation and test additions do not alter its computational identity.
+Environment-specific prebuilt binaries and preparation/runtime logs are kept in
+the local/remote task workspaces, outside Git. Large tables remain on Liyue.

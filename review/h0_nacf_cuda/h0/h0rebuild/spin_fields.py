@@ -5,6 +5,7 @@ labels are consumed. Noncollinear transverse initial magnetization is rejected
 by the public interface until independently validated.
 """
 from dataclasses import replace
+from .pw_derivatives import derivative
 import numpy as np
 from .nufft_backends import Type1NUFFTPlan,to_numpy
 from .reciprocal import _unique_magnitudes,radial_charge_transform,radial_density_transform
@@ -12,12 +13,12 @@ from .reciprocal import _unique_magnitudes,radial_charge_transform,radial_densit
 def _derivatives(rho,sigma,threshold):
     import pylibxc
     shape=rho.shape[:-1];n=rho.reshape(-1,2);s=sigma.reshape(-1,3)
-    active=n.sum(axis=1)>=threshold
-    ne=np.where(active[:,None],n,threshold/2)
-    se=np.where(active[:,None],s,0.)
+    if not np.isfinite(threshold) or threshold<=0: raise ValueError('Invalid LibXC density threshold')
     vr=np.zeros_like(n);vs=np.zeros_like(s)
     for name in ['GGA_X_PBE','GGA_C_PBE']:
-        answer=pylibxc.LibXCFunctional(name,'polarized').compute({'rho':ne.ravel(),'sigma':se.ravel()},do_vxc=True)
+        functional=pylibxc.LibXCFunctional(name,'polarized')
+        functional.set_dens_threshold(threshold)
+        answer=functional.compute({'rho':n.ravel(),'sigma':s.ravel()},do_vxc=True)
         r=np.asarray(answer['vrho']).reshape(-1,2)
         v=np.asarray(answer['vsigma']).reshape(-1,3)
         if name=='GGA_C_PBE':
@@ -25,7 +26,6 @@ def _derivatives(rho,sigma,threshold):
             r=r*masks
             v=v*np.column_stack([masks[:,0],masks[:,0]&masks[:,1],masks[:,1]])
         vr+=r;vs+=v
-    vr[~active]=0;vs[~active]=0
     return vr.reshape(*shape,2),vs.reshape(*shape,3)
 
 def add_collinear_spin_field(field,structure,species_data,moments_z,*,backend,device,eps,nthreads=1,max_work_mb=512.,threshold=1e-6):
@@ -81,10 +81,10 @@ def add_collinear_spin_field(field,structure,species_data,moments_z,*,backend,de
         mg=np.where(mask,mg,0.)*field.metadata['density_normalization_scale'];cg=np.where(mask,cg,0.)
         mag=ifft(mg);total=abs(field.rho+ifft(cg));amp=np.minimum(abs(mag),total)
         channels=np.stack([(total+amp)/2,(total-amp)/2],axis=-1)
+    pw_mask=array(mask,t.bool) if use_cuda else mask
     grad=[]
     for s in range(2):
-        coeff=fft(channels[...,s])/ng
-        grad.append([ifft(1j*gv[...,axis]*coeff) for axis in range(3)])
+        grad.append([derivative(channels[...,s],gv,pw_mask,axis) for axis in range(3)])
     sigma=[sum(x*x for x in grad[0]),sum(x*y for x,y in zip(*grad)),sum(x*x for x in grad[1])]
     if use_cuda:
         sigma=t.stack(sigma,dim=-1)
@@ -95,7 +95,7 @@ def add_collinear_spin_field(field,structure,species_data,moments_z,*,backend,de
         divergence=0
         for axis in range(3):
             flux=2*vs[...,0 if s==0 else 2]*grad[s][axis]+vs[...,1]*grad[1-s][axis]
-            divergence=divergence+ifft(1j*gv[...,axis]*fft(flux)/ng)
+            divergence=divergence+derivative(flux,gv,pw_mask,axis)
         potentials.append(2*(vr[...,s]-divergence))
     mean=(potentials[0]+potentials[1])/2
     delta=(potentials[0]-potentials[1])/2

@@ -5,6 +5,8 @@ files. Re-run preparation to select changed UPF/ORB contents. Runtime needs no
 UPF/ORB files. Geometry and reciprocal G grids are deliberately not cached here.
 """
 import dataclasses
+import copy
+import threading
 import hashlib
 import json
 import os
@@ -14,7 +16,7 @@ from collections import OrderedDict
 import numpy as np
 from . import models
 
-SCHEMA = 'h0-offline/v1'
+SCHEMA = 'h0-offline/v2'
 
 def encode(value, arrays):
     import torch
@@ -72,6 +74,8 @@ def read(path, device='cpu'):
         return decode(meta['data'], arrays, device)
 
 def prepare_species(orb_path, upf_path, store):
+    from .table_contract import ensure_store
+    ensure_store(store)
     from .orb import read_abacus_orb
     from .upf import read_upf
     from .provenance import sha256_file
@@ -86,46 +90,71 @@ def prepare_species(orb_path, upf_path, store):
     return identity
 
 def load_species(store, identity):
+    from .table_contract import verify_contract
+    verify_contract(store)
     if len(identity) != 64 or any(c not in '0123456789abcdef' for c in identity): raise ValueError('Invalid species ID')
     data = read(Path(store)/'species'/f'{identity}.npz')
     if fingerprint(data) != identity: raise ValueError('Offline species checksum mismatch')
     return data
 
 _resident = OrderedDict()
+_resident_lock = threading.RLock()
 
 def prepared_two_center(species_data, *, store, dr_bohr=.01, nspin=1, device='cuda', prepare=False):
-    """Prepare explicitly or load strictly; bounded in-process reuse by exact key."""
+    """Private resident masters; every consumer owns independent tensor buffers.
+
+    Copying is device-to-device. No warm buffer hash or GPU-to-CPU round trip.
+    Native pyabacus handles are not part of either runtime copies or disk state.
+    """
+    with _resident_lock:
+        return _prepared_two_center(species_data,store=store,dr_bohr=dr_bohr,nspin=nspin,device=device,prepare=prepare)
+
+def _prepared_two_center(species_data, *, store, dr_bohr, nspin, device, prepare):
     import torch
     from .cuda_two_center import CUDATwoCenter
-    from .precompiled import verify, sha256
-    root = Path(__file__).parent
-    sd = dict(sorted(species_data.items()))
-    # Numeric arrays participate: mutations cannot accidentally reuse old tables.
-    key = fingerprint({'species': sd, 'dr': dr_bohr, 'nspin': nspin, 'schema': SCHEMA,
-        'binary': verify('_cuda_two_center')['binary_sha256'],
-        'sources': {n: sha256(root/n) for n in ('cuda_two_center.py','scalar_upf.py','offline.py')}})
-    dev = torch.device(device)
-    if dev.index is None: dev = torch.device('cuda', torch.cuda.current_device())
-    resident_key = (str(Path(store).resolve()), key, str(dev))
+    from .precompiled import verify
+    from .table_contract import current, verify_contract, ensure_store
+    if prepare: ensure_store(store)
+    else: verify_contract(store)
+    sd = copy.deepcopy(dict(sorted(species_data.items())))
+    sources=current()
+    key=fingerprint({'species':sd,'dr':dr_bohr,'nspin':nspin,'schema':SCHEMA,
+        'binary':verify('_cuda_two_center')['binary_sha256'],'sources':sources})
+    dev=torch.device(device)
+    if dev.type!='cuda': raise ValueError('Two-center runtime requires CUDA')
+    if dev.index is None: dev=torch.device('cuda',torch.cuda.current_device())
+    with torch.cuda.device(dev): verify('_cuda_two_center',check_device=True)
+    resident_key=(str(Path(store).resolve()),key,str(dev))
     if resident_key in _resident:
-        obj = _resident.pop(resident_key); _resident[resident_key] = obj
-        obj.metadata['offline_cache'] = 'memory'; return obj
-    path = Path(store)/'two_center'/f'{key}.npz'
-    if path.exists():
-        record = read(path, dev)
-        if record['key'] != key or fingerprint(record['state']) != record['checksum']: raise ValueError('Two-center offline checksum mismatch')
-        obj = CUDATwoCenter.__new__(CUDATwoCenter)
-        obj.__dict__.update(record['state']); obj.device = dev; obj.sd = sd
-        obj.metadata['offline_cache'] = 'disk'
-    elif prepare:
-        obj = CUDATwoCenter(sd, dr_bohr=dr_bohr, nspin=nspin, device=str(dev), cache_dir=str(Path(store)))
-        state = {k:v for k,v in obj.__dict__.items() if k not in ('collections','integrators','sbt','device','sd')}
-        save(path, {'key': key, 'checksum': fingerprint(state), 'state': state})
-        obj.metadata['offline_cache'] = 'prepared'
+        state,ready=_resident[resident_key];_resident.move_to_end(resident_key);hit='memory'
+        torch.cuda.current_stream(dev).wait_event(ready)
     else:
-        raise FileNotFoundError(f'Missing prepared two-center table {key}; run prepare_tables.py once, runtime never tabulates.')
-    obj.metadata['offline_key'] = key
-    with torch.cuda.device(dev): verify('_cuda_two_center', check_device=True)
-    _resident[resident_key] = obj
-    while len(_resident) > 2: _resident.popitem(last=False)
+        path=Path(store)/'two_center'/f'{key}.npz'
+        if path.exists():
+            # Verify CPU bytes before uploading; previously verification copied
+            # an already-uploaded table back to the CPU.
+            record=read(path,'cpu')
+            if (record['key']!=key or record.get('sources')!=sources or
+                fingerprint(record['state'])!=record['checksum']):
+                raise ValueError('Two-center offline checksum/identity mismatch')
+            def upload(v):
+                if isinstance(v,torch.Tensor): return v.to(dev)
+                if isinstance(v,dict): return {k:upload(x) for k,x in v.items()}
+                if isinstance(v,list): return [upload(x) for x in v]
+                if isinstance(v,tuple): return tuple(upload(x) for x in v)
+                return v
+            state=upload(record['state']);hit='disk'
+        elif prepare:
+            obj=CUDATwoCenter(sd,dr_bohr=dr_bohr,nspin=nspin,device=str(dev),cache_dir=str(Path(store)))
+            state={k:v for k,v in obj.__dict__.items() if k not in ('collections','integrators','sbt','device','sd')}
+            if current()!=sources: raise RuntimeError('Generator changed during table preparation')
+            save(path,{'key':key,'sources':sources,'checksum':fingerprint(state),'state':state});hit='prepared'
+        else:
+            raise FileNotFoundError(f'Missing prepared two-center table {key}; explicitly prepare; runtime never tabulates')
+        ready=torch.cuda.Event();ready.record(torch.cuda.current_stream(dev))
+        _resident[resident_key]=(state,ready)
+        while len(_resident)>2: _resident.popitem(last=False)
+    obj=CUDATwoCenter.__new__(CUDATwoCenter)
+    obj.__dict__.update(copy.deepcopy(state));obj.device=dev;obj.sd=sd
+    obj.metadata.update(offline_cache=hit,offline_key=key)
     return obj

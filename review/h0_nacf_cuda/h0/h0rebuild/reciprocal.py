@@ -362,6 +362,7 @@ def build_periodic_field(
             tuple(grad),
             gvec,
             density_threshold=float(pbe_density_threshold),
+            pw_mask=np.sum(gvec*gvec,axis=-1)<=float(ecutrho_ry)+1e-12,
         )
     elif xc_upper in {"NONE", "OFF"}:
         vxc = np.zeros_like(rho)

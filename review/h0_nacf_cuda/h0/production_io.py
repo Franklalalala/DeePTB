@@ -39,15 +39,17 @@ def load_case(path, *, prepared_species=None):
     atoms = []
     moments = []
     for symbol, _, _ in spec:
-        assert lines[pos] == symbol
+        if lines[pos] != symbol: raise ValueError('STRU species order mismatch')
         species_moment = float(lines[pos+1])
         n = int(lines[pos+2])
         for row in lines[pos+3:pos+3+n]:
             words = row.split()
             xyz = np.array([float(v) for v in words[:3]])
             moment = species_moment
-            if 'mag' in words:
-                start = words.index('mag') + 1
+            mag_keys = [key for key in ('mag', 'magmom') if key in words]
+            if len(mag_keys)>1 or any(words.count(k)>1 for k in mag_keys): raise ValueError('Duplicate atomic moment')
+            if mag_keys:
+                start = words.index(mag_keys[0]) + 1
                 values = []
                 for word in words[start:]:
                     try: values.append(float(word))
@@ -56,6 +58,7 @@ def load_case(path, *, prepared_species=None):
                 elif len(values) == 3 and values[0] == values[1] == 0: moment = values[2]
                 else: raise ValueError('Only collinear z initial magnetization is supported')
             if 'angle1' in words or 'angle2' in words: raise ValueError('Magnetization angles require an explicit vector-field implementation')
+            if not np.isfinite(moment): raise ValueError('Nonfinite atomic moment')
             moments.append(moment)
             frac = xyz if mode == 'direct' else (xyz * lat0) @ np.linalg.inv(cell)
             atoms.append(Atom(symbol, frac))
@@ -67,9 +70,15 @@ def load_case(path, *, prepared_species=None):
     raw = (path/'OUT.ABACUS'/'INPUT').read_text()
     inp = {w[0]: w[1] for line in raw.splitlines() if len(w:=line.split('#')[0].split())>=2}
     spin=int(inp['nspin'])
-    assert spin in (1,4) and int(inp['lspinorb'])==(1 if spin==4 else 0)
-    assert inp['init_chg']=='atomic'
-    assert all('PBE' in d.upf.functional.upper() for d in sd.values())
+    if spin not in (1,4) or int(inp['lspinorb'])!=(1 if spin==4 else 0): raise ValueError('Unsupported spin/SOC contract')
+    if inp['init_chg']!='atomic': raise ValueError('Only atomic initial charge is supported')
+    if not all('PBE' in d.upf.functional.upper() for d in sd.values()): raise ValueError('Reader requires PBE pseudopotentials')
+    if inp.get('dft_functional','default').lower() not in ('default','pbe','gga_pbe'):
+        raise ValueError('This validation reader supports PBE only')
+    neutral=sum(sd[a.species].upf.z_valence for a in atoms)
+    nelec=float(inp.get('nelec',0)); delta=float(inp.get('nelec_delta',0))
+    if not np.isfinite(nelec) or not np.isfinite(delta) or delta!=0 or nelec not in (0,neutral):
+        raise ValueError('This atomic-reference reader supports neutral nelec only (0 means automatic)')
     log = (path/'OUT.ABACUS'/'running_scf.log').read_text()
     # ABACUS may move individual input atoms by whole lattice vectors before
     # writing CSR blocks. Keep the calculation geometry, but request that the
@@ -84,13 +93,13 @@ def load_case(path, *, prepared_species=None):
     logged_cart = np.asarray([[float(v) for v in row[1:4]] for row in logged]) * lat0
     output_shifts = shifts_between_coordinates(cell, [a.frac for a in atoms], logged_cart)
     grids = re.findall(r'^\s*fft grid for charge/potential\s*=\s*\[\s*(\d+),\s*(\d+),\s*(\d+)\s*\]',log,re.M|re.I)
-    assert len(set(grids))==1
+    if len(set(grids))!=1: raise ValueError('Missing or ambiguous charge FFT grid')
     opts = {'ecutrho_ry':float(inp['ecutrho']), 'fft_shape':tuple(map(int,grids[0])), 'xc':'PBE',
             'pseudo_rcut_bohr':float(inp['pseudo_rcut']),
             'nspin':spin, 'include_nlcc':True, 'total_electrons':sum(sd[a.species].upf.z_valence for a in atoms),
             'output_atom_cell_shifts':output_shifts}
     if spin == 4 and any(m != 0 for m in moments): opts['initial_moments_z'] = moments
-    contract = {k: inp.get(k) for k in ['nspin','lspinorb','ecutwfc','ecutrho','init_chg','dft_functional','nelec']}
+    contract = {k: inp.get(k) for k in ['nspin','lspinorb','ecutwfc','ecutrho','init_chg','dft_functional','nelec','nelec_delta']}
     contract.update({'grid':opts['fft_shape'], 'species':[a.species for a in atoms], 'source_path':str(path),
                      'initial_moments_z':moments,'reader_revision':'atomic-mag/v2',
                      'cell_bohr':cell.tolist(),'fractional_coordinates':[a.frac.tolist() for a in atoms],
