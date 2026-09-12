@@ -1,0 +1,193 @@
+--- a/dptb/nacf/assembly.py
++++ b/dptb/nacf/assembly.py
+@@ -10,6 +10,7 @@
+ 
+ from collections import defaultdict
+ import hashlib
++import os
+ 
+ import numpy as np
+ import torch
+@@ -28,7 +29,7 @@
+     """
+ 
+     def __init__(self, p2_store, p23_store, *, overlap_store=None, soc_store=None, device='cuda', dtype=torch.float64, backend='auto', ry_to_ev=13.605698,
+-                 p23_missing_policy='error', expected_p23_sha256=None):
++                 p23_missing_policy='error', expected_p23_sha256=None, prepared_cache_dir=None):
+         super().__init__()
+         if p23_missing_policy not in ('error', 'p2_if_missing_pairs'):
+             raise ValueError('unknown P23 missing-pair policy')
+@@ -45,6 +46,7 @@
+             raise ValueError('Ry to eV conversion must be finite and positive')
+         self.ry_to_ev = float(ry_to_ev)
+         self.backend = backend
++        self.prepared_cache_dir = prepared_cache_dir or os.environ.get('DPTB_NACF_PREPARED_DIR')
+         self.p2_manifest_sha256 = (hashlib.sha256((p2_store.root / 'manifest.json').read_bytes()).hexdigest()
+                                    if hasattr(p2_store, 'root') else None)
+         if hasattr(p23_store, 'manifest'):
+@@ -87,7 +89,11 @@
+                 source = self.overlap.base_component(left, right, kind)
+             else:
+                 source = self.p2.base_component(left, right, kind)
+-            self.tables[key] = TorchRadialBlockTable(source, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
++            if self.prepared_cache_dir is None:
++                self.tables[key] = TorchRadialBlockTable(source, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
++            else:
++                from .prepared import cached_table
++                self.tables[key] = cached_table(source, self.prepared_cache_dir, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
+         return key
+ 
+     def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True)):
+--- a/dptb/nacf/radial.py
++++ b/dptb/nacf/radial.py
+@@ -3,7 +3,7 @@
+ Table compilation is a one-time CPU operation. Warm forward uses device tensors
+ and either a fused CUDA kernel or the torch reference: no SciPy/NumPy, table
+ reads, tensor-to-host copies, or Python per-displacement loops. The native
+-extension is compiled lazily at first CUDA use, outside the warm path.
++extension is precompiled explicitly at installation; inference never compiles.
+ It preserves the source cubic spline (including its boundary conditions), rather
+ than refitting a different interpolant. Units and the ABACUS real harmonic gauge
+ are inherited unchanged from :class:`RadialBlockTable`.
+--- a/dptb/nacf/_cuda.py
++++ b/dptb/nacf/_cuda.py
+@@ -1,18 +1,21 @@
+-"""Lazy native backend; one launch evaluates and rotates a whole table batch."""
++"""Precompiled native backend; one launch evaluates and rotates a table batch."""
+ from functools import lru_cache
+ from pathlib import Path
+ 
+ 
+ @lru_cache(maxsize=1)
+ def extension():
+-    from torch.utils.cpp_extension import load
+-    source = Path(__file__).parent / 'csrc'
+-    return load(name='dptb_nacf_radial',
+-                sources=[str(source / 'bindings.cpp'), str(source / 'radial.cu')],
+-                extra_cflags=['-O3'], extra_cuda_cflags=['-O3', '--fmad=false'])
++    from .precompiled import load
++    return load()
++
++@lru_cache(maxsize=8)
++def check_device(device):
++    from .precompiled import verify
++    verify(device)
+ 
+ 
+ def evaluate(table, vectors):
++    check_device(vectors.device)
+     return extension().radial(
+         vectors.contiguous(), table.knots, table.coefficients,
+         table.cuda_degrees, table.cuda_directions, table.cuda_inverse,
+--- a/dptb/nacf/__init__.py
++++ b/dptb/nacf/__init__.py
+@@ -1,7 +1,7 @@
+ """Geometry-only NACF inference with source-bound, device-resident tables.
+ 
+ Offline building and benchmark helpers are deliberately not imported here.
+-CUDA compilation is lazy and never required for the CPU reference backend.
++CUDA binaries are prepared at installation and never compiled by inference.
+ """
+ from .assembly import NACFTableBank
+ from .inference import NACFGeometryPredictor, load_predictor, prepare_geometry
+--- /dev/null
++++ b/dptb/nacf/precompiled.py
+@@ -0,0 +1,26 @@
++"""NACF native runtime: load a verified binary, never compile at inference."""
++import hashlib, importlib, json, platform, sysconfig
++from pathlib import Path
++import torch
++ROOT=Path(__file__).resolve().parent
++
++def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++def identity():
++    return {'python':platform.python_version(),'torch':str(torch.__version__),'cuda':torch.version.cuda,
++            'abi':bool(torch._C._GLIBCXX_USE_CXX11_ABI),'system':platform.system(),'machine':platform.machine(),
++            'suffix':sysconfig.get_config_var('EXT_SUFFIX')}
++def verify(device=None):
++    path=ROOT/'prebuilt.json'
++    if not path.exists():raise RuntimeError('Missing NACF prebuilt binary; run python -m dptb.nacf.precompile once during installation. Runtime never compiles.')
++    m=json.loads(path.read_text())
++    if m['runtime']!=identity():raise RuntimeError('NACF prebuilt Python/Torch/CUDA ABI mismatch')
++    for name,digest in m['sources'].items():
++        if sha(ROOT/name)!=digest:raise RuntimeError('NACF native source mismatch: '+name)
++    if sha(ROOT/m['binary'])!=m['sha256']:raise RuntimeError('NACF prebuilt binary checksum mismatch')
++    if device is not None:
++        cap='.'.join(map(str,torch.cuda.get_device_capability(device)))
++        if cap not in m['architectures']:raise RuntimeError('NACF binary does not contain GPU architecture '+cap)
++    return m
++def load():
++    verify()
++    return importlib.import_module('._nacf_radial','dptb.nacf')
+--- /dev/null
++++ b/dptb/nacf/precompile.py
+@@ -0,0 +1,24 @@
++"""Explicit installation build; normal imports do not import a compiler helper."""
++import argparse,json,os,shutil,tempfile
++from pathlib import Path
++from .precompiled import ROOT,identity,sha,verify
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--check',action='store_true');p.add_argument('--force',action='store_true');a=p.parse_args()
++    try:
++        m=verify()
++        if not a.force: print('REUSED',m['sha256']);return
++    except (OSError,RuntimeError,ValueError):
++        if a.check:raise
++    if a.check:return
++    from torch.utils.cpp_extension import load
++    archs=['8.0','8.6','8.9','9.0'];os.environ['TORCH_CUDA_ARCH_LIST']=';'.join(archs)
++    build=Path(os.environ['TORCH_EXTENSIONS_DIR'])/'nacf_prebuilt';build.mkdir(parents=True,exist_ok=True)
++    sources=['csrc/bindings.cpp','csrc/radial.cu']
++    mod=load(name='_nacf_radial',sources=[str(ROOT/n) for n in sources],extra_cflags=['-O3'],
++             extra_cuda_cflags=['-O3','--fmad=false'],build_directory=str(build),verbose=True)
++    binary=ROOT/'_nacf_radial.so';pending=binary.with_suffix('.pending');shutil.copy2(mod.__file__,pending);os.replace(pending,binary)
++    m={'schema':1,'runtime':identity(),'architectures':archs,'sources':{n:sha(ROOT/n) for n in sources+['precompile.py']},
++       'binary':binary.name,'sha256':sha(binary),'flags':['-O3','--fmad=false']}
++    pending=ROOT/'prebuilt.pending';pending.write_text(json.dumps(m,indent=2)+'\n');os.replace(pending,ROOT/'prebuilt.json');print('BUILT',m['sha256'])
++if __name__=='__main__':main()
+--- /dev/null
++++ b/dptb/nacf/prepared.py
+@@ -0,0 +1,42 @@
++"""Persist GPU-ready radial buffers, including rotation/packing metadata.
++
++The source table is validated by its normal store before cache selection. This
++does not bypass P23 coverage or corrupt-source errors. Geometry stays online.
++"""
++import hashlib, os, tempfile
++from pathlib import Path
++import numpy as np
++import torch
++
++ATTRS=('left_shells','right_shells','support_bohr','shape','angular_degrees')
++def key_for(table):
++    h=hashlib.sha256(Path(__file__).with_name('radial.py').read_bytes())
++    h.update(b'nacf-prepared/v1')
++    for a in (table.distances,table.values,table._spline.c if table._spline is not None else np.empty(0)):
++        a=np.ascontiguousarray(a);h.update(a.dtype.str.encode());h.update(str(a.shape).encode());h.update(a.tobytes())
++    h.update(repr((table.left_shells,table.right_shells,table.support_bohr)).encode())
++    return h.hexdigest()
++
++def cached_table(source,cache_dir,*,device,dtype,backend):
++    from .radial import TorchRadialBlockTable
++    key=key_for(source);root=Path(cache_dir);root.mkdir(parents=True,exist_ok=True)
++    path=root/(key+'.pt');checksum=path.with_suffix('.sha256')
++    if path.exists():
++        if hashlib.sha256(path.read_bytes()).hexdigest()!=checksum.read_text().strip():raise ValueError('NACF prepared table checksum mismatch')
++        record=torch.load(path,map_location='cpu',weights_only=True)
++        if record['key']!=key:raise ValueError('NACF prepared table identity mismatch')
++        obj=TorchRadialBlockTable.__new__(TorchRadialBlockTable);torch.nn.Module.__init__(obj)
++        obj.backend=backend
++        for name,value in record['attrs'].items():setattr(obj,name,value)
++        for name,value in record['buffers'].items():obj.register_buffer(name,value.to(device=device,dtype=dtype if value.is_floating_point() else value.dtype))
++        obj.prepared_cache='disk';return obj
++    # Persist FP64 master buffers; each caller selects FP64/FP32 on load.
++    obj=TorchRadialBlockTable(source,device='cpu',dtype=torch.float64,backend=backend)
++    record={'key':key,'attrs':{k:getattr(obj,k) for k in ATTRS},'buffers':dict(obj.named_buffers())}
++    with tempfile.NamedTemporaryFile(dir=root,suffix='.pt',delete=False) as f:
++        pending=Path(f.name);torch.save(record,f)
++    digest=hashlib.sha256(pending.read_bytes()).hexdigest()
++    # Per-bank preparation is sequential. Publishing checksum before data means
++    # readers never accept an unverified artifact; a race fails closed.
++    checksum.write_text(digest+'\n');os.replace(pending,path)
++    obj=obj.to(device=device,dtype=dtype);obj.prepared_cache='prepared';return obj

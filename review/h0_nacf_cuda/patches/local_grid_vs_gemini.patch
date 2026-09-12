@@ -1,0 +1,54 @@
+--- a/csrc/local_grid/support_kernel.cu
++++ b/csrc/local_grid/support_kernel.cu
+@@ -1,5 +1,8 @@
+ #include <torch/extension.h>
+ #include <cuda_runtime.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAStream.h>
++#include <c10/cuda/CUDAException.h>
+ #include <cstdint>
+ #include <vector>
+ #include "harmonics_cuda.cuh"
+@@ -161,6 +164,8 @@
+ ) {
+     auto device = field_values.device();
+     TORCH_CHECK(device.is_cuda(), "build_atom_support_cuda requires CUDA tensor");
++    const c10::cuda::CUDAGuard device_guard(device);
++    const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+ 
+     auto nmin_cpu = nmin.to(torch::kCPU).contiguous();
+     auto counts_cpu = counts.to(torch::kCPU).contiguous();
+@@ -180,7 +185,7 @@
+     int threads = 256;
+     int blocks = (int)((total_candidates + threads - 1) / threads);
+ 
+-    find_active_nodes_kernel<<<blocks, threads>>>(
++    find_active_nodes_kernel<<<blocks, threads, 0, stream>>>(
+         (int)total_candidates,
+         nmin_a[0], nmin_a[1], nmin_a[2],
+         counts_a[1], counts_a[2],
+@@ -207,7 +212,7 @@
+ 
+     if (npoints > 0) {
+         int eval_blocks = (npoints + threads - 1) / threads;
+-        evaluate_ao_nodes_kernel<<<eval_blocks, threads>>>(
++        evaluate_ao_nodes_kernel<<<eval_blocks, threads, 0, stream>>>(
+             npoints,
+             active_indices.data_ptr<int64_t>(),
+             nmin_a[0], nmin_a[1], nmin_a[2],
+@@ -250,7 +255,7 @@
+         int64_t stride0 = box1 * stride1;
+ 
+         int pop_blocks = (npoints + threads - 1) / threads;
+-        populate_lookup_kernel<<<pop_blocks, threads>>>(
++        populate_lookup_kernel<<<pop_blocks, threads, 0, stream>>>(
+             npoints,
+             integer_indices.data_ptr<int64_t>(),
+             lo_a[0], lo_a[1], lo_a[2],
+@@ -263,5 +268,6 @@
+         lookup = torch::full({0, 0, 0}, -1, opt_i32);
+     }
+ 
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return {integer_indices, values, potential, spin_z_pot, lo, hi, lookup};
+ }

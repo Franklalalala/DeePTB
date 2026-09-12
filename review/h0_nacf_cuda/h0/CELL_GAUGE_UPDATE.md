@@ -1,0 +1,9 @@
+# Atom-cell gauge update (2026-09-12)
+
+Regression: nonSOC_db_seq_id_11083 has three N atoms at input fractional x about -1e-7. ABACUS moves them by +a1 before serializing H0/S. Comparing H0 blocks by the same R against the original input geometry compared a 1.9548 A N-Mo interaction to its 7.3487 A image. CPU and CUDA agreed to 5.99e-11 eV, but both appeared to differ from raw H0 by 8.800931 eV.
+
+The core assemble_h0 API now accepts output_atom_cell_shifts. For r_out_i = r_in_i + q_i @ cell, it transforms every H0/S/component key by R_out = R_in + q_i - q_j and updates serialized geometry/fingerprint. Matrix values and periodic fields remain unchanged; default behavior retains input coordinates. h0rebuild.cell_gauge exposes validated geometry-only integer-shift inference and reusable result rebasing. The production input reader obtains the explicitly logged ABACUS atom positions; it rejects real displacement or changed atom order, rather than searching reference matrix values or using tolerance-sensitive naive modulo.
+
+Three tests in tests_h0fast/test_cell_gauge.py passed under the established Liyue new_soc runtime: complex spinor Bloch covariance/eigenvalues and inverse transform, integer-lattice coordinate validation, and output serialization coherence. Local Windows SciPy lacks sph_harm_y, so numerical tests use the intended remote environment.
+
+Five real targeted blocks passed. Worst H0 block: 8.800931 -> 0.000126879 eV. Worst S block: 0.453638 -> 7.43085e-9. Onsite control unchanged at 0.609288 meV. This is targeted validation, not all-structure completion. Full random100 and batch tests now run from the immutable corrected snapshot /home/mingkang_nt/codex/h0_cuda_random100_cell_gauge_v2_20260912. Same samples, parameters and acceptance limits; original run/evidence retained. Detailed evidence and patch are in F:\codex\2026-09-12\h0-cuda-random100\work.
