@@ -756,6 +756,7 @@ def train_options():
         Argument("monitor_gated_edge_attention_heatmap", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention_heatmap),
         Argument("monitor_gated_edge_attention_heatmap_size", int, optional=True, default=64, doc=doc_monitor_gated_edge_attention_heatmap_size),
         Argument("clip_grad", float, optional=True, default=1, doc='Gradient clipping max norm.'),
+        Argument("skip_nonfinite_batch", bool, optional=True, default=True, doc="Skip and log batches with NaN/Inf loss or gradient norm before any optimizer update. Skipped batches do not advance optimizer-step or per-iteration scheduler clocks."),
         Argument("valid_fast", bool, optional=True, default=True, doc="Set True to valid on the first batch of validation dataset, set False to valid the whole dataset. Default: `True`"),
 
         # optimizer / lr scheduler
@@ -1920,6 +1921,7 @@ def slem_h0():
     doc_require_full_block_edge_coverage = "Fail before the H-B0 head unless its actual active rows are the ordered full graph-edge range with finite positive cutoff coefficients. Default: `False`; block-ODE requires `True`."
 
     return slem() + [
+        Argument("h0_ao_cg", bool, optional=True, default=True, doc="Convert packed AO priors to coupled irreps. Set false explicitly only for legacy checkpoint compatibility."),
         Argument("h0_init_scope", str, optional=True, default="both", doc=doc_h0_init_scope),
         Argument("h0_node_key", str, optional=True, default="node_h0", doc=doc_h0_node_key),
         Argument("h0_edge_key", str, optional=True, default="edge_h0", doc=doc_h0_edge_key),
@@ -2174,6 +2176,7 @@ def slem_prior():
             default="both",
             doc="Physical-prior initialization scope: both, node, edge, auxiliary, or none.",
         ),
+        Argument("h0_ao_cg", bool, optional=True, default=True, doc="AO-CG rotation; false explicitly selects legacy sorted-AO input."),
         Argument("prior_kind", str, optional=True, default="p2", doc="Prior slot: p2, p23, na_cf, or h0. This single value derives the node/edge RME keys."),
         Argument("prior_node_key", str, optional=True, default="", doc="Deprecated/optional: node-wise selected-prior RME field. Leave empty to derive from prior_kind (node_p2/node_p23); an explicit value must match the derived one."),
         Argument("prior_edge_key", str, optional=True, default="", doc="Deprecated/optional: edge-wise selected-prior RME field. Leave empty to derive from prior_kind (edge_p2/edge_p23); an explicit value must match the derived one."),
@@ -2196,6 +2199,7 @@ def slem_prior():
 def slem_prior_2b():
     """Concat-P two-stage residual embedding (Full-H − P labels)."""
     return slem() + [a for a in slem_edge_h0() if a.name.startswith("edge_router_") or a.name.startswith("edge_moe_")] + [
+        Argument("h0_ao_cg", bool, optional=True, default=True, doc="AO-CG rotation; false explicitly selects legacy sorted-AO input."),
         Argument(
             "only2b",
             bool,
@@ -3725,6 +3729,9 @@ def normalize(data):
     # defaults.  Doing this afterwards silently hides alias values behind the
     # canonical defaults (for example overlap_huckel_k behind huckel_k=1.75).
     data = canonicalize_training_config(data)
+    embedding = data.get("model_options", {}).get("embedding", {})
+    if embedding.get("method") in {"lem_moe_v3_edge", "lem_moe_v3_edge_h0", "lem_moe_v3_edge_prior_2b"}:
+        embedding.setdefault("so2_fusion_mode", "streamed_m_major_cueq" if embedding.get("edge_router_prior_activate", False) else "streamed_m_major_fused_p0")
     co = common_options()
     tr = train_options()
     da = data_options()

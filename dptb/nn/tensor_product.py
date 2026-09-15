@@ -326,7 +326,7 @@ class SO2_Linear(torch.nn.Module):
         self.radial_emb = radial_emb
         self.latent_dim = latent_dim
         self.m_linear = nn.ModuleList()
-        self.so2_m_linear_mode = so2_m_linear_mode or os.environ.get("DPTB_SO2_M_LINEAR_MODE", "standard")
+        self.so2_m_linear_mode = so2_m_linear_mode or os.environ.get("DPTB_SO2_M_LINEAR_MODE", "indexed_sandwich_cuda_multi")
         if self.so2_m_linear_mode == "cublas_grouped":
             self.so2_m_linear_mode = "indexed_sandwich_multi"
         if self.so2_m_linear_mode == "cuda_pack_scatter":

@@ -140,8 +140,8 @@ class TrainingState:
 
     ``global_step`` mirrors ``trainer.iter`` (the global optimizer-step counter)
     and ``epoch`` mirrors ``trainer.ep``.  ``batch_in_epoch`` is the number of
-    *committed* (optimizer-stepped, baked-into-``model_state_dict``) batches in
-    the current epoch at save time; on an iteration resume the epoch loop
+    consumed batches (including nonfinite skips) in the current epoch at
+    save time; on an iteration resume the epoch loop
     fast-forwards exactly this many batches so each remaining batch runs once.
     """
 

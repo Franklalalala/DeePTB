@@ -113,7 +113,7 @@ class BaseTrainer(with_metaclass(ABCMeta, PluginUser)):
         self.update_lr_per_iter = False
 
         # Restart/checkpoint state machine bookkeeping.
-        #   _batch_in_epoch : number of committed (optimizer-stepped) batches in
+        #   _batch_in_epoch : number of consumed batches (including nonfinite skips) in
         #                     the current epoch; read by Saver to persist a
         #                     fast-forward cursor for mid-epoch resume.
         #   _resume_plan    : one-shot plan consumed by the first epoch() call

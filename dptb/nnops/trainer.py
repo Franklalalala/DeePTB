@@ -4,6 +4,7 @@ import os
 import csv
 import math
 import copy
+import json
 import torch.nn as nn
 from dptb.configuration import migrate_legacy_checkpoint_train_options
 from dptb.utils.tools import (
@@ -908,6 +909,67 @@ class Trainer(BaseTrainer):
             return
         loss.backward()
 
+    def _skip_nonfinite_batch(self, values, batch, ref_batch=None, *, distributed=False):
+        """Discard a nonfinite batch before ANY optimizer/scheduler/plugin update.
+
+        Called after backwards (including DDP reductions), so skipping does not
+        leave a reducer waiting for hooks on the next forward. Gradient norms
+        are the pre-clipping norms. No optimizer or model-state rollback is done.
+        """
+        if not getattr(self, "train_options", {}).get("skip_nonfinite_batch", True):
+            return False
+        flags = torch.stack([
+            ~torch.isfinite(value.detach()).all() for value in values.values()
+        ])
+        bad = flags.any().to(dtype=torch.int32)
+        if distributed:
+            # WORLD includes both expert parallel and expert data-parallel ranks.
+            torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.MAX)
+        if not bool(bad.item()):
+            return False
+
+        optimizers = getattr(self, "optimizers", None)
+        if optimizers is None:
+            optimizers = [self.optimizer]
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+        # This is a consumed-loader cursor, NOT the successful optimizer clock.
+        self._batch_in_epoch = getattr(self, "_batch_in_epoch", 0) + 1
+        self._nonfinite_batches_skipped = getattr(self, "_nonfinite_batches_skipped", 0) + 1
+
+        def batch_record(item):
+            if item is None:
+                return None
+            def read(key):
+                value = item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+                if torch.is_tensor(value):
+                    return value.detach().cpu().tolist()
+                return value
+            return {key: read(key) for key in (
+                "__dptb_sample_indices__", "__dptb_batch_cost__",
+                "__dptb_batch_num_graphs__", "graph_id", "frame_id",
+            ) if read(key) is not None}
+
+        detail = {
+            "rank": torch.distributed.get_rank() if distributed else 0,
+            "expert": getattr(self, "local_expert_idx", None),
+            "nonfinite": [key for key, flag in zip(values, flags.cpu().tolist()) if flag],
+            "batch": batch_record(batch),
+            "reference_batch": batch_record(ref_batch),
+        }
+        details = [detail]
+        if distributed:
+            details = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(details, detail)
+        if not distributed or torch.distributed.get_rank() == 0:
+            log.warning("NONFINITE_BATCH_SKIPPED %s", json.dumps({
+                "epoch": int(self.ep), "batch_in_epoch": self._batch_in_epoch,
+                "next_optimizer_step": int(self.iter),
+                "skipped_since_start": self._nonfinite_batches_skipped,
+                "ranks": details,
+            }, ensure_ascii=True))
+        return True
+
     def iteration(self, batch, ref_batch=None):
         '''
         conduct one step forward computation, used in train, test and validation.
@@ -940,6 +1002,7 @@ class Trainer(BaseTrainer):
                 )
             loss_for_log = main_endpoint_state["train_loss"].detach()
         loss_opt_for_log = loss.detach()
+        finite_checks = {"main_loss": loss.detach()}
         self._backward_loss(loss)
         del loss
 
@@ -956,6 +1019,7 @@ class Trainer(BaseTrainer):
                 allow_self_consistency=False,
             )
             loss_opt_for_log = loss_opt_for_log + ref_loss.detach()
+            finite_checks["reference_loss"] = ref_loss.detach()
             self._backward_loss(ref_loss)
             if apply_flow_to_reference:
                 ref_flow_state = dict(getattr(self, "_last_flow_state", {}))
@@ -975,6 +1039,10 @@ class Trainer(BaseTrainer):
             self.model.parameters(),
             max_norm=self.clip_grad_norm
         )
+
+        finite_checks.update(objective=loss_opt_for_log, grad_norm=total_norm)
+        if self._skip_nonfinite_batch(finite_checks, batch, ref_batch):
+            return None
 
         self.optimizer.step()
 

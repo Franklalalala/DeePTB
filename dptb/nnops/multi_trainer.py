@@ -2783,6 +2783,7 @@ class MultiTrainer(Trainer):
         ref_batch_dict=None,
         ref_batch_info=None,
         original_batch=None,
+        original_ref_batch=None,
     ):
         dynamic_batch_state = self._dynamic_batch_state_from_batch(original_batch)
         with self._tagger.tag("iteration/entry", it=self.iter):
@@ -2836,6 +2837,13 @@ class MultiTrainer(Trainer):
             )
 
         with self._tagger.tag("expert/optimizer_step", it=self.iter, expert=local_idx):
+            if self._skip_nonfinite_batch(
+                {"objective": loss_local, "grad_norm": grad_norm},
+                original_batch if original_batch is not None else batch_dict,
+                original_ref_batch if original_ref_batch is not None else ref_batch_dict,
+                distributed=self._dist_ready(),
+            ):
+                return None
             local_opt.step()
 
         with self._tagger.tag("expert/sync_dp_buffers", it=self.iter, expert=local_idx):
@@ -2939,6 +2947,7 @@ class MultiTrainer(Trainer):
             ref_batch_dict=ref_batch_dict,
             ref_batch_info=ref_batch_info,
             original_batch=batch,
+            original_ref_batch=ref_batch,
         )
 
     def _iteration_distributed_expert_shared(self, batch, ref_batch=None):
@@ -2954,6 +2963,7 @@ class MultiTrainer(Trainer):
             ref_batch_dict=ref_batch_dict,
             ref_batch_info=ref_batch_info,
             original_batch=batch,
+            original_ref_batch=ref_batch,
         )
 
     # ---------------------------------------------------------------------
@@ -3145,13 +3155,22 @@ class MultiTrainer(Trainer):
                             max_norm=self.clip_grad_norm
                         )
 
-                    with self._tagger.tag("expert/optimizer_step", it=self.iter, expert=expert_idx):
-                        optimizer_step_started = True
-                        self.optimizers[expert_idx].step()
-
                     payload["grad_norm"] = grad_norm.detach() if torch.is_tensor(grad_norm) else torch.tensor(
                         float(grad_norm), device=self.device, dtype=self.dtype
                     )
+
+                finite_checks = {
+                    f"expert_{idx}_{key}": payload[key]
+                    for idx, payload in enumerate(payload_list)
+                    for key in ("loss_detached", "grad_norm")
+                }
+                if self._skip_nonfinite_batch(finite_checks, batch, ref_batch):
+                    return None
+                # Validate every expert before updating even the first one.
+                for expert_idx in range(len(payload_list)):
+                    with self._tagger.tag("expert/optimizer_step", it=self.iter, expert=expert_idx):
+                        optimizer_step_started = True
+                        self.optimizers[expert_idx].step()
 
                 with self._tagger.tag("iteration/collect_payloads", it=self.iter):
                     for expert_idx, payload in enumerate(payload_list):

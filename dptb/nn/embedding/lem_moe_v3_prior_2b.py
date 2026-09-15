@@ -2,7 +2,7 @@
 """only2b-style two-stage embedding on prior residual labels (y = Full-H - P).
 
 Both stages consume the prior RME (na_cf: node_p23 / edge_p2) through the same
-projector design as ``lem_moe_v3_prior`` (mask -> sorted-irrep permutation ->
+projector design as ``lem_moe_v3_prior`` (mask -> AO-product CG transform -> sorted-irrep permutation ->
 ``e3nn.Linear``), and *concat* it with the geometric InitLayer features instead
 of replacing them:  phi = [h_geo ; Pi(P)].
 
@@ -183,6 +183,8 @@ class _Prior2bMixin:
                 "branch and the GNN read node and edge prior RME."
             )
         self.prior_init_scope = scope
+        if isinstance(self, LemMoEV3EdgeH0) and not kwargs.get("edge_router_prior_activate", False):
+            kwargs.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
         self._prior2b_raw_kwargs: Dict[str, Any] = dict(kwargs)
 
         super().__init__(
@@ -316,7 +318,7 @@ class _Prior2bMixin:
         node_proj: torch.nn.Module,
         edge_proj: torch.nn.Module,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Same mask -> sorted-irrep -> Linear path as H0InitLayer, with explicit projectors."""
+        """Same mask -> AO-CG -> sorted-irrep -> Linear path as H0InitLayer, with explicit projectors."""
         h0 = self.h0_init
         out = []
         for key, expected, label, mask, proj, rows in (
@@ -335,7 +337,7 @@ class _Prior2bMixin:
                 raise KeyError(f"lem_moe_v3_prior_2b requires field {key!r} in the batch.")
             h0._guard_target_fallback(found_key, key, label)
             source = mask(source, atom_type if label == "node prior" else bond_type)
-            source = source.index_select(1, h0._h0_sort_index)
+            source = h0._ao_product_to_sorted_irreps(source)
             if label == "edge prior":
                 source = source[active_edges]
             feat = proj(source)

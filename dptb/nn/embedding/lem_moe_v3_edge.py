@@ -35,6 +35,8 @@ class LemMoEV3Edge(LemMoEV3):
         edge_one_hot_dim = int(edge_router_in_features or kwargs.get("edge_one_hot_dim", 128))
         self.edge_one_hot_dim = edge_one_hot_dim
         self.edge_router_in_features = edge_one_hot_dim
+        if not self.edge_router_prior_activate:
+            kwargs.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
         top_k = kwargs.get("top_k", 1)
         prev_so2_env = None
         if self.edge_router_prior_activate:
@@ -492,6 +494,7 @@ class LemMoEV3EdgeH0(LemMoEV3Edge):
         fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
         h0_merge_mode: str = "replace",
         h0_self_edge_tol: float = 1e-8,
+        h0_ao_cg: bool = True,
         **kwargs: Any,
     ):
         use_flow_time_embedding = bool(kwargs.pop("use_flow_time_embedding", False))
@@ -560,6 +563,7 @@ class LemMoEV3EdgeH0(LemMoEV3Edge):
                 allow_target_fallback_in_training=allow_target_fallback_in_training,
                 merge_mode=h0_merge_mode,
                 self_edge_tol=h0_self_edge_tol,
+                h0_ao_cg=h0_ao_cg,
                 dtype=self.dtype,
                 device=self.device,
             )

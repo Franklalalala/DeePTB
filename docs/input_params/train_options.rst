@@ -9,6 +9,30 @@ train_options:
 
     Options that defines the training behaviour of DeePTB.
 
+    .. _`train_options/skip_nonfinite_batch`:
+
+    skip_nonfinite_batch:
+        | type: ``bool``, optional, default: ``True``
+        | argument path: ``train_options/skip_nonfinite_batch``
+
+        Discard batches with NaN/Inf loss or gradient norm before any optimizer
+        update. This also applies when older configs omit the option. All experts
+        and distributed ranks skip together. Batch size and learning-rate settings
+        are unchanged; skipped batches advance only the consumed-batch cursor,
+        not optimizer steps, per-iteration schedulers, or training metrics.
+
+        The training log records ``NONFINITE_BATCH_SKIPPED`` followed by JSON
+        containing epoch, batch cursor, next optimizer step, skip count since
+        process start, rank/expert, offending checks, and available sample IDs
+        and reference-batch metadata. With rank-0 batch preparation, sample IDs
+        appear in rank 0's record. Missing IDs remain unavailable.
+
+        Backward/reduction completes before discarding gradients so DDP can run
+        the next batch. Unrelated exceptions keep their existing behavior.
+        This does not repair an already-corrupt checkpoint or roll back NaNs
+        created inside an optimizer update; forward-mutated buffers are not
+        rolled back. Validation and per-epoch scheduler behavior is unchanged.
+
     .. _`train_options/num_epoch`: 
 
     num_epoch: 

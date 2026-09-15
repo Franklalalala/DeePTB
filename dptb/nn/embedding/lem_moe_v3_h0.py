@@ -65,6 +65,7 @@ class LemMoEV3H0(LemMoEV3):
         fallback_edge_key: str = _keys.EDGE_FEATURES_KEY,
         h0_merge_mode: str = "replace",
         h0_self_edge_tol: float = 1e-8,
+        h0_ao_cg: bool = True,
         use_flow_time_embedding: bool = False,
         flow_time_condition_edges: bool = True,
         flow_time_key: str = "flow_time",
@@ -196,6 +197,7 @@ class LemMoEV3H0(LemMoEV3):
                 use_spatial_residual_block_input=use_spatial_residual_block_input,
                 merge_mode=h0_merge_mode,
                 self_edge_tol=h0_self_edge_tol,
+                h0_ao_cg=h0_ao_cg,
                 dtype=self.dtype,
                 device=self.device,
             )

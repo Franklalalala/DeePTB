@@ -512,6 +512,7 @@ class H0InitLayer(torch.nn.Module):
         use_spatial_residual_block_input: bool = False,
         merge_mode: str = "replace",
         self_edge_tol: float = 1e-8,
+        h0_ao_cg: bool = True,
         dtype: Union[str, torch.dtype] = torch.float32,
         device: Union[str, torch.device] = torch.device("cpu"),
     ):
@@ -548,7 +549,29 @@ class H0InitLayer(torch.nn.Module):
         self.register_buffer(
             "_h0_sort_index", h0_sort_index, persistent=False
         )
+        # Packed node_h0/edge_h0 from block_to_feature are AO-product (spatial
+        # or SOC uu_real) coordinates. e3nn.Linear declares coupled RMEs.
+        # Residual-block projectors already apply this CG; the generic H0
+        # feature path did not. Non-persistent so Linear state_dict keys stay
+        # unchanged. Legacy checkpoints require explicit h0_ao_cg=False.
+        cg_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+        self.register_buffer(
+            "_h0_cg_change_of_basis",
+            _build_uureal_cg_change_of_basis(
+                self.idp, dtype=cg_dtype, device=device
+            ) if h0_ao_cg else torch.empty(0, dtype=cg_dtype, device=device),
+            persistent=False,
+        )
         self.h0_dim = self.h0_irreps.dim
+        self.h0_ao_cg = bool(h0_ao_cg)
+        self._h0_ao_cg_version = int(self.h0_ao_cg)
+        # Persistent so new checkpoints record the AO-product CG contract.
+        # Missing key on load is fail-closed (old H0 weights are not equivalent).
+        self.register_buffer(
+            "h0_ao_cg_version",
+            torch.tensor([int(self.h0_ao_cg)], dtype=torch.int64, device=torch.device(device)),
+            persistent=True,
+        )
         self.h0_node_key = h0_node_key
         self.h0_edge_key = h0_edge_key
         self.use_h0_node_init = bool(use_h0_node_init)
@@ -655,6 +678,25 @@ class H0InitLayer(torch.nn.Module):
     ):
         version = local_metadata.get("version")
         module_name = prefix[:-1] if prefix.endswith(".") else prefix
+        cg_key = prefix + "h0_ao_cg_version"
+        raw = state_dict.get(cg_key)
+        if raw is None and not self.h0_ao_cg:
+            # Explicit legacy mode keeps old sorted-AO predictions and weights.
+            state_dict[cg_key] = self.h0_ao_cg_version.detach().clone()
+            log.warning("%s: explicitly loading legacy H0 without AO-CG rotation", module_name)
+        else:
+            try:
+                ver = int(raw.reshape(-1)[0].item()) if torch.is_tensor(raw) else int(raw)
+            except (TypeError, ValueError, RuntimeError, IndexError):
+                ver = -1
+            if ver != self._h0_ao_cg_version:
+                error_msgs.append(
+                    f"{module_name or '<root>'}: checkpoint h0_ao_cg_version={ver} "
+                    f"does not match requested version {self._h0_ao_cg_version}. "
+                    "New training defaults to AO-CG rotation. For an unmarked old "
+                    "checkpoint explicitly set h0_ao_cg=false to preserve legacy "
+                    "behavior; use fresh weights for the corrected contract."
+                )
         if self._legacy_unsorted_h0_checkpoint_is_unsafe():
             # Explicit pre-v2 markers are still fail-closed. Missing metadata is
             # the ensemble saver flattening state_dict into a plain dict; those
@@ -828,8 +870,29 @@ class H0InitLayer(torch.nn.Module):
             return base_node_features
 
         node_source = self._mask_node_source(node_source, atom_type)
-        node_source = node_source.index_select(1, self._h0_sort_index)
+        node_source = self._ao_product_to_sorted_irreps(node_source)
         return self._merge_features(base_node_features, self.node_projector(node_source))
+
+    def _ao_product_to_sorted_irreps(self, source: torch.Tensor) -> torch.Tensor:
+        """AO-product packed H0 -> coupled RME in sorted-irrep order.
+
+        ``block_to_feature`` (and compact uu_real expansion) stores flattened
+        spatial AO sub-blocks. Full spinor SOC is rejected by
+        ``_build_uureal_cg_change_of_basis`` / ``ensure_spatial_block_mapper``.
+        Residual-block projectors must not call this on already-coupled inputs.
+        """
+        if source.ndim != 2 or int(source.shape[-1]) != int(self.h0_dim):
+            raise RuntimeError(
+                "H0 AO-product source width "
+                f"{tuple(source.shape)} != h0_dim={self.h0_dim}."
+            )
+        if not self.h0_ao_cg:
+            return source.index_select(1, self._h0_sort_index.to(source.device))
+        change_of_basis = self._h0_cg_change_of_basis.to(
+            device=source.device, dtype=source.dtype
+        )
+        coupled = torch.einsum("kc,nc->nk", change_of_basis, source)
+        return coupled.index_select(1, self._h0_sort_index.to(source.device))
 
     def forward(
         self,
@@ -876,7 +939,7 @@ class H0InitLayer(torch.nn.Module):
                 )
                 return latents, base_node_features, base_edge_features, cutoff_coeffs, active_edges
             edge_source = self._mask_edge_source(edge_source, bond_type)
-            edge_source = edge_source.index_select(1, self._h0_sort_index)
+            edge_source = self._ao_product_to_sorted_irreps(edge_source)
             edge_features_h0 = self.edge_projector(edge_source[active_edges])
             edge_features = self._merge_features(base_edge_features, edge_features_h0)
 
