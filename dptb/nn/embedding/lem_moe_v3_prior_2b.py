@@ -389,8 +389,17 @@ class _Prior2bMixin:
 
         # --- pairwise 2b branch: y_2b = W_2b [h_geo ; Pi(P)], no message passing
         latents, geo_node, geo_edge, cutoff_coeffs, active_edges = self.two_b_init(*init_args)
+        two_b_data = data
+        if not self.only2b and self.use_flow_time_embedding:
+            # CFM updates the GNN state, never the frozen stage-1 input.
+            two_b_data = data.copy()
+            for key in (self.prior_node_key, self.prior_edge_key):
+                original_key = "serial_original_" + key
+                if original_key not in data:
+                    raise KeyError("Serial flow requires immutable input " + original_key)
+                two_b_data[key] = data[original_key]
         prior_node, prior_edge = self._project_prior(
-            data, atom_type, bond_type, active_edges, geo_node.shape[0], geo_edge.shape[0],
+            two_b_data, atom_type, bond_type, active_edges, geo_node.shape[0], geo_edge.shape[0],
             self.two_b_node_proj, self.two_b_edge_proj,
         )
         y2b_node = self.two_b_out_node(torch.cat([geo_node, prior_node], dim=-1))
@@ -438,6 +447,14 @@ class _Prior2bMixin:
             )
             node_features = torch.cat([geo_node, prior_node], dim=-1)
             edge_features = torch.cat([geo_edge, prior_edge], dim=-1)
+            if self.flow_time_conditioner is not None:
+                node_features = self.flow_time_conditioner(node_features, data)
+                if self.flow_time_condition_edges:
+                    edge_batch = batch[edge_index[0][active_edges]]
+                    if not self._edge_graph_invariant_checked:
+                        assert torch.equal(edge_batch, batch[edge_index[1][active_edges]])
+                        self._edge_graph_invariant_checked = True
+                    edge_features = self.flow_time_conditioner(edge_features, data, batch=edge_batch)
             if node_features.shape[-1] != self.concat_irreps.dim:
                 raise RuntimeError(
                     f"concat(geo, P) width {node_features.shape[-1]} != "

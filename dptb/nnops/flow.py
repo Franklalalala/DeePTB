@@ -2724,6 +2724,12 @@ class HamiltonianCFM:
 
         data = data.copy()
         ref_data = ref_data.copy()
+        # Immutable physical inputs for a serial S1 branch. GNN inputs below
+        # are time-dependent; these originals must survive training/sampling.
+        if not self.block_ode:
+            for key in (self.node_h0_key, self.edge_h0_key):
+                if key in data:
+                    data["serial_original_" + key] = data[key].detach().clone()
         if self.block_ode:
             # The model receives ``data`` while loss-time physical projection
             # uses ``ref_data``.  Break shallow tensor aliases up front so an
@@ -3615,6 +3621,10 @@ class HamiltonianCFM:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
         state = data.copy()
+        if not self.block_ode:
+            for key in (self.node_h0_key, self.edge_h0_key):
+                if key in state:
+                    state["serial_original_" + key] = state[key].detach().clone()
         num_graphs = self._num_graphs(state)
         if self.uureal_block_ode:
             if prior_seed is not None:

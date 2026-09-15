@@ -2198,7 +2198,7 @@ def slem_prior():
 
 def slem_prior_2b():
     """Concat-P two-stage residual embedding (Full-H − P labels)."""
-    return slem() + [a for a in slem_edge_h0() if a.name.startswith("edge_router_") or a.name.startswith("edge_moe_")] + [
+    return slem() + [a for a in slem_edge_h0() if a.name.startswith(("edge_router_", "edge_moe_", "flow_time_")) or a.name == "use_flow_time_embedding"] + [
         Argument("h0_ao_cg", bool, optional=True, default=True, doc="AO-CG rotation; false explicitly selects legacy sorted-AO input."),
         Argument(
             "only2b",

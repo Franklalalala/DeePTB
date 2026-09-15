@@ -132,7 +132,7 @@ def main():
                 if tag not in seen:
                     seen.add(tag)
                     mode = task['mode']
-                    if mode not in {'tests', 'smoke', 'production'}:
+                    if mode not in {'tests', 'smoke', 'production', 'campaign'}:
                         raise ValueError('unknown mode')
                     rc = run(['python3', str(root / 'node_mode.py'), mode], tag)
                     print('COMMAND_DONE', job, tag, rc, flush=True)

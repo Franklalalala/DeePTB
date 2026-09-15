@@ -1,0 +1,34 @@
+#!/bin/bash
+# Supply project, resources, FLOW_ROOT and FLOW_ARM with qsub.
+#PBS -q auto
+#PBS -j oe
+# Deliberately no errexit: the PBS parent must survive a failed child.
+set -o pipefail
+ROOT=${FLOW_ROOT:-${PBS_O_WORKDIR:-$PWD}}
+ARM=${FLOW_ARM:-unknown}
+child=
+stop_parent() {
+    trap - TERM INT
+    if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+        kill -TERM "$child" 2>/dev/null
+        wait "$child"
+    fi
+    exit 143
+}
+trap stop_parent TERM INT
+printf 'ALLOCATION_RETAINED job=%s arm=%s node=%s parent=%s\n' "${PBS_JOBID:-test}" "$ARM" "$(hostname)" "$$"
+while [ ! -f "$ROOT/DEPLOY_READY.json" ]; do
+    sleep 5 & child=$!
+    wait "$child"
+    child=
+done
+python3 "$ROOT/controller.py" --root "$ROOT" --arm "$ARM" & child=$!
+wait "$child"
+rc=$?
+child=
+printf 'WORKFLOW_EXIT rc=%s; ALLOCATION_RETAINED; no automatic retry\n' "$rc"
+while true; do
+    sleep 3600 & child=$!
+    wait "$child"
+    child=
+done
