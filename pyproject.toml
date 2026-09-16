@@ -5,6 +5,7 @@ license = "LGPL-3.0"
 description = "A unified deep learning package for electronic structure models including tight-binding, KS Hamiltonian and density matrix models"
 readme = "README.md"
 repository = "https://github.com/deepmodeling/DeePTB"
+include = [{ path = "dptb/nacf/csrc/*", format = ["sdist", "wheel"] }]
 
 [tool.poetry.dependencies]
 python = ">=3.9, <=3.12.9"
