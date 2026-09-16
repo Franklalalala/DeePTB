@@ -179,3 +179,13 @@ _version.py
 # LoopSCF experiment outputs are archived outside the source tree.
 /examples/loopscf/*_20[0-9][0-9][0-9][0-9][0-9][0-9]/
 /examples/loopscf/validation_*.json
+
+# Prepared priors, native binaries and acceptance campaigns are external assets.
+/h0/work/
+/h0/tmp/
+/h0/cache/
+/h0/prebuilt/
+/h0/offline_tables/
+/h0/new100/
+/h0/acceptance_v4/
+/dptb/nacf/prebuilt.json

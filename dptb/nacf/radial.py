@@ -3,7 +3,7 @@
 Table compilation is a one-time CPU operation. Warm forward uses device tensors
 and either a fused CUDA kernel or the torch reference: no SciPy/NumPy, table
 reads, tensor-to-host copies, or Python per-displacement loops. The native
-extension is compiled lazily at first CUDA use, outside the warm path.
+extension is precompiled explicitly at installation; inference never compiles.
 It preserves the source cubic spline (including its boundary conditions), rather
 than refitting a different interpolant. Units and the ABACUS real harmonic gauge
 are inherited unchanged from :class:`RadialBlockTable`.
@@ -17,7 +17,9 @@ import torch
 from scipy.linalg import qr
 from torch import nn
 
-from dptb.data.interfaces.p2_table import RadialBlockTable
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from dptb.data.interfaces.p2_table import RadialBlockTable
 
 
 def _harmonics(l: int, vectors: torch.Tensor) -> torch.Tensor:
@@ -58,6 +60,35 @@ def _rotation_z_to(vectors: torch.Tensor) -> torch.Tensor:
     return torch.where(((z >= 1 - 1e-14) | (radius[:, 0] <= 1e-14))[:, None, None], eye, rotation)
 
 
+def validate_table_options(table, dtype, backend):
+    if backend not in ('auto', 'torch', 'cuda'):
+        raise ValueError('backend must be auto, torch, or cuda')
+    if dtype not in (torch.float32, torch.float64):
+        raise ValueError('radial evaluation requires float32 or float64')
+    if not np.isfinite(table.distances).all() or not np.isfinite(table.support_bohr):
+        raise ValueError('radial knots and support must be finite')
+    if np.iscomplexobj(table.values):
+        raise ValueError('radial tables must be real; SOC belongs in the complex projector D matrix')
+
+    distances=np.asarray(table.distances); values=np.asarray(table.values)
+    shape=(sum(2*l+1 for l in table.left_shells),sum(2*l+1 for l in table.right_shells))
+    if (distances.ndim!=1 or len(distances)<2 or not np.all(np.diff(distances)>0)
+        or values.shape!=(len(distances),*shape) or not np.isfinite(values).all()):
+        raise ValueError('Invalid radial table shape, knots or values')
+    if table.support_bohr <= 0 or distances[0] < 0 or table.support_bohr > distances[-1]:
+        raise ValueError('Invalid radial support domain')
+    if table._spline is not None:
+        coefficients = np.asarray(table._spline.c)
+        if (coefficients.shape != (4, len(distances)-1, *shape)
+                or np.iscomplexobj(coefficients) or not np.isfinite(coefficients).all()
+                or not np.array_equal(table._spline.x, distances)):
+            raise ValueError('Invalid radial spline coefficients or knots')
+    for l in set(table.left_shells+table.right_shells):
+        base=np.asarray(table._rotator._base[l]);directions=np.asarray(table._rotator.directions)
+        if base.shape!=(len(directions),2*l+1) or directions.shape!=(len(directions),3) or not np.isfinite(base).all() or not np.isfinite(directions).all():
+            raise ValueError('Invalid radial rotation data')
+
+
 class TorchRadialBlockTable(nn.Module):
     """Compile one immutable radial table into serializable device buffers.
 
@@ -72,15 +103,8 @@ class TorchRadialBlockTable(nn.Module):
 
     def __init__(self, table: RadialBlockTable, *, device=None, dtype=torch.float64, backend='auto'):
         super().__init__()
-        if backend not in ('auto', 'torch', 'cuda'):
-            raise ValueError('backend must be auto, torch, or cuda')
-        self.backend = backend
-        if dtype not in (torch.float32, torch.float64):
-            raise ValueError('radial evaluation requires float32 or float64')
-        if not np.isfinite(table.distances).all() or not np.isfinite(table.support_bohr):
-            raise ValueError('radial knots and support must be finite')
-        if np.iscomplexobj(table.values):
-            raise ValueError('radial tables must be real; SOC belongs in the complex projector D matrix')
+        validate_table_options(table,dtype,backend)
+        self.backend=backend
         self.left_shells = table.left_shells
         self.right_shells = table.right_shells
         self.support_bohr = float(table.support_bohr)
@@ -88,7 +112,9 @@ class TorchRadialBlockTable(nn.Module):
         self.angular_degrees = tuple(sorted(set(self.left_shells + self.right_shells)))
 
         def buffer(name, array):
-            self.register_buffer(name, torch.as_tensor(np.array(array, copy=True), device=device, dtype=dtype).contiguous())
+            value=torch.as_tensor(np.array(array, copy=True), device=device, dtype=dtype).contiguous()
+            if not torch.isfinite(value).all():raise ValueError('Nonfinite prepared radial buffer')
+            self.register_buffer(name, value)
 
         buffer('knots', table.distances)
         if table._spline is not None:

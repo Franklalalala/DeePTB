@@ -1,18 +1,21 @@
-"""Lazy native backend; one launch evaluates and rotates a whole table batch."""
+"""Precompiled native backend; one launch evaluates and rotates a table batch."""
 from functools import lru_cache
 from pathlib import Path
 
 
 @lru_cache(maxsize=1)
 def extension():
-    from torch.utils.cpp_extension import load
-    source = Path(__file__).parent / 'csrc'
-    return load(name='dptb_nacf_radial',
-                sources=[str(source / 'bindings.cpp'), str(source / 'radial.cu')],
-                extra_cflags=['-O3'], extra_cuda_cflags=['-O3', '--fmad=false'])
+    from .precompiled import load
+    return load()
+
+@lru_cache(maxsize=8)
+def check_device(device):
+    from .precompiled import verify
+    verify(device)
 
 
 def evaluate(table, vectors):
+    check_device(vectors.device)
     return extension().radial(
         vectors.contiguous(), table.knots, table.coefficients,
         table.cuda_degrees, table.cuda_directions, table.cuda_inverse,

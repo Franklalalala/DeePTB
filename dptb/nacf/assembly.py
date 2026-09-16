@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import hashlib
+import os
 
 import numpy as np
 import torch
@@ -27,9 +28,25 @@ class NACFTableBank(nn.Module):
     Tables are loaded/checksummed once during preparation, never in forward.
     """
 
-    def __init__(self, p2_store, p23_store, *, overlap_store=None, soc_store=None, device='cuda', dtype=torch.float64, backend='auto'):
+    def __init__(self, p2_store, p23_store, *, overlap_store=None, soc_store=None, device='cuda', dtype=torch.float64, backend='auto', ry_to_ev=13.605698,
+                 p23_missing_policy='error', expected_p23_sha256=None, prepared_cache_dir=None):
         super().__init__()
+        if p23_missing_policy not in ('error', 'p2_if_missing_pairs'):
+            raise ValueError('unknown P23 missing-pair policy')
+        if p23_missing_policy != 'error' and expected_p23_sha256 is None:
+            raise ValueError('P23 composition fallback requires a trusted P23 manifest SHA256')
+        if expected_p23_sha256 is not None:
+            if (not isinstance(expected_p23_sha256, str) or len(expected_p23_sha256) != 64
+                    or any(c not in '0123456789abcdef' for c in expected_p23_sha256)
+                    or getattr(p23_store, 'manifest_sha256', None) != expected_p23_sha256):
+                raise ValueError('P23 manifest does not match supplied training fingerprint')
+        self.p23_missing_policy = p23_missing_policy
+        self.expected_p23_sha256 = expected_p23_sha256
+        if not np.isfinite(ry_to_ev) or ry_to_ev <= 0:
+            raise ValueError('Ry to eV conversion must be finite and positive')
+        self.ry_to_ev = float(ry_to_ev)
         self.backend = backend
+        self.prepared_cache_dir = prepared_cache_dir or os.environ.get('DPTB_NACF_PREPARED_DIR')
         self.p2_manifest_sha256 = (hashlib.sha256((p2_store.root / 'manifest.json').read_bytes()).hexdigest()
                                    if hasattr(p2_store, 'root') else None)
         if hasattr(p23_store, 'manifest'):
@@ -48,6 +65,19 @@ class NACFTableBank(nn.Module):
         self.tables = nn.ModuleDict()
         self.register_buffer('_anchor', torch.empty(0, device=device, dtype=dtype))
 
+    def p23_composition(self, symbols):
+        """Reproduce the source generator's whole-structure composition rule.
+
+        Only absence from the pinned manifest permits explicit P2 fallback.
+        Listed payloads still undergo normal loading/checksum validation.
+        """
+        unique = sorted(set(symbols))
+        missing = tuple(f'{centre}|{ao}' for centre in unique for ao in unique
+                        if not self.p23.has_factor(centre, ao))
+        if missing and self.p23_missing_policy == 'error':
+            raise KeyError(f'P23 manifest missing composition pairs: {missing[:16]}')
+        return not missing, missing
+
     def table(self, kind, left, right):
         key = f'{kind}_{left}_{right}'
         if key not in self.tables:
@@ -59,7 +89,11 @@ class NACFTableBank(nn.Module):
                 source = self.overlap.base_component(left, right, kind)
             else:
                 source = self.p2.base_component(left, right, kind)
-            self.tables[key] = TorchRadialBlockTable(source, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
+            if self.prepared_cache_dir is None:
+                self.tables[key] = TorchRadialBlockTable(source, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
+            else:
+                from .prepared import cached_table
+                self.tables[key] = cached_table(source, self.prepared_cache_dir, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
         return key
 
     def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True)):
@@ -110,6 +144,7 @@ class NACFAssemblyPlan(nn.Module):
             raise ValueError('every edge must have its reverse') from exc
         self.natoms = len(symbols)
         self.symbols = symbols
+        self.p23_used, self.p23_missing = bank.p23_composition(symbols)
         self.nedges = len(keys)
         self.width = max(int(bank.p2.species[s]['orbital_norb']) for s in symbols)
         self.node_sizes = tuple(int(bank.p2.species[s]['orbital_norb']) for s in symbols)
@@ -152,6 +187,11 @@ class NACFAssemblyPlan(nn.Module):
         from ase.cell import Cell
         enumeration_cell = Cell(cell).complete().array
         enumerator = VectorizedNearbyImageEnumerator(enumeration_cell) if np.any(pbc) else None
+        # A centre contributes to (i,j,R) only if it overlaps AO i. Enumerate
+        # that necessary neighbourhood once per (i,k,kind), then filter by j.
+        # Integer translations and the exact support tests are retained; the
+        # midpoint search formerly repeated lattice enumeration for every edge.
+        centre_candidates = {}
         for block_id, (i, j, rx, ry, rz) in enumerate(all_keys):
             shift = np.array([rx, ry, rz])
             ci, cj = positions[i], positions[j] + shift @ cell
@@ -169,23 +209,30 @@ class NACFAssemblyPlan(nn.Module):
                     base_rows[pair].append((block_id, row, ni, nj))
             for k, sk in enumerate(symbols):
                 for kind in ('projector', 'vna'):
-                    if kind == 'vna' and block_id >= self.natoms:
+                    if kind == 'vna' and (block_id >= self.natoms or not self.p23_used):
                         continue  # NACF needs P23 onsite only.
                     meta = bank.p2.species[sk] if kind == 'projector' else bank.p23.species[sk]
                     if kind == 'projector' and int(meta['projector_norb']) == 0:
                         continue
                     cutoff = float(meta['projector_max_cutoff_bohr'] if kind == 'projector' else meta['vna_cutoff_bohr'])
-                    if enumerator is None:
-                        translations, centres = np.zeros((1, 3), dtype=int), positions[k:k + 1]
-                    else:
-                        translations, centres = enumerator.query_arrays(positions[k], (ci + cj) * .5, cutoff + max(cutoff_i, cutoff_j) + distance * .5)
-                    di, dj = ci - centres, cj - centres
+                    candidate_key = (i, k, kind)
+                    if candidate_key not in centre_candidates:
+                        if enumerator is None:
+                            translations, centres = np.zeros((1, 3), dtype=int), positions[k:k + 1]
+                        else:
+                            translations, centres = enumerator.query_arrays(positions[k], ci, cutoff + cutoff_i)
+                        left_distance = np.linalg.norm(ci - centres, axis=1)
+                        active_left = (left_distance <= cutoff + cutoff_i + 1e-12 if kind == 'projector'
+                                       else left_distance < cutoff + cutoff_i - 1e-12)
+                        active_left &= np.all(translations[:, ~pbc] == 0, axis=1)
+                        centre_candidates[candidate_key] = translations[active_left], centres[active_left]
+                    translations, centres = centre_candidates[candidate_key]
+                    dj = cj - centres
                     if kind == 'projector':
-                        active = (np.linalg.norm(di, axis=1) <= cutoff + cutoff_i + 1e-12) & (np.linalg.norm(dj, axis=1) <= cutoff + cutoff_j + 1e-12)
+                        active = np.linalg.norm(dj, axis=1) <= cutoff + cutoff_j + 1e-12
                     else:
-                        active = (np.linalg.norm(di, axis=1) < cutoff + cutoff_i - 1e-12) & (np.linalg.norm(dj, axis=1) < cutoff + cutoff_j - 1e-12)
+                        active = np.linalg.norm(dj, axis=1) < cutoff + cutoff_j - 1e-12
                         active &= ~((k == i) & np.all(translations == 0, axis=1))
-                    active &= np.all(translations[:, ~pbc] == 0, axis=1)
                     for t in translations[active]:
                         left_pair, left_row = query(kind, i, k, -t)
                         right_pair, right_row = query(kind, j, k, shift - t)
@@ -237,7 +284,10 @@ class NACFAssemblyPlan(nn.Module):
             rows = getattr(self, f'base_rows_{number}')
             target = p2 if pair[0] == 'p2_base' else overlap
             target[rows[:, 0], :ni, :nj] = values[self.pair_ids[pair]][rows[:, 1]]
-        vna = torch.zeros_like(p2)
+        # VNA contributes only to P23 onsite, including in merged batch plans.
+        # Do not allocate (or spin-lift) unused edge blocks; P2 node blocks
+        # remain necessary intermediates for the P23 onsite result.
+        vna = p2.new_zeros((self.natoms, self.width, self.width))
         spinor = (torch.zeros((p2.shape[0], 4, self.width, self.width), device=p2.device,
                              dtype=torch.complex128 if p2.dtype == torch.float64 else torch.complex64)
                   if self.bank.soc is not None else None)
@@ -271,9 +321,9 @@ class NACFAssemblyPlan(nn.Module):
         node_p2, edge_p2 = hermitian(p2)
         node_vna = (vna[:self.natoms] + vna[:self.natoms].transpose(-1, -2)) * .5
         node_s, edge_s = hermitian(overlap)
-        # Match the historical materializer's constant exactly; changing to the
-        # newer CODATA constant here would move the checkpoint's physical prior.
-        ry_to_ev = 13.605698
+        # Match the selected training materializer. The non-SOC 2b and SOC29303
+        # join scripts used different constants; P23 factors are already in eV.
+        ry_to_ev = self.bank.ry_to_ev
         return {'node_p23_ao_ev': node_p2 * ry_to_ev + node_vna,
                 'edge_p2_ao_ev': edge_p2 * ry_to_ev,
                 'node_overlap_ao': node_s, 'edge_overlap_ao': edge_s,
@@ -299,6 +349,8 @@ class NACFBatchAssemblyPlan(NACFAssemblyPlan):
         self.nedges = sum(p.nedges for p in plans)
         self.width = max(p.width for p in plans)
         self.symbols = tuple(s for p in plans for s in p.symbols)
+        self.p23_used = tuple(p.p23_used for p in plans)
+        self.p23_missing = tuple(p.p23_missing for p in plans)
         self.node_sizes = tuple(n for p in plans for n in p.node_sizes)
         self.register_buffer('positions', torch.cat([p.positions for p in plans]))
         self.register_buffer('cell', torch.stack([p.cell for p in plans]))
@@ -422,7 +474,15 @@ class NACFFeaturePlan(nn.Module):
             indices = np.zeros((len(pairs), nfeatures), dtype=np.int64)
             signs = np.zeros((len(pairs), nfeatures))
             imaginary = np.zeros((len(pairs), nfeatures), dtype=bool)
+            mapped_rows = {}
             for row_id, (left, right) in enumerate(pairs):
+                previous = mapped_rows.get((left, right))
+                if previous is not None:
+                    indices[row_id] = indices[previous]
+                    signs[row_id] = signs[previous]
+                    imaginary[row_id] = imaginary[previous]
+                    continue
+                mapped_rows[(left, right)] = row_id
                 li, ls = permutations[left]
                 ri, rs = permutations[right]
                 if self.full_soc:

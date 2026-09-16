@@ -26,6 +26,9 @@ class LemMoEV3Edge(LemMoEV3):
     """LEM MoE v3 variant with per-active-edge routing coefficients."""
 
     def __init__(self, **kwargs: Any):
+        self.edge_router_top1_mode = kwargs.pop("edge_router_top1_mode", "legacy")
+        if self.edge_router_top1_mode not in ("legacy", "switch"):
+            raise ValueError("edge_router_top1_mode must be legacy or switch")
         edge_router_in_features = kwargs.pop("edge_router_in_features", None)
         self.edge_router_unique_types = bool(kwargs.pop("edge_router_unique_types", True))
         self.edge_moe_compact_dispatch = bool(kwargs.pop("edge_moe_compact_dispatch", True))
@@ -38,13 +41,17 @@ class LemMoEV3Edge(LemMoEV3):
         if not self.edge_router_prior_activate:
             kwargs.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
         top_k = kwargs.get("top_k", 1)
+        if self.edge_router_top1_mode == "switch" and (top_k != 1 or not self.edge_router_prior_activate):
+            raise ValueError("Switch top-1 branch requires top_k=1 and prior_activate=true")
+        if self.edge_router_top1_mode == "switch" and kwargs.get("num_shared_experts", 1) != 0:
+            raise ValueError("Switch top-1 branch requires num_shared_experts=0")
         prev_so2_env = None
         if self.edge_router_prior_activate:
             # softmax over a single gathered logit is the constant 1, so with
             # top_k=1 the routing coefficient carries no gradient at all: the
             # zero-initialised descriptor columns would stay zero forever and the
             # whole mode would be a silent no-op that still pays for staged SO2.
-            if int(top_k) < 2:
+            if int(top_k) < 2 and self.edge_router_top1_mode != "switch":
                 raise ValueError(
                     "edge_router_prior_activate needs top_k >= 2; got %r. With "
                     "top_k=1 the gate is constant and the router receives no "
@@ -159,12 +166,16 @@ class LemMoEV3Edge(LemMoEV3):
             self.register_buffer("_prior_mean", mean, persistent=False)
             self.register_buffer("_prior_std", std, persistent=False)
 
-        self.router = MOLERouterV3(
+        router_type = MOLERouterV3
+        if self.edge_router_top1_mode == "switch":
+            from dptb.nn.top1_prior import Top1PriorRouter
+            router_type = Top1PriorRouter
+        self.router = router_type(
             in_features=self.edge_router_in_features,
             num_experts=self.num_experts,
             top_k=top_k,
-            aux_loss_free=True,
-            bias_update_speed=0.005,
+            aux_loss_free=self.edge_router_top1_mode != "switch",
+            bias_update_speed=0.0 if self.edge_router_top1_mode == "switch" else 0.005,
         )
         if self.edge_router_prior_dim:
             # The descriptor contributes exactly zero at step 0, so it can earn
@@ -384,6 +395,10 @@ class LemMoEV3Edge(LemMoEV3):
             coeffs = active_edge_one_hot.new_zeros((0, self.num_experts))
             zero = active_edge_one_hot.new_zeros(())
             return MOLEGlobals(coefficients=coeffs, sizes=None), zero, zero, zero
+
+        if self.edge_router_top1_mode == "switch":
+            route, monitor, cv = self.router(active_edge_one_hot)
+            return route, monitor, cv, active_edge_one_hot.new_tensor(float(num_active_edges))
 
         if self.edge_router_prior_activate:
             # One routing decision per edge.  No dedup: the whole point of this

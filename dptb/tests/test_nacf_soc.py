@@ -41,6 +41,14 @@ def test_soc_d_spin_trace_radial_couplings_and_time_reversal():
     n=9
     scalar=np.kron(dij*np.array([[1/3,0,0],[0,2/3,2/3],[0,2/3,2/3]]),np.eye(3))
     np.testing.assert_allclose((d[:n,:n]+d[n:,n:])/2,scalar,atol=1e-14)
+    # The training prior is scalar D_eff. In real harmonics Lz is imaginary,
+    # so real uu/dd reproduce that prior even though the complex blocks differ.
+    np.testing.assert_allclose(d[:n,:n].real,scalar,atol=1e-14)
+    np.testing.assert_allclose(d[n:,n:].real,scalar,atol=1e-14)
+    rng=np.random.default_rng(193)
+    left,right=rng.normal(size=(n,7)),rng.normal(size=(n,5))
+    np.testing.assert_allclose((left.T@d[:n,:n]@right).real,
+                               left.T@scalar@right,atol=1e-13)
     np.testing.assert_allclose(d,d.conj().T,atol=1e-14)
     time_reversal=np.kron(np.array([[0,1],[-1,0]]),np.eye(n))
     np.testing.assert_allclose(time_reversal@d.conj()@time_reversal.T,d,atol=1e-14)

@@ -1278,6 +1278,9 @@ class MOLELinear(nn.Module):
         return flat_out.reshape(*x.shape[:-1], self.out_features)
 
     def forward(self, x, mole_globals: MOLEGlobals):
+        if getattr(mole_globals, "top1_independent", False):
+            from .top1_prior import linear
+            return linear(self, x, mole_globals)
         # 安全回退
         if mole_globals is None or mole_globals.coefficients is None:
             w_avg = self.weight_experts.mean(0)
@@ -2279,6 +2282,11 @@ class SO2_Linear(torch.nn.Module):
             self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
 
     def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
+        if getattr(mole_globals, "top1_independent", False):
+            from .top1_so2_cuda import try_forward
+            result = try_forward(self, x, R, mole_globals, latents, wigner_D_all, route=route)
+            if result is not None:
+                return result
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
         wigner_D_return = wigner_D_all

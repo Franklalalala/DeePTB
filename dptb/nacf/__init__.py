@@ -1,7 +1,7 @@
 """Geometry-only NACF inference with source-bound, device-resident tables.
 
 Offline building and benchmark helpers are deliberately not imported here.
-CUDA compilation is lazy and never required for the CPU reference backend.
+CUDA binaries are prepared at installation and never compiled by inference.
 """
 from .assembly import NACFTableBank
 from .inference import NACFGeometryPredictor, load_predictor, prepare_geometry

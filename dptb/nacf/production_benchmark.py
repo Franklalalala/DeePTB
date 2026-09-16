@@ -64,7 +64,8 @@ def memory_snapshot(device):
 
 
 @torch.inference_mode()
-def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False):
+def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False,
+                 cpu_feature_function=cpu_features):
     device=predictor.device
     structures=[atoms] if hasattr(atoms,'get_positions') else list(atoms)
     if not structures: raise ValueError('empty benchmark batch')
@@ -87,16 +88,24 @@ def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False):
     native=prepared.plan()
     geometry=prepared.geometry
     def clone(data): return {k:v.clone() for k,v in data.items()}
-    baseline={**clone(geometry),**clone(native)}
-    def ai_input(): return clone(baseline)
+    baseline=(prepared.model_inputs(native) if hasattr(prepared,'model_inputs')
+              else {**clone(geometry),**clone(native)})
+    def ai_input():
+        if hasattr(predictor.model,'prepare_arm_inputs'):
+            return predictor.model.prepare_arm_inputs(baseline)
+        return clone(baseline)
+    def ai_forward():
+        if hasattr(predictor.model,'forward_arms'):
+            return predictor.model.forward_arms(current_inputs)
+        return predictor.model(current_inputs)
     def cpu_from_graphs(graphs):
-        values=[cpu_features(predictor,item,SimpleNamespace(geometry=graph))
+        values=[cpu_feature_function(predictor,item,SimpleNamespace(geometry=graph))
                 for item,graph in zip(structures,graphs)]
         return values[0] if len(values)==1 else {k:torch.cat([v[k] for v in values]) for k in values[0]}
     def cpu_prior(): return cpu_from_graphs(cpu_graphs)
     def cpu_fresh():
         return cpu_from_graphs([graph_for(item) for item in structures])
-    functions=dict(ai_forward=lambda:predictor.model(current_inputs),cpu_prior=cpu_prior,
+    functions=dict(ai_forward=ai_forward,cpu_prior=cpu_prior,
                    torch_prior=prepared.plan,cuda_prior=prepared.plan,
                    cpu_fresh_prior=cpu_fresh,torch_fresh_prior=lambda:predictor.prepare(atoms).plan(),
                    cuda_fresh_prior=lambda:predictor.prepare(atoms).plan(),
@@ -129,7 +138,7 @@ def measure_case(predictor, atoms, repeats=3, warmup=1, allow_shared_gpu=False):
                 peaks[name].append(dict(baseline_allocated_bytes=allocated,
                                         peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
                                         incremental_peak_bytes=torch.cuda.max_memory_allocated(device)-allocated))
-            for key in ('node_features','edge_features') if name=='ai_forward' else ('node_p23','edge_p2'):
+            for key in ('node_features','edge_features') if name in ('ai_forward','cuda_geometry_to_full') else ('node_p23','edge_p2'):
                 if key in result and not torch.isfinite(result[key]).all(): raise AssertionError('nonfinite '+key)
             del result,current_inputs
     medians={k:float(np.median(v)) for k,v in samples.items()}
@@ -185,11 +194,23 @@ def main():
         ap.add_argument('--'+key,required=True)
     ap.add_argument('--device',default='cuda:0'); ap.add_argument('--repeats',type=int,default=3)
     ap.add_argument('--warmup',type=int,default=1)
+    ap.add_argument('--model-backend',choices=('checkpoint','reference'),default='checkpoint',
+                    help='Use the checkpoint model backend; reference is an explicit non-SOC diagnostic override')
+    ap.add_argument('--p23-missing-policy',choices=('error','p2_if_missing_pairs'),default='error')
+    ap.add_argument('--expected-p23-sha256',help='Trusted P23 fingerprint required for composition fallback')
     ap.add_argument('--allow-shared-gpu',action='store_true',help='Diagnostic run only; shared rows remain excluded from the primary aggregate')
     ap.add_argument('--batch-sizes',type=int,nargs='+',default=[])
     ap.add_argument('--skip-singletons',action='store_true',help='Run only the explicitly requested mixed batches')
     ap.add_argument('--resume',action='store_true',help='Resume matching output, preserving earlier failed attempts')
+    ap.add_argument('--hopping-checkpoint',help='SOC hopping arm; --checkpoint is then the onsite arm')
+    ap.add_argument('--soc',help='Full SOC projector sidecar, required with --hopping-checkpoint')
+    ap.add_argument('--onsite-config',help='Verified same-run SOC training config when checkpoint omits dataset settings')
+    ap.add_argument('--hopping-config',help='Verified same-run SOC hopping training config')
+    ap.add_argument('--soc-ry-to-ev',type=float,default=13.605693122994,
+                    help='Verified SOC training materializer conversion; default matches SOC29303')
     args=ap.parse_args()
+    if bool(args.soc) != bool(args.hopping_checkpoint): ap.error('SOC requires both --soc and --hopping-checkpoint')
+    if args.soc and args.model_backend != 'checkpoint': ap.error('SOC benchmarking requires the checkpoint model backend')
     if args.repeats<3 or args.warmup<1: ap.error('at least 3 repeats and 1 warmup required')
     out=Path(args.output)
     previous=None
@@ -206,8 +227,21 @@ def main():
     from ._cuda import extension
     extension()
     stages['extension_imported']=memory_snapshot(device)
-    predictor=load_predictor(args.checkpoint,args.p2,args.p23,args.overlap,args.expected_p2_sha256,args.device,backend='cuda')
-    if predictor.idp.has_soc: raise ValueError('this matched model benchmark requires the non-SOC checkpoint; measure full SOC tables separately')
+    cpu_function = cpu_features
+    if args.soc:
+        from .spinor_inference import load_soc_predictor
+        from .soc_cpu_reference import cpu_soc_features
+        predictor=load_soc_predictor(args.checkpoint,args.hopping_checkpoint,p2=args.p2,p23=args.p23,
+            overlap=args.overlap,soc=args.soc,expected_p2_sha256=args.expected_p2_sha256,
+            device=args.device,backend='cuda',ry_to_ev=args.soc_ry_to_ev,
+            onsite_config=args.onsite_config,hopping_config=args.hopping_config,
+            p23_missing_policy=args.p23_missing_policy,expected_p23_sha256=args.expected_p23_sha256)
+        cpu_function=cpu_soc_features
+    else:
+        predictor=load_predictor(args.checkpoint,args.p2,args.p23,args.overlap,args.expected_p2_sha256,args.device,
+                                 backend='cuda',model_backend=args.model_backend,
+                                 p23_missing_policy=args.p23_missing_policy,expected_p23_sha256=args.expected_p23_sha256)
+        if predictor.idp.has_soc: raise ValueError('compact SOC inference requires a hopping checkpoint and complete SOC tables')
     stages['model_loaded_empty_table_cache']=memory_snapshot(device)
     model_bytes=storage_bytes(list(predictor.model.parameters())+list(predictor.model.buffers()))
     structures=read(args.geometry,index=':')
@@ -217,19 +251,33 @@ def main():
     report=dict(schema='deeptb.nacf_production_benchmark/v1',scope=__doc__,checkpoint=args.checkpoint,
                 checkpoint_sha256=hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest(),
                 source_sha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path(__file__).parent.glob('*.py')},
-                runtime_model_overrides={'so2_fusion_mode':'streamed_m_major_ref','mole_linear_mode':'split_loop'},
+                runtime_model_overrides=predictor.runtime_model_overrides,
+                p23_missing_policy=predictor.bank.p23_missing_policy,
                 model_dtype=str(predictor.dtype),prior_dtype=str(predictor.bank._anchor.dtype),
                 geometry_sha256=hashlib.sha256(Path(args.geometry).read_bytes()).hexdigest(),
                 gpu=torch.cuda.get_device_name(device),torch_version=torch.__version__,threads=torch.get_num_threads(),
                 p2_sha256=predictor.bank.p2_manifest_sha256,p23_sha256=predictor.bank.p23.manifest_sha256,
                 overlap_sha256=predictor.bank.overlap.manifest_sha256,model_bytes=model_bytes,
                 memory_stages=stages,repeats=args.repeats,warmup=args.warmup,requested=len(structures),rows=[],batches=[])
+    report['source_sha256']['interfaces/p2_table.py']=hashlib.sha256(
+        (Path(__file__).parents[1]/'data/interfaces/p2_table.py').read_bytes()).hexdigest()
+    report.update(hopping_checkpoint=args.hopping_checkpoint,
+        hopping_checkpoint_sha256=hashlib.sha256(Path(args.hopping_checkpoint).read_bytes()).hexdigest() if args.soc else None,
+        soc_sha256=predictor.bank.soc.manifest_sha256 if args.soc else None,
+        output_contract='full_soc_nacf_plus_uu_real_residual' if args.soc else 'full_h_minus_nacf_addback',
+        cpu_algorithm='legacy_scalar_algorithm_lifted_to_complex_spinor' if args.soc else 'legacy_scalar_algorithm',
+        cpu_rotation='stable_south_pole',
+        ry_to_ev=predictor.bank.ry_to_ev,
+        training_config_sha256={role:hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                               for role,path in (('onsite',args.onsite_config),('hopping',args.hopping_config)) if path},
+        ai_forward_scope='both_onsite_and_hopping_arms_copies_excluded' if args.soc else 'single_model_copies_excluded')
     run_id=uuid.uuid4().hex
     invocation=dict(run_id=run_id,started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
                     allow_shared_gpu=args.allow_shared_gpu,source_sha256=report['source_sha256'])
     if previous is not None:
         for key in ('checkpoint_sha256','geometry_sha256','gpu','torch_version','threads','p2_sha256','p23_sha256','overlap_sha256',
-                    'model_dtype','prior_dtype','runtime_model_overrides','repeats','warmup','requested','source_sha256'):
+                    'model_dtype','prior_dtype','runtime_model_overrides','p23_missing_policy','repeats','warmup','requested','source_sha256',
+                    'hopping_checkpoint_sha256','soc_sha256','output_contract','cpu_algorithm','cpu_rotation','ai_forward_scope','ry_to_ev','training_config_sha256'):
             if previous.get(key)!=report[key]: raise ValueError('resume provenance mismatch: '+key)
         report['rows']=previous['rows']
         report['batches']=previous.get('batches',[])
@@ -255,7 +303,7 @@ def main():
         if any(r['index']==i and accepted(r) for r in report['rows']): continue
         unavailable=False
         try:
-            row=measure_case(predictor,atoms,args.repeats,args.warmup,args.allow_shared_gpu)
+            row=measure_case(predictor,atoms,args.repeats,args.warmup,args.allow_shared_gpu,cpu_feature_function=cpu_function)
             row.update(status='ok',index=i,identity=dict(atoms.info))
         except Exception as exc:
             row=dict(status='failed',index=i,identity=dict(atoms.info),error=repr(exc))
@@ -269,7 +317,7 @@ def main():
         if any(r['structures']==size and accepted(r) for r in report['batches']): continue
         try:
             errors=validate_batch(predictor,structures[:size])
-            row=measure_case(predictor,structures[:size],args.repeats,args.warmup,args.allow_shared_gpu)
+            row=measure_case(predictor,structures[:size],args.repeats,args.warmup,args.allow_shared_gpu,cpu_feature_function=cpu_function)
             row.update(status='ok',indices=list(range(size)),batch_vs_singleton_max_abs=errors)
         except Exception as exc:
             row=dict(status='failed',structures=size,error=repr(exc))

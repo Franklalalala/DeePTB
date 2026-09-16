@@ -29,7 +29,9 @@ class NACFGeometryPredictor:
         if not expected_p2_source_fingerprint or expected_p2_source_fingerprint != table_bank.p2_manifest_sha256:
             raise ValueError('table bank does not match the checkpoint training P2 fingerprint')
         embedding = model_options.get('embedding', {})
-        if embedding.get('method') not in ('lem_moe_v3_prior', 'lem_moe_v3_prior_2b') or embedding.get('prior_kind') != 'na_cf':
+        if embedding.get('method') not in (
+            'lem_moe_v3_prior', 'lem_moe_v3_prior_2b', 'lem_moe_v3_edge_prior_2b',
+        ) or embedding.get('prior_kind') != 'na_cf':
             raise ValueError('model is not an NACF-conditioned residual model')
         self.model = model.eval()
         self.bank = table_bank
@@ -113,7 +115,11 @@ class PreparedNACFInference:
 __all__ = ['NACFGeometryPredictor', 'PreparedNACFInference', 'prepare_geometry', 'load_predictor']
 
 
-def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cuda', backend='auto', soc=None):
+def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cuda', backend='auto', soc=None,
+                   *, model_backend='checkpoint', p23_missing_policy='error', expected_p23_sha256=None):
+    """Load the trained model backend unless an explicit reference run is requested."""
+    if model_backend not in ('checkpoint', 'reference'):
+        raise ValueError("model_backend must be 'checkpoint' or 'reference'")
     from dptb.nn import build_model
     checkpoint = Path(checkpoint)
     payload = torch.load(checkpoint, map_location='cpu', weights_only=False)
@@ -124,16 +130,20 @@ def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cud
                 raise ValueError(f'nonfinite checkpoint model tensor: {name}')
     options = copy.deepcopy(payload['config']['model_options'])
     del payload, state
-    options['embedding'].update(so2_fusion_mode='streamed_m_major_ref', mole_linear_mode='split_loop')
+    overrides = ({'so2_fusion_mode':'streamed_m_major_ref', 'mole_linear_mode':'split_loop'}
+                 if model_backend == 'reference' else {})
+    options['embedding'].update(overrides)
     from .soc import SOCProjectorStore
     p2_store = P2TableStore(p2)
     soc_store = None if soc is None else SOCProjectorStore(soc, p2_store)
     bank = NACFTableBank(p2_store, P23VNAFactorTableStore(p23),
-                         overlap_store=OverlapTableStore(overlap), soc_store=soc_store, device=device, backend=backend)
+                         overlap_store=OverlapTableStore(overlap), soc_store=soc_store, device=device, backend=backend,
+                         p23_missing_policy=p23_missing_policy, expected_p23_sha256=expected_p23_sha256)
     if bank.p2_manifest_sha256 != expected_p2_sha256:
         raise ValueError('P2 manifest does not match supplied training fingerprint')
     model = build_model(checkpoint=str(checkpoint), model_options=options,
                         common_options={}).eval().to(device)
     predictor = NACFGeometryPredictor(model, bank, options, target='full_h_minus_nacf',
                                       expected_p2_source_fingerprint=expected_p2_sha256)
+    predictor.runtime_model_overrides = overrides
     return predictor

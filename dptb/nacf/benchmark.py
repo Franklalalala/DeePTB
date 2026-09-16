@@ -45,11 +45,13 @@ def cpu_features(predictor, atoms, prepared):
         prior[row,:ni,:nj] = blocks[keys[row]] * 13.605698
         overlap[row,:ni,:nj] = (bank.overlap.onsite_component(symbols[i],'overlap') if row < n else
             bank.overlap.base_component(symbols[i],symbols[j],'overlap').evaluate(positions[j]+np.asarray(shift)@cell-positions[i]))
-    addition,_,_ = P23VNAFactorAssembler(bank.p23,factor_dtype=np.float64).assemble_graph_addition(
-        **args,edge_index=np.empty((2,0),dtype=int),edge_cell_shift=np.empty((0,3),dtype=int),
-        node_shapes=np.array([[s,s] for s in sizes]),edge_shapes=np.empty((0,2),dtype=int),
-        node_pad_shape=(width,width),edge_pad_shape=(width,width))
-    prior[:n] += addition
+    use_p23,_ = bank.p23_composition(symbols)
+    if use_p23:
+        addition,_,_ = P23VNAFactorAssembler(bank.p23,factor_dtype=np.float64).assemble_graph_addition(
+            **args,edge_index=np.empty((2,0),dtype=int),edge_cell_shift=np.empty((0,3),dtype=int),
+            node_shapes=np.array([[s,s] for s in sizes]),edge_shapes=np.empty((0,2),dtype=int),
+            node_pad_shape=(width,width),edge_pad_shape=(width,width))
+        prior[:n] += addition
     lookup = {k:r for r,k in enumerate(keys[n:])}
     reverse = [lookup[(j,i,-x,-y,-z)] for i,j,x,y,z in keys[n:]]
     converter = OrbAbacus2DeepTB()
