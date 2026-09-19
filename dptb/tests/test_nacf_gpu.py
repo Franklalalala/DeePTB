@@ -75,7 +75,10 @@ def test_nacf_rejects_incomplete_graph_and_supports_molecule():
     assert result['node_p23_ao_ev'].item() == pytest.approx((2 + .2 ** 2 * 2) * 13.605698)
 
 
-def test_fused_gauge_and_rme_gather_matches_existing_packer():
+@pytest.mark.parametrize('mapping,backend,device', [('expanded','torch','cpu'), ('compact','torch','cpu'), ('compact','cuda','cuda')])
+def test_fused_gauge_and_rme_gather_matches_existing_packer(mapping, backend, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
     from dptb.data.transforms import OrbitalMapper
     from dptb.data.interfaces.abacus import OrbAbacus2DeepTB
     from dptb.data.interfaces.blockwise_tensor import block_tensors_to_feature_tensors
@@ -86,20 +89,22 @@ def test_fused_gauge_and_rme_gather_matches_existing_packer():
     assembly.positions = torch.zeros((2, 3), dtype=torch.float64)
     assembly.edge_index = torch.tensor([[0, 1], [1, 0]])
     assembly.bank = SimpleNamespace(p2=SimpleNamespace(species={'H':{'orbital_shells':[0]}, 'C':{'orbital_shells':[0, 1]}}))
-    plan = NACFFeaturePlan(assembly, idp, output_dtype=torch.float64)
+    assembly.positions = assembly.positions.to(device)
+    assembly.edge_index = assembly.edge_index.to(device)
+    plan = NACFFeaturePlan(assembly, idp, output_dtype=torch.float64, mapping=mapping, packing_backend=backend)
     node = torch.randn((2, 4, 4), generator=torch.Generator().manual_seed(14), dtype=torch.float64)
     edge = node.flip(0).clone()
-    actual = plan.pack(node, edge)
+    actual = plan.pack(node.to(device), edge.to(device))
     converter = OrbAbacus2DeepTB()
     node_ref, edge_ref = torch.zeros_like(node), torch.zeros_like(edge)
     node_ref[0, :1, :1] = node[0, :1, :1]
     node_ref[1] = torch.from_numpy(converter.transform(node[1].numpy(), [0,1], [0,1]))
     edge_ref[0, :1, :] = torch.from_numpy(converter.transform(edge[0, :1, :].numpy(), [0], [0,1]))
     edge_ref[1, :, :1] = torch.from_numpy(converter.transform(edge[1, :, :1].numpy(), [0,1], [0]))
-    data = {'atomic_numbers':torch.tensor([[1],[6]]), 'edge_index':assembly.edge_index}
+    data = {'atomic_numbers':torch.tensor([[1],[6]]), 'edge_index':assembly.edge_index.cpu()}
     expected = block_tensors_to_feature_tensors(data, idp, node_blocks=node_ref, edge_blocks=edge_ref)
     for a, b in zip(actual, expected):
-        torch.testing.assert_close(a, b, atol=0, rtol=0)
+        torch.testing.assert_close(a.cpu(), b, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize('device', ['cpu', 'cuda'])

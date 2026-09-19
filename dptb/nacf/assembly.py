@@ -453,13 +453,26 @@ class NACFFeaturePlan(nn.Module):
     checkpoint. The hot path has no orbital loops or host synchronizations.
     Outputs follow the mapper: triangular non-SOC, directed uu-real, or full
     SOC orbital-pair-major [Re(uu,ud,du,dd), Im(uu,ud,du,dd)] features.
+
+    ``mapping='compact'`` stores one template per directed species pair plus
+    one integer per block. ``packing_backend='cuda'`` directly gathers from
+    these templates without expanding them. It requires a prebuilt extension;
+    AO blocks requiring gradients use the differentiable Torch path instead.
     """
 
-    def __init__(self, assembly: NACFAssemblyPlan, idp, *, output_dtype=torch.float32):
+    def __init__(self, assembly: NACFAssemblyPlan, idp, *, output_dtype=torch.float32,
+                 mapping='expanded', packing_backend='torch'):
         super().__init__()
         from dptb.data.interfaces.blockwise_tensor import ensure_spatial_block_mapper, onsite_feature_slices, edge_feature_slices
         from dptb.utils.constants import ABACUS2DeePTB, anglrMId
         from scipy.linalg import block_diag
+        if mapping not in ('expanded', 'compact'):
+            raise ValueError('mapping must be expanded or compact')
+        if packing_backend not in ('torch', 'cuda'):
+            raise ValueError('packing_backend must be torch or cuda')
+        if packing_backend == 'cuda' and mapping != 'compact':
+            raise ValueError('CUDA packing requires compact mapping')
+        self.mapping, self.packing_backend = mapping, packing_backend
         self.full_soc = bool(getattr(idp, 'has_soc', False) and not getattr(idp, 'nextham_uureal_mask', False))
         self.spinor_input = getattr(assembly, 'spinor_input', getattr(assembly.bank, 'soc', None) is not None)
         self.soc_doubling = bool(getattr(idp, 'soc_complex_doubling', False))
@@ -478,6 +491,7 @@ class NACFFeaturePlan(nn.Module):
         self.output_dtype = output_dtype
         width, nfeatures = assembly.width, int(idp.reduced_matrix_element)
         block_width = width * (2 if self.spinor_input else 1)
+        self.block_width = block_width
         permutations = {}
         for symbol in set(assembly.symbols):
             shells = tuple(map(int, assembly.bank.p2.species[symbol]['orbital_shells']))
@@ -490,21 +504,17 @@ class NACFFeaturePlan(nn.Module):
             index = np.argmax(np.abs(transform), axis=1)
             permutations[symbol] = index, transform[np.arange(len(index)), index]
         edges = assembly.edge_index.detach().cpu().numpy()
-        specs = [('node', [(s, s) for s in assembly.symbols]),
-                 ('edge', [(assembly.symbols[i], assembly.symbols[j]) for i, j in edges.T])]
-        for name, pairs in specs:
+        species, codes = np.unique(assembly.symbols, return_inverse=True)
+        nspecies = len(species)
+        specs = [('node', codes * (nspecies + 1)),
+                 ('edge', codes[edges[0]] * nspecies + codes[edges[1]])]
+        for name, pair_codes in specs:
+            pairs, row_types = np.unique(pair_codes, return_inverse=True)
             indices = np.zeros((len(pairs), nfeatures), dtype=np.int64)
-            signs = np.zeros((len(pairs), nfeatures))
+            signs = np.zeros((len(pairs), nfeatures), dtype=np.int8)
             imaginary = np.zeros((len(pairs), nfeatures), dtype=bool)
-            mapped_rows = {}
-            for row_id, (left, right) in enumerate(pairs):
-                previous = mapped_rows.get((left, right))
-                if previous is not None:
-                    indices[row_id] = indices[previous]
-                    signs[row_id] = signs[previous]
-                    imaginary[row_id] = imaginary[previous]
-                    continue
-                mapped_rows[(left, right)] = row_id
+            for row_id, pair in enumerate(pairs):
+                left, right = species[int(pair) // nspecies], species[int(pair) % nspecies]
                 li, ls = permutations[left]
                 ri, rs = permutations[right]
                 if self.full_soc:
@@ -526,18 +536,47 @@ class NACFFeaturePlan(nn.Module):
                     else:
                         indices[row_id, feature] = (li[row, None] * block_width + ri[None, col]).ravel()
                         signs[row_id, feature] = (ls[row, None] * rs[None, col]).ravel()
-            self.register_buffer(f'{name}_indices', torch.as_tensor(indices, device=assembly.positions.device))
-            self.register_buffer(f'{name}_signs', torch.as_tensor(signs, device=assembly.positions.device, dtype=assembly.positions.dtype))
-            if self.full_soc and self.soc_doubling:
-                self.register_buffer(f'{name}_imaginary', torch.as_tensor(imaginary, device=assembly.positions.device))
+            device = assembly.positions.device
+            if mapping == 'compact':
+                self.register_buffer(f'{name}_rows', torch.as_tensor(row_types, device=device))
+                self.register_buffer(f'{name}_template_indices', torch.as_tensor(indices, device=device))
+                self.register_buffer(f'{name}_template_signs', torch.as_tensor(signs, device=device))
+                self.register_buffer(f'{name}_template_imaginary', torch.as_tensor(imaginary, device=device))
+            else:
+                self.register_buffer(f'{name}_indices', torch.as_tensor(indices[row_types], device=device))
+                self.register_buffer(f'{name}_signs', torch.as_tensor(signs[row_types], device=device, dtype=assembly.positions.dtype))
+                if self.full_soc and self.soc_doubling:
+                    self.register_buffer(f'{name}_imaginary', torch.as_tensor(imaginary[row_types], device=device))
+
+    def _pack(self, name, blocks):
+        if blocks.ndim != 3 or blocks.shape[1:] != (self.block_width, self.block_width):
+            raise ValueError('AO blocks disagree with the feature plan width')
+        if self.mapping == 'compact':
+            rows = getattr(self, f'{name}_rows')
+            if blocks.shape[0] != rows.numel():
+                raise ValueError('AO block count disagrees with the feature plan')
+            indices = getattr(self, f'{name}_template_indices')
+            signs = getattr(self, f'{name}_template_signs')
+            imaginary = getattr(self, f'{name}_template_imaginary')
+            # The optional kernel is an inference path. Preserve autograd via
+            # ordinary Torch operations when a caller differentiates AO blocks.
+            if self.packing_backend == 'cuda' and not blocks.requires_grad:
+                from ._cuda import pack
+                return pack(blocks if self.full_soc else blocks.real, rows, indices, signs, imaginary, self.output_dtype)
+            indices, signs = indices[rows], signs[rows]
+            imaginary = imaginary[rows] if self.full_soc and self.soc_doubling else None
+        else:
+            indices, signs = getattr(self, f'{name}_indices'), getattr(self, f'{name}_signs')
+            imaginary = getattr(self, f'{name}_imaginary', None)
+        features = blocks.flatten(1).gather(1, indices) * signs
+        if self.full_soc and self.soc_doubling:
+            features = torch.where(imaginary, features.imag if features.is_complex() else torch.zeros_like(features), features.real)
+        elif not self.full_soc:
+            features = features.real
+        return features.to(self.output_dtype)
 
     def pack(self, node, edge):
-        nrme = node.flatten(1).gather(1, self.node_indices) * self.node_signs
-        if self.full_soc and self.soc_doubling:
-            nrme = torch.where(self.node_imaginary, nrme.imag if nrme.is_complex() else torch.zeros_like(nrme), nrme.real)
-        elif not self.full_soc:
-            nrme = nrme.real
-        return nrme.to(self.output_dtype), self.pack_edges(edge)
+        return self._pack('node', node), self.pack_edges(edge)
 
     def pack_edges(self, edge):
         """Pack scalar or spinor edge blocks without creating dummy node data.
@@ -545,12 +584,7 @@ class NACFFeaturePlan(nn.Module):
         An edge-VNA plan supplies scalar blocks and supports scalar/uu-real
         mappers. Full SOC requires an explicitly lifted spinor assembly plan.
         """
-        erme = edge.flatten(1).gather(1, self.edge_indices) * self.edge_signs
-        if self.full_soc and self.soc_doubling:
-            erme = torch.where(self.edge_imaginary, erme.imag if erme.is_complex() else torch.zeros_like(erme), erme.real)
-        elif not self.full_soc:
-            erme = erme.real
-        return erme.to(self.output_dtype)
+        return self._pack('edge', edge)
 
     def forward(self):
         blocks = self.assembly()

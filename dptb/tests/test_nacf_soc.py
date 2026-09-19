@@ -92,7 +92,11 @@ def test_soc_assembly_matches_independent_complex_contractions_and_batch(device)
 
 
 @pytest.mark.parametrize('doubling',[True,False])
-def test_soc_packing_four_spin_blocks_imaginary_and_unequal_widths(doubling):
+@pytest.mark.parametrize('mapping,backend,device', [('expanded','torch','cpu'), ('compact','torch','cpu'), ('compact','cuda','cuda')])
+@pytest.mark.parametrize('input_dtype',[torch.complex64,torch.complex128])
+def test_soc_packing_four_spin_blocks_imaginary_and_unequal_widths(doubling,mapping,backend,device,input_dtype):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
     from dptb.data.transforms import OrbitalMapper
     from dptb.data.interfaces.ham_to_feature import block_to_feature
     from dptb.data.interfaces.abacus import OrbAbacus2DeepTB
@@ -103,11 +107,13 @@ def test_soc_packing_four_spin_blocks_imaginary_and_unequal_widths(doubling):
     assembly.edge_index=torch.tensor([[0,1],[1,0]])
     assembly.bank=SimpleNamespace(soc=object(),p2=SimpleNamespace(species={'H':{'orbital_shells':[0]},'C':{'orbital_shells':[0,1]}}))
     dtype=torch.float64 if doubling else torch.complex128
-    plan=NACFFeaturePlan(assembly,idp,output_dtype=dtype)
+    assembly.positions=assembly.positions.to(device)
+    assembly.edge_index=assembly.edge_index.to(device)
+    plan=NACFFeaturePlan(assembly,idp,output_dtype=dtype,mapping=mapping,packing_backend=backend)
     rng=torch.Generator().manual_seed(24)
-    node=torch.randn((2,8,8),generator=rng,dtype=torch.complex128)
-    edge=torch.randn((2,8,8),generator=rng,dtype=torch.complex128)
-    actual=plan.pack(node,edge)
+    node=torch.randn((2,8,8),generator=rng,dtype=input_dtype).transpose(1,2)
+    edge=torch.randn((2,8,8),generator=rng,dtype=input_dtype).transpose(1,2)
+    actual=plan.pack(node.to(device),edge.to(device))
     converter=OrbAbacus2DeepTB(); blocks={}
     sizes=[1,4]; shells=[[0],[0,1]]
     for name,pairs,array in [('node',[(0,0),(1,1)],node),('edge',[(0,1),(1,0)],edge)]:
@@ -116,8 +122,8 @@ def test_soc_packing_four_spin_blocks_imaginary_and_unequal_widths(doubling):
             jj=np.r_[np.arange(sizes[j]),4+np.arange(sizes[j])]
             block=array[row].numpy()[np.ix_(ii,jj)]
             blocks[f'{i}_{j}_0_0_0']=converter.transform(block,shells[i]*2,shells[j]*2)
-    data={'atomic_numbers':torch.tensor([[1],[6]]),'edge_index':assembly.edge_index,'edge_cell_shift':torch.zeros((2,3))}
+    data={'atomic_numbers':torch.tensor([[1],[6]]),'edge_index':assembly.edge_index.cpu(),'edge_cell_shift':torch.zeros((2,3))}
     idp(data)
     block_to_feature(data,idp,blocks,output_dtype=dtype)
-    torch.testing.assert_close(actual[0],data['node_features'])
-    torch.testing.assert_close(actual[1],data['edge_features'])
+    torch.testing.assert_close(actual[0].cpu(),data['node_features'],rtol=0,atol=0)
+    torch.testing.assert_close(actual[1].cpu(),data['edge_features'],rtol=0,atol=0)
