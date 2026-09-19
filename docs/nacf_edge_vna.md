@@ -31,6 +31,35 @@ plan = bank.prepare_edge_vna(
 delta = plan()["edge_vna_ao_ev"]
 ```
 
+For GPU uu-real output, reuse the existing signed-permutation feature packer:
+
+```python
+from dptb.nacf.assembly import NACFFeaturePlan
+features = NACFFeaturePlan(plan, idp)  # checkpoint's uu-real OrbitalMapper
+delta_features = features.pack_edges(delta)
+```
+
+This avoids a Python loop over edges and transfers the packed float32 result
+once. The scalar correction stays scalar even if the shared bank also contains
+SOC projector tables. A full-spinor mapper requires explicit spin-diagonal
+lifting through a spinor assembly, rather than interpreting scalar AO padding
+as spin blocks.
+
+Use `backend='cuda'` on the shared bank to enable fused radial evaluation after
+explicit installation. With an older toolkit on a newer GPU, an appropriate
+PTX build can retain forward compatibility, for example:
+
+```bash
+python -m dptb.nacf.precompile --arch 8.9+PTX
+```
+
+The manifest records native and PTX targets separately. Runtime still checks
+source, binary and Python/Torch ABI identity, and never invokes a compiler.
+The driver may JIT the recorded PTX on first load; exclude that cold start only
+when explicitly reporting warm timing. Supported PTX still requires a capable
+driver. Compare the resulting float64 outputs with the reference on the target
+GPU before production.
+
 For batches, pass dictionaries with the same argument names to
 `bank.prepare_edge_vna_batch(geometries)`. `edge_ptr` partitions the returned
 tensor and `plan.edge_slices` gives the same boundaries as host integers.

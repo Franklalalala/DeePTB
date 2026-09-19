@@ -450,7 +450,7 @@ class NACFFeaturePlan(nn.Module):
         from dptb.utils.constants import ABACUS2DeePTB, anglrMId
         from scipy.linalg import block_diag
         self.full_soc = bool(getattr(idp, 'has_soc', False) and not getattr(idp, 'nextham_uureal_mask', False))
-        self.spinor_input = getattr(assembly.bank, 'soc', None) is not None
+        self.spinor_input = getattr(assembly, 'spinor_input', getattr(assembly.bank, 'soc', None) is not None)
         self.soc_doubling = bool(getattr(idp, 'soc_complex_doubling', False))
         if self.full_soc:
             if not self.spinor_input:
@@ -522,13 +522,24 @@ class NACFFeaturePlan(nn.Module):
 
     def pack(self, node, edge):
         nrme = node.flatten(1).gather(1, self.node_indices) * self.node_signs
-        erme = edge.flatten(1).gather(1, self.edge_indices) * self.edge_signs
         if self.full_soc and self.soc_doubling:
             nrme = torch.where(self.node_imaginary, nrme.imag if nrme.is_complex() else torch.zeros_like(nrme), nrme.real)
+        elif not self.full_soc:
+            nrme = nrme.real
+        return nrme.to(self.output_dtype), self.pack_edges(edge)
+
+    def pack_edges(self, edge):
+        """Pack scalar or spinor edge blocks without creating dummy node data.
+
+        An edge-VNA plan supplies scalar blocks and supports scalar/uu-real
+        mappers. Full SOC requires an explicitly lifted spinor assembly plan.
+        """
+        erme = edge.flatten(1).gather(1, self.edge_indices) * self.edge_signs
+        if self.full_soc and self.soc_doubling:
             erme = torch.where(self.edge_imaginary, erme.imag if erme.is_complex() else torch.zeros_like(erme), erme.real)
         elif not self.full_soc:
-            nrme, erme = nrme.real, erme.real
-        return nrme.to(self.output_dtype), erme.to(self.output_dtype)
+            erme = erme.real
+        return erme.to(self.output_dtype)
 
     def forward(self):
         blocks = self.assembly()

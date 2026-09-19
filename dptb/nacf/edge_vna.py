@@ -88,6 +88,8 @@ class NACFEdgeVNAPlan(nn.Module):
             n_atoms += len(symbols); n_queries += len(q); n_edges += len(topo['reverse']); n_terms += len(t)
             edge_ptr.append(n_edges); all_symbols.extend(symbols)
         all_symbols = np.asarray(all_symbols)
+        self.symbols = tuple(all_symbols.tolist())
+        self.spinor_input = False  # VNA is scalar even when the shared bank has SOC projectors.
         species, species_codes = np.unique(all_symbols, return_inverse=True)
         self.width = max(int(bank.p2.species[s]['orbital_norb']) for s in species)
         self.nedges, self.nqueries, self.nterms = n_edges, n_queries, n_terms

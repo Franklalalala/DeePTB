@@ -19,7 +19,12 @@ def verify(device=None):
     if sha(ROOT/m['binary'])!=m['sha256']:raise RuntimeError('NACF prebuilt binary checksum mismatch')
     if device is not None:
         cap='.'.join(map(str,torch.cuda.get_device_capability(device)))
-        if cap not in m['architectures']:raise RuntimeError('NACF binary does not contain GPU architecture '+cap)
+        # PTX is forward compatible with newer compute capabilities. Its target
+        # must be recorded by the build, never inferred from the current GPU.
+        ptx=m.get('ptx_architectures', [])
+        if cap not in m['architectures'] and not any(
+                tuple(map(int,cap.split('.'))) >= tuple(map(int,a.split('.'))) for a in ptx):
+            raise RuntimeError('NACF binary does not contain a compatible GPU architecture '+cap)
     return m
 def load():
     verify()
