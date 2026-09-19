@@ -37,12 +37,13 @@ double elapsed(Clock::time_point t) {
 
 extern "C" {
 int nacf_topology_abi() { return 1; }
-void* nacf_topology_build(I n, const double* pos, const double* cell,
+void* nacf_topology_build_mode(I n, const double* pos, const double* cell,
                         const uint8_t* pbc, const double* ao_cut,
                         const double* centre_cut, I e, const I* edges,
-                        const I* shifts, I max_terms, char* error) {
+                        const I* shifts, I max_terms, char* error, int mode) {
     try {
         if (n <= 0 || e < 0 || max_terms <= 0) throw std::invalid_argument("invalid topology size");
+        if (mode < 0 || mode > 2) throw std::invalid_argument("invalid topology mode");
         auto out = std::make_unique<Plan>();
         std::unordered_map<Key, I, Hash<Key>> edge_rows;
         for (I r = 0; r < e; ++r) {
@@ -82,10 +83,15 @@ void* nacf_topology_build(I n, const double* pos, const double* cell,
                 for (int b=0; b<3; ++b) d+=images[3*r+b]*cell[3*b+a];
                 d2+=d*d;
             }
-            // Keep the existing source's strict, species-dependent support.
-            if (std::sqrt(d2) < ao_cut[i]+centre_cut[k]-1e-12)
+            // Projectors include both endpoints; VNA excludes the origin
+            // centre. A negative centre cutoff disables a projector species.
+            const double distance=std::sqrt(d2), support=ao_cut[i]+centre_cut[k];
+            if (centre_cut[k] >= 0 && (mode==1 ? distance <= support+1e-12 : distance < support-1e-12))
                 out->queries.push_back({i,k,-I(images[3*r]),-I(images[3*r+1]),-I(images[3*r+2])});
         }
+        if (mode==1)
+            for (I i=0; i<n; ++i)
+                if (centre_cut[i]>=0) out->queries.push_back({i,i,0,0,0});
         std::sort(out->queries.begin(),out->queries.end());
         if (std::adjacent_find(out->queries.begin(),out->queries.end()) != out->queries.end())
             throw std::runtime_error("duplicate neighbour identity");
@@ -96,14 +102,18 @@ void* nacf_topology_build(I n, const double* pos, const double* cell,
             neighbours[x[0]].emplace(Centre{x[1],-x[2],-x[3],-x[4]},q);
             by_atom[x[0]].push_back(q);
         }
-        for (I r=0; r<e; ++r) {
-            if (r>out->reverse[r]) continue;
-            I i=edges[2*r],j=edges[2*r+1];
+        const I blocks=mode==0?e:(mode==1?n+e:n);
+        for (I r=0; r<blocks; ++r) {
+            if (mode==0 && r>out->reverse[r]) continue;
+            const I edge=mode==0?r:r-n;
+            const bool onsite=mode!=0 && r<n;
+            I i=onsite?r:edges[2*edge],j=onsite?r:edges[2*edge+1];
             bool left=by_atom[i].size()<=by_atom[j].size();
             for (I q : by_atom[left?i:j]) {
                 const auto& x=out->queries[q];
                 Centre other{x[1],-x[2],-x[3],-x[4]};
-                for (int a=0; a<3; ++a) other[a+1]+=(left?-1:1)*shifts[3*r+a];
+                if (!onsite)
+                    for (int a=0; a<3; ++a) other[a+1]+=(left?-1:1)*shifts[3*edge+a];
                 auto it=neighbours[left?j:i].find(other);
                 if (it==neighbours[left?j:i].end()) continue;
                 if (static_cast<I>(out->terms.size())==max_terms)
@@ -121,6 +131,12 @@ void* nacf_topology_build(I n, const double* pos, const double* cell,
         std::snprintf(error,1024,"unknown native topology error");
         return nullptr;
     }
+}
+void* nacf_topology_build(I n, const double* pos, const double* cell,
+                        const uint8_t* pbc, const double* ao_cut,
+                        const double* centre_cut, I e, const I* edges,
+                        const I* shifts, I max_terms, char* error) {
+    return nacf_topology_build_mode(n,pos,cell,pbc,ao_cut,centre_cut,e,edges,shifts,max_terms,error,0);
 }
 I nacf_topology_count(void* p,int which) {
     const auto& x=*static_cast<Plan*>(p);

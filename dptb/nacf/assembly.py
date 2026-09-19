@@ -96,8 +96,10 @@ class NACFTableBank(nn.Module):
                 self.tables[key] = cached_table(source, self.prepared_cache_dir, device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
         return key
 
-    def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True)):
-        return NACFAssemblyPlan(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, pbc=pbc)
+    def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True),
+                topology='python', library=None, max_terms=10_000_000):
+        return NACFAssemblyPlan(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, pbc=pbc,
+                                topology=topology, library=library, max_terms=max_terms)
 
     def prepare_edge_vna(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift,
                          *, pbc=(True, True, True), **options):
@@ -120,7 +122,7 @@ class NACFAssemblyPlan(nn.Module):
     once; the VNA factor contraction is already in eV.
     """
 
-    def __init__(self, bank, symbols, positions, cell, edges, shifts, *, pbc):
+    def __init__(self, bank, symbols, positions, cell, edges, shifts, *, pbc, topology='python', library=None, max_terms=10_000_000):
         super().__init__()
         self.bank = bank
         symbols = tuple(symbols)
@@ -182,72 +184,81 @@ class NACFAssemblyPlan(nn.Module):
             overlap[i, :n, :n] = bank.overlap.onsite_component(s, 'overlap')
         reg('onsite_base', base)
         reg('onsite_overlap', overlap)
-        query_lists, query_maps = defaultdict(list), defaultdict(dict)
-        base_rows, contractions = defaultdict(list), defaultdict(list)
+        self.topology_backend = topology
+        if topology == 'native':
+            from .assembly_topology import prepare_native
+            query_lists, base_rows, contractions, self.topology_stats = prepare_native(
+                bank, symbols, positions, cell, edges, shifts, pbc, self.p23_used,
+                library=library, max_terms=max_terms)
+        elif topology == 'python':
+            query_lists, query_maps = defaultdict(list), defaultdict(dict)
+            base_rows, contractions = defaultdict(list), defaultdict(list)
 
-        def query(kind, ao, centre, shift):
-            pair = (kind, symbols[centre], symbols[ao])
-            key = (ao, centre, *map(int, shift))
-            if key not in query_maps[pair]:
-                query_maps[pair][key] = len(query_lists[pair])
-                query_lists[pair].append(key)
-            return pair, query_maps[pair][key]
+            def query(kind, ao, centre, shift):
+                pair = (kind, symbols[centre], symbols[ao])
+                key = (ao, centre, *map(int, shift))
+                if key not in query_maps[pair]:
+                    query_maps[pair][key] = len(query_lists[pair])
+                    query_lists[pair].append(key)
+                return pair, query_maps[pair][key]
 
-        # Keep graph construction explicit. All subsequent queries refer to atom
-        # indices and integer translations, rather than rounded vector hashes.
-        from ase.cell import Cell
-        enumeration_cell = Cell(cell).complete().array
-        enumerator = VectorizedNearbyImageEnumerator(enumeration_cell) if np.any(pbc) else None
-        # A centre contributes to (i,j,R) only if it overlaps AO i. Enumerate
-        # that necessary neighbourhood once per (i,k,kind), then filter by j.
-        # Integer translations and the exact support tests are retained; the
-        # midpoint search formerly repeated lattice enumeration for every edge.
-        centre_candidates = {}
-        for block_id, (i, j, rx, ry, rz) in enumerate(all_keys):
-            shift = np.array([rx, ry, rz])
-            ci, cj = positions[i], positions[j] + shift @ cell
-            si, sj = symbols[i], symbols[j]
-            ni, nj = self.node_sizes[i], self.node_sizes[j]
-            cutoff_i = float(bank.p2.species[si]['orbital_cutoff_bohr'])
-            cutoff_j = float(bank.p2.species[sj]['orbital_cutoff_bohr'])
-            distance = np.linalg.norm(cj - ci)
-            if block_id >= self.natoms and distance <= cutoff_i + cutoff_j + 1e-10:
-                for kind in ('p2_base', 'overlap'):
-                    # Base table orientation is left AO=i, right AO=j.
-                    pair = (kind, si, sj)
-                    row = len(query_lists[pair])
-                    query_lists[pair].append((j, i, rx, ry, rz))
-                    base_rows[pair].append((block_id, row, ni, nj))
-            for k, sk in enumerate(symbols):
-                for kind in ('projector', 'vna'):
-                    if kind == 'vna' and (block_id >= self.natoms or not self.p23_used):
-                        continue  # NACF needs P23 onsite only.
-                    meta = bank.p2.species[sk] if kind == 'projector' else bank.p23.species[sk]
-                    if kind == 'projector' and int(meta['projector_norb']) == 0:
-                        continue
-                    cutoff = float(meta['projector_max_cutoff_bohr'] if kind == 'projector' else meta['vna_cutoff_bohr'])
-                    candidate_key = (i, k, kind)
-                    if candidate_key not in centre_candidates:
-                        if enumerator is None:
-                            translations, centres = np.zeros((1, 3), dtype=int), positions[k:k + 1]
+            # Keep graph construction explicit. All subsequent queries refer to atom
+            # indices and integer translations, rather than rounded vector hashes.
+            from ase.cell import Cell
+            enumeration_cell = Cell(cell).complete().array
+            enumerator = VectorizedNearbyImageEnumerator(enumeration_cell) if np.any(pbc) else None
+            # A centre contributes to (i,j,R) only if it overlaps AO i. Enumerate
+            # that necessary neighbourhood once per (i,k,kind), then filter by j.
+            # Integer translations and the exact support tests are retained; the
+            # midpoint search formerly repeated lattice enumeration for every edge.
+            centre_candidates = {}
+            for block_id, (i, j, rx, ry, rz) in enumerate(all_keys):
+                shift = np.array([rx, ry, rz])
+                ci, cj = positions[i], positions[j] + shift @ cell
+                si, sj = symbols[i], symbols[j]
+                ni, nj = self.node_sizes[i], self.node_sizes[j]
+                cutoff_i = float(bank.p2.species[si]['orbital_cutoff_bohr'])
+                cutoff_j = float(bank.p2.species[sj]['orbital_cutoff_bohr'])
+                distance = np.linalg.norm(cj - ci)
+                if block_id >= self.natoms and distance <= cutoff_i + cutoff_j + 1e-10:
+                    for kind in ('p2_base', 'overlap'):
+                        # Base table orientation is left AO=i, right AO=j.
+                        pair = (kind, si, sj)
+                        row = len(query_lists[pair])
+                        query_lists[pair].append((j, i, rx, ry, rz))
+                        base_rows[pair].append((block_id, row, ni, nj))
+                for k, sk in enumerate(symbols):
+                    for kind in ('projector', 'vna'):
+                        if kind == 'vna' and (block_id >= self.natoms or not self.p23_used):
+                            continue  # NACF needs P23 onsite only.
+                        meta = bank.p2.species[sk] if kind == 'projector' else bank.p23.species[sk]
+                        if kind == 'projector' and int(meta['projector_norb']) == 0:
+                            continue
+                        cutoff = float(meta['projector_max_cutoff_bohr'] if kind == 'projector' else meta['vna_cutoff_bohr'])
+                        candidate_key = (i, k, kind)
+                        if candidate_key not in centre_candidates:
+                            if enumerator is None:
+                                translations, centres = np.zeros((1, 3), dtype=int), positions[k:k + 1]
+                            else:
+                                translations, centres = enumerator.query_arrays(positions[k], ci, cutoff + cutoff_i)
+                            left_distance = np.linalg.norm(ci - centres, axis=1)
+                            active_left = (left_distance <= cutoff + cutoff_i + 1e-12 if kind == 'projector'
+                                           else left_distance < cutoff + cutoff_i - 1e-12)
+                            active_left &= np.all(translations[:, ~pbc] == 0, axis=1)
+                            centre_candidates[candidate_key] = translations[active_left], centres[active_left]
+                        translations, centres = centre_candidates[candidate_key]
+                        dj = cj - centres
+                        if kind == 'projector':
+                            active = np.linalg.norm(dj, axis=1) <= cutoff + cutoff_j + 1e-12
                         else:
-                            translations, centres = enumerator.query_arrays(positions[k], ci, cutoff + cutoff_i)
-                        left_distance = np.linalg.norm(ci - centres, axis=1)
-                        active_left = (left_distance <= cutoff + cutoff_i + 1e-12 if kind == 'projector'
-                                       else left_distance < cutoff + cutoff_i - 1e-12)
-                        active_left &= np.all(translations[:, ~pbc] == 0, axis=1)
-                        centre_candidates[candidate_key] = translations[active_left], centres[active_left]
-                    translations, centres = centre_candidates[candidate_key]
-                    dj = cj - centres
-                    if kind == 'projector':
-                        active = np.linalg.norm(dj, axis=1) <= cutoff + cutoff_j + 1e-12
-                    else:
-                        active = np.linalg.norm(dj, axis=1) < cutoff + cutoff_j - 1e-12
-                        active &= ~((k == i) & np.all(translations == 0, axis=1))
-                    for t in translations[active]:
-                        left_pair, left_row = query(kind, i, k, -t)
-                        right_pair, right_row = query(kind, j, k, shift - t)
-                        contractions[(kind, si, sj, sk)].append((block_id, left_row, right_row))
+                            active = np.linalg.norm(dj, axis=1) < cutoff + cutoff_j - 1e-12
+                            active &= ~((k == i) & np.all(translations == 0, axis=1))
+                        for t in translations[active]:
+                            left_pair, left_row = query(kind, i, k, -t)
+                            right_pair, right_row = query(kind, j, k, shift - t)
+                            contractions[(kind, si, sj, sk)].append((block_id, left_row, right_row))
+        else:
+            raise ValueError('topology must be python or native')
         self.query_specs = []
         self.pair_ids = {}
         for number, (pair, raw) in enumerate(query_lists.items()):

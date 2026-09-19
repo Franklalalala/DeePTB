@@ -32,12 +32,16 @@ def _library(path):
 
 
 def build_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs,
-                        edge_index, edge_cell_shift, *, library=None, max_terms=10_000_000):
+                        edge_index, edge_cell_shift, *, library=None, max_terms=10_000_000,
+                        mode='edge_vna'):
     """Return unique factor queries and half-edge third-centre terms.
 
     Query rows are (AO, centre, sx, sy, sz), so the queried displacement is
     pos[AO] - pos[centre] + shift @ cell. Zero-shift endpoint centres are
     excluded; periodic self images are retained. Cutoffs use Bohr.
+    ``projector`` includes endpoints and returns onsite followed by all directed
+    edge block rows. ``onsite_vna`` returns only onsite blocks. Projector centre
+    cutoff -1 disables a species with no projectors.
     """
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     lattice = np.ascontiguousarray(cell, dtype=np.float64)
@@ -50,7 +54,11 @@ def build_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs,
     if periodic_raw.shape != (3,) or not np.isin(periodic_raw, [0, 1]).all():
         raise ValueError('pbc must contain three booleans')
     periodic = np.ascontiguousarray(periodic_raw, dtype=np.uint8)
-    if ac.shape != (n,) or cc.shape != (n,) or (ac <= 0).any() or (cc <= 0).any():
+    modes = {'edge_vna': 0, 'projector': 1, 'onsite_vna': 2}
+    if mode not in modes:
+        raise ValueError('unknown topology mode')
+    valid_cc = (cc >= 0) | (cc == -1) if mode == 'projector' else cc > 0
+    if ac.shape != (n,) or cc.shape != (n,) or (ac <= 0).any() or not valid_cc.all():
         raise ValueError('cutoffs must be positive per-atom arrays')
     if not all(np.isfinite(x).all() for x in (pos, lattice, ac, cc)):
         raise ValueError('geometry and cutoffs must be finite')
@@ -71,9 +79,18 @@ def build_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs,
     lib = _library(path)
     dp, ip, bp = C.POINTER(C.c_double), C.POINTER(C.c_int64), C.POINTER(C.c_uint8)
     error = C.create_string_buffer(1024)
-    handle = lib.nacf_topology_build(n, pos.ctypes.data_as(dp), lattice.ctypes.data_as(dp),
+    args = (n, pos.ctypes.data_as(dp), lattice.ctypes.data_as(dp),
                                     periodic.ctypes.data_as(bp), ac.ctypes.data_as(dp), cc.ctypes.data_as(dp),
                                     len(edges), edges.ctypes.data_as(ip), shifts.ctypes.data_as(ip), max_terms, error)
+    if mode == 'edge_vna':
+        handle = lib.nacf_topology_build(*args)
+    else:
+        if not hasattr(lib, 'nacf_topology_build_mode'):
+            raise RuntimeError('rebuild the native library for assembly topology support')
+        function = lib.nacf_topology_build_mode
+        function.argtypes = lib.nacf_topology_build.argtypes + [C.c_int]
+        function.restype = C.c_void_p
+        handle = function(*args, modes[mode])
     if not handle:
         raise ValueError(error.value.decode('utf-8', errors='replace'))
     try:

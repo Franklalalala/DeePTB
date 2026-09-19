@@ -15,6 +15,7 @@ dptb/codex*/*
 *.dat
 *log*
 !dptb/nacf/topology.py
+!dptb/nacf/assembly_topology.py
 !dptb/nacf/csrc/topology.cpp
 !tools/build_nacf_topology.py
 dptb/tests/data/**/out*/config_*.json
