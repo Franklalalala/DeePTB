@@ -33,6 +33,9 @@ def pack(blocks, rows, indices, signs, imaginary, output_dtype):
     if blocks.dtype not in supported or output_dtype not in supported:
         raise ValueError('CUDA packing supports float32/64 and complex64/128')
     check_device(blocks.device)
+    native = extension()
+    if not hasattr(native, 'pack_out'):
+        raise RuntimeError('native packing is absent from this binary; rebuild with python -m dptb.nacf.precompile')
     output = torch.empty((blocks.shape[0], indices.shape[1]), dtype=output_dtype, device=blocks.device)
-    extension().pack_out(blocks.contiguous(), rows, indices, signs, imaginary, output)
+    native.pack_out(blocks.contiguous(), rows, indices, signs, imaginary, output)
     return output

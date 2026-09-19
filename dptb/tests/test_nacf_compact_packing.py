@@ -5,6 +5,16 @@ from dptb.data.transforms import OrbitalMapper
 from dptb.nacf.assembly import NACFFeaturePlan
 
 
+def test_old_native_binary_reports_rebuild(monkeypatch):
+    from dptb.nacf import _cuda
+    monkeypatch.setattr(_cuda, 'check_device', lambda device: None)
+    monkeypatch.setattr(_cuda, 'extension', lambda: SimpleNamespace())
+    blocks = SimpleNamespace(requires_grad=False, is_cuda=True,
+                             dtype=torch.float32, device='cuda')
+    with pytest.raises(RuntimeError, match='rebuild with python -m dptb.nacf.precompile'):
+        _cuda.pack(blocks, None, None, None, None, torch.float32)
+
+
 @pytest.mark.parametrize('device', ['cpu','cuda'])
 @pytest.mark.parametrize('empty', [False, True])
 def test_compact_repeated_types_empty_edges_and_ao_gradients(device, empty):
