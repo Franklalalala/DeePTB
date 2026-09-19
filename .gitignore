@@ -14,6 +14,9 @@ dptb/scripts/*
 dptb/codex*/*
 *.dat
 *log*
+!dptb/nacf/topology.py
+!dptb/nacf/csrc/topology.cpp
+!tools/build_nacf_topology.py
 dptb/tests/data/**/out*/config_*.json
 bandstructure.npy
 dptb/tests/data/hBN/data/set.0/xdat2.traj

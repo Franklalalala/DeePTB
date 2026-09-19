@@ -99,6 +99,17 @@ class NACFTableBank(nn.Module):
     def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True)):
         return NACFAssemblyPlan(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, pbc=pbc)
 
+    def prepare_edge_vna(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift,
+                         *, pbc=(True, True, True), **options):
+        """Explicit edge-only third-centre correction; mixed P23/P2 is unchanged."""
+        return self.prepare_edge_vna_batch([dict(symbols=symbols, positions_bohr=positions_bohr,
+            cell_bohr=cell_bohr, edge_index=edge_index, edge_cell_shift=edge_cell_shift, pbc=pbc)], **options)
+
+    def prepare_edge_vna_batch(self, geometries, **options):
+        """Reuse factor tables and group numerical work across multiple graphs."""
+        from .edge_vna import NACFEdgeVNAPlan
+        return NACFEdgeVNAPlan(self, geometries, **options)
+
 
 class NACFAssemblyPlan(nn.Module):
     """Geometry-bound plan; use ``forward()`` for repeated, identical geometry.
