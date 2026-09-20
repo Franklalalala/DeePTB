@@ -480,3 +480,22 @@ def test_moment_arms_report_stabilization_diagnostics(root):
     assert gated["diagnostics"]["moment_below_density_floor_elements"] > 0
     plain = bank.prepare(**g, arms=("d2",), topology="python")()
     assert torch.allclose(gated["d2_moment"], plain["d2"], atol=1e-12)
+
+
+def test_bank_epsilon_follows_dtype_migration(root):
+    """Reviewer reproduction (F2): projector weights cached before ``.to()`` must migrate with the bank."""
+    path, _, _ = root
+    store = EnvXCStore(path)
+    bank = EnvXCBank(store, device="cpu", dtype=torch.float32, backend="torch")
+    before = bank.epsilon("Xa")
+    assert before.dtype == torch.float32 and "epsilons.epsilon_Xa" in dict(bank.named_buffers())
+    bank.to(dtype=torch.float64)
+    after = bank.epsilon("Xa")
+    assert bank.dtype == torch.float64 and after.dtype == torch.float64
+    assert np.allclose(after.numpy(), store.epsilon("Xa")) and after.numel() == store.species["Xa"]["q_norb"]
+    # the compiled tables moved as well, and a plan built afterwards computes in the migrated dtype
+    cut = {s: store.orbital_cutoff(s) for s in store.species}
+    g = make_structure(["Xa", "Yb", "Xa"], [[0.3, 0.2, 0.1], [2.9, 0.4, 1.7], [0.8, 3.2, 2.6]], np.diag([7.0, 7.5, 8.0]), cut)
+    out = bank.prepare(**g, arms=("d2",), topology="python")()
+    assert out["d2"].dtype == torch.float64 and torch.isfinite(out["d2"]).all()
+    assert all(b.dtype == torch.float64 for b in bank.buffers() if b.is_floating_point())

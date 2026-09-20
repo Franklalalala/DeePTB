@@ -104,10 +104,43 @@ def onsite_neighbor_lists(g, radius=LEGACY_RADIUS_BOHR, *, atoms=None):
 
 
 # ----------------------------------------------------------------------------- density bank packing
+def _tensor_identity(value):
+    """Storage identity of one spline array without reading its contents.
+
+    Tensors: data pointer, shape, dtype, device and the in-place version counter (``None`` for inference
+    tensors, which do not track one). Other array-likes: object id, buffer address and shape.
+    """
+    if isinstance(value, torch.Tensor):
+        try:
+            version = value._version
+        except RuntimeError:            # inference tensors do not track a version counter
+            version = None
+        return (value.data_ptr(), tuple(value.shape), str(value.dtype), str(value.device), version)
+    array = np.asarray(value)
+    return (id(value), array.__array_interface__['data'][0], array.shape, str(array.dtype), None)
+
+
+def density_identity(density_bank):
+    """Cheap, synchronization-free content identity of a density bank.
+
+    Species order, each density object, and the storage identity of its ``knots`` and every ``coeff``
+    channel (see :func:`_tensor_identity`). Replacing a species density, or editing a knot or coefficient
+    tensor in place (version counter), changes the identity; no array is hashed. In-place edits of
+    inference-mode tensors are not tracked by Torch and are invisible here: invalidate explicitly.
+    """
+    return tuple((s, id(density), _tensor_identity(density.knots), tuple(_tensor_identity(c) for c in density.coeff))
+                 for s, density in density_bank.items())
+
+
 class PackedDensityBank:
-    """Concatenated species splines (knots, [channels,4,K-1] coefficients) for the fused kernel."""
+    """Concatenated species splines (knots, [channels,4,K-1] coefficients) for the fused kernel.
+
+    The bank records the :func:`density_identity` of its source at construction; ``matches`` tells whether
+    a density bank still has exactly that content identity.
+    """
 
     def __init__(self, density_bank, device):
+        self.identity = density_identity(density_bank)
         self.species = list(density_bank)
         self.index = {s: k for k, s in enumerate(self.species)}
         knots, coeffs, knot_ptr, coeff_ptr, channels = [], [], [0], [0], []
@@ -128,6 +161,9 @@ class PackedDensityBank:
         self.coeff_ptr = torch.tensor(coeff_ptr, device=device, dtype=torch.int64)
         self.channels = torch.tensor(channels, device=device, dtype=torch.int64)
         self.device = self.knots.device
+
+    def matches(self, density_bank):
+        return density_identity(density_bank) == self.identity
 
 
 def _segment_lists(neighbors, bank):
@@ -246,25 +282,44 @@ class OnsiteXCEvaluator:
     ``lda_pz81_v_dv_torch``, the same formula). Atoms are grouped by (species, order) and each
     group is evaluated in one fused launch; ``engine='reference'`` runs the accepted per-atom
     loop on exactly the same neighbours and quadrature objects.
+
+    The packed density bank of the fused engine is bound to the content identity of
+    ``density_bank`` (:func:`density_identity`, checked on every use without reading arrays).
+    ``density_policy='rebuild'`` repacks when a species density was replaced or edited in place
+    (counted in ``bank_rebuilds``); ``'fail'`` raises instead, for banks meant to be immutable.
+    ``invalidate()`` drops the packed bank explicitly.
     """
 
     def __init__(self, qgrid, density_bank, *, v_and_dv=None, potential=None, radius=LEGACY_RADIUS_BOHR,
-                 engine='fused', device='cuda', chunk_bytes=1 << 30):
+                 engine='fused', device='cuda', chunk_bytes=1 << 30, density_policy='rebuild'):
         if engine not in ('fused', 'reference'):
             raise ValueError("engine must be 'fused' or 'reference'")
+        if density_policy not in ('rebuild', 'fail'):
+            raise ValueError("density_policy must be 'rebuild' or 'fail'")
         if potential is None:
             if v_and_dv is None:
                 from .envxc import lda_pz81_v_dv_torch as v_and_dv
             potential = pz81_potential(v_and_dv)
         self.qgrid, self.density_bank, self.potential = qgrid, density_bank, potential
         self.radius, self.engine, self.device, self.chunk_bytes = float(radius), engine, torch.device(device), chunk_bytes
-        self._bank, self._bank_species = None, None
+        self.density_policy = density_policy
+        self._bank = None
+        self.bank_rebuilds = 0
         self.last_stats = None
 
+    def invalidate(self):
+        """Drop the packed density bank; the next use packs the current ``density_bank`` content."""
+        self._bank = None
+
     def bank(self):
-        species = list(self.density_bank)
-        if self._bank is None or self._bank_species != species:
-            self._bank = PackedDensityBank(self.density_bank, self.device); self._bank_species = species
+        if self._bank is None:
+            self._bank = PackedDensityBank(self.density_bank, self.device)
+        elif not self._bank.matches(self.density_bank):
+            if self.density_policy == 'fail':
+                raise RuntimeError('the density bank changed after the packed bank was built (a species density was '
+                                   "replaced or edited in place); call invalidate() or use density_policy='rebuild'")
+            self._bank = PackedDensityBank(self.density_bank, self.device)
+            self.bank_rebuilds += 1
         return self._bank
 
     def neighbors(self, g):

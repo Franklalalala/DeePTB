@@ -304,7 +304,9 @@ class EnvXCBank(nn.Module):
         self.prepared_cache_dir = prepared_cache_dir
         self.overlap_bank = overlap_bank
         self.tables = nn.ModuleDict()
-        self._epsilon: dict[str, torch.Tensor] = {}
+        # projector weights are registered buffers (``epsilons.epsilon_<symbol>``) so that ``.to()`` / ``_apply``
+        # migrate them together with the anchor and the compiled tables
+        self.epsilons = nn.Module()
         self.register_buffer("_anchor", torch.empty(0, device=device, dtype=dtype))
 
     @property
@@ -332,9 +334,12 @@ class EnvXCBank(nn.Module):
         return self.overlap_bank.tables[self.overlap_bank.table("overlap", left, right)]
 
     def epsilon(self, symbol: str) -> torch.Tensor:
-        if symbol not in self._epsilon:
-            self._epsilon[symbol] = torch.as_tensor(self.store.epsilon(symbol), device=self.device, dtype=self.dtype)
-        return self._epsilon[symbol]
+        name = f"epsilon_{symbol}"
+        value = getattr(self.epsilons, name, None)
+        if value is None:
+            self.epsilons.register_buffer(name, torch.as_tensor(self.store.epsilon(symbol), device=self.device, dtype=self.dtype))
+            value = getattr(self.epsilons, name)
+        return value
 
     def prepare(self, symbols, positions_bohr, cell_bohr, edge_index, edge_cell_shift, *, pbc=(True, True, True), **options):
         return self.prepare_batch([dict(symbols=symbols, positions_bohr=positions_bohr, cell_bohr=cell_bohr,

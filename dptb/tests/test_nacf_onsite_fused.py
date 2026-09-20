@@ -200,3 +200,44 @@ def test_evaluator_fused_equals_reference_engine_on_real_shaped_grouping():
     assert torch.isfinite(a).all()
     torch.testing.assert_close(a, b, atol=1e-11, rtol=1e-11)
     assert fused.last_stats['groups'] == 3 and fused.last_stats['pairs'] == reference.last_stats['pairs']
+
+
+def test_packed_bank_is_bound_to_density_content_not_species_names():
+    """Reviewer reproduction (F2): replacing a species density under the same key, or editing its spline in
+    place, must not leave the fused engine on a stale packed bank while the reference engine reads the new
+    density. Identity is checked without reading arrays."""
+    from dptb.nacf.onsite import density_identity
+    knots = torch.tensor([0., 1., 2.], dtype=torch.float64)
+
+    def density(scale):
+        return SplineDensity(knots, [torch.tensor(CubicSpline(knots.numpy(), scale * np.array([1., .5, .1])).c)])
+
+    ev = OnsiteXCEvaluator(lambda s, o: None, {'X': density(1.)}, potential=lambda n: n, device='cpu', engine='reference')
+    b1 = ev.bank(); c1 = b1.coeff.clone()
+    assert ev.bank() is b1 and ev.bank_rebuilds == 0
+    ev.density_bank['X'] = density(2.)                       # same key, new content
+    b2 = ev.bank()
+    assert b2 is not b1 and ev.bank_rebuilds == 1
+    assert not torch.equal(c1, b2.coeff)
+    torch.testing.assert_close(b2.coeff.reshape(4, -1), ev.density_bank['X'].coeff[0], atol=0, rtol=0)
+    assert float(ev.density_bank['X'](torch.tensor([0.], dtype=torch.float64))[0]) == 2.0
+    # in-place edit of a coefficient channel (version counter), then of the knots
+    ev.density_bank['X'].coeff[0].mul_(0.5)
+    b3 = ev.bank(); assert b3 is not b2 and torch.equal(b3.coeff, 0.5 * b2.coeff)
+    ev.density_bank['X'].knots[2] = 2.5
+    assert ev.bank() is not b3 and ev.bank_rebuilds == 3
+    # identity is stable under untouched banks and a fresh dict with the same objects
+    ident = density_identity(ev.density_bank)
+    assert ident == density_identity(dict(ev.density_bank))
+    assert ev.bank() is ev.bank()
+    # fail-closed policy for banks meant to be immutable; invalidate() is the explicit way out
+    frozen = OnsiteXCEvaluator(lambda s, o: None, {'X': density(1.)}, potential=lambda n: n, device='cpu', engine='reference', density_policy='fail')
+    frozen.bank()
+    frozen.density_bank['X'] = density(3.)
+    with pytest.raises(RuntimeError, match='density bank changed'):
+        frozen.bank()
+    frozen.invalidate()
+    torch.testing.assert_close(frozen.bank().coeff.reshape(4, -1), frozen.density_bank['X'].coeff[0], atol=0, rtol=0)
+    with pytest.raises(ValueError):
+        OnsiteXCEvaluator(lambda s, o: None, {'X': density(1.)}, potential=lambda n: n, device='cpu', density_policy='ignore')
+
