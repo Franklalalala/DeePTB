@@ -18,6 +18,29 @@ All returned blocks are environment corrections to be added to the pair-only XC 
 X(d,0); they are in eV and in the ABACUS AO gauge of the bank tables. Reverse edges are the
 exact transposes of the representative edge (computed once). Endpoints (i,0) and (j,R) are
 excluded by the topology; their other periodic images are retained.
+
+Stabilization of the moment arms (2026-09-20, after two real fixed100 counterexamples):
+the finite-rank moment Denv carries an absolute error that does not vanish with the density,
+while v'(rho_tot) ~ rho^(-2/3) diverges; on long edges (rho_tot ~ 1e-12 .. 1e-15) the product
+reached 1e4 .. 1e6 meV. The stored envelope moments are <w_a|rho|w_b> with w = |R| Y00, i.e. they
+carry the 1/(4 pi) of Y00^2. For a shell block (n_a = 2l_a+1, n_b = 2l_b+1) Cauchy-Schwarz with
+the addition theorem sum_m Y_lm^2 = n/(4 pi) gives the exact, rotation-invariant inequalities
+
+    ||<a|rho|b>||_F <= kappa_ab <w_a|rho|w_b>,  ||S_ab||_F <= kappa_ab <w_a|w_b>,  kappa_ab = sqrt(n_a n_b),
+
+hence for the residuals that multiply v':  ||Denv - b S|| <= 2 kappa N,  ||Dp + Denv - rho_t S||
+<= 2 kappa (P + N),  ||Dp - rho_p S|| <= 2 kappa P  (N, P = stored env / pair envelope moments,
+b = N/Sw, rho_p = P/Sw, rho_t = rho_p + b). Each residual shell block is rescaled by
+min(1, bound/||M||_F): a covariant projection (Frobenius norm is invariant under orthogonal shell
+rotations; signs and the block direction are kept), applied consistently to the environment,
+total and pair residuals so the zero-environment cancellation of McWEDA stays exact. It bounds
+the moment term by 2 kappa Sw |rho_t v'(rho_t)| ~ (2/3) kappa Sw |v_xc(rho_t)|, the scale of the
+D2 correction itself, vanishing with the density. Where the factorized envelope moment is
+unresolved (N_ab <= 0) the environment moment of that shell pair is omitted (b = 0, Denv = 0):
+d2_moment falls back to D2, mcweda to the direct pair term. This is a consistency projection
+between two approximate estimates (finite-rank signed moments vs factorized envelope moments),
+not an exact recovery; the rescaled shell pairs, removed Frobenius mass and omitted pairs are
+reported. Pure d2 is unchanged.
 """
 from __future__ import annotations
 
@@ -38,6 +61,42 @@ from .radial import TorchRadialBlockTable
 from .topology import build_edge_topology
 
 ARMS = ("d2", "d2_moment", "mcweda")
+
+
+def shell_kappa(shells_a, shells_b) -> np.ndarray:
+    """kappa_ab = sqrt((2l_a+1)(2l_b+1)): Frobenius bound factor of a shell block relative to the stored envelope moment."""
+    na = np.array([2 * int(l) + 1 for l in shells_a], dtype=np.float64)
+    nb = np.array([2 * int(l) + 1 for l in shells_b], dtype=np.float64)
+    return np.sqrt(na[:, None] * nb[None, :])
+
+
+def residual_rescale(M, bound, ia, ib):
+    """Shell-block Frobenius projection: scale every shell block M[..., a, b] by min(1, bound_ab / ||M_ab||_F).
+
+    ``M`` is [E, ni, nj] (torch or NumPy), ``bound`` [E, nsa, nsb] >= 0, ``ia``/``ib`` the shell index of every
+    AO row/column. Covariant under orthogonal rotations inside each shell (the Frobenius norm is invariant),
+    keeps signs and the block direction. Returns (scaled M, number of rescaled shell blocks, removed Frobenius
+    mass sum(||M|| - bound)+).
+    """
+    if isinstance(M, torch.Tensor):
+        E, ni, nj = M.shape
+        nsa, nsb = bound.shape[1:]
+        rows = M.new_zeros((E, nsa, nj)).index_add_(1, ia, M.square())
+        norm = M.new_zeros((E, nsa, nsb)).index_add_(2, ib, rows).sqrt()
+        over = norm > bound
+        factor = torch.where(over, bound / torch.where(over, norm, torch.ones_like(norm)), torch.ones_like(norm))
+        return M * factor[:, ia][:, :, ib], int(over.sum().item()), float((norm - bound).clamp_min(0.0).sum().item())
+    M = np.asarray(M, dtype=np.float64)
+    E, ni, nj = M.shape
+    nsa, nsb = bound.shape[1:]
+    rows = np.zeros((E, nsa, nj))
+    np.add.at(rows, (slice(None), ia), M * M)
+    blocks = np.zeros((E, nsa, nsb))
+    np.add.at(blocks, (slice(None), slice(None), ib), rows)
+    norm = np.sqrt(blocks)
+    over = norm > bound
+    factor = np.where(over, bound / np.where(over, norm, 1.0), 1.0)
+    return M * factor[:, ia][:, :, ib], int(np.count_nonzero(over)), float(np.maximum(norm - bound, 0.0).sum())
 
 
 # --------------------------------------------------------------------------- LDA-PZ81 (torch)
@@ -298,13 +357,17 @@ class NACFEnvXCPlan(nn.Module):
     def __init__(self, bank: EnvXCBank, geometries: Sequence[Mapping[str, Any]], *, arms=("d2",),
                  library=None, max_terms=10_000_000, chunk_bytes=32 * 1024 * 1024,
                  background_method="cubic", layer_chunk_bytes=256 * 1024 * 1024, profile=False,
-                 topology="native", overlap_floor=1e-8):
+                 topology="native", overlap_floor=1e-8, moment_density_floor=0.0):
         """``overlap_floor``: shell pairs whose positive-envelope overlap <w_a|w_b> (dimensionless, <= 1 for
         normalized radials) is not above this value are treated as non-overlapping: their background is
         undefined and their correction is zero. Near the support edge both <w_a|rho_env|w_b> and <w_a|w_b>
         vanish while the finite-rank numerator keeps an absolute error, so the ratio is meaningless there;
         the gated pair-XC elements are themselves bounded by max|v_xc| times that overlap. The number of
-        gated shell pairs and the largest gated pair-XC element are reported in the diagnostics."""
+        gated shell pairs and the largest gated pair-XC element are reported in the diagnostics.
+
+        ``moment_density_floor`` (bohr^-3, default 0 = off): optional explicit validity gate for the moment
+        arms; elements whose reference density rho_tot is below it get no moment term (counted). The
+        default stabilization is the exact envelope bound (module docstring), which needs no threshold."""
         super().__init__()
         arms = tuple(arms)
         if not arms or any(a not in ARMS for a in arms):
@@ -316,6 +379,9 @@ class NACFEnvXCPlan(nn.Module):
         if not (0.0 <= float(overlap_floor) < 1.0):
             raise ValueError("overlap_floor must lie in [0, 1)")
         self.overlap_floor = float(overlap_floor)
+        if float(moment_density_floor) < 0.0:
+            raise ValueError("moment_density_floor must be non-negative")
+        self.moment_density_floor = float(moment_density_floor)
         if not geometries:
             raise ValueError("at least one geometry is required")
         self.bank = bank
@@ -465,6 +531,10 @@ class NACFEnvXCPlan(nn.Module):
             if self.need_layers:
                 keys["layers"] = tuple(bank.table("xcbg", sa, sb, k) for k in range(self.n_layers))
             self.pair_specs.append((number, sa, sb, rev_flag, keys))
+            if self.need_moment:
+                si_, sj_ = (sb, sa) if rev_flag else (sa, sb)
+                if not hasattr(self, f"kappa_{si_}_{sj_}"):
+                    reg(f"kappa_{si_}_{sj_}", shell_kappa(self.species_meta[si_]["shells"], self.species_meta[sj_]["shells"]))
         if self.need_layers:
             nodes = store.background_nodes
             reg("bg_nodes", nodes)
@@ -661,7 +731,15 @@ class NACFEnvXCPlan(nn.Module):
             rho_pair_shell = torch.where(mask_shell, Pw / torch.where(mask_shell, Sw, torch.ones_like(Sw)), torch.zeros_like(N)).clamp_min(0.0)
         out = {a: self.positions.new_zeros((E, w, w)) for a in self.arms}
         above = 0
-        moment_stats = {"rho_tot_min": None, "dv_abs_max": 0.0}
+        moment_stats = {"rho_tot_min": None, "dv_abs_max": 0.0,
+                        "moment_env_rescaled_shell_pairs": 0, "moment_env_removed_frobenius_bohr3": 0.0,
+                        "mcweda_total_rescaled_shell_pairs": 0, "mcweda_total_removed_frobenius_bohr3": 0.0,
+                        "mcweda_pair_rescaled_shell_pairs": 0, "mcweda_pair_removed_frobenius_bohr3": 0.0,
+                        "moment_below_density_floor_elements": 0, "moment_density_floor": self.moment_density_floor,
+                        "moment_term_abs_max_eV": 0.0, "mcweda_term_abs_max_eV": 0.0}
+        if self.need_moment:
+            moment_stats["moment_unresolved_env_shell_pairs"] = negative
+            moment_stats["environment_dominated_shell_pairs"] = int(((b_shell > rho_pair_shell) & mask_shell).sum().item())
         for number, sa, sb, rev_flag, keys, rows, vec, fv, na, nb in group_cache:
             si, sj = (sb, sa) if rev_flag else (sa, sb)
             ia, ib = getattr(self, f"shell_of_ao_{si}"), getattr(self, f"shell_of_ao_{sj}")
@@ -688,21 +766,45 @@ class NACFEnvXCPlan(nn.Module):
                 rp = rho_pair_shell[rows][:, ia][:, :, ib]
                 rt = rp + bs
                 valid = ms & (rt > 0)
+                if self.moment_density_floor > 0.0:
+                    below = valid & (rt < self.moment_density_floor)
+                    moment_stats["moment_below_density_floor_elements"] += int(below.sum().item())
+                    valid = valid & ~below
                 Se = S[rows, :ni, :nj]
-                De = Denv[rows, :ni, :nj]
+                # covariant consistency projection (module docstring): every residual that multiplies v' is
+                # rescaled per shell block to its envelope bound; unresolved environment moments are omitted
+                nsi_, nsj_ = self.species_meta[si]["nshells"], self.species_meta[sj]["nshells"]
+                kappa = getattr(self, f"kappa_{si}_{sj}")
+                Nsh = N[rows, :nsi_, :nsj_]
+                resolved_sh = Nsh > 0
+                Nsh = Nsh.clamp_min(0.0)
+                De = Denv[rows, :ni, :nj] * resolved_sh[:, ia][:, :, ib]
+                M_env, n_res, removed = residual_rescale(De - bs * Se, 2.0 * kappa * Nsh, ia, ib)
+                moment_stats["moment_env_rescaled_shell_pairs"] += n_res
+                moment_stats["moment_env_removed_frobenius_bohr3"] += removed
                 v_t, dv_t = lda_pz81_v_dv_torch(torch.where(valid, rt, torch.ones_like(rt)))
                 if valid.any():
                     moment_stats["rho_tot_min"] = float(rt[valid].min().item()) if moment_stats["rho_tot_min"] is None else min(moment_stats["rho_tot_min"], float(rt[valid].min().item()))
                     moment_stats["dv_abs_max"] = max(moment_stats["dv_abs_max"], float(dv_t[valid].abs().max().item()))
                 if "d2_moment" in out:
-                    term = torch.where(valid, dv_t * (De - bs * Se), torch.zeros_like(De))
+                    term = torch.where(valid, dv_t * M_env, torch.zeros_like(M_env))
+                    moment_stats["moment_term_abs_max_eV"] = max(moment_stats["moment_term_abs_max_eV"], float(term.abs().max().item()) if term.numel() else 0.0)
                     out["d2_moment"][rows, :ni, :nj] = out["d2_moment"][rows, :ni, :nj] + term
                 if "mcweda" in out:
                     valid_p = ms & (rp > 0)
                     v_p, dv_p = lda_pz81_v_dv_torch(torch.where(valid_p, rp, torch.ones_like(rp)))
+                    Psh = Pw[rows, :nsi_, :nsj_].clamp_min(0.0)
                     Dpe = Dp[rows, :ni, :nj]
-                    term = ((v_t - v_p) * Se + dv_t * (Dpe + De - rt * Se) - dv_p * (Dpe - rp * Se))
-                    out["mcweda"][rows, :ni, :nj] = torch.where(valid & valid_p, term, torch.zeros_like(term))
+                    M_tot, n_t, rem_t = residual_rescale(Dpe + De - rt * Se, 2.0 * kappa * (Psh + Nsh), ia, ib)
+                    M_pair, n_p, rem_p = residual_rescale(Dpe - rp * Se, 2.0 * kappa * Psh, ia, ib)
+                    moment_stats["mcweda_total_rescaled_shell_pairs"] += n_t
+                    moment_stats["mcweda_total_removed_frobenius_bohr3"] += rem_t
+                    moment_stats["mcweda_pair_rescaled_shell_pairs"] += n_p
+                    moment_stats["mcweda_pair_removed_frobenius_bohr3"] += rem_p
+                    term = (v_t - v_p) * Se + dv_t * M_tot - dv_p * M_pair
+                    term = torch.where(valid & valid_p, term, torch.zeros_like(term))
+                    moment_stats["mcweda_term_abs_max_eV"] = max(moment_stats["mcweda_term_abs_max_eV"], float(term.abs().max().item()) if term.numel() else 0.0)
+                    out["mcweda"][rows, :ni, :nj] = term
         self._sync(); timing["xc_assembly"] = time.perf_counter() - t0
         # 5. reverse edges are exact transposes of the representative rows -----------------------
         rep = self.representative.bool()[:, None, None]
@@ -838,7 +940,7 @@ def python_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs, edge_
 
 
 def reference_edge_envxc(store: EnvXCStore, geometry: Mapping[str, Any], *, arms=("d2",), background_method="cubic",
-                         edge_overlap_ao=None, overlap_floor=1e-8) -> dict[str, Any]:
+                         edge_overlap_ao=None, overlap_floor=1e-8, moment_density_floor=0.0) -> dict[str, Any]:
     """Independent NumPy implementation of the plan formulas (brute-force periodic images,
     CPU RadialBlockTable evaluation). For tests and small structures; returns per-arm [E,w,w]."""
     arms = tuple(arms)
@@ -917,18 +1019,27 @@ def reference_edge_envxc(store: EnvXCStore, geometry: Mapping[str, Any], *, arms
                 raise ValueError("reference needs edge_overlap_ao for moment arms")
             from .envxc_tables import lda_pz81_v_dv
             valid = me & (rte > 0)
+            if moment_density_floor > 0.0:
+                valid &= rte >= moment_density_floor
+            kappa = shell_kappa(store.orbital_shells(si), store.orbital_shells(sj))
+            Nsh = np.maximum(N, 0.0)
+            De = Denv * (N > 0)[shell_of[si]][:, shell_of[sj]]
+            M_env, _, _ = residual_rescale((De - be * Se)[None], (2.0 * kappa * Nsh)[None], shell_of[si], shell_of[sj])
             v_t, dv_t = lda_pz81_v_dv(np.where(valid, rte, 1.0))
             if "d2_moment" in out:
-                out["d2_moment"][e, :ni, :nj] += np.where(valid, dv_t * (Denv - be * Se), 0.0)
+                out["d2_moment"][e, :ni, :nj] += np.where(valid, dv_t * M_env[0], 0.0)
             if "mcweda" in out:
                 Dp = _pair_block_cpu(store, "pairmom", si, sj, vec)
+                Psh = np.maximum(Pw, 0.0)
+                M_tot, _, _ = residual_rescale((Dp + De - rte * Se)[None], (2.0 * kappa * (Psh + Nsh))[None], shell_of[si], shell_of[sj])
+                M_pair, _, _ = residual_rescale((Dp - rpe * Se)[None], (2.0 * kappa * Psh)[None], shell_of[si], shell_of[sj])
                 valid_p = me & (rpe > 0)
                 v_p, dv_p = lda_pz81_v_dv(np.where(valid_p, rpe, 1.0))
-                term = (v_t - v_p) * Se + dv_t * (Dp + Denv - rte * Se) - dv_p * (Dp - rpe * Se)
+                term = (v_t - v_p) * Se + dv_t * M_tot[0] - dv_p * M_pair[0]
                 out["mcweda"][e, :ni, :nj] = np.where(valid & valid_p, term, 0.0)
     out["b_shell"] = b_all
     return out
 
 
 __all__ = ["ARMS", "EnvXCStore", "EnvXCBank", "NACFEnvXCPlan", "reference_edge_envxc", "lda_pz81_v_dv_torch",
-           "python_edge_topology"]
+           "python_edge_topology", "residual_rescale", "shell_kappa"]

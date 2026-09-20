@@ -373,3 +373,110 @@ def test_python_topology_matches_brute_force_counts(root):
     assert (topo["terms"][:, 0] <= topo["reverse"][topo["terms"][:, 0]]).all()
     q = topo["queries"]
     assert not np.any((q[:, 0] == q[:, 1]) & ~np.any(q[:, 2:], axis=1))   # zero-image self centre never queried
+
+
+def test_envelope_normalization_and_shell_frobenius_bound_on_exact_tables():
+    """Stored envelope moments carry Y00^2 = 1/(4 pi): the s-s same-channel moment at d=0 equals the envelope
+    moment exactly, and every shell block obeys ||D_ab||_F <= sqrt(n_a n_b) P_ab on the exact two-centre tables."""
+    from dptb.nacf.envxc import shell_kappa
+    xa, yb = synthetic_source("Xa", **SPECIES["Xa"]), synthetic_source("Yb", **SPECIES["Yb"])
+    dist = np.array([0.0, 1.3, 2.7, 4.6, 7.0, 10.5])
+    for a, b in ((xa, xa), (xa, yb)):
+        dens = build_table_values("pairmom", a, b, distances=dist, order=48)["values"]        # <mu|rho_pair|nu>
+        env = build_table_values("envpair", a, b, distances=dist, order=48)["values"]         # <w_a|rho_pair|w_b>, w=|R|Y00
+        kappa = shell_kappa(a.shells, b.shells)
+        oa, ob = np.cumsum([0] + [2 * l + 1 for l in a.shells]), np.cumsum([0] + [2 * l + 1 for l in b.shells])
+        for k in range(len(dist)):
+            for i in range(a.nshells):
+                for j in range(b.nshells):
+                    block = dens[k, oa[i]:oa[i + 1], ob[j]:ob[j + 1]]
+                    assert np.linalg.norm(block) <= kappa[i, j] * env[k, i, j] * (1 + 1e-9) + 1e-14, (a.symbol, b.symbol, k, i, j)
+        if a is b:
+            # d = 0, same s channel: |R|^2 = R^2 so the signed and the envelope moments coincide (tests the 4 pi convention)
+            for c, l in enumerate(a.shells):
+                if l == 0:
+                    assert abs(dens[0, oa[c], oa[c]] - env[0, c, c]) < 1e-12 * max(1.0, abs(env[0, c, c]))
+            assert env[0, 0, 0] > 1e-3      # non-trivial magnitude, so a missing 4 pi would have been caught
+
+
+def test_residual_rescale_is_covariant_and_bounds_the_low_density_product():
+    """Shell-block Frobenius rescaling commutes with orthogonal shell rotations (elementwise clipping does not),
+    and it caps the v' product in the replayed counterexample regime (rho_tot ~ 1e-15, moment error ~ 1e-6)."""
+    from dptb.nacf.envxc import residual_rescale, shell_kappa
+    rng = np.random.default_rng(7)
+    shells_a, shells_b = (0, 1, 2), (0, 1)
+    ia = np.repeat(np.arange(len(shells_a)), [2 * l + 1 for l in shells_a])
+    ib = np.repeat(np.arange(len(shells_b)), [2 * l + 1 for l in shells_b])
+    kappa = shell_kappa(shells_a, shells_b)
+    E = 3
+    M = torch.tensor(rng.normal(size=(E, len(ia), len(ib))))
+    bound = torch.tensor(np.abs(rng.normal(size=(E, len(shells_a), len(shells_b)))) * 0.8)
+    def block_rotation(shells):
+        blocks = []
+        for l in shells:
+            q, _ = np.linalg.qr(rng.normal(size=(2 * l + 1, 2 * l + 1)))
+            blocks.append(q)
+        out = np.zeros((sum(2 * l + 1 for l in shells),) * 2)
+        o = 0
+        for q in blocks:
+            n = q.shape[0]; out[o:o + n, o:o + n] = q; o += n
+        return torch.tensor(out)
+    Ra, Rb = block_rotation(shells_a), block_rotation(shells_b)
+    scaled, count, removed = residual_rescale(M, bound, torch.tensor(ia), torch.tensor(ib))
+    rotated_then_scaled, count_r, removed_r = residual_rescale(Ra @ M @ Rb.T, bound, torch.tensor(ia), torch.tensor(ib))
+    assert count > 0 and count == count_r and abs(removed - removed_r) < 1e-10
+    assert torch.allclose(rotated_then_scaled, Ra @ scaled @ Rb.T, atol=1e-12)
+    # the reviewer's counterexample: elementwise clipping of a p block is frame dependent
+    t = 0.3
+    D = torch.zeros((1, 3, 3)); D[0, 0, 0] = 2 * t
+    c, s = math.cos(math.pi / 4), math.sin(math.pi / 4)
+    R = torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    clip_then_rotate = R @ torch.clamp(D, -t, t) @ R.T
+    rotate_then_clip = torch.clamp(R @ D @ R.T, -t, t)
+    assert not torch.allclose(clip_then_rotate, rotate_then_clip, atol=1e-6)
+    ip = torch.zeros(3, dtype=torch.long)
+    b1 = torch.tensor([[[t]]])
+    fro_a = R @ residual_rescale(D, b1, ip, ip)[0] @ R.T
+    fro_b = residual_rescale(R @ D @ R.T, b1, ip, ip)[0]
+    assert torch.allclose(fro_a, fro_b, atol=1e-12)
+    # NumPy twin
+    s_np, c_np, r_np = residual_rescale(M.numpy(), bound.numpy(), ia, ib)
+    assert np.allclose(s_np, scaled.numpy()) and c_np == count and abs(r_np - removed) < 1e-10
+    # low-density replay: rho_tot 1e-15 (measured 1.9e-15), finite-rank residual 1e-6 bohr^-3, weak overlap Sw 1e-4
+    sw, rho_pair, b = 1e-4, 1e-15, 1e-15
+    N = torch.full((1, len(shells_a), len(shells_b)), b * sw)
+    residual = torch.full((1, len(ia), len(ib)), 1e-6)
+    _, dv = lda_pz81_v_dv_torch(torch.tensor([rho_pair + b]))
+    assert abs(float(dv)) > 1e10
+    unbounded = (dv * residual).abs().max().item()
+    bounded_res, n_res, _ = residual_rescale(residual, 2.0 * torch.tensor(kappa)[None] * N, torch.tensor(ia), torch.tensor(ib))
+    bounded = (dv * bounded_res).abs().max().item()
+    analytic = 2.0 * float(kappa.max()) * sw * abs(float((rho_pair + b) * dv))
+    assert unbounded > 1e3 and n_res == kappa.size
+    assert bounded <= analytic * (1 + 1e-12) and bounded < 1e-6
+    # inside the admissible range nothing changes
+    small = 0.1 * residual
+    kept, n_kept, _ = residual_rescale(small, 2.0 * torch.tensor(kappa)[None] * torch.full_like(N, 1.0), torch.tensor(ia), torch.tensor(ib))
+    assert torch.equal(kept, small) and n_kept == 0
+
+
+def test_moment_arms_report_stabilization_diagnostics(root):
+    path, sources, _ = root
+    store = EnvXCStore(path)
+    cut = {s: src.orbital_cutoff_bohr for s, src in sources.items()}
+    g = make_structure(["Xa", "Yb", "Xa"], [[0.3, 0.2, 0.1], [2.9, 0.4, 1.7], [0.8, 3.2, 2.6]], np.diag([7.0, 7.5, 8.0]), cut)
+    S = edge_overlap(sources, g)
+    bank = EnvXCBank(store, device="cpu", backend="torch")
+    out = bank.prepare(**g, arms=("d2_moment", "mcweda"), topology="python")(edge_overlap_ao=torch.tensor(S))
+    diag = out["diagnostics"]
+    for key in ("moment_env_rescaled_shell_pairs", "moment_env_removed_frobenius_bohr3", "mcweda_total_rescaled_shell_pairs",
+                "mcweda_pair_rescaled_shell_pairs", "moment_unresolved_env_shell_pairs", "environment_dominated_shell_pairs",
+                "moment_term_abs_max_eV", "mcweda_term_abs_max_eV", "moment_density_floor"):
+        assert key in diag
+    assert diag["moment_term_abs_max_eV"] < 1.0 and diag["mcweda_term_abs_max_eV"] < 1.0     # bounded by the XC scale
+    # the optional explicit floor removes the term where rho_tot is below it and counts what it removed; with a floor
+    # above every reference density (including leakage-inflated backgrounds) the arm falls back to the D2 base exactly
+    gated = bank.prepare(**g, arms=("d2_moment",), topology="python", moment_density_floor=1e12)(edge_overlap_ao=torch.tensor(S))
+    assert gated["diagnostics"]["moment_below_density_floor_elements"] > 0
+    plain = bank.prepare(**g, arms=("d2",), topology="python")()
+    assert torch.allclose(gated["d2_moment"], plain["d2"], atol=1e-12)
