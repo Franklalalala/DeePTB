@@ -55,7 +55,50 @@ def _library(path):
     lib.nacf_topology_seconds.argtypes = [ptr, C.c_int]
     lib.nacf_topology_seconds.restype = C.c_double
     lib.nacf_topology_free.argtypes = [ptr]
+    if hasattr(lib, 'nacf_onsite_neighbours'):
+        lib.nacf_onsite_neighbours.argtypes = [C.c_int64, dp, dp, bp, C.c_double, ip, C.c_int64, C.c_char_p]
+        lib.nacf_onsite_neighbours.restype = ptr
     return lib
+
+
+def onsite_neighbour_rows(positions, cell, pbc, radius, species_rank, *, library=None, max_pairs=200_000_000):
+    """Native fixed-radius onsite candidate rows ``(i, j, tx, ty, tz)`` in the accepted order.
+
+    Sorted by (atom, species rank of the neighbour, neighbour index, lexicographic image); the origin
+    self pair is included and other self images are retained. The neighbour position is
+    ``pos[j] + t @ cell``. The native cutoff is padded, so callers apply the accepted strict
+    ``|d| < radius`` test themselves (in the reference expression); this function never drops a pair at
+    the boundary. Requires a library built from the current ``topology.cpp``.
+    """
+    pos = np.ascontiguousarray(positions, dtype=np.float64)
+    lattice = np.ascontiguousarray(cell, dtype=np.float64)
+    periodic = np.ascontiguousarray(np.asarray(pbc, dtype=bool), dtype=np.uint8)
+    rank = np.ascontiguousarray(species_rank, dtype=np.int64)
+    n = len(pos)
+    if pos.shape != (n, 3) or n == 0 or lattice.shape != (3, 3) or periodic.shape != (3,) or rank.shape != (n,):
+        raise ValueError('invalid onsite neighbour geometry')
+    if not (float(radius) > 0) or not np.isfinite(pos).all() or not np.isfinite(lattice).all():
+        raise ValueError('onsite radius must be positive and the geometry finite')
+    path = library or os.environ.get('DPTB_NACF_TOPOLOGY_LIBRARY')
+    if not path:
+        raise RuntimeError('Build tools/build_nacf_topology.py and set DPTB_NACF_TOPOLOGY_LIBRARY')
+    lib = _library(str(Path(path).resolve(strict=True)))
+    if not hasattr(lib, 'nacf_onsite_neighbours'):
+        raise RuntimeError('rebuild the native topology library for onsite neighbour support')
+    dp, ip, bp = C.POINTER(C.c_double), C.POINTER(C.c_int64), C.POINTER(C.c_uint8)
+    error = C.create_string_buffer(1024)
+    handle = lib.nacf_onsite_neighbours(n, pos.ctypes.data_as(dp), lattice.ctypes.data_as(dp), periodic.ctypes.data_as(bp),
+                                        float(radius), rank.ctypes.data_as(ip), int(max_pairs), error)
+    if not handle:
+        raise ValueError(error.value.decode('utf-8', errors='replace'))
+    try:
+        count = lib.nacf_topology_count(handle, 0)
+        rows = (np.ctypeslib.as_array(lib.nacf_topology_data(handle, 0), (count * 5,)).copy().reshape(count, 5)
+                if count else np.empty((0, 5), dtype=np.int64))
+        return rows, {'broad_pairs': lib.nacf_topology_count(handle, 3), 'search_s': lib.nacf_topology_seconds(handle, 0),
+                      'sort_s': lib.nacf_topology_seconds(handle, 1)}
+    finally:
+        lib.nacf_topology_free(handle)
 
 
 def build_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs,

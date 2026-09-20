@@ -159,6 +159,47 @@ void* nacf_topology_build(I n, const double* pos, const double* cell,
                         const I* shifts, I max_terms, char* error) {
     return nacf_topology_build_mode(n,pos,cell,pbc,ao_cut,centre_cut,e,edges,shifts,max_terms,error,0);
 }
+// Fixed-radius onsite neighbourhoods of every atom in the accepted order: rows (i, j, tx, ty, tz)
+// sorted by (i, species rank of j, j, lexicographic image), origin self pair included, other self
+// images retained. The neighbour position is pos[j] + t cell. The cutoff is padded by a relative
+// 1e-12 so that the caller applies the accepted strict |d| < radius test itself, in the same
+// floating-point expression as the reference enumerator; nothing is dropped here at the boundary.
+void* nacf_onsite_neighbours(I n, const double* pos, const double* cell, const uint8_t* pbc,
+                             double radius, const I* rank, I max_pairs, char* error) {
+    try {
+        if (n <= 0 || !(radius > 0) || max_pairs <= 0) throw std::invalid_argument("invalid onsite neighbour request");
+        auto out = std::make_unique<Plan>();
+        const std::array<I, 2> batch{0,n};
+        auto t = Clock::now();
+        auto broad = neighbor_search::neighbor_list_cpu<double>(
+            {pos,static_cast<size_t>(n*3)},batch,{cell,9},{pbc,3},radius*(1+1e-12)+1e-12,
+            neighbor_search::PairMode::FullWithSelf,neighbor_search::Algorithm::Auto,1);
+        std::vector<I> pairs(broad.pair_count*2);
+        std::vector<int32_t> images(broad.pair_count*3);
+        neighbor_search::copy_pair_buffers(broad,pairs,images,1);
+        out->broad_pairs = broad.pair_count;
+        out->search_seconds = elapsed(t);
+        t = Clock::now();
+        if (static_cast<I>(broad.pair_count) > max_pairs) throw std::length_error("onsite neighbour budget exceeded");
+        std::vector<std::array<I,6>> rows;
+        rows.reserve(broad.pair_count);
+        for (size_t r=0; r<broad.pair_count; ++r) {
+            const I i=pairs[2*r], j=pairs[2*r+1];
+            rows.push_back({i,rank[j],j,I(images[3*r]),I(images[3*r+1]),I(images[3*r+2])});
+        }
+        std::sort(rows.begin(),rows.end());
+        out->queries.reserve(rows.size());
+        for (const auto& x : rows) out->queries.push_back({x[0],x[2],x[3],x[4],x[5]});
+        out->join_seconds = elapsed(t);
+        return out.release();
+    } catch (const std::exception& ex) {
+        std::snprintf(error,1024,"%s",ex.what());
+        return nullptr;
+    } catch (...) {
+        std::snprintf(error,1024,"unknown native onsite neighbour error");
+        return nullptr;
+    }
+}
 I nacf_topology_count(void* p,int which) {
     const auto& x=*static_cast<Plan*>(p);
     return which==0?x.queries.size():which==1?x.terms.size():which==2?x.reverse.size():x.broad_pairs;

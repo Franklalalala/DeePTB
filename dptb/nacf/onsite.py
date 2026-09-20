@@ -110,6 +110,46 @@ def onsite_neighbor_lists(g, radius=LEGACY_RADIUS_BOHR, *, atoms=None):
     return result
 
 
+def onsite_neighbor_lists_native(g, radius=LEGACY_RADIUS_BOHR, *, library=None, atoms=None):
+    """The lists of :func:`onsite_neighbor_lists` from one native (Tonari cell-list) search of the whole cell.
+
+    Same set, species grouping, order and displacement values as the accepted NumPy enumerator: the native
+    search returns every candidate within a padded radius sorted in the accepted order, and the strict
+    ``|d| < radius`` test is applied here in the reference expression ``(pos[j] + t @ cell) - pos[i]``.
+    The cost is O(neighbours) instead of O(atoms^2 x images).
+    """
+    from .topology import onsite_neighbour_rows
+    pos = np.asarray(g['positions_bohr'], dtype=np.float64)
+    cell = np.asarray(g['cell_bohr'], dtype=np.float64)
+    symbols = list(g['symbols'])
+    if pos.ndim != 2 or pos.shape[1] != 3 or cell.shape != (3, 3) or len(symbols) != len(pos):
+        raise ValueError('geometry needs positions_bohr [n,3], cell_bohr [3,3] and n symbols')
+    radius = float(radius)
+    if not radius > 0:
+        raise ValueError('onsite radius must be positive')
+    pbc = tuple(bool(x) for x in g.get('pbc', (True, True, True)))
+    species_order = list(dict.fromkeys(symbols))
+    rank = np.array([species_order.index(s) for s in symbols], dtype=np.int64)
+    rows, _ = onsite_neighbour_rows(pos, cell, pbc, radius, rank, library=library)
+    translations = np.ascontiguousarray(rows[:, 2:])
+    delta = (pos[rows[:, 1]] + translations @ cell) - pos[rows[:, 0]]
+    keep = np.linalg.norm(delta, axis=1) < radius
+    rows, delta = rows[keep], delta[keep]
+    atom_ptr = np.searchsorted(rows[:, 0], np.arange(len(pos) + 1))
+    targets = list(range(len(pos))) if atoms is None else [int(i) for i in atoms]
+    result = []
+    for i in targets:
+        a, b = atom_ptr[i], atom_ptr[i + 1]
+        ranks = rank[rows[a:b, 1]]
+        bounds = np.searchsorted(ranks, np.arange(len(species_order) + 1))
+        grouped = {}
+        for k, s in enumerate(species_order):
+            if bounds[k + 1] > bounds[k]:
+                grouped[s] = delta[a + bounds[k]:a + bounds[k + 1]]
+        result.append(grouped)
+    return result
+
+
 # ----------------------------------------------------------------------------- density bank packing
 def _tensor_identity(value):
     """Storage identity of one spline array without reading its contents.
@@ -398,7 +438,8 @@ class OnsiteXCEvaluator:
     """
 
     def __init__(self, qgrid, density_bank, *, v_and_dv=None, potential=None, radius=LEGACY_RADIUS_BOHR,
-                 engine='fused', device='cuda', chunk_bytes=1 << 30, rho_bytes=1 << 30, prune=True, density_policy='rebuild'):
+                 engine='fused', device='cuda', chunk_bytes=1 << 30, rho_bytes=1 << 30, prune=True, density_policy='rebuild',
+                 topology_library=None):
         if engine not in ('fused', 'reference'):
             raise ValueError("engine must be 'fused' or 'reference'")
         if density_policy not in ('rebuild', 'fail'):
@@ -410,6 +451,7 @@ class OnsiteXCEvaluator:
         self.qgrid, self.density_bank, self.potential = qgrid, density_bank, potential
         self.radius, self.engine, self.device, self.chunk_bytes = float(radius), engine, torch.device(device), chunk_bytes
         self.rho_bytes, self.prune = int(rho_bytes), bool(prune)   # fused engine: density bytes per launch; exact pair skipping
+        self.topology_library = topology_library                   # native accepted-order enumeration when set
         self.density_policy = density_policy
         self._bank = None
         self.bank_rebuilds = 0
@@ -431,6 +473,8 @@ class OnsiteXCEvaluator:
         return self._bank
 
     def neighbors(self, g):
+        if self.topology_library is not None:
+            return onsite_neighbor_lists_native(g, self.radius, library=self.topology_library)
         return onsite_neighbor_lists(g, self.radius)
 
     def blocks(self, quadrature, neighbors, *, return_density=False, stats=None):

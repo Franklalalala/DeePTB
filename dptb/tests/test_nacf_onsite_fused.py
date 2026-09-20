@@ -6,9 +6,12 @@ import pytest
 import torch
 from scipy.interpolate import CubicSpline
 from dptb.nacf.onsite import (PRUNE_MARGIN_BOHR, OnsiteXCEvaluator, PackedDensityBank, SplineDensity, fused_onsite_blocks,
-                              fused_onsite_density, onsite_candidates, onsite_neighbor_lists, pz81_potential, reference_onsite_blocks)
+                              fused_onsite_density, onsite_candidates, onsite_neighbor_lists, onsite_neighbor_lists_native,
+                              pz81_potential, reference_onsite_blocks)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+import os
+native = pytest.mark.skipif(not os.environ.get('DPTB_NACF_TOPOLOGY_LIBRARY'), reason='native topology not built')
 
 
 def reference_neighbors(g, i, radius):
@@ -302,3 +305,29 @@ def test_pruned_kernel_is_bitwise_the_unpruned_walk_and_chunked_launches_agree()
     assert ev.last_stats['candidates'] <= ev.last_stats['neighbours'] and ev.last_stats['candidate_pairs'] <= ev.last_stats['pairs']
     torch.testing.assert_close(got, OnsiteXCEvaluator(lambda s, o: q, density, potential=potential, radius=4.0, engine='reference', device=device)(g, 5, [(1, 1, 1)] * 3), atol=1e-11, rtol=1e-11)
 
+
+@native
+@pytest.mark.parametrize('cell,pbc', [(np.eye(3) * 2.5, [True] * 3), (np.array([[2.6, 0, 0], [.4, 2.9, 0], [-.3, .5, 3.3]]), [True] * 3),
+                                      (np.array([[3.1, 0, 0], [1.2, 2.7, 0], [0, 0, 4.0]]), [True, True, False]), (np.eye(3) * 9.0, [False] * 3)])
+def test_native_onsite_neighbours_equal_the_accepted_enumerator_bitwise(cell, pbc):
+    rng = np.random.default_rng(17)
+    pos = rng.uniform(-1.0, 4.0, (7, 3))
+    g = dict(symbols=['X', 'Y', 'X', 'Z', 'Y', 'Y', 'X'], positions_bohr=pos, cell_bohr=cell, pbc=pbc)
+    for radius in (3.7, 6.2, 11.0):
+        want = onsite_neighbor_lists(g, radius)
+        got = onsite_neighbor_lists_native(g, radius)
+        assert len(got) == len(want)
+        for a, b in zip(got, want):
+            assert list(a) == list(b)                      # species in first-appearance order
+            for s in b:
+                assert a[s].shape == b[s].shape
+                np.testing.assert_array_equal(a[s], b[s])   # same set, order and bitwise displacements
+        subset = onsite_neighbor_lists_native(g, radius, atoms=[3, 0])
+        assert len(subset) == 2 and all(np.array_equal(subset[0][s], want[3][s]) for s in want[3]) and list(subset[1]) == list(want[0])
+    # the evaluator uses the native path when a library is given, and the reference neighbours otherwise
+    density = {s: synthetic_density('cpu', seed=k) for k, s in enumerate('XYZ')}
+    ev = OnsiteXCEvaluator(lambda s, o: None, density, potential=lambda n: n, device='cpu', engine='reference', radius=6.2,
+                           topology_library=os.environ['DPTB_NACF_TOPOLOGY_LIBRARY'])
+    plain = OnsiteXCEvaluator(lambda s, o: None, density, potential=lambda n: n, device='cpu', engine='reference', radius=6.2)
+    for a, b in zip(ev.neighbors(g), plain.neighbors(g)):
+        assert list(a) == list(b) and all(np.array_equal(a[s], b[s]) for s in b)

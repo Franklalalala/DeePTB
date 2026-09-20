@@ -81,3 +81,16 @@ species fail explicitly. No radius, density, quadrature order or potential is ch
 The packed density bank is bound to the content identity of the density bank
 (`density_identity`); `density_policy='rebuild'|'fail'` and `invalidate()` control what
 happens when a species density is replaced or edited in place.
+
+Native onsite neighbourhoods: `OnsiteXCEvaluator(topology_library=...)` (or
+`onsite_neighbor_lists_native`) enumerates the fixed-radius lists with one Tonari
+cell-list search of the whole cell (`nacf_onsite_neighbours`, `FullWithSelf`, padded
+cutoff) sorted in the accepted order; the strict `|d| < radius` test is applied in the
+reference expression, so set, species grouping, order and displacement values are bitwise
+those of the NumPy enumerator, at O(neighbours) instead of O(atoms^2 x images) host cost.
+The NumPy path remains the default and the reference.
+
+Build explicitly with `python -m dptb.nacf.precompile --arch 8.9+PTX` and
+`python tools/build_nacf_topology.py --output /isolated/libnacf_topology.so`.
+Inference loads checksummed binaries and never invokes a compiler. The build
+retains `--fmad=false`; no fast-math flags are introduced.
