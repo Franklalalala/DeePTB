@@ -41,6 +41,20 @@ d2_moment falls back to D2, mcweda to the direct pair term. This is a consistenc
 between two approximate estimates (finite-rank signed moments vs factorized envelope moments),
 not an exact recovery; the rescaled shell pairs, removed Frobenius mass and omitted pairs are
 reported. Pure d2 is unchanged.
+
+McWEDA stabilization versions (``stabilization`` option of the plan; see :func:`mcweda_composition`):
+``v1`` is the recipe of the fixed100 receipts above: the total residual Dp + Denv - rho_t S is projected on its
+own to 2 kappa (P + N) and the pair residual to 2 kappa P. The independent audit (2026-09-20) showed that v1 does
+not use the projected environment residual in the total, so at fixed P a finite-rank leak of Denv survives with
+the bound 2 kappa P as N -> 0+, while the zero-environment branch (N <= 0) returns exactly zero: the correction
+is not continuous in the weak-environment limit. ``v2`` composes the projected residuals instead,
+
+    Delta = (v_t - v_p) S + (v'_t - v'_p) M_pair~ + v'_t M_env~,   M_pair~ = C_{2 kappa P}(Dp - rho_p S),
+
+so that M_tot~ := M_pair~ + M_env~ obeys the total bound by the triangle inequality, the term is continuous as
+N -> 0+ and both versions coincide algebraically whenever nothing is rescaled. v2 is a stabilization (recipe)
+change, not an exact backend optimization; both versions stay available so old, corrected and fused/unfused
+results can be compared separately. The diagnostics report ``stabilization``.
 """
 from __future__ import annotations
 
@@ -61,6 +75,37 @@ from .radial import TorchRadialBlockTable
 from .topology import build_edge_topology
 
 ARMS = ("d2", "d2_moment", "mcweda")
+STABILIZATIONS = ("v1", "v2")
+
+
+def mcweda_composition(version, S, D_env, D_pair, M_env, rho_p, rho_t, N_shell, P_shell, kappa, ia, ib, v_t, dv_t, v_p, dv_p):
+    """McWEDA remainder GSN(total) - GSN(pair) with the stabilization ``version`` (torch or NumPy inputs).
+
+    Inputs are AO blocks [E, ni, nj] (``S`` overlap, ``D_env`` signed environment moment already zeroed on
+    unresolved shell pairs, ``D_pair`` pair moment, ``M_env`` the projected environment residual
+    C_{2 kappa N}(D_env - b S)), AO-broadcast shell scalars ``rho_p``/``rho_t`` and their v/v', shell
+    envelope moments ``N_shell``/``P_shell`` [E, nsa, nsb] (clamped >= 0) and the shell bound factor ``kappa``.
+
+    ``v1``: (v_t - v_p) S + v'_t C_{2k(P+N)}(D_pair + D_env - rho_t S) - v'_p C_{2kP}(D_pair - rho_p S)
+    ``v2``: (v_t - v_p) S + (v'_t - v'_p) M_pair~ + v'_t M_env~,  M_pair~ = C_{2kP}(D_pair - rho_p S)
+
+    Without rescaling the two are algebraically identical (D_pair + D_env - rho_t S = (D_pair - rho_p S) +
+    (D_env - b S)). Both are shell covariant (Frobenius projections and shell scalars). v2 is continuous as
+    N -> 0+ at fixed P because ||M_env~|| <= 2 kappa N; v1 is not (its total projection admits a leak of
+    D_env up to 2 kappa P). Returns (term, counters) where counters hold the rescaled shell-pair counts and
+    removed Frobenius mass (Bohr^-3) of the total (v1 only) and pair residuals.
+    """
+    if version not in STABILIZATIONS:
+        raise ValueError(f"unknown McWEDA stabilization {version!r}; expected one of {STABILIZATIONS}")
+    M_pair, n_p, rem_p = residual_rescale(D_pair - rho_p * S, 2.0 * kappa * P_shell, ia, ib)
+    if version == "v1":
+        M_tot, n_t, rem_t = residual_rescale(D_pair + D_env - rho_t * S, 2.0 * kappa * (P_shell + N_shell), ia, ib)
+        term = (v_t - v_p) * S + dv_t * M_tot - dv_p * M_pair
+    else:
+        n_t, rem_t = 0, 0.0
+        term = (v_t - v_p) * S + (dv_t - dv_p) * M_pair + dv_t * M_env
+    return term, {"mcweda_total_rescaled_shell_pairs": n_t, "mcweda_total_removed_frobenius_bohr_minus3": rem_t,
+                  "mcweda_pair_rescaled_shell_pairs": n_p, "mcweda_pair_removed_frobenius_bohr_minus3": rem_p}
 
 
 def shell_kappa(shells_a, shells_b) -> np.ndarray:
@@ -362,8 +407,12 @@ class NACFEnvXCPlan(nn.Module):
     def __init__(self, bank: EnvXCBank, geometries: Sequence[Mapping[str, Any]], *, arms=("d2",),
                  library=None, max_terms=10_000_000, chunk_bytes=32 * 1024 * 1024,
                  background_method="cubic", layer_chunk_bytes=256 * 1024 * 1024, profile=False,
-                 topology="native", overlap_floor=1e-8, moment_density_floor=0.0):
-        """``overlap_floor``: shell pairs whose positive-envelope overlap <w_a|w_b> (dimensionless, <= 1 for
+                 topology="native", overlap_floor=1e-8, moment_density_floor=0.0, stabilization="v1"):
+        """``stabilization``: McWEDA residual composition, ``'v1'`` (fixed100 receipts, default for
+        compatibility) or ``'v2'`` (composed projected residuals, continuous weak-environment limit); see
+        :func:`mcweda_composition`. It only affects the ``mcweda`` arm.
+
+        ``overlap_floor``: shell pairs whose positive-envelope overlap <w_a|w_b> (dimensionless, <= 1 for
         normalized radials) is not above this value are treated as non-overlapping: their background is
         undefined and their correction is zero. Near the support edge both <w_a|rho_env|w_b> and <w_a|w_b>
         vanish while the finite-rank numerator keeps an absolute error, so the ratio is meaningless there;
@@ -381,6 +430,9 @@ class NACFEnvXCPlan(nn.Module):
             raise ValueError("background_method must be cubic or linear")
         if topology not in ("native", "python"):
             raise ValueError("topology must be native or python")
+        if stabilization not in STABILIZATIONS:
+            raise ValueError(f"stabilization must be one of {STABILIZATIONS}")
+        self.stabilization = str(stabilization)
         if not (0.0 <= float(overlap_floor) < 1.0):
             raise ValueError("overlap_floor must lie in [0, 1)")
         self.overlap_floor = float(overlap_floor)
@@ -800,13 +852,11 @@ class NACFEnvXCPlan(nn.Module):
                     v_p, dv_p = lda_pz81_v_dv_torch(torch.where(valid_p, rp, torch.ones_like(rp)))
                     Psh = Pw[rows, :nsi_, :nsj_].clamp_min(0.0)
                     Dpe = Dp[rows, :ni, :nj]
-                    M_tot, n_t, rem_t = residual_rescale(Dpe + De - rt * Se, 2.0 * kappa * (Psh + Nsh), ia, ib)
-                    M_pair, n_p, rem_p = residual_rescale(Dpe - rp * Se, 2.0 * kappa * Psh, ia, ib)
-                    moment_stats["mcweda_total_rescaled_shell_pairs"] += n_t
-                    moment_stats["mcweda_total_removed_frobenius_bohr3"] += rem_t
-                    moment_stats["mcweda_pair_rescaled_shell_pairs"] += n_p
-                    moment_stats["mcweda_pair_removed_frobenius_bohr3"] += rem_p
-                    term = (v_t - v_p) * Se + dv_t * M_tot - dv_p * M_pair
+                    term, counters = mcweda_composition(self.stabilization, Se, De, Dpe, M_env, rp, rt, Nsh, Psh, kappa, ia, ib, v_t, dv_t, v_p, dv_p)
+                    moment_stats["mcweda_total_rescaled_shell_pairs"] += counters["mcweda_total_rescaled_shell_pairs"]
+                    moment_stats["mcweda_total_removed_frobenius_bohr3"] += counters["mcweda_total_removed_frobenius_bohr_minus3"]
+                    moment_stats["mcweda_pair_rescaled_shell_pairs"] += counters["mcweda_pair_rescaled_shell_pairs"]
+                    moment_stats["mcweda_pair_removed_frobenius_bohr3"] += counters["mcweda_pair_removed_frobenius_bohr_minus3"]
                     term = torch.where(valid & valid_p, term, torch.zeros_like(term))
                     moment_stats["mcweda_term_abs_max_eV"] = max(moment_stats["mcweda_term_abs_max_eV"], float(term.abs().max().item()) if term.numel() else 0.0)
                     out["mcweda"][rows, :ni, :nj] = term
@@ -816,7 +866,13 @@ class NACFEnvXCPlan(nn.Module):
         for arm in out:
             out[arm] = torch.where(rep, out[arm], out[arm][self.reverse].transpose(-1, -2))
         b_full = torch.where(rep, b_shell, b_shell[self.reverse].transpose(-1, -2))
+        # the ``*_removed_frobenius_bohr3`` keys are kept for receipt compatibility; the quantity is a density moment in
+        # Bohr^-3, which the ``*_bohr_minus3`` duplicates state correctly
+        for key in tuple(moment_stats):
+            if key.endswith("_removed_frobenius_bohr3"):
+                moment_stats[key.replace("_bohr3", "_bohr_minus3")] = moment_stats[key]
         diagnostics = {"b_shell": b_full, "mask_shell": torch.where(rep, mask_shell, mask_shell[self.reverse].transpose(-1, -2)),
+                       "stabilization": self.stabilization,
                        "negative_numerators": negative, "negative_numerator_max_overlap": negative_max_overlap,
                        "negative_numerator_min_b": negative_min_value, "numerator_without_overlap": leaked,
                        "shell_pairs_below_overlap_floor": gated, "gated_pair_xc_abs_max_eV": gated_block_abs_max,
@@ -945,10 +1001,12 @@ def python_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs, edge_
 
 
 def reference_edge_envxc(store: EnvXCStore, geometry: Mapping[str, Any], *, arms=("d2",), background_method="cubic",
-                         edge_overlap_ao=None, overlap_floor=1e-8, moment_density_floor=0.0) -> dict[str, Any]:
+                         edge_overlap_ao=None, overlap_floor=1e-8, moment_density_floor=0.0, stabilization="v1") -> dict[str, Any]:
     """Independent NumPy implementation of the plan formulas (brute-force periodic images,
     CPU RadialBlockTable evaluation). For tests and small structures; returns per-arm [E,w,w]."""
     arms = tuple(arms)
+    if stabilization not in STABILIZATIONS:
+        raise ValueError(f"stabilization must be one of {STABILIZATIONS}")
     symbols = [str(s) for s in geometry["symbols"]]
     pos = np.asarray(geometry["positions_bohr"], dtype=np.float64)
     cell = np.asarray(geometry["cell_bohr"], dtype=np.float64)
@@ -1036,15 +1094,14 @@ def reference_edge_envxc(store: EnvXCStore, geometry: Mapping[str, Any], *, arms
             if "mcweda" in out:
                 Dp = _pair_block_cpu(store, "pairmom", si, sj, vec)
                 Psh = np.maximum(Pw, 0.0)
-                M_tot, _, _ = residual_rescale((Dp + De - rte * Se)[None], (2.0 * kappa * (Psh + Nsh))[None], shell_of[si], shell_of[sj])
-                M_pair, _, _ = residual_rescale((Dp - rpe * Se)[None], (2.0 * kappa * Psh)[None], shell_of[si], shell_of[sj])
                 valid_p = me & (rpe > 0)
                 v_p, dv_p = lda_pz81_v_dv(np.where(valid_p, rpe, 1.0))
-                term = (v_t - v_p) * Se + dv_t * M_tot[0] - dv_p * M_pair[0]
-                out["mcweda"][e, :ni, :nj] = np.where(valid & valid_p, term, 0.0)
+                term, _ = mcweda_composition(stabilization, Se[None], De[None], Dp[None], M_env, rpe[None], rte[None], Nsh[None], Psh[None],
+                                             kappa, shell_of[si], shell_of[sj], v_t[None], dv_t[None], v_p[None], dv_p[None])
+                out["mcweda"][e, :ni, :nj] = np.where(valid & valid_p, term[0], 0.0)
     out["b_shell"] = b_all
     return out
 
 
-__all__ = ["ARMS", "EnvXCStore", "EnvXCBank", "NACFEnvXCPlan", "reference_edge_envxc", "lda_pz81_v_dv_torch",
-           "python_edge_topology", "residual_rescale", "shell_kappa"]
+__all__ = ["ARMS", "STABILIZATIONS", "EnvXCStore", "EnvXCBank", "NACFEnvXCPlan", "reference_edge_envxc", "lda_pz81_v_dv_torch",
+           "mcweda_composition", "python_edge_topology", "residual_rescale", "shell_kappa"]
