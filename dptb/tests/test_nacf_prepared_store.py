@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -94,3 +95,32 @@ def test_table_bank_uses_bound_snapshot_and_rejects_competing_cache(tmp_path, mo
     with pytest.raises(ValueError, match='choose'):
         NACFTableBank(sources.p2, sources.p23, device='cpu', prepared_store=store,
                       prepared_cache_dir=str(tmp_path / 'cache'))
+
+
+def test_snapshot_writer_preserves_another_writers_pending_file(tmp_path):
+    _, _, reference = fixture(tmp_path)
+    root = tmp_path / 'concurrent'
+    root.mkdir()
+    key = 'p2_base|X|X'
+    pending = root / (hashlib.sha256(key.encode()).hexdigest() + '.pending')
+    pending.write_bytes(b'another writer owns this file')
+    with pytest.raises(FileExistsError):
+        write_table(root, key, reference)
+    assert pending.read_bytes() == b'another writer owns this file'
+    assert not pending.with_suffix('.npz').exists()
+
+
+def test_snapshot_publication_never_overwrites_a_concurrent_result(tmp_path, monkeypatch):
+    import dptb.nacf.prepared_store as module
+    _, _, reference = fixture(tmp_path)
+    root = tmp_path / 'publish'
+    original_link = module.os.link
+    def competing_writer(source, destination):
+        destination.write_bytes(b'published by another writer')
+        return original_link(source, destination)
+    monkeypatch.setattr(module.os, 'link', competing_writer)
+    with pytest.raises(FileExistsError):
+        write_table(root, 'p2_base|X|X', reference)
+    published = next(root.glob('*.npz'))
+    assert published.read_bytes() == b'published by another writer'
+    assert not list(root.glob('*.pending'))

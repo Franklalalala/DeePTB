@@ -67,14 +67,18 @@ def write_table(root, key, table, *, source=None):
     if path.exists():
         raise FileExistsError('prepared table already exists; verify and reuse its receipt')
     pending = path.with_suffix('.pending')
+    owned_pending = False
     try:
         with pending.open('xb') as handle:
+            owned_pending = True
             np.savez_compressed(handle, **arrays)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(pending, path)
+        # Publish without replacing an immutable table created by another writer.
+        # Both names are on the same filesystem; link creation is atomic.
+        os.link(pending, path)
     finally:
-        if pending.exists():
+        if owned_pending and pending.exists():
             pending.unlink()
     return {'path': path.name, 'sha256': sha256(path), 'bytes': path.stat().st_size,
             'buffer_bytes': sum(v.numel() * v.element_size() for v in table.buffers()),
