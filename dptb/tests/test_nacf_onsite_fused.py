@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 from scipy.interpolate import CubicSpline
-from dptb.nacf.onsite import (OnsiteXCEvaluator, PackedDensityBank, SplineDensity, fused_onsite_blocks,
-                              fused_onsite_density, onsite_neighbor_lists, pz81_potential, reference_onsite_blocks)
+from dptb.nacf.onsite import (PRUNE_MARGIN_BOHR, OnsiteXCEvaluator, PackedDensityBank, SplineDensity, fused_onsite_blocks,
+                              fused_onsite_density, onsite_candidates, onsite_neighbor_lists, pz81_potential, reference_onsite_blocks)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
 
@@ -240,4 +240,65 @@ def test_packed_bank_is_bound_to_density_content_not_species_names():
     torch.testing.assert_close(frozen.bank().coeff.reshape(4, -1), frozen.density_bank['X'].coeff[0], atol=0, rtol=0)
     with pytest.raises(ValueError):
         OnsiteXCEvaluator(lambda s, o: None, {'X': density(1.)}, potential=lambda n: n, device='cpu', density_policy='ignore')
+
+
+def test_candidate_selection_is_exact_and_keeps_accepted_positions():
+    """Only neighbours with |d| > r_grid + k_last + margin are dropped; survivors keep their per-species list position."""
+    a, b = synthetic_density('cpu', nlcc=True, seed=13), synthetic_density('cpu', nlcc=False, seed=14)
+    bank = PackedDensityBank({'A': a, 'B': b}, 'cpu')
+    np.testing.assert_allclose(bank.last_knot_host, [a.knots[-1].item(), b.knots[-1].item()])
+    rng = np.random.default_rng(2)
+    atoms = [{'A': rng.normal(size=(37, 3)) * 6.0, 'B': rng.normal(size=(21, 3)) * 6.0}, {'B': rng.normal(size=(5, 3)) * 20.0}, {'A': np.zeros((1, 3))}]
+    radius = 1.7
+    seg_ptr, segments, cand, local, stats = onsite_candidates(atoms, bank, radius)
+    assert stats['neighbours'] == 64 and stats['candidates'] == len(cand) == len(local) and seg_ptr.tolist() == [0, 2, 3, 4]
+    row = 0
+    for atom, (begin, end) in zip(atoms, zip(seg_ptr[:-1], seg_ptr[1:])):
+        for (species, cb, ce), (name, positions) in zip(segments[begin:end], atom.items()):
+            assert bank.species[species] == name
+            d = np.linalg.norm(positions, axis=1)
+            keep = np.flatnonzero(d <= radius + bank.last_knot_host[species] + PRUNE_MARGIN_BOHR)
+            assert ce - cb == len(keep)
+            np.testing.assert_array_equal(local[cb:ce], keep)
+            np.testing.assert_allclose(cand[cb:ce, :3], positions[keep], rtol=0, atol=0)
+            np.testing.assert_allclose(cand[cb:ce, 3], d[keep], rtol=0, atol=1e-15)
+            row += len(positions)
+    assert 0 < len(cand) < 64                              # the 20-Bohr cloud is almost entirely out of reach
+    full = onsite_candidates(atoms, bank, radius, prune=False)
+    assert full[4]['candidates'] == 64 and np.array_equal(full[3], np.concatenate([np.arange(len(p)) for atom in atoms for p in atom.values()]))
+
+
+@cuda
+def test_pruned_kernel_is_bitwise_the_unpruned_walk_and_chunked_launches_agree():
+    device = 'cuda'
+    density = {'A': synthetic_density(device, nlcc=True, seed=21), 'B': synthetic_density(device, nlcc=False, seed=22)}
+    bank = PackedDensityBank(density, device)
+    q = quadrature(device, 2049, 5, 23)
+    rng = np.random.default_rng(6)
+    # clouds at several scales so that atom-level pruning, in-kernel pair skipping and full evaluation all occur,
+    # plus exact boundary placements at k_last +- tiny for point 0
+    x0 = q.xyz[0].cpu().numpy(); ka = density['A'].knots.cpu().numpy()
+    special = np.stack([x0 - np.array([ka[-1], 0, 0]), x0 - np.array([ka[-1] + 1e-9, 0, 0]), x0 - np.array([ka[-1] - 1e-9, 0, 0])])
+    atoms = [{'A': np.concatenate([special, rng.normal(size=(50, 3)) * 2.0, rng.normal(size=(40, 3)) * 8.0]), 'B': rng.normal(size=(30, 3)) * 5.0},
+             {'B': np.concatenate([np.zeros((1, 3)), rng.normal(size=(70, 3)) * 12.0])},
+             {'A': rng.normal(size=(33, 3)) * 3.0}, {'A': np.zeros((1, 3)), 'B': rng.normal(size=(17, 3)) * 30.0}]
+    pruned = fused_onsite_density(q.xyz, atoms, bank)
+    plain = fused_onsite_density(q.xyz, atoms, bank, prune=False)
+    assert torch.equal(pruned, plain)
+    chunked = fused_onsite_density(q.xyz, atoms, bank, rho_bytes=q.xyz.shape[0] * 8)      # one atom per launch
+    assert torch.equal(pruned, chunked)
+    _, _, _, _, stats = onsite_candidates(atoms, bank, float(torch.linalg.vector_norm(q.xyz, dim=-1).max()))
+    assert 0 < stats['candidates'] < stats['neighbours']
+    potential = pz81_potential(lambda n: ((3.0 / (4 * math.pi * n)) ** (1.0 / 3.0), None))
+    counts = {}
+    blocks, rho = fused_onsite_blocks(q, atoms, bank, potential, rho_bytes=q.xyz.shape[0] * 16, return_density=True, stats=counts)
+    ref_blocks, ref_rho = reference_onsite_blocks(q, atoms, density, potential, return_density=True)
+    assert torch.equal(rho, pruned) and counts == stats
+    torch.testing.assert_close(rho, ref_rho, atol=1e-14, rtol=1e-13)
+    torch.testing.assert_close(blocks, ref_blocks, atol=1e-12, rtol=1e-12)
+    ev = OnsiteXCEvaluator(lambda s, o: q, density, potential=potential, radius=4.0, engine='fused', device=device, rho_bytes=q.xyz.shape[0] * 8)
+    g = dict(symbols=['A', 'B', 'A'], positions_bohr=rng.uniform(0, 3, (3, 3)), cell_bohr=np.eye(3) * 3.4)
+    got = ev(g, 5, [(1, 1, 1)] * 3)
+    assert ev.last_stats['candidates'] <= ev.last_stats['neighbours'] and ev.last_stats['candidate_pairs'] <= ev.last_stats['pairs']
+    torch.testing.assert_close(got, OnsiteXCEvaluator(lambda s, o: q, density, potential=potential, radius=4.0, engine='reference', device=device)(g, 5, [(1, 1, 1)] * 3), atol=1e-11, rtol=1e-11)
 

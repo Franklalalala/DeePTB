@@ -4,21 +4,28 @@ Exact engineering acceleration of the accepted per-atom loop (``AtomicDensity`` 
 ``OnsiteQuadrature.evaluate``): the same quadrature nodes and orders, the same fixed-radius
 neighbourhoods, the same density splines (normalized neutral valence plus unscaled NLCC,
 per-channel positivity, end clamping, support clipping) and the same LDA-PZ81 potential rule
-built from the caller-supplied ``v_and_dv``. Only the evaluation order changes: one fused CUDA
-launch per (species, order) atom group forms every neighbour density sum without distance or
-spline intermediates, the potential is applied once on ``[atoms, points]`` and the Gram
-contraction ``basis^T diag(v) basis`` of all atoms in the group runs as one folded GEMM.
-Remaining differences are FP64 rounding from summation order. The reference path is retained on identical inputs.
+built from the caller-supplied ``v_and_dv``. Only the evaluation order changes: fused CUDA
+launches per (species, order) atom group (bounded by a density byte budget) form every neighbour
+density sum without distance or spline intermediates, the potential is applied once on
+``[atoms, points]`` and the Gram contraction ``basis^T diag(v) basis`` of the atoms runs as one
+folded GEMM per launch. Pairs that are exactly zero under the accepted rule (beyond a species' last
+knot) are skipped without evaluation, first per neighbour on the host (``onsite_candidates``) and
+then per pair in the kernel by the triangle inequality, while the accepted 16-neighbour chunk
+partial sums are reproduced bitwise. Remaining differences from the Torch reference are FP64
+rounding from summation order. The reference path is retained on identical inputs.
 
 Inference only, CUDA FP64 only. Nothing here chooses physics: densities, potential, radius,
 quadrature objects and neighbour lists are supplied by the caller.
 """
 import itertools
+from types import SimpleNamespace
 import numpy as np
 import torch
 
 DENSITY_FLOOR = 1e-20      # accepted rule: v = v_and_dv(max(rho, floor))[0], zero where rho <= floor
 LEGACY_RADIUS_BOHR = 27.   # accepted onsite neighbourhood truncation of the fixed-cohort runs
+PRUNE_MARGIN_BOHR = 1e-9   # exact-zero pair skipping keeps every pair within k_last + margin (FP64 rounding is ~1e-14 Bohr)
+MAX_ATOMS_PER_LAUNCH = 65535
 
 
 def pz81_potential(v_and_dv):
@@ -161,6 +168,9 @@ class PackedDensityBank:
         self.coeff_ptr = torch.tensor(coeff_ptr, device=device, dtype=torch.int64)
         self.channels = torch.tensor(channels, device=device, dtype=torch.int64)
         self.device = self.knots.device
+        # host copy of every species' last knot: the density is exactly zero beyond it (accepted rule), which is what
+        # the exact candidate selection and the in-kernel pair skipping rely on
+        self.last_knot_host = np.array([float(k[-1]) for k in knots], dtype=np.float64)
 
     def matches(self, density_bank):
         return density_identity(density_bank) == self.identity
@@ -187,13 +197,58 @@ def _segment_lists(neighbors, bank):
     return np.asarray(seg_ptr, dtype=np.int64), np.asarray(segments, dtype=np.int64).reshape(-1, 3), np.concatenate(parts, axis=0)
 
 
-def fused_onsite_density(xyz, neighbors, bank):
-    """rho[atoms, points]: fused neighbour density sums on one CUDA FP64 quadrature grid.
+def onsite_candidates(neighbors, bank, grid_radius, *, prune=True, margin=PRUNE_MARGIN_BOHR):
+    """Exact candidate selection for the fused kernel: drop neighbours that cannot reach the grid.
 
-    ``xyz`` [P,3] CUDA float64; ``neighbors`` is a list (one entry per atom) of
-    ``{species: displacements[n,3]}`` relative to that atom; ``bank`` is a PackedDensityBank
-    on the same device. Inference only; fails on CPU or non-FP64 input instead of falling back.
+    A neighbour at centre distance ``|d|`` contributes to a grid point at radius ``r_p <= grid_radius`` only if
+    ``|p - d| <= k_last`` (the density is exactly zero beyond the species' last knot), and ``|p - d| >= |d| - r_p``,
+    so every neighbour with ``|d| > grid_radius + k_last + margin`` contributes exactly zero to every point and is
+    removed here; the margin dominates the FP64 rounding of both norms. The survivors keep their position
+    (``local``) in the accepted per-species list, which the kernel uses to reproduce the accepted 16-neighbour
+    chunk partial sums, so the result is bitwise the unpruned walk. ``prune=False`` keeps every neighbour.
+
+    Returns ``(seg_ptr, segments, candidates[c, 4] = (x, y, z, |d|), local[c], stats)``.
     """
+    seg_ptr, segments, positions = _segment_lists(neighbors, bank)
+    distance = np.linalg.norm(positions, axis=1)
+    counts = segments[:, 2] - segments[:, 1]
+    segment_of_row = np.repeat(np.arange(len(segments)), counts)
+    local = np.arange(len(positions), dtype=np.int64) - segments[segment_of_row, 1]
+    if prune:
+        reach = float(grid_radius) + bank.last_knot_host[segments[segment_of_row, 0]] + float(margin)
+        keep = distance <= reach
+    else:
+        keep = np.ones(len(positions), dtype=bool)
+    kept = np.bincount(segment_of_row[keep], minlength=len(segments)).astype(np.int64)
+    end = np.cumsum(kept)
+    compact = np.column_stack((segments[:, 0], end - kept, end)).astype(np.int64)
+    candidates = np.ascontiguousarray(np.column_stack((positions[keep], distance[keep])), dtype=np.float64)
+    stats = {'neighbours': int(len(positions)), 'candidates': int(keep.sum())}
+    return seg_ptr, compact, candidates, np.ascontiguousarray(local[keep]), stats
+
+
+def grid_radius(quadrature):
+    """Largest point radius of a quadrature object (cached on the object when it allows attributes)."""
+    cached = getattr(quadrature, '_nacf_grid_radius', None)
+    if cached is not None:
+        return cached
+    value = float(torch.linalg.vector_norm(quadrature.xyz, dim=-1).max())
+    try:
+        quadrature._nacf_grid_radius = value
+    except (AttributeError, TypeError):
+        pass
+    return value
+
+
+def _launch_density(native, xyz, candidates, local, seg_ptr, segments, bank, margin):
+    device = xyz.device
+    return native.onsite_density(
+        xyz.contiguous(), torch.as_tensor(candidates, device=device), torch.as_tensor(local, device=device),
+        torch.as_tensor(seg_ptr, device=device), torch.as_tensor(segments, device=device),
+        bank.knots, bank.knots_f32, bank.knot_ptr, bank.coeff, bank.coeff_ptr, bank.channels, float(margin))
+
+
+def _check_fused_inputs(xyz, bank):
     from ._cuda import extension, check_device
     if not isinstance(xyz, torch.Tensor) or not xyz.is_cuda:
         raise ValueError('fused onsite density requires a CUDA quadrature grid; use the reference path on CPU')
@@ -209,13 +264,45 @@ def fused_onsite_density(xyz, neighbors, bank):
     native = extension()
     if not hasattr(native, 'onsite_density'):
         raise RuntimeError('fused onsite density is absent from this binary; rebuild with python -m dptb.nacf.precompile')
+    return native
+
+
+def _atom_chunks(natoms, points, rho_bytes):
+    step = max(1, min(MAX_ATOMS_PER_LAUNCH, int(rho_bytes) // max(1, points * 8)))
+    return [(start, min(natoms, start + step)) for start in range(0, natoms, step)]
+
+
+def _chunk_segments(seg_ptr, segments, start, stop):
+    """Segment table and candidate range of atoms [start, stop) of a compact candidate layout."""
+    sub = segments[seg_ptr[start]:seg_ptr[stop]].copy()
+    if len(sub):
+        base, end = int(sub[0, 1]), int(sub[-1, 2])
+        sub[:, 1:] -= base
+    else:
+        base = end = 0
+    return seg_ptr[start:stop + 1] - seg_ptr[start], sub, base, end
+
+
+def fused_onsite_density(xyz, neighbors, bank, *, prune=True, rho_bytes=1 << 30):
+    """rho[atoms, points]: fused neighbour density sums on one CUDA FP64 quadrature grid.
+
+    ``xyz`` [P,3] CUDA float64; ``neighbors`` is a list (one entry per atom) of
+    ``{species: displacements[n,3]}`` relative to that atom; ``bank`` is a PackedDensityBank
+    on the same device. Launches are bounded to ``rho_bytes`` of density per launch (and 65535
+    atoms). ``prune=False`` disables the exact candidate/pair skipping (identical result, for checks).
+    Inference only; fails on CPU or non-FP64 input instead of falling back.
+    """
+    native = _check_fused_inputs(xyz, bank)
     if not len(neighbors):
         return xyz.new_zeros((0, xyz.shape[0]))
-    seg_ptr, segments, positions = _segment_lists(neighbors, bank)
-    device = xyz.device
-    return native.onsite_density(
-        xyz.contiguous(), torch.as_tensor(positions, device=device), torch.as_tensor(seg_ptr, device=device),
-        torch.as_tensor(segments, device=device), bank.knots, bank.knots_f32, bank.knot_ptr, bank.coeff, bank.coeff_ptr, bank.channels)
+    radius = grid_radius(SimpleNamespace(xyz=xyz))
+    seg_ptr, segments, candidates, local, _ = onsite_candidates(neighbors, bank, radius, prune=prune)
+    margin = PRUNE_MARGIN_BOHR if prune else float('inf')
+    parts = []
+    for start, stop in _atom_chunks(len(neighbors), xyz.shape[0], rho_bytes):
+        ptr, sub, base, end = _chunk_segments(seg_ptr, segments, start, stop)
+        parts.append(_launch_density(native, xyz, candidates[base:end], local[base:end], ptr, sub, bank, margin))
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 
 def gram_blocks(basis, v, *, chunk_bytes=1 << 30):
@@ -238,15 +325,35 @@ def gram_blocks(basis, v, *, chunk_bytes=1 << 30):
     return out
 
 
-def fused_onsite_blocks(quadrature, neighbors, bank, potential, *, chunk_bytes=1 << 30, return_density=False):
+def fused_onsite_blocks(quadrature, neighbors, bank, potential, *, chunk_bytes=1 << 30, rho_bytes=1 << 30, return_density=False, prune=True, stats=None):
     """Onsite XC AO blocks [atoms, norb, norb] for atoms sharing one quadrature object.
 
-    ``quadrature`` exposes ``xyz`` [P,3] and weight-scaled ``basis`` [P,norb] on CUDA FP64.
+    ``quadrature`` exposes ``xyz`` [P,3] and weight-scaled ``basis`` [P,norb] on CUDA FP64. Atoms are
+    processed in chunks bounded by ``rho_bytes`` of FP64 density (and 65535 atoms per launch): density,
+    potential and Gram of a chunk complete before the next chunk allocates. ``stats`` (dict) receives the
+    neighbour/candidate counts.
     """
-    rho = fused_onsite_density(quadrature.xyz, neighbors, bank)
-    v = potential(rho)
-    blocks = gram_blocks(quadrature.basis, v, chunk_bytes=chunk_bytes)
-    return (blocks, rho) if return_density else blocks
+    xyz, basis = quadrature.xyz, quadrature.basis
+    native = _check_fused_inputs(xyz, bank)
+    natoms, norb = len(neighbors), basis.shape[1]
+    if not natoms:
+        empty = basis.new_zeros((0, norb, norb))
+        return (empty, xyz.new_zeros((0, len(xyz)))) if return_density else empty
+    seg_ptr, segments, candidates, local, counts = onsite_candidates(neighbors, bank, grid_radius(quadrature), prune=prune)
+    if stats is not None:
+        stats.update(counts)
+    margin = PRUNE_MARGIN_BOHR if prune else float('inf')
+    out = basis.new_empty((natoms, norb, norb))
+    densities = []
+    for start, stop in _atom_chunks(natoms, xyz.shape[0], rho_bytes):
+        ptr, sub, base, end = _chunk_segments(seg_ptr, segments, start, stop)
+        rho = _launch_density(native, xyz, candidates[base:end], local[base:end], ptr, sub, bank, margin)
+        out[start:stop] = gram_blocks(basis, potential(rho), chunk_bytes=chunk_bytes)
+        if return_density:
+            densities.append(rho)
+    if return_density:
+        return out, (densities[0] if len(densities) == 1 else torch.cat(densities))
+    return out
 
 
 def reference_onsite_blocks(quadrature, neighbors, density_bank, potential, *, chunk=16, return_density=False):
@@ -291,7 +398,7 @@ class OnsiteXCEvaluator:
     """
 
     def __init__(self, qgrid, density_bank, *, v_and_dv=None, potential=None, radius=LEGACY_RADIUS_BOHR,
-                 engine='fused', device='cuda', chunk_bytes=1 << 30, density_policy='rebuild'):
+                 engine='fused', device='cuda', chunk_bytes=1 << 30, rho_bytes=1 << 30, prune=True, density_policy='rebuild'):
         if engine not in ('fused', 'reference'):
             raise ValueError("engine must be 'fused' or 'reference'")
         if density_policy not in ('rebuild', 'fail'):
@@ -302,6 +409,7 @@ class OnsiteXCEvaluator:
             potential = pz81_potential(v_and_dv)
         self.qgrid, self.density_bank, self.potential = qgrid, density_bank, potential
         self.radius, self.engine, self.device, self.chunk_bytes = float(radius), engine, torch.device(device), chunk_bytes
+        self.rho_bytes, self.prune = int(rho_bytes), bool(prune)   # fused engine: density bytes per launch; exact pair skipping
         self.density_policy = density_policy
         self._bank = None
         self.bank_rebuilds = 0
@@ -325,9 +433,10 @@ class OnsiteXCEvaluator:
     def neighbors(self, g):
         return onsite_neighbor_lists(g, self.radius)
 
-    def blocks(self, quadrature, neighbors, *, return_density=False):
+    def blocks(self, quadrature, neighbors, *, return_density=False, stats=None):
         if self.engine == 'fused':
-            return fused_onsite_blocks(quadrature, neighbors, self.bank(), self.potential, chunk_bytes=self.chunk_bytes, return_density=return_density)
+            return fused_onsite_blocks(quadrature, neighbors, self.bank(), self.potential, chunk_bytes=self.chunk_bytes, rho_bytes=self.rho_bytes,
+                                       return_density=return_density, prune=self.prune, stats=stats)
         return reference_onsite_blocks(quadrature, neighbors, self.density_bank, self.potential, return_density=return_density)
 
     def __call__(self, g, width, orders, *, neighbors=None):
@@ -342,17 +451,19 @@ class OnsiteXCEvaluator:
         groups = {}
         for i, (s, order) in enumerate(zip(symbols, orders)):
             groups.setdefault((s, tuple(int(x) for x in order)), []).append(i)
-        stats = {'atoms': len(symbols), 'groups': len(groups), 'points': 0, 'neighbours': 0, 'pairs': 0}
+        stats = {'atoms': len(symbols), 'groups': len(groups), 'points': 0, 'neighbours': 0, 'pairs': 0, 'candidates': 0, 'candidate_pairs': 0}
         for (s, order), ids in groups.items():
             quadrature = self.qgrid(s, order)
             group = [neighbors[i] for i in ids]
-            blocks = self.blocks(quadrature, group)
+            group_stats = {}
+            blocks = self.blocks(quadrature, group, stats=group_stats)
             n = blocks.shape[1]
             if n > width:
                 raise ValueError(f'onsite block of {s!r} ({n}) exceeds the AO width {width}')
             out[torch.as_tensor(ids, device=self.device), :n, :n] = blocks
             counts = [sum(len(p) for p in grouped.values()) for grouped in group]
-            stats['points'] += len(quadrature.xyz) * len(ids); stats['neighbours'] += sum(counts)
-            stats['pairs'] += len(quadrature.xyz) * sum(counts)
+            candidates = group_stats.get('candidates', sum(counts))
+            stats['points'] += len(quadrature.xyz) * len(ids); stats['neighbours'] += sum(counts); stats['candidates'] += candidates
+            stats['pairs'] += len(quadrature.xyz) * sum(counts); stats['candidate_pairs'] += len(quadrature.xyz) * candidates
         self.last_stats = stats
         return out

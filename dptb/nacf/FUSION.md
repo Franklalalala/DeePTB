@@ -59,16 +59,25 @@ endpoint exclusion and density conventions; this module chooses no physics.
 `basis`), same `AtomicDensity`-like splines (`knots`, list of `[4,K-1]` coefficients),
 same fixed 27 Bohr neighbourhoods (`onsite_neighbor_lists`, accepted enumerator set and
 order, origin included) and the same PZ81 rule `where(rho>1e-20, v_and_dv(max(rho,1e-20))[0], 0)`.
-Atoms are grouped by (species, order); `onsite_density` evaluates every group's neighbour
-density sums in one launch (thread per (atom, point); species segments; 16-neighbour
-chunk accumulation; per-channel positivity, end clamping and support clipping as the
-Torch spline; float32 interval search corrected against the FP64 knots), the potential is
-applied on `[atoms, points]` and the Gram contraction of the group is one folded GEMM. `engine='reference'` runs the accepted per-atom loop on identical inputs.
-Differences are FP64 summation-order rounding only; compare with absolute tolerance, not
+Atoms are grouped by (species, order); `onsite_density` evaluates a group's neighbour
+density sums in launches bounded by `rho_bytes` of FP64 density (default 1 GiB, at most
+65535 atoms; thread per (atom, point); species segments; 16-neighbour chunk accumulation;
+per-channel positivity, end clamping and support clipping as the Torch spline; float32
+interval search corrected against the FP64 knots), the potential is applied on
+`[atoms, points]` and the Gram contraction of each launch is one folded GEMM.
+`engine='reference'` runs the accepted per-atom loop on identical inputs.
+
+Exact pair skipping (`prune=True`, default): the accepted density is exactly zero beyond a
+species' last knot `k_last`, so a neighbour at centre distance `|d| > r_grid + k_last + 1e-9`
+contributes nothing to any grid point and is dropped on the host (`onsite_candidates`), and
+inside the kernel a pair with `||d| - |p|| > k_last + 1e-9` is skipped by the triangle
+inequality before any evaluation. Survivors keep their position in the accepted per-species
+list, so the 16-neighbour chunk partial sums are added in the accepted order and the result
+is bitwise identical to the unpruned walk (`prune=False`). The evaluator reports
+`neighbours`, `candidates`, `pairs` and `candidate_pairs`. Differences from the Torch
+reference are FP64 summation-order rounding only; compare with absolute tolerance, not
 bitwise. CUDA FP64 inference only: CPU, FP32, autograd, empty atom lists and unknown
 species fail explicitly. No radius, density, quadrature order or potential is chosen here.
-
-Build explicitly with `python -m dptb.nacf.precompile --arch 8.9+PTX` and
-`python tools/build_nacf_topology.py --output /isolated/libnacf_topology.so`.
-Inference loads checksummed binaries and never invokes a compiler. The build
-retains `--fmad=false`; no fast-math flags are introduced.
+The packed density bank is bound to the content identity of the density bank
+(`density_identity`); `density_policy='rebuild'|'fail'` and `invalidate()` control what
+happens when a species density is replaced or edited in place.
