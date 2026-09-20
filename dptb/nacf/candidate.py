@@ -41,6 +41,9 @@ from .onsite import OnsiteXCEvaluator, onsite_neighbor_lists
 
 RECIPE_SCHEMA = "nacf-candidate-prior/v1"
 SOURCE_KEYS = ("upf_sha256", "orbital_sha256", "source_sha256")
+XC_FUNCTIONAL = "LDA exchange + PZ81 correlation, unpolarized"
+DENSITY_DEFINITION = "normalized neutral valence (r=0 repair) + unscaled NLCC"
+ZERO_POINT = "cS: c = 4 pi sum(M2_valence) Ry_to_eV / (3 Omega), fully periodic"
 
 
 class CandidateIdentityError(ValueError):
@@ -163,6 +166,18 @@ class PairXCTables:
             self.tables[(a, b)] = table if isinstance(table, TorchRadialBlockTable) else TorchRadialBlockTable(table, device=device, dtype=dtype, backend=backend)
         self.sources = {s: normalize_sources(v) for s, v in sources.items()}
         self.manifest_sha256 = manifest_sha256
+        # Providers are immutable for a plan's lifetime. Direct injection without
+        # a manifest binds the actual compiled buffers once, outside forward.
+        self.content_sha256 = {}
+        if manifest_sha256 is None:
+            for pair, table in self.tables.items():
+                digest = hashlib.sha256(json.dumps({'left_shells': table.left_shells,
+                    'right_shells': table.right_shells, 'support_bohr': table.support_bohr}, sort_keys=True).encode())
+                for name, tensor in sorted(table.named_buffers()):
+                    array = tensor.detach().cpu().contiguous().numpy()
+                    digest.update(json.dumps([name, str(array.dtype), array.shape]).encode())
+                    digest.update(array.tobytes())
+                self.content_sha256['|'.join(pair)] = digest.hexdigest()
 
     @classmethod
     def from_manifest(cls, path, *, device="cuda", dtype=torch.float64, backend="auto", species=None, verify=True):
@@ -199,7 +214,7 @@ class PairXCTables:
 
     def identity(self):
         return {"family": "pair_xc", "manifest_sha256": self.manifest_sha256, "pairs": sorted("|".join(k) for k in self.tables),
-                "species_sources": self.sources}
+                "content_sha256": self.content_sha256, "species_sources": self.sources}
 
 
 class AtomicMoments:
@@ -232,7 +247,7 @@ class AtomicMoments:
 
     def identity(self):
         return {"family": "atomic_moments", "manifest_sha256": self.manifest_sha256, "approximation": self.approximation,
-                "species": sorted(self.m2), "species_sources": self.sources}
+                "species": sorted(self.m2), "m2_bohr2": dict(self.m2), "species_sources": self.sources}
 
 
 # --------------------------------------------------------------------------- recipe
@@ -251,14 +266,20 @@ class CandidateRecipe:
     fusion: Mapping[str, Any] = field(default_factory=lambda: {"radial": False, "contraction": False})
 
     def __post_init__(self):
+        for name, expected in (("xc_functional", XC_FUNCTIONAL), ("density_definition", DENSITY_DEFINITION), ("zero_point", ZERO_POINT)):
+            if getattr(self, name) != expected:
+                raise CandidateIdentityError(f"unsupported {name}: {getattr(self, name)!r}; implemented convention is {expected!r}")
         if self.envxc_arm not in ARMS:
             raise CandidateIdentityError(f"unsupported environment arm {self.envxc_arm!r}; expected one of {ARMS}")
         if self.stabilization not in STABILIZATIONS:
             raise CandidateIdentityError(f"unsupported stabilization {self.stabilization!r}; expected one of {STABILIZATIONS}")
         if not isinstance(self.order_policy, OrderPolicy):
             raise CandidateIdentityError("order_policy must be an OrderPolicy instance")
-        if not (self.onsite_radius_bohr > 0):
+        if not (math.isfinite(self.onsite_radius_bohr) and self.onsite_radius_bohr > 0):
             raise CandidateIdentityError("onsite_radius_bohr must be positive")
+        if not (math.isfinite(self.overlap_floor) and self.overlap_floor > 0
+                and math.isfinite(self.moment_density_floor) and self.moment_density_floor >= 0):
+            raise CandidateIdentityError("overlap floor must be finite positive and moment density floor finite nonnegative")
         if self.fusion.get("contraction"):
             # rejected under the strict FP32 packing gate (hopping fusion report); never a silent default
             raise CandidateIdentityError("fused contraction is not accepted for the candidate prior; evaluate it explicitly outside the recipe")
@@ -280,7 +301,7 @@ class CandidatePriorPlan:
         self.onsite_identity = dict(onsite_identity or {})
         self.library, self.max_terms = topology_library, int(max_terms)
         self.device, self.dtype = table_bank._anchor.device, table_bank._anchor.dtype
-        self.identity = self._validate()
+        self.identity = json.loads(json.dumps(self._validate(), sort_keys=True, default=str))
         self.identity_sha256 = hashlib.sha256(json.dumps(self.identity, sort_keys=True, default=str).encode()).hexdigest()
 
     # ---- identity ---------------------------------------------------------------------------
@@ -291,7 +312,10 @@ class CandidatePriorPlan:
             raise CandidateIdentityError("the candidate prior is scalar; SOC projector banks are not supported")
         if self.envxc.device != self.device or self.envxc.dtype != self.dtype:
             raise CandidateIdentityError("environment-XC bank and table bank must share device and dtype")
-        if self.onsite.device != self.device:
+        onsite_device = torch.device(self.onsite.device)
+        if onsite_device.type == 'cuda' and onsite_device.index is None:
+            onsite_device = torch.device('cuda', torch.cuda.current_device())
+        if onsite_device != self.device:
             raise CandidateIdentityError("onsite evaluator and table bank must share a device")
         if abs(self.onsite.radius - r.onsite_radius_bohr) > 1e-12:
             raise CandidateIdentityError(f"onsite evaluator radius {self.onsite.radius} differs from the recipe {r.onsite_radius_bohr}")
@@ -313,8 +337,8 @@ class CandidatePriorPlan:
                     "species": {s: normalize_sources(row) for s, row in getattr(bank.p23, "species", {}).items()}},
             "envxc": {"manifest_sha256": store.manifest_sha256, "build_identity": store.build_identity,
                       "species": {s: normalize_sources(store.manifest.get("sources", {}).get(s)) for s in store.species}},
-            "pair_xc": {"manifest_sha256": self.pair_xc.manifest_sha256, "species": dict(self.pair_xc.sources)},
-            "atomic_moments": {"manifest_sha256": self.moments.manifest_sha256, "species": dict(self.moments.sources)},
+            "pair_xc": {**self.pair_xc.identity(), "species": dict(self.pair_xc.sources)},
+            "atomic_moments": {**self.moments.identity(), "species": dict(self.moments.sources)},
             "onsite": {"species": {s: normalize_sources(v) for s, v in self.onsite_identity["species_sources"].items()},
                        "potential": self.onsite_identity["potential"], "engine": self.onsite.engine},
         }
@@ -339,17 +363,23 @@ class CandidatePriorPlan:
             problems.append(f"{s}: AO shells P2 {shells} vs envxc {store.orbital_shells(s)}")
         if abs(store.orbital_cutoff(s) - float(p2["orbital_cutoff_bohr"])) > 1e-9:
             problems.append(f"{s}: orbital cutoff P2 {p2['orbital_cutoff_bohr']} vs envxc {store.orbital_cutoff(s)}")
-        declared = {name: fam["species"].get(s, {}) for name, fam in families.items() if "species" in fam and s in fam["species"]}
+        declared = {name: fam["species"].get(s, {}) for name, fam in families.items() if "species" in fam}
+        reference = declared['p2']
+        required = set(reference) & {'upf_sha256', 'orbital_sha256'}
+        if not required and 'source_sha256' in reference:
+            required = {'source_sha256'}
         for name, src in declared.items():
             if not src:
                 problems.append(f"{s}: family {name} declares no source hash")
+            elif not required or not required.issubset(src):
+                problems.append(f"{s}: family {name} has no comparable complete P2 source identity; required {sorted(required)}")
         for key in SOURCE_KEYS:
             values = {name: src[key] for name, src in declared.items() if key in src}
             if len(set(values.values())) > 1:
                 problems.append(f"{s}: {key} differs across families {values}")
         return problems
 
-    def check_species(self, symbols):
+    def check_species(self, symbols, edge_index=None):
         missing = []
         for s in sorted(set(symbols)):
             if s not in self.bank.p2.species:
@@ -360,10 +390,11 @@ class CandidatePriorPlan:
                 missing.append(f"atomic moments: {s}")
             if s not in self.onsite_identity["species_sources"]:
                 missing.append(f"onsite identity: {s}")
-        for a in sorted(set(symbols)):
-            for b in sorted(set(symbols)):
-                if a <= b and not self.pair_xc.has(a, b):
-                    missing.append(f"pair XC table: {a}|{b}")
+        pairs = ({tuple(sorted((symbols[i], symbols[j]))) for i, j in np.asarray(edge_index).T}
+                 if edge_index is not None else {(a, b) for a in symbols for b in symbols if a <= b})
+        for a, b in sorted(pairs):
+            if not self.pair_xc.has(a, b):
+                missing.append(f"pair XC table: {a}|{b}")
         if missing:
             raise CandidateIdentityError("structure species not covered: " + ", ".join(missing))
         problems = []
@@ -388,9 +419,9 @@ class PreparedCandidate:
         pbc = tuple(bool(x) for x in g.get("pbc", (True, True, True)))
         if not all(pbc):
             raise CandidateIdentityError("the cS zero point of this recipe is defined for fully periodic cells only")
-        plan.check_species(symbols)
-        pos = np.asarray(g["positions_bohr"], dtype=np.float64); cell = np.asarray(g["cell_bohr"], dtype=np.float64)
-        ei = np.asarray(g["edge_index"], dtype=np.int64); sh = np.asarray(g["edge_cell_shift"], dtype=np.int64)
+        plan.check_species(symbols, g['edge_index'])
+        pos = np.array(g["positions_bohr"], dtype=np.float64, copy=True); cell = np.array(g["cell_bohr"], dtype=np.float64, copy=True)
+        ei = np.array(g["edge_index"], dtype=np.int64, copy=True); sh = np.array(g["edge_cell_shift"], dtype=np.int64, copy=True)
         self.geometry = dict(symbols=symbols, positions_bohr=pos, cell_bohr=cell, edge_index=ei, edge_cell_shift=sh, pbc=pbc)
         r = plan.recipe
         bank = plan.bank

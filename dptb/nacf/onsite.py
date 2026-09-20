@@ -24,7 +24,7 @@ import torch
 
 DENSITY_FLOOR = 1e-20      # accepted rule: v = v_and_dv(max(rho, floor))[0], zero where rho <= floor
 LEGACY_RADIUS_BOHR = 27.   # accepted onsite neighbourhood truncation of the fixed-cohort runs
-PRUNE_MARGIN_BOHR = 1e-9   # exact-zero pair skipping keeps every pair within k_last + margin (FP64 rounding is ~1e-14 Bohr)
+PRUNE_MARGIN_BOHR = 1e-9   # minimum padding; coordinate-scaled FP64 rounding bounds are added below and in CUDA
 MAX_ATOMS_PER_LAUNCH = 65535
 
 
@@ -255,7 +255,9 @@ def onsite_candidates(neighbors, bank, grid_radius, *, prune=True, margin=PRUNE_
     segment_of_row = np.repeat(np.arange(len(segments)), counts)
     local = np.arange(len(positions), dtype=np.int64) - segments[segment_of_row, 1]
     if prune:
-        reach = float(grid_radius) + bank.last_knot_host[segments[segment_of_row, 0]] + float(margin)
+        support = bank.last_knot_host[segments[segment_of_row, 0]]
+        rounding = 32 * np.finfo(np.float64).eps * (distance + abs(float(grid_radius)) + support + 1)
+        reach = float(grid_radius) + support + float(margin) + rounding
         keep = distance <= reach
     else:
         keep = np.ones(len(positions), dtype=bool)
@@ -268,16 +270,30 @@ def onsite_candidates(neighbors, bank, grid_radius, *, prune=True, margin=PRUNE_
 
 
 def grid_radius(quadrature):
-    """Largest point radius of a quadrature object (cached on the object when it allows attributes)."""
+    """Cache the largest point radius by tensor object/storage/version.
+
+    Inference tensors and edits through ``.data``/NumPy views have no usable version
+    counter. Call :func:`invalidate_grid_radius` after those edits. Replacement and
+    normal PyTorch in-place edits refresh automatically. Retaining the old tensor
+    also prevents allocator address reuse from producing a false cache hit.
+    """
+    xyz = quadrature.xyz
+    identity = (_tensor_identity(xyz), tuple(xyz.stride()))
     cached = getattr(quadrature, '_nacf_grid_radius', None)
-    if cached is not None:
-        return cached
-    value = float(torch.linalg.vector_norm(quadrature.xyz, dim=-1).max())
+    if isinstance(cached, tuple) and cached[0] is xyz and cached[1] == identity:
+        return cached[2]
+    value = float(torch.linalg.vector_norm(xyz, dim=-1).max()) if len(xyz) else 0.0
     try:
-        quadrature._nacf_grid_radius = value
+        quadrature._nacf_grid_radius = (xyz, identity, value)
     except (AttributeError, TypeError):
         pass
     return value
+
+
+def invalidate_grid_radius(quadrature):
+    """Explicit invalidation after untracked edits of a cached quadrature grid."""
+    if hasattr(quadrature, '_nacf_grid_radius'):
+        delattr(quadrature, '_nacf_grid_radius')
 
 
 def _launch_density(native, xyz, candidates, local, seg_ptr, segments, bank, margin):
@@ -371,7 +387,8 @@ def fused_onsite_blocks(quadrature, neighbors, bank, potential, *, chunk_bytes=1
     ``quadrature`` exposes ``xyz`` [P,3] and weight-scaled ``basis`` [P,norb] on CUDA FP64. Atoms are
     processed in chunks bounded by ``rho_bytes`` of FP64 density (and 65535 atoms per launch): density,
     potential and Gram of a chunk complete before the next chunk allocates. ``stats`` (dict) receives the
-    neighbour/candidate counts.
+    neighbour/candidate counts. ``rho_bytes`` bounds temporary density work (with a
+    one-atom minimum), not a requested full-density output or Gram intermediates.
     """
     xyz, basis = quadrature.xyz, quadrature.basis
     native = _check_fused_inputs(xyz, bank)
@@ -391,6 +408,7 @@ def fused_onsite_blocks(quadrature, neighbors, bank, potential, *, chunk_bytes=1
         out[start:stop] = gram_blocks(basis, potential(rho), chunk_bytes=chunk_bytes)
         if return_density:
             densities.append(rho)
+        del rho
     if return_density:
         return out, (densities[0] if len(densities) == 1 else torch.cat(densities))
     return out

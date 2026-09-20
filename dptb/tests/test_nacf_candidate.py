@@ -89,6 +89,9 @@ def make_plan(w, **kw):
 
 
 def test_recipe_requires_explicit_supported_choices():
+    for field, value in (("xc_functional", "PBE"), ("density_definition", "valence only"), ("zero_point", "none")):
+        with pytest.raises(CandidateIdentityError, match="unsupported"):
+            recipe(**{field: value})
     with pytest.raises(CandidateIdentityError):
         recipe(envxc_arm="d1")
     with pytest.raises(CandidateIdentityError):
@@ -207,6 +210,39 @@ def test_convergence_order_policy_is_geometry_only(world):
     with pytest.raises(RuntimeError, match="did not converge"):
         make_plan(w, recipe=recipe(order_policy=ConvergenceOrderPolicy((2, 2, 2), (3, 3, 3), (4, 4, 4), tolerance_eV=1e-30, strict=True))).prepare(g)
     assert loose.identity()["policy"] == "convergence" and FixedOrderPolicy((128, 24, 48)).identity() == {"policy": "fixed", "order": [128, 24, 48]}
+
+
+def test_missing_family_and_disjoint_sources_are_not_same_source(world):
+    import copy
+    for sources in ({}, {s: {'upf_sha256': '0' * 64} for s in SPECIES}):
+        pair = copy.copy(world['pair_xc']); pair.sources = sources
+        with pytest.raises(CandidateIdentityError, match='source'):
+            make_plan(world, pair_xc=pair)
+
+
+def test_injected_content_changes_the_candidate_identity(world):
+    import copy
+    w = world
+    first = AtomicMoments({'Xa': 2.0, 'Yb': 3.5}, sources=w['src'])
+    second = AtomicMoments({'Xa': 2.1, 'Yb': 3.5}, sources=w['src'])
+    assert make_plan(w, atomic_moments=first).identity_sha256 != make_plan(w, atomic_moments=second).identity_sha256
+    tables = copy.deepcopy(w['pair_xc'].tables)
+    pair_a = PairXCTables(tables, sources=w['src'], device='cpu')
+    tables[('Xa', 'Yb')].coefficients.add_(0.01)
+    pair_b = PairXCTables(tables, sources=w['src'], device='cpu')
+    assert make_plan(w, pair_xc=pair_a).identity_sha256 != make_plan(w, pair_xc=pair_b).identity_sha256
+
+
+def test_pair_coverage_uses_actual_edges_and_geometry_is_snapshotted(world):
+    w = world
+    pair = PairXCTables({('Xa', 'Yb'): w['pair_xc'].table('Xa', 'Yb')}, sources=w['src'], device='cpu')
+    g = make_structure(['Xa', 'Yb'], [[0., 0., 0.], [0., 0., 3.1]], np.eye(3) * 60,
+                       {s: kw['rcut'] for s, kw in SPECIES.items()})
+    prepared = make_plan(w, pair_xc=pair).prepare(g)
+    before = {k: v.copy() for k, v in prepared.geometry.items() if isinstance(v, np.ndarray)}
+    for key in before:
+        g[key].flat[0] += 1
+        np.testing.assert_array_equal(prepared.geometry[key], before[key])
 
 
 def test_source_normalization_and_manifest_adapters(tmp_path, world):

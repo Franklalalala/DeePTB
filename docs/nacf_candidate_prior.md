@@ -31,7 +31,8 @@ evaluator whose radius differs from the recipe, missing `onsite_identity` fields
 density definition that differs between the recipe, the onsite provider and the EnvXC
 tables, AO shells or orbital cutoffs that differ between P2 and EnvXC tables, and any
 species whose declared UPF/ORB/source hash differs between two families or is missing in
-one. Per structure, every species must be covered by every family and every species pair
+one. Disjoint source keys do not establish identity. Per structure, every species must
+be covered by every family and every species pair used by its directed edges
 must have a pair-XC table; partially periodic cells are refused because of the cS zero
 point. The recipe identity, the family manifests and the validated species are in
 `plan.identity` and hashed in `plan.identity_sha256`, which every forward reports.
@@ -47,3 +48,12 @@ checkpoints) is untouched; a checkpoint trained on the old prior must not be eva
 with this plan as if it were the same prior. Fused contraction is never enabled by the
 recipe. The `v1`/`v2` stabilization choice is part of the identity; `v1` reproduces the
 fixed100 receipts, `v2` is the audited composed-residual recipe.
+
+Only the implemented unpolarized LDA-PZ81, neutral-valence-plus-NLCC and cS conventions
+are accepted; arbitrary XC or zero-point labels are rejected. Pair-XC providers without
+a manifest hash bind their compiled contents once at construction. The actual atomic
+M2 values are always included. Injected providers and their tensors must remain immutable
+for the plan lifetime; construct new providers and a new plan after changing tables.
+Prepared geometries own copies of caller arrays, so later caller edits cannot mix new
+onsite coordinates with old edge plans. Onsite grid cache mutations use the separate
+`invalidate_grid_radius(quadrature)` contract for inference tensors or NumPy/.data edits.

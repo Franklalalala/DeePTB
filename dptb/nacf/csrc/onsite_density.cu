@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <limits>
 
 // Batched onsite density on one shared quadrature grid: rho[a,p] for every atom a of a
 // (species, order) group and every point p of the group's quadrature. One thread owns one
@@ -35,12 +36,16 @@ template<typename T> __global__ void onsite_density_kernel(
   const int64_t sp=segments[3*s],begin=segments[3*s+1],end=segments[3*s+2];
   const T* kn=knots+knot_ptr[sp];const float* knf=knots_f+knot_ptr[sp];const int nk=static_cast<int>(knot_ptr[sp+1]-knot_ptr[sp]);const int m=nk-1;
   const T* cf=coeff+coeff_ptr[sp];const int nch=static_cast<int>(channels[sp]);
-  const T kfirst=kn[0],klast=kn[m],window=klast+margin,window2=window*window;
+  const T kfirst=kn[0],klast=kn[m];
   int64_t chunk=-1;T sum=0;
   for(int64_t c=begin;c<end;++c) {
    const int64_t ck=cand_local[c]>>4;
    if(ck!=chunk){total+=sum;sum=0;chunk=ck;}
    const T dist=cand[4*c+3];
+   // Norms/subtraction/squaring can round at the coordinate scale, not only at
+   // the support scale. Padding grows with that scale and can only retain work.
+   const T rounding=T(32)*std::numeric_limits<T>::epsilon()*(dist+rp+klast+T(1));
+   const T window=klast+margin+rounding,window2=window*window;
    const T gap=dist>rp?dist-rp:rp-dist;
    if(gap>window)continue;
    const T dx=x0-cand[4*c],dy=y0-cand[4*c+1],dz=z0-cand[4*c+2];
