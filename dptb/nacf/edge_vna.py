@@ -134,7 +134,11 @@ class NACFEdgeVNAPlan(nn.Module):
 
     def forward(self):
         values = {}
-        for number, key in self.query_specs:
+        fused = hasattr(self, 'fused_radial_specs')
+        if fused:
+            from .fusion import evaluate_plan
+            values = evaluate_plan(self)
+        for number, key in ([] if fused else self.query_specs):
             q = getattr(self, f'query_{number}')
             translation = torch.einsum('qi,qij->qj',q[:,2:5].to(self.positions.dtype),self.cells[q[:,5]])
             delta = self.positions[q[:,0]]-self.positions[q[:,1]]+translation
@@ -143,6 +147,10 @@ class NACFEdgeVNAPlan(nn.Module):
         for number, left, right, ni, nj, chunk in self.contraction_specs:
             rows = getattr(self,f'terms_{number}')
             epsilon = getattr(self,f'epsilon_{number}')
+            if getattr(self, 'fused_contraction', False):
+                from .fusion import contract_add
+                contract_add(values[left], epsilon, values[right], rows, output)
+                continue
             for start in range(0,len(rows),chunk):
                 part = rows[start:start+chunk]
                 a,b = values[left][part[:,1]],values[right][part[:,2]]

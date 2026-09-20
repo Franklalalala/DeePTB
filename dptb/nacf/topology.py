@@ -42,6 +42,9 @@ def build_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs,
     ``projector`` includes endpoints and returns onsite followed by all directed
     edge block rows. ``onsite_vna`` returns only onsite blocks. Projector centre
     cutoff -1 disables a species with no projectors.
+    ``density`` returns (AO, neighbour, NEIGHBOUR image) queries, excludes
+    (i,0), and groups queries by directed edge in terms[:,0:2], excluding
+    its (j,R) endpoint. It accepts missing reverse edges and zero supports.
     """
     pos = np.ascontiguousarray(positions, dtype=np.float64)
     lattice = np.ascontiguousarray(cell, dtype=np.float64)
@@ -54,10 +57,11 @@ def build_edge_topology(positions, cell, pbc, ao_cutoffs, centre_cutoffs,
     if periodic_raw.shape != (3,) or not np.isin(periodic_raw, [0, 1]).all():
         raise ValueError('pbc must contain three booleans')
     periodic = np.ascontiguousarray(periodic_raw, dtype=np.uint8)
-    modes = {'edge_vna': 0, 'projector': 1, 'onsite_vna': 2}
+    modes = {'edge_vna': 0, 'projector': 1, 'onsite_vna': 2, 'density': 3}
     if mode not in modes:
         raise ValueError('unknown topology mode')
-    valid_cc = (cc >= 0) | (cc == -1) if mode == 'projector' else cc > 0
+    valid_cc = ((cc >= 0) | (cc == -1) if mode == 'projector' else
+                cc >= 0 if mode == 'density' else cc > 0)
     if ac.shape != (n,) or cc.shape != (n,) or (ac <= 0).any() or not valid_cc.all():
         raise ValueError('cutoffs must be positive per-atom arrays')
     if not all(np.isfinite(x).all() for x in (pos, lattice, ac, cc)):

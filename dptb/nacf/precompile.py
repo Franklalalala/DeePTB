@@ -18,7 +18,7 @@ def main():
     from torch.utils.cpp_extension import load
     os.environ['TORCH_CUDA_ARCH_LIST']=';'.join(archs)
     build=Path(os.environ['TORCH_EXTENSIONS_DIR'])/'nacf_prebuilt';build.mkdir(parents=True,exist_ok=True)
-    sources=['csrc/bindings.cpp','csrc/radial.cu','csrc/packing.cu']
+    sources=['csrc/bindings.cpp','csrc/radial.cu','csrc/packing.cu','csrc/contraction.cu','csrc/density.cu']
     mod=load(name='_nacf_radial',sources=[str(ROOT/n) for n in sources],extra_cflags=['-O3'],
              extra_cuda_cflags=['-O3','--fmad=false'],build_directory=str(build),verbose=True)
     binary=ROOT/'_nacf_radial.so';pending=binary.with_suffix('.pending');shutil.copy2(mod.__file__,pending);os.replace(pending,binary)

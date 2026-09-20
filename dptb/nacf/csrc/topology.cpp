@@ -43,7 +43,7 @@ void* nacf_topology_build_mode(I n, const double* pos, const double* cell,
                         const I* shifts, I max_terms, char* error, int mode) {
     try {
         if (n <= 0 || e < 0 || max_terms <= 0) throw std::invalid_argument("invalid topology size");
-        if (mode < 0 || mode > 2) throw std::invalid_argument("invalid topology mode");
+        if (mode < 0 || mode > 3) throw std::invalid_argument("invalid topology mode");
         auto out = std::make_unique<Plan>();
         std::unordered_map<Key, I, Hash<Key>> edge_rows;
         for (I r = 0; r < e; ++r) {
@@ -59,8 +59,8 @@ void* nacf_topology_build_mode(I n, const double* pos, const double* cell,
         out->reverse.resize(e);
         for (const auto& [key, row] : edge_rows) {
             auto it = edge_rows.find({key[1],key[0],-key[2],-key[3],-key[4]});
-            if (it == edge_rows.end()) throw std::invalid_argument("every edge must have its reverse");
-            out->reverse[row] = it->second;
+            if (it == edge_rows.end() && mode!=3) throw std::invalid_argument("every edge must have its reverse");
+            out->reverse[row] = it == edge_rows.end() ? -1 : it->second;
         }
         const double radius = *std::max_element(ao_cut,ao_cut+n) +
                               *std::max_element(centre_cut,centre_cut+n) + 1e-9;
@@ -86,8 +86,10 @@ void* nacf_topology_build_mode(I n, const double* pos, const double* cell,
             // Projectors include both endpoints; VNA excludes the origin
             // centre. A negative centre cutoff disables a projector species.
             const double distance=std::sqrt(d2), support=ao_cut[i]+centre_cut[k];
-            if (centre_cut[k] >= 0 && (mode==1 ? distance <= support+1e-12 : distance < support-1e-12))
-                out->queries.push_back({i,k,-I(images[3*r]),-I(images[3*r+1]),-I(images[3*r+2])});
+            if (centre_cut[k] >= 0 && (mode==1 || mode==3 ? distance <= support+1e-12 : distance < support-1e-12)) {
+                const I sign=mode==3?1:-1;
+                out->queries.push_back({i,k,sign*I(images[3*r]),sign*I(images[3*r+1]),sign*I(images[3*r+2])});
+            }
         }
         if (mode==1)
             for (I i=0; i<n; ++i)
@@ -95,6 +97,25 @@ void* nacf_topology_build_mode(I n, const double* pos, const double* cell,
         std::sort(out->queries.begin(),out->queries.end());
         if (std::adjacent_find(out->queries.begin(),out->queries.end()) != out->queries.end())
             throw std::runtime_error("duplicate neighbour identity");
+        if (mode==3) {
+            // Density queries use the NEIGHBOUR image relative to the AO.
+            // Origin self is excluded by the broad search, other self images remain.
+            if (static_cast<I>(out->queries.size())>max_terms)
+                throw std::length_error("density query budget exceeded");
+            std::vector<std::vector<I>> grouped(n);
+            for (I q=0;q<static_cast<I>(out->queries.size());++q)
+                grouped[out->queries[q][0]].push_back(q);
+            for (I r=0;r<e;++r) for (I q:grouped[edges[2*r]]) {
+                const auto& x=out->queries[q];
+                if (x[1]==edges[2*r+1] && x[2]==shifts[3*r] &&
+                    x[3]==shifts[3*r+1] && x[4]==shifts[3*r+2]) continue;
+                if (static_cast<I>(out->terms.size())==max_terms)
+                    throw std::length_error("density edge term budget exceeded");
+                out->terms.push_back({r,q,q});
+            }
+            out->join_seconds=elapsed(t);
+            return out.release();
+        }
         std::vector<std::unordered_map<Centre,I,Hash<Centre>>> neighbours(n);
         std::vector<std::vector<I>> by_atom(n);
         for (I q=0; q<static_cast<I>(out->queries.size()); ++q) {

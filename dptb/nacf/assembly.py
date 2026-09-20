@@ -289,7 +289,11 @@ class NACFAssemblyPlan(nn.Module):
 
     def forward(self):
         values = {}
-        for number, (kind, _, _), table_key in self.query_specs:
+        fused = hasattr(self, 'fused_radial_specs')
+        if fused:
+            from .fusion import evaluate_plan
+            values = evaluate_plan(self)
+        for number, (kind, _, _), table_key in ([] if fused else self.query_specs):
             query = getattr(self, f'query_{number}')
             if self.cell.ndim == 3:
                 translation = torch.einsum('ei,eij->ej', query[:, 2:5].to(self.cell.dtype), self.cell[query[:, 5]])
@@ -316,6 +320,11 @@ class NACFAssemblyPlan(nn.Module):
         for number, kind, left, right, ni, nj in self.contraction_specs:
             rows = getattr(self, f'terms_{number}')
             target = p2 if kind == 'projector' else vna
+            if getattr(self, 'fused_contraction', False) and not (kind == 'projector' and spinor is not None):
+                from .fusion import contract_add
+                matrix = getattr(self, f'fused_matrix_{number}') if kind == 'vna' else getattr(self, f'matrix_{number}')
+                contract_add(values[left], matrix, values[right], rows, target)
+                continue
             for start in range(0, rows.shape[0], 2048):
                 part = rows[start:start + 2048]
                 a, b = values[left][part[:, 1]], values[right][part[:, 2]]

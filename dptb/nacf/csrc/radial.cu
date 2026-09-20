@@ -159,3 +159,123 @@ at::Tensor nacf_radial_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
+
+// Descriptor layout is private to RadialMultiPlan (1-D only).
+template <typename T>
+__global__ void radial_multi_kernel(const T* vectors, const int64_t* query_groups,
+    const int64_t* groups, const int64_t* descriptors, T* output) {
+  const int query=blockIdx.x;
+  const int64_t* group=groups+query_groups[query]*4;
+  const int64_t* first=descriptors+group[1]*16;
+  const auto degrees=reinterpret_cast<const int64_t*>(first[2]);
+  const auto directions=reinterpret_cast<const T*>(first[3]);
+  const auto inverse=reinterpret_cast<const T*>(first[4]);
+  const auto scales=reinterpret_cast<const T*>(first[5]);
+  const int ngroups=first[11],nrot=first[12];
+  extern __shared__ double storage[];
+  T* ys = reinterpret_cast<T*>(storage);
+  T* rot = ys + nrot;
+  T* cart = rot + nrot;
+  T* radius = cart + 9;
+  T* delta = radius + 1;
+  __shared__ int interval;
+  if (threadIdx.x == 0) {
+    const int64_t vbase=static_cast<int64_t>(query)*3;
+    const T vx=vectors[vbase], vy=vectors[vbase+1], vz=vectors[vbase+2];
+    *radius = sqrt(vx*vx + vy*vy + vz*vz);
+    const T denom = *radius > T(1e-30) ? *radius : T(1e-30);
+    const T x=vx/denom, y=vy/denom, z=vz/denom;
+    const T xy=x*x+y*y;
+    const T divisor=z < 0 ? xy : 1+z;
+    const T factor=(z < 0 ? 1-z : 1)/(divisor > T(1e-30) ? divisor : T(1e-30));
+    cart[0]=1-x*x*factor; cart[1]=-x*y*factor; cart[2]=x;
+    cart[3]=-x*y*factor; cart[4]=1-y*y*factor; cart[5]=y;
+    cart[6]=-x; cart[7]=-y; cart[8]=1-xy*factor;
+    if (z <= T(-1+1e-14) || z >= T(1-1e-14) || *radius <= T(1e-14)) {
+      for (int k=0;k<9;++k) cart[k]=0;
+      cart[0]=1;
+      cart[4]=cart[8]=(z <= T(-1+1e-14) && *radius > T(1e-14)) ? -1 : 1;
+    }
+  }
+  __syncthreads();
+  // Evaluate Y_lm(R directions) once, then recover the small rotation matrices.
+  for (int g=0;g<ngroups;++g) {
+    const int l=degrees[3*g], db=degrees[3*g+1], rb=degrees[3*g+2], d=2*l+1;
+    for (int t=threadIdx.x;t<d*d;t+=blockDim.x) {
+      const int s=t/d, a=t%d;
+      const T* v=directions+3*(db+s);
+      ys[rb+t]=harmonic(l,a,cart[0]*v[0]+cart[1]*v[1]+cart[2]*v[2],
+          cart[3]*v[0]+cart[4]*v[1]+cart[5]*v[2],
+          cart[6]*v[0]+cart[7]*v[1]+cart[8]*v[2],scales[db+a]);
+    }
+  }
+  __syncthreads();
+  for (int g=0;g<ngroups;++g) {
+    const int l=degrees[3*g], rb=degrees[3*g+2], d=2*l+1;
+    for (int t=threadIdx.x;t<d*d;t+=blockDim.x) {
+      const int a=t/d, b=t%d;
+      T sum=0;
+      for (int s=0;s<d;++s) sum+=inverse[rb+b*d+s]*ys[rb+s*d+a];
+      rot[rb+t]=sum;
+    }
+  }
+  __syncthreads();
+  for (int table=0;table<group[2];++table) {
+    const int64_t* desc=descriptors+(group[1]+table)*16;
+    const auto knots=reinterpret_cast<const T*>(desc[0]);
+    const auto coefficients=reinterpret_cast<const T*>(desc[1]);
+    const auto ptr=reinterpret_cast<const int64_t*>(desc[6]);
+    const auto terms=reinterpret_cast<const int64_t*>(desc[7]);
+    const auto canonical=reinterpret_cast<const int64_t*>(desc[8]);
+    const int nk=desc[9],channels=desc[10],width=desc[13];
+    const T support=static_cast<T>(__longlong_as_double(desc[14]));
+    const int64_t output_offset=desc[15];
+    if (threadIdx.x==0) {
+    int lo=0, hi=nk;
+    while (lo < hi) {
+      const int mid=(lo+hi)/2;
+      if (*radius < knots[mid]) hi=mid; else lo=mid+1;
+    }
+    interval = min(max(lo, 1), nk-1)-1;
+    *delta = *radius-knots[interval];
+    }
+    __syncthreads();
+  if (*radius >= support - T(1e-12) || *radius <= T(1e-14)) {
+    for (int o=threadIdx.x;o<width;o+=blockDim.x) {
+      const int c=canonical[o];
+      output[output_offset+static_cast<int64_t>(query-group[0])*width+o]=
+          (*radius >= support-T(1e-12) || c < 0) ? T(0) : spline(coefficients,interval,channels,c,*delta);
+    }
+    __syncthreads();
+    continue;
+  }
+  // Sparse canonical channels and shell selection were compiled on the host.
+  for (int o=threadIdx.x;o<width;o+=blockDim.x) {
+    T sum=0;
+    for (int64_t t=ptr[o];t<ptr[o+1];++t) {
+      const int64_t* term=terms+3*t;
+      sum+=rot[term[1]]*spline(coefficients,interval,channels,term[0],*delta)*rot[term[2]];
+    }
+    output[output_offset+static_cast<int64_t>(query-group[0])*width+o]=sum;
+  }
+    __syncthreads();
+  }
+}
+
+at::Tensor nacf_radial_multi_cuda(at::Tensor vectors, at::Tensor query_groups,
+    at::Tensor groups, at::Tensor descriptors, int64_t size, int64_t max_rotation) {
+  TORCH_CHECK(vectors.is_cuda() && vectors.dim()==2 && vectors.size(1)==3 && vectors.is_contiguous(), "invalid multi vectors");
+  const c10::cuda::CUDAGuard guard(vectors.device());
+  for (auto t:{query_groups,groups,descriptors})
+    TORCH_CHECK(t.device()==vectors.device() && t.scalar_type()==at::kLong && t.is_contiguous(), "invalid multi descriptors");
+  TORCH_CHECK(query_groups.numel()==vectors.size(0) && groups.dim()==2 && groups.size(1)==4 && descriptors.dim()==2 && descriptors.size(1)==16 && size>=0, "invalid multi layout");
+  const size_t shared=(2*max_rotation+11)*vectors.element_size();
+  TORCH_CHECK(max_rotation>=0 && shared<=48*1024, "multi shared memory limit");
+  auto output=at::empty({size},vectors.options());
+  if (vectors.size(0)==0) return output;
+  AT_DISPATCH_FLOATING_TYPES(vectors.scalar_type(), "nacf_radial_multi_cuda", [&] {
+    radial_multi_kernel<scalar_t><<<vectors.size(0),128,shared,at::cuda::getCurrentCUDAStream()>>>(vectors.data_ptr<scalar_t>(),query_groups.data_ptr<int64_t>(),groups.data_ptr<int64_t>(),descriptors.data_ptr<int64_t>(),output.data_ptr<scalar_t>());
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
