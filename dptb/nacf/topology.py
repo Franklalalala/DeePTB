@@ -13,6 +13,33 @@ from pathlib import Path
 import numpy as np
 
 
+def group_rows(keys):
+    """Row indices grouped by integer key, keys ascending and rows ascending within a group.
+
+    One stable sort replaces ``np.unique(keys, return_inverse=True)`` followed by one boolean pass per group
+    (``flatnonzero(group == number)``), which costs O(groups x rows) on structures with many species pairs
+    and triples. Iteration order and row order are exactly those of the replaced idiom.
+    """
+    keys = np.asarray(keys)
+    if keys.size == 0:
+        return []
+    order = np.argsort(keys, kind='stable')
+    sorted_keys = keys[order]
+    cuts = np.flatnonzero(sorted_keys[1:] != sorted_keys[:-1]) + 1
+    starts = np.concatenate(([0], cuts))
+    return [(int(sorted_keys[s]), rows) for s, rows in zip(starts, np.split(order, cuts))]
+
+
+def device_array(array, *, device, dtype):
+    """Host array -> device tensor with one copy: the host copy is skipped when the transfer itself copies."""
+    if getattr(device, 'type', str(device)) == 'cpu':
+        array = np.array(array, copy=True)
+    else:
+        array = np.ascontiguousarray(array)
+    import torch
+    return torch.as_tensor(array, dtype=dtype, device=device)
+
+
 @lru_cache(maxsize=4)
 def _library(path):
     lib = C.CDLL(path)

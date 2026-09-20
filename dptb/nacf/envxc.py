@@ -72,7 +72,7 @@ from torch import nn
 from dptb.data.interfaces.p2_table import RadialBlockTable
 from .envxc_tables import ENVXC_SCHEMA, PAIR_KINDS, RY_TO_EV_XC, TABLE_KINDS, sha256_file, table_key
 from .radial import TorchRadialBlockTable
-from .topology import build_edge_topology
+from .topology import build_edge_topology, device_array, group_rows
 
 ARMS = ("d2", "d2_moment", "mcweda")
 STABILIZATIONS = ("v1", "v2")
@@ -458,7 +458,7 @@ class NACFEnvXCPlan(nn.Module):
             raise ValueError("d2 arms need background (xcbg) layers in the table root")
 
         def reg(name, array, integer=False):
-            self.register_buffer(name, torch.as_tensor(np.array(array, copy=True), dtype=torch.long if integer else dtype, device=device))
+            self.register_buffer(name, device_array(array, dtype=torch.long if integer else dtype, device=device))
 
         positions, cells, queries, terms, edges, shifts, reverse, all_symbols = [], [], [], [], [], [], [], []
         edge_ptr = [0]
@@ -534,11 +534,9 @@ class NACFEnvXCPlan(nn.Module):
         pair_ids = {}
         if len(q_all):
             q_pairs = codes[q_all[:, 1]] * ns + codes[q_all[:, 0]]
-            unique_pairs, group = np.unique(q_pairs, return_inverse=True)
             local = np.empty(len(q_all), dtype=np.int64)
-            for number, pair in enumerate(unique_pairs):
-                centre, ao = divmod(int(pair), ns)
-                rows = np.flatnonzero(group == number)
+            for number, (pair, rows) in enumerate(group_rows(q_pairs)):
+                centre, ao = divmod(pair, ns)
                 local[rows] = np.arange(len(rows))
                 sk, sa = species[centre], species[ao]
                 reg(f"fq_{number}", q_all[rows], True)
@@ -547,12 +545,11 @@ class NACFEnvXCPlan(nn.Module):
                 self.factor_specs.append((number, sk, sa, env_key, rho_key))
                 pair_ids[(centre, ao)] = number
             triples = ((codes[edge_array[t_all[:, 0], 0]] * ns + codes[edge_array[t_all[:, 0], 1]]) * ns + codes[q_all[t_all[:, 1], 1]])
-            unique_triples, group = np.unique(triples, return_inverse=True)
             self.contraction_specs = []
-            for number, triple in enumerate(unique_triples):
-                pair, sk_code = divmod(int(triple), ns)
+            for number, (triple, index) in enumerate(group_rows(triples)):
+                pair, sk_code = divmod(triple, ns)
                 si_code, sj_code = divmod(pair, ns)
-                rows = t_all[group == number].copy()
+                rows = t_all[index]
                 rows[:, 1:3] = local[rows[:, 1:3]]
                 si, sj, sk = species[si_code], species[sj_code], species[sk_code]
                 eps = bank.epsilon(sk)

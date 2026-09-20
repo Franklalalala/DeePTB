@@ -6,7 +6,7 @@ the numerical assembly plan.
 """
 import numpy as np
 
-from .topology import build_edge_topology
+from .topology import build_edge_topology, group_rows
 
 
 def prepare_native(bank, symbols, positions, cell, edges, shifts, pbc,
@@ -53,17 +53,16 @@ def prepare_native(bank, symbols, positions, cell, edges, shifts, pbc,
         stats[kind].update(queries=len(q), terms=len(t))
         pairs = codes[q[:, 1]]*ns+codes[q[:, 0]]
         local = np.empty(len(q), dtype=np.int64)
-        for pair in np.unique(pairs):
-            sk, sa = divmod(int(pair), ns)
-            rows = np.flatnonzero(pairs == pair)
+        for pair, rows in group_rows(pairs):
+            sk, sa = divmod(pair, ns)
             local[rows] = np.arange(len(rows))
             query_lists[(kind, str(species[sk]), str(species[sa]))] = q[rows]
         triples = ((codes[block_atoms[t[:, 0], 0]]*ns+codes[block_atoms[t[:, 0], 1]])*ns
                    + codes[q[t[:, 1], 1]])
-        for triple in np.unique(triples):
-            ij, sk = divmod(int(triple), ns)
+        for triple, index in group_rows(triples):
+            ij, sk = divmod(triple, ns)
             si, sj = divmod(ij, ns)
-            rows = t[triples == triple].copy()
+            rows = t[index]
             rows[:, 1:3] = local[rows[:, 1:3]]
             contractions[(kind, str(species[si]), str(species[sj]), str(species[sk]))] = rows
     return query_lists, base_rows, contractions, stats

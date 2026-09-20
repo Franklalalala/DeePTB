@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .topology import build_edge_topology
+from .topology import build_edge_topology, device_array, group_rows
 
 
 class NACFEdgeVNAPlan(nn.Module):
@@ -42,8 +42,7 @@ class NACFEdgeVNAPlan(nn.Module):
         itemsize = torch.empty((), dtype=dtype).element_size()
 
         def reg(name, array, integer=False):
-            self.register_buffer(name, torch.as_tensor(np.array(array, copy=True),
-                                 dtype=torch.long if integer else dtype, device=device))
+            self.register_buffer(name, device_array(array, dtype=torch.long if integer else dtype, device=device))
 
         positions, cells, queries, terms, edges, shifts, reverse = [], [], [], [], [], [], []
         all_symbols = []
@@ -103,12 +102,10 @@ class NACFEdgeVNAPlan(nn.Module):
         # Dense species IDs permit collision-free integer keys. Avoid sorting
         # hundreds of thousands of multi-column records in Python/NumPy.
         q_pairs = species_codes[q[:,1]]*nspecies+species_codes[q[:,0]]
-        unique_pairs, group = np.unique(q_pairs, return_inverse=True)
         local = np.empty(n_queries, dtype=np.int64)
         pair_ids = {}
-        for number, pair in enumerate(unique_pairs):
-            centre, ao = divmod(int(pair), nspecies)
-            rows = np.flatnonzero(group == number)
+        for number, (pair, rows) in enumerate(group_rows(q_pairs)):
+            centre, ao = divmod(pair, nspecies)
             local[rows] = np.arange(len(rows))
             key = bank.table('vna', str(species[centre]), str(species[ao]))
             reg(f'query_{number}', q[rows], True)
@@ -116,11 +113,10 @@ class NACFEdgeVNAPlan(nn.Module):
             pair_ids[(int(centre),int(ao))] = number
         triple_keys = ((species_codes[edge_array[t[:,0],0]]*nspecies+
                        species_codes[edge_array[t[:,0],1]])*nspecies+species_codes[q[t[:,1],1]])
-        unique_triples, group = np.unique(triple_keys, return_inverse=True)
-        for number, triple in enumerate(unique_triples):
-            pair, sk = divmod(int(triple), nspecies)
+        for number, (triple, index) in enumerate(group_rows(triple_keys)):
+            pair, sk = divmod(triple, nspecies)
             si, sj = divmod(pair, nspecies)
-            rows = t[group == number].copy()
+            rows = t[index]
             rows[:, 1:3] = local[rows[:, 1:3]]
             epsilon = np.asarray(bank.p23.epsilon(str(species[sk])), dtype=np.float64)
             ni, nj = (int(bank.p2.species[str(species[s])]['orbital_norb']) for s in (si,sj))
