@@ -29,7 +29,8 @@ class NACFTableBank(nn.Module):
     """
 
     def __init__(self, p2_store, p23_store, *, overlap_store=None, soc_store=None, device='cuda', dtype=torch.float64, backend='auto', ry_to_ev=13.605698,
-                 p23_missing_policy='error', expected_p23_sha256=None, prepared_cache_dir=None):
+                 p23_missing_policy='error', expected_p23_sha256=None, prepared_cache_dir=None,
+                 prepared_store=None):
         super().__init__()
         if p23_missing_policy not in ('error', 'p2_if_missing_pairs'):
             raise ValueError('unknown P23 missing-pair policy')
@@ -64,6 +65,11 @@ class NACFTableBank(nn.Module):
                 raise ValueError('overlap table does not bind the supplied P2 manifest')
         self.tables = nn.ModuleDict()
         self.register_buffer('_anchor', torch.empty(0, device=device, dtype=dtype))
+        self.prepared_store = prepared_store
+        if prepared_store is not None:
+            if self.prepared_cache_dir is not None:
+                raise ValueError('choose an immutable prepared store or a preparation cache')
+            prepared_store.bind(self)
 
     def p23_composition(self, symbols):
         """Reproduce the source generator's whole-structure composition rule.
@@ -81,6 +87,10 @@ class NACFTableBank(nn.Module):
     def table(self, kind, left, right):
         key = f'{kind}_{left}_{right}'
         if key not in self.tables:
+            if self.prepared_store is not None:
+                self.tables[key] = self.prepared_store.table(kind, left, right,
+                    device=self._anchor.device, dtype=self._anchor.dtype, backend=self.backend)
+                return key
             if kind == 'vna':
                 source = self.p23.factor(left, right)
             elif kind == 'projector':
