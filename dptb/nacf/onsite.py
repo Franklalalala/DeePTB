@@ -154,26 +154,31 @@ def onsite_neighbor_lists_native(g, radius=LEGACY_RADIUS_BOHR, *, library=None, 
 def _tensor_identity(value):
     """Storage identity of one spline array without reading its contents.
 
-    Tensors: data pointer, shape, dtype, device and the in-place version counter (``None`` for inference
-    tensors, which do not track one). Other array-likes: object id, buffer address and shape.
+    Tensors: object id, data pointer, shape, strides, storage offset, dtype, device and the in-place version
+    counter (``None`` for inference tensors, which do not track one). Other array-likes: object id, buffer
+    address, shape, strides and dtype. Strides and offset matter: ``c`` and ``c.T`` share every other field and
+    mean different coefficients.
     """
     if isinstance(value, torch.Tensor):
         try:
             version = value._version
         except RuntimeError:            # inference tensors do not track a version counter
             version = None
-        return (value.data_ptr(), tuple(value.shape), str(value.dtype), str(value.device), version)
+        return (id(value), value.data_ptr(), tuple(value.shape), tuple(value.stride()), value.storage_offset(),
+                str(value.dtype), str(value.device), version)
     array = np.asarray(value)
-    return (id(value), array.__array_interface__['data'][0], array.shape, str(array.dtype), None)
+    return (id(value), array.__array_interface__['data'][0], array.shape, array.strides, str(array.dtype), None)
 
 
 def density_identity(density_bank):
     """Cheap, synchronization-free content identity of a density bank.
 
     Species order, each density object, and the storage identity of its ``knots`` and every ``coeff``
-    channel (see :func:`_tensor_identity`). Replacing a species density, or editing a knot or coefficient
-    tensor in place (version counter), changes the identity; no array is hashed. In-place edits of
-    inference-mode tensors are not tracked by Torch and are invisible here: invalidate explicitly.
+    channel (see :func:`_tensor_identity`). Replacing a species density, replacing a knot or coefficient
+    tensor by another object or view (a transposed view of the same storage included), or editing one in
+    place (version counter) changes the identity; no array is hashed. In-place edits of inference-mode
+    tensors, of ``.data`` and through NumPy views are not tracked by Torch and are invisible here: call
+    ``invalidate()`` explicitly after such edits.
     """
     return tuple((s, id(density), _tensor_identity(density.knots), tuple(_tensor_identity(c) for c in density.coeff))
                  for s, density in density_bank.items())
@@ -183,11 +188,14 @@ class PackedDensityBank:
     """Concatenated species splines (knots, [channels,4,K-1] coefficients) for the fused kernel.
 
     The bank records the :func:`density_identity` of its source at construction; ``matches`` tells whether
-    a density bank still has exactly that content identity.
+    a density bank still has exactly that content identity. The source density objects and arrays are retained
+    for the bank's lifetime, so a replacement can never reuse their object ids or storage addresses and pass as
+    the same identity.
     """
 
     def __init__(self, density_bank, device):
         self.identity = density_identity(density_bank)
+        self.sources = tuple((density, density.knots, tuple(density.coeff)) for density in density_bank.values())
         self.species = list(density_bank)
         self.index = {s: k for k, s in enumerate(self.species)}
         knots, coeffs, knot_ptr, coeff_ptr, channels = [], [], [0], [0], []
@@ -278,7 +286,7 @@ def grid_radius(quadrature):
     also prevents allocator address reuse from producing a false cache hit.
     """
     xyz = quadrature.xyz
-    identity = (_tensor_identity(xyz), tuple(xyz.stride()))
+    identity = _tensor_identity(xyz)
     cached = getattr(quadrature, '_nacf_grid_radius', None)
     if isinstance(cached, tuple) and cached[0] is xyz and cached[1] == identity:
         return cached[2]
@@ -458,9 +466,10 @@ class OnsiteXCEvaluator:
 
     The packed density bank of the fused engine is bound to the content identity of
     ``density_bank`` (:func:`density_identity`, checked on every use without reading arrays).
-    ``density_policy='rebuild'`` repacks when a species density was replaced or edited in place
-    (counted in ``bank_rebuilds``); ``'fail'`` raises instead, for banks meant to be immutable.
-    ``invalidate()`` drops the packed bank explicitly.
+    ``density_policy='rebuild'`` repacks when a species density was replaced, a knot/coefficient
+    tensor was replaced by another object or view, or one was edited in place (counted in
+    ``bank_rebuilds``); ``'fail'`` raises instead, for banks meant to be immutable. Untracked
+    writes (inference tensors, ``.data``, NumPy views) need an explicit ``invalidate()``.
     """
 
     def __init__(self, qgrid, density_bank, *, v_and_dv=None, potential=None, radius=LEGACY_RADIUS_BOHR,

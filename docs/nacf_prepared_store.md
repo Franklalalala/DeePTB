@@ -19,6 +19,12 @@ reconstruction and verifies its coefficient hash; this is not spatial quadrature
 Version 1 coefficient snapshots remain readable. A SciPy arithmetic change can
 require explicit regeneration even when the underlying physical tables match.
 
+The implementation hash covers exact file bytes, including line endings. NACF
+source files have an LF Git attribute so Windows and Linux checkouts agree.
+Keep historical source/binary/manifest sets together; changing an old deployed
+file's line endings invalidates its receipt. Do not bypass this check or edit an
+immutable store's manifest to fit a different implementation.
+
 Disk compression does not imply an equal reduction in resident GPU memory.
 Report cold loading separately from warm table, fresh geometry inference.
 Preparing a store does not validate a physical prior, a new dataset, or a model

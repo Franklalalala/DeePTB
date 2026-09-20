@@ -13,8 +13,8 @@ import torch
 
 from dptb.data.interfaces.p2_table import RadialBlockTable
 from dptb.nacf.assembly import NACFTableBank
-from dptb.nacf.candidate import (AtomicMoments, CandidateIdentityError, CandidatePriorPlan, CandidateRecipe, ConvergenceOrderPolicy,
-                                 FixedOrderPolicy, PairXCTables, normalize_sources)
+from dptb.nacf.candidate import (XC_KEY, AtomicMoments, CandidateIdentityError, CandidateInputError, CandidatePriorPlan, CandidateRecipe,
+                                 ConvergenceOrderPolicy, FixedOrderPolicy, FusionSettings, OrderPolicy, PairXCTables, normalize_sources)
 from dptb.nacf.envxc import EnvXCBank, EnvXCStore
 from dptb.nacf.onsite import OnsiteXCEvaluator, SplineDensity
 from dptb.tests.test_nacf_envxc import SPECIES, build_root, edge_overlap, make_structure
@@ -88,6 +88,11 @@ def make_plan(w, **kw):
     return CandidatePriorPlan(chosen, **args)
 
 
+def dimer(cell=60.0):
+    """Two atoms, one directed edge each way, no periodic images inside the cutoffs."""
+    return make_structure(["Xa", "Yb"], [[0.0, 0.0, 0.0], [0.0, 0.0, 3.1]], np.eye(3) * cell, {s: kw["rcut"] for s, kw in SPECIES.items()})
+
+
 def test_recipe_requires_explicit_supported_choices():
     for field, value in (("xc_functional", "PBE"), ("density_definition", "valence only"), ("zero_point", "none")):
         with pytest.raises(CandidateIdentityError, match="unsupported"):
@@ -98,11 +103,16 @@ def test_recipe_requires_explicit_supported_choices():
         recipe(stabilization="v3")
     with pytest.raises(CandidateIdentityError):
         recipe(fusion={"radial": True, "contraction": True})
+    with pytest.raises(CandidateIdentityError, match="unknown fusion"):
+        recipe(fusion={"radials": True})
     with pytest.raises(CandidateIdentityError):
         recipe(order_policy="fixed")
     ident = recipe().identity()
     assert ident["schema"] == "nacf-candidate-prior/v1" and ident["envxc_arm"] == "mcweda" and ident["stabilization"] == "v2"
+    assert ident["fusion"] == {"radial": False, "contraction": False}
     assert json.dumps(ident)   # serializable receipt
+    # the canonical XC key is an alias of the implemented label and does not change the recipe identity
+    assert recipe(xc_functional=XC_KEY).identity() == ident
 
 
 def test_identity_is_validated_across_families_and_fails_closed(world):
@@ -139,11 +149,42 @@ def test_identity_is_validated_across_families_and_fails_closed(world):
         make_plan(w, table_bank=NACFTableBank(p2, w["bank"].p23, device="cpu", backend="torch"))
 
 
+def test_pair_xc_shells_must_match_p2_even_with_equal_ao_count(world):
+    """Reviewer counterexample (R2): P2 Xa is s,s,p (five AOs); a pair table whose left side is one d shell is also
+    five AOs, every matrix shape agrees and the source hashes are the same, yet the two gauges must not be added."""
+    w = world
+    rr = np.linspace(0.0, 10.5, 5); vv = np.zeros((5, 5, 9)); vv[:-1] = 1.0
+    wrong = RadialBlockTable(rr, vv, (2,), (0, 1, 2), 10.5)
+    tables = dict(w["pair_xc"].tables); tables[("Xa", "Yb")] = wrong
+    with pytest.raises(CandidateIdentityError, match=r"Xa\|Yb left shells \(2,\) vs P2 Xa \(0, 0, 1\)"):
+        make_plan(w, pair_xc=PairXCTables(tables, sources=w["src"], device="cpu", backend="torch"))
+    # the correct decomposition with the same AO counts is accepted (the fixture tables)
+    assert make_plan(w).identity["validated_species"] == ["Xa", "Yb"]
+
+
+def test_onsite_xc_declaration_is_checked_against_the_recipe(world):
+    """Reviewer R4: the potential label is provenance, not a free pass. Recognizable contradictions are refused,
+    the canonical key is the contract, and a label that does not name the functional needs the explicit key."""
+    w = world
+    base = w["onsite_identity"]
+    for label in ("PBE", "zero potential", "LDA PW92"):
+        with pytest.raises(CandidateIdentityError, match="contradicts"):
+            make_plan(w, onsite_identity={**base, "potential": label})
+    with pytest.raises(CandidateIdentityError, match="must declare xc_functional"):
+        make_plan(w, onsite_identity={**base, "potential": "accepted v_and_dv callable"})
+    with pytest.raises(CandidateIdentityError, match="declares xc_functional"):
+        make_plan(w, onsite_identity={**base, "xc_functional": "pbe"})
+    with pytest.raises(CandidateIdentityError, match="contradicts"):
+        make_plan(w, onsite_identity={**base, "potential": "PBE", "xc_functional": XC_KEY})
+    explicit = make_plan(w, onsite_identity={**base, "potential": "accepted v_and_dv callable", "xc_functional": XC_KEY})
+    assert explicit.identity["families"]["onsite"]["xc_functional"] == XC_KEY
+    assert make_plan(w).identity["families"]["onsite"]["xc_functional"] == XC_KEY      # the fixture label names pz81
+
+
 def test_structure_coverage_and_periodicity_are_required(world):
     w = world
     plan = make_plan(w)
-    cut = {s: kw["rcut"] for s, kw in SPECIES.items()}
-    g = make_structure(["Xa", "Yb"], [[0.0, 0.0, 0.0], [0.0, 0.0, 3.1]], np.diag([7.0, 7.0, 7.0]), cut)
+    g = dimer(7.0)
     with pytest.raises(CandidateIdentityError, match="fully periodic"):
         plan.prepare({**g, "pbc": (True, True, False)})
     with pytest.raises(CandidateIdentityError, match="not covered"):
@@ -151,6 +192,40 @@ def test_structure_coverage_and_periodicity_are_required(world):
     partial = PairXCTables({("Xa", "Xa"): w["pair_xc"].tables[("Xa", "Xa")]}, sources=w["src"], device="cpu", backend="torch")
     with pytest.raises(CandidateIdentityError, match="pair XC table: Xa\\|Yb"):
         make_plan(w, pair_xc=partial).prepare(g)
+
+
+def test_graph_arrays_are_validated_on_raw_values_before_casting(world):
+    """Reviewer counterexample (R1): fractional cell shifts (+0.25/-0.25) used to be truncated to 0/0 and another graph
+    was evaluated. Raw integrality, finiteness, shape and range are checked first; integral floats stay legal."""
+    w = world
+    plan = make_plan(w)
+    g = dimer()
+    assert g["edge_index"].shape == (2, 2)
+    reference = plan.prepare(g)()
+    as_float = {**g, "edge_index": g["edge_index"].astype(np.float64), "edge_cell_shift": g["edge_cell_shift"].astype(np.float64)}
+    prepared = plan.prepare(as_float)
+    for key in ("edge_index", "edge_cell_shift"):
+        assert prepared.geometry[key].dtype == np.int64
+        np.testing.assert_array_equal(prepared.geometry[key], g[key])          # same rows, same order
+    out = prepared()
+    torch.testing.assert_close(out["edge_ao_ev"], reference["edge_ao_ev"], atol=1e-12, rtol=0)
+    torch.testing.assert_close(out["node_ao_ev"], reference["node_ao_ev"], atol=1e-12, rtol=0)
+    fractional = dict(as_float); fractional["edge_cell_shift"] = as_float["edge_cell_shift"].copy()
+    fractional["edge_cell_shift"][0, 0] = 0.25; fractional["edge_cell_shift"][1, 0] = -0.25
+    with pytest.raises(CandidateInputError, match="exact integers"):
+        plan.prepare(fractional)
+    nonfinite = dict(as_float); nonfinite["edge_cell_shift"] = as_float["edge_cell_shift"].copy(); nonfinite["edge_cell_shift"][0, 1] = np.nan
+    with pytest.raises(CandidateInputError, match="finite"):
+        plan.prepare(nonfinite)
+    with pytest.raises(CandidateInputError, match="outside the structure"):
+        plan.prepare({**g, "edge_index": np.array([[0, 2], [2, 0]])})
+    with pytest.raises(CandidateInputError, match=r"\[2, 3\]"):
+        plan.prepare({**g, "edge_cell_shift": np.zeros((3, 3), dtype=np.int64)})
+    with pytest.raises(CandidateInputError, match=r"\[2, E\]"):
+        plan.prepare({**g, "edge_index": g["edge_index"][0]})
+    with pytest.raises(CandidateInputError, match="magnitude"):
+        plan.prepare({**g, "edge_cell_shift": np.array([[2**31, 0, 0], [-2**31, 0, 0]])})
+    assert issubclass(CandidateInputError, ValueError) and not issubclass(CandidateInputError, CandidateIdentityError)
 
 
 def test_forward_composes_exactly_the_accepted_recipe(world):
@@ -164,7 +239,7 @@ def test_forward_composes_exactly_the_accepted_recipe(world):
     assert out["node_ao_ev"].shape == (n, wdt, wdt) and out["edge_ao_ev"].shape == (E, wdt, wdt)
     assert torch.isfinite(out["node_ao_ev"]).all() and torch.isfinite(out["edge_ao_ev"]).all()
     # independent recomposition from the public plans
-    b = w["bank"].prepare(**g, topology="native")() if False else prepared.assembly()
+    b = prepared.assembly()
     vna = w["bank"].prepare_edge_vna(**g)()["edge_vna_ao_ev"]
     x = w["xbank"].prepare(**g, arms=("mcweda",), topology="python", stabilization="v2")(edge_overlap_ao=b["edge_overlap_ao"])["mcweda"]
     site = w["onsite"](g, wdt, [(2, 2, 2)] * n)
@@ -186,7 +261,10 @@ def test_forward_composes_exactly_the_accepted_recipe(world):
     torch.testing.assert_close(out["components"]["pair_xc_ao_ev"], reverse, atol=1e-12, rtol=0)
     d = out["diagnostics"]
     assert d["orders"] == [[2, 2, 2]] * n and d["envxc"]["stabilization"] == "v2" and d["recipe_identity_sha256"] == plan.identity_sha256
-    assert all(chk["passed"] for chk in d["order_checks"]) and d["onsite_bank_rebuilds"] == 0
+    # a fixed order is a choice, not a convergence proof (reviewer R5): no check was run and none is claimed
+    assert all(chk["selected_order"] == (2, 2, 2) and chk["convergence_checked"] is False and chk["converged"] is None and "passed" not in chk
+               for chk in d["order_checks"])
+    assert d["convergence_checked"] is False and d["converged"] is None and d["onsite_bank_rebuilds"] == 0
     # the v1 recipe is a different, explicitly stated identity with a different environment term
     plan_v1 = make_plan(w, recipe=recipe(stabilization="v1"))
     out_v1 = plan_v1.prepare(g)()
@@ -197,19 +275,63 @@ def test_forward_composes_exactly_the_accepted_recipe(world):
 
 def test_convergence_order_policy_is_geometry_only(world):
     w = world
-    cut = {s: kw["rcut"] for s, kw in SPECIES.items()}
-    g = make_structure(["Xa", "Yb"], [[0.0, 0.0, 0.0], [0.0, 0.0, 3.1]], np.diag([7.0, 7.0, 7.0]), cut)
+    g = dimer(7.0)
     loose = ConvergenceOrderPolicy((2, 2, 2), (3, 3, 3), (4, 4, 4), tolerance_eV=1e9)
     plan = make_plan(w, recipe=recipe(order_policy=loose))
     prepared = plan.prepare(g)
-    assert prepared.orders == [(2, 2, 2), (2, 2, 2)] and all(c["passed"] for c in prepared.order_checks)
+    assert prepared.orders == [(2, 2, 2), (2, 2, 2)]
+    assert all(c["convergence_checked"] and c["converged"] and c["tolerance_eV"] == 1e9 and c["medium_fine_eV"] >= 0 for c in prepared.order_checks)
+    assert prepared.convergence_summary() == (True, True)
     tight = ConvergenceOrderPolicy((2, 2, 2), (3, 3, 3), (4, 4, 4), tolerance_eV=1e-30, tail_radius_bohr=23.0)
     prepared = make_plan(w, recipe=recipe(order_policy=tight)).prepare(g)
     assert prepared.orders == [(3, 3, 3), (3, 3, 3)]
-    assert all(c["fine_finer_eV"] is not None and "environment_tail_eV" in c and not c["passed"] for c in prepared.order_checks)
+    assert all(c["fine_finer_eV"] is not None and "environment_tail_eV" in c and c["convergence_checked"] and c["converged"] is False
+               for c in prepared.order_checks)
+    assert prepared.convergence_summary() == (True, False)          # measured and failed: recorded, not a pass
     with pytest.raises(RuntimeError, match="did not converge"):
         make_plan(w, recipe=recipe(order_policy=ConvergenceOrderPolicy((2, 2, 2), (3, 3, 3), (4, 4, 4), tolerance_eV=1e-30, strict=True))).prepare(g)
     assert loose.identity()["policy"] == "convergence" and FixedOrderPolicy((128, 24, 48)).identity() == {"policy": "fixed", "order": [128, 24, 48]}
+
+
+def test_bound_recipe_and_order_policy_cannot_drift_from_the_hashed_identity(world):
+    """Reviewer R6: built-in policies, the recipe and its fusion settings are frozen; a custom mutable policy is
+    snapshotted at binding and the plan refuses to prepare once its identity differs from the hashed one."""
+    w = world
+    policy = FixedOrderPolicy((2, 2, 2))
+    with pytest.raises(AttributeError):
+        policy.order = (3, 3, 3)
+    rec = recipe(order_policy=policy, fusion={"radial": False})
+    assert isinstance(rec.fusion, FusionSettings)
+    with pytest.raises(AttributeError):
+        rec.fusion.radial = True
+    with pytest.raises(AttributeError):
+        rec.envxc_arm = "d2"
+    with pytest.raises(AttributeError):
+        ConvergenceOrderPolicy().medium = (1, 1, 1)
+
+    class Mutable(OrderPolicy):
+        def __init__(self, order):
+            self.order = tuple(order)
+
+        def identity(self):
+            return {"policy": "mutable-test", "order": list(self.order)}
+
+        def select(self, evaluator, g, width):
+            return FixedOrderPolicy(self.order).select(evaluator, g, width)
+
+    custom = Mutable((2, 2, 2))
+    plan = make_plan(w, recipe=recipe(order_policy=custom))
+    g = dimer()
+    assert plan.prepare(g).orders == [(2, 2, 2)] * 2 and plan.identity["recipe"]["order_policy"]["order"] == [2, 2, 2]
+    custom.order = (3, 3, 3)
+    with pytest.raises(CandidateIdentityError, match="changed after the plan was constructed"):
+        plan.prepare(g)
+    # the caller's onsite_identity mapping is copied at binding
+    ident = dict(w["onsite_identity"])
+    plan = make_plan(w, onsite_identity=ident)
+    ident["potential"] = "PBE"
+    assert plan.identity["families"]["onsite"]["potential"] == w["onsite_identity"]["potential"]
+    assert plan.prepare(g).orders == [(2, 2, 2)] * 2
 
 
 def test_missing_family_and_disjoint_sources_are_not_same_source(world):
@@ -236,8 +358,7 @@ def test_injected_content_changes_the_candidate_identity(world):
 def test_pair_coverage_uses_actual_edges_and_geometry_is_snapshotted(world):
     w = world
     pair = PairXCTables({('Xa', 'Yb'): w['pair_xc'].table('Xa', 'Yb')}, sources=w['src'], device='cpu')
-    g = make_structure(['Xa', 'Yb'], [[0., 0., 0.], [0., 0., 3.1]], np.eye(3) * 60,
-                       {s: kw['rcut'] for s, kw in SPECIES.items()})
+    g = dimer()
     prepared = make_plan(w, pair_xc=pair).prepare(g)
     before = {k: v.copy() for k, v in prepared.geometry.items() if isinstance(v, np.ndarray)}
     for key in before:

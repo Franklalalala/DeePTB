@@ -245,6 +245,37 @@ def test_packed_bank_is_bound_to_density_content_not_species_names():
         OnsiteXCEvaluator(lambda s, o: None, {'X': density(1.)}, potential=lambda n: n, device='cpu', density_policy='ignore')
 
 
+def test_packed_bank_refreshes_when_a_same_storage_view_replaces_a_coefficient_tensor():
+    """Reviewer reproduction (R3): ``c`` and ``c.T`` share data pointer, shape, dtype, device and version counter, yet
+    mean different coefficients. The identity includes object, strides and storage offset (NumPy strides too); the
+    explicit ``invalidate()`` contract for inference/.data/NumPy in-place writes is unchanged."""
+    from dptb.nacf.onsite import density_identity
+    knots = torch.linspace(0., 4., 5, dtype=torch.float64)
+    c = torch.arange(1., 17., dtype=torch.float64).reshape(4, 4)
+    density = SplineDensity(knots, [c])
+    ev = OnsiteXCEvaluator(lambda s, o: None, {'X': density}, potential=lambda n: n, device='cpu', engine='reference')
+    old = ev.bank()
+    before = float(density(torch.tensor([.5], dtype=torch.float64))[0])
+    density.coeff[0] = c.T                                    # same storage, shape, dtype and version; other strides
+    assert float(density(torch.tensor([.5], dtype=torch.float64))[0]) != before
+    new = ev.bank()
+    assert new is not old and ev.bank_rebuilds == 1
+    torch.testing.assert_close(new.coeff.reshape(4, 4), c.T, atol=0, rtol=0)
+    assert ev.bank() is new and ev.bank_rebuilds == 1
+    # the fail-closed policy sees the same replacement
+    frozen = OnsiteXCEvaluator(lambda s, o: None, {'X': SplineDensity(knots, [c])}, potential=lambda n: n, device='cpu',
+                               engine='reference', density_policy='fail')
+    frozen.bank(); frozen.density_bank['X'].coeff[0] = c.T
+    with pytest.raises(RuntimeError, match='density bank changed'):
+        frozen.bank()
+    # NumPy-backed arrays: strides are part of the identity as well
+    a = np.arange(16.).reshape(4, 4)
+    plain = SimpleNamespace(knots=np.linspace(0., 4., 5), coeff=[a])
+    ident = density_identity({'X': plain})
+    plain.coeff[0] = a.T
+    assert density_identity({'X': plain}) != ident
+
+
 def test_candidate_selection_is_exact_and_keeps_accepted_positions():
     """Only neighbours with |d| > r_grid + k_last + margin are dropped; survivors keep their per-species list position."""
     a, b = synthetic_density('cpu', nlcc=True, seed=13), synthetic_density('cpu', nlcc=False, seed=14)

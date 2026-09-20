@@ -1,0 +1,5 @@
+# Runtime manifests hash source bytes; keep them identical across Git checkouts.
+*.py text eol=lf
+*.cpp text eol=lf
+*.cu text eol=lf
+*.h text eol=lf
