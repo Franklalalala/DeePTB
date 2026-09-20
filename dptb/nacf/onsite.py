@@ -304,6 +304,13 @@ def _launch_density(native, xyz, candidates, local, seg_ptr, segments, bank, mar
         bank.knots, bank.knots_f32, bank.knot_ptr, bank.coeff, bank.coeff_ptr, bank.channels, float(margin))
 
 
+def _prune_margin(radius, candidates, bank):
+    """One conservative coordinate-scale FP64 bound for the entire launch group."""
+    distance = float(candidates[:, 3].max()) if len(candidates) else 0.0
+    scale = abs(radius) + distance + float(bank.last_knot_host.max()) + 1
+    return PRUNE_MARGIN_BOHR + 32 * np.finfo(np.float64).eps * scale
+
+
 def _check_fused_inputs(xyz, bank):
     from ._cuda import extension, check_device
     if not isinstance(xyz, torch.Tensor) or not xyz.is_cuda:
@@ -353,7 +360,7 @@ def fused_onsite_density(xyz, neighbors, bank, *, prune=True, rho_bytes=1 << 30)
         return xyz.new_zeros((0, xyz.shape[0]))
     radius = grid_radius(SimpleNamespace(xyz=xyz))
     seg_ptr, segments, candidates, local, _ = onsite_candidates(neighbors, bank, radius, prune=prune)
-    margin = PRUNE_MARGIN_BOHR if prune else float('inf')
+    margin = _prune_margin(radius, candidates, bank) if prune else float('inf')
     parts = []
     for start, stop in _atom_chunks(len(neighbors), xyz.shape[0], rho_bytes):
         ptr, sub, base, end = _chunk_segments(seg_ptr, segments, start, stop)
@@ -396,10 +403,11 @@ def fused_onsite_blocks(quadrature, neighbors, bank, potential, *, chunk_bytes=1
     if not natoms:
         empty = basis.new_zeros((0, norb, norb))
         return (empty, xyz.new_zeros((0, len(xyz)))) if return_density else empty
-    seg_ptr, segments, candidates, local, counts = onsite_candidates(neighbors, bank, grid_radius(quadrature), prune=prune)
+    radius = grid_radius(quadrature)
+    seg_ptr, segments, candidates, local, counts = onsite_candidates(neighbors, bank, radius, prune=prune)
     if stats is not None:
         stats.update(counts)
-    margin = PRUNE_MARGIN_BOHR if prune else float('inf')
+    margin = _prune_margin(radius, candidates, bank) if prune else float('inf')
     out = basis.new_empty((natoms, norb, norb))
     densities = []
     for start, stop in _atom_chunks(natoms, xyz.shape[0], rho_bytes):
