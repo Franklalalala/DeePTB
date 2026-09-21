@@ -39,6 +39,12 @@ AO-block provenance and packing conventions for DeePTB. `production_io.py`
 reads reference ABACUS output for validation only; it is not an inference input
 requirement. The assembly reports its actual backend and timing scope.
 
+For complete H0 block reproduction, explicitly set
+`pair_support='nonlocal_complete'`. The default `orbital_overlap` limits output
+to overlapping orbital supports and can omit nonzero third-center nonlocal
+blocks. `strict_reproduction=True` checks other numerical settings but does not
+change this support selection; see [the hot-path example](README_HOT_PATH.md).
+
 Use focused tests under `tests_h0fast` for a changed boundary. Dataset-dependent
 verification scripts and the finite `acceptance.py` runner are opt-in and need
 the original external reference inputs; historical Liyue fixture paths in those
@@ -58,6 +64,13 @@ The reference uses `cutoff=2*rmax` and `nr=int(rmax/0.01)+1`, giving about
 0.02 Bohr spacing, together with ABACUS's odd projector sample-count rule.
 This is a numerical reference convention, not a change to the H0 formula or
 a general recommendation to coarsen integration grids.
+
+`SOC_REFERENCE_DR_BOHR = 0.02` does not guarantee an identical grid for every
+cutoff. The reference's actual spacing is `2*rmax/(nr-1)`, whereas the CUDA
+table builder uses `nr=ceil(2*rmax/requested_dr)+1`. At `rmax=9` both give
+901 points; at `rmax=5.005` the reference gives 501 points (0.02002 Bohr) and
+the current 0.02 request gives 502 points (about 0.01998004 Bohr). Check the
+actual grid and reference for each new cutoff before extending qualification.
 
 The reference is ABACUS commit
 [`ee99e3ca`](https://github.com/deepmodeling/abacus-develop/tree/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f).

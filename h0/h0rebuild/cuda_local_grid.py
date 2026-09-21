@@ -412,8 +412,7 @@ class CudaPeriodicFFTGridAOCache:
         anchors_lookup = [a["lookup"] for a in anchors]
         anchors_values = [a["values"] for a in anchors]
         anchors_potential = [a["potential"] for a in anchors]
-        dummy_spin = torch.empty(0, device=self.device, dtype=torch.float64)
-        anchors_spin_z = [a["spin_z_potential"] if self.has_spin_z else dummy_spin for a in anchors]
+        anchors_spin_z = [a["spin_z_potential"] for a in anchors] if self.has_spin_z else []
 
         pair_i = torch.tensor([p[0] for p in pairs], device=self.device, dtype=torch.int32)
         pair_j = torch.tensor([p[1] for p in pairs], device=self.device, dtype=torch.int32)

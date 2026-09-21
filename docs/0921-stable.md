@@ -45,6 +45,13 @@ These are implementation regression results. They do not establish new physical
 accuracy, quadrature convergence, full production coverage or an end-to-end
 speedup. See `0920-stable.md` for the separately recorded historical benchmarks.
 
+The SOC50 native-topology/radial-fusion speed result applies to the explicitly
+configured table-bank assembly benchmark. The public geometry predictors share
+`prepare_geometry`, which currently calls `bank.prepare` without selecting
+native topology or radial fusion. Their default path therefore does not inherit
+that measured speedup. Check the actual preparation settings before quoting a
+predictor timing; the checkpoint's prior recipe remains unchanged.
+
 ## Provider boundary follow-up
 
 Candidate binding now rejects precompiled pair-XC buffers on a different device
@@ -70,3 +77,17 @@ ABACUS source. See [the H0 reference documentation](../h0/README.md#explicit-soc
 for the separate spacing/projector ablation and the retained cutoff-radius
 semantics; the combined single-case gain must not be attributed to both changes
 individually.
+
+## Local-grid batch follow-up
+
+`CudaPeriodicFFTGridAOCache.contract_pairs_batch` now passes an empty spin-z
+anchor list when no spin-z field is supplied, as required by the native API.
+Previously a nonempty batch failed with an anchor-list length error. The main
+`assemble_h0` path uses `contract_chunk` and does not call this batch wrapper.
+
+On an L40S with PyTorch 2.8.0 / CUDA 12.8, the new non-spin regression failed
+before the fix; after it, all eight focused batch/chunk cases passed. Batch
+blocks with and without a spin-z field matched independent CPU contractions,
+including periodic images and empty inputs. The current wrapper and unchanged
+native sources were checked against the verified installed binary manifest.
+This validates the interface repair, not full-cohort H0 precision.
