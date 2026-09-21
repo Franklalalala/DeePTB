@@ -48,6 +48,11 @@ the P2 shells of its two species. The shell check reads the real table headers: 
 one p shell and one d shell are both five AOs and every matrix shape agrees, so neither source
 hashes nor output dimensions prove the gauge. Table `support_bohr` is not compared.
 
+Precompiled pair-XC tables retain their own buffers; the `PairXCTables` constructor
+does not migrate them. Every buffer must already be on the table bank's device,
+and every floating buffer must match its dtype. Binding rejects mismatches with
+the table and buffer name rather than changing shared providers implicitly.
+
 The onsite provider must declare the recipe's functional. `onsite_identity["xc_functional"]` is
 the contract (`XC_KEY = "lda_pz81_unpolarized"`, or the recipe label); `onsite_identity["potential"]`
 stays a free implementation label kept for provenance. A label that recognizably names the
@@ -74,6 +79,13 @@ Edge rows keep the caller's order; the plan owns copies, so later caller edits c
 onsite coordinates with old edge plans. Then every species must be covered by every family,
 every species pair used by the directed edges must have a pair-XC table, and partially periodic
 cells are refused because of the cS zero point.
+
+After the order policy selects one order per atom, preparation calls `qgrid` once
+per selected `(species, order)` to verify nonempty `[points, 3]` coordinates and
+exactly `[points, P2_species_AO_count]` basis values. Global AO padding remains
+legal but cannot hide an incorrect species basis width. Providers should cache
+their quadrature by species/order and remain immutable while bound. These shape
+checks do not establish shell ordering, phases, weights or provenance.
 
 ## Order policy and diagnostics
 

@@ -44,3 +44,29 @@ v1 on the Ca/Sr case, comparing within each recipe. Fixed orders were 128/24/48.
 These are implementation regression results. They do not establish new physical
 accuracy, quadrature convergence, full production coverage or an end-to-end
 speedup. See `0920-stable.md` for the separately recorded historical benchmarks.
+
+## Provider boundary follow-up
+
+Candidate binding now rejects precompiled pair-XC buffers on a different device
+or with a different floating dtype. After selecting onsite orders, preparation
+checks each species' exact P2 AO count and its quadrature point alignment before
+global AO padding can hide a mismatched basis. Raw graph range checks compare
+Python scalars so float32 cannot round the integer upper bound into an accepted
+out-of-range value. These guards do not change the candidate formula or add the
+optional onsite neighbor cache.
+
+The focused candidate, provider-contract, onsite, grid-cache and H0 SOC-reference
+tests passed 53 cases on the configured RTX PRO 6000 environment, with one
+inapplicable negative-uint64 case skipped. The original guard tests reproduced
+7 failures before the fix. Twelve synthetic geometry/recipe combinations yielded
+120 output arrays identical bit for bit before and after the guard changes.
+Two existing real geometries also passed CUDA candidate/manual composition and
+RME packing: maximum component difference 5.69e-14 eV and packed difference
+7.11e-15 eV. These are implementation checks, with fixed quadrature orders.
+
+The H0 SOC helper bounds the all-below-threshold fallback by the available mesh.
+The reference's nonzero projector rule is retained and linked to the fixed
+ABACUS source. See [the H0 reference documentation](../h0/README.md#explicit-soc-reference-alignment)
+for the separate spacing/projector ablation and the retained cutoff-radius
+semantics; the combined single-case gain must not be attributed to both changes
+individually.

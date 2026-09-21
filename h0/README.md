@@ -59,6 +59,23 @@ The reference uses `cutoff=2*rmax` and `nr=int(rmax/0.01)+1`, giving about
 This is a numerical reference convention, not a change to the H0 formula or
 a general recommendation to coarsen integration grids.
 
+The reference is ABACUS commit
+[`ee99e3ca`](https://github.com/deepmodeling/abacus-develop/tree/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f).
+[`setup_nonlocal.cpp:111–142`](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_cell/setup_nonlocal.cpp#L111-L142)
+sets `cut_mesh = ir`, rounds an even value up, and copies `ir < cut_mesh`.
+An odd last nonzero index is therefore excluded intentionally; the UPF reader's
+inclusive support-count convention is different. The
+[`USE_NEW_TWO_CENTER` entry](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_hamilt_lcao/hamilt_lcaodft/LCAO_init_basis.cpp#L56-L71)
+passes those projectors to the
+[`two-center grid`](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_basis/module_nao/two_center_bundle.cpp#L62-L91).
+
+The helper retains the original `cutoff_radius` as a conservative support and
+grid envelope; resetting it to the new endpoint could change the universal
+grid as well as neighbor selection. After alignment it need not equal
+`r[cutoff_index - 1]`. For an all-below-threshold projector, the sample count
+is bounded by the available mesh, including an even mesh. This safe fallback
+does not reproduce the reference's out-of-range count.
+
 Apply the helper **once to original species**, after loading geometry and
 physics options. Use the same corrected species and spacing in both stages:
 
@@ -89,8 +106,21 @@ keys describe different projector samples and spacing. Defaults, the generic
 The input species are not mutated. Keep raw inputs for future preparations;
 do not repeatedly apply the cutoff transformation to corrected species.
 
-The original worst SOC case reproduced a maximum initial-H0 matrix error of
-0.012519 meV after alignment, versus 0.272390 meV with the old table. This is
-single-case evidence; full-cohort qualification is separate. It is not the
-stored-H0 prior's MAE against the final converged Hamiltonian. Compare against
-the original ABACUS H0/S CSR, and convert H from Ry to eV before reporting errors.
+The original worst SOC case, `SOC_mp-754958`, was rechecked with four separately
+prepared stores in the same installed CUDA reconstruction runtime. Against the
+original ABACUS initial-H0/S CSR, the maximum matrix errors were:
+
+| Two-center spacing | Projector alignment | H0 max error (meV) | S max error |
+|---|---|---:|---:|
+| 0.01 Bohr | Original | 0.272390 | 1.25393e-8 |
+| 0.02 Bohr | Original | 0.012519 | 4.99835e-10 |
+| 0.01 Bohr | ABACUS sample rule | 0.028457 | 1.25393e-8 |
+| 0.02 Bohr | ABACUS sample rule | 0.012519 | 4.99835e-10 |
+
+For this case, spacing alone reaches the reported combined maximum error;
+the combined number does not establish an additional gain from alignment at
+0.02 Bohr. Alignment also reduces the error at 0.01 Bohr and reproduces the
+specified reference's projector rule. These are single-case implementation
+checks, not full-cohort precision acceptance, quadrature convergence, speedup,
+or the stored-H0 prior's MAE against the final converged Hamiltonian. Convert
+H from Ry to eV before reporting errors.

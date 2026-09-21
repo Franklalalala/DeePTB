@@ -21,19 +21,26 @@ def species(samples):
 class SOCReferenceTests(unittest.TestCase):
     def test_abacus_sample_count_and_threshold(self):
         # Independent expected vectors exercise odd/even final indices and
-        # the strict threshold, including ABACUS's all-zero fallback.
+        # the strict threshold and bounded all-below-threshold fallback.
         cases = [
             ([0., 1., 2., 0., 0.], 3, [0., 1., 2., 0., 0.]),
             ([0., 1., 2., 3., 0.], 3, [0., 1., 2., 0., 0.]),
             ([0., 1., 2., 1e-10, -1e-10], 3, [0., 1., 2., 0., 0.]),
             ([0., 1., 2., 0., -2e-10], 5, [0., 1., 2., 0., -2e-10]),
-            ([0., 0., 0., 0.], 5, [0., 0., 0., 0.]),
+            ([0., 0., 0., 0.], 4, [0., 0., 0., 0.]),
+            ([0., 0., 0.], 3, [0., 0., 0.]),
+            ([0., 1e-10, -1e-10, 0.], 4, [0., 1e-10, -1e-10, 0.]),
         ]
         for samples, count, expected in cases:
             with self.subTest(samples=samples):
                 actual = align_soc_projectors(species(samples))['X'].upf.projectors[0]
                 self.assertEqual(actual.cutoff_index, count)
                 np.testing.assert_array_equal(actual.radial_u, expected)
+                self.assertTrue(1 <= actual.cutoff_index <= len(samples))
+
+    def test_rejects_empty_radial_mesh(self):
+        with self.assertRaisesRegex(ValueError, 'nonempty radial mesh'):
+            align_soc_projectors(species([]))
 
     def test_preserves_original_species_and_physics(self):
         original = species([0., 1., 2., 3., 0.])

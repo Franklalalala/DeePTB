@@ -47,7 +47,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from .candidate_checks import (SOURCE_KEYS, CandidateInputError, declared_xc, normalize_sources, pair_shell_problems,
+from .candidate_checks import (SOURCE_KEYS, CandidateInputError, declared_xc, normalize_sources, onsite_quadrature_problems, pair_shell_problems,
                                species_source_problems, validated_geometry)
 from .candidate_policy import (DENSITY_DEFINITION, RECIPE_SCHEMA, XC_FUNCTIONAL, XC_KEY, ZERO_POINT, CandidateIdentityError,
                                CandidateRecipe, ConvergenceOrderPolicy, FixedOrderPolicy, FusionSettings, OrderPolicy)
@@ -233,6 +233,14 @@ class CandidatePriorPlan:
         problems = []
         for s in sorted(common):
             problems.extend(self._species_problems(s, families))
+        # Precompiled tables are preserved by PairXCTables: constructor device/dtype options do not migrate them.
+        # Validate all buffers now, not after topology preparation or a partial numerical forward.
+        for (a, b), table in sorted(self.pair_xc.tables.items()):
+            for name, buffer in table.named_buffers():
+                if buffer.device != self.device:
+                    problems.append(f"pair XC {a}|{b} buffer {name}: device {buffer.device} vs table bank {self.device}")
+                if (buffer.is_floating_point() or buffer.is_complex()) and buffer.dtype != self.dtype:
+                    problems.append(f"pair XC {a}|{b} buffer {name}: dtype {buffer.dtype} vs table bank {self.dtype}")
         # every pair-XC table header must carry the P2 shell sequences of its species: equal AO counts are not enough
         problems.extend(pair_shell_problems(self.pair_xc.tables, p2))
         if problems:
@@ -327,6 +335,16 @@ class PreparedCandidate:
         volume = abs(float(np.linalg.det(cell)))
         self.c_ev = 4.0 * math.pi * sum(plan.moments.m2_bohr2(s) for s in symbols) * bank.ry_to_ev / (3.0 * volume)
         self.orders, self.order_checks = r.order_policy.select(plan.onsite, self.geometry, self.width)
+        # The onsite engine pads to the structure's largest AO count. A smaller species with the wrong
+        # number of basis columns would otherwise still fit and be added silently in an incompatible AO layout.
+        if len(self.orders) != len(symbols):
+            raise CandidateIdentityError("onsite order policy must select one order per atom")
+        problems = []
+        for s, order in dict.fromkeys((s, tuple(order)) for s, order in zip(symbols, self.orders)):
+            quadrature = plan.onsite.qgrid(s, order)
+            problems.extend(onsite_quadrature_problems(s, quadrature, bank.p2.species[s]["orbital_norb"]))
+        if problems:
+            raise CandidateIdentityError("onsite quadrature identity mismatch:\n  " + "\n  ".join(problems))
         self.prepare_seconds = time.perf_counter() - t0
 
     def pair_xc_blocks(self):

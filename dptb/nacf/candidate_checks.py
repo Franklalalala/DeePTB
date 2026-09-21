@@ -40,7 +40,8 @@ def integer_graph_array(value, name: str) -> np.ndarray:
             raise CandidateInputError(f"{name} must be finite")
         if not np.array_equal(raw, np.floor(raw)):
             raise CandidateInputError(f"{name} must hold exact integers; fractional entries are neither cell translations nor atom indices")
-    if raw.size and (raw.min() < -GRAPH_INTEGER_LIMIT or raw.max() > GRAPH_INTEGER_LIMIT):
+    # Compare Python scalars: NumPy may otherwise round INT32_MAX to 2**31 in float32.
+    if raw.size and (raw.min().item() < -GRAPH_INTEGER_LIMIT or raw.max().item() > GRAPH_INTEGER_LIMIT):
         raise CandidateInputError(f"{name} exceeds the supported integer magnitude {GRAPH_INTEGER_LIMIT}")
     return np.array(raw, dtype=np.int64, copy=True)
 
@@ -145,6 +146,22 @@ def pair_shell_problems(tables: Mapping[tuple[str, str], Any], p2_species: Mappi
     return problems
 
 
+def onsite_quadrature_problems(symbol: str, quadrature: Any, expected_norb: int) -> list[str]:
+    """Check a selected onsite grid before global AO padding can hide a species mismatch.
+
+    Shape checks establish AO count and point alignment, not shell order, phases, weights or provenance.
+    The caller supplies the quadrature object; this function does not construct grids or evaluate physics.
+    """
+    xyz = tuple(getattr(getattr(quadrature, "xyz", None), "shape", ()))
+    basis = tuple(getattr(getattr(quadrature, "basis", None), "shape", ()))
+    if len(xyz) != 2 or xyz[1] != 3 or xyz[0] < 1:
+        return [f"onsite {symbol}: quadrature xyz must have nonempty shape [points, 3], got {xyz}"]
+    expected = (xyz[0], int(expected_norb))
+    if basis != expected:
+        return [f"onsite {symbol}: quadrature basis shape {basis} vs expected {expected} from P2 AO count"]
+    return []
+
+
 def declared_xc(onsite_identity: Mapping[str, Any], recipe: CandidateRecipe) -> str:
     """Canonical XC key the onsite provider declares, checked against the recipe.
 
@@ -173,4 +190,4 @@ def declared_xc(onsite_identity: Mapping[str, Any], recipe: CandidateRecipe) -> 
 
 
 __all__ = ["SOURCE_KEYS", "GRAPH_INTEGER_LIMIT", "CandidateInputError", "integer_graph_array", "validated_geometry",
-           "normalize_sources", "species_source_problems", "pair_shell_problems", "declared_xc"]
+           "normalize_sources", "species_source_problems", "pair_shell_problems", "onsite_quadrature_problems", "declared_xc"]
