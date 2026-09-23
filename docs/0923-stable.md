@@ -84,7 +84,22 @@ forward and backward, fixed weights, router buffers restored before every step, 
 
 Against the grouped streaming route on the same step the fused-P0 route gives the same loss,
 outputs within 1.4e-7 and gradients within 5.4e-6 (worst of 267 parameters, relative to the
-parameter's largest gradient). The weight-space fused-P0 route of the dense and non-PA models
+parameter's largest gradient).
+
+Switch top-1 routes (256/1/0, `dptb.nn.top1_prior`) take the same route as one slot without
+folding: each edge's selected expert, bias included, scaled by its retained probability, as
+`top1_prior.linear` computes it. The route declines for `top1_reference_so2` and for layers
+with shared experts, which `top1_prior.linear` refuses. On one batch of the S9 hopping
+configuration (256/1/0 Switch, P→H−P, 598.5M parameters, 72,274 edges, same protocol):
+
+| SO2 route | ms per step | Peak GiB |
+|---|---|---|
+| grouped streaming, top-1 SO2CUDA branch off | 1395 | 50.5 |
+| grouped streaming with the top-1 SO2CUDA branch | 1042 | 49.8 |
+| fused-P0 | 994 | 49.7 |
+
+The fused-P0 route gives the same loss, outputs within 1.9e-7 and gradients within 2.1e-5 of
+the branch-off route (the top-1 branch: 1.0e-5, same parameter). The weight-space fused-P0 route of the dense and non-PA models
 keeps the output layer's two interpolation SO2 layers on the grouped streaming route and m0 on
 the torch path, which is why the PA model on the new route is faster than they are.
 
@@ -178,7 +193,9 @@ imports `indexed_sandwich_multi_block_direct_gemm`, which `dptb.nn.cuda_ops.grou
 not define; a503917 fails it identically. The route's GPU tests compare it with the grouped
 streaming and pack/scatter routes in forward and backward (including the routing
 coefficients) for front and non-front radial layers, interpolation m>0 blocks, layers without
-a shared expert, both GEMM schedules and coefficients that do or do not sum to one.
+a shared expert, both GEMM schedules and coefficients that do or do not sum to one, and, for
+Switch top-1 routes (059507d), with the streamed route and the top-1 pack/scatter branch
+including the gate gradient; those 44 tests pass on an H200.
 
 A production worker carrying the same route code ran the prior_activate + TE-flow hopping arm
 for 30 updates and one ODE validation on 256 test records: the validation MAE and RMSE differ
