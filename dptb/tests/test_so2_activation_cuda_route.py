@@ -27,8 +27,10 @@ def _inputs(layer, n=37, k=2, device="cpu"):
     R = torch.randn(n, 3, generator=g).to(device=device, dtype=x.dtype)
     logits = torch.randn(n, layer.fc_m0.num_experts, generator=g).to(device)
     val, idx = logits.topk(k, dim=-1)
-    val = val.softmax(-1).to(x.dtype)
-    globals_ = MOLEGlobals(sizes=torch.tensor([n]), topk_indices=idx, topk_values=val, activation_space=True)
+    val = val.softmax(-1).to(x.dtype).detach().requires_grad_(True)
+    coeffs = torch.zeros(n, layer.fc_m0.num_experts, device=device, dtype=x.dtype).scatter(1, idx, val)
+    globals_ = MOLEGlobals(coefficients=coeffs, sizes=None, topk_indices=idx,
+                           topk_values=val, activation_space=True)
     return x.requires_grad_(True), R, globals_
 
 
@@ -82,7 +84,7 @@ def test_cuda_route_matches_streamed_route_forward_and_backward(monkeypatch):
         monkeypatch.setenv("DPTB_SO2_ACTIVATION_CUDA", "1" if enabled else "0")
         calls = route.CALLS
         out, _ = layer(x, R, g)
-        grads = torch.autograd.grad(out.square().sum(), [x, *params])
+        grads = torch.autograd.grad(out.square().sum(), [x, g.topk_values, *params])
         return out.detach(), grads, route.CALLS - calls
 
     ref, ref_grads, ref_calls = run(False)

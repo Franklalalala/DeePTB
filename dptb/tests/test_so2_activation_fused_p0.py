@@ -8,7 +8,7 @@ from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
 
 
 def _layer(route, *, irreps_out="4x0e + 3x1o + 2x2e", radial=False, interpolation=False, shared=1,
-           device="cpu"):
+           rotate_in=True, rotate_out=True, device="cpu"):
     torch.manual_seed(20260923)
     layer = SO2_Linear(
         irreps_in="4x0e + 3x1o + 2x2e",
@@ -19,8 +19,8 @@ def _layer(route, *, irreps_out="4x0e + 3x1o + 2x2e", radial=False, interpolatio
         use_interpolation=interpolation,
         num_experts=4,
         num_shared_experts=shared,
-        rotate_in=True,
-        rotate_out=True,
+        rotate_in=rotate_in,
+        rotate_out=rotate_out,
         mole_linear_mode="indexed_ref",
         so2_fusion_mode=route,
     )
@@ -31,7 +31,7 @@ def _inputs(layer, n=37, k=2, device="cpu", sum_to_one=True):
     g = torch.Generator().manual_seed(7)
     x = torch.randn(n, layer.irreps_in.dim, generator=g).to(device)
     R = torch.randn(n, 3, generator=g).to(device)
-    latents = torch.randn(n, 8, generator=g).to(device)
+    latents = torch.randn(n, 8, generator=g).to(device).requires_grad_(True)
     logits = torch.randn(n, layer.fc_m0.num_experts, generator=g).to(device)
     val, idx = logits.topk(k, dim=-1)
     val = val.softmax(-1) if sum_to_one else val.sigmoid()
@@ -94,6 +94,12 @@ CASES = [
     dict(radial=True, irreps_out="3x0e + 2x1o + 1x2e"),
     dict(interpolation=True),                 # m>0 blocks are not MoLE linears
     dict(shared=0),
+    dict(shared=2),
+    dict(radial=True, interpolation=True),
+    dict(radial=True, interpolation=True, irreps_out="3x0e + 2x1o + 1x2e"),
+    dict(rotate_in=False, rotate_out=False),
+    dict(rotate_in=False),
+    dict(rotate_out=False),
 ]
 
 
@@ -117,7 +123,7 @@ def test_fused_route_matches_streamed_route(monkeypatch, case, schedule, sum_to_
         calls = (fused.CALLS, pack_scatter.CALLS)
         out, _ = mod(x, R, g_run, latents=lat)
         params = [p for p in mod.parameters() if p.requires_grad]
-        grads = torch.autograd.grad(out.square().sum(), [x, g.topk_values, *params])
+        grads = torch.autograd.grad(out.square().sum(), [x, g.topk_values, *([lat] if lat is not None else []), *params])
         return out.detach(), grads, (fused.CALLS - calls[0], pack_scatter.CALLS - calls[1])
 
     ref, ref_grads, ref_calls = run(ref_layer, False)
@@ -131,6 +137,8 @@ def test_fused_route_matches_streamed_route(monkeypatch, case, schedule, sum_to_
     ps, ps_grads, ps_calls = run(layer, True)
     assert ps_calls == (0, 1)
     torch.testing.assert_close(ps, got, rtol=1e-5, atol=1e-5)
+    for a, b in zip(ps_grads, got_grads):
+        torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
 
 
 SWITCH_CASES = [dict(), dict(irreps_out="3x0e + 2x1o + 1x2e"), dict(radial=True), dict(interpolation=True)]
@@ -138,9 +146,11 @@ SWITCH_CASES = [dict(), dict(irreps_out="3x0e + 2x1o + 1x2e"), dict(radial=True)
 
 @pytest.mark.skipif(not _cuda_route_available(), reason="needs CUDA and SO2CUDA (so2_cuda_ops)")
 @pytest.mark.parametrize("case", SWITCH_CASES)
-def test_fused_route_matches_switch_top1(monkeypatch, case):
+@pytest.mark.parametrize("schedule", ["per_slot", "expanded"])
+def test_fused_route_matches_switch_top1(monkeypatch, case, schedule):
     from dptb.nn.top1_prior import Top1Route
 
+    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", schedule)
     monkeypatch.setattr(fused, "_DISABLED", False)
     monkeypatch.setattr(pack_scatter, "_ACTIVATION_DISABLED", False)
     ref_layer = _layer("streamed_m_major_cueq", device="cuda", shared=0, **case)
@@ -157,7 +167,7 @@ def test_fused_route_matches_switch_top1(monkeypatch, case):
         calls = (fused.CALLS, fused.TOP1_CALLS, pack_scatter.CALLS)
         out, _ = mod(x, R, route, latents=lat)
         params = [p for p in mod.parameters() if p.requires_grad]
-        grads = torch.autograd.grad(out.square().sum(), [x, gates, *params])
+        grads = torch.autograd.grad(out.square().sum(), [x, gates, *([lat] if lat is not None else []), *params])
         return out.detach(), grads, (fused.CALLS - calls[0], fused.TOP1_CALLS - calls[1], pack_scatter.CALLS - calls[2])
 
     ref, ref_grads, ref_calls = run(ref_layer, True)  # streamed route, no SO2CUDA
@@ -170,3 +180,5 @@ def test_fused_route_matches_switch_top1(monkeypatch, case):
     ps, ps_grads, ps_calls = run(ref_layer, False)
     assert ps_calls == (0, 0, 1)
     torch.testing.assert_close(ps, got, rtol=1e-5, atol=1e-5)
+    for a, b in zip(ps_grads, got_grads):
+        torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
