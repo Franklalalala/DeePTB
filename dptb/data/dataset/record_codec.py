@@ -8,6 +8,7 @@ import ctypes
 import ctypes.util
 import io
 import pickle
+import threading
 import zlib
 
 
@@ -18,22 +19,53 @@ class _NumpyTwoPickleCompat(pickle.Unpickler):
         return super().find_class(module, name)
 
 
+# Resolved once per process: ctypes.util.find_library forks ldconfig on Linux,
+# which cost ~9 ms per record when it ran inside every decompression.  A forked
+# DataLoader worker inherits the loaded handle; the libzstd one-shot API is
+# stateless, so the handle is shared across threads.
+_ZSTD_LIBRARY = None
+_ZSTD_LOCK = threading.Lock()
+_ZSTANDARD_MODULE = None  # the zstandard module, False when it is not installed
+
+
+def _zstd_library():
+    global _ZSTD_LIBRARY
+    if _ZSTD_LIBRARY is None:
+        with _ZSTD_LOCK:
+            if _ZSTD_LIBRARY is None:
+                library = ctypes.util.find_library("zstd")
+                if library is None:
+                    raise ImportError("ZST1 records require zstandard or system libzstd")
+                lib = ctypes.CDLL(library)
+                lib.ZSTD_getFrameContentSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                lib.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
+                lib.ZSTD_decompress.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                lib.ZSTD_decompress.restype = ctypes.c_size_t
+                lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+                lib.ZSTD_isError.restype = ctypes.c_uint
+                _ZSTD_LIBRARY = lib
+    return _ZSTD_LIBRARY
+
+
+def _zstandard():
+    global _ZSTANDARD_MODULE
+    if _ZSTANDARD_MODULE is None:
+        try:
+            import zstandard
+        except ImportError:
+            _ZSTANDARD_MODULE = False
+        else:
+            _ZSTANDARD_MODULE = zstandard
+    return _ZSTANDARD_MODULE or None
+
+
 def _zstd_system_decompress(payload):
-    library = ctypes.util.find_library("zstd")
-    if library is None:
-        raise ImportError("ZST1 records require zstandard or system libzstd")
-    lib = ctypes.CDLL(library)
-    lib.ZSTD_getFrameContentSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    lib.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
-    lib.ZSTD_decompress.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-    ]
-    lib.ZSTD_decompress.restype = ctypes.c_size_t
-    lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
-    lib.ZSTD_isError.restype = ctypes.c_uint
+    lib = _zstd_library()
     source = ctypes.create_string_buffer(payload)
     size = lib.ZSTD_getFrameContentSize(source, len(payload))
     if size >= (1 << 64) - 2:
@@ -52,9 +84,8 @@ def decompress_record(serialized):
     if blob.startswith(b"ZL1\0"):
         return zlib.decompress(blob[4:])
     if blob.startswith(b"ZST1"):
-        try:
-            import zstandard
-        except ImportError:
+        zstandard = _zstandard()
+        if zstandard is None:
             return _zstd_system_decompress(blob[4:])
         # A context per call avoids sharing mutable state between reader threads.
         with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(blob[4:])) as reader:

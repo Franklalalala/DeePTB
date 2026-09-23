@@ -28,14 +28,35 @@ def test_corrupt_compressed_record_fails():
         _loads_with_numpy2_compat(b"ZL1\0not a stream")
 
 
+ZST1_FIXTURE = "WlNUMSi1L/0gHekAAIAElRIAAAAAAAAAfZSMAXiUXZQoSwFLAksDZXMu"
+
+
 def test_zstd_without_python_package(monkeypatch):
     import sys, base64
+    from dptb.data.dataset import record_codec
 
     monkeypatch.setitem(sys.modules, "zstandard", None)
-    fixture = base64.b64decode(
-        "WlNUMSi1L/0gHekAAIAElRIAAAAAAAAAfZSMAXiUXZQoSwFLAksDZXMu"
-    )
+    monkeypatch.setattr(record_codec, "_ZSTANDARD_MODULE", None)  # re-probe the package
+    fixture = base64.b64decode(ZST1_FIXTURE)
     assert _loads_with_numpy2_compat(fixture) == {"x": [1, 2, 3]}
+
+
+def test_system_libzstd_is_resolved_once_per_process(monkeypatch):
+    """find_library forks ldconfig; it must not run once per decoded record."""
+    import base64, ctypes.util
+    from dptb.data.dataset import record_codec
+
+    real = ctypes.util.find_library
+    if real("zstd") is None:
+        pytest.skip("system libzstd is not available")
+    calls = []
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: calls.append(name) or real(name))
+    monkeypatch.setattr(record_codec, "_ZSTD_LIBRARY", None)
+    monkeypatch.setattr(record_codec, "_ZSTANDARD_MODULE", False)  # force the libzstd route
+    fixture = base64.b64decode(ZST1_FIXTURE)
+    for _ in range(50):
+        assert record_codec.loads_record(fixture) == {"x": [1, 2, 3]}
+    assert calls == ["zstd"]
 
 
 def test_metadata_and_training_entrypoints_decode_same_record(tmp_path):
