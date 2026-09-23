@@ -309,6 +309,20 @@ def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
 # MOLE COMPONENTS (Added)
 # ------------------------------------------------------------------------------
 
+def _route_layout_token(tensor):
+    """Host-only metadata for a cached integer routing view; no device sync.
+
+    A retained source tensor prevents allocator address reuse. Inference tensors
+    have no version counter; conservatively do not cache them. Mutation through
+    .data or external raw pointers is outside this contract (as for autograd).
+    """
+    try:
+        return (tensor.data_ptr(), int(tensor._version), tuple(tensor.shape),
+                tuple(tensor.stride()), str(tensor.device), tensor.dtype)
+    except RuntimeError:
+        return None
+
+
 class MOLEGlobals:
     """Stores routing information for the current forward pass."""
 
@@ -334,6 +348,7 @@ class MOLEGlobals:
         # Keyed on the slot index explicitly: the other caches on this object are
         # content-blind and would alias slot 1 onto slot 0's permutation.
         self._expert_slot_layout_cache = {}
+        self._expert_slot_layout_sources = {}
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.topk_indices = topk_indices
         self.topk_values = topk_values
@@ -357,7 +372,10 @@ class MOLEGlobals:
         key = (int(slot), str(expert_index.device), int(expert_index.numel()),
                int(num_experts))
         cached = self._expert_slot_layout_cache.get(key)
-        if cached is not None:
+        token = _route_layout_token(expert_index)
+        sources = self._expert_slot_layout_sources
+        source = sources.get(key)
+        if cached is not None and token is not None and source is not None and source[0] == token:
             return cached
         eidx = expert_index.reshape(-1).to(dtype=torch.long)
         order = torch.argsort(eidx, stable=True)
@@ -367,10 +385,15 @@ class MOLEGlobals:
             torch.arange(order.numel(), device=order.device, dtype=order.dtype),
         )
         counts = torch.bincount(eidx, minlength=int(num_experts))
-        ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long)
+        ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long, device="cpu")
         ptr[1:] = torch.cumsum(counts.to("cpu"), dim=0)
         cached = (order, inverse, ptr.contiguous(), eidx.index_select(0, order))
-        self._expert_slot_layout_cache[key] = cached
+        if token is not None:
+            self._expert_slot_layout_cache[key] = cached
+            sources[key] = (token, expert_index)
+        else:
+            self._expert_slot_layout_cache.pop(key, None)
+            sources.pop(key, None)
         return cached
 
     @staticmethod
@@ -2325,6 +2348,10 @@ class SO2_Linear(torch.nn.Module):
         if (
             os.environ.get("DPTB_SO2_SORTED_EDGE_VIEW", "0") != "0"
             and graph_index is not None
+            # sorted_indexed_view is a weight-space graph-token view. It does
+            # not permute per-row top-k routes or preserve Switch semantics.
+            and not getattr(mole_globals, "activation_space", False)
+            and not getattr(mole_globals, "top1_independent", False)
             and self._cueq_linear_is_enabled()
             and not getattr(mole_globals, "_indexed_inputs_are_sorted", False)
         ):

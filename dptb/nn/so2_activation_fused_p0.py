@@ -72,10 +72,17 @@ def _layouts(mole_globals, idx, num_experts, schedule):
     same three for pair rows.  'expanded' has one layout over the n*k rows
     r = e*k + j of the flattened top-k table; 'per_slot' has one per slot j.
     """
+    try:
+        version = int(idx._version)
+    except RuntimeError:
+        version = None  # inference / transformed tensor: no reliable mutation token
+    source = getattr(mole_globals, "_activation_fused_p0_source", None)
     cache = getattr(mole_globals, "_activation_fused_p0_layouts", None)
-    if cache is None:
+    if (cache is None or version is None or source is None
+            or source[0] is not idx or source[1] != version):
         cache = {}
         mole_globals._activation_fused_p0_layouts = cache
+        mole_globals._activation_fused_p0_source = (idx, version)
     key = (schedule, str(idx.device), tuple(idx.shape), int(num_experts))
     hit = cache.get(key)
     if hit is not None:
@@ -86,24 +93,31 @@ def _layouts(mole_globals, idx, num_experts, schedule):
     else:
         slots = [(idx[:, j], 1) for j in range(k)]
     hit = []
-    for flat, width in slots:
+    for slot, (flat, width) in enumerate(slots):
         flat = flat.to(torch.long)
-        order = torch.argsort(flat, stable=True)
-        inverse = _inverse(order)
-        counts = torch.bincount(flat, minlength=int(num_experts))
-        ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long)
-        ptr[1:] = torch.cumsum(counts.cpu(), dim=0)
+        if schedule == "per_slot" and hasattr(mole_globals, "expert_slot_layout"):
+            # Share the same expert sort/CPU ptr already used by scalar MoLE
+            # and by pack/scatter. Avoid a second sort and device-host sync.
+            order, inverse, ptr, sorted_expert = mole_globals.expert_slot_layout(slot, flat, num_experts)
+        else:
+            order = torch.argsort(flat, stable=True)
+            inverse = _inverse(order)
+            counts = torch.bincount(flat, minlength=int(num_experts))
+            ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long, device="cpu")
+            ptr[1:] = torch.cumsum(counts.cpu(), dim=0)
+            sorted_expert = flat.index_select(0, order)
         gather = torch.div(order, width, rounding_mode="floor") if width > 1 else order
         hit.append({
             "gather": gather,
             "inverse": inverse,
             "ptr": ptr,
-            "sorted_expert": flat.index_select(0, order),
+            "sorted_expert": sorted_expert,
             "pair_gather": _pair_rows(gather),
             "pair_inverse": _pair_rows(inverse),
             "pair_ptr": ptr * 2,
         })
-    cache[key] = hit
+    if version is not None:
+        cache[key] = hit
     return hit
 
 
