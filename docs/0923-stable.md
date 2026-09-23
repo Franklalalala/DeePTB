@@ -32,8 +32,8 @@ every active edge and mixes expert outputs in activation space. On the grouped s
 route (`streamed_m_major_cueq`) its Wigner rotation and m-packing now run on SO2CUDA's
 pack/scatter autograd kernels, the same ones the independent (Switch) top-1 branch uses.
 The per-edge expert mixing stays in `MOLELinear.forward`; no per-edge weights are built.
-A `prior_activate` layer configured with `streamed_m_major_fused_p0` is declined by the
-fused kernel and lands on this route.
+It serves `prior_activate` layers configured with `streamed_m_major_cueq` and is the
+fallback of the fused-P0 route below.
 
 The route is on by default and applies to CUDA float32 with fixed geometry and a supported
 Wigner layout. `DPTB_SO2_ACTIVATION_CUDA=0` disables it. When `so2_cuda_ops` is not
@@ -84,7 +84,9 @@ forward and backward, fixed weights, router buffers restored before every step, 
 
 Against the grouped streaming route on the same step the fused-P0 route gives the same loss,
 outputs within 1.4e-7 and gradients within 5.4e-6 (worst of 267 parameters, relative to the
-parameter's largest gradient).
+parameter's largest gradient). The weight-space fused-P0 route of the dense and non-PA models keeps
+the output layer's two interpolation SO2 layers on the grouped streaming route and m0 on the
+torch path, which is why the PA model on the new route is faster than they are.
 
 Switch top-1 routes (256/1/0, `dptb.nn.top1_prior`) take the same route as one slot without
 folding: each edge's selected expert, bias included, scaled by its retained probability, as
@@ -99,9 +101,7 @@ configuration (256/1/0 Switch, P→H−P, 598.5M parameters, 72,274 edges, same 
 | fused-P0 | 994 | 49.7 |
 
 The fused-P0 route gives the same loss, outputs within 1.9e-7 and gradients within 2.1e-5 of
-the branch-off route (the top-1 branch: 1.0e-5, same parameter). The weight-space fused-P0 route of the dense and non-PA models
-keeps the output layer's two interpolation SO2 layers on the grouped streaming route and m0 on
-the torch path, which is why the PA model on the new route is faster than they are.
+the branch-off route (the top-1 branch: 1.0e-5, same parameter).
 
 ### `train_options.epoch_checkpoint`
 
