@@ -1220,3 +1220,17 @@ def test_multitrainer_dynamic_batch_cfg_can_opt_into_global_dist(monkeypatch):
 
     assert cfg["rank"] == 2
     assert cfg["world_size"] == 4
+
+
+@pytest.mark.parametrize("extra, warns", [({}, False), ({"max_samples": 2}, False), ({"max_samples": 96}, True)])
+def test_dynamic_batch_warns_when_explicit_max_samples_differs_from_batch_size(caplog, extra, warns):
+    dataset = MetadataCostDataset([2, 20, 4, 6])
+    with caplog.at_level("WARNING", logger="dptb.data.dataloader"):
+        opts = resolve_dynamic_batch_options(
+            dataset,
+            batch_size=2,
+            shuffle=False,
+            dynamic_batch={"enabled": True, "mode": "block", "max_cost": 50, **extra},
+        )
+    assert opts["max_samples"] == extra.get("max_samples", 2)
+    assert any("max_samples" in r.getMessage() for r in caplog.records) is warns
