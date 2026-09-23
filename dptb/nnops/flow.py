@@ -30,6 +30,7 @@ this file; they are not block-ode-specific (several are also used by the
 non-block-ode ``rme``/``ao_block`` fallback paths below).
 """
 
+import contextlib
 import copy
 import logging
 import math
@@ -91,6 +92,23 @@ from dptb.nnops.tied_irrep_gaussian_prior import (
 )
 
 log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _seeded_rng_scope(state, seed: int):
+    """Seeded RNG scope for the CPU and the CUDA devices holding tensors of ``state``.
+
+    ``fork_rng`` restores only the generators it is given, and ``torch.manual_seed``
+    reseeds every visible CUDA device, so this seeds exactly the generators it
+    restores.  A seeded generator matches ``torch.manual_seed`` on its device.
+    """
+    devices = sorted({value.device.index for value in state.values()
+                      if isinstance(value, torch.Tensor) and value.device.type == "cuda"})
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        torch.random.default_generator.manual_seed(seed)
+        for index in devices:
+            torch.cuda.default_generators[index].manual_seed(seed)
+        yield
 
 
 _BLOCK_ODE_OUTPUT_ONLY_KEYS = (
@@ -3681,11 +3699,7 @@ class HamiltonianCFM:
             # sampling inside a forked, deterministically seeded RNG scope.
             # Without this a stochastic prior would make every validation pass
             # start from a different point, adding pure jitter to the metric.
-            devices = [state[k].device for k in (self.node_h0_key, self.edge_h0_key)
-                       if isinstance(state.get(k), torch.Tensor)
-                       and state[k].device.type == "cuda"]
-            with torch.random.fork_rng(devices=devices, enabled=True):
-                torch.manual_seed(int(prior_seed))
+            with _seeded_rng_scope(state, int(prior_seed)):
                 return self.sample(
                     model,
                     state,
