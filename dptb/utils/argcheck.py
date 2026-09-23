@@ -776,6 +776,11 @@ def train_options():
         Argument("max_ckpt", int, optional=True, default=4, doc=doc_max_ckpt),
         Argument("max_epoch_ckpt", [int, None], optional=True, default=None,
                  doc=doc_max_epoch_ckpt),
+        Argument("epoch_checkpoint", bool, optional=True, default=True,
+                 doc="Also save a checkpoint at the end of every epoch, in addition to every `save_freq` "
+                     "iterations. Epoch checkpoints are the only exactly resumable ones; with `false` "
+                     "a resume from an iteration checkpoint restarts the data order at the epoch boundary "
+                     "(DPTB_ALLOW_INEXACT_RESUME=1). Default: `true`."),
 
         # distributed / DDP
         Argument("use_ddp", bool, optional=True, default=False, doc=doc_use_ddp),

@@ -12,7 +12,7 @@ from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMon
 from dptb.plugins.training_monitor import register_core_training_monitors
 from dptb.plugins.train_logger import Logger
 from dptb.utils.argcheck import normalize, collect_cutoffs, chk_avg_per_iter
-from dptb.plugins.saver import Saver
+from dptb.plugins.saver import Saver, checkpoint_intervals
 from typing import Tuple, Dict, List, Optional, Any
 from dptb.utils.tools import j_loader, setup_seed, j_must_have
 from dptb.utils.constants import dtype_dict
@@ -698,11 +698,8 @@ def train(
         with open(os.path.join(output, "train_config.json"), "w") as fp:
             json.dump(jdata, fp, indent=4)
 
-        trainer.register_plugin(Saver(
-            # interval=[(jdata["train_options"].get("save_freq"), 'epoch'), (1, 'iteration')] if jdata["train_options"].get(
-            #    "save_freq") else None))
-            interval=[(jdata["train_options"].get("save_freq"), 'iteration'),  (1, 'epoch')] if jdata["train_options"].get(
-                "save_freq") else None), checkpoint_path=checkpoint_path)
+        trainer.register_plugin(Saver(interval=checkpoint_intervals(jdata["train_options"])),
+                                checkpoint_path=checkpoint_path)
         # add a plugin to save the training parameters of the model, with model_output as given path
 
     print_model_params_detailed(trainer.model, logger=log, max_depth=5)
