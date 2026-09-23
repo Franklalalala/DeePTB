@@ -18,11 +18,12 @@
 [![Test](https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml/badge.svg)](https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml)
 -->
 
-## Maintained branch: `0917-stable`
+## Maintained branch: `0923-stable`
 
-Recent H0/NACF, two-stage Edge-MoE, Switch top-1 CUDA and S2 TE-flow development
-is consolidated in `0917-stable`. See the [feature and usage guide](docs/0917-stable.md)
-and [H0 setup](h0/README.md). New fixes and features are maintained on this branch.
+Recent H0/NACF, two-stage Edge-MoE, Switch top-1 CUDA, S2 TE-flow and the production fixes
+of the 0923 SOC wave are consolidated in `0923-stable`. See [0923-stable](docs/0923-stable.md),
+which continues [0921-stable](docs/0921-stable.md) and [0917-stable](docs/0917-stable.md),
+and the [H0 setup](h0/README.md). New fixes and features are maintained on this branch.
 
 ## 🚀 About DeePTB
 DeePTB is an innovative Python package that uses deep learning to accelerate *ab initio* electronic structure simulations. It offers versatile, accurate, and efficient simulations for a wide range of materials and phenomena. Trained on small systems, DeePTB can predict electronic structures of large systems, handle structural perturbations, and integrate with molecular dynamics for finite temperature simulations, providing comprehensive insights into atomic and electronic behavior.
