@@ -170,9 +170,26 @@ longer patch the library. Each comparison is against the same configuration on r
 | dense two-stage, 30 only2b plus 30 GNN-stage updates | stage 2 initialised from the stage-1 checkpoint, GNN seeded, two-body branch unchanged |
 | L2 only2b stage from step 0, 200 updates | loss, running mean and gradient norm identical at steps 100 and 200; 0.48 s per update with the job alone on the node |
 
+With the fused-P0 `prior_activate` route (8af4d9d) the focused tests on an H200 give 250
+passed, 8 skipped and 1 failed, with the production-only `DPTB_MOLE_LINEAR_MODE` and fused-P0
+mode variables unset. The failure,
+`test_so2_non_moe_cublas::test_non_moe_so2_indexed_sandwich_cuda_multi_block_complex_matches_standard`,
+imports `indexed_sandwich_multi_block_direct_gemm`, which `dptb.nn.cuda_ops.grouped_gemm` does
+not define; a503917 fails it identically. The route's GPU tests compare it with the grouped
+streaming and pack/scatter routes in forward and backward (including the routing
+coefficients) for front and non-front radial layers, interpolation m>0 blocks, layers without
+a shared expert, both GEMM schedules and coefficients that do or do not sum to one.
+
+A production worker carrying the same route code ran the prior_activate + TE-flow hopping arm
+for 30 updates and one ODE validation on 256 test records: the validation MAE and RMSE differ
+from the pack/scatter route by 1.2e-8 and 4.7e-8 (relative), the validation loss is identical,
+and the validation pass took 147 s instead of 169 s.
+
 ## Deployment
 
-Hopper release `dptb_ops/releases/20260923_stable_a503917` holds this code (commit a503917;
-later commits change documentation only), a `MANIFEST.json` with per-file SHA-256 and
-`QUALIFICATION.json` with the results above. `dptb_ops/current` is not changed. The 0923 production wave keeps running release
-`20260916_top1_switch_noshared_v1` with its worker patches until its tasks finish.
+Hopper release `dptb_ops/releases/20260923_stable_8af4d9d` holds the code up to the fused-P0
+route (later commits change documentation only), with a `MANIFEST.json` of per-file SHA-256.
+`20260923_stable_a503917` holds the code before it. `dptb_ops/current` is not changed. The
+0923 production wave keeps running release `20260916_top1_switch_noshared_v1` with its worker
+patches; its prior_activate tasks take this route through worker v9, whose route code is
+`dptb/nn/so2_activation_fused_p0.py` of 8af4d9d.
