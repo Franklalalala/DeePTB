@@ -121,6 +121,18 @@ def _layouts(mole_globals, idx, num_experts, schedule):
     return hit
 
 
+def _radial_blocks(module, latents):
+    """radial_emb(latents) split into its m blocks, or None without a radial embedding.
+
+    One split node: its backward concatenates the block gradients once, where a
+    weights[:, a:b] slice per m zero-fills a full-width gradient for every m."""
+    if not module.radial_emb:
+        return None
+    weights = module.radial_emb(latents)
+    bounds = module.m_in_index
+    return torch.split(weights, [bounds[m + 1] - bounds[m] for m in range(module.m_max + 1)], dim=-1)
+
+
 def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     global CALLS, TOP1_CALLS
     from so2_cuda_ops import tensor_product as ops
@@ -136,6 +148,20 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False))
     schedule = _gemm_schedule()
 
+    # Layer-structure conditions are checked before any kernel is launched.
+    linears = []
+    for m in range(module.m_max + 1):
+        fc = module.fc_m0 if m == 0 else (
+            module.m_linear[m - 1].fc if module.m_linear[m - 1].is_mole else None)
+        weight = bias = None
+        if fc is not None:
+            if fc.num_experts != module.fc_m0.num_experts:
+                raise _RouteDeclined("activation fused P0 needs one expert count per SO2 layer")
+            weight, bias = fc._routed_weight_and_bias(fold)
+            if m and bias is not None:
+                raise _RouteDeclined("activation fused P0 expects bias-free m>0 MoLE linears")
+        linears.append((fc, weight, bias))
+
     wigner_D_all = module._ensure_wigner_rotation(R, wigner_D_all)
     if ops._wigner_requires_grad(wigner_D_all):
         raise _RouteDeclined("activation fused P0 does not differentiate Wigner matrices")
@@ -143,35 +169,29 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     if info is None:
         raise _RouteDeclined("unsupported Wigner layout for activation fused P0")
     wigner, compact_offsets, mode, stride = info
-    weights = module.radial_emb(latents) if module.radial_emb else None
+    radials = _radial_blocks(module, latents)
     layouts = _layouts(mole_globals, idx, module.fc_m0.num_experts, schedule)
     out_dim = module.irreps_out.dim
     x = x.contiguous()
 
     blocks = []
-    for m in range(module.m_max + 1):
+    for m, (fc, weight, bias) in enumerate(linears):
         ib, il, ob, ol, offsets = ops._pair_maps(module, m, x.device)
         common = (wigner, ib, il, offsets, compact_offsets)
         if m == 0:
             inp = ops._PackM0Function.apply(x, *common, module.rotate_in, mode, stride)
-            fc = module.fc_m0
         else:
             inp = ops._PackPairFunction.apply(x, *common, m, module.rotate_in, mode, stride)
-            fc = module.m_linear[m - 1].fc if module.m_linear[m - 1].is_mole else None
         radial = None
-        if weights is not None:
-            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]]
+        if radials is not None:
+            radial = radials[m]
             if m:
                 radial = radial.unsqueeze(1)
             if module.front:
                 inp = inp * radial
         block = {"m": m, "inp": inp, "radial": radial, "maps": (ob, ol, offsets), "fc": fc}
         if fc is not None:
-            if fc.num_experts != module.fc_m0.num_experts:
-                raise _RouteDeclined("activation fused P0 needs one expert count per SO2 layer")
-            block["weight"], block["bias"] = fc._routed_weight_and_bias(fold)
-            if m and block["bias"] is not None:
-                raise _RouteDeclined("activation fused P0 expects bias-free m>0 MoLE linears")
+            block["weight"], block["bias"] = weight, bias
         blocks.append(block)
 
     routed = [b for b in blocks if b["fc"] is not None]

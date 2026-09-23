@@ -30,7 +30,8 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *,
     if info is None:
         raise RuntimeError('unsupported Wigner layout for activation CUDA pack/scatter')
     wigner, compact_offsets, mode, stride = info
-    weights = module.radial_emb(latents) if module.radial_emb else None
+    from .so2_activation_fused_p0 import _radial_blocks
+    radials = _radial_blocks(module, latents)
     out = None
     for m in range(module.m_max + 1):
         ib, il, ob, ol, offsets = ops._pair_maps(module, m, x.device)
@@ -40,8 +41,8 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *,
         else:
             inp = ops._PackPairFunction.apply(x.contiguous(), *common, m, module.rotate_in, mode, stride)
         radial = None
-        if weights is not None:
-            radial = weights[:, module.m_in_index[m]:module.m_in_index[m + 1]]
+        if radials is not None:
+            radial = radials[m]
             if m: radial = radial.unsqueeze(1)
             if module.front: inp = inp * radial
         y = module.fc_m0(inp, mole_globals) if m == 0 else module.m_linear[m-1](inp, mole_globals)
