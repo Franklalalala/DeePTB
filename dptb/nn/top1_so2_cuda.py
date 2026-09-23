@@ -1,11 +1,19 @@
-"""Reused SO2CUDA pack/scatter, scoped to the independent top-1 branch.
+"""Reused SO2CUDA pack/scatter for the streamed SO2 route of routed MoLE layers.
 
 Derived from the qualified 20260912 activation CUDA adapter; no new kernels.
+The Wigner rotation and m-packing run on SO2CUDA's pack/scatter autograd
+kernels while the expert linear stays in MOLELinear.forward: the independent
+top-1 branch (Switch) and activation-space prior_activate (per-edge top-k
+mixing of expert outputs) both use it.  No parameter-space mixing and no
+per-edge weights are built.
 """
 import os
 import torch
 
 CALLS = 0
+ACTIVATION_FALLBACKS = 0
+ACTIVATION_LAST_ERROR = None
+_ACTIVATION_DISABLED = False
 
 def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *, route):
     global CALLS
@@ -61,3 +69,39 @@ def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *, 
     if ops._wigner_requires_grad(wigner) or ops._wigner_tensor_and_mode(module, wigner, x) is None:
         return None
     return cuda_forward(module, x, R, mole_globals, latents, wigner, route=route)
+
+
+def activation_route_enabled():
+    """DPTB_SO2_ACTIVATION_CUDA=0 keeps prior_activate on the streamed SO2 route."""
+    return os.environ.get("DPTB_SO2_ACTIVATION_CUDA", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def try_activation_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *, route):
+    """prior_activate (activation-space MoLE) through the same pack/scatter kernels.
+
+    Returns None when the route does not apply (disabled, CPU, float64,
+    differentiable geometry, unsupported Wigner layout, SO2CUDA not
+    importable); the caller then runs the streamed route.  The first
+    RuntimeError from the CUDA path switches this process back to the streamed
+    route for good and is logged once.
+    """
+    global ACTIVATION_FALLBACKS, ACTIVATION_LAST_ERROR, _ACTIVATION_DISABLED
+    if _ACTIVATION_DISABLED or not activation_route_enabled():
+        return None
+    if x.device.type != 'cuda' or x.dtype != torch.float32:
+        return None
+    try:
+        import so2_cuda_ops  # noqa: F401
+    except ImportError as exc:
+        _ACTIVATION_DISABLED = True
+        ACTIVATION_LAST_ERROR = repr(exc)[:800]
+        print('SO2_ACTIVATION_CUDA_UNAVAILABLE (streamed route): %s' % ACTIVATION_LAST_ERROR, flush=True)
+        return None
+    try:
+        return try_forward(module, x, R, mole_globals, latents, wigner_D_all, route=route)
+    except RuntimeError as exc:
+        ACTIVATION_FALLBACKS += 1
+        _ACTIVATION_DISABLED = True
+        ACTIVATION_LAST_ERROR = repr(exc)[:800]
+        print('SO2_ACTIVATION_CUDA_FALLBACK (streamed route from now on): %s' % ACTIVATION_LAST_ERROR, flush=True)
+        return None

@@ -2293,6 +2293,12 @@ class SO2_Linear(torch.nn.Module):
             result = try_forward(self, x, R, mole_globals, latents, wigner_D_all, route=route)
             if result is not None:
                 return result
+        elif getattr(mole_globals, "activation_space", False):
+            # prior_activate: SO2CUDA pack/scatter, per-edge expert mixing unchanged.
+            from .top1_so2_cuda import try_activation_forward
+            result = try_activation_forward(self, x, R, mole_globals, latents, wigner_D_all, route=route)
+            if result is not None:
+                return result
         self._prepare_streamed_route(route)
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
         wigner_D_return = wigner_D_all
