@@ -14,6 +14,10 @@ m0 joins the same grouped calls (its bias is per expert).  m>0 blocks that are
 not MoLE linears (the interpolation blocks of the output layer) run their own
 linear and the finished-output scatter.  The kernels are SO2CUDA's existing
 pack, cuBLAS grouped GEMM and scatter kernels.
+
+Switch top-1 routes (dptb.nn.top1_prior, 256/1/0) are the case k = 1 without a
+shared expert: each edge's selected expert, scaled by its retained probability,
+exactly as top1_prior.linear computes it.
 """
 import os
 
@@ -21,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 CALLS = 0
+TOP1_CALLS = 0
 FALLBACKS = 0
 LAST_ERROR = None
 _DISABLED = False
@@ -98,7 +103,7 @@ def _layouts(mole_globals, idx, num_experts, schedule):
 
 
 def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
-    global CALLS
+    global CALLS, TOP1_CALLS
     from so2_cuda_ops import tensor_product as ops
     from so2_cuda_ops.grouped_gemm import grouped_gemm_multi
 
@@ -201,6 +206,8 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
                 part = ops._ScatterRawPairOutputFunction.apply(y.contiguous(), *common_out, m, module.rotate_out, mode, stride)
         out = part if out is None else out + part
     CALLS += 1
+    if getattr(mole_globals, "top1_independent", False):
+        TOP1_CALLS += 1
     if CALLS == 1:
         print("SO2_ACTIVATION_FUSED_P0_ACTIVE pid=%s edges=%s top_k=%s m_max=%s gemm=%s mode=%s"
               % (os.getpid(), n, k, module.m_max, schedule, mode), flush=True)
@@ -208,12 +215,18 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
 
 
 def _routed(mole_globals, x):
-    """The per-row top-k routing MOLELinear.forward would apply in activation space
-    (without coefficients it averages the experts instead)."""
+    """The per-row top-k routing MOLELinear.forward would apply in activation space:
+    prior_activate routes carry coefficients (without them MOLELinear averages the
+    experts instead); Switch top-1 routes (top1_prior) carry the selected expert and
+    its retained probability, applied as gate * (W_e x + b_e)."""
     idx = getattr(mole_globals, "topk_indices", None)
     val = getattr(mole_globals, "topk_values", None)
-    return (getattr(mole_globals, "coefficients", None) is not None
-            and idx is not None and val is not None and idx.dim() == 2 and idx.shape[0] == x.shape[0])
+    if getattr(mole_globals, "top1_independent", False):
+        if getattr(mole_globals, "top1_reference_so2", False) or idx is None or idx.dim() != 2 or idx.shape[1] != 1:
+            return False
+    elif getattr(mole_globals, "coefficients", None) is None:
+        return False
+    return idx is not None and val is not None and idx.dim() == 2 and idx.shape[0] == x.shape[0]
 
 
 def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
@@ -231,6 +244,8 @@ def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
         return None
     if (torch.is_tensor(R) and R.requires_grad) or not _routed(mole_globals, x):
         return None
+    if getattr(mole_globals, "top1_independent", False) and module.fc_m0.num_shared_experts != 0:
+        return None  # top1_prior.linear refuses shared experts; keep its error
     try:
         import so2_cuda_ops  # noqa: F401
     except ImportError as exc:

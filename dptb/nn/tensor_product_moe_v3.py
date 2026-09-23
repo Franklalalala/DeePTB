@@ -1748,8 +1748,9 @@ class SO2_Linear(torch.nn.Module):
             )
         if self.so2_fusion_mode == "streamed_m_major_fused_p0":
             if getattr(mole_globals, "activation_space", False):
-                # prior_activate: the weight-space fused kernel would build one
-                # mixed weight per edge, so the grouped GEMM segments by expert.
+                # prior_activate and Switch top-1: the weight-space fused kernel
+                # would build one mixed weight per edge, so the grouped GEMM
+                # segments by expert.
                 from .so2_activation_fused_p0 import try_forward as try_activation_fused_p0
 
                 fused_result = try_activation_fused_p0(self, x, R, mole_globals, latents, wigner_D_all)
