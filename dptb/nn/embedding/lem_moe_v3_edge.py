@@ -478,10 +478,14 @@ class LemMoEV3Edge(LemMoEV3):
             topk_indices, topk_values = self.router.last_topk()
             num_route_tokens = coeffs.new_tensor(float(coeffs.shape[0]))
 
+        # One coefficient row per active edge: row i routes edge i.  Without the
+        # graph_index every MOLELinear backend treats all rows as one route and
+        # applies row 0's mix to every edge.
         return (
             MOLEGlobals(
                 coefficients=coeffs,
                 sizes=None,
+                graph_index=torch.arange(num_active_edges, device=coeffs.device),
                 topk_indices=topk_indices,
                 topk_values=topk_values,
             ),
