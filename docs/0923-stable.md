@@ -43,8 +43,50 @@ keeps the streamed route. The first call prints `SO2_ACTIVATION_CUDA_ACTIVE`.
 This is the qualified 20260912 activation CUDA adapter. Against the streamed route its
 outputs agree to within 5.2e-7 and its gradients to within 2.8e-6. On the PA 24/2/1 hopping
 arm (bs 32), 20 updates gave losses and gradient norms identical to 4 decimals, and an update
-took 1.36 s instead of 1.66 s. A kernel that fuses `prior_activate` into fused-p0 itself
-(segments by expert id with k-way weights) is not implemented.
+took 1.36 s instead of 1.66 s.
+
+### prior_activate on the fused-P0 route
+
+`dptb/nn/so2_activation_fused_p0.py`, `dptb/nn/tensor_product_moe_v3.py`,
+`dptb/nn/embedding/lem_moe_v3_edge.py`, `dptb/utils/argcheck.py`. `streamed_m_major_fused_p0`
+(`indexed_sandwich_multi`) mixes one weight per route token, which per-edge routing cannot
+afford. For activation-space MoLE the same structure now runs with the grouped GEMM segmented
+by expert id: SO2CUDA packs each m once; one cuBLAS grouped call per top-k slot covers m0 and
+every m>0 block over that slot's rows sorted by expert, each expert with its own weight (the
+shared expert folded in when the coefficients sum to one); the slot outputs of an edge are
+summed with its routing coefficients; the raw GEMM output is scattered straight into the
+rotated output. Interpolation m>0 blocks (the output layer) run their own linear and the
+finished-output scatter, so all six SO2 layers of the production model take the route. No
+per-edge weight is built and no new kernel is involved.
+
+`prior_activate` now accepts `so2_fusion_mode: streamed_m_major_fused_p0` and uses it by
+default. The route declines to the pack/scatter route, and then to the grouped streaming
+route, off CUDA float32, with differentiable geometry, without per-row routing coefficients,
+without `so2_cuda_ops`, with `DPTB_SO2_ACTIVATION_FUSED_P0=0`, or after its first CUDA error
+(logged once as `SO2_ACTIVATION_FUSED_P0_FALLBACK`). The first call prints
+`SO2_ACTIVATION_FUSED_P0_ACTIVE`. `DPTB_SO2_ACTIVATION_FUSED_P0_GEMM=expanded` puts the rows of
+all slots into one grouped call instead.
+
+One training batch of the S1 hopping configuration (32 structures, 72,274 edges, H200,
+forward and backward, fixed weights, router buffers restored before every step, median of
+30 steps):
+
+| Model | SO2 route | ms per step | Peak GiB |
+|---|---|---|---|
+| PA 24/2/1 | grouped streaming (`streamed_m_major_cueq`, no SO2CUDA) | 1675 | 49.8 |
+| PA 24/2/1 | pack/scatter activation route | 1321 | 49.0 |
+| PA 24/2/1 | fused-P0, one grouped call per slot | **1124** | 48.9 |
+| PA 24/2/1 | fused-P0, one grouped call for all slots | 1149 | 48.9 |
+| 24/2/1 without PA | fused-P0 `indexed_sandwich_multi` | 1294 | 44.2 |
+| 24/2/1 without PA | grouped streaming | 1395 | 43.8 |
+| dense 1/1/0 | fused-P0 `indexed_sandwich_multi` | 1275 | 39.6 |
+| dense 1/1/0 | grouped streaming | 1377 | 39.2 |
+
+Against the grouped streaming route on the same step the fused-P0 route gives the same loss,
+outputs within 1.4e-7 and gradients within 5.4e-6 (worst of 267 parameters, relative to the
+parameter's largest gradient). The weight-space fused-P0 route of the dense and non-PA models
+keeps the output layer's two interpolation SO2 layers on the grouped streaming route and m0 on
+the torch path, which is why the PA model on the new route is faster than they are.
 
 ### `train_options.epoch_checkpoint`
 
