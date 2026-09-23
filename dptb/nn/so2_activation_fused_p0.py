@@ -268,12 +268,16 @@ def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
         return None
     if x.device.type != "cuda" or x.dtype != torch.float32:
         return None
-    if torch.is_autocast_enabled():
-        return None  # x can remain float32 inside a CUDA autocast region
+    if (torch.is_autocast_enabled()
+            or getattr(torch._C, "_are_functorch_transforms_active", lambda: False)()):
+        return None  # first-order float32 adapter, not an autocast/torch.func qualification
     if (torch.is_tensor(R) and R.requires_grad) or not _routed(mole_globals, x):
         return None
-    if getattr(mole_globals, "top1_independent", False) and module.fc_m0.num_shared_experts != 0:
-        return None  # top1_prior.linear refuses shared experts; keep its error
+    if getattr(mole_globals, "top1_independent", False):
+        linears = [module.fc_m0] + [block.fc for block in getattr(module, "m_linear", ())
+                                   if getattr(block, "is_mole", False)]
+        if any(fc.num_shared_experts != 0 for fc in linears):
+            return None  # top1_prior.linear refuses sharing in every block, not only m0
     try:
         import so2_cuda_ops  # noqa: F401
     except ImportError as exc:

@@ -65,7 +65,8 @@ def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *, 
         return None
     if torch.is_tensor(R) and R.requires_grad:
         return None
-    if torch.is_autocast_enabled():
+    if (torch.is_autocast_enabled()
+            or getattr(torch._C, "_are_functorch_transforms_active", lambda: False)()):
         return None
     # This function is also the Switch fallback when fused-P0 is unavailable.
     # The optional pack/scatter package must not become mandatory here.
