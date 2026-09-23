@@ -395,6 +395,28 @@ def _manual_dense(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "direction, map_atol",
+    [
+        ((0.31, -0.42, 0.85), 1.0e-14),
+        ((0.6, 0.0, -0.8), 1.0e-14),
+        ((3.0e-5, -2.0e-5, -1.0), 1.0e-14),
+        ((1.0e-6, 3.0e-7, -1.0), 1.0e-14),
+        ((2.0e-7, 0.0, -1.0), 1.0e-14),  # just outside the pole snap: 1 + cos = 2e-14
+        ((1.0e-7, 0.0, -1.0), 2.0e-7),  # inside the snap window: exactly -z
+        ((0.0, 0.0, -1.0), 1.0e-14),
+        ((0.0, 0.0, 1.0), 1.0e-14),
+    ],
+)
+def test_rotation_z_to_is_a_proper_rotation_onto_direction(direction, map_atol):
+    n = np.asarray(direction, dtype=np.float64)
+    n = n / np.linalg.norm(n)
+    q = rotation_z_to(n)
+    np.testing.assert_allclose(q @ q.T, np.eye(3), atol=1.0e-14, rtol=0.0)
+    np.testing.assert_allclose(np.linalg.det(q), 1.0, atol=1.0e-14)
+    np.testing.assert_allclose(q @ np.asarray([0.0, 0.0, 1.0]), n, atol=map_atol, rtol=0.0)
+
+
 def test_real_harmonic_rotations_are_orthogonal_through_f_shell():
     rotator = RealHarmonicRotator(3)
     q = rotation_z_to(np.asarray([0.31, -0.42, 0.85]))
