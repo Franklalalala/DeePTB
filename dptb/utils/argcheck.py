@@ -3727,7 +3727,7 @@ def normalize(data):
     data = canonicalize_training_config(data)
     embedding = data.get("model_options", {}).get("embedding", {})
     if embedding.get("method") in {"lem_moe_v3_edge", "lem_moe_v3_edge_h0", "lem_moe_v3_edge_prior_2b"}:
-        embedding.setdefault("so2_fusion_mode", "streamed_m_major_cueq" if embedding.get("edge_router_prior_activate", False) else "streamed_m_major_fused_p0")
+        embedding.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
     co = common_options()
     tr = train_options()
     da = data_options()

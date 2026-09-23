@@ -1046,8 +1046,8 @@ class MOLELinear(nn.Module):
                 "activation-space MoLE reached the weight-space path, which "
                 "would materialise one [out_features, in_features] weight per "
                 "route token -- exactly what per-edge routing cannot afford. "
-                "Set so2_fusion_mode='staged' so every MOLELinear is reached "
-                "through MOLELinear.forward."
+                "Reach every MOLELinear through MOLELinear.forward or the "
+                "expert-segmented fused-P0 route (so2_activation_fused_p0)."
             )
         coefficients = mole_globals.coefficients
         topk_indices = getattr(mole_globals, "topk_indices", None)
@@ -1747,6 +1747,23 @@ class SO2_Linear(torch.nn.Module):
                 route="streamed_m_major_cueq",
             )
         if self.so2_fusion_mode == "streamed_m_major_fused_p0":
+            if getattr(mole_globals, "activation_space", False):
+                # prior_activate: the weight-space fused kernel would build one
+                # mixed weight per edge, so the grouped GEMM segments by expert.
+                from .so2_activation_fused_p0 import try_forward as try_activation_fused_p0
+
+                fused_result = try_activation_fused_p0(self, x, R, mole_globals, latents, wigner_D_all)
+                if fused_result is not None:
+                    return fused_result
+            if getattr(mole_globals, "activation_space", False) or getattr(mole_globals, "top1_independent", False):
+                return self._forward_streamed_m_major_grouped(
+                    x,
+                    R,
+                    mole_globals,
+                    latents,
+                    wigner_D_all,
+                    route="streamed_m_major_cueq",
+                )
             from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
 
             fused_result = try_forward_so2_moe_fused_p0(
