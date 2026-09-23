@@ -117,8 +117,20 @@ the record codec, the `prior_activate` route including its GPU equivalence test,
 triggers, dynamic batching, the P2 table, streamed SO2 bounds, Switch top-1, prior-2b PA,
 restart/resume, the plugin clock, the flow TE prior and the default smoke suite.
 
+A GPU smoke on an H200 ran the Hopper release of this code with production workers that no
+longer patch the library. Each comparison is against the same configuration on release
+`20260916_top1_switch_noshared_v1`:
+
+| Run | Result |
+|---|---|
+| PA 24/2/1 hopping, 20 updates | `SO2_ACTIVATION_CUDA_ACTIVE`; loss and gradient norm identical at every update to the old code run with the worker patch; peak 47.37 GB on both |
+| 256/1/0 Switch P→Pres, 30 updates plus validation on 256 test records | losses identical; validation MAE/RMSE equal to 1e-9; top-1 CUDA branch used 1,716 times on both |
+| dense two-stage, 30 only2b plus 30 GNN-stage updates | stage 2 initialised from the stage-1 checkpoint, GNN seeded, two-body branch unchanged |
+| L2 only2b stage from step 0, 200 updates | loss, running mean and gradient norm identical at steps 100 and 200; 0.48 s per update with the job alone on the node |
+
 ## Deployment
 
-Hopper release `dptb_ops/releases/20260923_stable_a503917` holds this code and a
-`MANIFEST.json` with per-file SHA-256. The 0923 production wave keeps running release
+Hopper release `dptb_ops/releases/20260923_stable_a503917` holds this code (commit a503917;
+later commits change documentation only), a `MANIFEST.json` with per-file SHA-256 and
+`QUALIFICATION.json` with the results above. `dptb_ops/current` is not changed. The 0923 production wave keeps running release
 `20260916_top1_switch_noshared_v1` with its worker patches until its tasks finish.
