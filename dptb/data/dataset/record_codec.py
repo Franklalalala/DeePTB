@@ -7,6 +7,7 @@ row ordering. Zstandard may use its Python package or the system libzstd.
 import ctypes
 import ctypes.util
 import io
+import os
 import pickle
 import threading
 import zlib
@@ -26,6 +27,18 @@ class _NumpyTwoPickleCompat(pickle.Unpickler):
 _ZSTD_LIBRARY = None
 _ZSTD_LOCK = threading.Lock()
 _ZSTANDARD_MODULE = None  # the zstandard module, False when it is not installed
+
+
+def _reset_zstd_lock_after_fork():
+    # A fork during another thread's lazy initialisation can inherit a locked
+    # mutex with no surviving owner. Keep fully initialised handles; they are
+    # published only at the end of _zstd_library(). Never re-use the old mutex.
+    global _ZSTD_LOCK
+    _ZSTD_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_zstd_lock_after_fork)
 
 
 def _zstd_library():
