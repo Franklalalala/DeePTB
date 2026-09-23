@@ -10,7 +10,7 @@ weight (the shared expert folded in when the coefficients sum to one), and the
 k slot outputs of an edge are summed with its routing coefficients before the
 scatter.  No per-edge weight is built.
 
-m0 joins the same grouped call (its bias is per expert).  m>0 blocks that are
+m0 joins the same grouped calls (its bias is per expert).  m>0 blocks that are
 not MoLE linears (the interpolation blocks of the output layer) run their own
 linear and the finished-output scatter.  The kernels are SO2CUDA's existing
 pack, cuBLAS grouped GEMM and scatter kernels.
@@ -32,9 +32,11 @@ def enabled():
 
 
 def _gemm_schedule():
-    """'expanded' (default): one grouped call holds the rows of every top-k slot.
-    'per_slot': one grouped call per slot, each over that slot's sort order."""
-    value = os.environ.get("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", "expanded").strip().lower()
+    """'per_slot' (default): one grouped call per top-k slot, each over that slot's
+    sort order (the row grouping of MOLELinear._apply_activation_space).
+    'expanded': one grouped call holds the rows of every slot.  H200, PA 24/2/1,
+    72,274 edges, fwd+bwd: 1124 ms per_slot, 1149 ms expanded."""
+    value = os.environ.get("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", "per_slot").strip().lower()
     if value not in ("expanded", "per_slot"):
         raise RuntimeError("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM must be expanded or per_slot, got %r" % value)
     return value
@@ -104,12 +106,8 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
         raise RuntimeError("activation fused P0 requires CUDA float32")
     if torch.is_tensor(R) and R.requires_grad:
         raise RuntimeError("activation fused P0 requires fixed geometry")
-    idx = getattr(mole_globals, "topk_indices", None)
-    val = getattr(mole_globals, "topk_values", None)
-    if idx is None or val is None or idx.dim() != 2 or idx.shape[0] != x.shape[0]:
-        raise RuntimeError("activation fused P0 needs one top-k row per input row")
-    idx = idx.to(device=x.device, dtype=torch.long)
-    val = val.to(device=x.device, dtype=x.dtype)
+    idx = mole_globals.topk_indices.to(device=x.device, dtype=torch.long)
+    val = mole_globals.topk_values.to(device=x.device, dtype=x.dtype)
     n, k = idx.shape
     fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False))
     schedule = _gemm_schedule()
@@ -209,19 +207,29 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     return out.contiguous(), wigner_D_all
 
 
+def _routed(mole_globals, x):
+    """The per-row top-k routing MOLELinear.forward would apply in activation space
+    (without coefficients it averages the experts instead)."""
+    idx = getattr(mole_globals, "topk_indices", None)
+    val = getattr(mole_globals, "topk_values", None)
+    return (getattr(mole_globals, "coefficients", None) is not None
+            and idx is not None and val is not None and idx.dim() == 2 and idx.shape[0] == x.shape[0])
+
+
 def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     """Return (out, wigner) or None; the caller then takes the pack/scatter route.
 
-    None when disabled, on CPU or float64, with differentiable geometry, or when
-    SO2CUDA is not importable.  The first RuntimeError from the CUDA path turns
-    this route off for the process and is logged once.
+    None when disabled, on CPU or float64, with differentiable geometry, without
+    per-row top-k routing, or when SO2CUDA is not importable.  The first
+    RuntimeError from the CUDA path turns this route off for the process and is
+    logged once.
     """
     global FALLBACKS, LAST_ERROR, _DISABLED
     if _DISABLED or not enabled():
         return None
     if x.device.type != "cuda" or x.dtype != torch.float32:
         return None
-    if torch.is_tensor(R) and R.requires_grad:
+    if (torch.is_tensor(R) and R.requires_grad) or not _routed(mole_globals, x):
         return None
     try:
         import so2_cuda_ops  # noqa: F401

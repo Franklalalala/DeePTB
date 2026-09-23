@@ -36,15 +36,24 @@ def _inputs(layer, n=37, k=2, device="cpu", sum_to_one=True):
     val, idx = logits.topk(k, dim=-1)
     val = val.softmax(-1) if sum_to_one else val.sigmoid()
     val = val.detach().requires_grad_(True)
-    globals_ = MOLEGlobals(sizes=torch.tensor([n]), topk_indices=idx, topk_values=val,
-                           activation_space=True, coefficients_sum_to_one=sum_to_one)
+    globals_ = _globals(idx, val, layer.fc_m0.num_experts, sum_to_one)
     return x.requires_grad_(True), R, latents, globals_
 
 
-def test_route_declines_on_cpu_and_can_be_disabled(monkeypatch):
+def _globals(idx, val, num_experts, sum_to_one):
+    # as LemMoEV3Edge builds them: without coefficients MOLELinear.forward averages the experts
+    coeffs = torch.zeros(idx.shape[0], num_experts, dtype=val.dtype, device=val.device).scatter(1, idx, val)
+    return MOLEGlobals(coefficients=coeffs, sizes=None, topk_indices=idx, topk_values=val,
+                       activation_space=True, coefficients_sum_to_one=sum_to_one)
+
+
+def test_route_declines_on_cpu_and_without_routing(monkeypatch):
     layer = _layer("streamed_m_major_fused_p0")
     x, R, latents, g = _inputs(layer)
     assert fused.try_forward(layer, x, R, g) is None
+    assert fused._routed(g, x)
+    assert not fused._routed(MOLEGlobals(sizes=None, topk_indices=g.topk_indices, topk_values=g.topk_values,
+                                         activation_space=True), x)
     monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0", "0")
     assert not fused.enabled()
     monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0", "1")
@@ -104,8 +113,7 @@ def test_fused_route_matches_streamed_route(monkeypatch, case, schedule, sum_to_
 
     def run(mod, activation_cuda):
         monkeypatch.setenv("DPTB_SO2_ACTIVATION_CUDA", "1" if activation_cuda else "0")
-        g_run = MOLEGlobals(sizes=g.sizes, topk_indices=g.topk_indices, topk_values=g.topk_values,
-                            activation_space=True, coefficients_sum_to_one=sum_to_one)
+        g_run = _globals(g.topk_indices, g.topk_values, layer.fc_m0.num_experts, sum_to_one)
         calls = (fused.CALLS, pack_scatter.CALLS)
         out, _ = mod(x, R, g_run, latents=lat)
         params = [p for p in mod.parameters() if p.requires_grad]
