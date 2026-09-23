@@ -29,6 +29,11 @@ TOP1_CALLS = 0
 FALLBACKS = 0
 LAST_ERROR = None
 _DISABLED = False
+_DECLINE_WARNED = set()
+
+
+class _RouteDeclined(RuntimeError):
+    """An explicitly unsupported input, not a CUDA/runtime computation failure."""
 
 
 def enabled():
@@ -108,9 +113,9 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     from so2_cuda_ops.grouped_gemm import grouped_gemm_multi
 
     if x.device.type != "cuda" or x.dtype != torch.float32:
-        raise RuntimeError("activation fused P0 requires CUDA float32")
+        raise _RouteDeclined("activation fused P0 requires CUDA float32")
     if torch.is_tensor(R) and R.requires_grad:
-        raise RuntimeError("activation fused P0 requires fixed geometry")
+        raise _RouteDeclined("activation fused P0 requires fixed geometry")
     idx = mole_globals.topk_indices.to(device=x.device, dtype=torch.long)
     val = mole_globals.topk_values.to(device=x.device, dtype=x.dtype)
     n, k = idx.shape
@@ -119,10 +124,10 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
 
     wigner_D_all = module._ensure_wigner_rotation(R, wigner_D_all)
     if ops._wigner_requires_grad(wigner_D_all):
-        raise RuntimeError("activation fused P0 does not differentiate Wigner matrices")
+        raise _RouteDeclined("activation fused P0 does not differentiate Wigner matrices")
     info = ops._wigner_tensor_and_mode(module, wigner_D_all, x)
     if info is None:
-        raise RuntimeError("unsupported Wigner layout for activation fused P0")
+        raise _RouteDeclined("unsupported Wigner layout for activation fused P0")
     wigner, compact_offsets, mode, stride = info
     weights = module.radial_emb(latents) if module.radial_emb else None
     layouts = _layouts(mole_globals, idx, module.fc_m0.num_experts, schedule)
@@ -149,10 +154,10 @@ def cuda_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
         block = {"m": m, "inp": inp, "radial": radial, "maps": (ob, ol, offsets), "fc": fc}
         if fc is not None:
             if fc.num_experts != module.fc_m0.num_experts:
-                raise RuntimeError("activation fused P0 needs one expert count per SO2 layer")
+                raise _RouteDeclined("activation fused P0 needs one expert count per SO2 layer")
             block["weight"], block["bias"] = fc._routed_weight_and_bias(fold)
             if m and block["bias"] is not None:
-                raise RuntimeError("activation fused P0 expects bias-free m>0 MoLE linears")
+                raise _RouteDeclined("activation fused P0 expects bias-free m>0 MoLE linears")
         blocks.append(block)
 
     routed = [b for b in blocks if b["fc"] is not None]
@@ -221,27 +226,36 @@ def _routed(mole_globals, x):
     its retained probability, applied as gate * (W_e x + b_e)."""
     idx = getattr(mole_globals, "topk_indices", None)
     val = getattr(mole_globals, "topk_values", None)
-    if getattr(mole_globals, "top1_independent", False):
-        if getattr(mole_globals, "top1_reference_so2", False) or idx is None or idx.dim() != 2 or idx.shape[1] != 1:
-            return False
-    elif getattr(mole_globals, "coefficients", None) is None:
+    if not torch.is_tensor(idx) or not torch.is_tensor(val):
         return False
-    return idx is not None and val is not None and idx.dim() == 2 and idx.shape[0] == x.shape[0]
+    if (len(x.shape) != 2 or idx.dim() != 2 or val.shape != idx.shape
+            or idx.shape[0] != x.shape[0] or idx.shape[1] == 0
+            or idx.dtype not in (torch.int32, torch.int64)):
+        return False
+    if getattr(mole_globals, "top1_independent", False):
+        return not getattr(mole_globals, "top1_reference_so2", False) and idx.shape[1] == 1
+    # The adapter is also callable directly. Never reinterpret graph-token
+    # weight-space routing as per-row activation-space routing.
+    return (bool(getattr(mole_globals, "activation_space", False))
+            and getattr(mole_globals, "coefficients", None) is not None)
 
 
 def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
     """Return (out, wigner) or None; the caller then takes the pack/scatter route.
 
     None when disabled, on CPU or float64, with differentiable geometry, without
-    per-row top-k routing, or when SO2CUDA is not importable.  The first
-    RuntimeError from the CUDA path turns this route off for the process and is
-    logged once.
+    per-row top-k routing, or when SO2CUDA is not importable.  An
+    explicitly unsupported input declines this call without disabling later
+    compatible calls. Unexpected RuntimeError (including OOM/device faults) is
+    propagated; neither this wrapper nor the fallback may retry a failed kernel.
     """
     global FALLBACKS, LAST_ERROR, _DISABLED
     if _DISABLED or not enabled():
         return None
     if x.device.type != "cuda" or x.dtype != torch.float32:
         return None
+    if torch.is_autocast_enabled():
+        return None  # x can remain float32 inside a CUDA autocast region
     if (torch.is_tensor(R) and R.requires_grad) or not _routed(mole_globals, x):
         return None
     if getattr(mole_globals, "top1_independent", False) and module.fc_m0.num_shared_experts != 0:
@@ -255,9 +269,10 @@ def try_forward(module, x, R, mole_globals, latents=None, wigner_D_all=None):
         return None
     try:
         return cuda_forward(module, x, R, mole_globals, latents, wigner_D_all)
-    except RuntimeError as exc:
+    except _RouteDeclined as exc:
         FALLBACKS += 1
-        _DISABLED = True
         LAST_ERROR = repr(exc)[:800]
-        print("SO2_ACTIVATION_FUSED_P0_FALLBACK (pack/scatter route from now on): %s" % LAST_ERROR, flush=True)
+        if LAST_ERROR not in _DECLINE_WARNED:
+            _DECLINE_WARNED.add(LAST_ERROR)
+            print("SO2_ACTIVATION_FUSED_P0_DECLINED (this call only): %s" % LAST_ERROR, flush=True)
         return None

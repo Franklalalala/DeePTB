@@ -42,7 +42,7 @@ def test_activation_route_skips_cpu_and_can_be_disabled(monkeypatch):
     assert route.activation_route_enabled()
 
 
-def test_first_cuda_failure_falls_back_for_the_process(monkeypatch):
+def test_unexpected_cuda_failure_propagates(monkeypatch):
     layer = _layer()
     x, R, g = _inputs(layer)
     monkeypatch.setattr(route, "_ACTIVATION_DISABLED", False)
@@ -54,13 +54,11 @@ def test_first_cuda_failure_falls_back_for_the_process(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "so2_cuda_ops", object())
 
     def boom(*a, **kw):
-        raise RuntimeError("unsupported Wigner layout")
+        raise RuntimeError("injected CUDA execution failure")
     monkeypatch.setattr(route, "try_forward", boom)
-    assert route.try_activation_forward(layer, fake_x, R, g, route="streamed_m_major_cueq") is None
-    assert route._ACTIVATION_DISABLED and route.ACTIVATION_FALLBACKS == 1
-    # disabled for good: no further CUDA attempt
-    monkeypatch.setattr(route, "try_forward", lambda *a, **kw: pytest.fail("route must stay disabled"))
-    assert route.try_activation_forward(layer, fake_x, R, g, route="streamed_m_major_cueq") is None
+    with pytest.raises(RuntimeError, match="injected CUDA execution failure"):
+        route.try_activation_forward(layer, fake_x, R, g, route="streamed_m_major_cueq")
+    assert not route._ACTIVATION_DISABLED and route.ACTIVATION_FALLBACKS == 0
 
 
 def _cuda_route_available():
