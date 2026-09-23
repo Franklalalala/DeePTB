@@ -13,7 +13,7 @@ from torch.nn import Linear
 import os
 import torch.nn.functional as F
 from collections import defaultdict
-from .tensor_product import InterpolationBlock, RadialFunction
+from .tensor_product import InterpolationBlock, RadialFunction, complex_pair_output
 from dptb.utils.cuda_cache_memory import cuda_cache_memory_probe, record_cuda_cache_event
 
 # Load helpers (Keep original logic)
@@ -2470,8 +2470,4 @@ class SO2_m_Linear(torch.nn.Module):
         return self._finish_linear_output(x_m)
 
     def _finish_linear_output(self, x_m):
-        x_r = x_m.narrow(2, 0, self.num_out_channel)
-        x_i = x_m.narrow(2, self.num_out_channel, self.num_out_channel)
-        x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)
-        x_m_i = x_r.narrow(1, 1, 1) + x_i.narrow(1, 0, 1)
-        return torch.cat((x_m_r, x_m_i), dim=1)
+        return complex_pair_output(x_m, self.num_out_channel)

@@ -8,6 +8,20 @@ import os
 import torch.nn.functional as F
 from collections import defaultdict
 
+
+def complex_pair_output(x_m: torch.Tensor, num_out_channel: int) -> torch.Tensor:
+    """Complex product of an SO2 m block from its real linear output.
+
+    x_m is [N, 2, 2C]: pair row 0 holds (W_r x_r, W_i x_r) and row 1 holds
+    (W_r x_i, W_i x_i).  The result [N, 2, C] is (W_r x_r - W_i x_i, W_r x_i + W_i x_r).
+    unbind/stack give the backward one gradient buffer per level, where narrow()
+    views zero-fill a full-size gradient each.
+    """
+    row_0, row_1 = x_m.unflatten(-1, (2, num_out_channel)).unbind(1)
+    r_0, i_0 = row_0.unbind(-2)
+    r_1, i_1 = row_1.unbind(-2)
+    return torch.stack((r_0 - i_1, r_1 + i_0), dim=1)
+
 # 你可能已有的静态数据加载（保持不变）
 _Jd = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"), weights_only=False)
 _idx_data = torch.load(os.path.join(os.path.dirname(__file__), "z_rot_indices_lmax12.pt"), weights_only=False)
@@ -1761,11 +1775,7 @@ class SO2_m_Linear(torch.nn.Module):
         return self._finish_linear_output(x_m)
 
     def _finish_linear_output(self, x_m):
-        x_r = x_m.narrow(2, 0, self.num_out_channel)
-        x_i = x_m.narrow(2, self.num_out_channel, self.num_out_channel)
-        x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)
-        x_m_i = x_r.narrow(1, 1, 1) + x_i.narrow(1, 0, 1)
-        return torch.cat((x_m_r, x_m_i), dim=1)
+        return complex_pair_output(x_m, self.num_out_channel)
 
 
 class RadialFunction(nn.Module):
