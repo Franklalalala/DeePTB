@@ -680,8 +680,8 @@ class MOLERouterV3(nn.Module):
         scores = torch.sigmoid(logits)
 
         if self.full_expert_fast_path and (self.top_k is None or self.top_k >= self.num_experts):
-            denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
-            probs = scores / denominators
+            # All experts selected: the same logit-space softmax as the top-k gate below.
+            probs = torch.softmax(logits, dim=-1)
             monitor_val = probs.max(dim=-1)[0].mean().detach()
             self._last_topk_indices = None
             self._last_topk_values = None
@@ -745,9 +745,8 @@ class MOLERouterV3(nn.Module):
             return coeffs, monitor_val, expert_load_cv.detach()
 
         else:
-            # Fallback 逻辑保持稳定
-            denominators = scores.sum(dim=-1, keepdim=True) + 1e-8
-            probs = scores / denominators
+            # top_k=None selects every expert: the same logit-space softmax as the top-k gate.
+            probs = torch.softmax(logits, dim=-1)
             monitor_val = probs.max(dim=-1)[0].mean().detach()
             self._last_topk_indices = None
             self._last_topk_values = None
