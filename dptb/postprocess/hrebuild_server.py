@@ -252,7 +252,7 @@ class TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 # AF_UNIX / socketserver.UnixStreamServer is unavailable on some Windows
 # Python builds (used for local dev of this repo); the production target
-# (natlan/Linux) always has it. Define the unix-socket transport only when
+# (Linux) always has it. Define the unix-socket transport only when
 # supported, so importing this module doesn't fail on Windows dev machines.
 if hasattr(socket, "AF_UNIX") and hasattr(socketserver, "UnixStreamServer"):
 

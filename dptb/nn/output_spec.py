@@ -173,7 +173,7 @@ STRUCTURAL_FIELDS = frozenset(
         # backward needs the original values. They carry node_/edge_ prefixes
         # but are NOT model outputs — stitching them masked_replace mutated
         # them in place mid-autograd and broke backward with a tensor-version
-        # error (ScalarOnehotTP einsum over node_attrs, seen on the natlan P2
+        # error (ScalarOnehotTP einsum over node_attrs, seen on a P2
         # multi-expert smoke). keep_first is both correct and safe.
         "node_attrs",
         "edge_attrs",

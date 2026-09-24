@@ -108,7 +108,7 @@ def _abacus_to_dftio(mat: np.ndarray, l_lefts, l_rights, abacus2dftio) -> np.nda
     """Inverse of ``write_abacus_csr_file.transform_2_ABACUS``.
 
     Reproduces ``dftio.io.abacus.abacus_parser.AbacusParser.transform`` verbatim
-    (verified against the installed dftio package on natlan, 2026-07-03):
+    (verified against the installed dftio package, 2026-07-03):
     ``block_diag(ABACUS2DFTIO[l_left]) @ mat @ block_diag(ABACUS2DFTIO[l_right]).T``.
     """
     left_mats = [abacus2dftio[l] for l in l_lefts]
@@ -343,7 +343,7 @@ def write_input(
 
 # ---------------------------------------------------------------------------
 # ABACUS process execution (local subprocess, or a pluggable remote
-# executor e.g. SSH exec_command for natlan)
+# executor e.g. SSH exec_command on a remote host)
 # ---------------------------------------------------------------------------
 
 Executor = Callable[[str, str], Tuple[int, str, str]]  # (workdir, command) -> (returncode, stdout, stderr)

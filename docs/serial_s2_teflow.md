@@ -30,10 +30,10 @@ establish an improvement over the non-flow control.
 
 ## Retention and storage
 
-Use a PBS parent independent of the training child. The supplied
-`tools/hopper_serial/retained_workflow.pbs` waits for a deployment-ready marker,
-then invokes a controller. On either controller success or failure it holds the
-allocation without retrying. The existing allocation owner can run a `campaign`
+Use a PBS parent independent of the training child: it waits for a
+deployment-ready marker, then invokes a controller, and on either controller
+success or failure holds the allocation without retrying (the deployment scripts
+are kept outside this repository). The existing allocation owner can run a `campaign`
 request that performs smoke followed by production, with `stop_after=false`;
 child failures then leave the owner and its staging lease alive. TERM/INT remain
 explicit shutdown signals, and scheduler walltime/node failure still apply.
