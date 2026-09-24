@@ -3,7 +3,6 @@ from e3nn.o3 import xyz_to_angles, Irreps
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import logging
-import warnings
 import math
 import torch
 import torch.nn as nn
@@ -309,6 +308,20 @@ def _gather_so2_l_group(x: torch.Tensor, plan: _SO2LGroupPlan) -> torch.Tensor:
 # MOLE COMPONENTS (Added)
 # ------------------------------------------------------------------------------
 
+def _route_layout_token(tensor):
+    """Host-only metadata for a cached integer routing view; no device sync.
+
+    A retained source tensor prevents allocator address reuse. Inference tensors
+    have no version counter; conservatively do not cache them. Mutation through
+    .data or external raw pointers is outside this contract (as for autograd).
+    """
+    try:
+        return (tensor.data_ptr(), int(tensor._version), tuple(tensor.shape),
+                tuple(tensor.stride()), str(tensor.device), tensor.dtype)
+    except RuntimeError:
+        return None
+
+
 class MOLEGlobals:
     """Stores routing information for the current forward pass."""
 
@@ -334,6 +347,7 @@ class MOLEGlobals:
         # Keyed on the slot index explicitly: the other caches on this object are
         # content-blind and would alias slot 1 onto slot 0's permutation.
         self._expert_slot_layout_cache = {}
+        self._expert_slot_layout_sources = {}
         self.coefficients = coefficients  # [Batch, Num_Experts]
         self.topk_indices = topk_indices
         self.topk_values = topk_values
@@ -357,7 +371,10 @@ class MOLEGlobals:
         key = (int(slot), str(expert_index.device), int(expert_index.numel()),
                int(num_experts))
         cached = self._expert_slot_layout_cache.get(key)
-        if cached is not None:
+        token = _route_layout_token(expert_index)
+        sources = self._expert_slot_layout_sources
+        source = sources.get(key)
+        if cached is not None and token is not None and source is not None and source[0] == token:
             return cached
         eidx = expert_index.reshape(-1).to(dtype=torch.long)
         order = torch.argsort(eidx, stable=True)
@@ -367,10 +384,15 @@ class MOLEGlobals:
             torch.arange(order.numel(), device=order.device, dtype=order.dtype),
         )
         counts = torch.bincount(eidx, minlength=int(num_experts))
-        ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long)
+        ptr = torch.zeros(int(num_experts) + 1, dtype=torch.long, device="cpu")
         ptr[1:] = torch.cumsum(counts.to("cpu"), dim=0)
         cached = (order, inverse, ptr.contiguous(), eidx.index_select(0, order))
-        self._expert_slot_layout_cache[key] = cached
+        if token is not None:
+            self._expert_slot_layout_cache[key] = cached
+            sources[key] = (token, expert_index)
+        else:
+            self._expert_slot_layout_cache.pop(key, None)
+            sources.pop(key, None)
         return cached
 
     @staticmethod
@@ -1069,8 +1091,8 @@ class MOLELinear(nn.Module):
                 "activation-space MoLE reached the weight-space path, which "
                 "would materialise one [out_features, in_features] weight per "
                 "route token -- exactly what per-edge routing cannot afford. "
-                "Set so2_fusion_mode='staged' so every MOLELinear is reached "
-                "through MOLELinear.forward."
+                "Reach every MOLELinear through MOLELinear.forward or the "
+                "SO2CUDA routes of so2_activation_routes."
             )
         coefficients = mole_globals.coefficients
         topk_indices = getattr(mole_globals, "topk_indices", None)
@@ -1752,73 +1774,53 @@ class SO2_Linear(torch.nn.Module):
         } | {
             entry.l for entry in self._out_entry_plans if entry.l > 0
         }))
-        self._route_warned = set()
 
     def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
-        """
+        """Rotate, apply the m-wise (MoE) linears, rotate back.
+
         Args:
             x: Input features
             R: Edge vectors (for rotation)
             mole_globals: MoE routing info
             latents: Latent features for radial embedding
             wigner_D_all: Precomputed Wigner D matrices (optional)
-        """
-        if self.so2_fusion_mode == "streamed_m_major_ref":
-            return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
-        if self.so2_fusion_mode == "streamed_m_major_cueq":
-            return self._forward_streamed_m_major_grouped(
-                x,
-                R,
-                mole_globals,
-                latents,
-                wigner_D_all,
-                route="streamed_m_major_cueq",
-            )
-        if self.so2_fusion_mode == "streamed_m_major_persistent_grouped_p1":
-            from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
 
-            fused_result = try_forward_so2_moe_persistent_grouped_p1(
-                self,
-                x,
-                R,
-                mole_globals,
-                latents,
-                wigner_D_all,
+        ``so2_fusion_mode`` selects the route.  Activation-space routing (prior_activate,
+        Switch top-1) takes the SO2CUDA routes of ``so2_activation_routes`` in every
+        grouped mode; weight-space routing takes the fused-P0 or persistent-P1 kernels
+        when requested.  Whatever a route declines runs on the grouped streaming route.
+        """
+        mode = self.so2_fusion_mode
+        if mode == "staged":
+            return self._forward_staged(x, R, mole_globals, latents, wigner_D_all)
+        if mode == "streamed_m_major_ref":
+            return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
+        if getattr(mole_globals, "activation_space", False) or getattr(mole_globals, "top1_independent", False):
+            from . import so2_activation_routes
+
+            result = so2_activation_routes.forward(
+                self, x, R, mole_globals, latents, wigner_D_all,
+                fused=mode == "streamed_m_major_fused_p0",
             )
-            if fused_result is not None:
-                return fused_result
-            if os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_STRICT", "0") not in ("", "0", "false", "False", "FALSE"):
-                raise RuntimeError("streamed_m_major_persistent_grouped_p1 declined; strict mode forbids cueq fallback.")
-            return self._forward_streamed_m_major_grouped(
-                x,
-                R,
-                mole_globals,
-                latents,
-                wigner_D_all,
-                route="streamed_m_major_cueq",
-            )
-        if self.so2_fusion_mode == "streamed_m_major_fused_p0":
+            if result is not None:
+                return result
+        elif mode == "streamed_m_major_fused_p0":
             from dptb.nn.so2_moe_fused_p0 import try_forward_so2_moe_fused_p0
 
-            fused_result = try_forward_so2_moe_fused_p0(
-                self,
-                x,
-                R,
-                mole_globals,
-                latents,
-                wigner_D_all,
-            )
-            if fused_result is not None:
-                return fused_result
-            return self._forward_streamed_m_major_grouped(
-                x,
-                R,
-                mole_globals,
-                latents,
-                wigner_D_all,
-                route="streamed_m_major_cueq",
-            )
+            result = try_forward_so2_moe_fused_p0(self, x, R, mole_globals, latents, wigner_D_all)
+            if result is not None:
+                return result
+        elif mode == "streamed_m_major_persistent_grouped_p1":
+            from dptb.nn.so2_moe_persistent_grouped import try_forward_so2_moe_persistent_grouped_p1
 
+            result = try_forward_so2_moe_persistent_grouped_p1(self, x, R, mole_globals, latents, wigner_D_all)
+            if result is not None:
+                return result
+            if os.environ.get("DPTB_SO2_MOE_PERSISTENT_P1_STRICT", "0") not in ("", "0", "false", "False", "FALSE"):
+                raise RuntimeError("streamed_m_major_persistent_grouped_p1 declined; strict mode forbids cueq fallback.")
+        return self._forward_streamed_m_major_grouped(x, R, mole_globals, latents, wigner_D_all)
+
+    def _forward_staged(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
         n, _ = x.shape
         if self.radial_emb:
             if latents is None:
@@ -2080,12 +2082,6 @@ class SO2_Linear(torch.nn.Module):
         out = self._materialize_output_l_groups(out_groups, n=n, dtype=x.dtype, device=x.device)
         return out.contiguous(), wigner_D_all
 
-    def _warn_route_once(self, key: str, message: str):
-        if key in self._route_warned:
-            return
-        warnings.warn(message, RuntimeWarning, stacklevel=3)
-        self._route_warned.add(key)
-
     def _cueq_linear_is_enabled(self) -> bool:
         backends = []
         if isinstance(getattr(self, "fc_m0", None), MOLELinear):
@@ -2106,15 +2102,6 @@ class SO2_Linear(torch.nn.Module):
             if not isinstance(fc, MOLELinear) or fc.mole_linear_mode != "cublas_grouped":
                 return False
         return True
-
-    def _prepare_streamed_route(self, route: str):
-        if route == "streamed_m_major_cueq" and not self._cueq_linear_is_enabled():
-            self._warn_route_once(
-                "cueq_linear_not_enabled",
-                "streamed_m_major_cueq is active but MOLELinear is not using "
-                "cueq_indexed_linear; the route remains correct but only the grouped "
-                "streamed SO2 dataflow is active.",
-            )
 
     def _make_wigner_block_cache(self, wigner_D_all) -> Dict[int, torch.Tensor]:
         if wigner_D_all is None:
@@ -2338,13 +2325,7 @@ class SO2_Linear(torch.nn.Module):
                 linear_output = linear_output * radial_weight
             self._accumulate_grouped_pair_output_(out_groups, linear_output, rot_blocks, m)
 
-    def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None, *, route: str):
-        if getattr(mole_globals, "top1_independent", False):
-            from .top1_so2_cuda import try_forward
-            result = try_forward(self, x, R, mole_globals, latents, wigner_D_all, route=route)
-            if result is not None:
-                return result
-        self._prepare_streamed_route(route)
+    def _forward_streamed_m_major_grouped(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
         wigner_D_all = self._ensure_wigner_rotation(R, wigner_D_all)
         wigner_D_return = wigner_D_all
         unpermute_idx = None
@@ -2352,6 +2333,10 @@ class SO2_Linear(torch.nn.Module):
         if (
             os.environ.get("DPTB_SO2_SORTED_EDGE_VIEW", "0") != "0"
             and graph_index is not None
+            # sorted_indexed_view is a weight-space graph-token view. It does
+            # not permute per-row top-k routes or preserve Switch semantics.
+            and not getattr(mole_globals, "activation_space", False)
+            and not getattr(mole_globals, "top1_independent", False)
             and self._cueq_linear_is_enabled()
             and not getattr(mole_globals, "_indexed_inputs_are_sorted", False)
         ):

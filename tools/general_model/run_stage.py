@@ -46,8 +46,9 @@ def main():
   MultiTrainer.iteration=iteration
  try:multi_train(INPUT=a.input,init_model=a.s1_checkpoint,restart=a.restart,output=str(out),log_level=20,log_path=str(out/f'main.{int(time.time())}.log'))
  except SmokeComplete:pass
- from dptb.nn import top1_prior,top1_so2_cuda
- receipt={'status':'SMOKE_FINISHED' if a.smoke_steps else 'TRAIN_ENTRYPOINT_RETURNED','dispatch':dict(top1_prior.COUNTS),'so2_cuda_calls':top1_so2_cuda.CALLS,'peak_GiB':torch.cuda.max_memory_allocated()/2**30,'checkpoint_verification_required':True}
+ from dptb.nn import top1_prior,so2_activation_routes
+ routes=so2_activation_routes.STATS.snapshot()
+ receipt={'status':'SMOKE_FINISHED' if a.smoke_steps else 'TRAIN_ENTRYPOINT_RETURNED','dispatch':dict(top1_prior.COUNTS),'so2_routes':routes,'so2_cuda_calls':sum(routes['calls'].get(r,0) for r in ('fused_p0','pack_scatter')),'peak_GiB':torch.cuda.max_memory_allocated()/2**30,'checkpoint_verification_required':True}
  (out/'RUN_EXIT.json').write_text(json.dumps(receipt,indent=2))
  if not e['only2b']:assert receipt['dispatch'].get('grouped_cuda',0)>0 and receipt['so2_cuda_calls']>0,'selected CUDA route was not observed'
 if __name__=='__main__':main()

@@ -15,11 +15,13 @@ from .lem_moe_v3_h0_helpers import H0InitLayer, _sorted_irrep_coordinate_index
 
 
 
-# SO2 routes that reach every MOLELinear through MOLELinear.forward, which is what
-# activation-space (per-edge) dispatch requires.  The SO2CUDA fused routes are absent
-# on purpose: they consume fc._mix_expert_parameters() and would build one
-# [out_features, in_features] weight per edge.
-_PRIOR_ACTIVATE_ROUTES = ("staged", "streamed_m_major_cueq")
+# SO2 routes that apply activation-space (per-edge) dispatch without building a weight
+# per edge: 'staged' and the grouped streaming route reach every MOLELinear through
+# MOLELinear.forward; fused_p0 segments its grouped GEMM by expert id
+# (dptb.nn.so2_activation_routes).  The other SO2CUDA fused routes consume
+# fc._mix_expert_parameters() and would build one [out_features, in_features]
+# weight per edge.
+_PRIOR_ACTIVATE_ROUTES = ("staged", "streamed_m_major_cueq", "streamed_m_major_fused_p0")
 
 @Embedding.register("lem_moe_v3_edge")
 class LemMoEV3Edge(LemMoEV3):
@@ -70,18 +72,18 @@ class LemMoEV3Edge(LemMoEV3):
                     "dispatches through apply_experts and would materialise one "
                     "weight per edge." % (mixing,)
                 )
-            # Activation space needs exactly one thing: every MOLELinear reached
-            # through MOLELinear.forward.  Two routes do that -- 'staged', and the
-            # grouped streaming route, which reaches the m-linears through
-            # SO2_m_Linear.forward -> self.fc(x_m, mole_globals).  Only the SO2CUDA
-            # fused routes take the weights themselves via _mix_expert_parameters,
-            # which activation space forbids (it would build per-edge weights).
-            # L40S, bs=24, 16,610 edges, fwd+bwd: grouped 960.9 ms vs staged
-            # 1169.2 ms (1.22x), same loss to the bit and worst gradient 1.9e-6
-            # relative, so the grouped route is the default here.
+            # Activation space needs every expert applied to activations, never a
+            # weight mixed per route token.  'staged' and the grouped streaming
+            # route reach the m-linears through SO2_m_Linear.forward ->
+            # self.fc(x_m, mole_globals); fused_p0 segments its grouped GEMM by
+            # expert id and sums the top-k slot outputs before the scatter.  The
+            # other SO2CUDA fused routes take the weights via
+            # _mix_expert_parameters, which activation space forbids.  fused_p0 is
+            # the default, as for the other edge-MoE modes; off CUDA float32 it
+            # runs the grouped streaming route.
             requested_route = kwargs.get("so2_fusion_mode")
             if requested_route is None:
-                kwargs["so2_fusion_mode"] = "streamed_m_major_cueq"
+                kwargs["so2_fusion_mode"] = "streamed_m_major_fused_p0"
             elif requested_route not in _PRIOR_ACTIVATE_ROUTES:
                 # Silently rewriting this used to let a config claim a fused route
                 # and train on a different one with nothing in the log.
@@ -92,7 +94,7 @@ class LemMoEV3Edge(LemMoEV3):
                     "[out_features, in_features] weight per route token -- with "
                     "per-edge routing that is one weight per edge. Use one of %s "
                     "(omit the key for the faster default, %r)."
-                    % (requested_route, list(_PRIOR_ACTIVATE_ROUTES), "streamed_m_major_cueq")
+                    % (requested_route, list(_PRIOR_ACTIVATE_ROUTES), "streamed_m_major_fused_p0")
                 )
             # The m-linear cuBLAS fusion inside the grouped route is the one part
             # of it that DOES call _mix_expert_parameters, so it has to stay off.

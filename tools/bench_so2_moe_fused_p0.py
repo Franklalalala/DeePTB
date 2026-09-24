@@ -92,7 +92,6 @@ def main() -> None:
             globals_,
             latents,
             None,
-            route="streamed_m_major_fused_p0_ref",
         )
         fused_result = try_forward_so2_moe_fused_p0(module, x, R, globals_, latents, wigner)
         if fused_result is None:
@@ -108,7 +107,6 @@ def main() -> None:
                 globals_,
                 latents,
                 wigner,
-                route="streamed_m_major_fused_p0_ref",
             ),
             args.warmup,
             args.iters,
