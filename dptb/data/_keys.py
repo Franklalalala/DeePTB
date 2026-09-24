@@ -102,6 +102,10 @@ EDGE_HAMILTONIAN_KEY: Final[str] = "edge_hamiltonian"
 NODE_HAMILTONIAN_KEY: Final[str] = "node_hamiltonian"
 EDGE_H0_KEY: Final[str] = "edge_h0"
 NODE_H0_KEY: Final[str] = "node_h0"
+# Declared by a producer that writes coupled RME (mapper irreps layout) into the H0 keys instead of the
+# dataset's AO-product features -- the block-ODE flows write their codec RME there.  H0 init layers then
+# apply only the irreps sort, not the AO-product -> coupled conversion of ``h0_ao_cg``.
+H0_COUPLED_RME_KEY: Final[str] = "_h0_coupled_rme"
 # P2 physical Hamiltonian prior.  Keep this contract independent from the
 # historical stored-H0 path: P2 is assembled from transferable two-centre
 # tables plus factorized non-local projector contributions and is available at

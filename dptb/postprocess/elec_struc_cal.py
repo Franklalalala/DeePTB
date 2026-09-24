@@ -181,6 +181,9 @@ class ElecStruCal(object):
         data[AtomicDataDict.EDGE_H0_KEY] = (
             edge_h0.clone() if torch.is_tensor(edge_h0) else torch.as_tensor(edge_h0)
         )
+        # the H0 keys now hold AO products: drop a coupled-RME declaration the input carried
+        if AtomicDataDict.H0_COUPLED_RME_KEY in data:
+            del data[AtomicDataDict.H0_COUPLED_RME_KEY]
 
     # =========================================================
     # helpers: build mask_uureal if missing

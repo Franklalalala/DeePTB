@@ -466,6 +466,26 @@ def _get_feature_source(
     return tensor
 
 
+def _h0_is_coupled_rme(data) -> bool:
+    """Whether the batch declares (``_keys.H0_COUPLED_RME_KEY``) that its H0 keys hold coupled RME.
+
+    A collated batch carries one flag per graph; the graphs must agree."""
+    flag = data.get(_keys.H0_COUPLED_RME_KEY)
+    if flag is None:
+        return False
+    if not torch.is_tensor(flag):
+        return bool(flag)
+    values = flag.reshape(-1).bool()
+    if values.numel() == 0 or not bool(values.any()):
+        return False
+    if bool(values.all()):
+        return True
+    raise ValueError(
+        "The batch mixes graphs whose H0 holds coupled RME with graphs whose H0 holds AO products "
+        f"({_keys.H0_COUPLED_RME_KEY}); the H0 init layer converts one representation per batch."
+    )
+
+
 def _get_feature_source_with_key(
     data: AtomicDataDict.Type,
     candidate_keys: Sequence[str],
@@ -870,23 +890,27 @@ class H0InitLayer(torch.nn.Module):
             return base_node_features
 
         node_source = self._mask_node_source(node_source, atom_type)
-        node_source = self._ao_product_to_sorted_irreps(node_source)
+        node_source = self._ao_product_to_sorted_irreps(
+            node_source, coupled=node_source_key == self.h0_node_key and _h0_is_coupled_rme(data)
+        )
         return self._merge_features(base_node_features, self.node_projector(node_source))
 
-    def _ao_product_to_sorted_irreps(self, source: torch.Tensor) -> torch.Tensor:
+    def _ao_product_to_sorted_irreps(self, source: torch.Tensor, *, coupled: bool = False) -> torch.Tensor:
         """AO-product packed H0 -> coupled RME in sorted-irrep order.
 
         ``block_to_feature`` (and compact uu_real expansion) stores flattened
         spatial AO sub-blocks. Full spinor SOC is rejected by
         ``_build_uureal_cg_change_of_basis`` / ``ensure_spatial_block_mapper``.
-        Residual-block projectors must not call this on already-coupled inputs.
+        ``coupled=True``: the source already holds coupled RME in the mapper
+        layout (the block-ODE flows write their codec RME into the H0 keys and
+        declare it with ``_keys.H0_COUPLED_RME_KEY``); only the sort applies.
         """
         if source.ndim != 2 or int(source.shape[-1]) != int(self.h0_dim):
             raise RuntimeError(
                 "H0 AO-product source width "
                 f"{tuple(source.shape)} != h0_dim={self.h0_dim}."
             )
-        if not self.h0_ao_cg:
+        if coupled or not self.h0_ao_cg:
             return source.index_select(1, self._h0_sort_index.to(source.device))
         change_of_basis = self._h0_cg_change_of_basis.to(
             device=source.device, dtype=source.dtype
@@ -939,7 +963,9 @@ class H0InitLayer(torch.nn.Module):
                 )
                 return latents, base_node_features, base_edge_features, cutoff_coeffs, active_edges
             edge_source = self._mask_edge_source(edge_source, bond_type)
-            edge_source = self._ao_product_to_sorted_irreps(edge_source)
+            edge_source = self._ao_product_to_sorted_irreps(
+                edge_source, coupled=edge_source_key == self.h0_edge_key and _h0_is_coupled_rme(data)
+            )
             edge_features_h0 = self.edge_projector(edge_source[active_edges])
             edge_features = self._merge_features(base_edge_features, edge_features_h0)
 

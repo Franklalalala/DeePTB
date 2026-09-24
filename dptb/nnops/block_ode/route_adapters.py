@@ -70,6 +70,14 @@ from dptb.nnops.block_ode.rollout import RolloutContext
 from dptb.nnops.flow_context import CFMContext
 
 
+def _write_h0_rme(owner: Any, state: AtomicDataDict.Type, node_rme, edge_rme) -> None:
+    """Write codec RME into the H0 keys and declare it coupled (``_keys.H0_COUPLED_RME_KEY``), so
+    the embedding's H0 init applies only the irreps sort, not the AO-product conversion."""
+    state[owner.node_h0_key] = node_rme
+    state[owner.edge_h0_key] = edge_rme
+    state[_keys.H0_COUPLED_RME_KEY] = torch.ones((), dtype=torch.bool)
+
+
 class FullHRouteAdapter:
     """Adapter for the generic full-H block-ODE route (``output_space='ao_block_ode'``).
 
@@ -126,8 +134,7 @@ class FullHRouteAdapter:
 
     def write_state_in(self, owner: Any, state: AtomicDataDict.Type, current, ctx) -> None:
         node_rme, edge_rme = owner.block_codec.blocks_to_rme(state, current)
-        state[owner.node_h0_key] = node_rme.clone()
-        state[owner.edge_h0_key] = edge_rme.clone()
+        _write_h0_rme(owner, state, node_rme.clone(), edge_rme.clone())
         if owner.overwrite_feature_keys:
             state[owner.node_target_key] = node_rme.clone()
             state[owner.edge_target_key] = edge_rme.clone()
@@ -157,8 +164,7 @@ class FullHRouteAdapter:
 
     def finalize(self, owner: Any, state: AtomicDataDict.Type, current, ctx, *, num_graphs):
         node_final_rme, edge_final_rme = owner.block_codec.blocks_to_rme(state, current)
-        state[owner.node_h0_key] = node_final_rme
-        state[owner.edge_h0_key] = edge_final_rme
+        _write_h0_rme(owner, state, node_final_rme, edge_final_rme)
         if owner.overwrite_feature_keys:
             state[owner.node_target_key] = node_final_rme
             state[owner.edge_target_key] = edge_final_rme
@@ -258,8 +264,7 @@ class FullHRouteAdapter:
         if owner.detach_interpolated_h0:
             node_current = node_current.detach()
             edge_current = edge_current.detach()
-        data[owner.node_h0_key] = node_current
-        data[owner.edge_h0_key] = edge_current
+        _write_h0_rme(owner, data, node_current, edge_current)
         if owner.overwrite_feature_keys:
             data[owner.node_target_key] = node_current
             data[owner.edge_target_key] = edge_current
@@ -677,8 +682,7 @@ class ResidualRouteAdapter:
                 certify_image=True,
             )
         owner._drop_block_authority_fields(state)
-        state[owner.node_h0_key] = node_base
-        state[owner.edge_h0_key] = edge_base
+        _write_h0_rme(owner, state, node_base, edge_base)
         ctx = RolloutContext(
             topology_sidecar=topology_sidecar,
             device=owner.device,
@@ -696,8 +700,7 @@ class ResidualRouteAdapter:
         owner._attach_spatial_residual_state(state, current)
         # Re-assert the constant channel every step: a model that echoed a
         # mutated H0 key back through ``merged`` must not drift contract (2).
-        state[owner.node_h0_key] = ctx.node_base
-        state[owner.edge_h0_key] = ctx.edge_base
+        _write_h0_rme(owner, state, ctx.node_base, ctx.edge_base)
 
     def decode_endpoint(self, owner: Any, prediction, merged, current, ctx):
         endpoint = BlockTensorResult(
@@ -738,8 +741,7 @@ class ResidualRouteAdapter:
         )
         # H0 keys stay PHYSICAL H0 RME (deliberate divergence from the generic
         # ao_block_ode sampler, which overwrites them with the final state RME).
-        state[owner.node_h0_key] = ctx.node_base
-        state[owner.edge_h0_key] = ctx.edge_base
+        _write_h0_rme(owner, state, ctx.node_base, ctx.edge_base)
         state[owner.flow_time_key] = torch.ones(
             num_graphs, device=owner.device, dtype=owner.dtype
         )
@@ -795,8 +797,7 @@ class ResidualRouteAdapter:
             certify_image=certify_image,
             _construction_token=_FLOW_PROJECTED_STATE_TOKEN,
         )
-        data[owner.node_h0_key] = node_base
-        data[owner.edge_h0_key] = edge_base
+        _write_h0_rme(owner, data, node_base, edge_base)
         node_alpha = node_t.reshape((-1,) + (1,) * (endpoint.node_blocks.ndim - 1))
         edge_alpha = edge_t.reshape((-1,) + (1,) * (endpoint.edge_blocks.ndim - 1))
         if owner.prior == "zero":
