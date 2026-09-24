@@ -32,7 +32,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 from e3nn import o3
-from e3nn.o3 import Linear
+from dptb.nn.e3nn_fast import Linear
 from torch_scatter import scatter_mean
 
 from dptb.configuration import resolve_init_scope

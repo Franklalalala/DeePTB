@@ -375,8 +375,24 @@ class EquivariantMergedRMSNormFlat(nn.Module):
             self.register_parameter("affine_weight", None)
             self.register_parameter("affine_bias", None)
 
+        # per-block plan of the forward: (mul, dim, degree index, is a centred scalar)
+        self._blocks = tuple(
+            (mul, ir.dim, degree_map[ir.l], ir.l == 0 and (ir.p == 1 or self.treat_0o_as_scalar))
+            for mul, ir in self.irreps
+        )
+        self._widths = [mul * dim for mul, dim, _, _ in self._blocks]
+        self._group_widths = [mul for mul, _, _, _ in self._blocks]
+        self._scalar_widths = [mul for mul, _, _, scalar in self._blocks if scalar]
+        self._degree_inv_counts = tuple(degree_inv_group_counts)
+
     @torch.amp.autocast(device_type="cuda", enabled=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Centre the 0e channels, scale every channel by the inverse RMS merged over
+        degrees, apply the affine weight and bias.
+
+        The input is split into its irrep blocks once and the output concatenated once;
+        the reductions run per block, so neither direction scatters or gathers over the
+        full feature width."""
         if x.ndim != 2:
             raise ValueError(f"Expected [N, dim], got shape={tuple(x.shape)}")
         if x.shape[-1] != self.dim:
@@ -391,42 +407,61 @@ class EquivariantMergedRMSNormFlat(nn.Module):
             else orig_dtype
         )
         y = x.to(compute_dtype)
-        # identity check instead of data_ptr(): storageless wrapper tensors
-        # (torch.func transforms, fake tensors) reject data_ptr access, and
-        # .to() returns the same object exactly when no conversion happened.
-        if y is x:
-            y = y.clone()
+        n = y.shape[0]
+        parts = torch.split(y, self._widths, dim=1) if len(self._widths) > 1 else (y,)
+        views = [part if dim == 1 else part.reshape(n, mul, dim)
+                 for part, (mul, dim, _, _) in zip(parts, self._blocks)]
 
-        if self.center_0e and self.scalar_dim_idx.numel() > 0:
-            scalars = y.index_select(1, self.scalar_dim_idx)
-            scalars = scalars - scalars.mean(dim=1, keepdim=True)
-            y[:, self.scalar_dim_idx] = scalars
+        scalar_blocks = [i for i, block in enumerate(self._blocks) if block[3]]
+        if self.center_0e and scalar_blocks:
+            total = views[scalar_blocks[0]].sum(dim=1, keepdim=True)
+            for i in scalar_blocks[1:]:
+                total = total + views[i].sum(dim=1, keepdim=True)
+            mean = total / self.num_scalar
+            for i in scalar_blocks:
+                views[i] = views[i] - mean
 
-        group_sums = y.new_zeros((y.shape[0], self.num_groups))
-        group_sums.scatter_add_(1, self.dim_to_group.expand(y.shape[0], -1), y.square())
-
-        if self.normalization == "component":
-            group_ms = group_sums * self.group_inv_dims
-        else:
-            group_ms = group_sums
-
+        # mean square of every group (one irrep channel), summed per block
+        block_ms = []
+        for view, (mul, dim, _, _) in zip(views, self._blocks):
+            group_ms = view.square() if dim == 1 else view.square().sum(dim=-1)
+            if self.normalization == "component" and dim > 1:
+                group_ms = group_ms * (1.0 / dim)
+            block_ms.append(group_ms.sum(dim=1, keepdim=True))
         if self.std_balance_degrees:
-            degree_sums = group_ms.new_zeros((y.shape[0], self.num_degrees))
-            degree_sums.scatter_add_(1, self.group_to_degree.expand(y.shape[0], -1), group_ms)
-            degree_ms = degree_sums * self.degree_inv_group_counts
-            merged_ms = degree_ms.mean(dim=1, keepdim=True)
+            degree_sums = [None] * self.num_degrees
+            for ms, (_, _, degree, _) in zip(block_ms, self._blocks):
+                degree_sums[degree] = ms if degree_sums[degree] is None else degree_sums[degree] + ms
+            merged_ms = degree_sums[0] * self._degree_inv_counts[0]
+            for degree in range(1, self.num_degrees):
+                merged_ms = merged_ms + degree_sums[degree] * self._degree_inv_counts[degree]
+            merged_ms = merged_ms / self.num_degrees
         else:
-            merged_ms = group_ms.mean(dim=1, keepdim=True)
+            merged_ms = block_ms[0]
+            for ms in block_ms[1:]:
+                merged_ms = merged_ms + ms
+            merged_ms = merged_ms / self.num_groups
 
-        group_scale = torch.rsqrt(merged_ms + self.eps)
+        scale = torch.rsqrt(merged_ms + self.eps)
+        weights = None
         if self.affine:
-            group_scale = group_scale * self.affine_weight
-        group_scale = group_scale.index_select(1, self.dim_to_group)
-        y = y * group_scale
-
-        if self.affine and self.affine_bias is not None and self.scalar_dim_idx.numel() > 0:
-            y[:, self.scalar_dim_idx] = y[:, self.scalar_dim_idx] + self.affine_bias
-
+            weights = (torch.split(self.affine_weight, self._group_widths, dim=1)
+                       if len(self._group_widths) > 1 else (self.affine_weight,))
+        biases = None
+        if self.affine and self.affine_bias is not None and self._scalar_widths:
+            biases = (torch.split(self.affine_bias, self._scalar_widths, dim=1)
+                      if len(self._scalar_widths) > 1 else (self.affine_bias,))
+        out = []
+        k = 0
+        for i, (view, (mul, dim, _, scalar)) in enumerate(zip(views, self._blocks)):
+            block_scale = scale * weights[i] if weights is not None else scale
+            block = view * block_scale if dim == 1 else view * block_scale.unsqueeze(-1)
+            block = block.reshape(n, mul * dim)
+            if biases is not None and scalar:
+                block = block + biases[k]
+                k += 1
+            out.append(block)
+        y = out[0] if len(out) == 1 else torch.cat(out, dim=1)
         return y.to(orig_dtype)
 
 

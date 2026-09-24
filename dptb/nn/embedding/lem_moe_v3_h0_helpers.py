@@ -6,10 +6,11 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 from e3nn import o3
-from e3nn.o3 import Linear, wigner_3j
+from e3nn.o3 import wigner_3j
 from torch_runstats.scatter import scatter
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.nn.e3nn_fast import Linear
 from dptb.data.AtomicData import register_fields
 from dptb.data.interfaces.blockwise_tensor import (
     edge_feature_slices,

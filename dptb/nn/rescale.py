@@ -440,11 +440,21 @@ class E3PerSpeciesScaleShift(torch.nn.Module):
 
 @compile_mode("script")
 class E3ElementLinear(torch.nn.Module):
-    """Sum edgewise energies.
-    Includes optional per-species-pair edgewise energy scales.
+    """Per-channel scale of every irrep channel, plus a shift of every 0e channel.
+
+    ``weights`` holds, per row, one scale per irrep channel (``num_scales``) followed by
+    one shift per 0e channel (``num_shifts``); without weights the input is returned.
+    The input and the weights are split into their irrep blocks once and the output is
+    concatenated once, so the backward writes one gradient per input.
     """
 
     weight_numel: int
+    _muls: List[int]
+    _dims: List[int]
+    _shifted: List[bool]
+    _widths: List[int]
+    _scale_widths: List[int]
+    _shift_widths: List[int]
 
     def __init__(
         self,
@@ -458,79 +468,59 @@ class E3ElementLinear(torch.nn.Module):
         self.num_scalar = 0
         self.device = device
         self.dtype = dtype
-        shift_indices = []
-        scale_indices = []
-        scale_blocks: List[Tuple[int, int, int, int]] = []
-
-        count_scales= 0
-        count_shift = 0
-        feature_start = 0
+        self._muls = []
+        self._dims = []
+        self._shifted = []
         for mul, ir in irreps_in:
-            if str(ir) == "0e":
+            shifted = str(ir) == "0e"
+            if shifted:
                 self.num_scalar += mul
-                shift_indices += list(range(count_shift, count_shift + mul))
-                count_shift += mul
-            else:
-                shift_indices += [-1] * mul * ir.dim
+            self._muls.append(mul)
+            self._dims.append(ir.dim)
+            self._shifted.append(shifted)
+        self.num_scales = irreps_in.num_irreps
+        self.num_shifts = self.num_scalar
+        self.weight_numel = self.num_scales + self.num_shifts
+        self._widths = [mul * dim for mul, dim in zip(self._muls, self._dims)]
+        self._scale_widths = list(self._muls)
+        self._shift_widths = [mul for mul, shifted in zip(self._muls, self._shifted) if shifted]
 
-            for _ in range(mul):
-                scale_indices += [count_scales] * ir.dim
-                count_scales += 1
-            scale_blocks.append((feature_start, count_scales - mul, mul, ir.dim))
-            feature_start += mul * ir.dim
-
-        shift_index = torch.as_tensor(shift_indices, dtype=torch.int64, device=self.device)
-        scale_index = torch.as_tensor(scale_indices, dtype=torch.int64, device=self.device)
-        shift_mask = shift_index.ge(0)
-        self.register_buffer("shift_index", shift_index, persistent=False)
-        self.register_buffer("scale_index", scale_index, persistent=False)
-        self.register_buffer("shift_mask", shift_mask, persistent=False)
-        self.register_buffer("shift_source_index", shift_index[shift_mask], persistent=False)
-
-        self.weight_numel = irreps_in.num_irreps + self.num_scalar
-        assert count_scales + count_shift == self.weight_numel
-        self.num_scales = count_scales
-        self.num_shifts = count_shift
-        self._scale_blocks = tuple(scale_blocks)
-        self._use_block_scale = os.environ.get("DPTB_E3_ELEMENT_LINEAR_MODE", "block_view") == "block_view"
-
-    def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor]=None):
-
-        scales = weights[:, :self.num_scales] if weights is not None else None
-        if weights is not None:
-            if weights.shape[1] > self.num_scales:
-                shifts = weights[:, self.num_scales:]
-            else:
-                shifts = None
+    def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None):
+        if weights is None:
+            return x
+        assert len(weights) == len(x), "in_field doesnt seem to have correct shape as scales"
+        n = x.shape[0]
+        extra = weights.shape[1] - self.weight_numel
+        shifts: Optional[torch.Tensor] = None
+        if weights.shape[1] == self.num_scales:
+            scales = weights
+        elif extra >= 0:
+            pieces = torch.split(weights, [self.num_scales, self.num_shifts, extra], dim=1)
+            scales = pieces[0]
+            shifts = pieces[1]
         else:
-            shifts = None
-
-        if scales is not None:
-            assert len(scales) == len(
-                x
-            ), "in_field doesnt seem to have correct shape as scales"
-            if self._use_block_scale:
-                out = x.clone()
-                for feature_start, scale_start, mul, ir_dim in self._scale_blocks:
-                    out.narrow(1, feature_start, mul * ir_dim).view(x.shape[0], mul, ir_dim).mul_(
-                        scales.narrow(1, scale_start, mul).unsqueeze(-1)
-                    )
-                x = out
-            else:
-                x = scales[:,self.scale_index].reshape(x.shape[0], -1) * x
-        else:
-            x = x
-
+            raise ValueError(
+                "E3ElementLinear expects " + str(self.num_scales) + " scales and " + str(self.num_shifts)
+                + " shifts per row, got " + str(weights.shape[1]) + " weights"
+            )
+        x_blocks = torch.split(x, self._widths, dim=1)
+        scale_blocks = torch.split(scales, self._scale_widths, dim=1)
+        shift_blocks: List[torch.Tensor] = []
         if shifts is not None:
-            assert len(shifts) == len(
-                x
-            ), "in_field doesnt seem to have correct shape as shifts"
-
-            # bias = torch.zeros_like(x)
-            # bias[:, self.shift_index.ge(0)] = shifts[:,self.shift_index[self.shift_index.ge(0)]].reshape(-1, self.num_scalar)
-            # x = x + bias
-            x[:, self.shift_mask] = shifts[:, self.shift_source_index].reshape(-1, self.num_scalar) + x[:, self.shift_mask]
-        else:
-            x = x
-
-        return x
+            shift_blocks = list(torch.split(shifts, self._shift_widths, dim=1))
+        parts: List[torch.Tensor] = []
+        k = 0
+        for i in range(len(self._muls)):
+            mul = self._muls[i]
+            dim = self._dims[i]
+            if dim == 1:
+                part = x_blocks[i] * scale_blocks[i]
+            else:
+                part = (x_blocks[i].reshape(n, mul, dim) * scale_blocks[i].unsqueeze(-1)).reshape(n, mul * dim)
+            if self._shifted[i] and shifts is not None:
+                part = shift_blocks[k] + part
+                k += 1
+            parts.append(part)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=1)

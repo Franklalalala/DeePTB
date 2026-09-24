@@ -13,7 +13,7 @@ from torch.nn import Linear
 import os
 import torch.nn.functional as F
 from collections import defaultdict
-from .tensor_product import InterpolationBlock, RadialFunction
+from .tensor_product import InterpolationBlock, RadialFunction, complex_pair_output
 from dptb.utils.cuda_cache_memory import cuda_cache_memory_probe, record_cuda_cache_event
 
 # Load helpers (Keep original logic)
@@ -475,6 +475,30 @@ class MOLEGlobals:
             cached = ptr.to(device=target_device, dtype=torch.long).contiguous()
             self._indexed_segment_ptr_cache[key] = cached
         return cached
+
+
+class _RowPermutation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, order, inverse):
+        ctx.save_for_backward(order, inverse)
+        return x.index_select(0, order)
+
+    @staticmethod
+    def backward(ctx, grad):
+        order, inverse = ctx.saved_tensors
+        return permute_rows(grad, inverse, order), None, None
+
+
+def permute_rows(x: torch.Tensor, order: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
+    """x[order] for a permutation ``order`` of the rows of x whose inverse is ``inverse``.
+
+    The backward gathers the gradient with ``inverse``, where index_select's backward
+    zero-fills a buffer and index_adds into it.  Values and gradients are those of
+    index_select; only a bijection qualifies (a gather with repeated rows must sum).
+    Under a torch.func transform this is index_select itself."""
+    if getattr(torch._C, "_are_functorch_transforms_active", lambda: False)():
+        return x.index_select(0, order)
+    return _RowPermutation.apply(x, order, inverse)
 
 
 def _functorch_plain(values):
@@ -939,7 +963,7 @@ class MOLELinear(nn.Module):
         # the end puts it back.  Mixing the two orders silently routes rows to
         # the wrong expert, so no intermediate may be indexed with anything but
         # a sorted-space index.
-        xs = flat_x.index_select(0, order).contiguous()
+        xs = permute_rows(flat_x, order, inverse).contiguous()
         use_cublas = (
             self.mole_linear_mode == "cublas_grouped"
             and x.device.type == "cuda"
@@ -961,7 +985,7 @@ class MOLELinear(nn.Module):
                   else xs.new_zeros(rows, self.out_features))
         if bias is not None:
             ys = ys + bias.index_select(0, sorted_index)
-        return ys.index_select(0, inverse).reshape(
+        return permute_rows(ys, inverse, order).reshape(
             *x.shape[:-1], self.out_features)
 
     def _apply_expert_sorted_loop(self, x, expert_index):
@@ -2446,8 +2470,4 @@ class SO2_m_Linear(torch.nn.Module):
         return self._finish_linear_output(x_m)
 
     def _finish_linear_output(self, x_m):
-        x_r = x_m.narrow(2, 0, self.num_out_channel)
-        x_i = x_m.narrow(2, self.num_out_channel, self.num_out_channel)
-        x_m_r = x_r.narrow(1, 0, 1) - x_i.narrow(1, 1, 1)
-        x_m_i = x_r.narrow(1, 1, 1) + x_i.narrow(1, 0, 1)
-        return torch.cat((x_m_r, x_m_i), dim=1)
+        return complex_pair_output(x_m, self.num_out_channel)

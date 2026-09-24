@@ -483,7 +483,7 @@ def validate_prediction_route(
 
 
 def _linear_pair(ctx: OutputHeadContext):
-    from e3nn.o3 import Linear
+    from dptb.nn.e3nn_fast import Linear
 
     edge = Linear(
         ctx.final_irreps,

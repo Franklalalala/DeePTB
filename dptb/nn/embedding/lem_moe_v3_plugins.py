@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 from e3nn import o3
-from e3nn.nn import Gate
+
+from dptb.nn.e3nn_fast import Gate
 
 from .eqv3_grid_helpers import (
     EqV3StyleNodeFFN,
