@@ -30,6 +30,7 @@ this file; they are not block-ode-specific (several are also used by the
 non-block-ode ``rme``/``ao_block`` fallback paths below).
 """
 
+import contextlib
 import copy
 import logging
 import math
@@ -91,6 +92,23 @@ from dptb.nnops.tied_irrep_gaussian_prior import (
 )
 
 log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _seeded_rng_scope(state, seed: int):
+    """Seeded RNG scope for the CPU and the CUDA devices holding tensors of ``state``.
+
+    ``fork_rng`` restores only the generators it is given, and ``torch.manual_seed``
+    reseeds every visible CUDA device, so this seeds exactly the generators it
+    restores.  A seeded generator matches ``torch.manual_seed`` on its device.
+    """
+    devices = sorted({value.device.index for value in state.values()
+                      if isinstance(value, torch.Tensor) and value.device.type == "cuda"})
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        torch.random.default_generator.manual_seed(seed)
+        for index in devices:
+            torch.cuda.default_generators[index].manual_seed(seed)
+        yield
 
 
 _BLOCK_ODE_OUTPUT_ONLY_KEYS = (
@@ -3673,10 +3691,22 @@ class HamiltonianCFM:
                 num_graphs=num_graphs,
                 prior_seed=prior_seed,
             )
-        if prior_seed is not None:
-            raise ValueError("prior_seed is supported only by block_ode.")
         if prior_state is not None:
             raise ValueError("prior_state is supported only by block_ode.")
+        if prior_seed is not None:
+            # Non-ODE routes draw their prior through the ambient RNG rather
+            # than an explicit per-graph substream, so honor a requested seed by
+            # sampling inside a forked, deterministically seeded RNG scope.
+            # Without this a stochastic prior would make every validation pass
+            # start from a different point, adding pure jitter to the metric.
+            with _seeded_rng_scope(state, int(prior_seed)):
+                return self.sample(
+                    model,
+                    state,
+                    num_steps=num_steps,
+                    prior_seed=None,
+                    prior_state=None,
+                )
         node_current = self._sampling_base(state, self.node_h0_key, self.node_target_key, "node")
         edge_current = self._sampling_base(state, self.edge_h0_key, self.edge_target_key, "edge")
         if node_current is None and edge_current is None:
