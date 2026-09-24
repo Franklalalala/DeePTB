@@ -754,6 +754,19 @@ def resolve_dynamic_batch_options(
     opts["mode"] = mode
     if mode not in {"block", "edge"}:
         raise ValueError(f"dynamic_batch.mode must be one of ['block', 'edge'], got {mode!r}")
+    if (
+        "max_samples" in opts
+        and opts["max_samples"] is not None
+        and batch_size is not None
+        and int(opts["max_samples"]) != int(batch_size)
+    ):
+        # An explicit max_samples outlives edits to batch_size (a base config
+        # carrying max_samples=96 packs 96-record batches after batch_size=32).
+        log.warning(
+            "dynamic_batch.max_samples=%s differs from batch_size=%s: batches hold up to %s records "
+            "and the cost budget is calibrated for that size.",
+            opts["max_samples"], batch_size, opts["max_samples"],
+        )
     opts.setdefault("max_samples", batch_size)
     opts.setdefault("shuffle", shuffle)
     opts.setdefault("drop_last", False)
