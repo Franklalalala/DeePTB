@@ -41,7 +41,7 @@ from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.data.interfaces.blockwise_tensor import is_soc_uureal_mapper
 from dptb.data.interfaces.p2_contract import PRIOR_FIELD_SPECS
 from dptb.nn.embedding.emb import Embedding
-from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
+from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, write_router_regularizers
 
 from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0 import LemMoEV3H0
@@ -426,6 +426,7 @@ class _Prior2bMixin:
             data["mean_max_prob"] = monitor_val
             data["expert_load_cv"] = expert_load_cv
             data["edge_moe_num_route_tokens"] = num_route_tokens
+            write_router_regularizers(self.router, data)
             coeffs = mole_pa.coefficients
             topk_indices = mole_pa.topk_indices
             topk_values = mole_pa.topk_values
@@ -435,6 +436,7 @@ class _Prior2bMixin:
             topk_indices, topk_values = self.router.last_topk()
             data["mean_max_prob"] = monitor_val
             data["expert_load_cv"] = expert_load_cv
+            write_router_regularizers(self.router, data)
 
         # --- GNN branch (stage 2 only): first SO2 layer eats concat(geo, P-map)
         if not self.only2b:

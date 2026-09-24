@@ -636,6 +636,8 @@ class HamilLossAbs(nn.Module):
             onsite_boost_max: float = 100.0,
             z_loss_coef: float = 0.0,
             element_average: bool = False,
+            router_z_loss_coef: float = 0.0,
+            router_aux_loss_coef: float = 0.0,
             **kwargs,
     ):
         super(HamilLossAbs, self).__init__()
@@ -650,6 +652,14 @@ class HamilLossAbs(nn.Module):
         self._debug_counter = 0
         self.z_loss_coef = float(z_loss_coef)
         self.last_z_loss = None
+        self.router_z_loss_coef = float(router_z_loss_coef)
+        self.router_aux_loss_coef = float(router_aux_loss_coef)
+        for name, value in (("router_z_loss_coef", self.router_z_loss_coef),
+                            ("router_aux_loss_coef", self.router_aux_loss_coef)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("%s must be a finite non-negative number, got %r" % (name, value))
+        self.last_router_z_loss = None
+        self.last_router_aux_loss = None
         self.expert_load_cv = None
         self.element_average = bool(element_average)
 
@@ -685,6 +695,26 @@ class HamilLossAbs(nn.Module):
         else:
             assert idp is not None, "Either basis or idp should be provided."
             self.idp = idp
+
+    def _add_router_regularizers(self, total_loss: torch.Tensor, data: AtomicDataDict) -> torch.Tensor:
+        """Add router_z_loss_coef * data['router_z_loss'] and router_aux_loss_coef * data['router_aux_loss'].
+
+        The terms come from the routed MoE embeddings (dptb.nn.tensor_product_moe_v3.router_z_loss, the Switch
+        balancing loss of dptb.nn.top1_prior) and keep their gradient; the reported onsite/hopping losses and the
+        loss rebuilt from reduced stats stay the plain Hamiltonian loss.  A coefficient > 0 requires its term.
+        """
+        for coef, key, attr in ((self.router_z_loss_coef, "router_z_loss", "last_router_z_loss"),
+                                (self.router_aux_loss_coef, "router_aux_loss", "last_router_aux_loss")):
+            value = data.get(key) if hasattr(data, "get") else None
+            setattr(self, attr, value.detach() if torch.is_tensor(value) else None)
+            if coef > 0:
+                if not torch.is_tensor(value):
+                    raise KeyError(
+                        "%s_coef > 0 but the model did not produce data[%r]; only routed MoE embeddings "
+                        "(MOLERouterV3, the Switch top-1 router) do" % (key, key)
+                    )
+                total_loss = total_loss + coef * value.to(dtype=total_loss.dtype)
+        return total_loss
 
     def _current_onsite_weight(self) -> float:
         if not self.onsite_boost:
@@ -891,7 +921,7 @@ class HamilLossAbs(nn.Module):
             if self.z_loss_coef > 0 and isinstance(raw_z_loss, torch.Tensor):
                 total_loss = total_loss + self.z_loss_coef * raw_z_loss
 
-            return total_loss
+            return self._add_router_regularizers(total_loss, data)
 
         except Exception as e:
             if self.debug:

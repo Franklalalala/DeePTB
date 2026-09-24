@@ -692,16 +692,49 @@ def _expert_route_indices_from_globals(
     return all_experts.reshape(1, num_experts).expand(n_rows, num_experts)
 
 
+def router_z_loss(logits: torch.Tensor, sizes: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """ST-MoE router z-loss: mean over route tokens of logsumexp(logits)**2, weighted by ``sizes``.
+
+    It penalises the logit scale that saturates the gate, and keeps its gradient; the training objective adds it only
+    when ``loss_options.train.router_z_loss_coef`` is > 0.
+    """
+    if logits.shape[0] == 0:
+        return logits.new_zeros((), dtype=torch.float32)
+    z = torch.logsumexp(logits.float(), dim=-1).square()
+    if sizes is None:
+        return z.mean()
+    w = sizes.to(z.dtype).reshape(-1)
+    return (z * w).sum() / w.sum().clamp_min(1e-12)
+
+
+ROUTER_REGULARIZER_KEYS = (("router_z_loss", "last_router_z_loss"), ("router_aux_loss", "last_router_aux_loss"))
+
+
+def write_router_regularizers(router: Optional[nn.Module], data: dict) -> None:
+    """Expose the regularisers of the router's last forward to the loss (``data['router_z_loss']`` etc.)."""
+    for key, attr in ROUTER_REGULARIZER_KEYS:
+        value = getattr(router, attr, None) if router is not None else None
+        if value is not None:
+            data[key] = value
+
+
 class MOLERouterV3(nn.Module):
     def __init__(self, in_features, num_experts=48, top_k=6,
                  aux_loss_free=True,
                  bias_update_speed=0.005,
-                 full_expert_fast_path: bool = True):  # 修改1: 固定 Bias 更新速度，不再衰减
+                 full_expert_fast_path: bool = True,
+                 mixing_temperature: float = 1.0):  # 修改1: 固定 Bias 更新速度，不再衰减
         super().__init__()
         self.top_k = top_k
         self.num_experts = num_experts
         self.aux_loss_free = aux_loss_free
         self.full_expert_fast_path = full_expert_fast_path
+        # Temperature of the softmax that mixes the selected experts (and of the full-expert gate): the weights are
+        # softmax(logits / T).  T > 1 keeps the mixing soft for a given logit gap; selection (sigmoid scores + the
+        # balancing bias) does not depend on it.  T = 1 is the original gate.
+        self.mixing_temperature = float(mixing_temperature)
+        if not math.isfinite(self.mixing_temperature) or self.mixing_temperature <= 0:
+            raise ValueError("mixing_temperature must be a finite positive number, got %r" % (mixing_temperature,))
 
         # 固定的惩罚力度
         self.bias_update_speed = bias_update_speed
@@ -717,6 +750,7 @@ class MOLERouterV3(nn.Module):
         self.register_buffer('ema_load', torch.ones(num_experts) * (effective_top_k / num_experts))
         self._last_topk_indices = None
         self._last_topk_values = None
+        self.last_router_z_loss = None
 
         # 修改1: 删除了 step_count 等用于衰减的 Buffer
 
@@ -724,10 +758,11 @@ class MOLERouterV3(nn.Module):
         # 修改1: 删除了 Jitter (探索噪声) 的注入逻辑，完全依赖网络的自然 Logits
         logits = self.net(global_features)
         scores = torch.sigmoid(logits)
+        self.last_router_z_loss = router_z_loss(logits, sizes)
 
         if self.full_expert_fast_path and (self.top_k is None or self.top_k >= self.num_experts):
             # All experts selected: the same logit-space softmax as the top-k gate below.
-            probs = torch.softmax(logits, dim=-1)
+            probs = torch.softmax(self._tempered(logits), dim=-1)
             monitor_val = probs.max(dim=-1)[0].mean().detach()
             self._last_topk_indices = None
             self._last_topk_values = None
@@ -777,7 +812,7 @@ class MOLERouterV3(nn.Module):
             # sums to 1 by construction and keeps a usable gradient. Selection and
             # the load statistics above deliberately still use `scores`.
             topk_logits = torch.gather(logits, 1, topk_indices)
-            topk_probs = torch.softmax(topk_logits, dim=-1)
+            topk_probs = torch.softmax(self._tempered(topk_logits), dim=-1)
             self._last_topk_indices = topk_indices
             self._last_topk_values = topk_probs
 
@@ -792,7 +827,7 @@ class MOLERouterV3(nn.Module):
 
         else:
             # top_k=None selects every expert: the same logit-space softmax as the top-k gate.
-            probs = torch.softmax(logits, dim=-1)
+            probs = torch.softmax(self._tempered(logits), dim=-1)
             monitor_val = probs.max(dim=-1)[0].mean().detach()
             self._last_topk_indices = None
             self._last_topk_values = None
@@ -800,6 +835,9 @@ class MOLERouterV3(nn.Module):
 
     def last_topk(self):
         return self._last_topk_indices, self._last_topk_values
+
+    def _tempered(self, logits):
+        return logits if self.mixing_temperature == 1.0 else logits / self.mixing_temperature
 
 
 class MOLELinear(nn.Module):

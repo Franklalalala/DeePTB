@@ -14,7 +14,7 @@ from dptb.data.interfaces.blockwise_tensor import (
     infer_block_shapes,
 )
 from dptb.nn.embedding.emb import Embedding
-from dptb.nn.tensor_product_moe_v3 import MOLEGlobals
+from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, write_router_regularizers
 
 from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0_helpers import H0InitLayer
@@ -344,6 +344,7 @@ class LemMoEV3H0(LemMoEV3):
         topk_indices, topk_values = self.router.last_topk()
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
+        write_router_regularizers(self.router, data)
 
         num_nodes_total = node_one_hot.shape[0]
         precomputed_active_edges = data.get(_keys.LEM_ACTIVE_EDGES_KEY, None)

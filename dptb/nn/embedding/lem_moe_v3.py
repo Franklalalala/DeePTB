@@ -30,7 +30,8 @@ from .lem_moe_v3_plugins import (
     can_use_flat_s2_patch,
 )
 # Note: Modified SO2_Linear and MOLE classes imported here
-from dptb.nn.tensor_product_moe_v3 import SO2_Linear, MOLEGlobals, MOLERouterV3, SO2PostActivationExpertMixer
+from dptb.nn.tensor_product_moe_v3 import (SO2_Linear, MOLEGlobals, MOLERouterV3, SO2PostActivationExpertMixer,
+                                           write_router_regularizers)
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
@@ -1654,6 +1655,7 @@ class LemMoEV3(torch.nn.Module):
         # 这个值越接近 1.0 表示路由越自信，接近 0.5 (TopK=1时) 表示犹豫
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
+        write_router_regularizers(self.router, data)
         # 3. Prepare MOLEGlobals
         num_nodes_total = node_one_hot.shape[0]
         precomputed_active_edges = data.get(_keys.LEM_ACTIVE_EDGES_KEY, None)

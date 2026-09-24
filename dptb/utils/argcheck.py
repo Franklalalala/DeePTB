@@ -2038,6 +2038,7 @@ def _edge_router_arguments():
         Argument("edge_router_prior_activate", bool, optional=True, default=False, doc=doc_edge_router_prior_activate),
         Argument("edge_router_prior_stats", str, optional=True, default="", doc=doc_edge_router_prior_stats),
         Argument("edge_router_top1_mode", str, optional=True, default="legacy", doc="Top-1 prior routing: legacy or switch (global softmax, argmax, retained probability, no shared experts)."),
+        Argument("edge_router_temperature", (int, float), optional=True, default=1.0, doc="Temperature T of the softmax that mixes the selected experts of the edge router (weights = softmax(logits / T) over the top-k); T > 1 keeps the mixing soft for a given logit gap, selection is unchanged. Not for the switch mode. Default: `1.0`."),
     ]
 
 
@@ -2467,6 +2468,22 @@ def loss_options():
             optional=True,
             default=0,
             doc="Coefficient used to punish the unbalance of expert workload",
+        ),
+        Argument(
+            "router_z_loss_coef",
+            (int, float),
+            optional=True,
+            default=0.0,
+            doc="hamil_abs: coefficient of the ST-MoE router z-loss, the mean over route tokens of "
+                "logsumexp(router logits)^2 (edge-MoE MOLERouterV3 and the Switch top-1 router). 0 = off.",
+        ),
+        Argument(
+            "router_aux_loss_coef",
+            (int, float),
+            optional=True,
+            default=0.0,
+            doc="hamil_abs: coefficient of the Switch balancing loss E * sum_e f_e * P_e of the Switch top-1 "
+                "router (f_e: fraction of route tokens whose argmax is e; P_e: mean router probability). 0 = off.",
         ),
 
     ]

@@ -8,7 +8,7 @@ from dptb.configuration import resolve_init_scope
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
-from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLERouterV3
+from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLERouterV3, write_router_regularizers
 
 from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
 from .lem_moe_v3_h0_helpers import H0InitLayer, _sorted_irrep_coordinate_index
@@ -37,6 +37,9 @@ class LemMoEV3Edge(LemMoEV3):
         self.edge_moe_compact_min_edges = int(kwargs.pop("edge_moe_compact_min_edges", 16384))
         self.edge_router_prior_activate = bool(kwargs.pop("edge_router_prior_activate", False))
         self.edge_router_prior_stats = str(kwargs.pop("edge_router_prior_stats", "") or "")
+        self.edge_router_temperature = float(kwargs.pop("edge_router_temperature", 1.0))
+        if self.edge_router_top1_mode == "switch" and self.edge_router_temperature != 1.0:
+            raise ValueError("edge_router_temperature applies to the top-k gate; the Switch top-1 router has none")
         edge_one_hot_dim = int(edge_router_in_features or kwargs.get("edge_one_hot_dim", 128))
         self.edge_one_hot_dim = edge_one_hot_dim
         self.edge_router_in_features = edge_one_hot_dim
@@ -168,16 +171,17 @@ class LemMoEV3Edge(LemMoEV3):
             self.register_buffer("_prior_mean", mean, persistent=False)
             self.register_buffer("_prior_std", std, persistent=False)
 
-        router_type = MOLERouterV3
+        router_type, router_kwargs = MOLERouterV3, dict(mixing_temperature=self.edge_router_temperature)
         if self.edge_router_top1_mode == "switch":
             from dptb.nn.top1_prior import Top1PriorRouter
-            router_type = Top1PriorRouter
+            router_type, router_kwargs = Top1PriorRouter, {}
         self.router = router_type(
             in_features=self.edge_router_in_features,
             num_experts=self.num_experts,
             top_k=top_k,
             aux_loss_free=self.edge_router_top1_mode != "switch",
             bias_update_speed=0.0 if self.edge_router_top1_mode == "switch" else 0.005,
+            **router_kwargs,
         )
         if self.edge_router_prior_dim:
             # The descriptor contributes exactly zero at step 0, so it can earn
@@ -269,6 +273,7 @@ class LemMoEV3Edge(LemMoEV3):
         )
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
+        write_router_regularizers(self.router, data)
         data["edge_moe_num_active_edges"] = torch.as_tensor(
             active_edge_one_hot.shape[0],
             device=active_edge_one_hot.device,

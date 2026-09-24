@@ -3,13 +3,16 @@
 Global float32 softmax -> argmax -> retain selected probability. Ordinary
 autograd trains the probability; the hard index itself is not differentiated.
 No bias-adjusted selection, selected-only normalization, STE, or gate floor.
-This implements the Switch routing rule, not its complete training recipe:
-there is no capacity dropping or newly introduced auxiliary balancing loss.
+This implements the Switch routing rule without capacity dropping.  The Switch
+balancing loss E * sum_e f_e * P_e (f_e: fraction of route tokens whose argmax is
+e, no gradient; P_e: mean router probability of e) and the ST-MoE z-loss are
+computed every forward and enter the training objective only through
+loss_options.train.router_aux_loss_coef / router_z_loss_coef (default 0).
 """
 from collections import Counter
 import torch
 from torch import nn
-from .tensor_product_moe_v3 import MOLEGlobals
+from .tensor_product_moe_v3 import MOLEGlobals, router_z_loss
 
 COUNTS = Counter()
 
@@ -36,17 +39,26 @@ class Top1PriorRouter(nn.Module):
         self.register_buffer('ema_load', torch.full((num_experts,), 1 / num_experts))
         self._last_topk_indices = self._last_topk_values = None
         self.last_stats = {}
+        self.last_router_aux_loss = self.last_router_z_loss = None
 
     def forward(self, features, sizes=None):
         logits = self.net(features)
         probs = torch.softmax(logits.float(), dim=-1)
         indices = probs.argmax(-1, keepdim=True)
         gates = probs.gather(1, indices)
+        weights = (probs.new_ones(features.shape[0]) if sizes is None
+                   else sizes.to(probs).reshape(-1))
         with torch.no_grad():
             load = probs.new_zeros(self.num_experts)
-            weights = (probs.new_ones(features.shape[0]) if sizes is None
-                       else sizes.to(probs).reshape(-1))
             load.scatter_add_(0, indices[:, 0], weights)
+        if features.shape[0]:
+            total = weights.sum().clamp_min(1e-12)
+            mean_prob = (probs * weights.unsqueeze(-1)).sum(0) / total
+            self.last_router_aux_loss = self.num_experts * ((load / total) * mean_prob).sum()
+        else:
+            self.last_router_aux_loss = probs.new_zeros(())
+        self.last_router_z_loss = router_z_loss(logits, sizes)
+        with torch.no_grad():
             if self.training:
                 self.ema_load.mul_(0.9).add_(load, alpha=0.1)
             cv = self.ema_load.std(unbiased=False) / self.ema_load.mean().clamp_min(1e-8)
