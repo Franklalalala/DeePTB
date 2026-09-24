@@ -1,6 +1,6 @@
 # Maintained development branch
 
-Use `0921-stable` as the single integration and maintenance branch for new DeePTB
+Use `0924-stable` as the single integration and maintenance branch for new DeePTB
 features and fixes. Historical branches and immutable deployed releases are
 compatibility references; do not continue separate feature release lines unless
 the user explicitly requests one. Do not rewrite or delete historical branches
