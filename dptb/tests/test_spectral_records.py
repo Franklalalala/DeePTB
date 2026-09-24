@@ -60,7 +60,7 @@ def test_atomicdata_container_preserves_fields():
 
 def test_electron_count_has_declared_graph_alignment_in_strict_ensemble():
     from dptb.nn.output_spec import default_output_spec
-    from dptb.tests.test_distance_ensemble_stitch import _make_wrapper
+    from dptb.tests.model_helpers import _make_wrapper
 
     field = default_output_spec(strict=True).get("nelec")
     assert (

@@ -1,9 +1,7 @@
 """Round-three audit regressions: allocation-free capacity, DSO identity, startup."""
 import json,os,signal,subprocess,sys,time
 from pathlib import Path
-import numpy as np
 import pytest
-import torch
 
 def test_memory_budget_is_bound_to_acceptance_identity(tmp_path,monkeypatch):
  import acceptance
@@ -31,6 +29,7 @@ def test_memory_budget_is_bound_to_acceptance_identity(tmp_path,monkeypatch):
 def mapping(p):
  s=p.stat();return f'1000-2000 r-xp 00000000 {os.major(s.st_dev):02x}:{os.minor(s.st_dev):02x} {s.st_ino} {p}'
 
+@pytest.mark.skipif(sys.platform!='linux',reason='fakes /proc/self/maps and os.major/os.minor, both POSIX-only')
 def test_library_collision_fails_closed_and_aliases_are_stable(tmp_path,monkeypatch):
  from h0rebuild import numerical_identity as ni
  a=tmp_path/'a/libopenblas_probe.so';b=tmp_path/'b/libopenblas_probe.so'
@@ -53,7 +52,7 @@ def test_library_collision_fails_closed_and_aliases_are_stable(tmp_path,monkeypa
  after=ni.loaded_libraries(r'/libopenblas[^/]*\.so')
  assert before[0]==after[0] and before[1]!=after[1]
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='installed CUDA extension required')
+@pytest.mark.h0_extension('_cuda_local_grid')
 @pytest.mark.parametrize('norb',[1,2,3,4])
 def test_support_capacity_without_allocation(norb):
  from h0rebuild.precompiled import load
@@ -63,7 +62,7 @@ def test_support_capacity_without_allocation(norb):
  with pytest.raises(RuntimeError):native.validate_support_capacity(-1,norb)
  with pytest.raises(RuntimeError):native.validate_support_capacity(0,0)
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='installed CUDA extension required')
+@pytest.mark.h0_extension('_cuda_local_grid')
 def test_candidate_and_compacted_capacity_without_allocation():
  from h0rebuild.precompiled import load
  native=load('_cuda_local_grid');cap=2**31-1-256

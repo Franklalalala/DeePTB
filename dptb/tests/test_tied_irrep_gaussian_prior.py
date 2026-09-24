@@ -16,14 +16,13 @@ from dptb.data.interfaces.blockwise_tensor import (
 )
 from dptb.nnops.block_flow_codec import project_block_state
 from dptb.nnops.tied_irrep_gaussian_prior import (
-    TIED_IRREP_EFFECTIVE_VARIANCES,
     dense_all_one_irrep_expansion,
     effective_tied_irrep_latent,
     fill_tied_irrep_rme,
 )
 from dptb.utils.argcheck import flow_options, validate_block_ode_contract
 
-from test_residual_ao_block_ode import (  # noqa: E402
+from dptb.tests.block_ode_fixtures import (  # noqa: E402
     FP64_ATOL,
     _EndpointSpy,
     _LinearEchoModel,
@@ -70,19 +69,6 @@ _CANONICAL_O_Z = torch.tensor(
     ],
     dtype=torch.float64,
 )
-
-# The 6 individual shells packed into _CANONICAL_O_Z's 14 components, in
-# ascending (canonical, per OrbitalMapper.get_orbpair_maps) shell-index
-# order: 3 tied s-copies, then 2 tied p-copies, then 1 d-copy.
-_CANONICAL_O_SHELLS = (
-    ("s1", slice(0, 1)),
-    ("s2", slice(1, 2)),
-    ("s3", slice(2, 3)),
-    ("p1", slice(3, 6)),
-    ("p2", slice(6, 9)),
-    ("d1", slice(9, 14)),
-)
-
 
 def _canonical_o_effective_latent(z=_CANONICAL_O_Z):
     """The tied effective (g0, g1, g2) fields _CANONICAL_O_Z's copies sum to."""
@@ -144,271 +130,73 @@ def _node_tied_draw(flow, dim, *, types, batch, uids, seed, device):
     )
 
 
-def test_dense_all_one_expansion_fixed_vector_fixture():
-    """Golden fixture for ``dense_all_one_irrep_expansion``, regenerated after
-    PR#31 review finding P1-1 (missing sqrt(2L+1) Wigner-3j -> Clebsch-Gordan
-    normalization for every L>=1 channel).  Values below were printed by a
-    throwaway script calling the FIXED implementation, not hand-derived --
-    see ``test_dense_all_one_expansion_matches_production_codec_full_water_oxygen_matrix``
-    just below for the independent cross-check against the real production
-    codec that these numbers were verified against (bit-exact to fp64).
-
-    Every sub-block asserted here (s-s, p1-p1 raw/symmetrized, s1-p1, s1-d1)
-    sits at an ascending shell-index (canonical) or self-pair position, so the
-    dense-mirror fix (below, dedicated dense-vs-mirror review lane) leaves all
-    of their values bit-identical -- only the matrix-rank assertions change,
-    see the comment there.
-    """
-    z = torch.tensor(
-        [
-            0.10,
-            -0.20,
-            0.30,
-            0.01,
-            0.02,
-            0.03,
-            -0.04,
-            0.05,
-            -0.06,
-            0.07,
-            -0.08,
-            0.09,
-            -0.10,
-            0.11,
-        ],
-        dtype=torch.float64,
-    )
-    block = dense_all_one_irrep_expansion(z)
-
-    torch.testing.assert_close(
-        block[:3, :3],
-        torch.full((3, 3), 0.2, dtype=torch.float64),
-        rtol=0.0,
-        atol=5e-5,
-    )
-    torch.testing.assert_close(
-        block[3:6, 3:6],
-        torch.tensor(
-            [
-                [0.0009, -0.0778, 0.0000],
-                [-0.0354, 0.1890, -0.0919],
-                [0.0990, -0.0495, 0.1565],
-            ],
-            dtype=torch.float64,
-        ),
-        rtol=0.0,
-        atol=5e-5,
-    )
-    torch.testing.assert_close(
-        0.5 * (block[3:6, 3:6] + block[3:6, 3:6].T),
-        torch.tensor(
-            [
-                [0.0009, -0.0566, 0.0495],
-                [-0.0566, 0.1890, -0.0707],
-                [0.0495, -0.0707, 0.1565],
-            ],
-            dtype=torch.float64,
-        ),
-        rtol=0.0,
-        atol=5e-5,
-    )
-    torch.testing.assert_close(
-        block[0:1, 3:6],
-        torch.tensor([[-0.0300, 0.0700, -0.0300]], dtype=torch.float64),
-        rtol=0.0,
-        atol=5e-5,
-    )
-    torch.testing.assert_close(
-        block[0:1, 9:14],
-        torch.tensor(
-            [[0.0700, -0.0800, 0.0900, -0.1000, 0.1100]],
-            dtype=torch.float64,
-        ),
-        rtol=0.0,
-        atol=5e-5,
-    )
-    # Dense-mirror review (F:\claude\0721_pr31_fix dense-mirror lane): before
-    # the mirror-direction fix, the three descending-shell-index blocks
-    # (p2-p1, d1-p1, d1-p2) were erroneously IDENTICAL to their ascending
-    # partners (p1-p2, p1-d1, p2-d1) instead of those partners' transpose --
-    # a spurious extra linear dependency that dropped the observed rank of
-    # THIS SPECIFIC z's expansion from the fixed value below to 9.  11 is not
-    # a general invariant (see docs Section 8, "numerical AO-matrix rank...
-    # need not equal the prior support rank") -- it is this fixture's own
-    # verified value, confirmed well clear of the 1e-12 cutoff: the 11th
-    # singular value is ~2e-2 and the 12th is ~8e-17 (a 15-order-of-magnitude
-    # gap), both before and after symmetrization.
-    assert int(torch.linalg.matrix_rank(block, tol=1e-12).item()) == 11
-    sym = 0.5 * (block + block.T)
-    assert int(torch.linalg.matrix_rank(sym, tol=1e-12).item()) == 11
-
-
-def test_dense_all_one_expansion_matches_production_codec_full_water_oxygen_matrix():
-    """Dense-mirror review (fix/0721-dense-mirror lane) fast-vs-dense
-    full-matrix cross-check, superseding the narrower canonical-only version
-    of this test (formerly
-    ``test_dense_all_one_expansion_matches_production_codec_on_water_oxygen_row``,
-    which asserted only 4 single-copy/canonical-direction blocks -- s-s,
-    s1-p1, s1-d1, and raw p1-p1 -- and explicitly scoped OUT mirror-direction
-    blocks).  PR#31 review's original gap: the two "halves" of this prior's
-    math -- ``fill_tied_irrep_rme`` (production) and
-    ``dense_all_one_irrep_expansion`` (docs'/tests' reference) -- were never
-    cross-checked against each other anywhere; the pr31fix lane's follow-up
-    doubt was whether the narrow version's carved-out mirror/cross-degree
-    scope limit hid a real bug or just an untested corner.
-
-    Investigation result: REAL bug, not a misreading.  Feeding the doc's own
-    Section-4 ``z`` vector through both paths on water's real oxygen
-    ``3s2p1d`` basis (the canonical ``3x0e+2x1e+1x2e`` shape) and comparing
-    EVERY ordered pair of O's 6 individual shells (s1, s2, s3, p1, p2, d1 --
-    36 blocks: 6 self-pairs + 15 canonical/ascending pairs + 15 mirror/
-    descending pairs) found exactly 3 mismatches before the fix: p2-p1,
-    d1-p1, d1-p2 -- all descending-shell-index mirrors of either a
-    multi-copy pair (p1-p2, tied to the identical field so dense's old
-    ``weights``-are-copy-index-blind einsum made p2-p1 identically equal to
-    p1-p2 instead of its transpose) or a cross-degree pair (p-d, whose
-    coupled L=1/L=2 channels have mixed parity, so dense's old independent
-    ``wigner_3j(ir_out2.l, ir_out1.l, ir_in.l)`` recompute for d-p disagreed
-    with production's transpose-of-p-d on the L=2 channel's sign).  All 3
-    turned out to be EXACTLY production's transpose of dense's own (already
-    correct) canonical block -- confirmed for all 15 unordered pairs, not
-    just the 3 that were broken -- matching literally how
-    ``BlockStateCodec.rme_to_blocks`` -> ``feature_tensors_to_block_tensors``
-    derives every off-diagonal onsite mirror
-    (``symmetrize_onsite``'s ``sub_block[:, col, row] = part.transpose(-1,
-    -2)``).  Fixed in ``dense_all_one_irrep_expansion`` by deriving every
-    mirror block that way instead of an independent recompute; see that
-    function's docstring and inline comments for the full mechanism, and
-    ``test_dense_all_one_expansion_matches_production_codec_on_homonuclear_edge``
-    below for the edge-row half of this cross-check.
-    """
-    mapper = _water_mapper()
-    flow = _b_tied_flow(mapper)
-    data = _water_graph(mapper, dtype=torch.float64)
-    dim = mapper.orbpair_irreps.dim
-
-    z = _CANONICAL_O_Z
-    effective_latent = _canonical_o_effective_latent(z)
-
-    # _water_graph's atomic_numbers=[8,1,1] -> row 0 is the O node; only that
-    # row's mask is set so the H rows stay exactly zero (irrelevant here).
-    node_like = torch.zeros(3, dim, dtype=torch.float64)
-    node_mask = torch.zeros_like(node_like, dtype=torch.bool)
-    node_mask[0, :] = True
-    node_latent = torch.zeros(3, 9, dtype=torch.float64)
-    node_latent[0] = effective_latent
-
-    slices = flow._te_irrep_slices(dim)
-    node_rme = fill_tied_irrep_rme(node_like, slices, node_mask, node_latent, sigma=1.0)
-    n_edges = int(data[_keys.EDGE_INDEX_KEY].shape[1])
-    edge_rme = torch.zeros(n_edges, dim, dtype=torch.float64)
-
-    packed = flow.block_codec.rme_to_blocks(data, node_rme, edge_rme, project=False)
-    production = packed.node_blocks[0]
-    dense = dense_all_one_irrep_expansion(z)
-
-    # Headline claim: bit-exact over the WHOLE 14x14 matrix, not a subset.
-    torch.testing.assert_close(production, dense, rtol=0.0, atol=FP64_ATOL)
-
-    # Per-shell-pair breakdown of all 36 ordered pairs (every canonical AND
-    # every mirror direction) so a future regression fails pinpointing a
-    # specific shell pair instead of an opaque whole-matrix diff.
-    for a_name, a_slice in _CANONICAL_O_SHELLS:
-        for b_name, b_slice in _CANONICAL_O_SHELLS:
-            torch.testing.assert_close(
-                production[a_slice, b_slice],
-                dense[a_slice, b_slice],
-                rtol=0.0,
-                atol=FP64_ATOL,
-                msg=f"{a_name}-{b_name} block mismatch (production vs dense)",
-            )
-
-
-def test_dense_all_one_expansion_matches_production_codec_on_homonuclear_edge():
-    """Dense-mirror review: edge-row half of the full-matrix cross-check.
-
-    The node/onsite check above alone would leave ``fill_tied_irrep_rme`` ->
-    ``rme_to_blocks``'s EDGE path -- a structurally different mirror
-    mechanism (``complete_edge_blocks_from_reverse``'s reverse-edge
-    transpose ``H_ij(R)=H_ji(-R)^T``, not onsite's same-block
-    ``symmetrize_onsite`` transpose) -- unverified against dense, even after
-    the fix above.  Feeding the SAME tied ``z`` pattern to both directions of
-    a genuine reverse-edge pair (``_o2_edge_graph``, a synthetic homonuclear
-    O-O bond so the edge block is square and comparable to dense at all,
-    unlike water's own rectangular O-H/H-O edges) makes the two mechanisms
-    converge: each edge's own ascending-shell-index content is tied to the
-    identical value production's onsite path would use, and the completed
-    descending-shell-index content one edge borrows from its reverse partner
-    is therefore that partner's own (identically tied) ascending content,
-    transposed -- exactly the fixed ``dense_all_one_irrep_expansion``'s
-    mirror convention.  Confirmed empirically: both edge directions come out
-    bit-identical to ``dense`` (and, as a side effect of this specific
-    symmetric setup -- not a general edge-prior property -- to each other).
-    """
+@pytest.mark.parametrize("graph_kind", ["node_water_oxygen", "edge_homonuclear_o2"])
+def test_dense_all_one_expansion_matches_production_codec(graph_kind):
+    """``fill_tied_irrep_rme`` (production) and ``dense_all_one_irrep_expansion``
+    (the docs'/tests' independent reference) must agree bit-exactly over the
+    whole matrix, including every off-canonical mirror block: the onsite path
+    (``symmetrize_onsite``'s same-block transpose) and the edge path
+    (``complete_edge_blocks_from_reverse``'s ``H_ij(R)=H_ji(-R)^T``) are
+    structurally different mirror mechanisms, so both need checking against
+    the same tied ``z`` pattern on water's real oxygen 3s2p1d basis."""
     mapper = _water_mapper()
     flow = _b_tied_flow(mapper)
     dim = mapper.orbpair_irreps.dim
-    data = _o2_edge_graph(mapper)
-
     z = _CANONICAL_O_Z
     effective_latent = _canonical_o_effective_latent(z)
-
     slices = flow._te_irrep_slices(dim)
-    node_like = torch.zeros(2, dim, dtype=torch.float64)
-    node_mask = torch.zeros_like(node_like, dtype=torch.bool)
-    node_rme = fill_tied_irrep_rme(
-        node_like, slices, node_mask, torch.zeros(2, 9, dtype=torch.float64), sigma=1.0
-    )
-
-    edge_like = torch.zeros(2, dim, dtype=torch.float64)
-    edge_mask = torch.ones_like(edge_like, dtype=torch.bool)
-    edge_latent = effective_latent.reshape(1, 9).expand(2, 9).clone()
-    edge_rme = fill_tied_irrep_rme(edge_like, slices, edge_mask, edge_latent, sigma=1.0)
-
-    packed = flow.block_codec.rme_to_blocks(data, node_rme, edge_rme, project=False)
     dense = dense_all_one_irrep_expansion(z)
 
-    torch.testing.assert_close(
-        packed.edge_blocks[0], dense, rtol=0.0, atol=FP64_ATOL, msg="O(0)->O(1) edge block"
-    )
-    torch.testing.assert_close(
-        packed.edge_blocks[1], dense, rtol=0.0, atol=FP64_ATOL, msg="O(1)->O(0) edge block"
-    )
+    if graph_kind == "node_water_oxygen":
+        data = _water_graph(mapper, dtype=torch.float64)
+        # _water_graph's atomic_numbers=[8,1,1] -> row 0 is the O node; only
+        # that row's mask is set so the H rows stay exactly zero (irrelevant).
+        node_like = torch.zeros(3, dim, dtype=torch.float64)
+        node_mask = torch.zeros_like(node_like, dtype=torch.bool)
+        node_mask[0, :] = True
+        node_latent = torch.zeros(3, 9, dtype=torch.float64)
+        node_latent[0] = effective_latent
+        node_rme = fill_tied_irrep_rme(node_like, slices, node_mask, node_latent, sigma=1.0)
+        n_edges = int(data[_keys.EDGE_INDEX_KEY].shape[1])
+        edge_rme = torch.zeros(n_edges, dim, dtype=torch.float64)
+        packed = flow.block_codec.rme_to_blocks(data, node_rme, edge_rme, project=False)
+        production_blocks = [packed.node_blocks[0]]
+    else:
+        # A synthetic homonuclear O-O bond (both directions of one edge) so the
+        # edge block is square and comparable to dense at all, unlike water's
+        # own rectangular O-H/H-O edges.
+        data = _o2_edge_graph(mapper)
+        node_like = torch.zeros(2, dim, dtype=torch.float64)
+        node_mask = torch.zeros_like(node_like, dtype=torch.bool)
+        node_rme = fill_tied_irrep_rme(
+            node_like, slices, node_mask, torch.zeros(2, 9, dtype=torch.float64), sigma=1.0
+        )
+        edge_like = torch.zeros(2, dim, dtype=torch.float64)
+        edge_mask = torch.ones_like(edge_like, dtype=torch.bool)
+        edge_latent = effective_latent.reshape(1, 9).expand(2, 9).clone()
+        edge_rme = fill_tied_irrep_rme(edge_like, slices, edge_mask, edge_latent, sigma=1.0)
+        packed = flow.block_codec.rme_to_blocks(data, node_rme, edge_rme, project=False)
+        production_blocks = [packed.edge_blocks[0], packed.edge_blocks[1]]
+
+    for production in production_blocks:
+        torch.testing.assert_close(production, dense, rtol=0.0, atol=FP64_ATOL)
 
 
 def test_effective_latent_variances_match_multiplicity_sums():
-    """PR#31 review nit-3: assert each L=1/L=2 component individually rather
-    than only their mean-over-degree.  The original mean-based check was
-    statistically fine (``effective_tied_irrep_latent`` applies a uniform
-    per-slice scale, so no single m-component can get a different factor than
-    its siblings) but was a strictly weaker regression guard: it could not by
-    itself catch a future bug that scaled, say, only ``variances[1]``
-    differently from ``variances[2]``/``variances[3]`` as long as their mean
-    still landed near 2.0.  Same sampling budget/tolerance as before (8192
-    draws, seed 0, rtol=0.08) -- per-component sampling noise at this N still
-    sits several standard deviations inside that tolerance.
-    """
+    """Each L=0/L=1/L=2 component's variance must equal its literal tied-copy
+    multiplicity (3, 2, 1: the sum of that many iid unit-normal copies), not
+    just their mean-over-degree -- checked per m-component so a future bug
+    that scaled only one L=1/L=2 component couldn't hide behind the others'
+    mean (8192 draws, seed 0, rtol=0.08)."""
     generator = torch.Generator().manual_seed(0)
     standard = torch.randn(8192, 9, dtype=torch.float64, generator=generator)
     effective = effective_tied_irrep_latent(standard)
     variances = effective.var(dim=0, unbiased=True)
-    torch.testing.assert_close(
-        variances[0],
-        torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[0], dtype=torch.float64),
-        rtol=0.08,
-        atol=0.0,
-    )
-    for component in range(1, 4):
+    multiplicities = [3.0] + [2.0] * 3 + [1.0] * 5
+    for component, multiplicity in enumerate(multiplicities):
         torch.testing.assert_close(
             variances[component],
-            torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[1], dtype=torch.float64),
-            rtol=0.08,
-            atol=0.0,
-        )
-    for component in range(4, 9):
-        torch.testing.assert_close(
-            variances[component],
-            torch.tensor(TIED_IRREP_EFFECTIVE_VARIANCES[2], dtype=torch.float64),
+            torch.tensor(multiplicity, dtype=torch.float64),
             rtol=0.08,
             atol=0.0,
         )
@@ -466,7 +254,7 @@ def test_seeded_draw_is_batch_composition_invariant_per_uid():
     mapper = _mapper()
     flow = _b_tied_flow(mapper)
     data_a, h0_a, _ = _b_record(mapper, seed=0)
-    node_base, _ = flow.block_codec.blocks_to_rme(copy.deepcopy(data_a), h0_a)
+    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data_a), h0_a)
     dim = int(node_base.shape[-1])
     device = node_base.device
     t_h = mapper.chemical_symbol_to_type["H"]
@@ -531,43 +319,19 @@ def test_seeded_draw_is_batch_composition_invariant_per_uid():
             generator=flow._seeded_generator(device, _TIED_SEED),
         )
 
-
-def test_seeded_node_and_edge_tied_draws_are_independent_substreams():
-    """PR#31 review nit-5 / section 3a: node and edge draws for the SAME
-    graph must come from independent substreams, not accidentally alias each
-    other. ``_residual_tied_irrep_gaussian_eps`` calls
-    ``_tied_irrep_gaussian_prior_like`` twice with the SAME ``generator``
-    object (once ``label="node"``, once ``label="edge"``); the two only stay
-    distinct because ``_prior_uid_substream_seed`` XORs in a distinct
-    per-component constant before deriving each substream. This is
-    pre-existing, ``projected_te``-shared infrastructure PR#31 reuses
-    unmodified (review confirmed it sound by reading the source), but
-    ``test_seeded_draw_is_batch_composition_invariant_per_uid`` above only
-    ever exercises node draws for ``tied_irrep_gaussian`` -- nothing asserted
-    node != edge specifically, so a future refactor that accidentally
-    aliased the two component streams would pass silently.
-    """
-    mapper = _mapper()
-    flow = _b_tied_flow(mapper)
-    data, h0, _d1 = _b_record(mapper)
-    node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
-
-    generator = flow._seeded_generator(node_base.device, _TIED_SEED)
+    # Node and edge draws for the SAME graph must come from independent
+    # substreams: _residual_tied_irrep_gaussian_eps calls
+    # _tied_irrep_gaussian_prior_like twice with the SAME generator object
+    # (once label="node", once label="edge"), staying distinct only because
+    # _prior_uid_substream_seed XORs in a distinct per-component constant.
+    generator = flow._seeded_generator(device, _TIED_SEED)
     node_noise = flow._tied_irrep_gaussian_prior_like(
-        torch.zeros_like(node_base),
-        flow.node_sigma,
-        data=data,
-        label="node",
-        num_graphs=1,
-        generator=generator,
+        torch.zeros_like(node_base), flow.node_sigma, data=data_a, label="node",
+        num_graphs=1, generator=generator,
     )
     edge_noise = flow._tied_irrep_gaussian_prior_like(
-        torch.zeros_like(edge_base),
-        flow.edge_sigma,
-        data=data,
-        label="edge",
-        num_graphs=1,
-        generator=generator,
+        torch.zeros_like(edge_base), flow.edge_sigma, data=data_a, label="edge",
+        num_graphs=1, generator=generator,
     )
     assert torch.count_nonzero(node_noise) > 0
     assert torch.count_nonzero(edge_noise) > 0
@@ -685,13 +449,7 @@ def test_tied_prior_eps_satisfies_physical_projection_and_codec_contract():
 
 
 def _certified_tied_latent(flow, data, h0, seed=_TIED_SEED):
-    """A valid transformable latent: the seeded tied_irrep_gaussian eps (codec-image).
-
-    Mirrors ``test_residual_ao_block_ode._certified_latent`` with
-    ``flow._residual_te_eps`` swapped for ``flow._residual_tied_irrep_gaussian_eps``
-    -- the two share an identical signature (PR#31 review section 3a/3d), so
-    this is otherwise a verbatim copy.
-    """
+    """A valid transformable latent: the seeded tied_irrep_gaussian eps (codec-image)."""
     node_base, edge_base = flow.block_codec.blocks_to_rme(copy.deepcopy(data), h0)
     return flow._residual_tied_irrep_gaussian_eps(
         copy.deepcopy(data),
@@ -703,18 +461,13 @@ def _certified_tied_latent(flow, data, h0, seed=_TIED_SEED):
 
 
 def test_h1_tied_irrep_prior_state_is_pathwise_equivariant_while_seeded_is_layout_replay():
-    """PR#31 review P1-2: no SO(3) rotation-equivariance test existed for
-    ``tied_irrep_gaussian``, despite the ready-to-reuse pathwise-equivariance
-    harness ``test_residual_ao_block_ode.py`` built for the sibling
-    ``projected_te`` prior.  This is that harness ported near-verbatim (only
-    the flow builder and the eps-drawing call change), closing the gap: the
-    explicit ``prior_state`` latent IS pathwise equivariant under simultaneous
-    input rotation, while the SEEDED per-uid draw is only layout-replay (same
-    numeric draw regardless of structure orientation, since it is keyed by
-    ``sample_uid`` rather than by geometry) -- exactly the contrast the
-    projected_te version documents, now verified for a tied-irrep-sourced
-    latent too instead of resting on code-reading alone (review section 2c).
-    """
+    """An explicit ``prior_state`` latent is pathwise equivariant under
+    simultaneous input rotation, while the SEEDED per-uid draw is only
+    layout-replay (same numeric draw regardless of structure orientation,
+    since it is keyed by ``sample_uid`` rather than by geometry). Shares its
+    setup shape with the sibling ``projected_te`` harness in
+    test_residual_ao_block_ode.py (cluster A); kept here rather than added
+    there as a parameter, since this cluster does not edit that file."""
     mapper = _mapper()
     flow = _b_tied_flow(mapper)  # fp64 tied_irrep_gaussian B-mode flow
     data, h0, _d1 = _b_record(mapper)
@@ -805,8 +558,11 @@ def test_tied_prior_constructor_rejects_unsupported_contracts():
         _b_tied_flow(mapper, tied_irrep_sigma=0.0)
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _load_tied_config():
-    path = Path("configs") / "h_b0_block_ode_water_residual_tied_irrep.yaml"
+    path = _REPO_ROOT / "configs" / "h_b0_block_ode_water_residual_tied_irrep.yaml"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 

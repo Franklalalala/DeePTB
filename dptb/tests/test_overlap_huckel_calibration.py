@@ -6,7 +6,9 @@ from __future__ import annotations
 * huckel_scale_mode='global'/'pair_block' (+ prior_calibration artifacts, fail-closed),
 * basis_onsite_mode='calibrated' (data-calibrated onsite table),
 * prior_node/prior_edge split priors (hybrid oracle; missing-H0 fails loud),
-* default behavior unchanged, and the H0InitLayer training-time target-fallback guard.
+* default behavior unchanged.
+
+The H0InitLayer training-time target-fallback guard lives in test_h0_prior.py.
 """
 
 import pytest
@@ -190,42 +192,31 @@ def test_edge_channel_scale_multiplies_hopping_prior():
     assert ctx_scaled.edge_prior.device == ref[_keys.EDGE_FEATURES_KEY].device
 
 
-def test_edge_channel_scale_rejects_non_slice_constant_vector():
-    device = torch.device("cpu")
-    dtype = torch.float64
-    idp, data, ref = _case(device, dtype)
-    data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
+def _nested_scale(idp):
+    return [[1.0] * int(idp.reduced_matrix_element)]
+
+
+def _non_slice_constant_scale(idp, *, device, dtype):
     scale = _slice_constant_scale(idp, device=device, dtype=dtype)
-    block = next(
-        slc for slc in idp.orbpair_maps.values() if int(slc.stop) - int(slc.start) > 1
-    )
+    block = next(slc for slc in idp.orbpair_maps.values() if int(slc.stop) - int(slc.start) > 1)
     scale[int(block.start)] = 0.5
     scale[int(block.start) + 1] = 0.75
-    flow = _flow(idp, device, dtype, huckel_edge_channel_scale=scale.cpu().tolist())
-
-    with pytest.raises(ValueError, match="slice-constant|orbpair"):
-        flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
+    return scale.cpu().tolist()
 
 
-def test_edge_channel_scale_rejects_nested_values_even_if_width_matches():
+@pytest.mark.parametrize("build_scale,match", [
+    (_non_slice_constant_scale, "slice-constant|orbpair"),
+    (lambda idp, **_: _nested_scale(idp), "1-D|one-dimensional"),
+    (lambda idp, **_: [1.0, 2.0, 3.0], "huckel_edge_channel_scale"),
+], ids=["non_slice_constant", "nested_values", "width_mismatch"])
+def test_edge_channel_scale_rejects_malformed_vectors(build_scale, match):
     device = torch.device("cpu")
     dtype = torch.float64
     idp, data, ref = _case(device, dtype)
     data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
-    nested = [[1.0] * int(idp.reduced_matrix_element)]
-
-    with pytest.raises(ValueError, match="1-D|one-dimensional"):
-        _flow(idp, device, dtype, huckel_edge_channel_scale=nested)
-
-
-def test_edge_channel_scale_width_mismatch_raises():
-    device = torch.device("cpu")
-    dtype = torch.float64
-    idp, data, ref = _case(device, dtype)
-    data[_keys.EDGE_OVERLAP_KEY] = torch.full_like(ref[_keys.EDGE_FEATURES_KEY], 0.2)
-    flow = _flow(idp, device, dtype, overlap_huckel_edge_channel_scale=[1.0, 2.0, 3.0])
-
-    with pytest.raises(ValueError, match="huckel_edge_channel_scale"):
+    scale = build_scale(idp, device=device, dtype=dtype)
+    with pytest.raises(ValueError, match=match):
+        flow = _flow(idp, device, dtype, huckel_edge_channel_scale=scale)
         flow.prepare_batch(data, ref, t=torch.zeros(1, device=device, dtype=dtype))
 
 
@@ -383,7 +374,6 @@ def test_argcheck_accepts_new_keys_and_defaults_are_inert():
             "huckel_scale_mode": "pair_block",
             "huckel_scale_global": 0.5,
             "huckel_edge_channel_scale": "1.0",
-            "overlap_huckel_edge_channel_scale": [1.0],
             "prior_calibration": "/tmp/calib.pt",
             "basis_onsite_mode": "calibrated",
             "prior_node": "basis_onsite",
@@ -393,7 +383,6 @@ def test_argcheck_accepts_new_keys_and_defaults_are_inert():
     schema.check_value(value, strict=True)
     assert value["huckel_energy_mode"] == "orbital_pair"
     assert value["huckel_edge_channel_scale"] == "1.0"
-    assert value["overlap_huckel_edge_channel_scale"] == [1.0]
     assert value["prior_edge"] == "external"
 
     defaults = schema.normalize_value({"enabled": False})
@@ -478,137 +467,3 @@ def test_calibration_tool_end_to_end(tmp_path):
         data2, ref, t=torch.zeros(1, device=device, dtype=dtype)
     )
     torch.testing.assert_close(ctx2.edge_prior, edge_features, atol=1e-6, rtol=1e-6)
-
-
-def test_h0init_training_target_fallback_fails_loud():
-    from dptb.nn.embedding.lem_moe_v3_h0_helpers import H0InitLayer
-
-    class _BaseInit(torch.nn.Module):
-        def __init__(self, idp):
-            super().__init__()
-            self.idp = idp
-            if getattr(idp, "orbpair_irreps", None) is None:
-                idp.get_irreps()
-            self.irreps_out = idp.orbpair_irreps.sort()[0].simplify()
-
-        def forward(self, edge_index, atom_type, bond_type, edge_sh, edge_length,
-                    edge_one_hot, active_edges=None, cutoff_coeffs=None):
-            n_edge = edge_index.shape[1]
-            dim = self.irreps_out.dim
-            active = torch.arange(n_edge) if active_edges is None else active_edges
-            return (
-                torch.zeros(n_edge, 8),
-                torch.zeros(atom_type.numel(), dim),
-                torch.zeros(active.numel(), dim),
-                torch.ones(n_edge) if cutoff_coeffs is None else cutoff_coeffs,
-                active,
-            )
-
-    device = torch.device("cpu")
-    dtype = torch.float64
-    idp, data, ref = _case(device, dtype)
-    layer = H0InitLayer(base_init=_BaseInit(idp))
-    layer.train()
-
-    edge_index = data[_keys.EDGE_INDEX_KEY]
-    atom_type = data[AtomicDataDict.ATOM_TYPE_KEY]
-    bond_type = data[AtomicDataDict.EDGE_TYPE_KEY]
-    # target features present, node_h0/edge_h0 absent -> the fallback would feed
-    # the label; in training mode this must fail loud.
-    batch = {
-        _keys.NODE_FEATURES_KEY: torch.randn(2, idp.reduced_matrix_element),
-        _keys.EDGE_FEATURES_KEY: torch.randn(2, idp.reduced_matrix_element),
-    }
-    with pytest.raises(RuntimeError, match="label leak|allow_target_fallback_in_training"):
-        layer(
-            batch,
-            edge_index,
-            atom_type,
-            bond_type,
-            edge_sh=torch.zeros(2, 1),
-            edge_length=torch.ones(2),
-            edge_one_hot=torch.zeros(2, 4),
-        )
-
-    # eval mode keeps the historical surrogate behavior (no raise).
-    layer.eval()
-    out = layer(
-        batch,
-        edge_index,
-        atom_type,
-        bond_type,
-        edge_sh=torch.zeros(2, 1),
-        edge_length=torch.ones(2),
-        edge_one_hot=torch.zeros(2, 4),
-    )
-    assert len(out) == 5
-
-    # explicit opt-in restores the old training behavior.
-    layer2 = H0InitLayer(base_init=_BaseInit(idp), allow_target_fallback_in_training=True)
-    layer2.train()
-    out2 = layer2(
-        batch,
-        edge_index,
-        atom_type,
-        bond_type,
-        edge_sh=torch.zeros(2, 1),
-        edge_length=torch.ones(2),
-        edge_one_hot=torch.zeros(2, 4),
-    )
-    assert len(out2) == 5
-
-
-def test_h0init_can_keep_native_node_init_while_replacing_edges():
-    from dptb.nn.embedding.lem_moe_v3_h0_helpers import H0InitLayer
-
-    class _BaseInit(torch.nn.Module):
-        def __init__(self, idp):
-            super().__init__()
-            self.idp = idp
-            if getattr(idp, "orbpair_irreps", None) is None:
-                idp.get_irreps()
-            self.irreps_out = idp.orbpair_irreps.sort()[0].simplify()
-
-        def forward(self, edge_index, atom_type, bond_type, edge_sh, edge_length,
-                    edge_one_hot, active_edges=None, cutoff_coeffs=None):
-            n_edge = edge_index.shape[1]
-            dim = self.irreps_out.dim
-            active = torch.arange(n_edge) if active_edges is None else active_edges
-            return (
-                torch.zeros(n_edge, 8),
-                torch.zeros(atom_type.numel(), dim),
-                torch.zeros(active.numel(), dim),
-                torch.ones(n_edge) if cutoff_coeffs is None else cutoff_coeffs,
-                active,
-            )
-
-    device = torch.device("cpu")
-    dtype = torch.float32
-    idp, data, _ref = _case(device, dtype)
-    layer = H0InitLayer(
-        base_init=_BaseInit(idp),
-        use_h0_node_init=False,
-        use_h0_edge_init=True,
-        fallback_to_hamiltonian=False,
-        dtype=dtype,
-        device=device,
-    )
-    layer.eval()
-    edge_index = data[_keys.EDGE_INDEX_KEY]
-    atom_type = data[AtomicDataDict.ATOM_TYPE_KEY]
-    bond_type = data[AtomicDataDict.EDGE_TYPE_KEY]
-    batch = {
-        _keys.NODE_H0_KEY: torch.randn(atom_type.numel(), idp.reduced_matrix_element),
-        _keys.EDGE_H0_KEY: torch.randn(edge_index.shape[1], idp.reduced_matrix_element),
-    }
-    _latents, node_features, edge_features, _cutoff, _active = layer(
-        batch,
-        edge_index,
-        atom_type,
-        bond_type,
-        edge_sh=torch.zeros(edge_index.shape[1], 1),
-        edge_length=torch.ones(edge_index.shape[1]),
-        edge_one_hot=torch.zeros(edge_index.shape[1], 4),
-    )
-    torch.testing.assert_close(node_features, torch.zeros_like(node_features))
-    assert edge_features.shape[0] == edge_index.shape[1]

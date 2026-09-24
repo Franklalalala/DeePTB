@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from types import SimpleNamespace
 
@@ -23,9 +22,7 @@ from tools.build_nonsoc_p2_tables import (
 )
 from tools.smoke_nonsoc_p2_table import _hermiticity, _numerical_gate
 
-
-def _sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
+from dptb.tests.p2_support import sha256_bytes as _sha256_bytes, sha256_file
 
 
 def _synthetic_code_identity(
@@ -105,7 +102,7 @@ def _write_zero_audit_table(root):
             "upf_sha256": _sha256_bytes(upf_bytes),
             "upf_has_so": False,
             "array_path": f"species/{symbol}.npz",
-            "array_sha256": hashlib.sha256(array_path.read_bytes()).hexdigest(),
+            "array_sha256": sha256_file(array_path),
         }
     base_tables = {}
     for left in species:
@@ -122,7 +119,7 @@ def _write_zero_audit_table(root):
             base_tables[f"{left}|{right}"] = {
                 "path": f"base/{left}__{right}.npz",
                 "interpolation": "linear",
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "sha256": sha256_file(path),
             }
     identity = canonical_species_source_identity(species)
     manifest = {
@@ -180,7 +177,7 @@ def _write_component_reciprocity_table(root, *, tamper_vna_cross=False):
             "upf_sha256": _sha256_bytes(upf_bytes),
             "upf_has_so": False,
             "array_path": f"species/{symbol}.npz",
-            "array_sha256": hashlib.sha256(array_path.read_bytes()).hexdigest(),
+            "array_sha256": sha256_file(array_path),
             "onsite_component_arrays": onsite_arrays,
         }
 
@@ -218,7 +215,7 @@ def _write_component_reciprocity_table(root, *, tamper_vna_cross=False):
                 "path": f"base/{left}__{right}.npz",
                 "interpolation": "linear",
                 "component_arrays": base_arrays,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "sha256": sha256_file(path),
             }
     identity = canonical_species_source_identity(species)
     manifest = {

@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-from itertools import product
 import numpy as np
 import pytest
 from h0rebuild.spatial import PeriodicAtomIndex

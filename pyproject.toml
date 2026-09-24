@@ -99,3 +99,7 @@ format-jinja = """
         {{ serialize_pep440(bump_version(base), stage, revision, dev=distance, metadata=[commit]) }}
     {%- endif -%}
 """
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["dptb/tests"]

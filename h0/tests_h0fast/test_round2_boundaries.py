@@ -1,5 +1,6 @@
-import copy
-import importlib
+"""NACF spline-fault coverage moved to dptb/tests/test_nacf_tables.py. The process-lifecycle tests
+below need POSIX fcntl/session-group/SIGSTOP semantics and only run on Linux; the native-launch
+rejection tests need the verified H0 CUDA extensions (h0/tests_h0fast/conftest.py)."""
 import json
 import os
 from pathlib import Path
@@ -12,31 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 import torch
-from scipy.interpolate import CubicSpline
 
-def nacf(monkeypatch):
-    from dptb.nacf import radial, prepared
-    return radial, prepared
+_LINUX_ONLY = pytest.mark.skipif(sys.platform != 'linux', reason='needs POSIX fcntl/session-group/SIGSTOP semantics')
 
-
-def source_table(radial):
-    directions=np.array([[1.,0,0],[0,1.,0],[0,0,1.],[-1.,0,0],[0,-1.,0],[0,0,-1.]])
-    r=np.array([0.,.5,1.,2.,3.]);v=np.stack([np.diag([1.,2.,3.])*(1-x/3)**2 for x in r])
-    return types.SimpleNamespace(distances=r,values=v,left_shells=(1,),right_shells=(1,),support_bohr=3.,
-        _spline=CubicSpline(r,v,axis=0),_rotator=types.SimpleNamespace(directions=directions,
-        _base={1:radial._harmonics(1,torch.from_numpy(directions)).numpy()}))
-
-@pytest.mark.parametrize('fault',['nan','inf','complex','shape','knots'])
-def test_spline_semantics_cold_and_cache(monkeypatch,tmp_path,fault):
-    radial,prepared=nacf(monkeypatch);source=source_table(radial)
-    kw=dict(device='cpu',dtype=torch.float64,backend='torch')
-    prepared.cached_table(source,tmp_path,**kw)
-    if fault in ('nan','inf'):source._spline.c[0,0,0,0]=float(fault)
-    elif fault=='complex':source._spline.c=source._spline.c.astype(complex)+1j
-    elif fault=='shape':source._spline.c=source._spline.c[:2]
-    else:source._spline.x=source.distances+.1
-    with pytest.raises(ValueError,match='spline'):radial.TorchRadialBlockTable(source,**kw)
-    with pytest.raises(ValueError,match='spline'):prepared.cached_table(source,tmp_path,**kw)
 
 def test_comparison_empty_zero_and_missing():
     from h0rebuild.models import BlockKey
@@ -52,6 +31,8 @@ def test_comparison_empty_zero_and_missing():
     with pytest.raises(ValueError,match='empty total'):compare_blocks({}, {}, [1])
     json.dumps(result,allow_nan=False);json.dumps(zero,allow_nan=False)
 
+@_LINUX_ONLY  # capture()'s staleness cache keys on st_ctime as a POSIX inode-change proxy; Windows'
+             # st_ctime is the file creation time and does not move on rewrite (see C_REPORT.md)
 def test_dependency_change_and_relocation(monkeypatch,tmp_path):
     from h0rebuild.numerical_identity import capture
     a=tmp_path/'a';b=tmp_path/'b';a.mkdir();b.mkdir()
@@ -90,6 +71,7 @@ def worker_script(path):
         "d=Path(a.attempt_dir);(d/'seen_pid').write_text(str(os.getpid()));time.sleep(a.delay);register_worker(d,a.ready_fd,a.start_fd);(d/'started').write_text('yes');time.sleep(a.sleep);(d/'completed').write_text('yes')\n")
     return script
 
+@_LINUX_ONLY
 @pytest.mark.parametrize('duration,budget,expected',[(.05,2,False),(2,.15,True)])
 def test_registered_execution(tmp_path,duration,budget,expected):
     from lifecycle import run_registered,write
@@ -99,6 +81,7 @@ def test_registered_execution(tmp_path,duration,budget,expected):
     assert execution['timed_out']==expected and execution['registered']
     assert (execution['returncode']==0)==(not expected)
 
+@_LINUX_ONLY
 def test_case_lock_independent_of_gpu(tmp_path,monkeypatch):
     import fcntl
     import acceptance
@@ -109,6 +92,7 @@ def test_case_lock_independent_of_gpu(tmp_path,monkeypatch):
         for gpu in (0,1):
             with pytest.raises(RuntimeError,match='owns case'):acceptance.run_attempt('X',gpu,tmp_path/'run',contract,2)
 
+@_LINUX_ONLY
 @pytest.mark.parametrize('window',['before_register','after_go'])
 def test_dispatcher_crash_keeps_lock_and_worker_converges(tmp_path,window):
     import fcntl
@@ -161,6 +145,7 @@ def test_private_copy_survives_eviction_on_side_stream():
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(run,['cuda:'+str(i) for i in range(min(2,torch.cuda.device_count()))]))
 
+@_LINUX_ONLY
 @pytest.mark.parametrize('wall_timeout',[False,True])
 def test_watchdog_survives_dispatcher_and_worker_pause(tmp_path,wall_timeout):
     from lifecycle import write
@@ -198,7 +183,7 @@ def local_inputs(device='cuda:0'):
         t([[0,0,0]],torch.int32),torch.ones((2,2,2),device=device,dtype=torch.float64),False,
         torch.empty(0,device=device,dtype=torch.float64)]
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+@pytest.mark.h0_extension('_cuda_local_grid')
 @pytest.mark.parametrize('fault',['negative_ch','large_ch','capacity','intmin_m','counts','shape','device','stride'])
 def test_local_native_rejects_before_launch(fault):
     from h0rebuild.precompiled import load
@@ -213,7 +198,7 @@ def test_local_native_rejects_before_launch(fault):
     else:args[12]=torch.ones(2,2,4,device='cuda:0',dtype=torch.float64)[:,:,::2]
     with pytest.raises(RuntimeError):native.build_atom_support_cuda(*args)
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+@pytest.mark.h0_extension('_cuda_local_grid')
 def test_local_native_valid_empty_pair_and_device():
     from h0rebuild.precompiled import load
     native=load('_cuda_local_grid');args=local_inputs()
@@ -234,7 +219,7 @@ def test_local_native_valid_empty_pair_and_device():
     j[0]=-1
     with pytest.raises(RuntimeError,match='pair index'):native.contract_pairs_batch_cuda(*pairs)
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+@pytest.mark.h0_extension('_cuda_two_center')
 def test_two_center_native_intmin_rejected():
     from h0rebuild.precompiled import load
     native=load('_cuda_two_center');dev='cuda:0'

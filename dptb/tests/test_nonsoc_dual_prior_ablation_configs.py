@@ -288,7 +288,6 @@ def test_explicit_unbound_dev_override_is_never_production_qualified(
 
 
 def test_all_eight_configs_pass_strict_argcheck(tmp_path: Path) -> None:
-    pytest.importorskip("torch")
     from dptb.utils.argcheck import normalize
 
     written = build_configs(
@@ -307,7 +306,6 @@ def test_all_eight_configs_pass_strict_argcheck(tmp_path: Path) -> None:
 def test_argcheck_requires_prior_source_hash_unless_explicit_dev_override(
     tmp_path: Path,
 ) -> None:
-    pytest.importorskip("torch")
     from dptb.utils.argcheck import normalize
 
     written = build_configs(
@@ -376,7 +374,6 @@ def _p23_config(*, direct: bool = False):
 
 
 def test_strict_p2_full_h_config_and_semantic_guards():
-    pytest.importorskip("torch")
     from dptb.utils.argcheck import normalize
 
     payload = yaml.safe_load(SMOKE_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -421,7 +418,6 @@ def test_strict_p2_full_h_config_and_semantic_guards():
 
 
 def test_auxiliary_prior_scope_does_not_require_p2_dataset_fields():
-    pytest.importorskip("torch")
     from dptb.utils.argcheck import normalize
 
     payload = yaml.safe_load(SMOKE_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -437,7 +433,6 @@ def test_auxiliary_prior_scope_does_not_require_p2_dataset_fields():
 
 
 def test_p23_residual_and_direct_configs_fail_closed_on_cross_wiring():
-    pytest.importorskip("torch")
     from dptb.utils.argcheck import normalize
 
     residual = normalize(_p23_config(direct=False))

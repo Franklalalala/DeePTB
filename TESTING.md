@@ -19,6 +19,30 @@ For a deliberately broad review, request the full suite explicitly:
 python tools/test.py dptb/tests
 ```
 
+## Layout and optional components
+
+`dptb/tests` groups tests by behaviour, one file per module family. Builders shared by
+several files live in helper modules that tests import (`block_ode_fixtures`,
+`pair_helpers`, `flow_helpers`, `model_helpers`, `nacf_support`, `p2_support`, `_trainer_probes`); a test
+module never imports another test module. `h0/tests_h0fast` runs on its own:
+`python -m pytest h0/tests_h0fast`.
+
+A test that needs an optional component skips with a reason when it is missing
+(`dptb/tests/_requires.py`): `requires_cuda`, `requires_multi_gpu`, `requires_so2_cuda`
+(the external `so2_cuda_ops` package), `requires_module(name)` (e.g. `dftio`), and the
+NACF native markers `requires_nacf_prebuilt` / `requires_nacf_topology`, resolved lazily in
+`conftest.py`. Tests on real reference data are opt-in through the environment variable
+the test names. Run the GPU paths on a machine that has them, e.g. with SO2CUDA on the
+path:
+
+```bash
+PYTHONPATH=$PWD:/path/to/SO2CUDA/src python -m pytest dptb/tests/test_so2_kernels_cuda.py
+```
+
+`conftest.py` fails a module that changes torch's default dtype at import or leaks it, or
+that leaves `torch.use_deterministic_algorithms` switched on, and sets
+`CUBLAS_WORKSPACE_CONFIG` before CUDA starts.
+
 Keep tests that establish observable facts: numerical results against a small
 independent reference, data/graph alignment, valid checkpoint restoration,
 finite and correctly routed gradients, or rejection of corrupt input. A

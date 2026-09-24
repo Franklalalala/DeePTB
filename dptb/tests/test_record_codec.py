@@ -28,14 +28,33 @@ def test_corrupt_compressed_record_fails():
         _loads_with_numpy2_compat(b"ZL1\0not a stream")
 
 
-def test_zstd_without_python_package(monkeypatch):
-    import sys, base64
+ZST1_FIXTURE = "WlNUMSi1L/0gHekAAIAElRIAAAAAAAAAfZSMAXiUXZQoSwFLAksDZXMu"
+
+
+def test_zstd_falls_back_to_system_libzstd_resolved_once_per_process(monkeypatch):
+    """Without the zstandard python package, decoding falls back to the system
+    libzstd via ctypes and still decodes correctly; find_library forks
+    ldconfig, so it must resolve once per process, not once per record."""
+    import base64
+    import ctypes.util
+    import sys
+    from dptb.data.dataset import record_codec
+
+    real_find_library = ctypes.util.find_library
+    if real_find_library("zstd") is None:
+        pytest.skip("system libzstd is not available")
 
     monkeypatch.setitem(sys.modules, "zstandard", None)
-    fixture = base64.b64decode(
-        "WlNUMSi1L/0gHekAAIAElRIAAAAAAAAAfZSMAXiUXZQoSwFLAksDZXMu"
-    )
-    assert _loads_with_numpy2_compat(fixture) == {"x": [1, 2, 3]}
+    monkeypatch.setattr(record_codec, "_ZSTANDARD_MODULE", None)  # re-probe: package absent
+    monkeypatch.setattr(record_codec, "_ZSTD_LIBRARY", None)  # re-resolve the ctypes handle
+    calls = []
+    monkeypatch.setattr(ctypes.util, "find_library",
+                        lambda name: calls.append(name) or real_find_library(name))
+
+    fixture = base64.b64decode(ZST1_FIXTURE)
+    for _ in range(50):
+        assert record_codec.loads_record(fixture) == {"x": [1, 2, 3]}
+    assert calls == ["zstd"]
 
 
 def test_metadata_and_training_entrypoints_decode_same_record(tmp_path):

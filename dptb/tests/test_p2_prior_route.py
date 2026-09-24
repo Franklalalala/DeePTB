@@ -18,7 +18,6 @@ from dptb.data.dataset.lmdb_dataset import (
     validate_non_soc_p2_block_tensors,
     validate_p2_feature_pair,
 )
-from dptb.data.interfaces import blockwise_tensor as blockwise_tensor_module
 from dptb.data.interfaces.blockwise_tensor import (
     EDGE_FULL_HAMIL_TARGET_BLOCKS_KEY,
     EDGE_FULL_HAMIL_TARGET_BLOCK_SHAPE_KEY,
@@ -622,96 +621,6 @@ def test_dual_prior_lmdb_selects_p23_and_direct_skips_ao_blocks(tmp_path):
             prior_kind="p23",
             require_blocks=False,
         ).get(0)
-
-
-def test_runtime_contract_scans_each_immutable_record_once_per_worker(
-    tmp_path, monkeypatch
-):
-    record, _, p23_source = _compact_dual_prior_record()
-    _write_single_lmdb(tmp_path, "dual-prior-runtime-cache", record)
-    dataset = _compact_selected_prior_dataset(
-        tmp_path,
-        "dual-prior-runtime-cache",
-        p23_source,
-        prior_kind="p23",
-        require_blocks=True,
-    )
-
-    counts = {
-        "canonical_edge_graph": 0,
-        "edge_graph_fingerprint": 0,
-        "row_fingerprint": 0,
-        "fingerprint_fields": 0,
-        "fingerprint_text_fields": 0,
-        "strict_packed_blocks": 0,
-    }
-
-    def _counted(module, name, counter):
-        original = getattr(module, name)
-
-        def wrapper(*args, **kwargs):
-            counts[counter] += 1
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(module, name, wrapper)
-
-    _counted(lmdb_dataset_module, "canonical_edge_graph", "canonical_edge_graph")
-    _counted(lmdb_dataset_module, "edge_graph_fingerprint", "edge_graph_fingerprint")
-    _counted(
-        lmdb_dataset_module,
-        "fingerprint_present_row_aligned_fields",
-        "row_fingerprint",
-    )
-    _counted(lmdb_dataset_module, "fingerprint_fields", "fingerprint_fields")
-    _counted(
-        lmdb_dataset_module,
-        "fingerprint_text_fields",
-        "fingerprint_text_fields",
-    )
-    _counted(
-        blockwise_tensor_module,
-        "validate_packed_non_soc_blocks",
-        "strict_packed_blocks",
-    )
-
-    feature_finite_flags = []
-    original_feature_validator = lmdb_dataset_module.validate_p2_feature_pair
-
-    def counted_feature_validator(*args, **kwargs):
-        feature_finite_flags.append(kwargs.get("check_finite", True))
-        return original_feature_validator(*args, **kwargs)
-
-    monkeypatch.setattr(
-        lmdb_dataset_module, "validate_p2_feature_pair", counted_feature_validator
-    )
-    block_expensive_flags = []
-    original_block_validator = lmdb_dataset_module.validate_non_soc_p2_block_tensors
-
-    def counted_block_validator(*args, **kwargs):
-        block_expensive_flags.append(kwargs.get("expensive_checks", True))
-        return original_block_validator(*args, **kwargs)
-
-    monkeypatch.setattr(
-        lmdb_dataset_module,
-        "validate_non_soc_p2_block_tensors",
-        counted_block_validator,
-    )
-
-    first = dataset.get(0)
-    assert dataset._last_lmdb_pickle_bytes > 0
-    assert dataset._last_lmdb_record_identity[1] == 0
-    first_counts = dict(counts)
-    second = dataset.get(0)
-
-    torch.testing.assert_close(
-        first[_keys.NODE_P23_KEY], second[_keys.NODE_P23_KEY]
-    )
-    assert all(value > 0 for value in first_counts.values())
-    assert counts == first_counts
-    assert feature_finite_flags == [True, False]
-    assert block_expensive_flags == [True, False]
-    assert len(dataset._validated_record_contracts) == 1
-    assert dataset.__getstate__()["_validated_record_contracts"] == {}
 
 
 def test_tampered_first_read_is_never_added_to_runtime_contract_cache(

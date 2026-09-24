@@ -9,8 +9,8 @@ SMOKE = [
     "dptb/tests/test_band_losses.py",
     "dptb/tests/test_record_codec.py",
     "dptb/tests/test_spectral_records.py",
-    "dptb/tests/test_prior2b_pa.py",
-    "dptb/tests/test_distance_ensemble_stitch.py",
+    "dptb/tests/test_lem_moe_v3_prior_2b.py",
+    "dptb/tests/test_distance_experts.py",
 ]
 
 

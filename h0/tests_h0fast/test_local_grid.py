@@ -1,24 +1,29 @@
-"""Comprehensive test suite for CUDA local grid and potential acceleration lane."""
+"""Opt-in real-data test suite for the CUDA local-grid extension (needs H0_REFERENCE_ROOT and the
+verified `_cuda_local_grid` extension -- see h0/tests_h0fast/conftest.py)."""
+import os
 import unittest
 import numpy as np
+import pytest
 import torch
 from pathlib import Path
-from scipy.interpolate import CubicSpline
 
-import h0rebuild._cuda_local_grid as clg
-from h0rebuild.cuda_local_grid import (
-    CudaSpeciesCache,
-    CudaGeometrySupports,
-    CudaPeriodicFFTGridAOCache,
-)
-from h0rebuild.radial import OrbitalEvaluator
-from h0rebuild.grid_collocation import FFTGridAOCache, _cartesian_box_index_bounds
-from h0rebuild.periodic_collocation import PeriodicFFTGridAOCache
-from h0rebuild.assemble import build_periodic_field, iter_pair_images
+try:
+    import h0rebuild._cuda_local_grid as clg  # the compiled extension, or ModuleNotFoundError if unbuilt
+    from h0rebuild.cuda_local_grid import (
+        CudaSpeciesCache,
+        CudaGeometrySupports,
+        CudaPeriodicFFTGridAOCache,
+    )
+    from h0rebuild.radial import OrbitalEvaluator  # this scipy predates sph_harm_y if it fails here
+    from h0rebuild.grid_collocation import FFTGridAOCache, _cartesian_box_index_bounds
+    from h0rebuild.periodic_collocation import PeriodicFFTGridAOCache
+    from h0rebuild.assemble import build_periodic_field, iter_pair_images
+except ImportError as _error:
+    pytest.skip(f"h0rebuild CUDA local-grid extension unavailable: {_error}", allow_module_level=True)
 from h0rebuild.models import BlockKey
 from production_io import load_case
 
-RAW_ROOT = Path("/home/mingkang_nt/codex/h0_cuda_random100_cell_gauge_v2_20260912/raw")
+pytestmark = [pytest.mark.h0_reference, pytest.mark.h0_extension('_cuda_local_grid')]
 
 
 class TestCudaLocalGrid(unittest.TestCase):
@@ -26,10 +31,11 @@ class TestCudaLocalGrid(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         assert cls.device.type == "cuda", "CUDA must be available for local grid tests"
+        cls.raw_root = Path(os.environ["H0_REFERENCE_ROOT"]) / "raw"
 
     def test_01_atom_support_exactness(self):
         """Test GPU support generation matches CPU FFTGridAOCache exact nodes and AO values."""
-        st, sd, opts, _ = load_case(RAW_ROOT / "nonSOC_db_seq_id_15674")
+        st, sd, opts, _ = load_case(self.raw_root / "nonSOC_db_seq_id_15674")
         field = build_periodic_field(
             st, sd, ecutrho_ry=opts["ecutrho_ry"], fft_shape=opts["fft_shape"],
             xc="LDA_PZ81", include_nlcc=False, field_backend="numpy", compute_device="cpu"
@@ -85,7 +91,7 @@ class TestCudaLocalGrid(unittest.TestCase):
 
     def test_02_boundary_atom_outside_home_cell(self):
         """Preserve support for atoms slightly outside the home cell (the prior bug)."""
-        st, sd, opts, _ = load_case(RAW_ROOT / "nonSOC_db_seq_id_15674")
+        st, sd, opts, _ = load_case(self.raw_root / "nonSOC_db_seq_id_15674")
         field = build_periodic_field(
             st, sd, ecutrho_ry=opts["ecutrho_ry"], fft_shape=opts["fft_shape"],
             xc="LDA_PZ81", include_nlcc=False, field_backend="numpy", compute_device="cpu"
@@ -126,7 +132,7 @@ class TestCudaLocalGrid(unittest.TestCase):
 
     def test_03_small_nonsoc_full_blocks_regression(self):
         """Validate local blocks on small nonSOC system (nonSOC_db_seq_id_15674)."""
-        st, sd, opts, _ = load_case(RAW_ROOT / "nonSOC_db_seq_id_15674")
+        st, sd, opts, _ = load_case(self.raw_root / "nonSOC_db_seq_id_15674")
         field = build_periodic_field(
             st, sd, ecutrho_ry=opts["ecutrho_ry"], fft_shape=opts["fft_shape"],
             xc=opts["xc"], include_nlcc=opts["include_nlcc"],
@@ -161,7 +167,7 @@ class TestCudaLocalGrid(unittest.TestCase):
         from dataclasses import replace
         from h0rebuild.spin_fields import add_collinear_spin_field
 
-        st, sd, opts, _ = load_case(RAW_ROOT / "SOC_mp-31055")
+        st, sd, opts, _ = load_case(self.raw_root / "SOC_mp-31055")
         field = build_periodic_field(
             st, sd, ecutrho_ry=opts["ecutrho_ry"], fft_shape=opts["fft_shape"],
             xc=opts["xc"], include_nlcc=opts["include_nlcc"],
@@ -208,7 +214,7 @@ class TestCudaLocalGrid(unittest.TestCase):
 
     def test_05_bounded_slow24_case_regression(self):
         """Validate local blocks on bounded portion (first 30 pairs) of 24-atom Ba/Mo/N case."""
-        st, sd, opts, _ = load_case(RAW_ROOT / "nonSOC_db_seq_id_11083")
+        st, sd, opts, _ = load_case(self.raw_root / "nonSOC_db_seq_id_11083")
         field = build_periodic_field(
             st, sd, ecutrho_ry=opts["ecutrho_ry"], fft_shape=opts["fft_shape"],
             xc=opts["xc"], include_nlcc=opts["include_nlcc"],
@@ -241,7 +247,7 @@ class TestCudaLocalGrid(unittest.TestCase):
 
     def test_06_cache_lifetime_and_budget(self):
         """Validate CudaSpeciesCache retention and CudaGeometrySupports memory budget."""
-        st, sd, opts, _ = load_case(RAW_ROOT / "nonSOC_db_seq_id_15674")
+        st, sd, opts, _ = load_case(self.raw_root / "nonSOC_db_seq_id_15674")
         spec_cache = CudaSpeciesCache(sd, device=self.device)
 
         field = build_periodic_field(

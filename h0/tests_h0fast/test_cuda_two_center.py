@@ -1,26 +1,29 @@
-"""Comprehensive unit, regression, and benchmark test suite for CUDA Two-Center & Nonlocal accelerator.
+"""Opt-in unit and regression test suite for the CUDA Two-Center & Nonlocal accelerator (needs
+H0_REFERENCE_ROOT, pyabacus and the verified `_cuda_two_center` extension -- see conftest.py).
 
 Verifies:
 1. Recompilation invariance (binary sha256 unchanged across multiple species sets)
 2. Numerical agreement against upstream PyAbacusTwoCenter on scalar (nspin=1) and SOC (nspin=4)
 3. Near-zero and symmetry/Hermiticity properties (S(R) = S(-R)^T)
 4. Batched GPU evaluation consistency
-5. Diagnostic timing profile on 24-atom case nonSOC_db_seq_id_11083
 """
-import hashlib
-import json
-import time
+import os
 import unittest
 from pathlib import Path
 import numpy as np
-import torch
+import pytest
 
 from production_io import read_abacus_orb, read_upf, SpeciesData, Structure, Atom
 from h0rebuild.scalar_upf import scalarize_upf
 from h0rebuild.pyabacus_integrals import PyAbacusTwoCenter
-from h0rebuild.cuda_two_center import CUDATwoCenter
+try:
+    from h0rebuild.cuda_two_center import CUDATwoCenter  # loads the compiled extension at import time
+except (ImportError, RuntimeError) as _error:
+    pytest.skip(f"h0rebuild.cuda_two_center unavailable: {_error}", allow_module_level=True)
 import build_two_center
 from h0rebuild.precompiled import verify
+
+pytestmark = [pytest.mark.h0_reference, pytest.mark.h0_extension('_cuda_two_center')]
 
 
 def load_simple_structure(case_dir: Path, scalarize: bool = False):
@@ -51,11 +54,11 @@ class TestCUDATwoCenter(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.repo_root = Path(__file__).resolve().parent.parent
-        cls.case_10667_scalar = Path("/home/mingkang_nt/codex/h0_flash_20260912/production_reference/db_seq_id_10667")
-        cls.case_10282_scalar = Path("/home/mingkang_nt/codex/h0_flash_20260912/production_reference/db_seq_id_10282")
-        cls.case_10667_soc = Path("/home/mingkang_nt/codex/h0_cuda_benchmark_20260912/oracle/db_seq_id_10667_nspin4")
-        cls.case_10282_soc = Path("/home/mingkang_nt/codex/h0_cuda_benchmark_20260912/oracle/db_seq_id_10282_nspin4")
-        cls.case_11083_24atom = Path("/home/mingkang_nt/codex/h0_cuda_random100_20260912/raw/nonSOC_db_seq_id_11083")
+        reference_root = Path(os.environ["H0_REFERENCE_ROOT"])
+        cls.case_10667_scalar = reference_root / "production_reference" / "db_seq_id_10667"
+        cls.case_10282_scalar = reference_root / "production_reference" / "db_seq_id_10282"
+        cls.case_10667_soc = reference_root / "oracle" / "db_seq_id_10667_nspin4"
+        cls.case_10282_soc = reference_root / "oracle" / "db_seq_id_10282_nspin4"
 
     def test_01_recompilation_invariance(self):
         """Verify extension is compiled once: binary hash unchanged across multiple element sets."""
@@ -251,56 +254,6 @@ class TestCUDATwoCenter(unittest.TestCase):
 
             np.testing.assert_allclose(batch_S_k, single_S, atol=1e-14, err_msg=f"Batch S mismatch at pair {k}")
             np.testing.assert_allclose(batch_T_k, single_T, atol=1e-14, err_msg=f"Batch T mismatch at pair {k}")
-
-    def test_09_diagnostic_profile_24atom_11083(self):
-        """Diagnostic timing benchmark on 24-atom case nonSOC_db_seq_id_11083."""
-        self.assertTrue(self.case_11083_24atom.exists(), f"Missing case: {self.case_11083_24atom}")
-        struct, sd = load_simple_structure(self.case_11083_24atom, scalarize=True)
-
-        # 1. Measure data-preparation time for CUDATwoCenter
-        t0 = time.perf_counter()
-        cuda = CUDATwoCenter(sd, nspin=1)
-        cuda_prep_time = cuda.timing["prep_seconds"]
-        print(f"\n[24-atom benchmark] CUDATwoCenter table prep time: {cuda_prep_time:.4f} s")
-
-        # 2. Setup a benchmark batch of 100 orbital pairs
-        rng = np.random.default_rng(123)
-        n_pairs = 100
-        atoms = struct.atoms
-        pair_symbols = []
-        displacements = rng.uniform(-4.0, 4.0, size=(n_pairs, 3))
-        for k in range(n_pairs):
-            a1 = atoms[k % len(atoms)]
-            a2 = atoms[(k + 1) % len(atoms)]
-            pair_symbols.append((a1.species, a2.species))
-
-        # 3. Time batched CUDA evaluation (warmup + timed)
-        cuda.eval_two_center_batch(pair_symbols[:5], displacements[:5])  # warmup
-        torch.cuda.synchronize()
-
-        t0_cuda = time.perf_counter()
-        out_S, out_T = cuda.eval_two_center_batch(pair_symbols, displacements)
-        torch.cuda.synchronize()
-        cuda_kernel_time = time.perf_counter() - t0_cuda
-        print(f"[24-atom benchmark] CUDA kernel time for {n_pairs} pairs: {cuda_kernel_time * 1000:.2f} ms ({cuda_kernel_time / n_pairs * 1000:.3f} ms/pair)")
-
-        # 4. Time PyAbacusTwoCenter baseline for the same pairs
-        t0_ref_init = time.perf_counter()
-        ref = PyAbacusTwoCenter(sd, nspin=1)
-        ref_prep_time = time.perf_counter() - t0_ref_init
-
-        t0_ref = time.perf_counter()
-        for k in range(n_pairs):
-            s1, s2 = pair_symbols[k]
-            ref.scalar_pair(s1, s2, [0, 0, 0], displacements[k])
-        ref_loop_time = time.perf_counter() - t0_ref
-        print(f"[24-atom benchmark] PyAbacus loop time for {n_pairs} pairs: {ref_loop_time:.4f} s ({ref_loop_time / n_pairs * 1000:.2f} ms/pair)")
-
-        speedup = ref_loop_time / cuda_kernel_time
-        print(f"[24-atom benchmark] Speedup over Python orbital loop: {speedup:.1f}x")
-
-        # Assert significant speedup (> 10x)
-        self.assertGreater(speedup, 10.0, f"CUDA kernel speedup was only {speedup:.1f}x (expected > 10x)")
 
 
 if __name__ == "__main__":

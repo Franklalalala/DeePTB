@@ -19,7 +19,7 @@ Design contract
   ``torch.distributed``. Collective ordering stays entirely in ``MultiTrainer``.
 * **Byte-for-byte behaviour.** The arithmetic is a verbatim move of the former
   ``MultiTrainer`` method bodies; results are identical to the pre-refactor code.
-  Pinned by ``dptb/tests/test_metric_reducer.py`` plus the existing
+  Pinned by ``dptb/tests/test_metric_reduction.py`` plus the existing
   ``test_hamiltonian_flow`` compatible-pack / display-window regressions that
   drive these paths through the trainer delegators.
 

@@ -11,7 +11,7 @@ after the refactor. Only the Python-side access changes (named field instead of
 ``pack[MultiTrainer._P_SOMETHING]``).
 
 Wire compatibility with the legacy layout is pinned by
-``dptb/tests/test_metric_pack.py`` (index-position assertions + round-trip
+``dptb/tests/test_metric_reduction.py`` (index-position assertions + round-trip
 equality + a legacy-replica byte-equality check against the retained
 ``MultiTrainer._P_*`` / ``_DB_*`` constants).
 

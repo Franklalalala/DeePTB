@@ -2,12 +2,16 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
+
 from h0rebuild.models import OrbitalBasis,OrbitalChannel
-from h0rebuild.radial import OrbitalEvaluator
+try:
+    from h0rebuild.radial import OrbitalEvaluator
+except ImportError as _error:
+    pytest.skip(f"this scipy predates sph_harm_y, which h0rebuild.harmonics needs: {_error}", allow_module_level=True)
 from h0rebuild.reciprocal import PeriodicField,reciprocal_grid
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+@pytest.mark.h0_extension('_cuda_local_grid')
 @pytest.mark.parametrize('budget',[0,10**7])
 @pytest.mark.parametrize('spin',[False,True])
 def test_chunk_equals_separate_native_pairs_with_images_and_eviction(budget,spin):

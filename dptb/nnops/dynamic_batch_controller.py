@@ -27,7 +27,7 @@ guarantee every rank makes the same collective sequence. The only
 collective-adjacent call here is ``trainer._flush_display_window`` inside
 ``flush_display_after_oom_skip_if_needed`` — invoked in the exact position and
 under the exact ``distributed_expert`` / display-cadence conditions as before the
-extraction. ``test_dynamic_cost_batch.py`` pins that no ``dist.all_reduce`` is
+extraction. ``dptb/tests/test_dynamic_batch_oom.py`` pins that no ``dist.all_reduce`` is
 issued on the OOM path.
 
 The bodies here are a verbatim move of the former ``MultiTrainer`` methods, with

@@ -1,6 +1,24 @@
-"""Synthetic unittest for weighting, missing-index, and closure-policy behavior."""
+"""Synthetic unittest for weighting, missing-index, and closure-policy behavior
+of examples/loopscf/summarize_experiment.py.
+
+Opt-in only (set DPTB_RUN_LOOPSCF_REPORT_TESTS=1): the script lives outside the
+installed package, and importing it mutates sys.path at collection time, which
+would otherwise affect every other test module in the same pytest session even
+when this one is skipped.
+"""
 
 from __future__ import annotations
+
+import os
+
+import pytest
+
+if not os.environ.get("DPTB_RUN_LOOPSCF_REPORT_TESTS"):
+    pytest.skip(
+        "opt-in only: set DPTB_RUN_LOOPSCF_REPORT_TESTS=1 to test "
+        "examples/loopscf/summarize_experiment.py",
+        allow_module_level=True,
+    )
 
 import json
 import math
@@ -13,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[2] / "examples/loopscf"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import summarize_experiment as se
+import summarize_experiment as se  # noqa: E402
 
 
 def _variant(onsite, n_on, hopping, n_hop, fw10, seconds):

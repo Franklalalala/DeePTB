@@ -3,15 +3,17 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-import torch
 
 from h0rebuild.models import BlockKey, OrbitalBasis, OrbitalChannel
-from h0rebuild.periodic_collocation import PeriodicFFTGridAOCache
-from h0rebuild.radial import OrbitalEvaluator
+try:
+    from h0rebuild.periodic_collocation import PeriodicFFTGridAOCache
+    from h0rebuild.radial import OrbitalEvaluator
+except ImportError as _error:
+    pytest.skip(f"this scipy predates sph_harm_y, which h0rebuild.harmonics needs: {_error}", allow_module_level=True)
 from h0rebuild.reciprocal import PeriodicField, reciprocal_grid
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.h0_extension('_cuda_local_grid')
 @pytest.mark.parametrize("spin", [False, True])
 @pytest.mark.parametrize("empty", [False, True])
 def test_batch_matches_cpu_with_optional_spin_z(spin, empty):

@@ -1,8 +1,4 @@
-import copy
 from concurrent.futures import ThreadPoolExecutor
-import importlib
-import json
-from pathlib import Path
 import shutil
 import sys
 import types
@@ -66,15 +62,15 @@ def test_unmanifested_store_cannot_be_stamped(tmp_path):
     assert not (tmp_path/'source_contract.json').exists()
 
 @pytest.fixture
-def fixture_case(tmp_path):
-    raw=Path('/home/mingkang_nt/codex/h0_cuda_random100_cell_gauge_v2_20260912/raw/SOC_mp-561353')
-    if not raw.exists():pytest.skip('Liyue real fixture required')
+def fixture_case(tmp_path, h0_reference_root):
+    raw=h0_reference_root/'raw'/'SOC_mp-561353'
     case=tmp_path/'case';(case/'OUT.ABACUS').mkdir(parents=True)
     for name in ['STRU','OUT.ABACUS/INPUT','OUT.ABACUS/running_scf.log']:shutil.copy2(raw/name,case/name)
     import production_io
     _,sd,_,_=production_io.load_case(raw)
     return case,sd
 
+@pytest.mark.h0_reference
 def test_magmom_equivalence(fixture_case):
     import production_io
     case,sd=fixture_case
@@ -83,6 +79,7 @@ def test_magmom_equivalence(fixture_case):
     _,_,got,_=production_io.load_case(case,prepared_species=sd)
     assert got['initial_moments_z']==opts['initial_moments_z']
 
+@pytest.mark.h0_reference
 @pytest.mark.parametrize('key,value',[('nelec','124'),('nelec_delta','1'),('dft_functional','lda')])
 def test_unsupported_physics_rejected(fixture_case,key,value):
     import production_io,re
@@ -90,39 +87,9 @@ def test_unsupported_physics_rejected(fixture_case,key,value):
     text=re.sub(r'^\s*'+key+r'\s+.*$', '',text,flags=re.M)+'\n'+key+' '+value+'\n';p.write_text(text)
     with pytest.raises(ValueError):production_io.load_case(case,prepared_species=sd)
 
-def nacf_modules():
-    from dptb.nacf import radial, prepared
-    return radial, prepared
-
-
-def synthetic_table(radial):
-    directions=np.array([[1.,0,0],[0,1.,0],[0,0,1.],[-1.,0,0],[0,-1.,0],[0,0,-1.]])
-    base=radial._harmonics(1,torch.from_numpy(directions)).numpy()
-    r=np.array([0.,.5,1.,2.,3.]);v=np.stack([np.diag([1.,2.,3.])*(1-x/3)**2 for x in r])
-    return types.SimpleNamespace(distances=r,values=v,left_shells=(1,),right_shells=(1,),support_bohr=3.,
-        _spline=CubicSpline(r,v,axis=0),_rotator=types.SimpleNamespace(directions=directions,_base={1:base}))
-
-def test_nacf_rotation_identity_and_hit_validation(tmp_path):
-    radial,prepared=nacf_modules();a=synthetic_table(radial);b=copy.deepcopy(a);b._rotator._base[1]*=1.01
-    args=dict(device='cpu',dtype=torch.float64,backend='torch')
-    prepared.cached_table(a,tmp_path,**args)
-    cached=prepared.cached_table(b,tmp_path,**args);fresh=radial.TorchRadialBlockTable(b,**args)
-    assert prepared.key_for(a)!=prepared.key_for(b)
-    v=torch.tensor([[.3,.7,.2],[.8,-.4,.1]],dtype=torch.float64)
-    torch.testing.assert_close(cached(v),fresh(v),rtol=0,atol=0)
-    with pytest.raises(ValueError):prepared.cached_table(a,tmp_path,device='cpu',dtype=torch.float16,backend='torch')
-    with pytest.raises(ValueError):prepared.cached_table(a,tmp_path,device='cpu',dtype=torch.float64,backend='bogus')
-
-def test_nacf_concurrent_atomic_publication_and_corruption(tmp_path):
-    radial,prepared=nacf_modules();source=synthetic_table(radial)
-    def load(_):return prepared.cached_table(source,tmp_path,device='cpu',dtype=torch.float64,backend='torch')
-    with ThreadPoolExecutor(max_workers=4) as pool:objects=list(pool.map(load,range(12)))
-    for obj in objects:torch.testing.assert_close(obj.coefficients,objects[0].coefficients)
-    p=tmp_path/(prepared.key_for(source)+'.pt');data=p.read_bytes();p.write_bytes(data[:-10]+b'corruption')
-    with pytest.raises(ValueError,match='checksum'):load(0)
-
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
-def test_h0_private_resident_and_native_devices(tmp_path):
+@pytest.mark.h0_reference
+@pytest.mark.h0_extension('_cuda_two_center')
+def test_h0_private_resident_and_native_devices(tmp_path, h0_reference_root):
     import production_io
     from h0rebuild.offline import prepared_two_center,_resident
     from h0rebuild.models import SpeciesData
@@ -130,7 +97,7 @@ def test_h0_private_resident_and_native_devices(tmp_path):
     from h0rebuild.pyabacus_integrals import PyAbacusTwoCenter
     from h0rebuild.precompiled import verify
     from h0rebuild.cuda_two_center import CUDATwoCenter,_C
-    raw=Path('/home/mingkang_nt/codex/h0_cuda_random100_cell_gauge_v2_20260912/raw/nonSOC_db_seq_id_10868')
+    raw=h0_reference_root/'raw'/'nonSOC_db_seq_id_10868'
     _,sd,_,_=production_io.load_case(raw);sd={k:SpeciesData(v.orb,scalarize_upf(v.upf)) for k,v in sd.items()}
     binary=verify('_cuda_two_center')['binary_sha256']
     a=prepared_two_center(sd,store=tmp_path,prepare=True,device='cuda:0')
@@ -168,7 +135,8 @@ def test_h0_private_resident_and_native_devices(tmp_path):
     assert verify('_cuda_two_center')['binary_sha256']==binary
     torch.cuda.set_device(0)
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+@pytest.mark.h0_reference
+@pytest.mark.h0_extension('_cuda_local_grid')
 def test_local_grid_offline_spline_no_refit(fixture_case):
     from h0rebuild.cuda_local_grid import CudaPeriodicFFTGridAOCache
     _,sd=fixture_case;orb=next(iter(sd.values())).orb
@@ -179,16 +147,8 @@ def test_local_grid_offline_spline_no_refit(fixture_case):
         got=obj._get_species_table(types.SimpleNamespace(basis=orb))
     np.testing.assert_array_equal(got['spline_coeffs'].cpu(),np.asarray(orb.metadata['offline_spline_coefficients']))
 
-def test_pbe_uniform_density_retains_local_correlation():
-    pytest.importorskip('pylibxc')
-    from h0rebuild.builtin_pbe import local,spin_correction
-    rho=np.array([[2e-7,3e-7],[.1,.2],[.4,.4],[1.,.1]])
-    actual=local(rho,True)
-    # Independent branch-vector tests separately compare built-in reference
-    # values; here verify the originally lost local term survives at zero G.
-    assert np.isfinite(actual).all() and np.all(actual<0)
-    for component in spin_correction(rho,np.zeros((4,3))):
-        np.testing.assert_array_equal(component,0.)
+# NOTE: test_builtin_pbe.py::test_builtin_scalar_reference_vectors already exercises `local()` at these
+# same small-rho magnitudes against the independent ABACUS reference vectors; this was a duplicate.
 
 @pytest.mark.skipif(sys.platform!='linux',reason='POSIX stopped-child semantics')
 def test_real_stopped_worker_does_not_exhaust_budget():

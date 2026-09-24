@@ -1,8 +1,13 @@
 import unittest,tempfile
 from pathlib import Path
 import numpy as np
-from h0rebuild.assemble import AssemblyResult,hermiticity_report
-from h0rebuild.models import BlockKey
+import pytest
+
+try:
+    from h0rebuild.assemble import AssemblyResult,hermiticity_report
+except ImportError as _error:
+    pytest.skip(f"this scipy predates sph_harm_y, which h0rebuild.harmonics needs: {_error}", allow_module_level=True)
+from h0rebuild.models import BlockKey  # noqa: E402
 from h0rebuild.cell_gauge import rebase_result,shifts_between_coordinates,validate_cell_shifts
 from h0rebuild.io import save_result,load_blocks,validate_artifact
 
