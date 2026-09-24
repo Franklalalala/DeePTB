@@ -22,6 +22,24 @@ from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
+
+def checkpoint_intervals(train_options):
+    """Saver triggers: every ``save_freq`` iterations, plus every epoch unless
+    ``train_options.epoch_checkpoint`` is false.
+
+    Only an epoch checkpoint resumes exactly; an iteration checkpoint restores
+    model/optimizer/scheduler state but restarts the data order at the epoch
+    boundary (preflight requires DPTB_ALLOW_INEXACT_RESUME=1).  Returns None
+    when checkpointing is off (no ``save_freq``).
+    """
+    save_freq = train_options.get("save_freq")
+    if not save_freq:
+        return None
+    intervals = [(save_freq, "iteration")]
+    if train_options.get("epoch_checkpoint", True):
+        intervals.append((1, "epoch"))
+    return intervals
+
 # codex checkpoint pressure controls, 2026-05-25.
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 

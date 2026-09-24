@@ -50,7 +50,7 @@ from dptb.plugins.monitor import (
 )
 from dptb.plugins.training_monitor import register_core_training_monitors
 from dptb.plugins.train_logger import Logger
-from dptb.plugins.saver import Saver
+from dptb.plugins.saver import Saver, checkpoint_intervals
 from dptb.utils.argcheck import collect_cutoffs, chk_avg_per_iter, normalize
 from dptb.utils.cuda_cache_memory import (
     configure_cuda_cache_memory_monitor,
@@ -719,7 +719,7 @@ def _multi_train_impl(
 
         if output and jdata["train_options"].get("save_freq"):
             trainer.register_plugin(
-                Saver(interval=[(jdata["train_options"].get("save_freq"), 'iteration'), (1, 'epoch')]),
+                Saver(interval=checkpoint_intervals(jdata["train_options"])),
                 checkpoint_path=run_opt["checkpoint_path"]
             )
 
