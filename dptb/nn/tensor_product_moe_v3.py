@@ -1277,6 +1277,26 @@ class MOLELinear(nn.Module):
             flat_out = flat_out.index_select(0, unpermute_idx)
         return flat_out.reshape(*x.shape[:-1], self.out_features)
 
+    def _apply_split_loop_by_graph_index(self, x, mixed_weights, mixed_bias, mole_globals):
+        """One F.linear per route over the rows graph_index assigns to it."""
+        graph_index = _mole_graph_index(mole_globals, x.shape[0], device=x.device)
+        if x.shape[0] == 0:
+            # A zero-row indexed contraction allocates no per-row weights, but
+            # retains the zero gradients to inputs, routing and expert parameters.
+            return self._apply_indexed_ref(x, mixed_weights, mixed_bias, graph_index)
+        order = torch.argsort(graph_index, stable=True)
+        counts = torch.bincount(graph_index, minlength=mixed_weights.shape[0]).tolist()
+        parts = []
+        for route, x_route in enumerate(torch.split(x.index_select(0, order), counts, dim=0)):
+            if x_route.shape[0]:
+                bias = mixed_bias[route] if mixed_bias is not None else None
+                parts.append(F.linear(x_route, mixed_weights[route], bias))
+        if not parts:
+            return x.new_zeros(*x.shape[:-1], self.out_features)
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(order.numel(), device=order.device, dtype=order.dtype)
+        return torch.cat(parts, dim=0).index_select(0, inverse)
+
     def forward(self, x, mole_globals: MOLEGlobals):
         if getattr(mole_globals, "top1_independent", False):
             from .top1_prior import linear
@@ -1325,6 +1345,14 @@ class MOLELinear(nn.Module):
                 return self._apply_cublas_grouped(x, mixed_weights, mixed_bias, graph_index, mole_globals)
             raise AssertionError(f"unreachable mole_linear_mode={mode!r}")
 
+        if (
+            getattr(mole_globals, "graph_index", None) is not None
+            and getattr(mole_globals, "split_sizes", None) is None
+            and getattr(mole_globals, "_sizes_tensor", None) is None
+        ):
+            # Rows name their route only through graph_index (edge-MoE dispatch).
+            # Contiguous splits would put every row on route 0.
+            return self._apply_split_loop_by_graph_index(x, mixed_weights, mixed_bias, mole_globals)
         split_sizes = _mole_split_sizes(mole_globals, x.shape[0])
         x_split = torch.split(x, split_sizes, dim=0)
         out_parts = []
