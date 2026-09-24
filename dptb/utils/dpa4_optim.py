@@ -579,8 +579,12 @@ class HybridMuon(Optimizer):
         # near-zero update.
         x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1.0e-7)
         for a, b, c in [self._FAST_COEFF] * 8 + [self._POLISH_COEFF] * 2:
+            # a*x + b*(gram@x) + c*(gram@gram@x) in the reference form
+            # (b*gram + c*gram@gram) @ x: one [m, m] x [m, n] product per iteration
+            # fewer, with the scaling and the sums done by baddbmm
             gram = x @ x.transpose(-2, -1)
-            x = a * x + b * (gram @ x) + c * ((gram @ gram) @ x)
+            poly = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            x = torch.baddbmm(x, poly, x, beta=a, alpha=1.0)
 
         if transposed:
             x = x.transpose(-2, -1)
