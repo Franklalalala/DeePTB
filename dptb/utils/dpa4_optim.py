@@ -1,3 +1,4 @@
+import logging
 import math
 from fnmatch import fnmatchcase
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -9,6 +10,8 @@ from torch.optim import Optimizer
 NumberOrList = Union[float, Sequence[float]]
 NamedParamMap = Dict[int, str]
 ClipStatTensors = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+log = logging.getLogger(__name__)
 
 
 def _is_named_parameter(item) -> bool:
@@ -283,6 +286,7 @@ class HybridMuon(Optimizer):
         "*freq*",
         "*router*",
     )
+    _DEFAULT_EXPERT_PATTERNS = ("*weight_experts*", "*bias_experts*")
 
     def __init__(
         self,
@@ -315,6 +319,13 @@ class HybridMuon(Optimizer):
         muon_clip_max_ratio: float = 0.25,
         muon_clip_param_rms_floor: float = 1.0e-3,
         muon_clip_warmup_steps: int = 5,
+        expert_update_scale: str = "none",
+        expert_update_scale_min: float = 0.1,
+        expert_update_scale_const: float = 1.0,
+        expert_name_patterns: Optional[Sequence[str]] = None,
+        expert_weight_decay_mult: float = 1.0,
+        adamw_name_patterns: Optional[Sequence[str]] = None,
+        adamw_pattern_lr_scale: float = 1.0,
     ) -> None:
         if lr <= 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -370,6 +381,17 @@ class HybridMuon(Optimizer):
             raise ValueError(f"Invalid muon_clip_param_rms_floor: {muon_clip_param_rms_floor}")
         if muon_clip_warmup_steps < 0:
             raise ValueError(f"Invalid muon_clip_warmup_steps: {muon_clip_warmup_steps}")
+        expert_update_scale = str(expert_update_scale).lower()
+        if expert_update_scale not in {"none", "sqrt_load", "const"}:
+            raise ValueError("expert_update_scale must be none, sqrt_load or const")
+        if not (0.0 < expert_update_scale_min <= 1.0):
+            raise ValueError(f"Invalid expert_update_scale_min: {expert_update_scale_min}")
+        if not (0.0 < expert_update_scale_const <= 1.0):
+            raise ValueError(f"Invalid expert_update_scale_const: {expert_update_scale_const}")
+        if expert_weight_decay_mult < 0.0:
+            raise ValueError(f"Invalid expert_weight_decay_mult: {expert_weight_decay_mult}")
+        if adamw_pattern_lr_scale <= 0.0:
+            raise ValueError(f"Invalid adamw_pattern_lr_scale: {adamw_pattern_lr_scale}")
 
         defaults = dict(
             lr=float(lr),
@@ -406,6 +428,16 @@ class HybridMuon(Optimizer):
             muon_clip_max_ratio=float(muon_clip_max_ratio),
             muon_clip_param_rms_floor=float(muon_clip_param_rms_floor),
             muon_clip_warmup_steps=int(muon_clip_warmup_steps),
+            # routed experts: per-expert scale applied to the final Muon update (after
+            # orthogonalisation and clipping, where it is not normalised away), weight-decay multiplier, and a
+            # name-based AdamW override that also works for 2-D parameters (the 1-D exclude list does not)
+            expert_update_scale=expert_update_scale,
+            expert_update_scale_min=float(expert_update_scale_min),
+            expert_update_scale_const=float(expert_update_scale_const),
+            expert_name_patterns=_as_pattern_tuple(expert_name_patterns, self._DEFAULT_EXPERT_PATTERNS),
+            expert_weight_decay_mult=float(expert_weight_decay_mult),
+            adamw_name_patterns=_as_pattern_tuple(adamw_name_patterns, ()),
+            adamw_pattern_lr_scale=float(adamw_pattern_lr_scale),
         )
         params, self._param_names = _normalize_named_parameters(params)
         super().__init__(params, defaults)
@@ -413,6 +445,11 @@ class HybridMuon(Optimizer):
         self._pending_diagnostics_tensor: Optional[torch.Tensor] = None
         self._last_step_diagnostics_cache: Optional[Dict[str, float]] = None
         self._route_summary_cache: Optional[Dict[str, Union[int, float]]] = None
+        self._expert_scale_missing = set()
+        self.last_expert_scale: Optional[torch.Tensor] = None
+        # per-expert norms of the routed-expert updates of the last step, filled only while record_expert_stats
+        self.record_expert_stats = False
+        self.last_expert_stats: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def add_param_group(self, param_group) -> None:
         super().add_param_group(param_group)
@@ -493,9 +530,60 @@ class HybridMuon(Optimizer):
         )
 
     def _uses_muon(self, param: torch.Tensor, group) -> bool:
+        if self._is_forced_adamw(param, group):
+            return False
         return self._uses_native_muon_shape(param, group["matrix_min_dim"]) or (
             self._flat_1d_matrix_shape(param, group) is not None
         )
+
+    def _is_forced_adamw(self, param: torch.Tensor, group) -> bool:
+        self._ensure_group_defaults(group)
+        patterns = group["adamw_name_patterns"]
+        return bool(patterns) and self._matches_any(self._param_names.get(id(param), ""), patterns)
+
+    def _is_expert_param(self, param: torch.Tensor, group) -> bool:
+        self._ensure_group_defaults(group)
+        return param.dim() >= 2 and self._matches_any(
+            self._param_names.get(id(param), ""), group["expert_name_patterns"]
+        )
+
+    def _expert_scale(self, param: torch.Tensor, group) -> Optional[torch.Tensor]:
+        """Per-expert factor [E] for the final update of a routed-expert parameter, or None."""
+        mode = group["expert_update_scale"]
+        if mode == "none":
+            return None
+        num_experts = int(param.shape[0])
+        if mode == "const":
+            scale = torch.full((num_experts,), group["expert_update_scale_const"],
+                               dtype=torch.float32, device=param.device)
+        else:
+            from dptb.nn import moe_registry
+            load = moe_registry.expert_load(num_experts)
+            if load is None:
+                if num_experts not in self._expert_scale_missing:
+                    self._expert_scale_missing.add(num_experts)
+                    log.warning("HybridMuon expert_update_scale=sqrt_load: no training router with %d experts; "
+                                "updates of %s-shaped expert parameters are left unscaled",
+                                num_experts, num_experts)
+                return None
+            load = load.to(device=param.device, dtype=torch.float32)
+            scale = group["expert_update_scale_const"] * (load / load.mean().clamp_min(1.0e-12)).clamp_min(0.0).sqrt().clamp(
+                group["expert_update_scale_min"], 1.0
+            )
+        self.last_expert_scale = scale.detach()
+        return scale.to(dtype=param.dtype)
+
+    def _publish_lr_ratio(self) -> None:
+        """current lr / running-peak lr -> routers (bias schedules); the peak is kept in the param group."""
+        if not self.param_groups:
+            return
+        group = self.param_groups[0]
+        lr = float(group["lr"])
+        peak = max(float(group.get("peak_lr_seen", 0.0) or 0.0), lr)
+        group["peak_lr_seen"] = peak
+        group["committed_steps"] = int(group.get("committed_steps", 0) or 0) + 1
+        from dptb.nn import moe_registry
+        moe_registry.publish_lr_scale(lr / peak if peak > 0.0 else 1.0, step=group["committed_steps"])
 
     def _effective_shape_for_param(self, param: torch.Tensor, group) -> List[int]:
         return self._flat_1d_matrix_shape(param, group) or self._effective_shape(param)
@@ -691,13 +779,17 @@ class HybridMuon(Optimizer):
                     self._adamw_step(param, grad, group, lr, weight_decay)
 
         self._finalize_step_stats()
+        self._publish_lr_ratio()
         return loss
 
     def _muon_step(self, param, grad, group, lr, weight_decay):
         state = self.state[param]
-        if len(state) == 0:
+        if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
+        is_expert = self._is_expert_param(param, group)
+        if is_expert:
+            weight_decay = weight_decay * group["expert_weight_decay_mult"]
         if weight_decay != 0.0:
             param.mul_(1.0 - lr * weight_decay)
 
@@ -712,7 +804,26 @@ class HybridMuon(Optimizer):
         rows, cols = int(effective_shape[-2]), int(effective_shape[-1])
         scaled_update = ortho_update * (group["muon_scale"] * math.sqrt(max(rows, cols)))
         scaled_update = self._clip_muon_update(param, scaled_update, group, state, lr)
+        expert_scale = self._expert_scale(param, group) if is_expert else None
+        if is_expert and self.record_expert_stats:
+            self._record_expert_stats(param, grad, momentum, scaled_update, expert_scale, lr, weight_decay)
+        if expert_scale is not None:
+            scaled_update = scaled_update * expert_scale.reshape(-1, *([1] * (param.dim() - 1)))
         param.add_(scaled_update, alpha=-lr)
+
+    @torch.no_grad()
+    def _record_expert_stats(self, param, grad, momentum, clipped_update, expert_scale, lr, weight_decay):
+        num_experts = int(param.shape[0])
+
+        def per_expert(t):
+            return t.detach().float().reshape(num_experts, -1).norm(dim=1)
+
+        scale = expert_scale.float() if expert_scale is not None else torch.ones(num_experts, device=param.device)
+        self.last_expert_stats[self._param_names.get(id(param), str(id(param)))] = dict(
+            grad=per_expert(grad), momentum=per_expert(momentum), update_clipped=per_expert(clipped_update) * lr,
+            update_applied=per_expert(clipped_update) * scale * lr, scale=scale,
+            decay=per_expert(param) * (lr * weight_decay), weight=per_expert(param),
+        )
 
     def _magma_lite_scale(self, param, grad, update, group, state):
         grad_blocks = self._reshape_to_matrix_batch_for_param(grad.float(), param, group)
@@ -801,11 +912,15 @@ class HybridMuon(Optimizer):
 
     def _adamw_step(self, param, grad, group, lr, weight_decay):
         state = self.state[param]
-        if len(state) == 0:
+        if "exp_avg" not in state:
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
             state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
+        if self._is_forced_adamw(param, group):
+            lr = lr * group["adamw_pattern_lr_scale"]
+        if self._is_expert_param(param, group):
+            weight_decay = weight_decay * group["expert_weight_decay_mult"]
         if weight_decay != 0.0:
             param.mul_(1.0 - lr * weight_decay)
 

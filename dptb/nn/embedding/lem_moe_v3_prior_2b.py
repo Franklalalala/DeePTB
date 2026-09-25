@@ -411,14 +411,7 @@ class _Prior2bMixin:
         mole_pa = None
         use_edge_router = isinstance(self, LemMoEV3EdgeH0)
         if use_edge_router:
-            router_input = active_edge_one_hot
-            if use_pa:
-                descriptor = self._gram_descriptor(
-                    self._raw_prior_source(data, bond_type, active_edges)
-                )
-                router_input = torch.cat(
-                    [router_input, descriptor.to(dtype=router_input.dtype)], dim=-1
-                )
+            router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
             active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
             mole_pa, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
                 router_input, active_bond_type

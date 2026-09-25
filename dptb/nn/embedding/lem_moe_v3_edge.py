@@ -40,6 +40,29 @@ class LemMoEV3Edge(LemMoEV3):
         self.edge_router_temperature = float(kwargs.pop("edge_router_temperature", 1.0))
         if self.edge_router_top1_mode == "switch" and self.edge_router_temperature != 1.0:
             raise ValueError("edge_router_temperature applies to the top-k gate; the Switch top-1 router has none")
+        # edge-router options; the defaults reproduce the production router, see MOLERouterV3
+        self.edge_router_options = dict(
+            logit_kind=str(kwargs.pop("edge_router_logit", "raw")),
+            logit_scale=float(kwargs.pop("edge_router_logit_scale", 10.0)),
+            select=str(kwargs.pop("edge_router_select", "sigmoid")),
+            bias_at_eval=bool(kwargs.pop("edge_router_bias_at_eval", False)),
+            bias_schedule=str(kwargs.pop("edge_router_bias_schedule", "const")),
+            select_noise=float(kwargs.pop("edge_router_select_noise", 0.0)),
+            bias_freeze_after_step=int(kwargs.pop("edge_router_bias_freeze_after_step", 0)),
+        )
+        self.edge_router_bias_speed = float(kwargs.pop("edge_router_bias_speed", 0.005))
+        # what the per-edge (prior_activate) router sees: learned bond-type embedding plus the prior Gram descriptor
+        # (production), plus a radial basis of the edge length instead (control), or the embedding alone
+        self.edge_router_input = str(kwargs.pop("edge_router_input", "onehot_prior"))
+        self.edge_router_rbf = int(kwargs.pop("edge_router_rbf", 16))
+        self.edge_router_rbf_rmax = float(kwargs.pop("edge_router_rbf_rmax", 10.0))
+        if self.edge_router_input not in ("onehot_prior", "onehot_r", "onehot"):
+            raise ValueError("edge_router_input must be onehot_prior, onehot_r or onehot; got %r" % self.edge_router_input)
+        if self.edge_router_input != "onehot_prior" and not self.edge_router_prior_activate:
+            raise ValueError("edge_router_input=%r needs edge_router_prior_activate=true (per-edge routing)"
+                             % self.edge_router_input)
+        if self.edge_router_input == "onehot_r" and (self.edge_router_rbf < 1 or self.edge_router_rbf_rmax <= 0.0):
+            raise ValueError("edge_router_input=onehot_r needs edge_router_rbf >= 1 and edge_router_rbf_rmax > 0")
         edge_one_hot_dim = int(edge_router_in_features or kwargs.get("edge_one_hot_dim", 128))
         self.edge_one_hot_dim = edge_one_hot_dim
         self.edge_router_in_features = edge_one_hot_dim
@@ -159,6 +182,14 @@ class LemMoEV3Edge(LemMoEV3):
             self._prior_source_dim = offset
             self.edge_router_prior_dim = desc_dim
             self.edge_router_in_features = edge_one_hot_dim + desc_dim
+            if self.edge_router_input == "onehot_r":
+                self.edge_router_in_features = edge_one_hot_dim + self.edge_router_rbf
+                centers = torch.linspace(0.0, self.edge_router_rbf_rmax, self.edge_router_rbf,
+                                         dtype=self.dtype, device=self.device)
+                self.register_buffer("_router_rbf_centers", centers, persistent=False)
+                self._router_rbf_width = self.edge_router_rbf_rmax / max(self.edge_router_rbf - 1, 1)
+            elif self.edge_router_input == "onehot":
+                self.edge_router_in_features = edge_one_hot_dim
             mean = torch.zeros(desc_dim, dtype=self.dtype, device=self.device)
             std = torch.ones(desc_dim, dtype=self.dtype, device=self.device)
             if self.edge_router_prior_stats:
@@ -179,19 +210,29 @@ class LemMoEV3Edge(LemMoEV3):
             self.register_buffer("_prior_mean", mean, persistent=False)
             self.register_buffer("_prior_std", std, persistent=False)
 
-        router_type, router_kwargs = MOLERouterV3, dict(mixing_temperature=self.edge_router_temperature)
+        router_type, router_kwargs = MOLERouterV3, dict(mixing_temperature=self.edge_router_temperature,
+                                                         **self.edge_router_options)
         if self.edge_router_top1_mode == "switch":
             from dptb.nn.top1_prior import Top1PriorRouter
+            if self.edge_router_options != dict(logit_kind="raw", logit_scale=10.0, select="sigmoid",
+                                                bias_at_eval=False, bias_schedule="const", select_noise=0.0,
+                                                bias_freeze_after_step=0):
+                raise ValueError("edge_router_logit/select/bias_*/select_noise apply to the top-k router only, "
+                                 "not to edge_router_top1_mode=switch")
             router_type, router_kwargs = Top1PriorRouter, {}
         self.router = router_type(
             in_features=self.edge_router_in_features,
             num_experts=self.num_experts,
             top_k=top_k,
             aux_loss_free=self.edge_router_top1_mode != "switch",
-            bias_update_speed=0.0 if self.edge_router_top1_mode == "switch" else 0.005,
+            bias_update_speed=0.0 if self.edge_router_top1_mode == "switch" else self.edge_router_bias_speed,
             **router_kwargs,
         )
-        if self.edge_router_prior_dim:
+        if self.edge_router_prior_dim and self.edge_router_input == "onehot_r":
+            # radial columns start at zero, like the descriptor columns of the production router
+            with torch.no_grad():
+                self.router.net[0].weight[:, edge_one_hot_dim:].zero_()
+        elif self.edge_router_prior_dim and self.edge_router_input == "onehot_prior":
             # The descriptor contributes exactly zero at step 0, so it can earn
             # influence without injecting a scale shock into the gate, and
             # gradients still flow into these columns.  Note this is NOT a
@@ -267,14 +308,7 @@ class LemMoEV3Edge(LemMoEV3):
 
         active_edge_one_hot = edge_one_hot[active_edges]
         active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
-        router_input = active_edge_one_hot
-        if self.edge_router_prior_activate:
-            descriptor = self._gram_descriptor(
-                self._raw_prior_source(data, bond_type, active_edges)
-            )
-            router_input = torch.cat(
-                [active_edge_one_hot, descriptor.to(active_edge_one_hot.dtype)], dim=-1
-            )
+        router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
         mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
             router_input,
             active_bond_type,
@@ -342,6 +376,21 @@ class LemMoEV3Edge(LemMoEV3):
         )
 
         return data
+
+    def _edge_router_input(self, data, bond_type, active_edges, active_edge_one_hot, edge_vector):
+        if not self.edge_router_prior_activate or self.edge_router_input == "onehot":
+            return active_edge_one_hot
+        if self.edge_router_input == "onehot_r":
+            length = edge_vector[active_edges].norm(dim=-1, keepdim=True).to(active_edge_one_hot.dtype)
+            centers = self._router_rbf_centers.to(dtype=length.dtype, device=length.device)
+            rbf = torch.exp(-0.5 * ((length - centers) / self._router_rbf_width) ** 2)
+            return torch.cat([active_edge_one_hot, rbf], dim=-1)
+        descriptor = self._gram_descriptor(
+            self._raw_prior_source(data, bond_type, active_edges)
+        )
+        return torch.cat(
+            [active_edge_one_hot, descriptor.to(active_edge_one_hot.dtype)], dim=-1
+        )
 
     def _raw_prior_source(
         self,

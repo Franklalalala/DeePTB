@@ -719,12 +719,56 @@ def write_router_regularizers(router: Optional[nn.Module], data: dict) -> None:
 
 
 class MOLERouterV3(nn.Module):
+    """Top-k router with aux-loss-free load balancing.
+
+    Defaults reproduce the production router: raw logits, selection on ``sigmoid(logits) + expert_bias`` in training
+    and on ``sigmoid(logits)`` in eval, softmax mixing over the selected logits.  The options below are part of the
+    model configuration, so a checkpoint carries them:
+
+    - ``logit_kind="cosine"``: ``z_e = logit_scale * cos(h, w_e)`` with ``h`` the hidden layer after SiLU and ``w_e``
+      the e-th row of the last layer (its bias is unused); bounded, so the sigmoid never reaches its float32 1.0
+      plateau (at raw logits of hundreds every expert ties at 1.0 and the selection falls to the bias / index).
+    - ``select="logit"``: rank on the logits instead of their sigmoid (no saturation ties whatever the logit scale).
+    - ``bias_at_eval``: keep the frozen ``expert_bias`` in the eval selection, so train and eval select alike.
+    - ``bias_schedule``: ``"const"`` fixed sign-rule step; ``"follow_lr"`` step times lr / peak lr; ``"freeze_decay"``
+      no bias updates once the learning rate falls below its peak (the optimizer publishes the ratio through
+      :mod:`dptb.nn.moe_registry`).
+    - ``select_noise``: std of Gaussian noise added to the selection scores in training only (noisy top-k); the
+      mixing weights stay noise-free.
+    - ``mixing_temperature`` (0924-stable): ``g = softmax(z_selected / T)``; changes mixing hardness only.
+    - ``bias_freeze_after_step``: no bias updates from this committed optimizer step on (0 = never); the frozen bias
+      keeps acting in the selection.
+    """
+
+    _LOGIT_KINDS = ("raw", "cosine")
+    _SELECTS = ("sigmoid", "logit")
+    _BIAS_SCHEDULES = ("const", "follow_lr", "freeze_decay")
+
     def __init__(self, in_features, num_experts=48, top_k=6,
                  aux_loss_free=True,
                  bias_update_speed=0.005,
                  full_expert_fast_path: bool = True,
-                 mixing_temperature: float = 1.0):  # 修改1: 固定 Bias 更新速度，不再衰减
+                 mixing_temperature: float = 1.0,
+                 logit_kind: str = "raw",
+                 logit_scale: float = 10.0,
+                 select: str = "sigmoid",
+                 bias_at_eval: bool = False,
+                 bias_schedule: str = "const",
+                 select_noise: float = 0.0,
+                 bias_freeze_after_step: int = 0):  # 修改1: 固定 Bias 更新速度，不再衰减
         super().__init__()
+        if logit_kind not in self._LOGIT_KINDS:
+            raise ValueError(f"logit_kind must be one of {self._LOGIT_KINDS}; got {logit_kind!r}")
+        if select not in self._SELECTS:
+            raise ValueError(f"select must be one of {self._SELECTS}; got {select!r}")
+        if bias_schedule not in self._BIAS_SCHEDULES:
+            raise ValueError(f"bias_schedule must be one of {self._BIAS_SCHEDULES}; got {bias_schedule!r}")
+        if not float(logit_scale) > 0.0:
+            raise ValueError(f"logit_scale must be positive; got {logit_scale!r}")
+        if float(select_noise) < 0.0:
+            raise ValueError(f"select_noise must be >= 0; got {select_noise!r}")
+        if int(bias_freeze_after_step) < 0:
+            raise ValueError(f"bias_freeze_after_step must be >= 0; got {bias_freeze_after_step!r}")
         self.top_k = top_k
         self.num_experts = num_experts
         self.aux_loss_free = aux_loss_free
@@ -735,6 +779,20 @@ class MOLERouterV3(nn.Module):
         self.mixing_temperature = float(mixing_temperature)
         if not math.isfinite(self.mixing_temperature) or self.mixing_temperature <= 0:
             raise ValueError("mixing_temperature must be a finite positive number, got %r" % (mixing_temperature,))
+        self.logit_kind = logit_kind
+        self.logit_scale = float(logit_scale)
+        self.select = select
+        self.bias_at_eval = bool(bias_at_eval)
+        self.bias_schedule = bias_schedule
+        self.select_noise = float(select_noise)
+        self.bias_freeze_after_step = int(bias_freeze_after_step)
+        # current_lr / peak_lr and the committed optimizer-step count, published by the optimizer after every step
+        # (moe_registry); opt_step stays 0 with optimizers that do not publish
+        self.bias_lr_scale = 1.0
+        self.opt_step = 0
+        # read-only statistics of the last *training* forward (validation never touches them); off by default
+        self.record_train_stats = False
+        self.last_train_stats = None
 
         # 固定的惩罚力度
         self.bias_update_speed = bias_update_speed
@@ -752,11 +810,38 @@ class MOLERouterV3(nn.Module):
         self._last_topk_values = None
         self.last_router_z_loss = None
 
+        from dptb.nn import moe_registry
+        moe_registry.register_router(self)
+
         # 修改1: 删除了 step_count 等用于衰减的 Buffer
+
+    def router_config(self) -> dict:
+        return dict(logit_kind=self.logit_kind, logit_scale=self.logit_scale, select=self.select,
+                    bias_at_eval=self.bias_at_eval, bias_schedule=self.bias_schedule,
+                    bias_update_speed=float(self.bias_update_speed), select_noise=self.select_noise,
+                    mixing_temperature=self.mixing_temperature, bias_freeze_after_step=self.bias_freeze_after_step)
+
+    def _logits(self, global_features):
+        if self.logit_kind == "cosine":
+            hidden = self.net[1](self.net[0](global_features))
+            return self.logit_scale * (
+                F.normalize(hidden, dim=-1) @ F.normalize(self.net[2].weight, dim=-1).t()
+            )
+        return self.net(global_features)
+
+    def _bias_step(self) -> float:
+        speed = float(self.bias_update_speed)
+        if self.bias_freeze_after_step > 0 and int(self.opt_step) >= self.bias_freeze_after_step:
+            return 0.0
+        if self.bias_schedule == "follow_lr":
+            return speed * min(max(float(self.bias_lr_scale), 0.0), 1.0)
+        if self.bias_schedule == "freeze_decay":
+            return speed if float(self.bias_lr_scale) >= 0.999 else 0.0
+        return speed
 
     def forward(self, global_features, sizes=None):
         # 修改1: 删除了 Jitter (探索噪声) 的注入逻辑，完全依赖网络的自然 Logits
-        logits = self.net(global_features)
+        logits = self._logits(global_features)
         scores = torch.sigmoid(logits)
         self.last_router_z_loss = router_z_loss(logits, sizes)
 
@@ -769,10 +854,13 @@ class MOLERouterV3(nn.Module):
             return probs, monitor_val, torch.zeros((), dtype=scores.dtype, device=scores.device)
 
         # 加上 Bias 用于选择 Top-K (Aux-loss-free 核心机制)
-        if self.aux_loss_free and self.training:
-            scores_for_selection = scores + self.expert_bias
+        selection_base = logits if self.select == "logit" else scores
+        if self.aux_loss_free and (self.training or self.bias_at_eval):
+            scores_for_selection = selection_base + self.expert_bias
         else:
-            scores_for_selection = scores
+            scores_for_selection = selection_base
+        if self.training and self.select_noise > 0.0:
+            scores_for_selection = scores_for_selection + self.select_noise * torch.randn_like(scores_for_selection)
 
         if self.top_k is not None:
             topk_scores_biased, topk_indices = torch.topk(scores_for_selection, k=self.top_k, dim=-1)
@@ -796,10 +884,12 @@ class MOLERouterV3(nn.Module):
                 expert_load_cv = self.ema_load.std() / (self.ema_load.mean() + 1e-8)
 
             # 修改1: 使用恒定力度 (0.005) 更新 Bias，持续进行负载均衡
-            if self.aux_loss_free and self.training and self.bias_update_speed > 0.0:
+            bias_before = self.expert_bias.detach().clone() if (self.training and self.record_train_stats) else None
+            bias_step = self._bias_step() if (self.aux_loss_free and self.training) else 0.0
+            if bias_step > 0.0:
                 with torch.no_grad():
                     error = current_load - target_load
-                    self.expert_bias -= torch.sign(error) * self.bias_update_speed
+                    self.expert_bias -= torch.sign(error) * bias_step
                     # 保持 Bias 整体均值为 0，防止激活值整体漂移
                     self.expert_bias -= self.expert_bias.mean()
 
@@ -815,6 +905,8 @@ class MOLERouterV3(nn.Module):
             topk_probs = torch.softmax(self._tempered(topk_logits), dim=-1)
             self._last_topk_indices = topk_indices
             self._last_topk_values = topk_probs
+            if self.training and self.record_train_stats:
+                self._record_train_stats(scores_for_selection, topk_indices, topk_probs, current_load, bias_before)
 
             # 构建稀疏输出系数
             coeffs = torch.zeros_like(scores)
@@ -838,6 +930,25 @@ class MOLERouterV3(nn.Module):
 
     def _tempered(self, logits):
         return logits if self.mixing_temperature == 1.0 else logits / self.mixing_temperature
+
+    @torch.no_grad()
+    def _record_train_stats(self, selection_scores, topk_indices, topk_probs, hard_load, bias_before):
+        k = int(topk_indices.shape[1])
+        n = int(selection_scores.shape[0])
+        soft = torch.zeros(self.num_experts, dtype=torch.float32, device=topk_probs.device)
+        soft.index_add_(0, topk_indices.reshape(-1), topk_probs.reshape(-1).float())
+        g2 = torch.zeros_like(soft)
+        g2.index_add_(0, topk_indices.reshape(-1), topk_probs.reshape(-1).float().square())
+        stats = dict(opt_step=int(self.opt_step), n_rows=n, top_k=k, hard_load=hard_load.detach().float().clone(),
+                     soft_load=soft, soft_load_sq=g2, bias=bias_before,
+                     mmp=topk_probs.max(dim=-1)[0].float().mean())
+        if k < self.num_experts and n > 0:
+            v = torch.topk(selection_scores.detach().float(), k=k + 1, dim=-1).values
+            margin = v[:, k - 1] - v[:, k]             # last selected vs first rejected selection score
+            stats["sel_margin_mean"] = margin.mean()
+            stats["sel_margin_q10"] = torch.quantile(margin[: min(n, 65536)], 0.1)
+            stats["sel_ties"] = (margin == 0).float().mean()
+        self.last_train_stats = stats
 
 
 class MOLELinear(nn.Module):
