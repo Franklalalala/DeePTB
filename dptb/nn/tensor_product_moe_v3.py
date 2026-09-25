@@ -1686,6 +1686,63 @@ class SO2PostActivationExpertMixer(torch.nn.Module):
         return torch.cat(out_parts, dim=0), wigner_D_all
 
 
+class SO2SlotPostActivationMixer(torch.nn.Module):
+    """Nonlinear experts for per-row top-k routing: ``h' = sum_j g_j act(SO2_{e_j}(x))``.
+
+    ``SO2_{e_j}`` is the selected SO2 operator of top-k slot ``j``: expert ``e_j`` with the shared affine parameters
+    folded in (weights and biases; any non-MoLE blocks such as interpolation blocks are part of every slot), which is
+    exact only when the coefficients sum to one; with ``act`` the identity the sum equals the pre-activation mix.
+    State dicts are interchangeable with pre_activation, but loading pre_activation weights does not preserve the
+    function (the activation moved inside the sum).  Each slot runs the layer's own
+    activation-space route with a one-slot MOLEGlobals (coefficient 1), so the grouped GEMM stays segmented by
+    expert id and no per-edge weight is built; the slot outputs are activated separately and then weighted by
+    the router's coefficients ``g``, which keep their gradient.  ``act`` must be equivariant on the layer's output
+    irreps (e3nn ``Gate``: gates computed from 0e scalars, one gate value for all m components of a gated irrep).
+    Cost: k SO2 passes (rotation, GEMM, scatter) instead of one, and k activated outputs kept for backward.
+    """
+
+    def __init__(self, tp: "SO2_Linear", activation: torch.nn.Module):
+        super().__init__()
+        # not registered as submodules: they belong to the owning update block
+        object.__setattr__(self, "tp", tp)
+        object.__setattr__(self, "activation", activation)
+
+    def _activated_dim(self) -> int:
+        irreps_out = getattr(self.activation, "irreps_out", None)
+        if irreps_out is not None:
+            return int(irreps_out.dim)
+        probe = torch.zeros(0, int(self.tp.irreps_out.dim))
+        return int(self.activation(probe).shape[-1])
+
+    def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
+        if x.shape[0] == 0:
+            # no active rows: the router builds globals without top-k metadata; nothing to route or activate
+            return x.new_zeros((0, self._activated_dim())), wigner_D_all
+        idx = getattr(mole_globals, "topk_indices", None)
+        val = getattr(mole_globals, "topk_values", None)
+        if mole_globals is None or not getattr(mole_globals, "activation_space", False) or idx is None or val is None:
+            raise ValueError("SO2SlotPostActivationMixer needs per-row activation-space top-k routing "
+                             "(prior_activate); got %r." % (type(mole_globals).__name__,))
+        if not getattr(mole_globals, "coefficients_sum_to_one", False):
+            raise ValueError("SO2SlotPostActivationMixer folds the shared expert into every slot, which needs "
+                             "coefficients that sum to one.")
+        if idx.dim() != 2 or val.shape != idx.shape or idx.shape[0] != x.shape[0] or idx.shape[1] == 0:
+            raise ValueError("top-k routing must be [n_rows, k] for %d rows; got indices %s, values %s."
+                             % (x.shape[0], tuple(idx.shape), tuple(val.shape)))
+        num_experts = int(self.tp.num_experts)
+        out = None
+        for j in range(idx.shape[1]):
+            slot_idx = idx[:, j:j + 1].to(device=x.device, dtype=torch.long).contiguous()
+            one = torch.ones(slot_idx.shape, dtype=x.dtype, device=x.device)
+            coeff = torch.zeros(slot_idx.shape[0], num_experts, dtype=x.dtype, device=x.device).scatter_(1, slot_idx, one)
+            slot_globals = MOLEGlobals(coefficients=coeff, sizes=None, topk_indices=slot_idx, topk_values=one,
+                                       activation_space=True, coefficients_sum_to_one=True)
+            y, wigner_D_all = self.tp(x, R, slot_globals, latents, wigner_D_all)
+            part = self.activation(y) * val[:, j:j + 1].to(device=y.device, dtype=y.dtype)
+            out = part if out is None else out + part
+        return out, wigner_D_all
+
+
 class SO2_Linear(torch.nn.Module):
     """
     SO(2) Convolutional layer with MoE and Rotate Control.

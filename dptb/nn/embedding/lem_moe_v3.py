@@ -31,7 +31,7 @@ from .lem_moe_v3_plugins import (
 )
 # Note: Modified SO2_Linear and MOLE classes imported here
 from dptb.nn.tensor_product_moe_v3 import (SO2_Linear, MOLEGlobals, MOLERouterV3, SO2PostActivationExpertMixer,
-                                           write_router_regularizers)
+                                           SO2SlotPostActivationMixer, write_router_regularizers)
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
@@ -101,7 +101,7 @@ def _normalize_stable_standard_compat_mode(name: str, mode: Optional[str]) -> st
 
 def _normalize_so2_expert_mixing_mode(mode: Optional[str]) -> str:
     mode = mode or "pre_activation"
-    allowed = {"pre_activation", "post_activation"}
+    allowed = {"pre_activation", "post_activation", "post_activation_slot"}
     if mode not in allowed:
         raise ValueError(f"so2_expert_mixing_mode must be one of {sorted(allowed)}, got {mode!r}.")
     return mode
@@ -1156,6 +1156,10 @@ class LemMoEV3(torch.nn.Module):
         self.ao_projector_bank_path = ao_projector_bank_path
         self.cg_head_impl = _normalize_cg_head_impl(cg_head_impl)
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
+        if self.so2_expert_mixing_mode == "post_activation_slot" and not getattr(self, "edge_router_prior_activate", False):
+            # the slot mixer needs per-row top-k metadata with coefficients summing to one (prior_activate)
+            raise ValueError("so2_expert_mixing_mode='post_activation_slot' needs per-edge routing "
+                             "(lem_moe_v3_edge* with edge_router_prior_activate=true).")
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
         self.edge_aggregation_gated_attention = bool(edge_aggregation_gated_attention)
@@ -2228,6 +2232,14 @@ class UpdateNode(torch.nn.Module):
                 so2_expert_route_chunk_size,
                 so2_expert_route_checkpoint,
             )
+        elif self.so2_expert_mixing_mode == "post_activation_slot":
+            # per-row top-k slots activated separately, mixed with the router's own coefficients
+            if so2_expert_route_checkpoint or so2_expert_route_chunk_size:
+                raise ValueError(
+                    "so2_expert_mixing_mode='post_activation_slot' implements neither "
+                    "so2_expert_route_checkpoint nor so2_expert_route_chunk_size; unset them."
+                )
+            self.post_activation_expert_mixer = SO2SlotPostActivationMixer(self.tp, self.activation)
 
         self.focus_gate = PostActivation0eFocusGate(
             self.irreps_out,
@@ -2558,6 +2570,14 @@ class UpdateEdge(torch.nn.Module):
                 so2_expert_route_chunk_size,
                 so2_expert_route_checkpoint,
             )
+        elif self.so2_expert_mixing_mode == "post_activation_slot":
+            # per-row top-k slots activated separately, mixed with the router's own coefficients
+            if so2_expert_route_checkpoint or so2_expert_route_chunk_size:
+                raise ValueError(
+                    "so2_expert_mixing_mode='post_activation_slot' implements neither "
+                    "so2_expert_route_checkpoint nor so2_expert_route_chunk_size; unset them."
+                )
+            self.post_activation_expert_mixer = SO2SlotPostActivationMixer(self.tp, self.activation)
 
         if res_update:
             self.linear_res = Linear(

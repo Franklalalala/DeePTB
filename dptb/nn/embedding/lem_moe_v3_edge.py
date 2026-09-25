@@ -67,13 +67,21 @@ class LemMoEV3Edge(LemMoEV3):
             # whose reference backend gathers one [out, in] weight per row -- the
             # very cost activation space exists to avoid, and the weight-space
             # guard does not sit on that path.
+            # post_activation_slot runs every top-k slot through the same
+            # activation-space route (SO2SlotPostActivationMixer), so it is allowed.
             mixing = kwargs.get("so2_expert_mixing_mode", "pre_activation")
-            if mixing != "pre_activation":
+            if mixing == "post_activation_slot" and self.edge_router_top1_mode == "switch":
+                raise ValueError(
+                    "so2_expert_mixing_mode='post_activation_slot' folds the shared expert into every "
+                    "slot, which needs top-k coefficients summing to one; the Switch top-1 route "
+                    "keeps its retained probability instead."
+                )
+            if mixing not in ("pre_activation", "post_activation_slot"):
                 raise ValueError(
                     "edge_router_prior_activate requires "
-                    "so2_expert_mixing_mode='pre_activation'; got %r, which "
-                    "dispatches through apply_experts and would materialise one "
-                    "weight per edge." % (mixing,)
+                    "so2_expert_mixing_mode='pre_activation' or 'post_activation_slot'; "
+                    "got %r, which dispatches through apply_experts and would "
+                    "materialise one weight per edge." % (mixing,)
                 )
             # Activation space needs every expert applied to activations, never a
             # weight mixed per route token.  'staged' and the grouped streaming
