@@ -181,6 +181,13 @@ def install_matrix_depth(model, mode="stack", maximum=6):
 
     def forward(batch):
         depth = int(model._matrix_depth_K)
+        quantile = getattr(model, "_matrix_depth_exit_quantile", None)
+        if quantile is not None:
+            bi = batch.get(A.BATCH_KEY)
+            if model.training or not 0 <= quantile <= 1 or (bi is not None and int(bi.max()) != 0):
+                raise ValueError("adaptive inference requires eval mode, one graph and quantile in [0,1]")
+        survival = 1.0
+        observed_masses = []
         if depth < 1 or (mode == "unshared" and depth > maximum):
             raise ValueError("depth outside constructed range")
         contexts = [{} for _ in embeddings]
@@ -193,14 +200,42 @@ def install_matrix_depth(model, mode="stack", maximum=6):
                 out = original(clone_data(batch))
                 preds.append((out[A.NODE_FEATURES_KEY], out[A.EDGE_FEATURES_KEY]))
                 logits.append(torch.stack([c["logit"] for c in contexts]).mean(0))
+                if quantile is not None:
+                    import math
+                    if not bool(torch.isfinite(logits[-1]).all()):
+                        raise RuntimeError("nonfinite exit logit")
+                    hazard = 1.0 if k == depth else float((logits[-1] - math.log(depth-k)).sigmoid())
+                    observed_masses.append(survival * hazard)
+                    survival *= 1-hazard
+                    if 1-survival >= quantile or k == depth:
+                        break
         finally:
             for _, emb in embeddings:
                 emb._depth_context = None
         out["_loop_preds"] = preds
         out["_stack_logits"] = torch.stack(logits, -1)
-        out["_exit_probabilities"] = exit_distribution(out["_stack_logits"])
+        if quantile is None:
+            out["_exit_probabilities"] = exit_distribution(out["_stack_logits"])
+        else:
+            out["_exit_step"] = len(preds)
+            out["_exit_cdf"] = 1-survival
+            out["_observed_exit_masses"] = observed_masses
+            out["_remaining_survival"] = survival
         out["_stack_counts"] = [(c["encoder_calls"], c["round_calls"]) for c in contexts]
         return out
 
     model.forward = forward
     return model
+
+
+def matrix_predict_until_exit(model, batch, max_steps=3, quantile=0.5):
+    """Single-graph deployment policy; no unexecuted round is computed."""
+    old_depth = model._matrix_depth_K
+    old_quantile = getattr(model, "_matrix_depth_exit_quantile", None)
+    model._matrix_depth_K = max_steps
+    model._matrix_depth_exit_quantile = quantile
+    try:
+        return model(batch)
+    finally:
+        model._matrix_depth_K = old_depth
+        model._matrix_depth_exit_quantile = old_quantile

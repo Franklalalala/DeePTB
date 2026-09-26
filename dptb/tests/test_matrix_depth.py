@@ -118,3 +118,19 @@ def test_full_spinor_blocks_roundtrip_and_reverse_conjugation():
     other={k:v for k,v in data.items() if k not in (A.NODE_FEATURES_KEY,A.EDGE_FEATURES_KEY)}
     block_to_feature(other,idp,blocks=explicit)
     torch.testing.assert_close(data[A.EDGE_FEATURES_KEY],other[A.EDGE_FEATURES_KEY])
+
+
+def test_shared_independent_initialization_and_actual_early_exit():
+    from dptb.nnops.loopscf.matrix_depth import matrix_predict_until_exit
+    base,data=tiny(True)
+    shared=install_matrix_depth(copy.deepcopy(base),'core',3)
+    independent=install_matrix_depth(copy.deepcopy(base),'unshared',3)
+    with torch.no_grad():
+        a=shared(clone_data(data));b=independent(clone_data(data))
+        for x,y in zip(a['_loop_preds'],b['_loop_preds']):
+            for u,v in zip(x,y):torch.testing.assert_close(u,v)
+        stopped=matrix_predict_until_exit(shared,clone_data(data),3,0.5)
+    assert stopped['_exit_step']==2
+    assert stopped['_stack_counts']==[(1,2)]
+    assert sum(stopped['_observed_exit_masses'])+stopped['_remaining_survival']==pytest.approx(1.)
+    assert shared._matrix_depth_K==3 and shared._matrix_depth_exit_quantile is None
