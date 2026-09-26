@@ -1891,6 +1891,10 @@ def slem():
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
         Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
+        Argument("structure_mole", dict, optional=True,
+                 doc="Opt-in structure MoLE: enabled, route_scope=structure|constant, prior_stats=true, "
+                     "execution=merged_core|reference, hidden=64, rbf_rmax=10, stats_path, init_from. "
+                     "Training-calibrated scales and fixed seed-0 projection persist in checkpoints."),
         Argument("mole_expert_parameterization", str, optional=True, default="full",
                  doc="Routed SO2 weights: full (legacy bank) or shared_core (P D_e Q^T, shared P/Q and expert cores). Shared affine weights remain separate. Changes checkpoint parameter layout; no automatic full-bank conversion."),
         Argument("mole_expert_rank", int, optional=True, default=64,

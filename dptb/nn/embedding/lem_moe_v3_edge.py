@@ -30,6 +30,11 @@ class LemMoEV3Edge(LemMoEV3):
     """LEM MoE v3 variant with per-active-edge routing coefficients."""
 
     def __init__(self, **kwargs: Any):
+        from dptb.nn.structure_mole import options, validate_embedding
+        self.structure_mole_options = options(kwargs.pop("structure_mole", None))
+        self.structure_mole_enabled = self.structure_mole_options["enabled"]
+        if self.structure_mole_enabled:
+            validate_embedding(self.structure_mole_options, kwargs)
         self.edge_router_top1_mode = kwargs.pop("edge_router_top1_mode", "legacy")
         if self.edge_router_top1_mode not in ("legacy", "switch"):
             raise ValueError("edge_router_top1_mode must be legacy or switch")
@@ -185,7 +190,7 @@ class LemMoEV3Edge(LemMoEV3):
         self._prior_chunks = []
         self._prior_source_dim = 0
         self.edge_router_prior_dim = 0
-        if self.edge_router_prior_activate:
+        if self.edge_router_prior_activate or self.structure_mole_enabled:
             prior_irreps, sort_index = _sorted_irrep_coordinate_index(self.idp)
             self.register_buffer("_prior_sort_index", sort_index, persistent=False)
             offset = 0
@@ -232,6 +237,20 @@ class LemMoEV3Edge(LemMoEV3):
             # silently restoring whatever the checkpoint was written with.
             self.register_buffer("_prior_mean", mean, persistent=False)
             self.register_buffer("_prior_std", std, persistent=False)
+
+        if self.structure_mole_enabled:
+            from dptb.nn.structure_mole import StructureStats
+            cfg = self.structure_mole_options
+            # Replace the legacy router; constant scope has no router parameters.
+            self.router = None
+            self.structure_stats = None
+            if cfg["route_scope"] == "structure":
+                self.structure_stats = StructureStats(len(self.idp.chemical_symbol_to_type),
+                    self.edge_router_prior_dim, cfg["rbf_rmax"]).to(device=self.device, dtype=self.dtype)
+                self.router = torch.nn.Sequential(
+                    torch.nn.Linear(self.structure_stats.width, cfg["hidden"]), torch.nn.SiLU(),
+                    torch.nn.Linear(cfg["hidden"], 4)).to(device=self.device, dtype=self.dtype)
+            return
 
         router_type, router_kwargs = MOLERouterV3, dict(mixing_temperature=self.edge_router_temperature,
                                                          **self.edge_router_options)
@@ -332,11 +351,15 @@ class LemMoEV3Edge(LemMoEV3):
 
         active_edge_one_hot = edge_one_hot[active_edges]
         active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
-        router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
-        mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
-            router_input,
-            active_bond_type, data=data, active_edges=active_edges,
-        )
+        if self.structure_mole_enabled:
+            from dptb.nn.structure_mole import make_route
+            mole_globals, monitor_val, expert_load_cv, num_route_tokens = make_route(self, data, active_edges)
+        else:
+            router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
+            mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
+                router_input,
+                active_bond_type, data=data, active_edges=active_edges,
+            )
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
         write_router_regularizers(self.router, data)

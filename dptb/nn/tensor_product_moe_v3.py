@@ -1658,6 +1658,9 @@ class MOLELinear(nn.Module):
                 raise ValueError("A shared-only MOLELinear cannot execute a routed branch")
             bias = self.bias_shared.sum(0) if self.bias_shared is not None else None
             return F.linear(x, self.weight_shared.sum(0), bias)
+        if getattr(mole_globals, "structure_execution", None) in ("merged_core", "constant"):
+            from .structure_mole import merged_linear
+            return merged_linear(self, x, mole_globals)
         if getattr(mole_globals, "top1_independent", False):
             from .top1_prior import linear
             return linear(self, x, mole_globals)
@@ -2237,6 +2240,10 @@ class SO2_Linear(torch.nn.Module):
                 topk_values=x.new_zeros((n, 1)),
                 activation_space=True, coefficients_sum_to_one=False, branch="shared",
             )
+        # Explicit structure route: compact Wigner operations plus grouped
+        # low-rank cores. Bypass kernels that materialize full expert banks.
+        if getattr(mole_globals, "structure_execution", None) in ("merged_core", "constant"):
+            return self._forward_streamed_m_major_ref(x, R, mole_globals, latents, wigner_D_all)
         mode = self.so2_fusion_mode
         if mode == "staged":
             return self._forward_staged(x, R, mole_globals, latents, wigner_D_all)

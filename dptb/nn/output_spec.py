@@ -145,6 +145,10 @@ STRUCTURAL_FIELDS = frozenset(
         "expert_node_mask",
         "mean_max_prob",
         "expert_load_cv",
+        "structure_mole_alpha_mean",
+        "structure_mole_alpha_std",
+        "structure_mole_covariance_effective_rank",
+        "structure_mole_n_eff",
         # PyG collation internals
         "__slices__",
         "__cumsum__",

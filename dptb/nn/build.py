@@ -650,6 +650,11 @@ def build_model(
                 else:
                     model = None
 
+    structure_options = (model_options.get("embedding") or {}).get("structure_mole") or {}
+    if from_scratch and structure_options.get("enabled", False):
+        from dptb.nn.structure_mole import initialize_fresh
+        initialize_fresh(model, structure_options)
+
     shift_options = model_options.get("shift_head") or {}
     if from_scratch and shift_options.get("mode", "off") != "off" and shift_options.get("init_from"):
         from dptb.nn.shift_head import load_dense_backbone
