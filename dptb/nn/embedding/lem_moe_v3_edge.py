@@ -39,6 +39,7 @@ class LemMoEV3Edge(LemMoEV3):
         self.edge_moe_compact_min_edges = int(kwargs.pop("edge_moe_compact_min_edges", 16384))
         self.edge_router_prior_activate = bool(kwargs.pop("edge_router_prior_activate", False))
         self.edge_router_prior_stats = str(kwargs.pop("edge_router_prior_stats", "") or "")
+        self.edge_router_prior_cg = bool(kwargs.pop("edge_router_prior_cg", False))
         self.edge_router_temperature = float(kwargs.pop("edge_router_temperature", 1.0))
         if self.edge_router_top1_mode == "switch" and self.edge_router_temperature != 1.0:
             raise ValueError("edge_router_temperature applies to the top-k gate; the Switch top-1 router has none")
@@ -188,6 +189,15 @@ class LemMoEV3Edge(LemMoEV3):
         if self.edge_router_prior_activate:
             prior_irreps, sort_index = _sorted_irrep_coordinate_index(self.idp)
             self.register_buffer("_prior_sort_index", sort_index, persistent=False)
+            if self.edge_router_prior_cg:
+                from .lem_moe_v3_h0_helpers import _build_uureal_cg_change_of_basis
+                # Independent of legacy h0_ao_cg: this flag fixes routing only.
+                # No parameters, RNG draws or state_dict keys are added.
+                self.register_buffer(
+                    "_prior_cg_change_of_basis",
+                    _build_uureal_cg_change_of_basis(self.idp, dtype=self.dtype, device=self.device),
+                    persistent=False,
+                )
             offset = 0
             desc_dim = 0
             for mul, ir in prior_irreps:
@@ -426,7 +436,7 @@ class LemMoEV3Edge(LemMoEV3):
         bond_type: torch.Tensor,
         active_edges: torch.Tensor,
     ) -> torch.Tensor:
-        """The frozen edge prior, masked and permuted into sorted-irrep order.
+        """The frozen prior, masked, optionally CG-coupled, then sorted.
 
         Read straight from the data dict, with no fallback: H0InitLayer's
         fallback chain can reach the target Hamiltonian, and routing on the
@@ -444,6 +454,12 @@ class LemMoEV3Edge(LemMoEV3):
         source = data[key].to(dtype=self.dtype)
         mask = self.idp.mask_to_erme.to(source.device)[bond_type.flatten()]
         source = source * mask.to(dtype=source.dtype)
+        if self.edge_router_prior_cg:
+            from .lem_moe_v3_h0_helpers import _h0_is_coupled_rme
+            if not _h0_is_coupled_rme(data):
+                source = torch.einsum(
+                    "kc,nc->nk", self._prior_cg_change_of_basis.to(source), source
+                )
         source = source.index_select(1, self._prior_sort_index.to(source.device))
         return source.index_select(0, active_edges)
 

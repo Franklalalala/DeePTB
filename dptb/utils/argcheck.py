@@ -2061,6 +2061,8 @@ def _edge_router_arguments():
         Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
         Argument("edge_router_prior_activate", bool, optional=True, default=False, doc=doc_edge_router_prior_activate),
         Argument("edge_router_prior_stats", str, optional=True, default="", doc=doc_edge_router_prior_stats),
+        Argument("edge_router_prior_cg", bool, optional=True, default=False,
+                 doc="Convert AO-product priors to coupled RME before the legacy edge-router Gram descriptor; respect _h0_coupled_rme. Default false preserves checkpoint behavior. Recalibrate prior stats and retrain when enabled."),
         Argument("edge_router_top1_mode", str, optional=True, default="legacy", doc="Top-1 prior routing: legacy or switch (global softmax, argmax, retained probability, no shared experts)."),
         Argument("edge_router_route_drop_p", (int, float), optional=True, default=0.0,
                  extra_check=lambda v: not isinstance(v, bool) and 0.0 <= v <= 1.0,
