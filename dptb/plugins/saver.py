@@ -1065,6 +1065,12 @@ class Saver(Plugin, StatefulPlugin):
             "epoch": self.trainer.ep,
             "stats": self.trainer.stats,
         }
+        model = self.trainer.model
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model = model.module
+        moe_init_metadata = getattr(model, "moe_init_metadata", None)
+        if moe_init_metadata is not None:
+            obj["moe_init"] = copy.deepcopy(moe_init_metadata)
         training_state = self._build_training_state_blob(kind)
         obj["training_state"] = training_state
         # Single source of truth: the flat legacy key mirrors training_state's

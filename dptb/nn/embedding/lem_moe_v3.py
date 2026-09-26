@@ -31,7 +31,8 @@ from .lem_moe_v3_plugins import (
 )
 # Note: Modified SO2_Linear and MOLE classes imported here
 from dptb.nn.tensor_product_moe_v3 import (SO2_Linear, MOLEGlobals, MOLERouterV3, SO2PostActivationExpertMixer,
-                                           SO2SlotPostActivationMixer, write_router_regularizers)
+                                           SO2SlotPostActivationMixer, SO2SharedPostActivationMixer,
+                                           write_router_regularizers)
 import math
 from dptb.data.transforms import OrbitalMapper
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
@@ -101,10 +102,23 @@ def _normalize_stable_standard_compat_mode(name: str, mode: Optional[str]) -> st
 
 def _normalize_so2_expert_mixing_mode(mode: Optional[str]) -> str:
     mode = mode or "pre_activation"
-    allowed = {"pre_activation", "post_activation", "post_activation_slot"}
+    allowed = {"pre_activation", "post_activation", "post_activation_slot", "post_activation_shared"}
     if mode not in allowed:
         raise ValueError(f"so2_expert_mixing_mode must be one of {sorted(allowed)}, got {mode!r}.")
     return mode
+
+
+def _normalize_so2_moe_layers(layers, n_layers: int) -> Tuple[int, ...]:
+    """Layer indices whose SO2 updates own routed experts; all is legacy behavior."""
+    if layers is None or layers == "all":
+        return tuple(range(n_layers))
+    if not isinstance(layers, (list, tuple)) or not layers:
+        raise ValueError("so2_moe_layers must be 'all' or a nonempty list of layer indices")
+    if any(type(i) is not int or not 0 <= i < n_layers for i in layers):
+        raise ValueError("so2_moe_layers indices must be integers in [0, n_layers)")
+    if len(set(layers)) != len(layers):
+        raise ValueError("so2_moe_layers must not repeat a layer index")
+    return tuple(sorted(layers))
 
 
 def _normalize_cg_head_impl(mode: Optional[str]) -> str:
@@ -1045,7 +1059,10 @@ class LemMoEV3(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            mole_expert_parameterization: str = "full",
+            mole_expert_rank: int = 64,
             so2_expert_mixing_mode: str = "pre_activation",
+            so2_moe_layers: Union[str, List[int]] = "all",
             so2_expert_route_chunk_size: Optional[int] = None,
             so2_expert_route_checkpoint: bool = False,
             so2_output_router_hidden_dim: int = 32,
@@ -1156,10 +1173,17 @@ class LemMoEV3(torch.nn.Module):
         self.ao_projector_bank_path = ao_projector_bank_path
         self.cg_head_impl = _normalize_cg_head_impl(cg_head_impl)
         self.so2_expert_mixing_mode = _normalize_so2_expert_mixing_mode(so2_expert_mixing_mode)
-        if self.so2_expert_mixing_mode == "post_activation_slot" and not getattr(self, "edge_router_prior_activate", False):
-            # the slot mixer needs per-row top-k metadata with coefficients summing to one (prior_activate)
-            raise ValueError("so2_expert_mixing_mode='post_activation_slot' needs per-edge routing "
-                             "(lem_moe_v3_edge* with edge_router_prior_activate=true).")
+        self.so2_moe_layers = _normalize_so2_moe_layers(so2_moe_layers, n_layers)
+        if len(self.so2_moe_layers) != n_layers:
+            if not getattr(self, "edge_router_prior_activate", False):
+                raise ValueError("Selective so2_moe_layers requires per-edge prior-activate routing")
+            if num_shared_experts < 1:
+                raise ValueError("Selective so2_moe_layers requires at least one shared expert")
+        if (self.so2_expert_mixing_mode in ("post_activation_slot", "post_activation_shared")
+                and not getattr(self, "edge_router_prior_activate", False)):
+            # the slot mixers need per-row top-k metadata (prior_activate)
+            raise ValueError("so2_expert_mixing_mode=%r needs per-edge routing "
+                             "(lem_moe_v3_edge* with edge_router_prior_activate=true)." % (self.so2_expert_mixing_mode,))
         self.node_message_aggregation = _normalize_node_message_aggregation(node_message_aggregation)
         self.num_focus = int(num_focus)
         self.edge_aggregation_gated_attention = bool(edge_aggregation_gated_attention)
@@ -1320,6 +1344,7 @@ class LemMoEV3(torch.nn.Module):
                 node_activation_type = hidden_node_activation_type
 
             use_node_ffn = ffn_hidden_factor > 1.0 and ((i < n_layers - 1) or ffn_apply_to_last)
+            routed_layer = i in self.so2_moe_layers
 
             self.layers.append(self._layer_type()(
                 num_types=self.n_atom,
@@ -1345,7 +1370,9 @@ class LemMoEV3(torch.nn.Module):
                 so2_wigner_apply_mode=so2_wigner_apply_mode,
                 so2_fusion_mode=so2_fusion_mode,
                 mole_linear_mode=mole_linear_mode,
-                so2_expert_mixing_mode=self.so2_expert_mixing_mode,
+                mole_expert_parameterization=mole_expert_parameterization if routed_layer else "full",
+                mole_expert_rank=mole_expert_rank,
+                so2_expert_mixing_mode=self.so2_expert_mixing_mode if routed_layer else "pre_activation",
                 so2_expert_route_chunk_size=so2_expert_route_chunk_size,
                 so2_expert_route_checkpoint=so2_expert_route_checkpoint,
                 so2_output_router_hidden_dim=so2_output_router_hidden_dim,
@@ -1364,7 +1391,7 @@ class LemMoEV3(torch.nn.Module):
                 dtype=dtype,
                 device=device,
                 use_interpolation_tp=use_interpolation_tp,
-                num_experts=num_experts,
+                num_experts=num_experts if routed_layer else 0,
                 num_shared_experts=num_shared_experts,  # Pass down to Layer -> SO2_Linear
             ))
 
@@ -1773,6 +1800,10 @@ class LemMoEV3(torch.nn.Module):
             data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)
             return data
 
+        if getattr(self, "capture_shift_features", False):
+            data["_shift_node_features"] = node_features
+            data["_shift_active_edges"] = active_edges
+
         out_node_features, out_edge_features = self._apply_rme_output_heads(
             node_features, edge_features, node_one_hot, edge_one_hot
         )
@@ -2107,6 +2138,8 @@ class UpdateNode(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            mole_expert_parameterization: str = "full",
+            mole_expert_rank: int = 64,
             so2_expert_mixing_mode: str = "pre_activation",
             so2_expert_route_chunk_size: Optional[int] = None,
             so2_expert_route_checkpoint: bool = False,
@@ -2212,6 +2245,8 @@ class UpdateNode(torch.nn.Module):
             wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            mole_expert_parameterization=mole_expert_parameterization,
+            mole_expert_rank=mole_expert_rank,
         )
 
         self.lin_post = Linear(
@@ -2240,6 +2275,14 @@ class UpdateNode(torch.nn.Module):
                     "so2_expert_route_checkpoint nor so2_expert_route_chunk_size; unset them."
                 )
             self.post_activation_expert_mixer = SO2SlotPostActivationMixer(self.tp, self.activation)
+        elif self.so2_expert_mixing_mode == "post_activation_shared":
+            # separate shared branch + per-slot routed experts, each activated (DPA3-MoE eq. 4)
+            if so2_expert_route_checkpoint or so2_expert_route_chunk_size:
+                raise ValueError(
+                    "so2_expert_mixing_mode='post_activation_shared' implements neither "
+                    "so2_expert_route_checkpoint nor so2_expert_route_chunk_size; unset them."
+                )
+            self.post_activation_expert_mixer = SO2SharedPostActivationMixer(self.tp, self.activation)
 
         self.focus_gate = PostActivation0eFocusGate(
             self.irreps_out,
@@ -2454,6 +2497,8 @@ class UpdateEdge(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            mole_expert_parameterization: str = "full",
+            mole_expert_rank: int = 64,
             so2_expert_mixing_mode: str = "pre_activation",
             so2_expert_route_chunk_size: Optional[int] = None,
             so2_expert_route_checkpoint: bool = False,
@@ -2534,6 +2579,8 @@ class UpdateEdge(torch.nn.Module):
             wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            mole_expert_parameterization=mole_expert_parameterization,
+            mole_expert_rank=mole_expert_rank,
         )
 
         self.latents_mlp_1 = ScalarMLPFunction(
@@ -2578,6 +2625,14 @@ class UpdateEdge(torch.nn.Module):
                     "so2_expert_route_checkpoint nor so2_expert_route_chunk_size; unset them."
                 )
             self.post_activation_expert_mixer = SO2SlotPostActivationMixer(self.tp, self.activation)
+        elif self.so2_expert_mixing_mode == "post_activation_shared":
+            # separate shared branch + per-slot routed experts, each activated (DPA3-MoE eq. 4)
+            if so2_expert_route_checkpoint or so2_expert_route_chunk_size:
+                raise ValueError(
+                    "so2_expert_mixing_mode='post_activation_shared' implements neither "
+                    "so2_expert_route_checkpoint nor so2_expert_route_chunk_size; unset them."
+                )
+            self.post_activation_expert_mixer = SO2SharedPostActivationMixer(self.tp, self.activation)
 
         if res_update:
             self.linear_res = Linear(
@@ -2754,6 +2809,8 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode: str = "compact_blocks",
             so2_fusion_mode: str = "streamed_m_major_cueq",
             mole_linear_mode: Optional[str] = "cueq_indexed_linear",
+            mole_expert_parameterization: str = "full",
+            mole_expert_rank: int = 64,
             so2_expert_mixing_mode: str = "pre_activation",
             so2_expert_route_chunk_size: Optional[int] = None,
             so2_expert_route_checkpoint: bool = False,
@@ -2812,6 +2869,8 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            mole_expert_parameterization=mole_expert_parameterization,
+            mole_expert_rank=mole_expert_rank,
             so2_expert_mixing_mode=so2_expert_mixing_mode,
             so2_expert_route_chunk_size=so2_expert_route_chunk_size,
             so2_expert_route_checkpoint=so2_expert_route_checkpoint,
@@ -2844,6 +2903,8 @@ class Layer(torch.nn.Module):
             so2_wigner_apply_mode=so2_wigner_apply_mode,
             so2_fusion_mode=so2_fusion_mode,
             mole_linear_mode=mole_linear_mode,
+            mole_expert_parameterization=mole_expert_parameterization,
+            mole_expert_rank=mole_expert_rank,
             so2_expert_mixing_mode=so2_expert_mixing_mode,
             so2_expert_route_chunk_size=so2_expert_route_chunk_size,
             so2_expert_route_checkpoint=so2_expert_route_checkpoint,

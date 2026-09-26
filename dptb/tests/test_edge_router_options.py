@@ -258,7 +258,8 @@ def test_router_options_reach_the_router_and_the_model_config():
     cfg = model.embedding.router.router_config()
     assert cfg == dict(logit_kind="cosine", logit_scale=8.0, select="logit", bias_at_eval=True,
                        bias_schedule="follow_lr", bias_update_speed=0.001, select_noise=0.5,
-                       mixing_temperature=1.0, bias_freeze_after_step=0)
+                       mixing_temperature=1.0, bias_freeze_after_step=0, gate="renorm", type_support=0,
+                       type_support_seed=0)
     out = model(_data(model))
     (out["node_features"].square().mean() + out["edge_features"].square().mean()).backward()
     assert model.embedding.router.net[0].weight.grad.abs().sum() > 0
@@ -377,3 +378,84 @@ def test_new_optimizer_and_router_defaults_do_not_look_like_geometry_losses():
     assert not MultiTrainer._contains_geometry_gradient_option({"optimizer": opt_defaults})
     for a in list(hm_args()) + list(_edge_router_arguments()):
         assert not any(term in a.name.lower() for term in ("force", "stress", "virial")) or a.name == "muon_force_name_patterns", a.name
+
+
+# ---------------------------------------------------------------- per-bond-type candidate sets (0926)
+
+def test_type_support_selects_inside_the_hashed_set_and_is_deterministic():
+    torch.manual_seed(1)
+    r = MOLERouterV3(40, num_experts=24, top_k=2, logit_kind="cosine", select="logit", bias_at_eval=True,
+                     type_support=4)
+    x = _x(n=512, d=40, seed=5)
+    bt = torch.randint(0, 300, (512,), generator=torch.Generator().manual_seed(7))
+    allowed = r.type_support_mask(bt)
+    assert allowed.sum(1).eq(4).all()
+    same = bt.unsqueeze(1) == bt.unsqueeze(0)                 # rows of one bond type share one set
+    a = allowed.float()
+    assert torch.equal((a @ a.t() == 4)[same], torch.ones(int(same.sum()), dtype=torch.bool))
+    for mode in ("train", "eval"):
+        r.train(mode == "train")
+        coeffs, _, _ = r(x, bond_type=bt)
+        idx, val = r.last_topk()
+        assert allowed.gather(1, idx).all()
+        assert torch.allclose(val.sum(1), torch.ones(512))
+        assert (coeffs[~allowed] == 0).all()
+    assert torch.equal(r.type_support_mask(bt), allowed)
+    # spread: every expert serves roughly 4/24 of the types
+    use = r.type_support_mask(torch.arange(4624)).float().sum(0)
+    assert use.min() > 0.5 * 4624 * 4 / 24 and use.max() < 1.5 * 4624 * 4 / 24
+
+
+def test_type_support_full_softmax_mass_stays_in_the_set():
+    torch.manual_seed(2)
+    r = MOLERouterV3(40, num_experts=24, top_k=2, logit_kind="cosine", select="logit", type_support=6,
+                     gate="full_softmax")
+    x = _x(n=256, d=40, seed=9)
+    bt = torch.randint(0, 50, (256,))
+    r.eval()
+    r(x, bond_type=bt)
+    idx, val = r.last_topk()
+    allowed = r.type_support_mask(bt)
+    z = r._logits(x).masked_fill(~allowed, float("-inf"))
+    want = torch.softmax(z, dim=-1).gather(1, idx)
+    assert torch.allclose(val, want) and (val.sum(1) < 1).all()
+
+
+def test_type_support_zero_is_the_old_router():
+    torch.manual_seed(3)
+    a = MOLERouterV3(40, num_experts=8, top_k=2)
+    torch.manual_seed(3)
+    b = MOLERouterV3(40, num_experts=8, top_k=2, type_support=0)
+    x = _x()
+    ca, _, _ = a(x)
+    cb, _, _ = b(x, bond_type=torch.zeros(64, dtype=torch.long))
+    assert torch.equal(ca, cb)
+
+
+def test_type_support_rejects_bad_values():
+    for bad in (-1, 1, 25):
+        with pytest.raises(ValueError, match="type_support"):
+            MOLERouterV3(40, num_experts=24, top_k=2, type_support=bad)
+    r = MOLERouterV3(40, num_experts=24, top_k=2, type_support=4)
+    with pytest.raises(ValueError, match="bond type"):
+        r(_x())
+
+
+def test_type_support_reaches_the_model_and_routes_inside_the_sets():
+    model = _build(False, **dict(PA, edge_router_logit="cosine", edge_router_select="logit",
+                                 edge_router_bias_at_eval=True, edge_router_type_support=4))
+    router = model.embedding.router
+    assert router.router_config()["type_support"] == 4
+    data = _data(model)
+    out = model(data)
+    idx, _ = router.last_topk()
+    assert idx is not None and idx.shape[1] == 2
+    assert router._last_allowed is not None and router._last_allowed.gather(1, idx).all()
+    (out["node_features"].square().mean() + out["edge_features"].square().mean()).backward()
+    assert router.net[0].weight.grad.abs().sum() > 0
+
+
+def test_type_support_needs_per_edge_routing():
+    with pytest.raises(ValueError, match="type_support"):
+        _build(False, **dict(PA, method="lem_moe_v3_edge_prior_2b", edge_router_prior_activate=False,
+                             edge_router_type_support=4))

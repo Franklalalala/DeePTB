@@ -556,7 +556,7 @@ class E3Hamiltonian(torch.nn.Module):
                     if verbose:
                         self._tensor_stats(f"[NODE]{opairtype}.rme(raw)", rme)
 
-                    rme2 = rme.reshape(n_node, -1, n_rme).transpose(1, 2)  # (n_node, n_rme, n_chunk)
+                    rme2 = rme.unflatten(1, (-1, n_rme)).transpose(1, 2)  # (n_node, n_rme, n_chunk)
                     if verbose:
                         self._dbg(f"[DBG][NODE]{opairtype}: rme reshape -> {tuple(rme2.shape)} (n_node, n_rme, n_chunk)")
 
@@ -570,7 +570,7 @@ class E3Hamiltonian(torch.nn.Module):
                         if verbose:
                             self._tensor_stats(f"[NODE]{opairtype}.HR(after_spinproj)", HR)
 
-                    flat = HR.reshape(n_node, -1)
+                    flat = HR.flatten(1)
                     if verbose:
                         self._dbg(f"[DBG][NODE]{opairtype}: flat shape={tuple(flat.shape)}")
                         slen = self._slice_len(sli, total_dim=data[self.node_field].shape[1])

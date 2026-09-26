@@ -335,6 +335,7 @@ class MOLEGlobals:
             topk_values=None,
             activation_space=False,
             coefficients_sum_to_one=False,
+            branch="all",
     ):
         # Activation-space dispatch: mix experts as sum_e c_e (x W_e) rather than
         # materialising one [out, in] weight per route token.  Set by the caller
@@ -344,6 +345,16 @@ class MOLEGlobals:
         # gathered top-k logits).  It licenses folding the shared expert into the
         # routed weights, which is exact only when the coefficients sum to 1.
         self.coefficients_sum_to_one = bool(coefficients_sum_to_one)
+        # Which part of every MoLE layer this pass computes (activation-space routing only):
+        # "all" = routed experts + shared expert (+ the non-MoLE blocks of an SO2 layer);
+        # "routed" = the routed experts only (no shared expert, no non-MoLE block);
+        # "shared" = the shared expert and the non-MoLE blocks only (routed coefficients unused).
+        # SO2SharedPostActivationMixer activates the shared branch and every routed slot separately.
+        if branch not in ("all", "routed", "shared"):
+            raise ValueError("MOLEGlobals.branch must be all, routed or shared; got %r" % (branch,))
+        if branch != "all" and not self.activation_space:
+            raise ValueError("MOLEGlobals.branch=%r needs activation-space (per-row) routing" % (branch,))
+        self.branch = branch
         # Keyed on the slot index explicitly: the other caches on this object are
         # content-blind and would alias slot 1 onto slot 0's permutation.
         self._expert_slot_layout_cache = {}
@@ -738,11 +749,21 @@ class MOLERouterV3(nn.Module):
     - ``mixing_temperature`` (0924-stable): ``g = softmax(z_selected / T)``; changes mixing hardness only.
     - ``bias_freeze_after_step``: no bias updates from this committed optimizer step on (0 = never); the frozen bias
       keeps acting in the selection.
+    - ``gate``: ``"renorm"`` (default) mixes the selected experts with a softmax over their own logits (sums to one);
+      ``"full_softmax"`` takes the softmax over every routed expert and keeps the selected entries without
+      renormalising (DPA3-MoE, Liu et al., npj Artif. Intell. 2026, eqs. 5-6), so the routed branch carries the
+      router's probability mass (< 1) next to the shared expert.  ``coefficients_sum_to_one`` tells the caller which.
+    - ``type_support`` (> 0, per-edge routing only): every bond type may only use a fixed set of ``type_support``
+      experts, drawn by a deterministic hash of (bond type, expert, ``type_support_seed``); the router then selects
+      its top-k inside that set (the mask acts on the selection scores and, for ``full_softmax``, on the softmax).
+      Chemistry fixes the candidate experts, the router input (the prior descriptor) chooses among them, so no test
+      edge can land in a (bond type, expert) cell the expert never trained on.  ``forward`` then needs ``bond_type``.
     """
 
     _LOGIT_KINDS = ("raw", "cosine")
     _SELECTS = ("sigmoid", "logit")
     _BIAS_SCHEDULES = ("const", "follow_lr", "freeze_decay")
+    _GATES = ("renorm", "full_softmax")
 
     def __init__(self, in_features, num_experts=48, top_k=6,
                  aux_loss_free=True,
@@ -755,7 +776,10 @@ class MOLERouterV3(nn.Module):
                  bias_at_eval: bool = False,
                  bias_schedule: str = "const",
                  select_noise: float = 0.0,
-                 bias_freeze_after_step: int = 0):  # 修改1: 固定 Bias 更新速度，不再衰减
+                 bias_freeze_after_step: int = 0,
+                 gate: str = "renorm",
+                 type_support: int = 0,
+                 type_support_seed: int = 0):  # 修改1: 固定 Bias 更新速度，不再衰减
         super().__init__()
         if logit_kind not in self._LOGIT_KINDS:
             raise ValueError(f"logit_kind must be one of {self._LOGIT_KINDS}; got {logit_kind!r}")
@@ -769,6 +793,12 @@ class MOLERouterV3(nn.Module):
             raise ValueError(f"select_noise must be >= 0; got {select_noise!r}")
         if int(bias_freeze_after_step) < 0:
             raise ValueError(f"bias_freeze_after_step must be >= 0; got {bias_freeze_after_step!r}")
+        if gate not in self._GATES:
+            raise ValueError(f"gate must be one of {self._GATES}; got {gate!r}")
+        type_support = int(type_support)
+        if type_support < 0 or (type_support > 0 and (top_k is None or not int(top_k) <= type_support <= num_experts)):
+            raise ValueError(f"type_support must be 0 or between top_k and num_experts; got {type_support!r} "
+                             f"(top_k={top_k!r}, num_experts={num_experts!r})")
         self.top_k = top_k
         self.num_experts = num_experts
         self.aux_loss_free = aux_loss_free
@@ -786,6 +816,10 @@ class MOLERouterV3(nn.Module):
         self.bias_schedule = bias_schedule
         self.select_noise = float(select_noise)
         self.bias_freeze_after_step = int(bias_freeze_after_step)
+        self.gate = gate
+        self.type_support = type_support
+        self.type_support_seed = int(type_support_seed)
+        self._last_allowed = None   # [N, E] candidate mask of the last forward (type_support > 0), for checks
         # current_lr / peak_lr and the committed optimizer-step count, published by the optimizer after every step
         # (moe_registry); opt_step stays 0 with optimizers that do not publish
         self.bias_lr_scale = 1.0
@@ -819,7 +853,27 @@ class MOLERouterV3(nn.Module):
         return dict(logit_kind=self.logit_kind, logit_scale=self.logit_scale, select=self.select,
                     bias_at_eval=self.bias_at_eval, bias_schedule=self.bias_schedule,
                     bias_update_speed=float(self.bias_update_speed), select_noise=self.select_noise,
-                    mixing_temperature=self.mixing_temperature, bias_freeze_after_step=self.bias_freeze_after_step)
+                    mixing_temperature=self.mixing_temperature, bias_freeze_after_step=self.bias_freeze_after_step,
+                    gate=self.gate, type_support=self.type_support, type_support_seed=self.type_support_seed)
+
+    @property
+    def coefficients_sum_to_one(self) -> bool:
+        """True when the top-k coefficients sum to one (licenses folding the shared expert into every slot)."""
+        return self.gate == "renorm" or self.top_k is None or self.top_k >= self.num_experts
+
+    def type_support_mask(self, bond_type: torch.Tensor) -> torch.Tensor:
+        """[N] bond-type indices -> [N, E] bool, True on the ``type_support`` experts a bond type may use.  A fixed
+        integer hash of (type, expert, seed) ranks the experts of every type and the top ``type_support`` form its
+        set, so the set is a pure function of the type (same in every batch, step, process and checkpoint)."""
+        m = 2147483647
+        e = torch.arange(self.num_experts, device=bond_type.device, dtype=torch.int64).unsqueeze(0)
+        tt = bond_type.reshape(-1, 1).to(torch.int64)
+        h = (tt * 1000003 + e * 7919 + (self.type_support_seed + 1) * 104729) % m
+        h = (h * 48271) % m
+        h = ((h ^ (h >> 13)) * 69621) % m
+        h = (h * 48271 + e) % m
+        idx = torch.topk(h.to(torch.float64), k=self.type_support, dim=1).indices
+        return torch.zeros(h.shape, dtype=torch.bool, device=bond_type.device).scatter_(1, idx, True)
 
     def _logits(self, global_features):
         if self.logit_kind == "cosine":
@@ -839,19 +893,42 @@ class MOLERouterV3(nn.Module):
             return speed if float(self.bias_lr_scale) >= 0.999 else 0.0
         return speed
 
-    def forward(self, global_features, sizes=None):
+    def forward(self, global_features, sizes=None, bond_type=None, regularizer_weights=None):
         # 修改1: 删除了 Jitter (探索噪声) 的注入逻辑，完全依赖网络的自然 Logits
         logits = self._logits(global_features)
+        allowed = None
+        if self.type_support > 0:
+            if bond_type is None or bond_type.numel() != logits.shape[0]:
+                raise ValueError("type_support needs one bond type per routed row")
+            allowed = self.type_support_mask(bond_type)
+        self._last_allowed = allowed
         scores = torch.sigmoid(logits)
-        self.last_router_z_loss = router_z_loss(logits, sizes)
+        # A dropped structure contributes neither task nor z-loss gradients.
+        # Keep selection/load balancing on the original routes (no budget gate).
+        self.last_router_z_loss = router_z_loss(
+            logits, sizes if regularizer_weights is None else regularizer_weights)
 
-        if self.full_expert_fast_path and (self.top_k is None or self.top_k >= self.num_experts):
-            # All experts selected: the same logit-space softmax as the top-k gate below.
+        if self.top_k is None or self.top_k >= self.num_experts:
+            # Full soft mixture: canonical slots keep activation-space dispatch
+            # available regardless of the legacy fast-path flag. Selection bias
+            # and noise have no role when every expert participates.
             probs = torch.softmax(self._tempered(logits), dim=-1)
-            monitor_val = probs.max(dim=-1)[0].mean().detach()
-            self._last_topk_indices = None
-            self._last_topk_values = None
-            return probs, monitor_val, torch.zeros((), dtype=scores.dtype, device=scores.device)
+            indices = torch.arange(self.num_experts, device=logits.device).expand(logits.shape[0], -1)
+            self._last_topk_indices = indices
+            self._last_topk_values = probs  # keep the router gradient
+            monitor_val = probs.max(dim=-1)[0].mean().detach() if logits.shape[0] else probs.new_zeros(())
+            legacy_load = not self.full_expert_fast_path and self.top_k is not None
+            if self.training and (self.record_train_stats or legacy_load):
+                with torch.no_grad():
+                    total = logits.shape[0] if sizes is None else sizes.sum()
+                    hard_load = probs.new_ones(self.num_experts) * total
+                    # Retain the optional slow router's historical load buffer,
+                    # but never update selection bias for an all-expert route.
+                    if legacy_load:
+                        self.ema_load.mul_(0.9).add_(hard_load, alpha=0.1)
+                    if self.record_train_stats:
+                        self._record_train_stats(logits, indices, probs, hard_load, self.expert_bias.detach().clone())
+            return probs, monitor_val, probs.new_zeros(())
 
         # 加上 Bias 用于选择 Top-K (Aux-loss-free 核心机制)
         selection_base = logits if self.select == "logit" else scores
@@ -861,6 +938,8 @@ class MOLERouterV3(nn.Module):
             scores_for_selection = selection_base
         if self.training and self.select_noise > 0.0:
             scores_for_selection = scores_for_selection + self.select_noise * torch.randn_like(scores_for_selection)
+        if allowed is not None:
+            scores_for_selection = scores_for_selection.masked_fill(~allowed, float("-inf"))
 
         if self.top_k is not None:
             topk_scores_biased, topk_indices = torch.topk(scores_for_selection, k=self.top_k, dim=-1)
@@ -901,8 +980,15 @@ class MOLERouterV3(nn.Module):
             # softmax over the gathered logits is scale-free, needs no epsilon,
             # sums to 1 by construction and keeps a usable gradient. Selection and
             # the load statistics above deliberately still use `scores`.
-            topk_logits = torch.gather(logits, 1, topk_indices)
-            topk_probs = torch.softmax(self._tempered(topk_logits), dim=-1)
+            if self.gate == "full_softmax":
+                # softmax over every routed expert, the selected entries kept as they are (sum < 1)
+                gl = self._tempered(logits)
+                if allowed is not None:   # the router's probability mass is spread over the type's experts only
+                    gl = gl.masked_fill(~allowed, float("-inf"))
+                topk_probs = torch.gather(torch.softmax(gl, dim=-1), 1, topk_indices)
+            else:
+                topk_logits = torch.gather(logits, 1, topk_indices)
+                topk_probs = torch.softmax(self._tempered(topk_logits), dim=-1)
             self._last_topk_indices = topk_indices
             self._last_topk_values = topk_probs
             if self.training and self.record_train_stats:
@@ -916,14 +1002,6 @@ class MOLERouterV3(nn.Module):
             monitor_val = topk_probs.max(dim=-1)[0].mean().detach()
 
             return coeffs, monitor_val, expert_load_cv.detach()
-
-        else:
-            # top_k=None selects every expert: the same logit-space softmax as the top-k gate.
-            probs = torch.softmax(self._tempered(logits), dim=-1)
-            monitor_val = probs.max(dim=-1)[0].mean().detach()
-            self._last_topk_indices = None
-            self._last_topk_values = None
-            return probs, monitor_val, torch.tensor(0.0, device=scores.device)
 
     def last_topk(self):
         return self._last_topk_indices, self._last_topk_values
@@ -942,6 +1020,8 @@ class MOLERouterV3(nn.Module):
         stats = dict(opt_step=int(self.opt_step), n_rows=n, top_k=k, hard_load=hard_load.detach().float().clone(),
                      soft_load=soft, soft_load_sq=g2, bias=bias_before,
                      mmp=topk_probs.max(dim=-1)[0].float().mean())
+        if k == self.num_experts and n == 0:
+            stats["mmp"] = soft.new_zeros(())
         if k < self.num_experts and n > 0:
             v = torch.topk(selection_scores.detach().float(), k=k + 1, dim=-1).values
             margin = v[:, k - 1] - v[:, k]             # last selected vs first rejected selection score
@@ -968,12 +1048,23 @@ class MOLELinear(nn.Module):
             num_shared_experts=1,
             bias=True,
             mole_linear_mode=None,
+            mole_expert_parameterization="full",
+            mole_expert_rank=64,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
+        if num_experts < 0 or num_shared_experts < 0 or num_experts + num_shared_experts == 0:
+            raise ValueError("MOLELinear needs nonnegative expert counts and at least one expert")
+        if mole_expert_parameterization not in ("full", "shared_core"):
+            raise ValueError("mole_expert_parameterization must be full or shared_core")
+        if mole_expert_parameterization == "shared_core" and (
+                isinstance(mole_expert_rank, bool) or not isinstance(mole_expert_rank, int) or mole_expert_rank <= 0):
+            raise ValueError("mole_expert_rank must be a positive integer for shared_core")
+        self.mole_expert_parameterization = mole_expert_parameterization
+        self.mole_expert_rank = min(mole_expert_rank, in_features, out_features)
         self.mole_linear_mode = _normalize_mole_linear_mode(
             mole_linear_mode or os.environ.get("DPTB_MOLE_LINEAR_MODE", "split_loop")
         )
@@ -982,8 +1073,16 @@ class MOLELinear(nn.Module):
         self._cueq_weight_order = None if cueq_weight_order in ("", "auto") else cueq_weight_order
 
         # 1. 路由专家权重
-        self.weight_experts = nn.Parameter(torch.empty(num_experts, out_features, in_features))
-        if bias:
+        if num_experts == 0:
+            self.register_parameter("weight_experts", None)
+        elif mole_expert_parameterization == "full":
+            self.weight_experts = nn.Parameter(torch.empty(num_experts, out_features, in_features))
+        else:
+            rank = self.mole_expert_rank
+            self.basis_left = nn.Parameter(torch.empty(out_features, rank))
+            self.basis_right = nn.Parameter(torch.empty(in_features, rank))
+            self.core_experts = nn.Parameter(torch.empty(num_experts, rank, rank))
+        if bias and num_experts:
             self.bias_experts = nn.Parameter(torch.empty(num_experts, out_features))
         else:
             self.register_parameter('bias_experts', None)
@@ -1003,7 +1102,31 @@ class MOLELinear(nn.Module):
 
     def reset_parameters(self):
         k = math.sqrt(1.0 / self.in_features)
-        nn.init.uniform_(self.weight_experts, -k, k)
+        if self.num_experts == 0:
+            pass
+        elif self.mole_expert_parameterization == "full":
+            nn.init.uniform_(self.weight_experts, -k, k)
+        else:
+            device = self.core_experts.device
+            devices = []
+            if device.type == "cuda":
+                devices = [device.index if device.index is not None else torch.cuda.current_device()]
+            # Initialize the factors without shifting the legacy stream used
+            # by biases, shared experts, radial blocks and later routers.
+            # fork_rng also preserves CPU state when the parameters are CUDA.
+            with torch.random.fork_rng(devices=devices):
+                nn.init.orthogonal_(self.basis_left)
+                nn.init.orthogonal_(self.basis_right)
+                # E||P D Q.T||_F^2 = out/3, matching the full uniform bank.
+                nn.init.normal_(self.core_experts,
+                                std=math.sqrt(self.out_features / 3.0) / self.mole_expert_rank)
+            # Consume exactly the original bank's draws on its own device and
+            # dtype. This temporary is construction/reset cost only: it is
+            # neither registered nor kept for forward or checkpointing.
+            legacy_draws = torch.empty(self.num_experts, self.out_features, self.in_features,
+                                       device=device, dtype=self.core_experts.dtype)
+            nn.init.uniform_(legacy_draws, -k, k)
+            del legacy_draws
         if self.bias_experts is not None:
             nn.init.uniform_(self.bias_experts, -k, k)
 
@@ -1011,6 +1134,31 @@ class MOLELinear(nn.Module):
             nn.init.uniform_(self.weight_shared, -k, k)
             if self.bias_shared is not None:
                 nn.init.uniform_(self.bias_shared, -k, k)
+
+    def __getattr__(self, name):
+        # Preserve the readable bank interface used by SO2/CUDA callers. Only
+        # P/Q/D are leaves in shared_core; no full matrix is checkpointed.
+        if name == "weight_experts" and "core_experts" in self.__dict__.get("_parameters", {}):
+            return self._expert_weight_bank()
+        return super().__getattr__(name)
+
+    def _expert_weight_bank(self):
+        if self.num_experts == 0 or self.mole_expert_parameterization == "full":
+            return super().__getattr__("weight_experts")
+        # Expert-sized, not edge-sized. Keep this differentiable and local to
+        # the current forward: caching across optimizer steps would be stale.
+        return (self.basis_left.unsqueeze(0) @ self.core_experts) @ self.basis_right.t()
+
+    @torch.no_grad()
+    def scale_expert_weights_(self, scale):
+        """Scale the represented bank, including the SO2 m>0 initial scale."""
+        if self.num_experts == 0:
+            return self
+        if self.mole_expert_parameterization == "full":
+            self.weight_experts.mul_(scale)
+        else:
+            self.core_experts.mul_(scale)
+        return self
 
     def _apply_indexed_ref(self, x, mixed_weights, mixed_bias, graph_index):
         flat_x = x.reshape(-1, self.in_features)
@@ -1034,10 +1182,11 @@ class MOLELinear(nn.Module):
     def _apply_expert_cublas_grouped(self, x, expert_index):
         if x.device.type != "cuda":
             raise RuntimeError("expert cublas_grouped dispatch requires CUDA.")
-        if x.dtype != torch.float32 or self.weight_experts.dtype != torch.float32:
+        weight = self._expert_weight_bank()
+        if x.dtype != torch.float32 or weight.dtype != torch.float32:
             raise RuntimeError(
                 "expert cublas_grouped dispatch currently requires float32 tensors; "
-                f"got x={x.dtype}, weight={self.weight_experts.dtype}."
+                f"got x={x.dtype}, weight={weight.dtype}."
             )
 
         from dptb.nn.cublas_grouped_gemm import grouped_gemm
@@ -1064,7 +1213,7 @@ class MOLELinear(nn.Module):
         flat_out = grouped_gemm(
             flat_x.contiguous(),
             ptr.to(device="cpu", dtype=torch.long).contiguous(),
-            self.weight_experts.contiguous(),
+            weight.contiguous(),
         )
         if self.bias_experts is not None:
             flat_out = flat_out + self.bias_experts.index_select(0, sorted_expert_index)
@@ -1078,6 +1227,8 @@ class MOLELinear(nn.Module):
         This is the nonlinear MoE building block: expert_index is an expert id,
         not a graph id for a pre-mixed weight class.
         """
+        if self.num_experts == 0:
+            raise ValueError("A shared-only MOLELinear has no routed experts to select")
         expert_index = expert_index.to(device=x.device, dtype=torch.long).reshape(-1)
         if expert_index.numel() != x.shape[0]:
             raise ValueError(
@@ -1104,7 +1255,13 @@ class MOLELinear(nn.Module):
 
         sum_j c_j (W_ej + W_sh) == sum_j c_j W_ej + W_sh requires sum_j c_j == 1.
         """
-        weight = self.weight_experts
+        if self.num_experts == 0:
+            if fold_shared:
+                raise ValueError("A shared-only MOLELinear cannot fold shared weights into routed slots")
+            # The fused SO2 shared branch asks for the layout but never dispatches it.
+            # These empty views are not parameters and never enter the state dict.
+            return self.weight_shared[:0], None
+        weight = self._expert_weight_bank()
         bias = self.bias_experts
         if fold_shared and self.num_shared_experts > 0:
             weight = weight + self.weight_shared.sum(0).unsqueeze(0)
@@ -1167,13 +1324,14 @@ class MOLELinear(nn.Module):
         """
         flat_x = x.reshape(-1, self.in_features)
         eidx = _expand_route_index_for_leading_dims(expert_index, x)
+        weight = self._expert_weight_bank()
         out = None
         for e in range(self.num_experts):
             rows = (eidx == e).nonzero(as_tuple=True)[0]
             if rows.numel() == 0:
                 continue
             bias = self.bias_experts[e] if self.bias_experts is not None else None
-            part = F.linear(flat_x.index_select(0, rows), self.weight_experts[e], bias)
+            part = F.linear(flat_x.index_select(0, rows), weight[e], bias)
             if out is None:
                 # Take dtype from the matmul, not from x: under autocast F.linear
                 # returns bf16/fp16 while x stays fp32, and index_add requires
@@ -1208,8 +1366,7 @@ class MOLELinear(nn.Module):
         if idx is None or val is None:
             raise ValueError(
                 "activation-space MoLE needs top-k routing metadata, but "
-                "router.last_topk() returned None. It is unset when top_k >= "
-                "num_experts and mole_full_expert_fast_path is on."
+                "router.last_topk() returned None; route the inputs before dispatch."
             )
         if idx.shape[0] != x.shape[0]:
             raise ValueError(
@@ -1218,18 +1375,21 @@ class MOLELinear(nn.Module):
             )
         idx = idx.to(device=x.device, dtype=torch.long)
         val = val.to(device=x.device, dtype=x.dtype)
-        fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False))
-        weight, bias = self._routed_weight_and_bias(fold)
-        view = [idx.shape[0]] + [1] * (x.dim() - 1)
+        branch = getattr(mole_globals, "branch", "all")
+        # only a pass that computes both parts may fold the shared expert into the slots
+        fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False)) and branch == "all"
         out = None
-        for j in range(idx.shape[1]):
-            layout = mole_globals.expert_slot_layout(j, idx[:, j], self.num_experts)
-            part = self._apply_expert_with_layout(x, layout, weight, bias)
-            part = part * val[:, j].reshape(view)
-            out = part if out is None else out + part
+        if branch != "shared":
+            weight, bias = self._routed_weight_and_bias(fold)
+            view = [idx.shape[0]] + [1] * (x.dim() - 1)
+            for j in range(idx.shape[1]):
+                layout = mole_globals.expert_slot_layout(j, idx[:, j], self.num_experts)
+                part = self._apply_expert_with_layout(x, layout, weight, bias)
+                part = part * val[:, j].reshape(view)
+                out = part if out is None else out + part
         if out is None:
             out = x.new_zeros(*x.shape[:-1], self.out_features)
-        if not fold and self.num_shared_experts > 0:
+        if branch != "routed" and not fold and self.num_shared_experts > 0:
             shared_bias = self.bias_shared.sum(0) if self.bias_shared is not None else None
             out = out + F.linear(x, self.weight_shared.sum(0), shared_bias)
         return out
@@ -1246,16 +1406,17 @@ class MOLELinear(nn.Module):
         coefficients = mole_globals.coefficients
         topk_indices = getattr(mole_globals, "topk_indices", None)
         topk_values = getattr(mole_globals, "topk_values", None)
+        weight = self._expert_weight_bank()
 
         if (
             topk_indices is not None
             and topk_values is not None
             and topk_indices.shape[0] == coefficients.shape[0]
         ):
-            topk_indices = topk_indices.to(device=self.weight_experts.device, dtype=torch.long)
-            topk_values = topk_values.to(device=self.weight_experts.device, dtype=self.weight_experts.dtype)
+            topk_indices = topk_indices.to(device=weight.device, dtype=torch.long)
+            topk_values = topk_values.to(device=weight.device, dtype=weight.dtype)
             n_routes, k_routes = topk_indices.shape
-            gathered_weights = self.weight_experts.index_select(0, topk_indices.reshape(-1))
+            gathered_weights = weight.index_select(0, topk_indices.reshape(-1))
             gathered_weights = gathered_weights.reshape(
                 n_routes,
                 k_routes,
@@ -1270,7 +1431,7 @@ class MOLELinear(nn.Module):
                 gathered_bias = gathered_bias.reshape(n_routes, k_routes, self.out_features)
                 mixed_bias = (gathered_bias * topk_values.reshape(n_routes, k_routes, 1)).sum(dim=1)
         else:
-            mixed_weights = torch.einsum("be, eoi -> boi", coefficients, self.weight_experts)
+            mixed_weights = torch.einsum("be, eoi -> boi", coefficients, weight)
             mixed_bias = None
             if self.bias_experts is not None:
                 mixed_bias = torch.einsum("be, eo -> bo", coefficients, self.bias_experts)
@@ -1492,6 +1653,11 @@ class MOLELinear(nn.Module):
         return torch.cat(parts, dim=0).index_select(0, inverse)
 
     def forward(self, x, mole_globals: MOLEGlobals):
+        if self.num_experts == 0:
+            if getattr(mole_globals, "branch", "shared") == "routed":
+                raise ValueError("A shared-only MOLELinear cannot execute a routed branch")
+            bias = self.bias_shared.sum(0) if self.bias_shared is not None else None
+            return F.linear(x, self.weight_shared.sum(0), bias)
         if getattr(mole_globals, "top1_independent", False):
             from .top1_prior import linear
             return linear(self, x, mole_globals)
@@ -1854,6 +2020,64 @@ class SO2SlotPostActivationMixer(torch.nn.Module):
         return out, wigner_D_all
 
 
+class SO2SharedPostActivationMixer(torch.nn.Module):
+    """Nonlinear experts with a separate shared branch (DPA3-MoE, Liu et al., npj Artif. Intell. 2026, eq. 4):
+
+    ``h' = act(SO2_sh(x)) + sum_j g_j [act(SO2_{e_j}(x)) - act(0)]``
+
+    ``SO2_sh`` is the layer with the shared expert and every non-MoLE block (interpolation) and no routed expert;
+    ``SO2_{e_j}`` is routed expert ``e_j`` of top-k slot ``j`` alone (no shared expert, no non-MoLE block).  Both
+    are activated separately; the coefficients ``g`` need not sum to one (``edge_router_gate=full_softmax`` keeps the
+    router's probability mass).  Subtracting ``act(0)`` (zero for the gate activation) makes a routed expert with
+    zero weights contribute exactly nothing, so routed experts initialised at zero reproduce the dense layer.
+    State dicts are interchangeable with pre_activation.  Cost: k + 1 SO2 passes instead of one.
+    """
+
+    def __init__(self, tp: "SO2_Linear", activation: torch.nn.Module):
+        super().__init__()
+        # not registered as submodules: they belong to the owning update block
+        object.__setattr__(self, "tp", tp)
+        object.__setattr__(self, "activation", activation)
+
+    def _activated_dim(self) -> int:
+        irreps_out = getattr(self.activation, "irreps_out", None)
+        if irreps_out is not None:
+            return int(irreps_out.dim)
+        probe = torch.zeros(0, int(self.tp.irreps_out.dim))
+        return int(self.activation(probe).shape[-1])
+
+    def forward(self, x, R, mole_globals: MOLEGlobals, latents=None, wigner_D_all=None):
+        if x.shape[0] == 0:
+            return x.new_zeros((0, self._activated_dim())), wigner_D_all
+        idx = getattr(mole_globals, "topk_indices", None)
+        val = getattr(mole_globals, "topk_values", None)
+        if mole_globals is None or not getattr(mole_globals, "activation_space", False) or idx is None or val is None:
+            raise ValueError("SO2SharedPostActivationMixer needs per-row activation-space top-k routing "
+                             "(prior_activate); got %r." % (type(mole_globals).__name__,))
+        if idx.dim() != 2 or val.shape != idx.shape or idx.shape[0] != x.shape[0] or idx.shape[1] == 0:
+            raise ValueError("top-k routing must be [n_rows, k] for %d rows; got indices %s, values %s."
+                             % (x.shape[0], tuple(idx.shape), tuple(val.shape)))
+        num_experts = int(self.tp.num_experts)
+        n = idx.shape[0]
+        idx = idx.to(device=x.device, dtype=torch.long)
+        zero_val = torch.zeros(n, 1, dtype=x.dtype, device=x.device)
+        shared_globals = MOLEGlobals(coefficients=torch.zeros(n, num_experts, dtype=x.dtype, device=x.device),
+                                     sizes=None, topk_indices=idx[:, :1].contiguous(), topk_values=zero_val,
+                                     activation_space=True, coefficients_sum_to_one=False, branch="shared")
+        y, wigner_D_all = self.tp(x, R, shared_globals, latents, wigner_D_all)
+        out = self.activation(y)
+        act0 = self.activation(y.new_zeros(1, y.shape[-1]))
+        for j in range(idx.shape[1]):
+            slot_idx = idx[:, j:j + 1].contiguous()
+            one = torch.ones(slot_idx.shape, dtype=x.dtype, device=x.device)
+            coeff = torch.zeros(n, num_experts, dtype=x.dtype, device=x.device).scatter_(1, slot_idx, one)
+            slot_globals = MOLEGlobals(coefficients=coeff, sizes=None, topk_indices=slot_idx, topk_values=one,
+                                       activation_space=True, coefficients_sum_to_one=False, branch="routed")
+            y, wigner_D_all = self.tp(x, R, slot_globals, latents, wigner_D_all)
+            out = out + (self.activation(y) - act0) * val[:, j:j + 1].to(device=y.device, dtype=y.dtype)
+        return out, wigner_D_all
+
+
 class SO2_Linear(torch.nn.Module):
     """
     SO(2) Convolutional layer with MoE and Rotate Control.
@@ -1876,6 +2100,8 @@ class SO2_Linear(torch.nn.Module):
             rotate_out: bool = True,
             wigner_apply_mode: str = "compact_blocks",
             mole_linear_mode=None,
+            mole_expert_parameterization="full",
+            mole_expert_rank=64,
             so2_fusion_mode: str = "staged",
     ):
         super(SO2_Linear, self).__init__()
@@ -1912,6 +2138,8 @@ class SO2_Linear(torch.nn.Module):
             num_shared_experts=num_shared_experts,
             bias=True,
             mole_linear_mode=mole_linear_mode,
+            mole_expert_parameterization=mole_expert_parameterization,
+            mole_expert_rank=mole_expert_rank,
         )
 
         for m in range(1, self.m_max + 1):
@@ -1924,6 +2152,8 @@ class SO2_Linear(torch.nn.Module):
                 num_experts=num_experts,
                 num_shared_experts=num_shared_experts,
                 mole_linear_mode=mole_linear_mode,
+                mole_expert_parameterization=mole_expert_parameterization,
+                mole_expert_rank=mole_expert_rank,
             ))
 
         # --- Mask 和 Index 构建逻辑 (保持不变) ---
@@ -1996,6 +2226,17 @@ class SO2_Linear(torch.nn.Module):
         grouped mode; weight-space routing takes the fused-P0 or persistent-P1 kernels
         when requested.  Whatever a route declines runs on the grouped streaming route.
         """
+        if self.num_experts == 0:
+            # Never pass the embedding's E-way expert ids into a shared-only layer.
+            # Keep activation-space dispatch so fused P0 uses its existing shared
+            # branch, including each output interpolation block exactly once.
+            n = x.shape[0]
+            mole_globals = MOLEGlobals(
+                coefficients=x.new_zeros((n, 0)),
+                topk_indices=torch.zeros((n, 1), device=x.device, dtype=torch.long),
+                topk_values=x.new_zeros((n, 1)),
+                activation_space=True, coefficients_sum_to_one=False, branch="shared",
+            )
         mode = self.so2_fusion_mode
         if mode == "staged":
             return self._forward_staged(x, R, mole_globals, latents, wigner_D_all)
@@ -2071,7 +2312,7 @@ class SO2_Linear(torch.nn.Module):
             rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
             transformed = torch.bmm(x_combined, rot_mat)
             for part, slice_info, mul in zip(transformed.split(muls, dim=1), slices, muls):
-                x_[:, slice_info] = part.reshape(n, -1)
+                x_[:, slice_info] = part.flatten(1)
 
         # === 3. Convolution (Linear / MoE) ===
         out = torch.zeros(n, self.irreps_out.dim, dtype=x.dtype, device=x.device)
@@ -2091,7 +2332,7 @@ class SO2_Linear(torch.nn.Module):
                     out[:, self.m_out_mask[m]] += self.fc_m0(inp, mole_globals)
             else:
                 # MoE Logic for m>0
-                x_m_in = x_[:, self.m_in_mask[m]].reshape(n, -1, 2).transpose(1, 2).contiguous()
+                x_m_in = x_[:, self.m_in_mask[m]].unflatten(1, (-1, 2)).transpose(1, 2).contiguous()
 
                 if self.front and self.radial_emb:
                     x_m_in.mul_(radial_weight)
@@ -2103,7 +2344,7 @@ class SO2_Linear(torch.nn.Module):
                 else:
                     linear_output = self.m_linear[m - 1](x_m_in, mole_globals)
 
-                final_addition = linear_output.transpose(1, 2).contiguous().reshape(n, -1)
+                final_addition = linear_output.transpose(1, 2).contiguous().flatten(1)
                 out[:, self.m_out_mask[m]] += final_addition
 
         # === 4. Rotate Out (Local -> Global) ===
@@ -2124,7 +2365,7 @@ class SO2_Linear(torch.nn.Module):
             rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
             rotated = torch.bmm(out_combined, rot_mat.transpose(1, 2))
             for part, slice_info, mul in zip(rotated.split(muls, dim=1), slices, muls):
-                out[:, slice_info] = part.reshape(n, -1)
+                out[:, slice_info] = part.flatten(1)
 
         return out.contiguous(), wigner_D_all
 
@@ -2621,6 +2862,8 @@ class SO2_m_Linear(torch.nn.Module):
             num_experts: int = 8,  # Added
             num_shared_experts: int = 1, # Added
             mole_linear_mode=None,
+            mole_expert_parameterization="full",
+            mole_expert_rank=64,
     ):
         super(SO2_m_Linear, self).__init__()
         self.m = m
@@ -2639,15 +2882,20 @@ class SO2_m_Linear(torch.nn.Module):
                 num_shared_experts=num_shared_experts,
                 bias=False,
                 mole_linear_mode=mole_linear_mode,
+                mole_expert_parameterization=mole_expert_parameterization,
+                mole_expert_rank=mole_expert_rank,
             )
-            with torch.no_grad():
-                self.fc.weight_experts.data.mul_(1 / math.sqrt(2))
+            if self.fc.num_experts:
+                self.fc.scale_expert_weights_(1 / math.sqrt(2))
             self.is_mole = True
 
     def forward(self, x_m, mole_globals: MOLEGlobals):  # Added mole_globals
         # x_m ~ [N, 2, n_channels]
         if self.is_mole:
             x_m = self.fc(x_m, mole_globals)
+        elif getattr(mole_globals, "branch", "all") == "routed":
+            # a non-MoLE block (interpolation) belongs to the shared branch
+            x_m = x_m.new_zeros(*x_m.shape[:-1], 2 * self.num_out_channel)
         else:
             x_m = self.fc(x_m)
 

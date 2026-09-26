@@ -1,3 +1,4 @@
+from dptb.nn.shift_head import optimizer_named_parameters
 import torch
 import logging
 import os
@@ -71,7 +72,7 @@ class Trainer(BaseTrainer):
             self.model,
             train_options.get("activation_recompute", None),
         )
-        self.optimizer = get_optimizer(model_param=self.model.named_parameters(), **train_options["optimizer"])
+        self.optimizer = get_optimizer(model_param=optimizer_named_parameters(self.model), **train_options["optimizer"])
         self.lr_scheduler = get_lr_scheduler(optimizer=self.optimizer, **train_options["lr_scheduler"])
         self.update_lr_per_iter = train_options["update_lr_per_iter"]
         self.common_options = common_options

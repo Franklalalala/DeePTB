@@ -284,6 +284,10 @@ class Lem(torch.nn.Module):
                 active_edges,
             )
 
+        if getattr(self, "capture_shift_features", False):
+            data["_shift_node_features"] = node_features
+            data["_shift_active_edges"] = active_edges
+
         data[_keys.NODE_FEATURES_KEY] = self.out_node(node_features)
         data[_keys.EDGE_FEATURES_KEY] = torch.zeros(
             edge_index.shape[1],

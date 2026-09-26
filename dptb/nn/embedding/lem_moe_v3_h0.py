@@ -523,6 +523,10 @@ class LemMoEV3H0(LemMoEV3):
             data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)
             return data
 
+        if getattr(self, "capture_shift_features", False):
+            data["_shift_node_features"] = node_features
+            data["_shift_active_edges"] = active_edges
+
         out_node_features, out_edge_features = self._apply_rme_output_heads(
             node_features, edge_features, node_one_hot, edge_one_hot
         )

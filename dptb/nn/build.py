@@ -85,6 +85,11 @@ class DistanceEnsembleWrapper(nn.Module):
         self.num_experts = len(distance_ranges)
         self.clip_last_expert_range = bool(clip_last_expert_range)
         self.experts = nn.ModuleList(experts)
+        for i, expert in enumerate(experts):
+            head = getattr(expert, "shift_head", None)
+            if head is not None:
+                head.distance_policy = (*distance_ranges[i], i == len(experts) - 1,
+                                        self.clip_last_expert_range)
 
         base_model = self.experts[0]
         self.name = getattr(base_model, "name", "distance_ensemble")
@@ -506,6 +511,7 @@ def build_model(
     init_mixed = False
     init_dftbsk = False
     ckpt_state_dict = None
+    moe_init_metadata = None
 
     if not from_scratch:
         if checkpoint.split(".")[-1] == "json":
@@ -514,6 +520,7 @@ def build_model(
             f = torch.load(checkpoint, map_location="cpu", weights_only=False)
             ckptconfig = f['config']
             ckpt_state_dict = f.get("model_state_dict", None)
+            moe_init_metadata = copy.deepcopy(f.get("moe_init"))
             del f
 
         checkpoint_model_options = migrate_legacy_checkpoint_model_options(
@@ -643,6 +650,11 @@ def build_model(
                 else:
                     model = None
 
+    shift_options = model_options.get("shift_head") or {}
+    if from_scratch and shift_options.get("mode", "off") != "off" and shift_options.get("init_from"):
+        from dptb.nn.shift_head import load_dense_backbone
+        load_dense_backbone(model, shift_options["init_from"])
+
     if not no_check:
         for k, v in model.model_options.items():
             if k not in model_options:
@@ -651,6 +663,9 @@ def build_model(
                 deep_dict_difference(k, v, model_options)
 
     model.to(model.device)
+    if moe_init_metadata is not None:
+        # Provenance only: loading or resuming never repeats dense upcycling.
+        model.moe_init_metadata = moe_init_metadata
 
     return model
 

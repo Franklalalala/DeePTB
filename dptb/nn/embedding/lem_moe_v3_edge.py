@@ -8,6 +8,8 @@ from dptb.configuration import resolve_init_scope
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
 from dptb.nn.embedding.emb import Embedding
+from dptb.nn.route_drop import (validate_route_drop, sample_structure_routes,
+                                apply_structure_routes, record_route_drop)
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLERouterV3, write_router_regularizers
 
 from .lem_moe_v3 import LemMoEV3, _apply_onehot_tp
@@ -49,6 +51,9 @@ class LemMoEV3Edge(LemMoEV3):
             bias_schedule=str(kwargs.pop("edge_router_bias_schedule", "const")),
             select_noise=float(kwargs.pop("edge_router_select_noise", 0.0)),
             bias_freeze_after_step=int(kwargs.pop("edge_router_bias_freeze_after_step", 0)),
+            gate=str(kwargs.pop("edge_router_gate", "renorm")),
+            type_support=int(kwargs.pop("edge_router_type_support", 0)),
+            type_support_seed=int(kwargs.pop("edge_router_type_support_seed", 0)),
         )
         self.edge_router_bias_speed = float(kwargs.pop("edge_router_bias_speed", 0.005))
         # what the per-edge (prior_activate) router sees: learned bond-type embedding plus the prior Gram descriptor
@@ -58,6 +63,8 @@ class LemMoEV3Edge(LemMoEV3):
         self.edge_router_rbf_rmax = float(kwargs.pop("edge_router_rbf_rmax", 10.0))
         if self.edge_router_input not in ("onehot_prior", "onehot_r", "onehot"):
             raise ValueError("edge_router_input must be onehot_prior, onehot_r or onehot; got %r" % self.edge_router_input)
+        if self.edge_router_options["type_support"] > 0 and not self.edge_router_prior_activate:
+            raise ValueError("edge_router_type_support needs edge_router_prior_activate=true (per-edge routing)")
         if self.edge_router_input != "onehot_prior" and not self.edge_router_prior_activate:
             raise ValueError("edge_router_input=%r needs edge_router_prior_activate=true (per-edge routing)"
                              % self.edge_router_input)
@@ -69,6 +76,16 @@ class LemMoEV3Edge(LemMoEV3):
         if not self.edge_router_prior_activate:
             kwargs.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
         top_k = kwargs.get("top_k", 1)
+        self.edge_router_route_drop_p = kwargs.pop("edge_router_route_drop_p", 0.0)
+        self.edge_router_route_drop_scale = kwargs.pop("edge_router_route_drop_scale", "inverted")
+        validate_route_drop(self.edge_router_route_drop_p, self.edge_router_route_drop_scale)
+        self.edge_router_route_drop_p = float(self.edge_router_route_drop_p)
+        if self.edge_router_route_drop_p > 0.0:
+            if (not self.edge_router_prior_activate or self.edge_router_top1_mode != "legacy"
+                    or top_k is None or top_k < 2 or kwargs.get("num_shared_experts", 1) < 1
+                    or kwargs.get("so2_expert_mixing_mode", "pre_activation") != "pre_activation"):
+                raise ValueError("edge_router_route_drop_p > 0 requires edge_router_prior_activate=true, "
+                                 "pre_activation, top_k >= 2, shared experts and no switch/top1 routing")
         if self.edge_router_top1_mode == "switch" and (top_k != 1 or not self.edge_router_prior_activate):
             raise ValueError("Switch top-1 branch requires top_k=1 and prior_activate=true")
         if self.edge_router_top1_mode == "switch" and kwargs.get("num_shared_experts", 1) != 0:
@@ -99,10 +116,16 @@ class LemMoEV3Edge(LemMoEV3):
                     "slot, which needs top-k coefficients summing to one; the Switch top-1 route "
                     "keeps its retained probability instead."
                 )
-            if mixing not in ("pre_activation", "post_activation_slot"):
+            if mixing == "post_activation_slot" and self.edge_router_options["gate"] != "renorm":
                 raise ValueError(
-                    "edge_router_prior_activate requires "
-                    "so2_expert_mixing_mode='pre_activation' or 'post_activation_slot'; "
+                    "so2_expert_mixing_mode='post_activation_slot' folds the shared expert into every slot, "
+                    "which needs coefficients summing to one (edge_router_gate='renorm'); use "
+                    "'post_activation_shared' with edge_router_gate='full_softmax'."
+                )
+            if mixing not in ("pre_activation", "post_activation_slot", "post_activation_shared"):
+                raise ValueError(
+                    "edge_router_prior_activate requires so2_expert_mixing_mode='pre_activation', "
+                    "'post_activation_slot' or 'post_activation_shared'; "
                     "got %r, which dispatches through apply_experts and would "
                     "materialise one weight per edge." % (mixing,)
                 )
@@ -216,7 +239,8 @@ class LemMoEV3Edge(LemMoEV3):
             from dptb.nn.top1_prior import Top1PriorRouter
             if self.edge_router_options != dict(logit_kind="raw", logit_scale=10.0, select="sigmoid",
                                                 bias_at_eval=False, bias_schedule="const", select_noise=0.0,
-                                                bias_freeze_after_step=0):
+                                                bias_freeze_after_step=0, gate="renorm", type_support=0,
+                                                type_support_seed=0):
                 raise ValueError("edge_router_logit/select/bias_*/select_noise apply to the top-k router only, "
                                  "not to edge_router_top1_mode=switch")
             router_type, router_kwargs = Top1PriorRouter, {}
@@ -311,7 +335,7 @@ class LemMoEV3Edge(LemMoEV3):
         router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
         mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
             router_input,
-            active_bond_type,
+            active_bond_type, data=data, active_edges=active_edges,
         )
         data["mean_max_prob"] = monitor_val
         data["expert_load_cv"] = expert_load_cv
@@ -349,6 +373,10 @@ class LemMoEV3Edge(LemMoEV3):
                 dtype=node_features.dtype,
             )
             node_features = torch.cat([node_features, pad], dim=0)
+
+        if getattr(self, "capture_shift_features", False):
+            data["_shift_node_features"] = node_features
+            data["_shift_active_edges"] = active_edges
 
         out_node_features = self.out_node(node_features)
         out_edge_features = self.out_edge(edge_features)
@@ -443,10 +471,31 @@ class LemMoEV3Edge(LemMoEV3):
         desc = torch.sign(desc) * torch.log1p(desc.abs()).clamp(max=20.0)
         return (desc - self._prior_mean) / self._prior_std.clamp_min(1e-6)
 
-    def _make_edge_moe_globals(
+    def _make_edge_moe_globals(self, active_edge_one_hot, active_bond_type, *, data=None, active_edges=None):
+        # Exact legacy fast path: no extra RNG draws, tensor operations or state.
+        if getattr(self, "edge_router_route_drop_p", 0.0) == 0.0 or not self.training:
+            return LemMoEV3Edge._make_undropped_edge_moe_globals(self, active_edge_one_hot, active_bond_type)
+        if data is None or active_edges is None:
+            raise ValueError("structure route dropout needs batch data and active_edges")
+        keep, edge_keep = sample_structure_routes(data, self.edge_router_route_drop_p)
+        active_keep = edge_keep.index_select(0, active_edges)
+        route, monitor, cv, count = self._make_undropped_edge_moe_globals(
+            active_edge_one_hot, active_bond_type, regularizer_weights=active_keep)
+        route = apply_structure_routes(route, active_keep, self.edge_router_route_drop_p,
+                                       self.edge_router_route_drop_scale, self.router.top_k)
+        # Dispatch and the public last_topk view agree; no masks enter state_dict.
+        self.router._last_topk_indices = route.topk_indices
+        self.router._last_topk_values = route.topk_values
+        self.last_route_drop_mask = ~keep
+        self.last_route_drop_stats = record_route_drop(
+            data, keep, edge_keep, active_keep, step=self.router.opt_step)
+        return route, monitor, cv, count
+
+    def _make_undropped_edge_moe_globals(
         self,
         active_edge_one_hot: torch.Tensor,
         active_bond_type: torch.Tensor,
+        regularizer_weights=None,
     ):
         num_active_edges = int(active_edge_one_hot.shape[0])
         if active_edge_one_hot.shape[-1] != self.edge_router_in_features:
@@ -455,9 +504,22 @@ class LemMoEV3Edge(LemMoEV3):
                 f"{self.edge_router_in_features}, but active edge input has "
                 f"{active_edge_one_hot.shape[-1]}."
             )
+        full_soft = (num_active_edges == 0 and self.edge_router_prior_activate and
+                     self.edge_router_top1_mode != "switch" and
+                     (self.router.top_k is None or self.router.top_k >= self.num_experts))
+        if num_active_edges == 0 and self.edge_router_prior_activate and full_soft:
+            # Use the router even for an empty full-soft batch: this clears stale
+            # routes and provides the same [N, E] metadata and logging contract.
+            coeffs, monitor, cv = self.router(active_edge_one_hot, bond_type=active_bond_type)
+            indices, values = self.router.last_topk()
+            return MOLEGlobals(coefficients=coeffs, sizes=None, topk_indices=indices,
+                               topk_values=values, activation_space=True,
+                               coefficients_sum_to_one=True), monitor, cv, coeffs.new_zeros(())
         if num_active_edges == 0:
             coeffs = active_edge_one_hot.new_zeros((0, self.num_experts))
             zero = active_edge_one_hot.new_zeros(())
+            if regularizer_weights is not None:
+                self.router.last_router_z_loss = zero
             return MOLEGlobals(coefficients=coeffs, sizes=None), zero, zero, zero
 
         if self.edge_router_top1_mode == "switch":
@@ -469,13 +531,17 @@ class LemMoEV3Edge(LemMoEV3):
             # mode is that pooling by any function of (bond type, r) would make
             # the coefficients a function of (bond type, r) too, no matter what
             # the descriptor carries.
-            coeffs, monitor_val, expert_load_cv = self.router(active_edge_one_hot)
+            if self.edge_router_options["type_support"] > 0:
+                coeffs, monitor_val, expert_load_cv = self.router(
+                    active_edge_one_hot, bond_type=active_bond_type, regularizer_weights=regularizer_weights)
+            else:
+                coeffs, monitor_val, expert_load_cv = self.router(
+                    active_edge_one_hot, regularizer_weights=regularizer_weights)
             topk_indices, topk_values = self.router.last_topk()
             if topk_indices is None or topk_values is None:
                 raise RuntimeError(
-                    "edge_router_prior_activate requires top_k < num_experts so "
-                    "the router exposes top-k metadata for activation-space "
-                    "dispatch."
+                    "edge_router_prior_activate requires router dispatch metadata "
+                    "for every selected expert."
                 )
             num_route_tokens = coeffs.new_tensor(float(coeffs.shape[0]))
             return (
@@ -485,10 +551,11 @@ class LemMoEV3Edge(LemMoEV3):
                     topk_indices=topk_indices,
                     topk_values=topk_values,
                     activation_space=True,
-                    # MOLERouterV3 normalises the selected top-k logits with a
-                    # softmax, so these sum to 1 exactly and the shared expert
-                    # can be folded into the routed weights.
-                    coefficients_sum_to_one=True,
+                    # MOLERouterV3 with gate='renorm' normalises the selected top-k
+                    # logits with a softmax, so these sum to 1 exactly and the shared
+                    # expert can be folded into the routed weights; gate='full_softmax'
+                    # keeps the router's probability mass (< 1), so it may not.
+                    coefficients_sum_to_one=bool(getattr(self.router, "coefficients_sum_to_one", True)),
                 ),
                 monitor_val,
                 expert_load_cv,

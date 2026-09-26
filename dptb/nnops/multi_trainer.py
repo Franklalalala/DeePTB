@@ -1,3 +1,4 @@
+from dptb.nn.shift_head import optimizer_named_parameters
 import contextlib
 import time
 import logging
@@ -1056,7 +1057,7 @@ class MultiTrainer(Trainer):
         return self._expert_module(expert_idx).parameters()
 
     def _expert_optimizer_parameters(self, expert_idx: int):
-        return self._expert_module(expert_idx).named_parameters()
+        return optimizer_named_parameters(self._expert_module(expert_idx))
 
     def _maybe_wrap_local_expert_ddp(self):
         if (

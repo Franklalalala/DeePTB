@@ -1132,7 +1132,7 @@ def HybridMuon():
                  doc="Per-expert factor on the final Muon update of routed-expert parameters (expert_name_patterns), applied after orthogonalisation and clipping: `const` = c (uniform attenuation), `sqrt_load` = c * clamp(sqrt(load EMA / mean load), expert_update_scale_min, 1) from the training router (imbalance correction; balanced experts get c), with c = expert_update_scale_const. Default: none."),
         Argument("expert_update_scale_min", float, optional=True, default=0.1, doc="Lower clamp of the sqrt_load factor. Default: 0.1."),
         Argument("expert_update_scale_const", float, optional=True, default=1.0, doc="Uniform factor c of expert_update_scale (const and sqrt_load). Default: 1."),
-        Argument("expert_name_patterns", list, optional=True, default=["*weight_experts*", "*bias_experts*"], doc="Name patterns of routed-expert parameters (leading dimension = expert)."),
+        Argument("expert_name_patterns", list, optional=True, default=["*weight_experts*", "*bias_experts*", "*core_experts*"], doc="Name patterns of routed-expert parameters (leading dimension = expert)."),
         Argument("expert_weight_decay_mult", float, optional=True, default=1.0, doc="Weight-decay multiplier for routed-expert parameters. Default: 1."),
         Argument("adamw_name_patterns", list, optional=True, default=[], doc="Parameters whose names match go to AdamW whatever their shape (the 1-D exclude list cannot move 2-D parameters off Muon)."),
         Argument("adamw_pattern_lr_scale", float, optional=True, default=1.0, doc="Learning-rate multiplier for the parameters matched by adamw_name_patterns. Default: 1. (No option name may contain 'force', 'stress' or 'virial': MultiTrainer reads such train_options keys as geometry-gradient losses.)"),
@@ -1364,6 +1364,7 @@ def train_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
@@ -1412,6 +1413,7 @@ def validation_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
@@ -1460,6 +1462,7 @@ def reference_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
@@ -1508,6 +1511,7 @@ def test_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
@@ -1782,7 +1786,7 @@ def slem():
     doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. The 0425-stable branch defaults to `streamed_m_major_cueq`; `streamed_m_major_fused_p0` is an opt-in trainable prototype that treats Wigner/R as constants and falls back on unsupported shapes."
     doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
     doc_so2_m_linear_mode = "SO2 m-linear backend for non-MoE SO2 TP. Supported values are `standard`, `indexed_sandwich_multi`, or null; `cublas_grouped` is accepted only as a legacy alias. Triton experiment modes remain unsupported."
-    doc_so2_expert_mixing_mode = "Expert mixing placement for SO2 MoE TP. `pre_activation` keeps the existing fused-weight path; `post_activation` evaluates raw expert TP outputs, applies equivariant activation, routes from 0e output scalars, and mixes activated outputs; `post_activation_slot` (per-edge prior_activate routing) runs each top-k slot through the activation-space route with its own expert (shared expert folded in), applies the activation per slot and mixes the activated slots with the router coefficients."
+    doc_so2_expert_mixing_mode = "Expert mixing placement for SO2 MoE TP. `pre_activation` keeps the existing fused-weight path; `post_activation` evaluates raw expert TP outputs, applies equivariant activation, routes from 0e output scalars, and mixes activated outputs; `post_activation_slot` (per-edge prior_activate routing) runs each top-k slot through the activation-space route with its own expert (shared expert folded in), applies the activation per slot and mixes the activated slots with the router coefficients; `post_activation_shared` (per-edge prior_activate routing) keeps the shared expert (with every non-MoLE block) as its own activated branch and adds each routed slot activated alone: act(shared) + sum_j g_j [act(expert_j) - act(0)] (DPA3-MoE, Liu et al., npj Artif. Intell. 2026, eq. 4); k + 1 SO2 passes."
     doc_so2_expert_route_chunk_size = "Maximum original SO2 rows processed per post-activation expert-mixing chunk. Null or non-positive means process all rows in one chunk."
     doc_so2_expert_route_checkpoint = "Whether to activation-checkpoint each post-activation expert-route chunk. This recomputes TP/activation/router during backward to reduce saved route activations."
     doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
@@ -1887,8 +1891,18 @@ def slem():
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
         Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
+        Argument("mole_expert_parameterization", str, optional=True, default="full",
+                 doc="Routed SO2 weights: full (legacy bank) or shared_core (P D_e Q^T, shared P/Q and expert cores). Shared affine weights remain separate. Changes checkpoint parameter layout; no automatic full-bank conversion."),
+        Argument("mole_expert_rank", int, optional=True, default=64,
+                 doc="Positive shared_core rank, capped at min(in_features, out_features) in each MoLE block. Bank materialization reuses existing CUDA; this does not imply low-rank execution speed."),
         Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
         Argument("so2_expert_mixing_mode", str, optional=True, default="pre_activation", doc=doc_so2_expert_mixing_mode),
+        Argument("so2_moe_layers", [str, list], optional=True, default="all",
+                 doc="Indices of LEM layers with routed SO2 experts, or 'all' (legacy default). "
+                     "Other layers retain only shared SO2 parameters, use a single activation, and keep "
+                     "the same interpolation, radial and residual paths. A subset requires per-edge "
+                     "prior-activate routing and num_shared_experts >= 1. For a three-layer model, "
+                     "[1] routes only the last hidden layer; indices are zero-based."),
         Argument("so2_expert_route_chunk_size", [int, None], optional=True, default=None, doc=doc_so2_expert_route_chunk_size),
         Argument("so2_expert_route_checkpoint", bool, optional=True, default=False, doc=doc_so2_expert_route_checkpoint),
         Argument("so2_output_router_hidden_dim", int, optional=True, default=32, doc=doc_so2_output_router_hidden_dim),
@@ -2048,6 +2062,14 @@ def _edge_router_arguments():
         Argument("edge_router_prior_activate", bool, optional=True, default=False, doc=doc_edge_router_prior_activate),
         Argument("edge_router_prior_stats", str, optional=True, default="", doc=doc_edge_router_prior_stats),
         Argument("edge_router_top1_mode", str, optional=True, default="legacy", doc="Top-1 prior routing: legacy or switch (global softmax, argmax, retained probability, no shared experts)."),
+        Argument("edge_router_route_drop_p", (int, float), optional=True, default=0.0,
+                 extra_check=lambda v: not isinstance(v, bool) and 0.0 <= v <= 1.0,
+                 extra_check_errmsg="edge_router_route_drop_p must be finite and in [0, 1]",
+                 doc="Training-only structure-wise route dropout, shared across all layers. Requires per-edge pre_activation routing, top_k >= 2 and shared experts."),
+        Argument("edge_router_route_drop_scale", str, optional=True, default="inverted",
+                 extra_check=lambda v: v in {"inverted", "none"},
+                 extra_check_errmsg="edge_router_route_drop_scale must be inverted or none",
+                 doc="inverted scales surviving routed coefficients by 1/(1-p); none leaves them unchanged. p=1 is shared-only training. Eval never drops or scales."),
         Argument("edge_router_temperature", (int, float), optional=True, default=1.0, doc="Temperature T of the softmax that mixes the selected experts of the edge router (weights = softmax(logits / T) over the top-k); T > 1 keeps the mixing soft for a given logit gap, selection is unchanged. Not for the switch mode. Default: `1.0`."),
         Argument("edge_router_logit", str, optional=True, default="raw",
                  extra_check=lambda v: v in {"raw", "cosine"}, extra_check_errmsg="edge_router_logit must be raw or cosine",
@@ -2064,6 +2086,11 @@ def _edge_router_arguments():
                  doc="Bias step over training: `const`, `follow_lr` (times lr / peak lr) or `freeze_decay` (no bias updates once lr falls below its peak). Needs HybridMuon for the lr ratio; other optimizers leave the ratio at 1."),
         Argument("edge_router_select_noise", float, optional=True, default=0.0, doc="Std of Gaussian noise added to the selection scores in training only (noisy top-k); mixing weights stay noise-free. Default: 0."),
         Argument("edge_router_bias_freeze_after_step", int, optional=True, default=0, doc="No load-balancing bias updates from this committed optimizer step on (0 = never); the frozen bias keeps acting in the selection. Needs HybridMuon for the step count."),
+        Argument("edge_router_gate", str, optional=True, default="renorm",
+                 extra_check=lambda v: v in {"renorm", "full_softmax"}, extra_check_errmsg="edge_router_gate must be renorm or full_softmax",
+                 doc="Mixing weights of the selected experts: `renorm` = softmax over the selected logits (sums to one; the shared expert may be folded into every slot); `full_softmax` = softmax over every routed expert, the selected entries kept without renormalisation (DPA3-MoE, Liu et al., npj Artif. Intell. 2026), so the routed branch carries the router's probability mass next to the shared expert. `full_softmax` needs so2_expert_mixing_mode `pre_activation` or `post_activation_shared`. Default: `renorm`."),
+        Argument("edge_router_type_support", int, optional=True, default=0, doc="Per-edge routing only: every bond type may use a fixed, hashed set of this many experts (>= top_k); the router picks its top-k inside the set (chemistry fixes the candidates, the prior descriptor chooses among them). 0 = off. Default: 0."),
+        Argument("edge_router_type_support_seed", int, optional=True, default=0, doc="Seed of the hash that draws the per-bond-type expert sets of edge_router_type_support. Default: 0."),
         Argument("edge_router_input", str, optional=True, default="onehot_prior",
                  extra_check=lambda v: v in {"onehot_prior", "onehot_r", "onehot"},
                  extra_check_errmsg="edge_router_input must be onehot_prior, onehot_r or onehot",
@@ -2284,6 +2311,14 @@ def model_options():
     return Argument("model_options", dict, sub_fields=[
         Argument("embedding", dict, optional=True, sub_fields=[], sub_variants=[embedding()], doc=doc_embedding),
         Argument("prediction", dict, optional=True, sub_fields=[], sub_variants=[prediction()], doc=doc_prediction),
+        Argument("shift_head", [dict, type(None)], optional=True, default=None, sub_fields=[
+            Argument("mode", str, optional=True, default="off"),
+            Argument("hidden", int, optional=True, default=64),
+            Argument("layers", int, optional=True, default=2),
+            Argument("element_dim", int, optional=True, default=0),
+            Argument("freeze_backbone", bool, optional=True, default=False),
+            Argument("init_from", [str, type(None)], optional=True, default=None),
+        ]),
         nnsk(),
         dftbsk(),
         ], sub_variants=[], optional=True, doc=doc_model_options)

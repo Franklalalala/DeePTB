@@ -286,7 +286,7 @@ class HybridMuon(Optimizer):
         "*freq*",
         "*router*",
     )
-    _DEFAULT_EXPERT_PATTERNS = ("*weight_experts*", "*bias_experts*")
+    _DEFAULT_EXPERT_PATTERNS = ("*weight_experts*", "*bias_experts*", "*core_experts*")
 
     def __init__(
         self,

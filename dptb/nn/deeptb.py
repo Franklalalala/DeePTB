@@ -114,6 +114,7 @@ class NNENV(nn.Module):
             transform: bool = True,
             has_soc: bool = False,
             scale_type: str = 'scale_w_back_grad',
+            shift_head: Optional[dict] = None,
             **kwargs,
     ):
         
@@ -468,6 +469,21 @@ class NNENV(nn.Module):
         elif self.method == "block_native":
             pass
 
+        from dptb.nn.shift_head import PotentialShiftHead, normalize_shift_options
+        shift_options = normalize_shift_options(shift_head)
+        self.shift_head = None
+        if shift_options["mode"] != "off":
+            if self.method != "e3tb" or self.blockwise_hamiltonian or not self.transform:
+                raise ValueError("shift_head requires transformed e3tb feature outputs")
+            if embedding["method"] not in {"lem", "lem_moe_v3", "lem_moe_v3_h0", "lem_moe_v3_edge", "lem_moe_v3_edge_h0"}:
+                raise ValueError("shift_head is supported on LEM and LEM MoE v3/H0/edge backbones")
+            self.shift_head = PotentialShiftHead(self.idp, self.embedding.out_node.irreps_in,
+                                                 shift_options, dtype=self.dtype, device=self.device)
+            self.embedding.capture_shift_features = True
+            self.model_options["shift_head"] = shift_options
+            if shift_options["freeze_backbone"]:
+                for name, param in self.named_parameters():
+                    param.requires_grad_(name.startswith("shift_head."))
 
     def forward(self, data: AtomicDataDict.Type):
         if data.get(AtomicDataDict.EDGE_TYPE_KEY, None) is None:
@@ -519,6 +535,8 @@ class NNENV(nn.Module):
                 data[AtomicDataDict.NODE_FEATURES_KEY] += data[AtomicDataDict.NODE_ATTRS_KEY]
                 data[AtomicDataDict.EDGE_FEATURES_KEY] += data[AtomicDataDict.EDGE_ATTRS_KEY]
 
+        if self.shift_head is not None:
+            data = self.shift_head(data)
         return data
     
     @classmethod
@@ -547,6 +565,7 @@ class NNENV(nn.Module):
             "embedding": checkpoint_model_options["embedding"] if not embedding else embedding,
             "prediction": checkpoint_model_options["prediction"] if not prediction else prediction,
         }
+        model_options["shift_head"] = kwargs.pop("shift_head", checkpoint_model_options.get("shift_head"))
         common_options = dict(ckpt["config"]["common_options"])
         common_options.update(kwargs)
         for key, value in {

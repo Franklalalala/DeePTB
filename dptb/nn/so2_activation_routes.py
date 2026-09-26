@@ -433,14 +433,16 @@ def _fused_p0(module, x, packed, mole_globals, linears, schedule, grouped_gemm_m
     idx = mole_globals.topk_indices.to(device=x.device, dtype=torch.long)
     val = mole_globals.topk_values.to(device=x.device, dtype=x.dtype)
     n, k = idx.shape
-    fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False))
+    branch = getattr(mole_globals, "branch", "all")
+    fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False)) and branch == "all"
     routed = [m for m, (fc, _, _) in enumerate(linears) if fc is not None]
     # an expert bias is one more weight column against a column of ones: the GEMM adds
     # it and its gradient is the per-expert row sum of the GEMM's weight gradient
     weights = [linears[m][1] if linears[m][2] is None
                else torch.cat((linears[m][1], linears[m][2].unsqueeze(-1)), dim=-1) for m in routed]
     mixed = {}
-    for j, lay in enumerate(_slot_layouts(mole_globals, idx, module.fc_m0.num_experts, schedule)):
+    slot_layouts = [] if branch == "shared" else _slot_layouts(mole_globals, idx, module.fc_m0.num_experts, schedule)
+    for j, lay in enumerate(slot_layouts):
         xs, ptrs = [], []
         for m in routed:
             flat = packed.inputs[m].reshape(-1, packed.inputs[m].shape[-1])
@@ -474,10 +476,15 @@ def _fused_p0(module, x, packed, mole_globals, linears, schedule, grouped_gemm_m
     for m, (fc, _, _) in enumerate(linears):
         inp = packed.inputs[m]
         if fc is None:
-            raw = module.m_linear[m - 1].fc(inp)  # interpolation block
+            if branch == "routed":  # a non-MoLE block belongs to the shared branch
+                raw = inp.new_zeros(*inp.shape[:-1], 2 * module.m_linear[m - 1].num_out_channel)
+            else:
+                raw = module.m_linear[m - 1].fc(inp)  # interpolation block
         else:
-            raw = mixed[m]
-            if not fold and fc.num_shared_experts > 0:
+            raw = mixed.get(m)
+            if raw is None:
+                raw = inp.new_zeros(*inp.shape[:-1], fc.out_features)
+            if branch != "routed" and not fold and fc.num_shared_experts > 0:
                 shared_bias = fc.bias_shared.sum(0) if fc.bias_shared is not None else None
                 raw = raw + F.linear(inp, fc.weight_shared.sum(0), shared_bias)
         raws.append(packed.finish_m0(raw) if m == 0 else packed.finish_raw(m, raw))
@@ -490,7 +497,12 @@ def _pack_scatter(module, packed, mole_globals):
     for m in range(1, module.m_max + 1):
         linear = module.m_linear[m - 1]
         inp = packed.inputs[m]
-        raw = linear.fc(inp, mole_globals) if linear.is_mole else linear.fc(inp)
+        if linear.is_mole:
+            raw = linear.fc(inp, mole_globals)
+        elif getattr(mole_globals, "branch", "all") == "routed":  # a non-MoLE block belongs to the shared branch
+            raw = inp.new_zeros(*inp.shape[:-1], 2 * linear.num_out_channel)
+        else:
+            raw = linear.fc(inp)
         raws.append(packed.finish_raw(m, raw))
     return packed.scatter(y0, raws)
 
@@ -515,7 +527,8 @@ def forward(module, x, R, mole_globals, latents=None, wigner_D_all=None, *, fuse
         elif not _per_row_routing(mole_globals, x):
             _decline(FUSED_P0, "no per-row top-k routing", log_it=True)
         else:
-            fold = bool(getattr(mole_globals, "coefficients_sum_to_one", False))
+            fold = (bool(getattr(mole_globals, "coefficients_sum_to_one", False))
+                    and getattr(mole_globals, "branch", "all") == "all")
             switch = getattr(mole_globals, "top1_independent", False)
             try:
                 schedule = _gemm_schedule()

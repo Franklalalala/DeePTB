@@ -1585,6 +1585,16 @@ class RecordPipeline:
         self.target_decoder.assemble_block_tensors(ctx, atomicdata, num_nodes, num_edges)
         self.prior_decoder.validate_blocks(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.validate_full_h(ctx, atomicdata)
+        if getattr(dataset, "overlap_sidecar_root", None):
+            # Prepacked labels use the stored graph without filtering/reordering.
+            # Fail closed if a future graph transform violates that contract.
+            for key in (AtomicDataDict.EDGE_INDEX_KEY, AtomicDataDict.EDGE_CELL_SHIFT_KEY):
+                if key not in data_dict or not torch.equal(
+                    torch.as_tensor(data_dict[key]).to(atomicdata[key]), atomicdata[key]
+                ):
+                    raise ValueError("Overlap sidecar requires unchanged stored edge row order")
+            for key in (AtomicDataDict.PHYS_NODE_OVERLAP_KEY, AtomicDataDict.PHYS_EDGE_OVERLAP_KEY):
+                atomicdata[key] = data_dict[key]
         attach_spectral_targets(dataset, data_dict, atomicdata)
         self.schema_validator.mark_validated(ctx, graph)
 
