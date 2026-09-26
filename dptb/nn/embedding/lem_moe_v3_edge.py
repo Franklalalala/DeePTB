@@ -378,7 +378,7 @@ class LemMoEV3Edge(LemMoEV3):
             data["_shift_node_features"] = node_features
             data["_shift_active_edges"] = active_edges
 
-        out_node_features = self.out_node(node_features)
+        out_node_features = self._readout_node(node_features, atom_type)
         out_edge_features = self.out_edge(edge_features)
 
         if self.use_out_onehot_tp:

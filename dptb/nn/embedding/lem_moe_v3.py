@@ -1033,6 +1033,7 @@ class LemMoEV3(torch.nn.Module):
             edge_one_hot_dim: int = 128,
             use_out_onehot_tp: bool = True,
             use_layer_onehot_tp: bool = True,
+            node_readout: str = "shared",
             output_route: Optional[str] = None,
             rme_head_mode: Optional[str] = None,
             rme_fusion_rank: int = 16,
@@ -1443,6 +1444,23 @@ class LemMoEV3(torch.nn.Module):
         self.out_edge, self.out_node = build_output_heads(
             self.output_route_spec, head_context
         )
+        if node_readout not in ("shared", "chemical_core"):
+            raise ValueError("node_readout must be shared or chemical_core")
+        self.chemical_core = None
+        if node_readout == "chemical_core":
+            if self.output_route_spec.canonical_name != "legacy_rme":
+                raise ValueError("chemical_core currently requires the legacy_rme output route")
+            from dptb.nn.chemical_readout import ChemicalCoreReadout
+            # Do not perturb any later trunk/H0 initialization.
+            devices = [self.out_node.weight.device] if self.out_node.weight.is_cuda else []
+            with torch.random.fork_rng(devices=devices):
+                self.chemical_core = ChemicalCoreReadout(self.out_node, self.idp._index_to_Z)
+
+    def _readout_node(self, node_features, atom_types):
+        output = self.out_node(node_features)
+        if self.chemical_core is not None:
+            output = self.chemical_core(node_features, atom_types, output)
+        return output
 
     @property
     def out_edge_irreps(self):
@@ -1466,8 +1484,9 @@ class LemMoEV3(torch.nn.Module):
         edge_features: torch.Tensor,
         node_one_hot: torch.Tensor,
         edge_one_hot: torch.Tensor,
+        atom_types: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        out_node_features = self.out_node(node_features)
+        out_node_features = self._readout_node(node_features, atom_types)
         out_edge_features = self.out_edge(edge_features)
 
         if self.use_out_onehot_tp:
@@ -1805,7 +1824,7 @@ class LemMoEV3(torch.nn.Module):
             data["_shift_active_edges"] = active_edges
 
         out_node_features, out_edge_features = self._apply_rme_output_heads(
-            node_features, edge_features, node_one_hot, edge_one_hot
+            node_features, edge_features, node_one_hot, edge_one_hot, atom_type
         )
 
         data[_keys.NODE_FEATURES_KEY] = out_node_features

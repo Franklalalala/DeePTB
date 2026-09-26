@@ -67,6 +67,8 @@ class Trainer(BaseTrainer):
 
         # init the object
         self.model = model.to(self.device)
+        from dptb.nn.chemical_readout import initialize_chemical_readouts
+        initialize_chemical_readouts(self.model, train_datasets)
         self.num_experts = int(getattr(self.model, "num_experts", 0) or 0)
         self.activation_recompute_state = configure_activation_recompute(
             self.model,

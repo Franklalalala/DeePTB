@@ -2055,6 +2055,12 @@ def _edge_router_arguments():
     doc_edge_router_prior_stats = "Path to a frozen per-channel mean/std file for the prior descriptor (torch.save of {'mean': ..., 'std': ...}). Empty means identity. Never trained. Default: `\"\"`."
 
     return [
+        Argument("node_readout", str, optional=True, default="shared",
+                 extra_check=lambda v: v in {"shared", "chemical_core"},
+                 extra_check_errmsg="node_readout must be shared or chemical_core",
+                 doc="Onsite same-irrep chemical core. Fixed rank=16, structure support scale=100, initial shared weight cap fraction=0.25."),
+        Argument("node_readout_init_from", [str, type(None)], optional=True, default=None,
+                 doc="Fresh chemical-core build: strictly initialize the dense backbone from this checkpoint, then capture caps. Resume never reads this path."),
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
         Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),

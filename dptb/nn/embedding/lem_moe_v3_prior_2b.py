@@ -518,7 +518,7 @@ class _Prior2bMixin:
                     "do not set output_route='h_b0'."
                 )
             gnn_node, gnn_edge = self._apply_rme_output_heads(
-                node_features, edge_features, node_one_hot, active_edge_one_hot
+                node_features, edge_features, node_one_hot, active_edge_one_hot, atom_type
             )
             if y2b_node.shape[0] < gnn_node.shape[0]:
                 y2b_node = torch.cat(

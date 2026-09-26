@@ -650,6 +650,14 @@ def build_model(
                 else:
                     model = None
 
+    chemical_options = model_options.get("embedding") or {}
+    chemical_source = chemical_options.get("node_readout_init_from")
+    if from_scratch and chemical_source:
+        if chemical_options.get("node_readout", "shared") != "chemical_core":
+            raise ValueError("node_readout_init_from requires node_readout=chemical_core")
+        from dptb.nn.chemical_readout import load_dense_chemical_backbone
+        load_dense_chemical_backbone(model, chemical_source)
+
     shift_options = model_options.get("shift_head") or {}
     if from_scratch and shift_options.get("mode", "off") != "off" and shift_options.get("init_from"):
         from dptb.nn.shift_head import load_dense_backbone
