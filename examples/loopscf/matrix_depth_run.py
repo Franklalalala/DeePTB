@@ -17,6 +17,7 @@ def main():
     p.add_argument('--eval-limit',type=int,default=3000)
     p.add_argument('--resume',type=pathlib.Path)
     p.add_argument('--evaluate-only',action='store_true')
+    p.add_argument('--start-file',type=pathlib.Path)
     a=p.parse_args();a.run.mkdir(parents=True,exist_ok=True)
     sys.path.insert(0,str(a.state_helper))
     from exact_state import atomic_json,atomic_torch,append,loader_contract,epoch_iterator,snapshot,restore,digest
@@ -188,6 +189,7 @@ def main():
             del iterator
             iterator,plan,cursor,epoch_rng=epoch_iterator(t,sampler,saved)
             first=None
+        t.rebase_plugin_cadence()
         for q in t.plugin_queues.values():heapq.heapify(q)
         last_iteration_state={}
         original_call_plugins=t.call_plugins
@@ -198,6 +200,13 @@ def main():
         atomic_json(a.run/'OPTIMIZER.json',{'lr':[g['lr'] for g in t.optimizers[0].param_groups],
                   'scheduler_last_epoch':t.lr_schedulers[0].last_epoch,'trainable':sum(p.numel() for p in t.model.parameters() if p.requires_grad),
                   'parameters':sum(p.numel() for p in t.model.parameters()),'restored_parameter_states':len(t.optimizers[0].state)})
+        if a.start_file and not a.evaluate_only:
+            atomic_json(a.run/'READY.json',dict(identity,pid=os.getpid(),time=time.time()))
+            while not a.start_file.exists():
+                if stopped[0] or time.time()>=a.deadline:raise RuntimeError('formal start barrier expired')
+                time.sleep(1)
+            release=json.loads(a.start_file.read_text());assert not release.get('abort'),release
+            atomic_json(a.run/'TRAIN_START.json',dict(time=time.time(),release=release))
         torch.cuda.reset_peak_memory_stats();start=time.monotonic();last_save=start;commits=0;fetch_start=time.monotonic()
         while not a.evaluate_only:
             if first is not None:batch=first;first=None
