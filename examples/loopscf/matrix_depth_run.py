@@ -28,7 +28,8 @@ def main():
     from dptb.plugins.saver import Saver
     from dptb.plugins.monitor import Validationer
     from dptb.utils.tools import get_optimizer,get_lr_scheduler
-    from dptb.nnops.loopscf.matrix_depth import install_matrix_depth,ReplayDepth,clone_data
+    from dptb.nnops.loopscf.matrix_depth import install_matrix_depth,ReplayDepth,clone_data,matrix_predict_until_exit
+    from dptb.nnops.loopscf.stack import exit_distribution
     from dptb.nnops.loopscf.matrix_objective import attach_adaptive_matrix_loss
     assert torch.cuda.device_count()==1
     assert os.environ.get('SLURM_JOB_ID')=='81373'
@@ -65,6 +66,12 @@ def main():
 
     def evaluate(t,label,limit):
         t.model.eval();begin=time.monotonic();rows=0
+        # Native validation shuffles in single-process mode. Fix only its
+        # traversal order so every saved row is the same dataset index.
+        seq=torch.utils.data.SequentialSampler(t.validation_datasets)
+        object.__setattr__(t.validation_loader,'sampler',seq)
+        t.validation_loader.batch_sampler.sampler=seq
+        t.validation_loader_generator.manual_seed(t.validation_loader_seed)
         if a.mode!='dense':t.model._matrix_depth_K=6
         lf=t.validation_lossfunc
         sums=[dict(absolute=0.,square=0.,count=0.) for _ in range(6)]
@@ -89,7 +96,18 @@ def main():
                     curve.append(dict(k=k+1,loss=float(loss),mae=stats['absolute']/stats['count'],**stats))
                     for key in stats:sums[k][key]+=stats[key]
                 probs=pred.get('_exit_probabilities')
+                probs3=exit_distribution(pred['_stack_logits'][...,:3]) if probs is not None else None
+                early=None
+                if a.mode!='dense' and rows<8:
+                    begin_exit=time.monotonic()
+                    deployed=matrix_predict_until_exit(t.model,clone_data(data),3,0.5)
+                    torch.cuda.synchronize()
+                    selected=deployed['_exit_step']-1
+                    for key,expected in zip((A.NODE_FEATURES_KEY,A.EDGE_FEATURES_KEY),predictions[selected]):
+                        torch.testing.assert_close(deployed[key],expected,atol=1e-6,rtol=1e-5)
+                    early={'step':selected+1,'cdf':deployed['_exit_cdf'],'seconds':time.monotonic()-begin_exit}
                 append(path,{'index':rows,'curve':curve,'probabilities':probs.cpu().tolist() if probs is not None else None,
+                             'probabilities_k3':probs3.cpu().tolist() if probs3 is not None else None,'actual_early_exit':early,
                              'atom_count':int(data[A.ATOM_TYPE_KEY].numel()),'edge_count':int(data[A.EDGE_INDEX_KEY].shape[1])})
                 rows+=1
         torch.cuda.synchronize()
