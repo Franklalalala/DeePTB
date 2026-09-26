@@ -138,6 +138,7 @@ def main():
 
     def run(t,epochs=1):
         assert len(t.optimizers)==1 and not t.distributed_expert
+        assert len(t.optimizers[0].param_groups)==1, 'Update witness requires the pinned single-group optimizer'
         sampler=loader_contract(t)
         atomic_json(a.run/'DATA.json',{'train_records':len(t.train_datasets),'test_records':len(t.validation_datasets),
                                      'dynamic_batch':t.train_loader.dynamic_batch_options})
@@ -170,7 +171,11 @@ def main():
         depth_rng=ReplayDepth(3,config['common_options']['seed'])
         iterator,plan,cursor,epoch_rng=epoch_iterator(t,sampler)
         if len(sampler._cost_cache)==len(t.train_datasets):
-            atomic_json(cost_file,{'identity_hash':digest(cost_identity),'costs':sampler._cost_cache})
+            atomic_json(cost_file,{'identity_hash':digest(cost_identity),
+                                  'costs':{int(k):float(v) for k,v in sampler._cost_cache.items()}})
+            if not (a.run/'COST_CACHE.json').exists():
+                atomic_json(a.run/'COST_CACHE.json',{'created':str(cost_file),
+                            'identity_hash':digest(cost_identity),'records':len(sampler._cost_cache)})
         first=next(iterator)
         data,info=t._prepare_batch_bundle(first,with_lengths=True)
         t.model.eval()
@@ -206,7 +211,16 @@ def main():
             assert saved['depth_mode']==a.mode
             restore(t,saved,identity);depth_rng.load_state_dict(saved['depth_rng'])
             del iterator
-            iterator,plan,cursor,epoch_rng=epoch_iterator(t,sampler,saved)
+            if a.evaluate_only:
+                # Validate the immutable plan without reading its consumed prefix.
+                # Evaluation has no dependency on training-worker RNG or cursor.
+                t._set_expert_dp_sampler_epoch(t.ep)
+                plan=list(sampler);assert plan==saved['batch_plan'], 'Sampler/data order changed'
+                cursor=saved['consumed_batches'];assert 0<=cursor<=len(plan)
+                epoch_rng=saved['epoch_rng'];iterator=None
+                atomic_json(a.run/'EVAL_RESTORE.json',{'plan_verified':True,'prefix_batches_read':0,'saved_cursor':cursor})
+            else:
+                iterator,plan,cursor,epoch_rng=epoch_iterator(t,sampler,saved)
             first=None
         t.rebase_plugin_cadence()
         for q in t.plugin_queues.values():heapq.heapify(q)
