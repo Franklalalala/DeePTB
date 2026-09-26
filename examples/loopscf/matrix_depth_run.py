@@ -6,6 +6,25 @@ The helper and runtime remain read-only; every result is under --run.
 import argparse,copy,hashlib,heapq,json,math,os,pathlib,signal,socket,subprocess,sys,time
 
 
+def configure_task_ipc():
+    """Long task-only TMPDIR cannot hold multiprocessing AF_UNIX paths.
+
+    Linux abstract sockets retain multiprocessing authentication and create
+    no filesystem object outside (or inside) the task directory.
+    """
+    if sys.platform!='linux':return
+    import multiprocessing.connection as connection
+    import uuid
+    original=connection.arbitrary_address
+    def address(family):
+        if family=='AF_UNIX':return '\0loopdepth0927-'+str(os.getpid())+'-'+uuid.uuid4().hex
+        return original(family)
+    connection.arbitrary_address=address
+
+
+configure_task_ipc()
+
+
 def main():
     p=argparse.ArgumentParser()
     for name in ('config','base','run','state-helper'):
