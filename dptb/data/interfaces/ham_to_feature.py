@@ -608,8 +608,11 @@ def feature_to_block(data, idp, overlap: bool = False):
         edge_index = data[_keys.EDGE_INDEX_KEY]
         if edge_index.shape[1] > 0:
             edge_shift = data[_keys.EDGE_CELL_SHIFT_KEY]
-            src_atoms = atomic_numbers[edge_index[0].cpu()]
-            dst_atoms = atomic_numbers[edge_index[1].cpu()]
+            # transform_bond requires tensor device semantics on all NumPy /
+            # torch versions; NumPy indexing by tensors is version-dependent.
+            atomic_numbers_tensor = torch.as_tensor(atomic_numbers, dtype=torch.long)
+            src_atoms = atomic_numbers_tensor[edge_index[0].cpu()]
+            dst_atoms = atomic_numbers_tensor[edge_index[1].cpu()]
             edge_types_idx = idp.transform_bond(src_atoms, dst_atoms).flatten()
 
             if isinstance(edge_types_idx, torch.Tensor):

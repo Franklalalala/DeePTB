@@ -96,7 +96,9 @@ def _install_embedding(emb, mode, maximum):
         return layer(*state[:3], *args[3:10], state[3], *args[11:])
 
     def forward(data):
-        ctx = emb._depth_context
+        ctx = getattr(emb,'_depth_context',None)
+        if ctx is None:
+            raise RuntimeError('matrix-depth embedding requires its installed model wrapper')
         first = "template" not in ctx
         if first:
             if mode == "latent":
@@ -161,6 +163,8 @@ def install_matrix_depth(model, mode="stack", maximum=6):
     if hasattr(model, "_matrix_depth_mode"):
         raise ValueError("install on a pristine model")
     embeddings = _iter_embeddings(model)
+    if len(embeddings)!=1 or hasattr(model,'_wm_prepare'):
+        raise ValueError('matrix-depth requires a pristine single-embedding model')
     for _, emb in embeddings:
         if getattr(emb.idp, "has_soc", False) and not getattr(emb.idp, "soc_uureal_target", False):
             raise ValueError("matrix-depth SOC is qualified only for compact uu-real targets")
@@ -177,7 +181,16 @@ def install_matrix_depth(model, mode="stack", maximum=6):
     original = model.forward
     model._matrix_depth_mode = mode
     model._matrix_depth_K = 3
-    model.register_buffer("_matrix_depth_version", torch.tensor(1, device=next(model.parameters()).device))
+    codes={'stack':1,'core':2,'unshared':3,'latent':4}
+    contract={'_matrix_depth_version':2,'_matrix_depth_mode_code':codes[mode],'_matrix_depth_maximum':maximum}
+    for key,value in contract.items():
+        model.register_buffer(key,torch.tensor(value,device=next(model.parameters()).device))
+    def check_contract(module,state_dict,prefix,*_):
+        for key,value in contract.items():
+            saved=state_dict.get(prefix+key)
+            if saved is None or saved.numel()!=1 or int(saved)!=value:
+                raise RuntimeError('matrix-depth checkpoint contract mismatch: '+prefix+key)
+    model.register_load_state_dict_pre_hook(check_contract)
 
     def forward(batch):
         depth = int(model._matrix_depth_K)

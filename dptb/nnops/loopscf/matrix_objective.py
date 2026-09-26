@@ -12,7 +12,7 @@ from dptb.nnops.layout import normalize_idp_mask_layout, project_uureal_to_like
 from .stack import adaptive_objective
 
 
-def native_graph_contributions(data, ref, idp):
+def native_graph_contributions(data, ref, idp, *, intrinsic=False):
     batch = data[A.BATCH_KEY].flatten()
     ng = int(batch.max()) + 1
     result = data[A.NODE_FEATURES_KEY].new_zeros(ng)
@@ -31,6 +31,10 @@ def native_graph_contributions(data, ref, idp):
         count_g = result.new_zeros(ng).index_add(0,groups,mask.sum(-1).to(pred.dtype))
         abs_g = result.new_zeros(ng).index_add(0,groups,diff.abs().sum(-1))
         sq_g = result.new_zeros(ng).index_add(0,groups,diff.square().sum(-1))
+        if intrinsic:
+            valid=(count_g>0.5).to(pred.dtype)
+            result=result+0.25*(abs_g/count_g.clamp_min(1)+(sq_g/count_g.clamp_min(1)+1e-12).sqrt())*valid
+            continue
         mse = sq_g.sum()/count
         # Native HamilLossAbs adds 1e-12 even at perfect prediction. Allocate
         # this floor by each graph's active count to retain K1 gradients too.
@@ -41,25 +45,40 @@ def native_graph_contributions(data, ref, idp):
     return result
 
 
-def attach_adaptive_matrix_loss(criterion, beta=0.0005, adaptive_weight=0.8):
-    """Retain native masks, metric accumulators and exact K=1 reduction."""
+def attach_adaptive_matrix_loss(criterion, beta_relative=0.05, adaptive_weight=0.8):
+    """Native parameter objective, intrinsic graph signal for the exit gate.
+
+    A zero-valued surrogate routes gate gradients through each graph's own
+    masked mean error. This avoids other graphs' RMSE denominator changing
+    the preferred exit of an improving graph. Entropy has a relative scale.
+    """
     if getattr(criterion,"onsite_boost",False) or getattr(criterion,"element_average",False) or criterion.z_loss_coef:
         raise ValueError("adaptive matrix loss requires unboosted native L1/RMSE")
+    if any(getattr(criterion,k,0) for k in ('router_z_loss_coef','router_aux_loss_coef')):
+        raise ValueError('router regularization is outside the matrix-only objective')
     original = criterion.forward
     def forward(data,ref):
         rounds=data.get("_loop_preds")
         if rounds is None:
             return original(data,ref)
-        losses=[];contributions=[]
+        losses=[];contributions=[];intrinsic=[]
         for node,edge in rounds:
             pred=dict(data);pred[A.NODE_FEATURES_KEY]=node;pred[A.EDGE_FEATURES_KEY]=edge
             losses.append(original(pred,ref))
             contributions.append(native_graph_contributions(pred,ref,criterion.idp))
+            with torch.no_grad():intrinsic.append(native_graph_contributions(pred,ref,criterion.idp,intrinsic=True))
         loss=torch.stack(contributions,-1)
-        # adaptive_objective averages graphs; restore native sum scaling.
-        task,entropy=adaptive_objective(loss*loss.shape[0],data['_exit_probabilities'],beta)
+        gate_loss=torch.stack(intrinsic,-1)
+        probabilities=data['_exit_probabilities']
+        beta=beta_relative*gate_loss.mean().detach().clamp_min(1e-12)
+        gate_task,entropy=adaptive_objective(gate_loss,probabilities,beta)
+        # Preserve the reported native weighted value, using the intrinsic
+        # signal only for the gate gradient. K1 value and gradients are exact.
+        native_task=(probabilities.detach()*loss).sum()
+        task=native_task+(gate_task-gate_task.detach())-beta*entropy.mean().detach()
         criterion.depth_diagnostics={"entropy":entropy.detach(),"probabilities":data['_exit_probabilities'].detach(),
-                                     "round_native_losses":torch.stack(losses).detach(),"graph_contributions":loss.detach()}
+                                     "round_native_losses":torch.stack(losses).detach(),"graph_contributions":loss.detach(),
+                                     "gate_intrinsic_losses":gate_loss,"beta_effective":beta,"beta_relative":beta_relative}
         return adaptive_weight*task+(1-adaptive_weight)*torch.stack(losses).mean()
     criterion.forward=forward
     return criterion

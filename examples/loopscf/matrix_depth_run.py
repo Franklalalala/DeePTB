@@ -122,6 +122,24 @@ def main():
         atomic_json(a.run/'DATA.json',{'train_records':len(t.train_datasets),'test_records':len(t.validation_datasets),
                                      'dynamic_batch':t.train_loader.dynamic_batch_options})
         assert len(t.train_datasets)==29242 and len(t.validation_datasets)==3000
+        # Cache measured immutable per-record costs, never a hand-set budget.
+        # Native 128-batch calibration has already run above and stays intact.
+        root=a.run
+        while root.name!='loopdepth0927' and root!=root.parent:root=root.parent
+        assert root.name=='loopdepth0927'
+        cost_identity={'data':config['data_options']['train'],'basis':config['common_options']['basis'],
+                       'dataset_gate':hashlib.sha256((root/'outputs/DATASET_GATE.json').read_bytes()).hexdigest(),
+                       'cost_signature':sampler._cost_signature(),'records':len(t.train_datasets)}
+        cost_file=root/'cache'/('main_costs_'+digest(cost_identity)+'.json')
+        if cost_file.exists():
+            cached=json.loads(cost_file.read_text());assert cached['identity_hash']==digest(cost_identity)
+            costs={int(k):v for k,v in cached['costs'].items()}
+            assert set(costs)==set(range(len(t.train_datasets)))
+            from dptb.data.dataloader import _metadata_cost_parts
+            for idx in [0,1,127,128,731,12345,29241]:
+                assert _metadata_cost_parts(t.train_datasets,idx,sampler.cost_estimator)[0]==costs[idx]
+            sampler._cost_cache=costs
+            atomic_json(a.run/'COST_CACHE.json',{'loaded':str(cost_file),'identity_hash':digest(cost_identity),'sample_verified':7})
         # Restore original moments before adding parameters. Native continuation
         # of these finished WSD checkpoints stays at min_lr; no silent restart.
         t.optimizers[0].load_state_dict(base['optimizers_state_dict'][0])
@@ -131,6 +149,8 @@ def main():
         t.train_options['max_steps']=parent_step+a.steps
         depth_rng=ReplayDepth(3,config['common_options']['seed'])
         iterator,plan,cursor,epoch_rng=epoch_iterator(t,sampler)
+        if len(sampler._cost_cache)==len(t.train_datasets):
+            atomic_json(cost_file,{'identity_hash':digest(cost_identity),'costs':sampler._cost_cache})
         first=next(iterator)
         data,info=t._prepare_batch_bundle(first,with_lengths=True)
         t.model.eval()
@@ -163,11 +183,18 @@ def main():
         del old_optimizer
         saved=torch.load(a.resume,map_location='cpu',weights_only=False) if a.resume else None
         if saved:
+            assert saved['depth_mode']==a.mode
             restore(t,saved,identity);depth_rng.load_state_dict(saved['depth_rng'])
             del iterator
             iterator,plan,cursor,epoch_rng=epoch_iterator(t,sampler,saved)
             first=None
         for q in t.plugin_queues.values():heapq.heapify(q)
+        last_iteration_state={}
+        original_call_plugins=t.call_plugins
+        def capture_plugins(*args,**kwargs):
+            if kwargs.get('queue_name')=='iteration':last_iteration_state.update(kwargs)
+            return original_call_plugins(*args,**kwargs)
+        t.call_plugins=capture_plugins
         atomic_json(a.run/'OPTIMIZER.json',{'lr':[g['lr'] for g in t.optimizers[0].param_groups],
                   'scheduler_last_epoch':t.lr_schedulers[0].last_epoch,'trainable':sum(p.numel() for p in t.model.parameters() if p.requires_grad),
                   'parameters':sum(p.numel() for p in t.model.parameters()),'restored_parameter_states':len(t.optimizers[0].state)})
@@ -188,6 +215,7 @@ def main():
             before=t.iter;begin=time.monotonic()
             witness=commits in (0,19,99)
             previous={n:p.detach().clone() for n,p in t.model.named_parameters() if p.requires_grad} if witness else None
+            previous_lr=t.optimizers[0].param_groups[0]['lr']
             loss=t.iteration(batch);torch.cuda.synchronize()
             if t.iter==before:
                 append(a.run/'SKIPPED.jsonl',{'step':before,'cursor':cursor,'K':depth})
@@ -199,6 +227,8 @@ def main():
                  'lr':[g['lr'] for g in t.optimizers[0].param_groups],
                  'peak_allocated_bytes':torch.cuda.max_memory_allocated(),'peak_reserved_bytes':torch.cuda.max_memory_reserved(),
                  'time':time.time(),'pid':os.getpid(),'host':socket.gethostname()}
+            row['gradient_norm_before_clip']=float(last_iteration_state['total_grad_norm'])
+            row['gradient_clip_limit']=float(t.clip_grad_norm)
             if witness:
                 deltas=[(p.detach()-previous[n]).square().sum() for n,p in t.model.named_parameters() if n in previous]
                 row['parameter_delta_l2']=float(torch.stack(deltas).sum().sqrt());assert row['parameter_delta_l2']>0
@@ -206,11 +236,23 @@ def main():
                 row['maps']=maps_receipt(iterator)
                 row['nonzero_gradient_tensors']=sum(int(p.grad is not None and bool(p.grad.abs().sum()>0)) for p in t.model.parameters())
                 assert row['nonzero_gradient_tensors']>0
+                group=t.optimizers[0].param_groups[0]
+                assert group.get('expert_lr_mult',1)==1 and group.get('expert_weight_decay_mult',1)==1
+                wd=group['weight_decay']
+                nondecay=[(p.detach()-previous[n]*(1-previous_lr*wd if p.grad is not None else 1)).square().sum()
+                          for n,p in t.model.named_parameters() if n in previous]
+                row['nondecay_parameter_delta_l2']=float(torch.stack(nondecay).sum().sqrt())
+                assert row['nondecay_parameter_delta_l2']>0
+                row['optimizer_diagnostics']=t.optimizers[0].get_diagnostics()
+                gate_deltas=[(p.detach()-previous[n]).square().sum() for n,p in t.model.named_parameters() if n in previous and '.depth_gate.' in n]
+                row['gate_parameter_delta_l2']=float(torch.stack(gate_deltas).sum().sqrt()) if gate_deltas else 0.
+                del nondecay,gate_deltas
                 del previous,deltas
             diag=getattr(t.train_lossfunc,'depth_diagnostics',None)
             if diag:
                 row['entropy_mean']=float(diag['entropy'].mean());row['exit_mean']=diag['probabilities'].mean(0).tolist()
                 row['round_native_losses']=diag['round_native_losses'].tolist()
+                row['beta_effective']=float(diag['beta_effective']);row['beta_relative']=diag['beta_relative']
             append(a.run/'STEPS.jsonl',row)
             if commits%10==0 or witness:atomic_json(a.run/'HEARTBEAT.json',row)
             final=stopped[0] or time.time()>=a.deadline or before>=parent_step+a.steps

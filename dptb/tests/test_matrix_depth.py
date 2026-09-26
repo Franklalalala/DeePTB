@@ -139,3 +139,42 @@ def test_shared_independent_initialization_and_actual_early_exit():
     assert stopped['_stack_counts']==[(1,2)]
     assert sum(stopped['_observed_exit_masses'])+stopped['_remaining_survival']==pytest.approx(1.)
     assert shared._matrix_depth_K==3 and shared._matrix_depth_exit_quantile is None
+
+
+def test_checkpoint_contract_and_same_mode_roundtrip():
+    base,data=tiny(True)
+    first=install_matrix_depth(base,'core',3)
+    other,_=tiny(True);other=install_matrix_depth(other,'core',3)
+    other.load_state_dict(first.state_dict(),strict=True)
+    with torch.no_grad():
+        a=first(clone_data(data));b=other(clone_data(data))
+    for x,y in zip(a['_loop_preds'],b['_loop_preds']):
+        for u,v in zip(x,y):torch.testing.assert_close(u,v)
+    for key in ['_matrix_depth_mode_code','_matrix_depth_maximum','_matrix_depth_version']:
+        bad=dict(first.state_dict());bad[key]=bad[key]+1
+        with pytest.raises(RuntimeError,match='contract mismatch'):
+            other.load_state_dict(bad,strict=False)
+
+
+def test_gate_uses_intrinsic_graph_improvement():
+    from dptb.nnops.loss import HamilLossAbs
+    from dptb.nnops.loopscf.matrix_objective import native_graph_contributions,attach_adaptive_matrix_loss
+    model,_=tiny(True);idp=model.idp;w=idp.reduced_matrix_element
+    n1=torch.full((2,w),2.,requires_grad=True)
+    n2=torch.tensor([1.8,0.1])[:,None].expand(2,w).clone().requires_grad_()
+    e=torch.zeros(2,w,requires_grad=True)
+    data={A.BATCH_KEY:torch.tensor([0,1]),A.ATOM_TYPE_KEY:torch.tensor([[1],[1]]),
+          A.EDGE_INDEX_KEY:torch.tensor([[0,1],[0,1]]),A.EDGE_TYPE_KEY:torch.tensor([3,3]),
+          A.NODE_FEATURES_KEY:n1,A.EDGE_FEATURES_KEY:e,
+          'expert_node_mask':torch.ones(2,dtype=torch.bool),'expert_edge_mask':torch.zeros(2,dtype=torch.bool)}
+    ref={**data,A.NODE_FEATURES_KEY:torch.zeros_like(n1),A.EDGE_FEATURES_KEY:torch.zeros_like(e)}
+    before=native_graph_contributions(data,ref,idp,intrinsic=True)
+    after=native_graph_contributions({**data,A.NODE_FEATURES_KEY:n2},ref,idp,intrinsic=True)
+    assert bool((after<before).all())
+    logits=torch.zeros(2,2,requires_grad=True)
+    data['_loop_preds']=[(n1,e),(n2,e)];data['_exit_probabilities']=exit_distribution(logits)
+    criterion=attach_adaptive_matrix_loss(HamilLossAbs(idp=idp,z_loss_coef=0))
+    loss=criterion(data,ref);grad=torch.autograd.grad(loss,logits)[0]
+    assert bool((grad[:,0]>0).all()),'both graphs must prefer their improved later round'
+    changed={**data,A.NODE_FEATURES_KEY:torch.stack([n2[0],n2[1]*100])}
+    torch.testing.assert_close(native_graph_contributions(changed,ref,idp,intrinsic=True)[0],after[0])
