@@ -123,8 +123,11 @@ def test_full_spinor_blocks_roundtrip_and_reverse_conjugation():
 def test_shared_independent_initialization_and_actual_early_exit():
     from dptb.nnops.loopscf.matrix_depth import matrix_predict_until_exit
     base,data=tiny(True)
-    shared=install_matrix_depth(copy.deepcopy(base),'core',3)
-    independent=install_matrix_depth(copy.deepcopy(base),'unshared',3)
+    # Reconstruct the full model: its CG ScriptFunctions are not picklable.
+    other,_=tiny(True)
+    other.load_state_dict(base.state_dict())
+    shared=install_matrix_depth(base,'core',3)
+    independent=install_matrix_depth(other,'unshared',3)
     with torch.no_grad():
         a=shared(clone_data(data));b=independent(clone_data(data))
         for x,y in zip(a['_loop_preds'],b['_loop_preds']):
