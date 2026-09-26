@@ -2055,6 +2055,14 @@ def _edge_router_arguments():
     doc_edge_router_prior_stats = "Path to a frozen per-channel mean/std file for the prior descriptor (torch.save of {'mean': ..., 'std': ...}). Empty means identity. Never trained. Default: `\"\"`."
 
     return [
+        Argument("edge_router_scope", str, optional=True, default="edge",
+                 extra_check=lambda v: v in {"edge", "atom_after_layer0"},
+                 extra_check_errmsg="edge_router_scope must be edge or atom_after_layer0",
+                 doc="edge preserves legacy routing. atom_after_layer0 (edge_h0 only) recomputes "
+                     "four soft atom coefficients before each specified layer > 0 from current "
+                     "node invariants and cutoff-weighted symmetric prior means. Endpoint-average "
+                     "edge coefficients; gradients reach the backbone. Requires pre_activation, "
+                     "prior_activate, top_k=num_experts=4 and route_drop_p=bias_speed=0."),
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
         Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),

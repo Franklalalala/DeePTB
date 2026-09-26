@@ -30,6 +30,24 @@ class LemMoEV3Edge(LemMoEV3):
     """LEM MoE v3 variant with per-active-edge routing coefficients."""
 
     def __init__(self, **kwargs: Any):
+        self.edge_router_scope = kwargs.pop("edge_router_scope", "edge")
+        if self.edge_router_scope not in ("edge", "atom_after_layer0"):
+            raise ValueError("edge_router_scope must be edge or atom_after_layer0")
+        atom_route = self.edge_router_scope == "atom_after_layer0"
+        if atom_route:
+            # Other descendants have their own forward loops; fail rather than
+            # silently using the static edge router there.
+            if type(self).__name__ != "LemMoEV3EdgeH0":
+                raise ValueError("atom_after_layer0 requires lem_moe_v3_edge_h0")
+            if (not kwargs.get("edge_router_prior_activate", False)
+                    or kwargs.get("num_experts", 8) != 4 or kwargs.get("top_k", 1) != 4
+                    or kwargs.get("so2_expert_mixing_mode", "pre_activation") != "pre_activation"
+                    or kwargs.get("edge_router_input", "onehot_prior") != "onehot_prior"
+                    or kwargs.get("edge_router_route_drop_p", 0.0) != 0.0
+                    or kwargs.get("edge_router_bias_speed", 0.005) != 0.0
+                    or kwargs.get("edge_router_type_support", 0) != 0):
+                raise ValueError("atom_after_layer0 needs prior_activate, num_experts=top_k=4, "
+                                 "pre_activation, onehot_prior, drop_p=bias_speed=type_support=0")
         self.edge_router_top1_mode = kwargs.pop("edge_router_top1_mode", "legacy")
         if self.edge_router_top1_mode not in ("legacy", "switch"):
             raise ValueError("edge_router_top1_mode must be legacy or switch")
@@ -171,6 +189,10 @@ class LemMoEV3Edge(LemMoEV3):
         finally:
             if prev_so2_env is not None:
                 os.environ["DPTB_SO2_FUSION_MODE"] = prev_so2_env
+        if atom_route:
+            if 0 in self.so2_moe_layers:
+                raise ValueError("atom_after_layer0 requires explicit so2_moe_layers after layer 0")
+            self._atom_route_irreps = self.layers[0].irreps_out
         if self.edge_router_prior_activate:
             stray = [name for name, mod in self.named_modules()
                      if getattr(mod, "so2_fusion_mode", "staged") not in _PRIOR_ACTIVATE_ROUTES]
@@ -233,6 +255,14 @@ class LemMoEV3Edge(LemMoEV3):
             self.register_buffer("_prior_mean", mean, persistent=False)
             self.register_buffer("_prior_std", std, persistent=False)
 
+        if atom_route:
+            from dptb.nn.atom_route import invariant_width
+            self.edge_router_in_features = invariant_width(self._atom_route_irreps) + self.edge_router_prior_dim
+            # Unlike the legacy edge router, all environment/prior columns start
+            # live, so routing gradients reach layer 0 from the first update.
+            self._prior_mean = self._prior_mean.detach().clone()
+            self._prior_std = self._prior_std.detach().clone()
+            self._non_persistent_buffers_set.difference_update({"_prior_mean", "_prior_std"})
         router_type, router_kwargs = MOLERouterV3, dict(mixing_temperature=self.edge_router_temperature,
                                                          **self.edge_router_options)
         if self.edge_router_top1_mode == "switch":
@@ -252,11 +282,11 @@ class LemMoEV3Edge(LemMoEV3):
             bias_update_speed=0.0 if self.edge_router_top1_mode == "switch" else self.edge_router_bias_speed,
             **router_kwargs,
         )
-        if self.edge_router_prior_dim and self.edge_router_input == "onehot_r":
+        if not atom_route and self.edge_router_prior_dim and self.edge_router_input == "onehot_r":
             # radial columns start at zero, like the descriptor columns of the production router
             with torch.no_grad():
                 self.router.net[0].weight[:, edge_one_hot_dim:].zero_()
-        elif self.edge_router_prior_dim and self.edge_router_input == "onehot_prior":
+        elif not atom_route and self.edge_router_prior_dim and self.edge_router_input == "onehot_prior":
             # The descriptor contributes exactly zero at step 0, so it can earn
             # influence without injecting a scale shock into the gate, and
             # gradients still flow into these columns.  Note this is NOT a
@@ -332,23 +362,35 @@ class LemMoEV3Edge(LemMoEV3):
 
         active_edge_one_hot = edge_one_hot[active_edges]
         active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
-        router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
-        mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
-            router_input,
-            active_bond_type, data=data, active_edges=active_edges,
-        )
-        data["mean_max_prob"] = monitor_val
-        data["expert_load_cv"] = expert_load_cv
-        write_router_regularizers(self.router, data)
-        data["edge_moe_num_active_edges"] = torch.as_tensor(
-            active_edge_one_hot.shape[0],
-            device=active_edge_one_hot.device,
-        )
-        data["edge_moe_num_route_tokens"] = num_route_tokens
-
+        atom_route = self.edge_router_scope == "atom_after_layer0"
+        if atom_route:
+            from dptb.nn.atom_route import pool_prior
+            prior = self._gram_descriptor(self._raw_prior_source(data, bond_type, active_edges))
+            atom_prior = pool_prior(data, active_edges, prior, cutoff_coeffs, num_nodes_total)
+            mole_globals = None
+            self.last_atom_route_stats = {}
+        else:
+            router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
+            mole_globals, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
+                router_input,
+                active_bond_type, data=data, active_edges=active_edges,
+            )
+            data["mean_max_prob"] = monitor_val
+            data["expert_load_cv"] = expert_load_cv
+            write_router_regularizers(self.router, data)
+            data["edge_moe_num_active_edges"] = torch.as_tensor(
+                active_edge_one_hot.shape[0],
+                device=active_edge_one_hot.device,
+            )
+            data["edge_moe_num_route_tokens"] = num_route_tokens
         data[_keys.EDGE_OVERLAP_KEY] = latents
         wigner_D_all = None
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
+            if atom_route:
+                mole_globals = None
+                if layer_index in self.so2_moe_layers:
+                    mole_globals = self._make_atom_moe_globals(
+                        data, node_features, atom_prior, active_edges, layer_index)
             latents, node_features, edge_features, wigner_D_all = layer(
                 latents,
                 node_features,
@@ -405,6 +447,32 @@ class LemMoEV3Edge(LemMoEV3):
 
         return data
 
+    def _make_atom_moe_globals(self, data, node_features, atom_prior, active_edges, layer_index):
+        from dptb.nn.atom_route import node_invariants, edge_coefficients, record_atom_routes
+        # Init may omit trailing isolated nodes. Their environment is zero; the
+        # pool and route still have one row per actual atom.
+        if node_features.shape[0] < atom_prior.shape[0]:
+            node_features = torch.nn.functional.pad(
+                node_features, (0, 0, 0, atom_prior.shape[0] - node_features.shape[0]))
+        features = torch.cat([node_invariants(node_features, self._atom_route_irreps), atom_prior], -1)
+        alpha, monitor, cv = self.router(features)
+        route = edge_coefficients(alpha, data[_keys.EDGE_INDEX_KEY][:, active_edges])
+        data["mean_max_prob"] = monitor
+        data["expert_load_cv"] = cv
+        data["edge_moe_num_active_edges"] = alpha.new_tensor(active_edges.numel())
+        data["edge_moe_num_route_tokens"] = alpha.new_tensor(alpha.shape[0])
+        # Sum regularizers for multiple independently recomputed routed layers.
+        if self.last_atom_route_stats:
+            old_z = data["router_z_loss"]
+            write_router_regularizers(self.router, data)
+            data["router_z_loss"] = old_z + data["router_z_loss"]
+        else:
+            write_router_regularizers(self.router, data)
+        stats = record_atom_routes(alpha, data, layer_index, self.router.opt_step, self.training,
+                                   self.idp.untransform(data[_keys.ATOM_TYPE_KEY]))
+        self.last_atom_route_stats[str(layer_index)] = stats
+        return route
+
     def _edge_router_input(self, data, bond_type, active_edges, active_edge_one_hot, edge_vector):
         if not self.edge_router_prior_activate or self.edge_router_input == "onehot":
             return active_edge_one_hot
@@ -444,7 +512,16 @@ class LemMoEV3Edge(LemMoEV3):
         source = data[key].to(dtype=self.dtype)
         mask = self.idp.mask_to_erme.to(source.device)[bond_type.flatten()]
         source = source * mask.to(dtype=source.dtype)
-        source = source.index_select(1, self._prior_sort_index.to(source.device))
+        if self.edge_router_scope == "atom_after_layer0":
+            from .lem_moe_v3_h0_helpers import _h0_is_coupled_rme
+            coupled = _h0_is_coupled_rme(data)
+            if not isinstance(self.init_layer, H0InitLayer):
+                raise ValueError("atom routing requires H0InitLayer")
+            if not coupled and not self.init_layer.h0_ao_cg:
+                raise ValueError("atom routing requires h0_ao_cg=true for AO-product priors")
+            source = self.init_layer._ao_product_to_sorted_irreps(source, coupled=coupled)
+        else:
+            source = source.index_select(1, self._prior_sort_index.to(source.device))
         return source.index_select(0, active_edges)
 
     def _gram_descriptor(self, x: torch.Tensor) -> torch.Tensor:
