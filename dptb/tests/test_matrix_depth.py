@@ -68,7 +68,8 @@ def test_random_depth_checkpoint_replay_and_exit_law():
 
 
 @pytest.mark.parametrize("head",["onsite","hopping"])
-def test_graph_allocation_preserves_native_loss_and_excluded_gradients(head):
+@pytest.mark.parametrize("scale",[1.,1e-7,0.])
+def test_graph_allocation_preserves_native_loss_and_excluded_gradients(head,scale):
     from dptb.nnops.loss import HamilLossAbs
     from dptb.nnops.loopscf.matrix_objective import native_graph_contributions, attach_adaptive_matrix_loss
     model,_=tiny(True); idp=model.idp; width=idp.reduced_matrix_element
@@ -78,7 +79,8 @@ def test_graph_allocation_preserves_native_loss_and_excluded_gradients(head):
           A.EDGE_FEATURES_KEY:torch.randn(3,width,requires_grad=True),
           'expert_node_mask':torch.full((3,),head=='onsite'),
           'expert_edge_mask':torch.full((3,),head=='hopping')}
-    ref={**data,A.NODE_FEATURES_KEY:torch.randn(3,width),A.EDGE_FEATURES_KEY:torch.randn(3,width)}
+    ref={**data,A.NODE_FEATURES_KEY:data[A.NODE_FEATURES_KEY].detach()+scale*torch.randn(3,width),
+         A.EDGE_FEATURES_KEY:data[A.EDGE_FEATURES_KEY].detach()+scale*torch.randn(3,width)}
     criterion=HamilLossAbs(idp=idp,z_loss_coef=0)
     expected=criterion(data,ref)
     parts=native_graph_contributions(data,ref,idp)

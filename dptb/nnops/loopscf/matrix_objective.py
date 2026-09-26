@@ -26,12 +26,17 @@ def native_graph_contributions(data, ref, idp):
             mask = mask & data[physical].reshape(-1,1)
         mask = normalize_idp_mask_layout(idp,mask,ref[key],label=key)
         diff = (pred-ref[key])*mask
-        count = mask.sum().to(pred.dtype).clamp_min(1)
+        raw_count = mask.sum().to(pred.dtype)
+        count = raw_count.clamp_min(1)
+        count_g = result.new_zeros(ng).index_add(0,groups,mask.sum(-1).to(pred.dtype))
         abs_g = result.new_zeros(ng).index_add(0,groups,diff.abs().sum(-1))
         sq_g = result.new_zeros(ng).index_add(0,groups,diff.square().sum(-1))
         mse = sq_g.sum()/count
-        rmse = mse.clamp_min(1e-24).sqrt()
-        rmse_g = torch.where(mse>0,sq_g/(count*rmse),torch.zeros_like(sq_g))
+        # Native HamilLossAbs adds 1e-12 even at perfect prediction. Allocate
+        # this floor by each graph's active count to retain K1 gradients too.
+        rmse = (mse+1e-12).sqrt()
+        rmse_g = (sq_g+1e-12*count_g)/(count*rmse)
+        rmse_g = rmse_g*(raw_count>0.5).to(pred.dtype)
         result = result + 0.25*(abs_g/count+rmse_g)
     return result
 
