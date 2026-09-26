@@ -152,8 +152,8 @@ def _install_embedding(emb, mode, maximum):
 def install_matrix_depth(model, mode="stack", maximum=6):
     """Install on a strictly loaded base; K=1 retains its physical input path.
 
-    Full SOC and compact uu-real use their original mapper/head. Only matrix
-    output is supported. An unshared model cannot extrapolate beyond its
+    Compact SOC uu-real uses its original mapper/head. Full-spinor H0 input
+    remains unsupported by the base initializer. An unshared model cannot extrapolate beyond its
     declared independent cores; callers must not silently reuse its last core.
     """
     if mode not in ("stack", "core", "unshared", "latent") or maximum < 1:
@@ -162,6 +162,8 @@ def install_matrix_depth(model, mode="stack", maximum=6):
         raise ValueError("install on a pristine model")
     embeddings = _iter_embeddings(model)
     for _, emb in embeddings:
+        if getattr(emb.idp, "has_soc", False) and not getattr(emb.idp, "soc_uureal_target", False):
+            raise ValueError("matrix-depth SOC is qualified only for compact uu-real targets")
         if emb.__class__.__name__ not in ("LemMoEV3H0", "LemMoEV3EdgeH0") or not emb.use_h0_init:
             raise ValueError("unsupported embedding")
         if any(bool(getattr(emb, flag, False)) for flag in

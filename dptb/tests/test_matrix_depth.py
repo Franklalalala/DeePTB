@@ -25,10 +25,9 @@ def tiny(compact=True):
 
 
 @pytest.mark.parametrize("mode",["stack","core","unshared","latent"])
-@pytest.mark.parametrize("compact",[True,False])
-def test_k1_identity_and_multiround_gradients(mode,compact):
+def test_k1_identity_and_multiround_gradients(mode):
     torch.manual_seed(42)
-    model,data = tiny(compact)
+    model,data = tiny(True)
     with torch.no_grad(): expected=model(clone_data(data))
     model=install_matrix_depth(model,mode,maximum=3)
     model._matrix_depth_K=1
@@ -93,3 +92,29 @@ def test_graph_allocation_preserves_native_loss_and_excluded_gradients(head):
     after=torch.autograd.grad(actual,(data[A.NODE_FEATURES_KEY],data[A.EDGE_FEATURES_KEY]))
     for a,b in zip(before,after):torch.testing.assert_close(a,b)
     assert torch.count_nonzero(after[1 if head=='onsite' else 0])==0
+
+
+def test_full_spinor_blocks_roundtrip_and_reverse_conjugation():
+    import numpy as np
+    from dptb.data.transforms import OrbitalMapper
+    from dptb.data.interfaces.ham_to_feature import block_to_feature,feature_to_block
+    idp=OrbitalMapper({'C':'1s1p'},method='e3tb',has_soc=True,full_soc_prediction=True)
+    rng=np.random.default_rng(13)
+    rand=lambda: (rng.normal(size=(8,8))+1j*rng.normal(size=(8,8))).astype(np.complex64)
+    h1=rand();h1=h1+h1.conj().T
+    h2=rand();h2=h2+h2.conj().T
+    hop=rand()
+    blocks={'0_0_0_0_0':h1,'1_1_0_0_0':h2,'0_1_0_0_0':hop}
+    data={A.ATOMIC_NUMBERS_KEY:torch.tensor([6,6]),A.EDGE_INDEX_KEY:torch.tensor([[0,1],[1,0]]),
+          A.EDGE_CELL_SHIFT_KEY:torch.zeros(2,3,dtype=torch.long)}
+    block_to_feature(data,idp,blocks=blocks)
+    restored=feature_to_block(data,idp)
+    for key,value in blocks.items():np.testing.assert_allclose(restored[key],value,atol=2e-6)
+    if '1_0_0_0_0' in restored:
+        np.testing.assert_allclose(restored['1_0_0_0_0'],hop.conj().T,atol=2e-6)
+    # Repack both directed edges; the reverse was resolved through conjugate
+    # transpose, including exchange of ud/du and the imaginary sign.
+    explicit={**blocks,'1_0_0_0_0':hop.conj().T}
+    other={k:v for k,v in data.items() if k not in (A.NODE_FEATURES_KEY,A.EDGE_FEATURES_KEY)}
+    block_to_feature(other,idp,blocks=explicit)
+    torch.testing.assert_close(data[A.EDGE_FEATURES_KEY],other[A.EDGE_FEATURES_KEY])
