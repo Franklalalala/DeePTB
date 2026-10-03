@@ -119,6 +119,7 @@ class Eigenvalues(nn.Module):
         self.clip_diagnostics = False  # True: the fast path also records the exact residual spectrum per k (slow; for validation)
         self.last_clip_stats = None  # statistics of the last fast-path call (dict); None after a legacy-path call
         self._clip_notes = set()
+        self._assembler_cache = None  # (graph key, assemblers) of the last structure of the fast path; reused for the same graph
 
     def _clip_note(self, key, message):
         """Log a message once per instance."""
@@ -180,6 +181,8 @@ class Eigenvalues(nn.Module):
         scale = max(band_fast._absmax(x) for x in (h_node, h_edge, h0_node, h0_edge))
         kind, spin = band_fast.detect_kind(idp, (r_node, r_edge), scale, torch.finfo(dtype).eps)
         atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].flatten()
+        key = band_fast.graph_key(idp, atom_types, data[AtomicDataDict.EDGE_INDEX_KEY], data[AtomicDataDict.EDGE_CELL_SHIFT_KEY], device)
+        cached = self._assembler_cache[1] if (self._assembler_cache is not None and self._assembler_cache[0] == key) else None
         # strict FP32 inside the fast path, whatever the global matmul precision is; restored on every exit
         tf32, precision = torch.backends.cuda.matmul.allow_tf32, torch.get_float32_matmul_precision()
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -187,7 +190,8 @@ class Eigenvalues(nn.Module):
             solver = band_fast.SpectralBandSolver(
                 idp, atom_types, data[AtomicDataDict.EDGE_INDEX_KEY], data[AtomicDataDict.EDGE_CELL_SHIFT_KEY],
                 (data[self.s2k.node_field], data[self.s2k.edge_field]), (h0_node, h0_edge), (r_node, r_edge), device,
-                precision="fp64" if fp64 else "fp32", kind=kind, batched=self._clip_backend(device))
+                precision="fp64" if fp64 else "fp32", kind=kind, batched=self._clip_backend(device), assemblers=cached)
+            self._assembler_cache = (key, solver.assemblers)
             self.last_clip_stats = dict(spin)
             try:
                 levels = solver.solve(kpoints0, b=clip_b, ill_threshold=ill_threshold, fp32_min_lambda=self.fp32_min_lambda,

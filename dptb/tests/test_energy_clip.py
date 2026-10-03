@@ -433,6 +433,27 @@ def test_out_of_memory_retries_with_a_smaller_chunk(monkeypatch):
     np.testing.assert_allclose(got, ref, atol=1e-9)
 
 
+def test_assemblers_are_reused_for_the_same_graph_only():
+    toy = Toy(spin="diag", r_scale=0.05, target=2e-3)
+    mod = toy.module()
+    first = run(mod, toy.data())
+    assert mod.last_clip_stats["assemblers_reused"] is False
+    d = toy.data()  # another Hamiltonian on the same graph
+    d[A.NODE_FEATURES_KEY] = d[A.NODE_H0_KEY] + 0.5 * (d[A.NODE_FEATURES_KEY] - d[A.NODE_H0_KEY])
+    run(mod, d)
+    assert mod.last_clip_stats["assemblers_reused"] is True
+    again = run(mod, toy.data())
+    assert mod.last_clip_stats["assemblers_reused"] is True
+    assert np.array_equal(first, again)
+    assert np.array_equal(first, run(toy.module(), toy.data()))  # a fresh module (no cache) gives the same levels
+    d = toy.data()  # a different graph: drop the last edge
+    for key in (A.EDGE_FEATURES_KEY, A.EDGE_OVERLAP_KEY, A.EDGE_H0_KEY, A.EDGE_CELL_SHIFT_KEY):
+        d[key] = d[key][:-1]
+    d[A.EDGE_INDEX_KEY] = d[A.EDGE_INDEX_KEY][:, :-1]
+    run(mod, d)
+    assert mod.last_clip_stats["assemblers_reused"] is False
+
+
 def test_screen_diagnostics_find_every_out_of_bound_k_point():
     toy = Toy(spin="diag", r_scale=0.05, target=2e-3)
     mod = toy.module()

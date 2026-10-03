@@ -35,6 +35,7 @@ Assembly: ``DenseRAssembler`` turns the per-edge / per-atom orbital-pair blocks 
 structure; every k chunk is then one matrix product ``exp(-2 pi i k.R) @ H_R``.  It reproduces ``HR2HK`` (same blocks, same 0.5
 factors and ``H + H^H``; only the summation order differs).
 """
+import hashlib
 import logging
 import math
 import re
@@ -201,6 +202,17 @@ class DenseRAssembler:
         return H + H.mH
 
 
+def graph_key(idp, atom_types, edge_index, edge_shift, device):
+    """Exact identity of a structure's graph for reusing its assemblers: idp, device and the bytes of the atom types, the edge index
+    and the integer cell shifts (the only inputs of ``DenseRAssembler``)."""
+    h = hashlib.sha1()
+    for x in (atom_types.flatten(), edge_index, torch.round(edge_shift.detach().double())):
+        a = x.detach().to("cpu").long().contiguous().numpy()
+        h.update(repr(a.shape).encode())
+        h.update(a.tobytes())
+    return (id(idp), str(torch.device(device)), h.hexdigest())
+
+
 def _absmax(x):
     return max(float(x.amax()), -float(x.amin())) if x.numel() else 0.0
 
@@ -325,7 +337,7 @@ class SpectralBandSolver:
     'general' (see the module docstring; ``detect_kind`` chooses it for a residual).  ``precision`` 'fp32' (complex64) or 'fp64'.
     ``batched`` is a ``BatchedEigh`` (CUDA) or None for ``torch.linalg``."""
 
-    def __init__(self, idp, atom_types, edge_index, edge_shift, S, H0, R, device, precision="fp32", kind="uu", batched=None):
+    def __init__(self, idp, atom_types, edge_index, edge_shift, S, H0, R, device, precision="fp32", kind="uu", batched=None, assemblers=None):
         layout = feature_layout(idp)
         if layout is None:
             raise ValueError("spectral clipping does not handle this feature layout")
@@ -336,7 +348,15 @@ class SpectralBandSolver:
         self.kind, self.fp64, self.be = kind, precision == "fp64", batched
         self.rdt = torch.float64 if self.fp64 else torch.float32
         self.cdt = torch.complex128 if self.fp64 else torch.complex64
-        asm = lambda mode, uu_only=False: DenseRAssembler(idp, atom_types, edge_index, edge_shift, mode, self.device, uu_only)
+        # assemblers depend on the graph only: ``assemblers`` (from an earlier solver of the same graph, see ``graph_key``) are reused
+        self.assemblers = dict(assemblers or {})
+        self.assemblers_reused = bool(assemblers)
+
+        def asm(mode, uu_only=False):
+            if (mode, uu_only) not in self.assemblers:
+                self.assemblers[(mode, uu_only)] = DenseRAssembler(idp, atom_types, edge_index, edge_shift, mode, self.device, uu_only)
+            return self.assemblers[(mode, uu_only)]
+
         self.pS = asm("overlap")
         self.N = self.pS.N
         if kind == "scalar":
@@ -524,7 +544,7 @@ class SpectralBandSolver:
         st = self.stats = dict(path=self.kind, backend="cusolver" if self.be is not None else "torch", precision="fp64" if self.fp64 else "fp32",
                                k_total=nk, kchunk=chunk, k_flagged=0, k_clipped=0, n_clipped=0, k_ill_candidates=0, k_fp64=0, k_dropped=0,
                                n_dropped=0, n_effective_min=self.D, cusolver_fallback=0, oom_retries=0, clip_b=b, ill_threshold=ill_threshold,
-                               t_prepare_s=self.t_assemblers + time.perf_counter() - t0)
+                               t_prepare_s=self.t_assemblers + time.perf_counter() - t0, assemblers_reused=self.assemblers_reused)
         diag = []
         out = torch.empty((nk, self.D), dtype=self.rdt, device=self.device)
         t1 = time.perf_counter()
