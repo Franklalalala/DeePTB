@@ -4,9 +4,11 @@ The quantities module of GNN, with AtomicDataDict.Type as input and output the s
 This version:
   - Keeps SOC (Full H) + scalar overlap (S is NxN) compatibility by expanding S -> blockdiag(S,S) implicitly.
   - Adds ill-conditioned overlap fallback via ill_threshold projection (migrated from the second script).
+  - Spectral clipping of the Hamiltonian residual H - H0 (dptb/nn/band_fast.py) when H0 is given, off the autograd path.
 """
 
 import os  # kept for compatibility with your previous iterations (even if unused)
+import logging
 
 import torch
 import numpy as np
@@ -15,6 +17,10 @@ from dptb.nn.hr2hk import HR2HK
 from typing import Union, Optional
 from dptb.data.transforms import OrbitalMapper
 from dptb.data import AtomicDataDict
+
+log = logging.getLogger(__name__)
+
+_CLIP_FROM_INIT = object()  # forward(clip_b=...) default: the value given to __init__
 
 
 def _blockdiag_dup(mat: torch.Tensor) -> torch.Tensor:
@@ -52,7 +58,23 @@ class Eigenvalues(nn.Module):
             s_node_field: str = None,
             s_out_field: str = None,
             dtype: Union[str, torch.dtype] = torch.float32,
-            device: Union[str, torch.device] = torch.device("cpu")):
+            device: Union[str, torch.device] = torch.device("cpu"),
+            clip_b: Optional[float] = 10.0,
+            h0_node_field: str = AtomicDataDict.NODE_H0_KEY,
+            h0_edge_field: str = AtomicDataDict.EDGE_H0_KEY,
+            fp32_min_lambda: float = 1e-4,
+            kchunk: Union[str, int] = "auto",
+            eig_backend: str = "auto"):
+        """
+        clip_b:          half-width (eV) of the spectral clipping of the residual H - H0 (generalized eigenvalues of (H - H0, S));
+                         None switches the clipping off.  The clipped fast path (dptb/nn/band_fast.py) is taken only when
+                         clip_b is not None, there is an overlap matrix, the data carry H0 (h0_node_field / h0_edge_field, the
+                         same shapes as the H features) and nothing is being differentiated; every other call runs the legacy
+                         code below unchanged.
+        fp32_min_lambda: float32 only - k points whose smallest S eigenvalue is below this limit are solved in float64.
+        kchunk:          k points per chunk of the fast path, 'auto' (memory bound, at most 128) or an int.
+        eig_backend:     'auto' (batched cuSOLVER on CUDA when it can be loaded, else torch), 'cusolver' or 'torch'.
+        """
         super(Eigenvalues, self).__init__()
 
         self.h2k = HR2HK(
@@ -82,11 +104,108 @@ class Eigenvalues(nn.Module):
         self.h_out_field = h_out_field
         self.s_out_field = s_out_field
 
+        if clip_b is not None and not clip_b > 0:
+            raise ValueError(f"clip_b must be positive or None, got {clip_b!r}")
+        if eig_backend not in ("auto", "cusolver", "torch"):
+            raise ValueError(f"eig_backend must be 'auto', 'cusolver' or 'torch', got {eig_backend!r}")
+        if not (kchunk == "auto" or (isinstance(kchunk, int) and kchunk >= 1)):
+            raise ValueError(f"kchunk must be 'auto' or a positive int, got {kchunk!r}")
+        self.clip_b = clip_b
+        self.h0_node_field = h0_node_field
+        self.h0_edge_field = h0_edge_field
+        self.fp32_min_lambda = fp32_min_lambda
+        self.kchunk = kchunk
+        self.eig_backend = eig_backend
+        self.clip_diagnostics = False  # True: the fast path also records the exact residual spectrum per k (slow; for validation)
+        self.last_clip_stats = None  # statistics of the last fast-path call (dict); None after a legacy-path call
+        self._clip_notes = set()
+
+    def _clip_note(self, key, message):
+        """Log a message once per instance."""
+        if key not in self._clip_notes:
+            self._clip_notes.add(key)
+            log.info(message)
+
+    def _clip_inputs(self, data):
+        """(H0 node, H0 edge) features when the clipped fast path applies to this call, else None (legacy path).
+
+        Raises ValueError when H0 is present but not in the layout of the H features."""
+        from dptb.nn import band_fast
+
+        h_node, h_edge = data.get(self.h2k.node_field), data.get(self.h2k.edge_field)
+        if h_node is None or h_edge is None or data.get(self.s2k.node_field) is None or data.get(self.s2k.edge_field) is None:
+            return None
+        if torch.is_grad_enabled() or h_node.requires_grad or h_edge.requires_grad:
+            return None  # training / differentiation: the legacy path
+        h0_node, h0_edge = data.get(self.h0_node_field), data.get(self.h0_edge_field)
+        if h0_node is None or h0_edge is None:
+            self._clip_note("no_h0", "no H0 in data; spectral clipping skipped")
+            return None
+        if h0_node.shape != h_node.shape or h0_edge.shape != h_edge.shape:
+            raise ValueError(
+                f"spectral clipping needs H0 in the layout of the Hamiltonian features, but {self.h0_node_field!r} / {self.h0_edge_field!r} "
+                f"have shapes {tuple(h0_node.shape)} / {tuple(h0_edge.shape)} and {self.h2k.node_field!r} / {self.h2k.edge_field!r} have "
+                f"{tuple(h_node.shape)} / {tuple(h_edge.shape)}; give H0 in the same (full) layout or pass clip_b=None")
+        if band_fast.feature_layout(self.h2k.idp) is None:
+            self._clip_note("layout", "spectral clipping does not handle this orbital layout; legacy eigensolver used")
+            return None
+        return h0_node, h0_edge
+
+    def _clip_backend(self, device):
+        """The batched cuSOLVER solver for a CUDA device (eig_backend 'auto' / 'cusolver'), else None (torch.linalg)."""
+        if self.eig_backend == "torch" or device.type != "cuda":
+            return None
+        from dptb.nn.cusolver_batched import batched_eigh_available, get_batched_eigh
+
+        if self.eig_backend == "cusolver":
+            return get_batched_eigh(device)
+        return get_batched_eigh(device) if batched_eigh_available(device) else None
+
+    def _forward_clipped(self, data, nk, ill_threshold, clip_b, h0):
+        """Bands with spectral clipping of the residual (see dptb/nn/band_fast.py); same output as the legacy path."""
+        from dptb.nn import band_fast
+
+        kpoints = data[AtomicDataDict.KPOINT_KEY]
+        if kpoints.is_nested:
+            assert kpoints.size(0) == 1
+            kpoints0 = kpoints[0]
+        else:
+            kpoints0 = kpoints
+        idp, device = self.h2k.idp, torch.device(self.h2k.device)
+        fp64 = self.h2k.dtype == torch.float64
+        h_node, h_edge = data[self.h2k.node_field], data[self.h2k.edge_field]
+        h0_node, h0_edge = h0
+        dtype = torch.promote_types(h_node.dtype, h0_node.dtype)
+        r_node, r_edge = h_node.to(device, dtype) - h0_node.to(device, dtype), h_edge.to(device, dtype) - h0_edge.to(device, dtype)
+        scale = max(band_fast._absmax(x) for x in (h_node, h_edge, h0_node, h0_edge))
+        kind, spin = band_fast.detect_kind(idp, (r_node, r_edge), scale, torch.finfo(dtype).eps)
+        atom_types = data[AtomicDataDict.ATOM_TYPE_KEY].flatten()
+        # strict FP32 inside the fast path, whatever the global matmul precision is; restored on every exit
+        tf32, precision = torch.backends.cuda.matmul.allow_tf32, torch.get_float32_matmul_precision()
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            solver = band_fast.SpectralBandSolver(
+                idp, atom_types, data[AtomicDataDict.EDGE_INDEX_KEY], data[AtomicDataDict.EDGE_CELL_SHIFT_KEY],
+                (data[self.s2k.node_field], data[self.s2k.edge_field]), (h0_node, h0_edge), (r_node, r_edge), device,
+                precision="fp64" if fp64 else "fp32", kind=kind, batched=self._clip_backend(device))
+            self.last_clip_stats = dict(spin)
+            try:
+                levels = solver.solve(kpoints0, b=clip_b, ill_threshold=ill_threshold, fp32_min_lambda=self.fp32_min_lambda,
+                                      kchunk=self.kchunk, diagnose=self.clip_diagnostics, max_chunk=nk)
+            finally:
+                self.last_clip_stats = {**spin, **solver.stats}
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+            torch.set_float32_matmul_precision(precision)
+        data[self.out_field] = torch.nested.as_nested_tensor([levels])
+        return data
+
     def forward(
             self,
             data: AtomicDataDict.Type,
             nk: Optional[int] = None,
-            ill_threshold: Optional[float] = 1e-5
+            ill_threshold: Optional[float] = 1e-5,
+            clip_b: Optional[float] = _CLIP_FROM_INIT
     ) -> AtomicDataDict.Type:
         """
         Compute eigenvalues along k-points.
@@ -94,7 +213,21 @@ class Eigenvalues(nn.Module):
         ill_threshold:
           - None: legacy behavior (pure Cholesky reduction of generalized eigenproblem)
           - float: robust projection for ill-conditioned overlap S
+        clip_b: half-width (eV) of the spectral clipping of H - H0 (default: the value given to __init__); None = no clipping.
+          The clipped fast path runs when clip_b is not None, there is an overlap matrix, data carries H0 in the layout of the H
+          features and gradients are not needed; otherwise this is the legacy code, unchanged.  The fast path keeps the output
+          layout (nested eigenvalues, ascending, same dtype), fills self.last_clip_stats, does not leave H(k) / S(k) in data and
+          takes nk as an upper bound of its k chunk.  ill_threshold keeps its meaning (directions of S with eigenvalue <=
+          ill_threshold are removed and padded with 1e4 eV; None: removal only if S is not positive definite even in float64).
         """
+        self.last_clip_stats = None
+        if clip_b is _CLIP_FROM_INIT:
+            clip_b = self.clip_b
+        if clip_b is not None and self.overlap:
+            h0 = self._clip_inputs(data)
+            if h0 is not None:
+                return self._forward_clipped(data, nk, ill_threshold, clip_b, h0)
+
         kpoints = data[AtomicDataDict.KPOINT_KEY]
         if kpoints.is_nested:
             nested = True
