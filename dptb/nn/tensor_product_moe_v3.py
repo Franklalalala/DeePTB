@@ -2143,44 +2143,51 @@ class SO2_Linear(torch.nn.Module):
         return None
 
     def _direct_rotate_pack_m(self, x, m: int, wigner_D_all):
-        n, _ = x.shape
-        if m == 0:
-            parts = []
-            for (mul, (l, p)), slice_info in zip(self.irreps_in, self.irreps_in.slices()):
-                x_l = x[:, slice_info].reshape(n, mul, 2 * l + 1)
-                if l == 0 or not self.rotate_in:
-                    parts.append(x_l[:, :, l])
-                else:
-                    rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-                    parts.append(torch.einsum("ncd,nd->nc", x_l, rot_mat[:, :, l]))
-            return torch.cat(parts, dim=1)
-
+        n = x.shape[0]
+        # Split the input once. Repeated x[:, slice] views each allocate a
+        # full-width zero gradient (including the redundant leading slice).
+        specs = tuple(self.irreps_in)
+        widths = [mul * (2 * ir.l + 1) for mul, ir in specs]
+        blocks = torch.split(x, widths, dim=-1) if len(widths) > 1 else (x,)
         parts = []
-        for (mul, (l, p)), slice_info in zip(self.irreps_in, self.irreps_in.slices()):
+        for (mul, (l, p)), block in zip(specs, blocks):
             if l < m:
                 continue
-            x_l = x[:, slice_info].reshape(n, mul, 2 * l + 1)
-            local_rows = [l - m, l + m]
-            if not self.rotate_in:
-                pair = x_l[:, :, local_rows]
+            x_l = block.reshape(n, mul, 2 * l + 1)
+            if m == 0:
+                if l == 0 or not self.rotate_in:
+                    parts.append(x_l.select(-1, l))
+                else:
+                    rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+                    parts.append(torch.einsum("ncd,nd->nc", x_l, rot_mat.select(-1, l)))
             else:
-                rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-                pair = torch.einsum("ncd,ndp->ncp", x_l, rot_mat[:, :, local_rows])
-            parts.append(pair)
+                local_rows = [l - m, l + m]
+                if not self.rotate_in:
+                    pair = x_l.index_select(-1, torch.tensor(local_rows, device=x.device))
+                else:
+                    rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
+                    pair = torch.einsum("ncd,ndp->ncp", x_l, rot_mat[:, :, local_rows])
+                parts.append(pair)
+        if m == 0:
+            return torch.cat(parts, dim=1)
         return torch.cat(parts, dim=1).transpose(1, 2).contiguous()
 
     def _accumulate_m0_output(self, out, y_m0, wigner_D_all):
         n = out.shape[0]
-        channel_start = 0
-        for (mul, (l, p)), slice_info in zip(self.irreps_out, self.irreps_out.slices()):
-            y_l = y_m0[:, channel_start:channel_start + mul]
-            channel_start += mul
-            out_l = out[:, slice_info].reshape(n, mul, 2 * l + 1)
+        specs = tuple(self.irreps_out)
+        blocks = torch.split(y_m0, [mul for mul, _ in specs], dim=-1) if len(specs) > 1 else (y_m0,)
+        parts = []
+        for (mul, (l, p)), y_l in zip(specs, blocks):
             if l == 0 or not self.rotate_out:
-                out_l[:, :, l] += y_l
+                zero = torch.zeros_like(y_l)
+                contribution = torch.stack([y_l if i == l else zero for i in range(2 * l + 1)], dim=-1)
             else:
                 rot_mat = _select_wigner_block(wigner_D_all, l, self.offsets, self.dims)
-                out_l += y_l.unsqueeze(-1) * rot_mat[:, :, l].unsqueeze(1)
+                contribution = y_l.unsqueeze(-1) * rot_mat.select(-1, l).unsqueeze(1)
+            parts.append(contribution.reshape(n, mul * (2 * l + 1)))
+        # Keep the caller's in-place accumulation contract, but assemble once
+        # instead of building a CopySlices chain on views of the output buffer.
+        out.add_(torch.cat(parts, dim=-1))
 
     def _accumulate_m_output(self, out, y_m, m: int, wigner_D_all):
         n = out.shape[0]
