@@ -22,7 +22,7 @@ UniTB-dense 通过 `so2_backend.dense_forward` 调用 SO2CUDA 的 `dense_pairs`�
 | `DPTB_SO2_FUSION_MODE` | 在未显式给出模型选项时选择 MoE SO2 路线。 |
 | `DPTB_MOLE_LINEAR_MODE` | 在未显式给出模型选项时选择专家线性路线。 |
 | `DPTB_SO2_M_LINEAR_MODE` | 在未显式给出参数时选择 true-dense 路线；`cuda_pack_scatter_multi` 映射为默认路线。 |
-| `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE` | 由 SO2CUDA 解析；生产值为 `scalar` 或 `indexed_sandwich_multi`。 |
+| `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE` | 由 SO2CUDA 解析；默认 `indexed_sandwich_multi`，设为 `scalar` 可与 SO2CUDA 0.2.0 之前的运行逐位一致。 |
 | `DPTB_SO2_ACTIVATION_FUSED_P0` | 值为 `0` 时关闭激活空间融合。 |
 | `DPTB_SO2_ACTIVATION_FUSED_P0_GEMM` | SO2CUDA 激活空间调度，生产默认 `per_slot`。 |
 | `DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES` / `MAX_EDGES` | true-dense 加速边数范围；优先于 `SO2_CUDA_MIN_EDGES` / `MAX_EDGES`，`0` 不设限。 |
