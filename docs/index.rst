@@ -4,7 +4,7 @@ DeePTB 文档
 
 DeePTB 提供 Slater–Koster 模型与等变原子轨道算符预测，支持哈密顿量、密度矩阵、重叠矩阵、自旋轨道耦合以及电子结构后处理。
 
-``1006-stable`` 是本仓库的维护分支。UniTB 支持 dense 与 X1 配置；上游无先验 ``lem`` / ``slem`` 与带先验基线独立维护。SO2CUDA 是可选加速组件，LoopSCF 在独立仓库中使用 DeePTB 的通用接口。
+``1006-stable`` 是本仓库的维护分支。UniTB 默认使用 PDQ-MoE，并支持单专家的 UniTB-dense 配置；上游无先验 ``lem`` / ``slem`` 与带先验基线独立维护。SO2CUDA 是可选加速组件，LoopSCF 在独立仓库中使用 DeePTB 的通用接口。
 
 .. toctree::
    :maxdepth: 2

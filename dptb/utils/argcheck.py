@@ -1987,9 +1987,9 @@ def _disabled_embedding_option(name):
 
 def unitb():
     """UniTB architecture and paper-control options with production defaults."""
-    from dptb.nn.embedding.unitb_options import X1_DEFAULTS, DENSE_DEFAULTS, ALIASES
+    from dptb.nn.embedding.unitb_options import UNITB_DEFAULTS, DENSE_DEFAULTS, ALIASES
 
-    names = set(X1_DEFAULTS) | {
+    names = set(UNITB_DEFAULTS) | {
         "PolynomialCutoff_p", "cutoff_type", "norm_eps", "r_start_cos_ratio",
         "sh_normalized", "sh_normalization", "res_update", "res_update_ratios_learnable",
         "use_out_onehot_tp", "use_layer_onehot_tp", "so2_wigner_apply_mode",
@@ -2010,9 +2010,9 @@ def unitb():
     }
     result = [arg for arg in slem_edge_h0() if arg.name in names]
     for arg in result:
-        if arg.name in X1_DEFAULTS:
+        if arg.name in UNITB_DEFAULTS:
             arg.optional = True
-            arg.default = X1_DEFAULTS[arg.name]
+            arg.default = UNITB_DEFAULTS[arg.name]
         if arg.name in DENSE_DEFAULTS or arg.name in ALIASES.values():
             # Preserve omission for constructor-dependent defaults and aliases.
             arg.optional = True

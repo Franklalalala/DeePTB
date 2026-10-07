@@ -14,12 +14,12 @@ DeePTB 用深度学习构建紧束缚模型及原子轨道基下的哈密顿量�
 | --- | --- |
 | DeePTB-SK | Slater–Koster 参数化及局域环境修正 |
 | DeePTB-E3 | 等变原子轨道算符预测；保留上游标准 embedding 接口 |
-| UniTB | `unitb` embedding；包含 UniTB-dense 与 UniTB-X1 配置，X1 使用 PDQ-MoE，兼容既有生产检查点 |
+| UniTB | `unitb` embedding；默认使用 PDQ-MoE，单专家配置为 UniTB-dense；兼容既有生产检查点 |
 | `lem`、`slem` | 上游不接受先验输入的基线 |
 | `lem_prior`、`slem_prior` | 接受先验输入的基线 |
 | `h0`、`dptb.nacf` | 物理 H0 与 NACF 先验构建、缓存和推理 |
 
-UniTB-X1 使用 **H₀-routed shared-basis mixture of experts (PDQ-MoE)**，即 H₀ 先验路由的共享基底专家混合。新配置用 `{"method":"unitb"}` 选择 X1 默认 embedding，增加 `"num_experts":1` 选择 dense；电荷平衡头与训练先验加噪单独配置。详见 [UniTB](docs/unitb.md) 与 [配置示例](examples/unitb/README.md)。
+UniTB 使用 **H₀-routed shared-basis mixture of experts (PDQ-MoE)**，即 H₀ 先验路由的共享基底专家混合。新配置用 `{"method":"unitb"}` 选择 UniTB 默认 embedding，增加 `"num_experts":1` 得到 UniTB-dense；电荷平衡头与训练先验加噪单独配置。详见 [UniTB](docs/unitb.md) 与 [配置示例](examples/unitb/README.md)。
 
 `lem` / `slem` 与固定上游版本的实现保持原样，不接受先验；需要先验时使用 `lem_prior` / `slem_prior`。先验来源、缺失行为和旧检查点兼容约定见 [基线说明](docs/embedding_baselines.md)。
 
@@ -59,7 +59,7 @@ python tools/test.py dptb/tests/test_record_codec.py
 
 ## English
 
-`1006-stable` provides UniTB dense and X1 embeddings, upstream LEM/SLEM, and separate prior-aware baselines. X1 uses an H₀-routed shared-basis mixture of experts (PDQ-MoE). Legacy checkpoints retain their original parameter names and effective configurations. SO2CUDA 0.2.0 is optional: eligible CUDA inputs use its kernels automatically; the PyTorch reference path remains available. LoopSCF is maintained in its own repository and depends on this DeePTB branch.
+`1006-stable` provides the UniTB embedding, upstream LEM/SLEM, and separate prior-aware baselines. UniTB uses an H₀-routed shared-basis mixture of experts (PDQ-MoE); its single-expert configuration is UniTB-dense. Legacy checkpoints retain their original parameter names and effective configurations. SO2CUDA 0.2.0 is optional: eligible CUDA inputs use its kernels automatically; the PyTorch reference path remains available. LoopSCF is maintained in its own repository and depends on this DeePTB branch.
 
 ## 文档与引用
 

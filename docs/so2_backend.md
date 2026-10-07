@@ -4,30 +4,29 @@ SO2 参数、路由和纯 PyTorch 参考计算保留在 DeePTB。可选的 SO2CU
 
 安装 SO2CUDA 后，符合 CUDA FP32、布局与路由条件的层自动调用 `so2_cuda_ops.deeptb`。CPU、其他 dtype、autocast、几何求导、非线性插值块、`torch.func` 或缺少可选包时使用参考实现，并按原因记录一次回退日志。原生执行错误会直接抛出，便于发现配置或工具链问题。
 
-UniTB-dense 通过 `so2_backend.dense_forward` 调用 SO2CUDA 的 `dense_pairs`，保持 m=0 与逐 m 的累加次序；UniTB-X1 使用激活空间融合和分组 GEMM，保留每个 top-k 槽的非线性与加权顺序。true-dense 层使用 SO2CUDA 的 `true_dense_pairs` 接口；没有该接口的旧包会回退。
+UniTB-dense 通过 `so2_backend.dense_forward` 调用 SO2CUDA 的 `dense_pairs`，保持 m=0 与逐 m 的累加次序；UniTB（PDQ-MoE）使用激活空间融合和分组 GEMM，保留每个 top-k 槽的非线性与加权顺序。true-dense 层使用 SO2CUDA 的 `true_dense_pairs` 接口；没有该接口的旧包会回退。
 
 ## 配置
 
 | 设置 | 作用 |
 |---|---|
-| `SO2_CUDA_BACKEND=auto` | 默认自动选择；设为 `off` 强制参考实现。旧值 `none`、`torch` 等同 `off`。 |
-| `so2_fusion_mode=streamed_m_major_fused_p0` | UniTB 的生产配置；保留 `staged`、`streamed_m_major_ref` 和 grouped 参考路线。 |
+| `SO2_CUDA_BACKEND=auto` | 默认自动选择；设为 `off` 强制参考实现。 |
+| `so2_fusion_mode=streamed_m_major_fused_p0` | UniTB 默认；没有可用加速时使用分组 PyTorch 实现，`staged`、`streamed_m_major_ref` 为可选的 PyTorch 参考路线。 |
 | `mole_linear_mode=cublas_grouped` | 专家线性层通过同一可选后端调用分组 GEMM。 |
 | `so2_m_linear_mode=indexed_sandwich_cuda_multi` | 扩展 true-dense 层的默认路线；`standard` 使用 PyTorch。 |
 
-兼容现有启动脚本的变量如下；无需全部设置：
+以下环境变量可在不改配置时选择路线，均可不设：
 
-| 旧变量 | 处理 |
+| 变量 | 作用 |
 |---|---|
 | `DPTB_SO2_FUSION_MODE` | 在未显式给出模型选项时选择 MoE SO2 路线。 |
 | `DPTB_MOLE_LINEAR_MODE` | 在未显式给出模型选项时选择专家线性路线。 |
-| `DPTB_SO2_M_LINEAR_MODE` | 在未显式给出参数时选择 true-dense 路线；`cuda_pack_scatter_multi` 映射为默认路线。 |
-| `DPTB_SO2_MOE_FUSED_P0_FORWARD_MODE` | 由 SO2CUDA 解析；默认 `indexed_sandwich_multi`，设为 `scalar` 可与 SO2CUDA 0.2.0 之前的运行逐位一致。 |
+| `DPTB_SO2_M_LINEAR_MODE` | 在未显式给出参数时选择 true-dense 路线。 |
 | `DPTB_SO2_ACTIVATION_FUSED_P0` | 值为 `0` 时关闭激活空间融合。 |
-| `DPTB_SO2_ACTIVATION_FUSED_P0_GEMM` | SO2CUDA 激活空间调度，生产默认 `per_slot`。 |
+| `DPTB_SO2_ACTIVATION_FUSED_P0_GEMM` | SO2CUDA 激活空间调度，默认 `per_slot`。 |
 | `DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES` / `MAX_EDGES` | true-dense 加速边数范围；优先于 `SO2_CUDA_MIN_EDGES` / `MAX_EDGES`，`0` 不设限。 |
 
-`DPTB_SO2_FUSE_M_CUBLAS`、`DPTB_SO2_SORTED_EDGE_VIEW`、persistent、scheduled、materialized 和 CUTLASS 实验开关不再选择 DeePTB 路线。SO2CUDA 的构建目录和精度变量由该包维护，例如 `SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR`、`SO2_CUDA_FAST_TF32`。严格 FP32 使用 `SO2_CUDA_FAST_TF32=0`。
+SO2CUDA 的构建目录和精度变量由该包维护，例如 `SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR`、`SO2_CUDA_FAST_TF32`。严格 FP32 使用 `SO2_CUDA_FAST_TF32=0`。
 
 ## 张量积调用
 

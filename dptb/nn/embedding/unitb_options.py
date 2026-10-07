@@ -4,7 +4,7 @@ import logging
 
 log = logging.getLogger(__name__)
 
-X1_DEFAULTS = {
+UNITB_DEFAULTS = {
     "n_layers": 3, "n_radial_basis": 128, "r_max": 7.408480947893776,
     "irreps_hidden": "128x0e+24x1o+16x2e+16x3o+32x4e+24x5o+48x6e",
     "avg_num_neighbors": 80, "env_embed_multiplicity": 10,
@@ -69,7 +69,7 @@ def unitb_options(options, *, legacy=False):
             active = bool(value.get("enabled", False)) if isinstance(default, dict) else value != default
             if active:
                 raise ValueError(f"{key} belongs to an archived model, not UniTB")
-        defaults = deepcopy(X1_DEFAULTS)
+        defaults = deepcopy(UNITB_DEFAULTS)
         if options.get("num_experts", 4) == 1:
             defaults.update(DENSE_DEFAULTS)
         structure = options.get("structure_mole") or {}

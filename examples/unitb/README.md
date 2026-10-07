@@ -1,6 +1,6 @@
 # UniTB 训练入口示例
 
-`dense/input.json` 与 `x1/input.json` 通过仓库的标准训练配置入口读取。
+`input.json`（UniTB）与 `dense/input.json`（UniTB-dense）通过仓库的标准训练配置入口读取。
 embedding 只列出与默认不同的选项。示例是 H/O、compact uu-real、H−H0 监督，
 请把 basis 改成数据的真实轨道基组，保留其 SOC 与表示约定；不要只替换元素名称。
 
@@ -11,9 +11,9 @@ embedding 只列出与默认不同的选项。示例是 H/O、compact uu-real、
 加载后得到 `node_h0/edge_h0`。示例 target_kind=h0res，监督对象是 ΔH。
 逐元素截断半径须与数据配方相符，可在 embedding.r_max 中提供字典。
 
-X1 还需将 `OVERLAP_ROOT` 换为物理 overlap sidecar 根目录。每个 split 的
+UniTB 示例还需将 `OVERLAP_ROOT` 换为物理 overlap sidecar 根目录。每个 split 的
 shard/key、结构身份和边顺序须与主数据对应；侧车提供物理 `S`，不是网络 latent。
-两份示例通过 distance_ranges 只监督 onsite。X1 启用 QEq 局部电荷头和
+两份示例通过 distance_ranges 只监督 onsite。UniTB 示例启用 QEq 局部电荷头和
 onsite 尺度的训练加噪。hopping 配方把
 `te_prior_sigma` 改为 5，并使用主训练入口已有的距离/标签掩码；不要靠加噪配置
 代替距离专家的监督掩码。完整训练超参数与批次设置由实验配方决定。

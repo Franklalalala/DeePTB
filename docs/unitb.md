@@ -5,25 +5,25 @@ UniTB 把 dense 与逐边先验路由模型放在同一个 embedding 中。配�
 `dptb.nn.embedding.unitb.UniTB`。主干依次执行几何编码、先验初始化、路由、
 消息传递与 Hamiltonian 输出。初始化层、交互层和先验投影只有一份实现。
 
-## dense 与 X1
+## 默认配置与 UniTB-dense
 
-X1 embedding 使用默认配置：
+UniTB 默认配置（PDQ-MoE）：
 
 ```json
 {"method": "unitb"}
 ```
 
-dense 自动选择一个 full 专家、无共享专家、top-1、均匀通道和类型路由：
+UniTB-dense 自动选择一个 full 专家、无共享专家、top-1、均匀通道和类型路由：
 
 ```json
 {"method": "unitb", "num_experts": 1}
 ```
 
-显式配置覆盖默认值。X1 默认为 3 层、latent_dim=128、平均邻居数 80，
+显式配置覆盖默认值。UniTB 默认为 3 层、latent_dim=128、平均邻居数 80，
 隐藏通道为 `128x0e+24x1o+16x2e+16x3o+32x4e+24x5o+48x6e`；
-dense 为每阶 32 通道。截断半径可以是标量或逐元素字典；加载旧模型时保留其
+UniTB-dense 为每阶 32 通道。截断半径可以是标量或逐元素字典；加载旧模型时保留其
 原始字典。`use_interpolation_out` 控制末层插值 MLP，默认关闭；训练过该选项
-的 dense 检查点必须继续使用原值。
+的 UniTB-dense 检查点必须继续使用原值。
 
 完整数据入口例子见 [examples/unitb](../examples/unitb/README.md)。
 电荷头和训练加噪属于模型/训练配置，不因选择 embedding 而自动启用。
@@ -85,7 +85,7 @@ Switch 需要 `top_k=1`、`num_shared_experts=0`，并使用其自己的原始�
 数据提供 `node_h0`、`edge_h0`；也可以用 `h0_node_key`、`h0_edge_key`
 指向兼容表示的其他物理先验。公共模块 `prior_common` 负责 AO/CG 表示与
 排序投影。路由器直接读取显式先验，缺失时报错，不回退到监督标签。
-X1 的时间条件在普通监督训练/验证中均使用 t=0。
+UniTB 的时间条件在普通监督训练/验证中均使用 t=0。
 
 ```json
 {"shift_head": {"mode": "atom", "response": {"kind": "qeq"}}}
@@ -115,7 +115,7 @@ hopping `(v_i+v_j) S_ij/2`，遵循原 active-edge 与距离专家掩码。
 `te_prior_sigma` 是噪声尺度：onsite 配方为 0.5，hopping 配方为 5。
 `te_prior_scale_reference=target` 使用当前监督 ΔH 的 RMS。
 标准训练 schema 的 `te_prior_scale_reference` 默认是 `residual`、
-`te_prior_sigma` 默认是 1，因此 X1 示例显式设置这两个字段。
+`te_prior_sigma` 默认是 1，因此 UniTB 示例显式设置这两个字段。
 同时设置 `flow_options.t_max=0`；`t_min` 与 `t0_probability` 保持为 0。
 历史配置中的关闭状态仍可读取；启用 flow 训练或 ODE 会明确报错。
 
@@ -137,20 +137,20 @@ PDQ-MoE。历史图路由 `LemMoEV3`/`LemMoEV3H0` 保留自己的 forward 与层
 
 ## 可选 CUDA 后端
 
-DeePTB 不依赖 SO2CUDA 才能运行。安装 SO2CUDA 0.2.0 后，默认 `SO2_CUDA_BACKEND=auto` 对受支持的 CUDA/FP32 输入自动使用加速；`SO2_CUDA_BACKEND=off` 选择 PyTorch 参考路径。完整开关和限制见 [SO2 后端](so2_backend.md)，dense/X1 的三行加速测试见 [SO2CUDA README](https://github.com/Franklalalala/SO2CUDA#dense-与-x1-加速测试)。
+DeePTB 不依赖 SO2CUDA 才能运行。安装 SO2CUDA 0.2.0 后，默认 `SO2_CUDA_BACKEND=auto` 对受支持的 CUDA/FP32 输入自动使用加速；`SO2_CUDA_BACKEND=off` 选择 PyTorch 参考路径。完整开关和限制见 [SO2 后端](so2_backend.md)，UniTB 与 UniTB-dense 的加速测试见 [SO2CUDA README](https://github.com/Franklalalala/SO2CUDA#readme)。
 
-单专家 dense 通过 `so2_backend.dense_forward` 使用 `dense_pairs`；X1 使用 activation fused-P0 与分组 GEMM。旧接口名保留用于兼容，不能据名称推断已执行的路线。CPU 与 CUDA 在 cutoff 边界附近的活动边选择可能不同，个别边输出不等价；检查点等价性按同设备验证。
+UniTB-dense 通过 `so2_backend.dense_forward` 使用 `dense_pairs`；UniTB 使用 activation fused-P0 与分组 GEMM。旧接口名保留用于兼容，不能据名称推断已执行的路线。CPU 与 CUDA 在 cutoff 边界附近的活动边选择可能不同，个别边输出不等价；检查点等价性按同设备验证。
 
 ## English
 
-UniTB unifies dense and X1 prior-conditioned embeddings. X1 uses an
-H₀-routed shared-basis mixture of experts (PDQ-MoE):
+UniTB unifies dense and edge-routed prior-conditioned embeddings. Its default
+uses an H₀-routed shared-basis mixture of experts (PDQ-MoE):
 `W(e) = W_s + Σ_{k∈top-2(e)} g_k(e) P D_k Qᵀ`.
 Each routed SO(2) linear has one full-rank shared expert, shared rank-64 bases,
 and four independent cores. Bond-type and H₀ CG Gram features select two experts;
 renormalized gates mix linear outputs before activation.
 
-Use `{"method":"unitb"}` for X1 defaults or add `"num_experts":1` for dense.
+Use `{"method":"unitb"}` for the UniTB defaults or add `"num_experts":1` for UniTB-dense.
 Explicit options override defaults. Charge equilibration and training-only prior
 noise are configured separately. The charge solve is neutral per structure;
 `qeq_local` controls local readout plus electrostatic response, and the
