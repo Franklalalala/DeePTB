@@ -22,6 +22,6 @@ def main():
    base['train_options']['distance_ranges']=[[0., 1e-6]] if arm=='onsite' else [[1e-6, 10.]]
    base['train_options']['clip_last_expert_range']=arm=='onsite'
    for stage in ['s1','s2']:
-    d=make(base,route,stage,a.data,a.max_samples);path=out/f'{route}.{arm}.{stage}.json';path.write_text(json.dumps(d,indent=2)+'\n');manifest[path.name]={'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'route':route,'stage':stage,'arm':arm,'max_samples':d['train_options']['dynamic_batch']['max_samples'],'validation':'generated_not_hanhai_gpu_validated'}
+    d=make(base,route,stage,a.data,a.max_samples);path=out/f'{route}.{arm}.{stage}.json';path.write_text(json.dumps(d,indent=2)+'\n');manifest[path.name]={'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'route':route,'stage':stage,'arm':arm,'max_samples':d['train_options']['dynamic_batch']['max_samples'],'validation':'generated_not_gpu_validated'}
  (out/'CONFIG_MANIFEST.json').write_text(json.dumps(manifest,indent=2));print('generated',len(manifest),'configs')
 if __name__=='__main__':main()

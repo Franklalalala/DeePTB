@@ -295,8 +295,7 @@
       "enabled": false,
       "preserve_rng_state": false,
       "targets": [
-        "lem_moe_v3_tp",
-        "lem_non_linear_expert_block"
+        "lem_moe_v3_tp"
       ],
       "use_reentrant": false
     },

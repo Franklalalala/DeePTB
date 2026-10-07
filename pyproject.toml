@@ -32,7 +32,10 @@ seekpath = "*"
 pandas = "*"
 openpyxl = "*"
 seaborn = "*"
-so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main" }
+so2-cuda-ops = { git = "https://github.com/Franklalalala/SO2CUDA.git", branch = "main", optional = true }
+
+[tool.poetry.extras]
+so2 = ["so2-cuda-ops"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.2.0"
@@ -64,12 +67,6 @@ optional = true
 [tool.poetry.group.3Dfermi.dependencies]
 ifermi = "*"
 pymatgen = "*"
-
-[tool.poetry.group.tbtrans_init]
-optional = true
-
-[tool.poetry.group.tbtrans_init.dependencies]
-sisl = "*"
 
 [tool.poetry.group.pybinding]
 optional = true
