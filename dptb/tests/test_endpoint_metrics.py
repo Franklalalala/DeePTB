@@ -128,45 +128,14 @@ def test_nonflow_per_iteration_scheduler_uses_objective_while_public_loss_is_end
     assert state["train_loss_opt"].item() == pytest.approx(2.0)
 
 
-def test_flow_per_iteration_scheduler_keeps_endpoint_metric(monkeypatch):
-    trainer, observed_states = make_fake_trainer(monkeypatch)
-    trainer.flow_cfm = SimpleNamespace(enabled=True)
-    trainer.update_lr_per_iter = True
-    trainer.iter = 2
-    trainer.stats = {
-        "train_loss": {"latest_avg_iter_loss": torch.tensor(91.0)},
-        "train_loss_opt": {"latest_avg_iter_loss": torch.tensor(17.0)},
-    }
-    trainer.lr_scheduler = RecordingMetricScheduler()
-
-    def fake_flow_loss(batch, lossfunc, *, use_flow=True, allow_self_consistency=True):
-        trainer._last_flow_state = {
-            "train_loss": torch.tensor(13.0),
-            "train_onsite_loss": torch.tensor(14.0),
-            "train_hopping_loss": torch.tensor(15.0),
-        }
-        return trainer.model.weight * batch.x
-
-    trainer._loss_on_batch = fake_flow_loss
-
-    objective = trainer.iteration(FakeBatch("train", 2.0))
-
-    assert trainer.lr_scheduler.metrics == pytest.approx([91.0])
-    assert objective.item() == pytest.approx(2.0)
-    state = observed_states[0][2]
-    assert state["train_loss"].item() == pytest.approx(13.0)
-    assert state["train_loss_opt"].item() == pytest.approx(2.0)
-
-
 # ---------------------------------------------------------------------------
 # epoch scheduler: Trainer prefers the objective, MultiTrainer the endpoint,
 # flow always prefers the endpoint regardless of the class default
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     ("trainer_cls", "flow_enabled", "expected_metric"),
-    [(Trainer, False, 19.0), (Trainer, True, 11.0), (MultiTrainer, False, 11.0)],
-    ids=["single_trainer_prefers_objective", "single_trainer_flow_prefers_endpoint",
-         "multi_trainer_prefers_endpoint"],
+    [(Trainer, False, 19.0), (MultiTrainer, False, 11.0)],
+    ids=["single_trainer_prefers_objective", "multi_trainer_prefers_endpoint"],
 )
 def test_epoch_scheduler_respects_single_trainer_objective_contract(trainer_cls, flow_enabled, expected_metric):
     scheduler = RecordingMetricScheduler()
@@ -196,18 +165,10 @@ def test_epoch_scheduler_respects_single_trainer_objective_contract(trainer_cls,
 @pytest.mark.parametrize(
     ("state", "expected_value", "same_object_as"),
     [
-        ({"validation_compatible_euler_3_loss": 7.0}, 7.0, None),
-        ({"validation_loss": 5.0, "validation_compatible_euler_1_loss": 2.0,
-          "validation_compatible_euler_3_loss": 7.0}, 5.0, "validation_loss"),
-        ({"validation_flow_random_t_loss": 9.0}, None, "accumulated"),
+        ({"validation_loss": 5.0}, 5.0, "validation_loss"),
         ({}, None, "accumulated"),
-        ({"validation_compatible_euler_5_loss": 50.0, "validation_compatible_euler_2_loss": 20.0,
-          "validation_compatible_euler_10_loss": 100.0}, 20.0, None),
-        ({"validation_compatible_euler_x_loss": 99.0, "validation_compatible_euler_4_loss": 4.0}, 4.0, None),
     ],
-    ids=["euler_used_when_legacy_absent", "legacy_takes_precedence_byte_identical",
-         "falls_through_no_compatible_key", "falls_through_empty_state",
-         "smallest_num_steps_wins_numeric_not_lexical", "non_numeric_suffix_ignored"],
+    ids=["public_endpoint", "accumulated_without_endpoint"],
 )
 def test_validation_return_resolves_fail_closed(state, expected_value, same_object_as):
     tensors = {key: torch.tensor(value) for key, value in state.items()}
@@ -518,18 +479,3 @@ def test_h11_display_window_expert_metric_averages_only_over_fired_steps():
     # raw active telemetry: mean over BOTH window steps (unchanged by throttling).
     assert active_nodes.item() == pytest.approx(_ACTIVE_NODES)
     assert active_edges.item() == pytest.approx(_ACTIVE_EDGES)
-
-
-def test_h11c_payload_metrics_never_source_onsite_from_flow_namespace():
-    """The compatible onsite/hopping payload must come from the compatible metric,
-    never the flow-namespaced train_flow_* value: the namespaces are disjoint."""
-    mt = _minimal_multitrainer()
-    flow_only = {
-        "train_flow_onsite_loss": torch.tensor(7.0, dtype=mt.dtype),
-        "train_flow_hopping_loss": torch.tensor(9.0, dtype=mt.dtype),
-    }
-    metrics = mt._payload_metrics_from_flow_state(flow_only, prefix="train")
-    assert metrics["onsite"].item() != pytest.approx(7.0)
-    assert metrics["hopping"].item() != pytest.approx(9.0)
-    assert metrics["onsite"].item() == pytest.approx(0.0)
-    assert metrics["hopping"].item() == pytest.approx(0.0)

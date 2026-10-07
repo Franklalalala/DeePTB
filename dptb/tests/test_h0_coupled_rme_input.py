@@ -1,6 +1,4 @@
-"""H0 input space of the H0 init layer: dataset batches carry AO-product H0 and get the
-``h0_ao_cg`` conversion; the block-ODE flows write coupled RME and declare it with
-``_keys.H0_COUPLED_RME_KEY``, which leaves only the irreps sort."""
+"""Equivalent AO-product and explicitly coupled H0 inputs share the same output."""
 from __future__ import annotations
 
 import copy
@@ -10,7 +8,8 @@ import torch
 
 from dptb.data import _keys
 from dptb.nn.build import build_model
-from dptb.tests.block_ode_fixtures import _b_flow, _b_record
+from ase import Atoms
+from dptb.data import AtomicData
 
 
 def _model():
@@ -20,7 +19,7 @@ def _model():
         model_options={
             "embedding": {
                 "method": "lem_moe_v3_h0", "output_route": "h_b0", "h0_init_scope": "both",
-                "use_spatial_residual_block_input": True, "n_layers": 1, "avg_num_neighbors": 2.0,
+                "n_layers": 1, "avg_num_neighbors": 2.0,
                 "r_max": 4.0, "irreps_hidden": "2x0e+2x1o+2x1e+2x2e", "env_embed_multiplicity": 2,
                 "latent_dim": 6, "latent_channels": [6], "edge_one_hot_dim": 3, "num_experts": 1,
                 "num_shared_experts": 1, "top_k": 1, "universal": True, "use_layer_onehot_tp": False,
@@ -38,12 +37,6 @@ def _model():
     ).to(dtype=torch.float64).eval()
 
 
-def test_block_ode_flow_declares_coupled_h0():
-    model = _model()
-    flow = _b_flow(model.idp, dtype=torch.float64)
-    raw, _, _ = _b_record(model.idp, dtype=torch.float64, seed=5)
-    data, _, _ = flow.prepare_batch(copy.deepcopy(raw), copy.deepcopy(raw), t=torch.tensor([0.3], dtype=torch.float64))
-    assert bool(data[_keys.H0_COUPLED_RME_KEY])
 
 
 def test_ao_product_batch_equals_the_same_h0_supplied_coupled():
@@ -52,9 +45,14 @@ def test_ao_product_batch_equals_the_same_h0_supplied_coupled():
     model = _model()
     layer = model.embedding.init_layer
     assert layer.h0_ao_cg
-    flow = _b_flow(model.idp, dtype=torch.float64)
-    raw, _, _ = _b_record(model.idp, dtype=torch.float64, seed=5)
-    data, _, _ = flow.prepare_batch(copy.deepcopy(raw), copy.deepcopy(raw), t=torch.tensor([0.3], dtype=torch.float64))
+    atoms = Atoms("HCH", positions=[[0., 0., 0.], [1.1, .2, 0.], [0., 1.3, .1]])
+    data = model.idp(AtomicData.to_AtomicDataDict(AtomicData.from_ase(atoms, r_max=4.0)))
+    data[_keys.POSITIONS_KEY] = data[_keys.POSITIONS_KEY].to(torch.float64)
+    width = int(model.idp.reduced_matrix_element)
+    data[_keys.NODE_H0_KEY] = torch.zeros(3, width, dtype=torch.float64)
+    data[_keys.EDGE_H0_KEY] = torch.zeros(data[_keys.EDGE_INDEX_KEY].shape[1], width, dtype=torch.float64)
+    data[_keys.H0_COUPLED_RME_KEY] = torch.tensor(True)
+    data["flow_time"] = torch.tensor([0.0], dtype=torch.float64)
     generator = torch.Generator().manual_seed(11)
     atom_type = data[_keys.ATOM_TYPE_KEY].flatten()
     bond_type = data[_keys.EDGE_TYPE_KEY].flatten()
@@ -82,7 +80,7 @@ def test_ao_product_batch_equals_the_same_h0_supplied_coupled():
 
 
 def test_collated_flags_must_agree():
-    from dptb.nn.embedding.lem_moe_v3_h0_helpers import _h0_is_coupled_rme
+    from dptb.nn.embedding.prior_common import _h0_is_coupled_rme
 
     key = _keys.H0_COUPLED_RME_KEY
     assert _h0_is_coupled_rme({key: torch.tensor([True, True])})

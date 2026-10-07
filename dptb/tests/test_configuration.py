@@ -22,8 +22,6 @@ from dptb.configuration import (
     resolve_init_scope,
 )
 from dptb.nnops.ddp_utils import merge_restart_train_options
-from dptb.nnops.flow import HamiltonianCFM
-from dptb.nnops.flow_priors import OverlapHuckelFamily
 from dptb.nnops.multi_trainer import MultiTrainer
 from dptb.utils.argcheck import (
     TRAIN_OPTION_GROUP_MEMBERS,
@@ -37,14 +35,6 @@ from dptb.utils.argcheck import (
 from dptb.utils.argcheck import test_data_sub as _test_data_sub
 
 
-def _schema_then_runtime(raw):
-    canonical = canonicalize_training_config(
-        {"train_options": {"flow_options": raw}}, warn_deprecated=False
-    )["train_options"]["flow_options"]
-    schema = flow_options()
-    normalized = schema.normalize_value(canonical)
-    schema.check_value(normalized, strict=True)
-    return normalized, HamiltonianCFM(normalized)
 
 
 _KNOWN_GOOD_LOSS = {
@@ -67,68 +57,27 @@ def _normalized_train_options(train_opts):
     return normalized
 
 
+def test_disabled_checkpoint_flow_options_preserve_supervised_schema():
+    legacy = {"enabled": False, "log_compatible_loss": False, "prediction_add_h0": False}
+    canonical = canonicalize_flow_options(legacy, warn_deprecated=False)
+    schema = flow_options()
+    schema.check_value(schema.normalize_value(canonical), strict=True)
+    assert canonical == {"enabled": False}
+    with pytest.raises(ValueError, match="prediction_add_h0"):
+        canonicalize_flow_options({**legacy, "prediction_add_h0": True})
+
+
 # --------------------------------------------------------------------------
 # flow options
 # --------------------------------------------------------------------------
-def test_flow_aliases_survive_schema_defaults_and_reach_runtime():
-    normalized, flow = _schema_then_runtime(
-        {
-            "enabled": True,
-            "prior": "overlap_huckel",
-            "overlap_huckel_k": 9.0,
-            "overlap_huckel_edge_channel_scale": [2.0],
-            "prior_jitter_sigma": 0.25,
-            "dftb_skdata": "sentinel-skdata",
-        }
-    )
-
-    assert "overlap_huckel_k" not in normalized
-    assert "prior_jitter_sigma" not in normalized
-    assert normalized["huckel_k"] == pytest.approx(9.0)
-    assert normalized["physical_prior_jitter_sigma"] == pytest.approx(0.25)
-    assert normalized["prior_skdata"] == "sentinel-skdata"
-    family = flow._families[OverlapHuckelFamily]
-    assert family.huckel_k == pytest.approx(9.0)
-    assert family.huckel_edge_channel_scale == [2.0]
-    assert flow.physical_prior_jitter_sigma == pytest.approx(0.25)
 
 
-@pytest.mark.parametrize(
-    ("canonical", "alias", "old_default", "custom"),
-    [
-        ("huckel_k", "overlap_huckel_k", 1.75, 9.0),
-        ("huckel_edge_channel_scale", "overlap_huckel_edge_channel_scale", None, [2.0]),
-        ("prior_skdata", "dftb_skdata", "", "sentinel-skdata"),
-        ("physical_prior_jitter_sigma", "prior_jitter_sigma", 0.0, 0.25),
-    ],
-)
-def test_legacy_checkpoint_migration_resolves_only_schema_default_alias_collisions(
-    canonical, alias, old_default, custom
-):
-    for stored in ({canonical: old_default, alias: custom}, {canonical: custom, alias: old_default}):
-        migrated = migrate_legacy_checkpoint_train_options(
-            {"flow_options": stored}, warn_deprecated=False
-        )["flow_options"]
-        assert migrated[canonical] == custom
-        assert alias not in migrated
 
 
 @pytest.mark.parametrize(
     ("canonicalize", "raw", "key"),
     [
-        (canonicalize_flow_options, {"huckel_k": 2.0, "overlap_huckel_k": 3.0}, "huckel_k"),
         # a canonical value equal to the old schema default still conflicts
-        (canonicalize_flow_options, {"huckel_k": 1.75, "overlap_huckel_k": 9.0}, "huckel_k"),
-        (
-            migrate_legacy_checkpoint_train_options,
-            {"flow_options": {"huckel_k": 2.0, "overlap_huckel_k": 3.0}},
-            "huckel_k",
-        ),
-        (
-            canonicalize_flow_options,
-            {"meanflow_aggressive": True, "meanflow": {"aggressive": False}},
-            "meanflow_aggressive",
-        ),
         (
             canonicalize_training_config,
             {"train_options": {"endpoint_loss_mode": "reduce",
@@ -139,11 +88,6 @@ def test_legacy_checkpoint_migration_resolves_only_schema_default_alias_collisio
             canonicalize_training_config,
             {"train_options": {"endpoint_loss_mode": "sometimes"}},
             "endpoint_loss_mode",
-        ),
-        (
-            canonicalize_flow_options,
-            {"validation_flow_metrics": ["random_t"], "log_validation_random_t_loss": False},
-            "validation_flow_metrics",
         ),
         (
             canonicalize_embedding_options,
@@ -207,10 +151,6 @@ def test_endpoint_legacy_boolean_mode_truth_table_is_preserved_everywhere(
         assert "log_single_model_compatible_loss_mode" not in options
 
 
-def test_block_te_schema_default_resolves_to_block_mode():
-    normalized, flow = _schema_then_runtime({"enabled": True, "prior": "block_te"})
-    assert normalized["te_prior_mode"] == "auto"
-    assert flow.te_prior_mode == "block"
 
 
 @pytest.mark.parametrize(
@@ -228,36 +168,8 @@ def test_missing_h0_flags_collapse_to_policy(legacy, expected):
     assert "warn_missing_h0" not in canonical
 
 
-def test_dead_logging_flags_are_removed_but_runtime_contract_stays_on():
-    canonical = canonicalize_flow_options(
-        {
-            "enabled": True,
-            "log_compatible_loss": False,
-            "log_train_compatible_loss": False,
-            "log_validation_compatible_loss": False,
-            "compatible_loss_to_legacy_keys": False,
-        },
-        warn_deprecated=False,
-    )
-    assert not any(key.startswith("log_") for key in canonical)
-    flow = HamiltonianCFM(canonical)
-    assert flow.log_train_compatible_loss is True
-    assert flow.log_validation_compatible_loss is True
-    assert flow.compatible_loss_to_legacy_keys is True
 
 
-def test_validation_flow_logging_booleans_collapse_to_one_metric_list():
-    canonical = canonicalize_flow_options(
-        {
-            "log_validation_random_t_loss": False,
-            "log_validation_t0_loss": True,
-            "log_validation_flow_euler_loss": False,
-        },
-        warn_deprecated=False,
-    )
-
-    assert canonical["validation_flow_metrics"] == ["one_step"]
-    assert not any(key.startswith("log_validation_") for key in canonical)
 
 
 # --------------------------------------------------------------------------
@@ -277,22 +189,11 @@ def test_h0_and_p2_init_boolean_combinations_collapse_to_scopes():
     assert h0["h0_init_scope"] == "edge"
     assert h0["fallback_to_hamiltonian"] is False
 
-    pair_default = canonicalize_embedding_options({"method": "lem_pair"}, warn_deprecated=False)
-    assert pair_default["h0_init_scope"] == "both"
-
-    pair = canonicalize_embedding_options(
-        {
-            "method": "lem_pair",
-            "use_h0_init": True,
-            "use_h0_node_init": False,
-            "use_h0_edge_init": True,
-        },
-        warn_deprecated=False,
-    )
-    assert pair["h0_init_scope"] == "edge"
-    assert "use_h0_init" not in pair
-    assert "use_h0_node_init" not in pair
-    assert "use_h0_edge_init" not in pair
+    h0_default = canonicalize_embedding_options({"method": "lem_moe_v3_h0"}, warn_deprecated=False)
+    assert h0_default["h0_init_scope"] == "both"
+    assert "use_h0_init" not in h0
+    assert "use_h0_node_init" not in h0
+    assert "use_h0_edge_init" not in h0
 
     p2 = canonicalize_embedding_options(
         {
@@ -450,10 +351,9 @@ def test_restart_merge_uses_checkpoint_as_base_and_locks_optimizer_contract():
     checkpoint = {
         "endpoint_loss_mode": "full_forward",
         "flow_options": {
-            "enabled": True,
-            "objective": "cfm",
-            "prior": "block_te",
-            "sigma_data": 0.5,
+            "enabled": False,
+            "prior": "te",
+            "te_prior_sigma": 0.5,
         },
         "optimizer": {"type": "AdamW", "lr": 1.0e-3},
         "lr_scheduler": {"type": "rop", "factor": 0.5},
@@ -464,17 +364,16 @@ def test_restart_merge_uses_checkpoint_as_base_and_locks_optimizer_contract():
     merged = merge_restart_train_options(
         {
             "display_freq": 7,
-            "flow_options": {"sigma_data": 0.25},
+            "flow_options": {"te_prior_sigma": 0.25},
             "optimizer": {"type": "SGD", "lr": 0.1},
         },
         checkpoint,
     )
     assert merged["endpoint_loss_mode"] == "full_forward"
     assert merged["flow_options"] == {
-        "enabled": True,
-        "objective": "cfm",
-        "prior": "block_te",
-        "sigma_data": 0.25,
+        "enabled": False,
+        "prior": "te",
+        "te_prior_sigma": 0.25,
     }
     assert merged["display_freq"] == 7
     assert merged["optimizer"] == checkpoint["optimizer"]
@@ -577,7 +476,7 @@ def test_nested_groups_normalize_identically_to_flat():
         "cudnn_benchmark": True,
         "allow_tf32": False,
         "train_num_workers": 4,
-        "flow_options": {"enabled": True, "prior": "zero"},
+        "flow_options": {"enabled": False, "prior": "te"},
         "self_consistency": {"enabled": True, "weight": 0.2},
         "loss_options": _KNOWN_GOOD_LOSS,
     }
@@ -588,7 +487,7 @@ def test_nested_groups_normalize_identically_to_flat():
         "observers": {"use_tensorboard": True, "monitor_flag": True, "debug_profile": True},
         "runtime": {"cudnn_benchmark": True, "allow_tf32": False, "train_num_workers": 4},
         "physical_prior": {
-            "flow_options": {"enabled": True, "prior": "zero"},
+            "flow_options": {"enabled": False, "prior": "te"},
             "self_consistency": {"enabled": True, "weight": 0.2},
         },
         "loss_options": _KNOWN_GOOD_LOSS,
@@ -605,7 +504,7 @@ def test_nested_groups_normalize_identically_to_flat():
     assert normalized_nested == normalized_flat
     assert normalized_nested["use_ddp"] is True
     assert normalized_nested["save_freq"] == 25
-    assert normalized_nested["flow_options"]["enabled"] is True
+    assert normalized_nested["flow_options"]["enabled"] is False
     assert normalized_nested["self_consistency"]["weight"] == pytest.approx(0.2)
 
 
@@ -650,8 +549,7 @@ def test_flatten_train_option_groups_is_idempotent():
 @pytest.mark.parametrize(
     ("section", "legacy", "expected"),
     [
-        ("flow", {"overlap_huckel_k": 9.0, "dftb_skdata": "sentinel"},
-         {"huckel_k": 9.0, "prior_skdata": "sentinel"}),
+        ("flow", {"strict_h0": True}, {"missing_h0_policy": "error"}),
         # enabled=False forces full_forward regardless of the legacy mode
         ("train", {"log_single_model_compatible_loss": False,
                    "log_single_model_compatible_loss_mode": "reduce"},
@@ -677,10 +575,9 @@ def test_warn_deprecated_false_emits_no_warnings():
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning becomes an error
         out = canonicalize_flow_options(
-            {"overlap_huckel_k": 9.0, "strict_h0": True},
+            {"strict_h0": True},
             warn_deprecated=False,
         )
-    assert out["huckel_k"] == pytest.approx(9.0)
     assert out["missing_h0_policy"] == "error"
 
 

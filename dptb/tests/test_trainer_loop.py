@@ -25,6 +25,37 @@ from dptb.tests._trainer_probes import (
 # --------------------------------------------------------------------------
 # single-process Trainer
 # --------------------------------------------------------------------------
+def test_external_objective_completed_backward_preserves_accumulated_gradient():
+    weight = torch.nn.Parameter(torch.tensor(2.0))
+    total = torch.tensor(0.0)
+    for scale, coefficient in [(1.0, 0.25), (2.0, 0.75)]:
+        term = coefficient * (weight * scale).square()
+        term.backward()
+        total = total + term.detach()
+    total._dptb_backward_done = True
+
+    Trainer._backward_loss(None, total)
+
+    # Independent derivative: (0.25 + 0.75 * 4) * 2w = 13 at w=2.
+    assert total.item() == 13.0
+    assert weight.grad.item() == 13.0
+
+
+def test_ordinary_objective_uses_backward():
+    weight = torch.nn.Parameter(torch.tensor(2.0))
+    Trainer._backward_loss(None, weight.square())
+    assert weight.grad.item() == 4.0
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_backward_hook_rejects_invalid_completion(marked):
+    loss = torch.tensor(0.0, requires_grad=marked)
+    if marked:
+        loss._dptb_backward_done = True
+    with pytest.raises(RuntimeError):
+        Trainer._backward_loss(None, loss)
+
+
 @pytest.mark.parametrize("with_reference", [False, True])
 def test_iteration_takes_one_step_and_routes_train_and_reference_metrics(monkeypatch, with_reference):
     trainer, plugin_calls = make_fake_trainer(monkeypatch)

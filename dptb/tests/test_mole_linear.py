@@ -161,7 +161,7 @@ def test_cueq_mode_rejects_half_precision():
 
 @requires_so2_cuda
 def test_grouped_gemm_multi_matches_per_group_linear():
-    from dptb.nn.cublas_grouped_gemm import grouped_gemm_multi
+    from dptb.nn.so2_backend import grouped_gemm_multi
 
     torch.manual_seed(20260521)
     ptr = torch.tensor([0, 4, 4, 9])  # group 1 is empty
@@ -187,7 +187,7 @@ EXPERT_BACKENDS = [
 
 def _count_grouped_gemm(monkeypatch):
     """Count cuBLAS grouped GEMM calls (the module needs SO2CUDA's loader, so only import it where used)."""
-    import dptb.nn.cublas_grouped_gemm as cublas
+    import dptb.nn.so2_backend as cublas
 
     calls = []
     original = cublas.grouped_gemm

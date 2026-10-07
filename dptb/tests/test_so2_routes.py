@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from dptb.nn import so2_activation_routes as routes
+from dptb.nn import so2_backend as routes
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, SO2_Linear
 from dptb.tests._requires import requires_so2_cuda
 
@@ -45,58 +45,48 @@ def _inputs(layer, n=37, k=2, device="cpu", sum_to_one=True):
     return x.requires_grad_(True), R, latents, _globals(idx, val, layer.fc_m0.num_experts, sum_to_one)
 
 
-def _calls():
-    return (routes.STATS.calls[routes.FUSED_P0], routes.STATS.calls[routes.FUSED_P0 + "_top1"],
-            routes.STATS.calls[routes.PACK_SCATTER])
-
-
-def test_cpu_calls_decline_and_run_the_streamed_route():
-    ref = _layer("streamed_m_major_cueq")
+def test_cpu_fused_configuration_uses_reference():
+    ref = _layer("streamed_m_major_ref")
     got = _layer("streamed_m_major_fused_p0")
     got.load_state_dict(ref.state_dict())
     x, R, _, g = _inputs(ref)
-    before = routes.STATS.declines[("all", "not CUDA float32")]
     torch.testing.assert_close(got(x, R, g)[0], ref(x, R, g)[0], rtol=0, atol=0)
-    assert routes.STATS.declines[("all", "not CUDA float32")] == before + 2
-    assert routes.forward(ref, x, R, MOLEGlobals(sizes=None), fused=True) is None
-    assert routes.STATS.declines[("all", "weight-space routing")] > 0
 
 
-def test_fused_route_needs_per_row_coefficients():
-    layer = _layer("streamed_m_major_fused_p0")
-    x, _, _, g = _inputs(layer)
-    assert routes._per_row_routing(g, x)
-    no_coefficients = MOLEGlobals(sizes=None, topk_indices=g.topk_indices, topk_values=g.topk_values,
-                                  activation_space=True)
-    assert not routes._per_row_routing(no_coefficients, x)
-    assert not routes._per_row_routing(g, x[:-1])
+def test_disabled_backend_grouped_linear_and_gradients(monkeypatch, caplog):
+    monkeypatch.setenv("SO2_CUDA_BACKEND", "off")
+    x = torch.randn(5, 3, dtype=torch.float64, requires_grad=True)
+    w = torch.randn(3, 4, 3, dtype=torch.float64, requires_grad=True)
+    ptr = torch.tensor([0, 2, 2, 5])
+    got = routes.grouped_gemm(x, ptr, w)
+    ref = torch.cat([torch.nn.functional.linear(x[:2], w[0]),
+                     torch.nn.functional.linear(x[2:2], w[1]),
+                     torch.nn.functional.linear(x[2:], w[2])])
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    probe = torch.randn_like(got)
+    actual = torch.autograd.grad((got * probe).sum(), (x, w))
+    expected = torch.autograd.grad((ref * probe).sum(), (x, w))
+    for a, b in zip(actual, expected):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
-def test_route_switches(monkeypatch):
-    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0", "0")
-    assert not routes._switch_on("DPTB_SO2_ACTIVATION_FUSED_P0")
-    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", "expanded")
-    assert routes._gemm_schedule() == "expanded"
-    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", "all")
-    with pytest.raises(RuntimeError, match="DPTB_SO2_ACTIVATION_FUSED_P0_GEMM"):
-        routes._gemm_schedule()
+@pytest.mark.parametrize("ptr", [[1, 2, 5], [0, 6, 5], [0, 2, 4]])
+def test_grouped_reference_rejects_invalid_segments(monkeypatch, ptr):
+    monkeypatch.setenv("SO2_CUDA_BACKEND", "off")
+    with pytest.raises(ValueError):
+        routes.grouped_gemm(torch.randn(5, 3), torch.tensor(ptr), torch.randn(2, 4, 3))
 
 
-def test_error_inside_a_route_propagates(monkeypatch):
-    layer = _layer("streamed_m_major_fused_p0")
-    x, R, _, g = _inputs(layer)
-    monkeypatch.setattr(routes, "_preflight", lambda *a: None)
-    monkeypatch.setattr(routes, "_load_ops", lambda: (object(), object()))
-    monkeypatch.setattr(routes, "_wigner_layout", lambda ops, module, x, R, w: (w, (None, None, 0, 0)))
+def test_backend_execution_errors_propagate(monkeypatch):
+    from types import SimpleNamespace
 
-    def boom(*a, **kw):
-        raise RuntimeError("injected CUDA execution failure")
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected execution failure")
 
-    monkeypatch.setattr(routes, "_Packed", boom)
-    calls = _calls()
-    with pytest.raises(RuntimeError, match="injected CUDA execution failure"):
-        layer(x, R, g)
-    assert _calls() == calls
+    monkeypatch.setattr(routes, "backend", lambda: SimpleNamespace(grouped_gemm=fail))
+    monkeypatch.setattr(routes, "_cuda_fp32", lambda *args: True)
+    with pytest.raises(RuntimeError, match="injected execution failure"):
+        routes.grouped_gemm(torch.randn(5, 3), torch.tensor([0, 5]), torch.randn(1, 4, 3))
 
 
 CASES = {
@@ -130,77 +120,28 @@ def _assert_same(got, ref):
 
 @requires_so2_cuda
 @pytest.mark.parametrize("case", CASES.values(), ids=CASES.keys())
-@pytest.mark.parametrize("schedule", ["expanded", "per_slot"])
 @pytest.mark.parametrize("sum_to_one", [True, False])
-def test_prior_activate_routes_match_streamed_route(monkeypatch, case, schedule, sum_to_one):
-    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", schedule)
-    ref_layer = _layer("streamed_m_major_cueq", device="cuda", **case)
+def test_activation_cuda_matches_reference(monkeypatch, case, sum_to_one):
+    ref_layer = _layer("streamed_m_major_ref", device="cuda", **case)
     layer = _layer("streamed_m_major_fused_p0", device="cuda", **case)
     layer.load_state_dict(ref_layer.state_dict())
     x, R, latents, g = _inputs(layer, n=211, device="cuda", sum_to_one=sum_to_one)
     lat = latents if case.get("radial") else None
-
-    def run(mod, activation_cuda):
-        monkeypatch.setenv("DPTB_SO2_ACTIVATION_CUDA", "1" if activation_cuda else "0")
-        route = _globals(g.topk_indices, g.topk_values, layer.fc_m0.num_experts, sum_to_one)
-        calls = _calls()
-        result = _run(mod, x, R, route, lat, g.topk_values)
-        return result, tuple(b - a for a, b in zip(calls, _calls()))
-
-    ref, ref_calls = run(ref_layer, False)          # grouped streaming route
-    got, got_calls = run(layer, False)              # fused-P0
-    assert ref_calls == (0, 0, 0) and got_calls == (1, 0, 0)
+    ref = _run(ref_layer, x, R, g, lat, g.topk_values)
+    calls = routes.STATS.calls["fused_p0"]
+    got = _run(layer, x, R, g, lat, g.topk_values)
+    assert routes.STATS.calls["fused_p0"] == calls + (0 if case.get("interpolation") else 1)
     _assert_same(got, ref)
-    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0", "0")
-    ps, ps_calls = run(layer, True)                 # pack/scatter
-    assert ps_calls == (0, 0, 1)
-    _assert_same(ps, got)
 
 
 @requires_so2_cuda
 def test_inference_warmup_then_training():
-    """Layouts cached under torch.inference_mode must still be usable by a training step."""
+    """Integer layouts cached during inference remain usable by autograd."""
     layer = _layer("streamed_m_major_fused_p0", device="cuda", radial=True)
     x, R, latents, g = _inputs(layer, n=64, device="cuda")
     with torch.inference_mode():
         layer(x.detach(), R, _globals(g.topk_indices, g.topk_values.detach(), layer.fc_m0.num_experts, True),
               latents=latents.detach())
-    calls = _calls()
     _, grads = _run(layer, x, R, _globals(g.topk_indices, g.topk_values, layer.fc_m0.num_experts, True),
                     latents, g.topk_values)
-    assert _calls()[0] == calls[0] + 1
     assert all(torch.isfinite(grad).all() for grad in grads)
-
-
-SWITCH_CASES = {"front": dict(), "back": dict(irreps_out="3x0e + 2x1o + 1x2e"), "radial": dict(radial=True),
-                "interp": dict(interpolation=True)}
-
-
-@requires_so2_cuda
-@pytest.mark.parametrize("case", SWITCH_CASES.values(), ids=SWITCH_CASES.keys())
-@pytest.mark.parametrize("schedule", ["per_slot", "expanded"])
-def test_switch_routes_match_streamed_route(monkeypatch, case, schedule):
-    from dptb.nn.top1_prior import Top1Route
-
-    monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0_GEMM", schedule)
-    ref_layer = _layer("streamed_m_major_cueq", device="cuda", shared=0, **case)
-    layer = _layer("streamed_m_major_fused_p0", device="cuda", shared=0, **case)
-    layer.load_state_dict(ref_layer.state_dict())
-    x, R, latents, g = _inputs(layer, n=211, k=1, device="cuda")
-    lat = latents if case.get("radial") else None
-    gates = torch.rand(g.topk_indices.shape, generator=torch.Generator().manual_seed(3)).to("cuda").requires_grad_(True)
-
-    def run(mod, reference):
-        route = Top1Route(g.topk_indices, gates)
-        route.top1_reference_so2 = reference
-        calls = _calls()
-        result = _run(mod, x, R, route, lat, gates)
-        return result, tuple(b - a for a, b in zip(calls, _calls()))
-
-    ref, ref_calls = run(ref_layer, True)           # streamed route, no SO2CUDA
-    got, got_calls = run(layer, False)              # fused-P0
-    assert ref_calls == (0, 0, 0) and got_calls == (1, 1, 0)
-    _assert_same(got, ref)
-    ps, ps_calls = run(ref_layer, False)            # pack/scatter
-    assert ps_calls == (0, 0, 1)
-    _assert_same(ps, got)

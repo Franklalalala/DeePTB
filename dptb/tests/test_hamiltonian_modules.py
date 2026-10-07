@@ -17,7 +17,6 @@ import torch
 from dptb.data import AtomicDataDict
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.hamiltonian import E3Hamiltonian, SKHamiltonian, SKHamiltonian_old, _contract_cg_rme
-from dptb.nnops.block_flow_codec import BlockStateCodec
 from dptb.tests._requires import requires_cuda
 
 SK_BASIS = {"Si": ["3s", "3p"]}
@@ -129,10 +128,6 @@ def test_soc_decompose_rejects_a_non_soc_mapper():
         module(data)
 
 
-def test_block_state_codec_remains_the_soc_rejection_boundary():
-    mapper = OrbitalMapper({"C": ["2p"]}, method="e3tb", device="cpu", has_soc=True)
-    with pytest.raises(NotImplementedError, match="does not support SOC"):
-        BlockStateCodec(mapper, dtype=torch.float64)
 
 
 # ---------------------------------------------------------------------------

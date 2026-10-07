@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import yaml
-from pathlib import Path
 
 import numpy as np
 
@@ -14,8 +12,7 @@ from dptb.data import AtomicDataDict, _keys
 from dptb.data.interfaces.h0rebuild_adapter import PHYSICAL_H0_SIDECAR_SCHEMA, array_sha256, build_physical_h0_meta
 from dptb.data.transforms import OrbitalMapper
 from dptb.data.transforms_upper_triangle import OrbitalMapper as UpperTriangleOrbitalMapper
-from dptb.nn.embedding.lem_moe_v3_h0_helpers import H0InitLayer
-from dptb.utils.argcheck import flow_options
+from dptb.nn.embedding.prior_common import H0InitLayer
 from tools.materialize_h0rebuild_lmdb import _validated_roots
 
 
@@ -272,23 +269,3 @@ def test_materializer_rejects_nested_input_output_roots(tmp_path):
         _validated_roots(str(input_root), str(tmp_path))
 
 
-def test_physical_h0_overlay_uses_train_options_schema():
-    repo_root = Path(__file__).resolve().parents[2]
-    overlay = yaml.safe_load((repo_root / "configs" / "physical_h0_flow_overlay.yaml").read_text(encoding="utf-8"))
-
-    assert "flow_options" not in overlay
-    flow = overlay["train_options"]["flow_options"]
-    assert flow["node_h0_key"] == "node_physical_h0"
-    assert flow["edge_h0_key"] == "edge_physical_h0"
-    normalized = flow_options().normalize_value(flow)
-    flow_options().check_value(normalized, strict=True)
-
-    # P0 wiring fix: the H0-init embedding must read exactly the keys the flow
-    # overwrites with the interpolated state x_t.  If the embedding is left at
-    # the stored-h0 defaults (node_h0/edge_h0) while the flow points at the
-    # physical keys, x_t never reaches the network and the prior is silently
-    # deactivated.  The overlay must therefore repoint the embedding keys too,
-    # and they must stay aligned with the flow keys.
-    embedding = overlay["model_options"]["embedding"]
-    assert embedding["h0_node_key"] == flow["node_h0_key"] == "node_physical_h0"
-    assert embedding["h0_edge_key"] == flow["edge_h0_key"] == "edge_physical_h0"

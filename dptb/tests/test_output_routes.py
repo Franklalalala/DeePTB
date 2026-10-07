@@ -40,7 +40,6 @@ from dptb.nn.embedding.output_routes import (
 )
 from dptb.nn.deeptb import _resolve_embedding_output_route_spec
 from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
-from dptb.nnops.flow import assert_flow_h0_keys_reach_model
 from dptb.utils.argcheck import model_options
 
 BASIS = {"H": "1s", "O": "1s1p"}
@@ -107,36 +106,6 @@ def _data(model):
     }
 
 
-def test_real_hb0_block_ode_guards_model_contract_and_active_rows(tmp_path):
-    model = _build("h_b0", tmp_path, embedding_overrides={
-        "method": "lem_moe_v3_h0", "use_h0_init": True, "use_flow_time_embedding": True,
-        "flow_time_allow_missing": False, "require_full_block_edge_coverage": True,
-    })
-    flow = SimpleNamespace(enabled=True, block_ode=True, node_h0_key=_keys.NODE_H0_KEY,
-                           edge_h0_key=_keys.EDGE_H0_KEY, flow_time_key="flow_time")
-    assert assert_flow_h0_keys_reach_model(flow, model) is None
-
-    for owner, attribute, value, match in (
-        (model, "block_native_add_h0", True, "prediction.add_h0=false"),
-        (model.embedding.flow_time_conditioner, "allow_missing_time", True, "flow_time_allow_missing=false"),
-        (model, "blockwise_hamiltonian", False, "one NNENV owner"),
-        (model.embedding, "require_full_block_edge_coverage", False, "require_full_block_edge_coverage=true"),
-    ):
-        original = getattr(owner, attribute)
-        setattr(owner, attribute, value)
-        try:
-            with pytest.raises(ValueError, match=match):
-                assert_flow_h0_keys_reach_model(flow, model)
-        finally:
-            setattr(owner, attribute, original)
-
-    data = _data(model)
-    data[_keys.POSITIONS_KEY] = torch.tensor([[0.0, 0.0, 0.0], [5.5, 0.0, 0.0]])
-    data[_keys.NODE_H0_KEY] = torch.zeros((2, model.idp.reduced_matrix_element))
-    data[_keys.EDGE_H0_KEY] = torch.zeros((2, model.idp.reduced_matrix_element))
-    data["flow_time"] = torch.tensor([0.25])
-    with pytest.raises(ValueError, match="ordered full H-B0"):
-        model(data)
 
 
 def test_block_native_add_h0_exposes_full_h_without_changing_residual(tmp_path):

@@ -10,7 +10,7 @@ import torch
 from dptb.data import _keys
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.embedding.lem_moe_v3_edge import LemMoEV3EdgeH0
-from dptb.nn.embedding.lem_moe_v3_h0_helpers import H0InitLayer
+from dptb.nn.embedding.prior_common import H0InitLayer
 from dptb.nn.embedding.lem_moe_v3_prior_2b import _Prior2bMixin
 from dptb.tests.model_helpers import _build, _data, _has_grad, _params_equal
 
@@ -48,10 +48,8 @@ def _unchanged(model, frozen):
 # graph-level router (lem_moe_v3_prior_2b)
 # ---------------------------------------------------------------------------
 def test_concat_merge_doubles_the_first_layer_input():
-    emb = _build(only2b=True, ffn_hidden_factor=2.0).embedding
+    emb = _build(only2b=True).embedding
     assert emb.layers[0].irreps_in.dim == 2 * int(emb.h0_init.irreps_out.dim)
-    # layer 0 of a 2-layer stack gets the node FFN when ffn_hidden_factor > 1, as in the base model
-    assert emb.layers[0].node_ffn is not None and emb.layers[1].node_ffn is None
 
 
 def test_stage1_trains_only_the_two_body_branch():
@@ -209,61 +207,6 @@ def test_switch_stage2_reuses_stage1_and_trains_the_router(kind):
 def test_switch_rejects_shared_experts():
     with pytest.raises(ValueError, match="num_shared_experts"):
         _build(False, **dict(SWITCH, num_shared_experts=1))
-
-
-# ---------------------------------------------------------------------------
-# flow-conditioned stage 2
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("kind", ["h0", "na_cf"])
-def test_flow_stage2_never_changes_the_frozen_physical_stage1_input(kind):
-    from dptb.nnops.flow import HamiltonianCFM
-
-    keys = PRIOR_KEYS[kind]
-    s1 = _build(True, prior_kind=kind, **EDGE)
-    s2 = _build(False, prior_kind=kind, **EDGE, use_flow_time_embedding=True, flow_time_condition_edges=True,
-                flow_time_allow_missing=False)
-    s2.load_state_dict(s1.state_dict(), strict=True)
-    data = _prior_data(s1, kind)
-    data.update(batch=torch.zeros(2, dtype=torch.long), node_features=torch.randn_like(data[keys[0]]),
-                edge_features=torch.randn_like(data[keys[1]]))
-    flow = HamiltonianCFM(dict(enabled=True, prior="te", te_prior_mode="typewise", node_h0_key=keys[0],
-                               edge_h0_key=keys[1]), idp=s2.idp)
-    state, reference, ctx = flow.prepare_batch(_clone(data), _clone(data), t=torch.tensor([.2]))
-    for label, key in zip(("node", "edge"), keys):
-        assert torch.equal(state["serial_original_" + key], data[key])
-        base, prior = getattr(ctx, label + "_base"), getattr(ctx, label + "_prior")
-        target, t = getattr(ctx, label + "_target"), getattr(ctx, label + "_t")[:, None]
-        torch.testing.assert_close(state[key], (1 - t) * (base + prior) + t * target)
-        assert torch.equal(reference[label + "_features"], data[label + "_features"])
-
-    frozen = _frozen(s2)
-    captures = {"node": [], "edge": []}
-    hooks = [getattr(s2.embedding, "two_b_out_" + key).register_forward_hook(
-        lambda module, args, out, key=key: captures[key].append(out.detach().clone())) for key in captures]
-    try:
-        first = s2(_clone(state))
-        second = s2(dict(_clone(state), flow_time=torch.tensor([.8])))
-        assert any(not torch.allclose(first[k + "_features"], second[k + "_features"]) for k in captures)
-        s2.embedding.only2b = True
-        s2(_clone(data))
-        s2.embedding.only2b = False
-        for values in captures.values():  # the two-body branch saw the same physical input all three times
-            torch.testing.assert_close(values[1], values[0], rtol=1e-6, atol=1e-6)
-            torch.testing.assert_close(values[2], values[0], rtol=1e-6, atol=1e-6)
-    finally:
-        for hook in hooks:
-            hook.remove()
-    (first["node_features"].square().mean() + first["edge_features"].square().mean()).backward()
-    torch.optim.SGD(s2.parameters(), lr=.001).step()
-    assert _unchanged(s2, frozen)
-    no_labels = _clone(data)
-    no_labels["node_features"].zero_()
-    no_labels["edge_features"].zero_()
-    for steps in (1, 2):
-        sampled = flow.sample(s2, no_labels, num_steps=steps)
-        assert all(torch.isfinite(sampled[k + "_features"]).all() for k in captures)
-    with pytest.raises(KeyError, match="immutable input"):
-        s2(_clone(data))
 
 
 # ---------------------------------------------------------------------------

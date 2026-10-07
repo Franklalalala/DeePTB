@@ -6,22 +6,12 @@ import pytest
 import torch
 from e3nn import o3
 
-from dptb.nn.embedding.lem_moe_v3_plugins import build_gate_activation
+from dptb.nn.embedding.unitb_activations import build_gate_activation
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear, SO2_Linear, SO2SlotPostActivationMixer
 from dptb.tests._requires import requires_so2_cuda
 from dptb.tests.model_helpers import _build, _data
 
-IRREPS_IN = "4x0e + 3x1o + 2x2e"
-GATED_OUT = "3x0e + 2x1o + 2x2e"
-
-
-def _layer(route, irreps_out, *, radial=False, interpolation=False, shared=1, dtype=torch.float64, device="cpu"):
-    torch.manual_seed(20260925)
-    layer = SO2_Linear(irreps_in=IRREPS_IN, irreps_out=irreps_out, radial_emb=radial,
-                       latent_dim=8 if radial else None, radial_channels=[16] if radial else None,
-                       use_interpolation=interpolation, num_experts=4, num_shared_experts=shared,
-                       mole_linear_mode="indexed_ref", so2_fusion_mode=route)
-    return layer.to(device=device, dtype=dtype)
+from dptb.tests.so2_helpers import GATED_OUT, _gate_layer, _inputs, _layer, _route_calls
 
 
 def _routing(n, num_experts, k=2, device="cpu", dtype=torch.float64, seed=7):
@@ -36,14 +26,6 @@ def _routing(n, num_experts, k=2, device="cpu", dtype=torch.float64, seed=7):
                      activation_space=True, coefficients_sum_to_one=True)
     mg.selected_logits = sel
     return mg
-
-
-def _inputs(layer, n=23, device="cpu", dtype=torch.float64, seed=11):
-    g = torch.Generator().manual_seed(seed)
-    x = torch.randn(n, layer.irreps_in.dim, generator=g, dtype=torch.float64).to(device=device, dtype=dtype)
-    R = torch.randn(n, 3, generator=g, dtype=torch.float64).to(device=device, dtype=dtype)
-    lat = torch.randn(n, 8, generator=g, dtype=torch.float64).to(device=device, dtype=dtype)
-    return x.requires_grad_(True), R, lat
 
 
 CASES = {"plain": dict(), "radial": dict(radial=True), "interp": dict(interpolation=True),
@@ -71,12 +53,6 @@ def test_identity_activation_equals_pre_activation_mix(route, case):
             assert a is None and b is None
             continue
         torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-9)
-
-
-def _gate_layer(route="staged", dtype=torch.float64, device="cpu", **kw):
-    gate = build_gate_activation(o3.Irreps(GATED_OUT))
-    layer = _layer(route, str(gate.irreps_in), dtype=dtype, device=device, **kw)
-    return layer, gate.to(device=device, dtype=dtype)
 
 
 # Rotations only, and only where the SO2 layer itself is equivariant: the eSCN-type SO2 layer is SO(3)-equivariant
@@ -171,27 +147,12 @@ def test_rejects_routing_it_cannot_fold():
         mixer(x, R, MOLEGlobals(coefficients=g.coefficients, sizes=None))
 
 
-def _route_counters():
-    """(fused slot calls, pack/scatter calls) of whichever SO2CUDA activation module this library has."""
-    try:
-        from dptb.nn import so2_activation_routes as r
-        return r.STATS.calls[r.FUSED_P0], r.STATS.calls[r.PACK_SCATTER]
-    except ImportError:                                   # release 0923 (07c0711): separate modules
-        from dptb.nn import so2_activation_fused_p0 as f0
-        from dptb.nn import top1_so2_cuda as t1
-        pack = getattr(t1, "ACTIVATION_CALLS", getattr(t1, "CALLS", 0))
-        return f0.CALLS, pack
-
-
 @requires_so2_cuda
-@pytest.mark.parametrize("force_pack_scatter", [False, True], ids=["fused_p0", "pack_scatter"])
 @pytest.mark.parametrize("case", [dict(), dict(radial=True), dict(radial=True, back=True), dict(interpolation=True),
                                   dict(shared=0)], ids=["plain", "radial", "radial-back", "interp", "shared0"])
-def test_fused_route_matches_staged_route_on_cuda(monkeypatch, case, force_pack_scatter):
+def test_fused_route_matches_staged_route_on_cuda(monkeypatch, case):
     case = dict(case)
     back = case.pop("back", False)
-    if force_pack_scatter:
-        monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0", "0")
     if back:                                              # radial after the linear: fewer output than input channels
         gate = build_gate_activation(o3.Irreps("2x0e + 1x1o + 1x2e"))
         ref_layer = _layer("staged", str(gate.irreps_in), dtype=torch.float32, device="cuda", **case)
@@ -206,14 +167,12 @@ def test_fused_route_matches_staged_route_on_cuda(monkeypatch, case, force_pack_
     latents = lat.requires_grad_(True) if case.get("radial") else None
     outs, grads = [], []
     for layer in (ref_layer, got_layer):
-        before = _route_counters()
+        before = _route_calls()
         out, _ = SO2SlotPostActivationMixer(layer, gate)(x, R, g, latents=latents)
-        after = _route_counters()
+        after = _route_calls()
         if layer is got_layer:                            # the CUDA route really ran, once per top-k slot
-            if force_pack_scatter:
-                assert after[1] - before[1] == g.topk_indices.shape[1], (before, after)
-            else:
-                assert after[0] - before[0] == g.topk_indices.shape[1], (before, after)
+            expected_calls = 0 if case.get("interpolation") else g.topk_indices.shape[1]
+            assert after - before == expected_calls, (before, after)
         params = list(layer.parameters())
         wanted = [x, g.selected_logits] + ([latents] if latents is not None else []) + params
         grads.append(torch.autograd.grad(out.square().sum(), wanted, retain_graph=True))

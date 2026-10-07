@@ -1,7 +1,7 @@
 """H-B0 head: active-edge contract, endpoint conditioning, head-input RMS telemetry,
 Hermitian averaging.
 
-All ``LemMoEV3H0``/``LemPair`` cases below run in fp64 with
+All ``LemMoEV3H0`` cases below run in fp64 with
 ``torch.use_deterministic_algorithms(True)`` scoped by ``_deterministic()`` — the
 conftest.py module-scoped guard fails the whole module if that flag leaks past a test.
 """
@@ -20,7 +20,6 @@ from dptb.data.transforms import OrbitalMapper
 from dptb.nn.embedding.late_block_expansion_cg import LateBlockExpansionCGHead
 from dptb.nn.embedding.lem_moe_v3 import UpdateNode
 from dptb.nn.embedding.lem_moe_v3_h0 import LemMoEV3H0
-from dptb.nn.embedding.lem_pair import LemPair
 from dptb.tests.pair_helpers import ao_wigner, clone_data, fp64_default, model_options, molecule_data, rotate_data
 
 
@@ -412,30 +411,6 @@ def test_head_input_rms_enabled_matches_manual_irreps_slice_calculation():
         assert torch.equal(telemetry["edge_l"], torch.tensor([ir.l for _, ir in model.out_edge.irreps_in], dtype=torch.long))
         assert not telemetry["node"].requires_grad
         assert not telemetry["edge"].requires_grad
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    (
-        dict(condition_source="endpoints"),
-        dict(condition_source="endpoints", log_head_input_rms=True),
-        dict(pair_refine_enable=True, pair_refine_rank=4, pair_refine_identity_init=True, log_head_input_rms=True),
-    ),
-    ids=["endpoint_condition", "endpoint_condition_with_head_input_rms", "pair_refine_with_head_input_rms"],
-)
-def test_lem_pair_feature_combination_smoke(overrides):
-    """LemPair (not just LemMoEV3H0) accepts these option combinations end to end."""
-    with fp64_default(), _deterministic():
-        options = model_options()
-        options.update(overrides)
-        torch.manual_seed(47)
-        model = LemPair(**options).eval()
-        output = model(molecule_data(model))
-        assert torch.isfinite(output[_keys.NODE_HAMILTONIAN_KEY]).all()
-        assert torch.isfinite(output[_keys.EDGE_HAMILTONIAN_KEY]).all()
-        if overrides.get("log_head_input_rms"):
-            assert torch.isfinite(output["head_input_rms"]["node"]).all()
-            assert torch.isfinite(output["head_input_rms"]["edge"]).all()
 
 
 def test_hb0_hermitian_average_enforces_exact_reverse_transpose_and_preserves_nodes():

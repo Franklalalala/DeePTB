@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+
 import pytest
 import torch
-from torch import nn
 
 import dptb.data.build as data_build
 from dptb.data.build import DatasetBuilder
@@ -24,7 +24,6 @@ from dptb.data.interfaces.blockwise_tensor import (
     feature_tensors_to_block_tensors,
 )
 from dptb.data.transforms import OrbitalMapper
-from dptb.nnops import trainer as trainer_mod
 from dptb.nnops.blockwise_nextham_loss import HamilBlockwiseNexTHamLoss
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
 from tools.convert_feature_lmdb_to_blockwise import (
@@ -329,57 +328,3 @@ def test_dataset_builder_forwards_uureal_mask_to_orbital_mapper(monkeypatch, tmp
     assert captured["dataset"]["type_mapper"] is not None
 
 
-def test_trainer_builds_flow_with_loss_idp_when_loss_uses_compressed_layout(monkeypatch):
-    model_idp = object()
-    loss_idp = object()
-    captured = {}
-
-    class MinimalModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.tensor(1.0))
-            self.hamiltonian = SimpleNamespace(idp=model_idp)
-
-    class MinimalDataset:
-        get_Hamiltonian = True
-        get_DM = False
-
-    def fake_loss(**kwargs):
-        assert kwargs["idp"] is model_idp
-        return SimpleNamespace(idp=loss_idp)
-
-    def fake_flow(options, *, idp, dtype, device):
-        captured["idp"] = idp
-        return SimpleNamespace(enabled=False)
-
-    monkeypatch.setattr(trainer_mod, "DataLoader", lambda **kwargs: [])
-    monkeypatch.setattr(trainer_mod, "Loss", fake_loss)
-    monkeypatch.setattr(trainer_mod, "build_hamiltonian_flow", fake_flow)
-    monkeypatch.setattr(
-        trainer_mod, "get_optimizer", lambda **kwargs: SimpleNamespace(param_groups=[{"lr": 0.1}])
-    )
-    monkeypatch.setattr(trainer_mod, "get_lr_scheduler", lambda **kwargs: SimpleNamespace())
-    monkeypatch.setattr(trainer_mod, "configure_activation_recompute", lambda *args, **kwargs: {})
-
-    trainer_mod.Trainer(
-        train_options={
-            "optimizer": {"type": "Adam", "lr": 0.1},
-            "lr_scheduler": {"type": "exp", "gamma": 1.0},
-            "update_lr_per_iter": False,
-            "clip_grad": 1.0,
-            "batch_size": 1,
-            "loss_options": {"train": {"method": "hamil_abs"}},
-            "flow_options": {"enabled": True},
-        },
-        common_options={
-            "dtype": "float32",
-            "device": "cpu",
-            "basis": {"Si": ["3s", "3p"]},
-            "has_soc": True,
-            "nextham_uureal_mask": True,
-        },
-        model=MinimalModel(),
-        train_datasets=MinimalDataset(),
-    )
-
-    assert captured["idp"] is loss_idp
