@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch
 from dptb.utils.register import Register
-
 """this is the register class for descriptors
 
 all descriptors inplemendeted should be a instance of nn.Module class, and provide a forward function that
@@ -15,6 +14,10 @@ class Embedding:
         return Embedding._register.register(target)
     
     def __new__(cls, method: str, **kwargs):
+        if method in {"lem", "slem"}:
+            from .prior_inputs import resolve_legacy_prior_method
+
+            method = resolve_legacy_prior_method(method, kwargs)
         if method in Embedding._register.keys():
             return Embedding._register[method](**kwargs)
         else:
@@ -23,6 +26,5 @@ class Embedding:
 
         
     
-
 
 

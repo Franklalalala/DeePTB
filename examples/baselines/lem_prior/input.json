@@ -1,0 +1,42 @@
+{
+  "common_options": {
+    "basis": {
+      "C": "1s1p"
+    },
+    "overlap": false,
+    "dtype": "float64",
+    "device": "cpu",
+    "seed": 2026
+  },
+  "model_options": {
+    "embedding": {
+      "method": "lem_prior",
+      "n_layers": 1,
+      "n_radial_basis": 4,
+      "r_max": 4.0,
+      "avg_num_neighbors": 2.0,
+      "irreps_hidden": "4x0e+4x1o+4x1e+4x2e",
+      "env_embed_multiplicity": 2,
+      "latent_dim": 8,
+      "latent_channels": [
+        8
+      ],
+      "tp_radial_emb": false,
+      "h0_init_scope": "both",
+      "h0_merge_mode": "add",
+      "h0_node_mode": "direct",
+      "h0_node_key": "node_h0",
+      "h0_edge_key": "edge_h0",
+      "fallback_to_hamiltonian": false,
+      "h0_ao_cg": true
+    },
+    "prediction": {
+      "method": "e3tb",
+      "scale_type": "no_scale"
+    }
+  },
+  "smoke_options": {
+    "steps": 20,
+    "learning_rate": 0.003
+  }
+}
