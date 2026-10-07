@@ -1,8 +1,7 @@
 """One-shot Hamiltonian rebuild endpoint on top of ABACUS ``restart_dh``.
 
-WS4 (see ``F:\\claude\\0702_nextham_dm_plan\\02_llm_execution_plan.md``, section
-"WS4 hrebuild"). Given a predicted real-space Hamiltonian block dict
-(the output of ``dptb.data.interfaces.feature_to_block``), this module:
+Given a predicted real-space Hamiltonian block dictionary from
+``dptb.data.interfaces.ham_to_feature.feature_to_block``, this module:
 
 1. writes it out as an ABACUS ``hrs1_nao.csr`` file (:func:`write_hr_csr`),
 2. drives an ABACUS binary built from the ``dyzheng/abacus-develop@restart_dh``
@@ -18,7 +17,7 @@ WS4 (see ``F:\\claude\\0702_nextham_dm_plan\\02_llm_execution_plan.md``, section
    existing band-structure / eigenvalue machinery without any new k-space
    code (:func:`blocks_to_override_h5`).
 
-Unit discipline (verified empirically, not assumed -- see the WS4 report):
+Unit discipline:
 ABACUS CSR files are in Rydberg. ``write_blocks_to_abacus_csr`` in
 ``write_abacus_csr_file.py`` assumes its *input* is already in eV (it
 divides by ``H_FACTOR = 13.605698`` to reach Ry). That assumption holds for
@@ -26,8 +25,7 @@ ABACUS-native NAO-basis models (dftio-parsed periodic crystal data, e.g. the
 D3 / h0 production route). It does **not** hold for the QHFlow2/QH9-derived
 molecular route (water N1 CFM model), whose Hamiltonians are in Hartree and
 whose AO basis is a Gaussian basis with no corresponding ABACUS NAO/UPF
-pair -- that route is out of scope for this endpoint (see WS4 report, "GTO
-vs NAO" note in plan section 11). Callers must declare the unit their
+pair. That route is outside this endpoint. Callers must declare the unit their
 blocks are in via ``unit=`` on :func:`write_hr_csr` / :func:`read_hr_csr`.
 """
 
