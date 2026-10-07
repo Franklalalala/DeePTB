@@ -5,6 +5,15 @@ from dptb.utils.constants import CUBIC_MAG_NUM_DICT, LM_MAG_NUM_DICT
 
 log = logging.getLogger(__name__)
 
+
+def _complex_dtype(dtype):
+    """SOC constants follow the requested real precision, not the global default."""
+    if dtype == torch.float32:
+        return torch.complex64
+    if dtype == torch.float64:
+        return torch.complex128
+    raise ValueError("SOC matrices support only torch.float32 and torch.float64")
+
 # l=0,  m=0, s
 #
 #       m=-1, py
@@ -42,14 +51,9 @@ def lm2cubic_mat(cubic_mag_num, lm_mag_num, device='cpu', dtype=torch.float32):
     assert len(cubic_mag_num) in [1, 3, 5], "The number of magnetic_quantum_numbers must be 1, 3, 5"
     assert len(lm_mag_num) == len(cubic_mag_num), "The number of lm_mag_nummust the same  as cubic_mag_num"
     
-    if dtype is torch.float32:
-        cdtype = torch.complex64
-    elif dtype is torch.float64:
-        cdtype = torch.complex128
-    else:
-        log.error(msg="the dtype is not supported! now only float64, float32 is supported!")
+    cdtype = _complex_dtype(dtype)
 
-    t2 = torch.tensor(2.0)
+    t2 = torch.tensor(2.0, dtype=dtype, device=device)
     s2_1=1.0/torch.sqrt(t2)
     M = torch.zeros([len(cubic_mag_num),len(cubic_mag_num)],device=device, dtype=cdtype)
 
@@ -191,12 +195,7 @@ def get_soc_matrix_cubic_basis(orbital: str,cubic_mag_num=None, lm_mag_num=None,
     if lm_mag_num is None:
         lm_mag_num = LM_MAG_NUM_DICT[orbital]
 
-    if dtype is torch.float32:
-        cdtype = torch.complex64
-    elif dtype is torch.float64:
-        cdtype = torch.complex128
-    else:
-        log.error(msg="the dtype is not supported! now only float64, float32 is supported!")
+    cdtype = _complex_dtype(dtype)
 
     num_orb = {'s':1,'p':3,'d':5}
     assert len(cubic_mag_num)  == num_orb[orbital], "The number of magnetic_quantum_numbers is not correct!"
@@ -204,11 +203,14 @@ def get_soc_matrix_cubic_basis(orbital: str,cubic_mag_num=None, lm_mag_num=None,
     assert orbital in ['s','p','d']   
 
     lm_basis = creat_basis_lm(orbital)
-    Mtrans = lm2cubic_mat(cubic_mag_num, lm_mag_num)
-    Msoc_lm = get_matrix_lmbasis(lm_basis)
-    Msoc_lm_clx = torch.complex(Msoc_lm, torch.zeros_like(Msoc_lm))
+    # These tiny constants have historically been evaluated on CPU and then
+    # copied into the requested output device. Keep that arithmetic for FP32
+    # (also in CUDA models), while generating FP64 constants in true FP64.
+    Mtrans = lm2cubic_mat(cubic_mag_num, lm_mag_num, device='cpu', dtype=dtype)
+    Msoc_lm = get_matrix_lmbasis(lm_basis, device='cpu', dtype=dtype)
+    Msoc_lm_clx = Msoc_lm.to(dtype=cdtype)
 
-    trans = torch.kron(Mtrans, torch.eye(2)).T
+    trans = torch.kron(Mtrans, torch.eye(2, device='cpu', dtype=dtype)).T
     transHT = torch.conj(trans.T)
     Msoc_cubic = transHT @ Msoc_lm_clx @ trans
     
@@ -222,4 +224,3 @@ def get_soc_matrix_cubic_basis(orbital: str,cubic_mag_num=None, lm_mag_num=None,
     Msoc_updn_block[norbs:2*norbs,    0:  norbs] = Msoc_cubic[1:2*norbs:2,0:2*norbs:2]
 
     return Msoc_updn_block
-

@@ -283,6 +283,7 @@ class DatasetBuilder:
                 type_mapper=idp,
                 orthogonal=orthogonal,
                 get_Hamiltonian=get_Hamiltonian,
+                overlap_sidecar_root=kwargs.get("overlap_sidecar_root"),
                 get_H0=kwargs.get("get_H0", False),
                 get_prior=kwargs.get("get_prior", kwargs.get("get_P2", False)),
                 residual_hamiltonian=kwargs.get("residual_hamiltonian", False),

@@ -223,13 +223,10 @@ def with_batch(data: Type) -> Type:
         pos = data[_keys.POSITIONS_KEY]
         batch = torch.zeros(len(pos), dtype=torch.long, device=pos.device)
         data[_keys.BATCH_KEY] = batch
-        # ugly way to make a tensor of [0, len(pos)], but it avoids transfers or casts
-        data[_keys.BATCH_PTR_KEY] = torch.arange(
-            start=0,
-            end=len(pos) + 1,
-            step=len(pos),
-            dtype=torch.long,
-            device=pos.device,
+        # Explicit endpoints also represent a single empty structure; arange
+        # with step=len(pos) would fail when there are no nodes.
+        data[_keys.BATCH_PTR_KEY] = torch.tensor(
+            [0, len(pos)], dtype=torch.long, device=pos.device,
         )
         
         return data

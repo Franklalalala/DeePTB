@@ -175,6 +175,8 @@ STRUCTURAL_FIELDS = frozenset(
         # them in place mid-autograd and broke backward with a tensor-version
         # error (ScalarOnehotTP einsum over node_attrs, seen on a P2
         # multi-expert smoke). keep_first is both correct and safe.
+        "phys_node_overlap",
+        "phys_edge_overlap",
         "node_attrs",
         "edge_attrs",
         # Residual AO-block tensors are also model inputs.  They deliberately

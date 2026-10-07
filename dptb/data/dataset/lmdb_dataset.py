@@ -1201,6 +1201,7 @@ class LMDBDataset(AtomicDataset):
             audit_prior_representations: Optional[bool] = None,
             require_prior_blocks: Optional[bool] = None,
             *,
+            overlap_sidecar_root: Optional[str] = None,
             get_P2: Optional[bool] = None,
             p2_key: Optional[str] = None,
             prefer_precomputed_p2: Optional[bool] = None,
@@ -1239,6 +1240,7 @@ class LMDBDataset(AtomicDataset):
         )
         # TO DO, this may be simplified
         # See if a subclass defines some inputs
+        self.overlap_sidecar_root = os.path.abspath(overlap_sidecar_root) if overlap_sidecar_root else None
         self.url = getattr(type(self), "URL", url)
         self.include_frames = include_frames
         self.info_files = info_files  # there should be one info file for one LMDB Dataset
@@ -1734,8 +1736,41 @@ class LMDBDataset(AtomicDataset):
                         os.path.realpath(lmdb_path),
                         int(self.index_map[int(idx)]),
                     )
-                    return _loads_with_numpy2_compat(serialized)
+                    record = _loads_with_numpy2_compat(serialized)
+                    if getattr(self, "overlap_sidecar_root", None):
+                        self._join_overlap_sidecar(record, lmdb_path, key)
+                    return record
         raise IndexError(f"LMDB entry {self.index_map[int(idx)]} not found for dataset index {idx}")
+
+    def _join_overlap_sidecar(self, record, shard_path, key):
+        """Read physical S through the same worker-local/pread-compatible env cache."""
+        path = os.path.join(self.overlap_sidecar_root, os.path.basename(shard_path))
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Overlap sidecar shard missing: {path}")
+        with self._get_lmdb_env(path).begin(buffers=True) as txn:
+            payload = txn.get(key)
+            if payload is None:
+                raise ValueError(f"Overlap sidecar key missing: {path} key={key.hex()}")
+            self._last_overlap_sidecar_bytes = len(payload)
+            side = _loads_with_numpy2_compat(bytes(payload))
+        for field in ("idx", "edge_graph_fingerprint"):
+            if field not in record or field not in side or record[field] != side[field]:
+                raise ValueError(f"Overlap sidecar {field} mismatch or missing: {path} key={key.hex()}")
+        if int(record["idx"]) != int.from_bytes(key, "big"):
+            raise ValueError(f"Overlap sidecar idx disagrees with LMDB key: {path} key={key.hex()}")
+        if "record_uid" in record and "record_uid" in side and record["record_uid"] != side["record_uid"]:
+            raise ValueError(f"Overlap sidecar record_uid mismatch: {path} key={key.hex()}")
+        for part in ("node", "edge"):
+            source = part + "_overlap"
+            target = part + "_features"
+            if source not in side or target not in record:
+                raise ValueError(f"Overlap sidecar missing {source} or main {target}")
+            value = torch.as_tensor(side[source])
+            if value.ndim != 2 or tuple(value.shape) != tuple(record[target].shape):
+                raise ValueError(f"Overlap sidecar {source} shape mismatch")
+            if value.dtype != torch.float32 or not torch.isfinite(value).all():
+                raise ValueError(f"Overlap sidecar {source} must be finite float32")
+            record["phys_" + source] = value
 
     def get_dynamic_batch_cost_parts(self, idx: int) -> Dict[str, int]:
         raw_idx = self._resolve_dynamic_batch_index(idx)

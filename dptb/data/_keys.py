@@ -210,6 +210,12 @@ ALL_ENERGY_KEYS: Final[List[str]] = [
 BATCH_KEY: Final[str] = "batch"
 BATCH_PTR_KEY: Final[str] = "ptr"
 
+# Physical S is separate from the embedding latent overlap fields.
+PHYS_NODE_OVERLAP_KEY: Final[str] = "phys_node_overlap"
+PHYS_EDGE_OVERLAP_KEY: Final[str] = "phys_edge_overlap"
+NODE_SHIFT_DELTA_KEY: Final[str] = "node_shift_delta"
+EDGE_SHIFT_DELTA_KEY: Final[str] = "edge_shift_delta"
+
 # Make a list of allowed keys
 ALLOWED_KEYS: List[str] = [
     getattr(sys.modules[__name__], k)

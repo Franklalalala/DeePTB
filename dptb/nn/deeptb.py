@@ -114,6 +114,7 @@ class NNENV(nn.Module):
             transform: bool = True,
             has_soc: bool = False,
             scale_type: str = 'scale_w_back_grad',
+            shift_head: Optional[dict] = None,
             **kwargs,
     ):
         
@@ -468,11 +469,40 @@ class NNENV(nn.Module):
         elif self.method == "block_native":
             pass
 
+        from dptb.nn.shift_head import normalize_shift_options
+        from dptb.nn.charge_head import ChargeHead, normalize_charge_options
+        shift_options = (normalize_charge_options(shift_head) if embedding["method"] == "unitb"
+                         else normalize_shift_options(shift_head))
+        self.shift_head = None
+        if shift_options["mode"] != "off":
+            if self.method != "e3tb" or self.blockwise_hamiltonian or not self.transform:
+                raise ValueError("shift_head requires transformed e3tb feature outputs")
+            if embedding["method"] not in {"unitb", "lem", "lem_moe_v3", "lem_moe_v3_h0", "lem_moe_v3_edge", "lem_moe_v3_edge_h0"}:
+                raise ValueError("shift_head is supported on LEM and LEM MoE v3/H0/edge backbones")
+            from dptb.nn.response_shift_head import ResponseShiftHead
+            if shift_options["response"] is None:
+                raise ValueError("shift_head requires an atom response; additive heads are archived")
+            if embedding["method"] not in {"unitb", "lem_moe_v3", "lem_moe_v3_h0", "lem_moe_v3_edge", "lem_moe_v3_edge_h0"}:
+                raise ValueError("response hidden capture requires LEM MoE v3 backbone")
+            head_type = ChargeHead if embedding["method"] == "unitb" else ResponseShiftHead
+            self.shift_head = head_type(self.idp, self.embedding.layers[-1].irreps_in,
+                                       shift_options, dtype=self.dtype, device=self.device)
+            self.embedding.capture_shift_hidden = True
+            self.model_options["shift_head"] = shift_options
 
     def forward(self, data: AtomicDataDict.Type):
         if data.get(AtomicDataDict.EDGE_TYPE_KEY, None) is None:
             self.idp(data)
 
+        if self.shift_head is not None and (
+            self.shift_head.options.get("response") is not None
+            or self.shift_head.options.get("overlap_input", "physical") == "standard"
+        ):
+            # LEM overwrites edge_overlap with latents. Snapshot physical inputs
+            # BEFORE that write, but only under the explicit new input contract.
+            from dptb.nn.shift_overlap import prepare_shift_overlap
+            prepare_shift_overlap(data, self.idp.reduced_matrix_element,
+                                  standard=self.shift_head.options.get("overlap_input") == "standard", dtype=self.dtype)
         data = self.embedding(data)
         if self.method == "block_native":
             if self.block_native_add_h0:
@@ -519,6 +549,8 @@ class NNENV(nn.Module):
                 data[AtomicDataDict.NODE_FEATURES_KEY] += data[AtomicDataDict.NODE_ATTRS_KEY]
                 data[AtomicDataDict.EDGE_FEATURES_KEY] += data[AtomicDataDict.EDGE_ATTRS_KEY]
 
+        if self.shift_head is not None:
+            data = self.shift_head(data)
         return data
     
     @classmethod
@@ -547,6 +579,7 @@ class NNENV(nn.Module):
             "embedding": checkpoint_model_options["embedding"] if not embedding else embedding,
             "prediction": checkpoint_model_options["prediction"] if not prediction else prediction,
         }
+        model_options["shift_head"] = kwargs.pop("shift_head", checkpoint_model_options.get("shift_head"))
         common_options = dict(ckpt["config"]["common_options"])
         common_options.update(kwargs)
         for key, value in {

@@ -13,7 +13,6 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 from tools.build_nonsoc_p2_tables import _as_orbital_like, _sbt_context, _build_values, _distance_grid
-from h0rebuild.orb import read_abacus_orb
 
 
 def _build_pair(task):
@@ -29,6 +28,8 @@ def _build_pair(task):
 
 
 def main():
+    from h0rebuild.orb import read_abacus_orb
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--p2-manifest', required=True)
     ap.add_argument('--orb-root', required=True)
