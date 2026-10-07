@@ -62,8 +62,6 @@ class MPNN(torch.nn.Module):
                     p=p, 
                     n_edge=n_edge, 
                     n_node=n_node, 
-                    node_net=node_net, 
-                    edge_net=edge_net, 
                     dtype=dtype,
                     device=device,
                     if_exp=if_exp,

@@ -10,7 +10,7 @@ class Identity(torch.nn.Module):
         dtype: Union[str, torch.dtype] = torch.float32,
         device: Union[str, torch.device] = torch.device("cpu"),
     ):
-        super(Identity, self).__init__(Identity, dtype, device)
+        super().__init__()
 
     def forward(self, data: AtomicDataDict) -> AtomicDataDict:
         return data
