@@ -20,7 +20,7 @@ from dptb.data.interfaces.p2_contract import PRIOR_FIELD_SPECS, build_prior_spec
 from dptb.nn.embedding.emb import Embedding
 
 from .lem_moe_v3_h0 import LemMoEV3H0
-from .lem_moe_v3_h0_helpers import H0InitLayer
+from .prior_common import H0InitLayer
 from .soft_edge_memory import EquivariantSoftEdgeMemory
 
 

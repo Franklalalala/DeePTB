@@ -1,15 +1,12 @@
+"""Shared equivariant activations."""
 from __future__ import annotations
 
 import torch
 from e3nn import o3
 
 from dptb.nn.e3nn_fast import Gate
-
 from .eqv3_grid_helpers import (
-    EqV3StyleNodeFFN,
-    FlatSwiGLUS2Merge,
     build_equivariant_norm,
-    can_use_flat_s2_patch,
 )
 
 

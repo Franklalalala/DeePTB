@@ -16,11 +16,10 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.nn.embedding.emb import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, write_router_regularizers
 
-from .lem_moe_v3 import LemMoEV3
-from .lem_moe_v3_h0_helpers import H0InitLayer
+from .lem_moe_v3 import LemMoEV3, _capture_shift_hidden
+from .prior_common import H0InitLayer
 from .flow_time import FlowTimeConditioner
 from .late_block_expansion_cg import LateBlockExpansionCGHead
-from .two_stage_pair import TwoStagePairStream
 
 
 @Embedding.register("lem_moe_v3_h0")
@@ -112,7 +111,9 @@ class LemMoEV3H0(LemMoEV3):
             raise ValueError(
                 "log_head_input_rms=true requires output_route='h_b0'."
             )
-        self.two_stage_pair_enable = bool(two_stage_pair_enable)
+        if two_stage_pair_enable:
+            raise ValueError("Two-stage pair streams belong to archived models")
+        self.two_stage_pair_enable = False
         self.allow_no_h0_current_state = bool(allow_no_h0_current_state)
         self.two_stage_pair = None
         (
@@ -128,16 +129,6 @@ class LemMoEV3H0(LemMoEV3):
             option_name="h0_init_scope",
         )
         self.require_full_block_edge_coverage = bool(require_full_block_edge_coverage)
-        if (
-            self.two_stage_pair_enable
-            and not self.use_h0_init
-            and not self.allow_no_h0_current_state
-        ):
-            raise ValueError(
-                "two_stage_pair_enable=true requires an active H0 init scope in "
-                "LemMoEV3H0 or allow_no_h0_current_state=true for an absolute "
-                "Full-H flow."
-            )
         if self.require_full_block_edge_coverage and (
             (
                 not self.use_h0_init
@@ -201,61 +192,6 @@ class LemMoEV3H0(LemMoEV3):
                 dtype=self.dtype,
                 device=self.device,
             )
-        if self.two_stage_pair_enable:
-            final_irreps = self.layers[-1].irreps_out
-            self.two_stage_pair = TwoStagePairStream(
-                num_types=self.n_atom,
-                node_irreps=final_irreps,
-                edge_irreps=final_irreps,
-                latent_dim=self.latent_dim,
-                norm_eps=kwargs.get("norm_eps", 1.0e-8),
-                latent_channels=kwargs.get("latent_channels", [128, 128]),
-                radial_emb=kwargs.get("tp_radial_emb", False),
-                radial_channels=kwargs.get("tp_radial_channels", [128, 128]),
-                use_layer_onehot_tp=kwargs.get("use_layer_onehot_tp", True),
-                edge_one_hot_dim=kwargs.get("edge_one_hot_dim", 128),
-                equivariant_norm_type=kwargs.get("equivariant_norm_type", "none"),
-                activation_type="gate",
-                swiglu_s2_grid_resolution=kwargs.get(
-                    "swiglu_s2_grid_resolution", (14, 14)
-                ),
-                swiglu_s2_compat_mode=kwargs.get(
-                    "swiglu_s2_compat_mode", "modern"
-                ),
-                so2_wigner_apply_mode=kwargs.get(
-                    "so2_wigner_apply_mode", "compact_blocks"
-                ),
-                so2_fusion_mode=kwargs.get(
-                    "so2_fusion_mode", "streamed_m_major_cueq"
-                ),
-                mole_linear_mode=kwargs.get(
-                    "mole_linear_mode", "cueq_indexed_linear"
-                ),
-                so2_expert_mixing_mode=kwargs.get(
-                    "so2_expert_mixing_mode", "pre_activation"
-                ),
-                so2_expert_route_chunk_size=kwargs.get(
-                    "so2_expert_route_chunk_size", None
-                ),
-                so2_expert_route_checkpoint=kwargs.get(
-                    "so2_expert_route_checkpoint", False
-                ),
-                so2_output_router_hidden_dim=kwargs.get(
-                    "so2_output_router_hidden_dim", 32
-                ),
-                onehot_tp_mode=kwargs.get("onehot_tp_mode", None),
-                dtype=self.dtype,
-                device=self.device,
-                num_experts=kwargs.get("num_experts", 8),
-                num_shared_experts=kwargs.get("num_shared_experts", 1),
-                n_refine_layers=two_stage_pair_refine_layers,
-                refine_rank=two_stage_pair_refine_rank,
-                refine_condition=two_stage_pair_refine_condition,
-                refine_radial_dim=two_stage_pair_refine_radial_dim,
-                refine_edge_chunk_size=two_stage_pair_refine_edge_chunk_size,
-                tail_gate=two_stage_pair_tail_gate,
-            )
-
     @staticmethod
     def _require_ordered_full_block_edge_coverage(
         edge_index: torch.Tensor,
@@ -433,7 +369,8 @@ class LemMoEV3H0(LemMoEV3):
 
         data[_keys.EDGE_OVERLAP_KEY] = latents
         wigner_D_all = None
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
+            _capture_shift_hidden(self, data, idx, node_features, num_nodes_total, active_edges)
             latents, node_features, edge_features, wigner_D_all = layer(
                 latents,
                 node_features,
@@ -460,32 +397,13 @@ class LemMoEV3H0(LemMoEV3):
             )
             node_features = torch.cat([node_features, pad], dim=0)
 
-        if getattr(self, "two_stage_pair_enable", False):
-            edge_features = self.two_stage_pair(
-                latents,
-                node_features,
-                node_one_hot,
-                edge_features,
-                edge_index,
-                edge_vector,
-                cutoff_coeffs,
-                active_edges,
-                edge_one_hot,
-                wigner_D_all,
-                mole_globals,
-            )
-
         if getattr(self, "use_block_native_output", False):
-            head_kwargs = {}
-            if getattr(self, "pair_refine_enable", False):
-                head_kwargs["full_cutoff_coeffs"] = cutoff_coeffs
             head_outputs = self._apply_block_native_output_heads(
                 node_features,
                 edge_features,
                 atom_type,
                 edge_index,
                 active_edges,
-                **head_kwargs,
             )
             if getattr(self, "log_head_input_rms", False):
                 out_node_blocks, out_edge_blocks, head_input_rms = head_outputs
@@ -522,6 +440,10 @@ class LemMoEV3H0(LemMoEV3):
             data.pop(_keys.LEM_ACTIVE_EDGE_SPLIT_SIZES_KEY, None)
             data.pop(_keys.LEM_CUTOFF_COEFFS_KEY, None)
             return data
+
+        if getattr(self, "capture_shift_features", False):
+            data["_shift_node_features"] = node_features
+            data["_shift_active_edges"] = active_edges
 
         out_node_features, out_edge_features = self._apply_rme_output_heads(
             node_features, edge_features, node_one_hot, edge_one_hot

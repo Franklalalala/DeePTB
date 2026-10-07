@@ -1,3 +1,4 @@
+"""Shared prior projection and representation contracts for embeddings."""
 from __future__ import annotations
 
 import logging
@@ -136,6 +137,24 @@ def _sorted_irrep_coordinate_index(idp, *, device=None) -> tuple[o3.Irreps, torc
     return sorted_irreps, index
 
 
+def _ao_product_to_sorted_irreps(
+    source: torch.Tensor,
+    sort_index: torch.Tensor,
+    change_of_basis: torch.Tensor,
+    *,
+    coupled: bool = False,
+) -> torch.Tensor:
+    """Convert masked AO products to coupled RME and sort irrep coordinates.
+
+    Already coupled inputs and explicit legacy sorted-AO inputs skip the CG
+    contraction. Callers retain their own buffers and checkpoint conventions.
+    """
+    if not coupled:
+        change_of_basis = change_of_basis.to(device=source.device, dtype=source.dtype)
+        source = torch.einsum("kc,nc->nk", change_of_basis, source)
+    return source.index_select(1, sort_index.to(source.device))
+
+
 class DirectUuRealBlockProjector(torch.nn.Module):
     """Bias-free AO-block Clebsch-Gordan contraction into hidden irreps.
 
@@ -239,9 +258,9 @@ class DirectUuRealBlockProjector(torch.nn.Module):
         preservation is retained.
         """
         raw_product = self._gather_product(blocks, types, plan)
-        change_of_basis = self.cg_change_of_basis.to(device=blocks.device, dtype=blocks.dtype)
-        raw_coupled = torch.einsum("kc,nc->nk", change_of_basis, raw_product)
-        return raw_coupled.index_select(1, self.sort_index.to(blocks.device))
+        return _ao_product_to_sorted_irreps(
+            raw_product, self.sort_index, self.cg_change_of_basis
+        )
 
     def forward(self, data, atom_type, bond_type, active_edges):
         required = (
@@ -376,9 +395,9 @@ class DirectSpatialResidualBlockProjector(torch.nn.Module):
         preservation is retained.
         """
         raw_product = self._gather_product(blocks, types, plan)
-        change_of_basis = self.cg_change_of_basis.to(device=blocks.device, dtype=blocks.dtype)
-        raw_coupled = torch.einsum("kc,nc->nk", change_of_basis, raw_product)
-        return raw_coupled.index_select(1, self.sort_index.to(blocks.device))
+        return _ao_product_to_sorted_irreps(
+            raw_product, self.sort_index, self.cg_change_of_basis
+        )
 
     def forward(self, data, atom_type, bond_type, active_edges):
         required = (
@@ -911,13 +930,10 @@ class H0InitLayer(torch.nn.Module):
                 "H0 AO-product source width "
                 f"{tuple(source.shape)} != h0_dim={self.h0_dim}."
             )
-        if coupled or not self.h0_ao_cg:
-            return source.index_select(1, self._h0_sort_index.to(source.device))
-        change_of_basis = self._h0_cg_change_of_basis.to(
-            device=source.device, dtype=source.dtype
+        return _ao_product_to_sorted_irreps(
+            source, self._h0_sort_index, self._h0_cg_change_of_basis,
+            coupled=coupled or not self.h0_ao_cg,
         )
-        coupled = torch.einsum("kc,nc->nk", change_of_basis, source)
-        return coupled.index_select(1, self._h0_sort_index.to(source.device))
 
     def forward(
         self,

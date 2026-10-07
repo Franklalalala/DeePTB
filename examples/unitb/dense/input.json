@@ -1,0 +1,65 @@
+{
+  "common_options": {
+    "basis": {
+      "H": "2s1p",
+      "O": "2s2p1d"
+    },
+    "device": "cuda:0",
+    "has_soc": true,
+    "nextham_uureal_mask": true
+  },
+  "model_options": {
+    "embedding": {
+      "method": "unitb",
+      "num_experts": 1
+    },
+    "prediction": {
+      "method": "e3tb",
+      "scale_type": "no_scale",
+      "scales_trainable": false,
+      "shifts_trainable": false
+    }
+  },
+  "train_options": {
+    "num_epoch": 1,
+    "batch_size": 1,
+    "optimizer": {
+      "type": "Adam",
+      "lr": 0.001
+    },
+    "loss_options": {
+      "train": {
+        "method": "hamil_abs"
+      }
+    },
+    "distance_ranges": [
+      [
+        0.0,
+        1e-06
+      ]
+    ],
+    "clip_last_expert_range": true
+  },
+  "data_options": {
+    "train": {
+      "type": "LMDBDataset",
+      "root": "DATA_ROOT/train",
+      "prefix": "data",
+      "get_Hamiltonian": true,
+      "get_H0": true,
+      "h0_key": "hamiltonian_0",
+      "prefer_precomputed_h0": true,
+      "target_kind": "h0res"
+    },
+    "validation": {
+      "type": "LMDBDataset",
+      "root": "DATA_ROOT/validation",
+      "prefix": "data",
+      "get_Hamiltonian": true,
+      "get_H0": true,
+      "h0_key": "hamiltonian_0",
+      "prefer_precomputed_h0": true,
+      "target_kind": "h0res"
+    }
+  }
+}

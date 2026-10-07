@@ -46,7 +46,7 @@ from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, write_router_regularizers
 from .lem_moe_v3 import LemMoEV3
 from .lem_moe_v3_h0 import LemMoEV3H0
 from .lem_moe_v3_edge import LemMoEV3EdgeH0
-from .lem_moe_v3_h0_helpers import H0InitLayer, _get_feature_source_with_key
+from .prior_common import H0InitLayer, _get_feature_source_with_key
 
 
 PRIOR_2B_KINDS = {
@@ -70,6 +70,7 @@ _LAYER_PASSTHROUGH = (
     "so2_wigner_apply_mode",
     "so2_fusion_mode",
     "mole_linear_mode",
+    "mole_expert_rank",
     "so2_expert_route_chunk_size",
     "so2_expert_route_checkpoint",
     "so2_output_router_hidden_dim",
@@ -271,6 +272,12 @@ class _Prior2bMixin:
         )
         layer_kwargs = {name: self._layer_option(name) for name in _LAYER_PASSTHROUGH}
         layer_kwargs.update({name: getattr(self, name) for name in _LAYER_FROM_SELF})
+        routed_layer = 0 in self.so2_moe_layers
+        layer_kwargs["mole_expert_parameterization"] = (
+            self._layer_option("mole_expert_parameterization") if routed_layer else "full"
+        )
+        if not routed_layer:
+            layer_kwargs["so2_expert_mixing_mode"] = "pre_activation"
         self.layers[0] = self._layer_type()(
             num_types=self.n_atom,
             avg_num_neighbors=old.avg_num_neighbors,
@@ -281,7 +288,7 @@ class _Prior2bMixin:
             node_activation_type=node_act,
             use_node_ffn=use_node_ffn,
             use_interpolation_tp=use_interpolation_tp,
-            num_experts=self.num_experts,
+            num_experts=self.num_experts if routed_layer else 0,
             dtype=self.dtype,
             device=self.device,
             **layer_kwargs,
@@ -389,17 +396,8 @@ class _Prior2bMixin:
 
         # --- pairwise 2b branch: y_2b = W_2b [h_geo ; Pi(P)], no message passing
         latents, geo_node, geo_edge, cutoff_coeffs, active_edges = self.two_b_init(*init_args)
-        two_b_data = data
-        if not self.only2b and self.use_flow_time_embedding:
-            # CFM updates the GNN state, never the frozen stage-1 input.
-            two_b_data = data.copy()
-            for key in (self.prior_node_key, self.prior_edge_key):
-                original_key = "serial_original_" + key
-                if original_key not in data:
-                    raise KeyError("Serial flow requires immutable input " + original_key)
-                two_b_data[key] = data[original_key]
         prior_node, prior_edge = self._project_prior(
-            two_b_data, atom_type, bond_type, active_edges, geo_node.shape[0], geo_edge.shape[0],
+            data, atom_type, bond_type, active_edges, geo_node.shape[0], geo_edge.shape[0],
             self.two_b_node_proj, self.two_b_edge_proj,
         )
         y2b_node = self.two_b_out_node(torch.cat([geo_node, prior_node], dim=-1))
@@ -414,7 +412,7 @@ class _Prior2bMixin:
             router_input = self._edge_router_input(data, bond_type, active_edges, active_edge_one_hot, edge_vector)
             active_bond_type = bond_type.to(device=active_edges.device)[active_edges]
             mole_pa, monitor_val, expert_load_cv, num_route_tokens = self._make_edge_moe_globals(
-                router_input, active_bond_type
+                router_input, active_bond_type, data=data, active_edges=active_edges
             )
             data["mean_max_prob"] = monitor_val
             data["expert_load_cv"] = expert_load_cv
@@ -567,6 +565,11 @@ class LemMoEV3EdgePrior2b(_Prior2bMixin, LemMoEV3EdgeH0):
 
 @Embedding.register("lem_moe_v3_prior_2b")
 def build_prior_2b(**kwargs):
+    from dptb.nn.route_drop import validate_route_drop
+    validate_route_drop(kwargs.get("edge_router_route_drop_p", 0.0),
+                        kwargs.get("edge_router_route_drop_scale", "inverted"))
+    if kwargs.get("edge_router_route_drop_p", 0.0) > 0 and not kwargs.get("edge_router_prior_activate", False):
+        raise ValueError("edge_router_route_drop_p > 0 requires edge_router_prior_activate=true")
     cls = LemMoEV3Prior2bPA if kwargs.get("edge_router_prior_activate", False) else LemMoEV3Prior2b
     return cls(**kwargs)
 
