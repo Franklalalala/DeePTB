@@ -15,7 +15,7 @@ _FLAG_NAMES = (
     "_activation_recompute_use_reentrant",
     "_activation_recompute_preserve_rng_state",
 )
-_DEFAULT_TARGETS = ("lem_moe_v3_tp", "lem_non_linear_expert_block")
+_DEFAULT_TARGETS = ("lem_moe_v3_tp",)
 
 
 def _split_tensor_args(args: tuple[Any, ...]):
@@ -388,22 +388,6 @@ def configure_activation_recompute(model: torch.nn.Module, options: dict[str, An
                     preserve_rng_state=preserve_rng_state,
                 )
                 state["edge_tp"] += 1
-        if "lem_non_linear_expert_block" in targets:
-            if class_name == "NonLinearExpertUpdateNode" and checkpoint_node_tp and hasattr(module, "expert_tp"):
-                _set_activation_recompute_flags(
-                    module,
-                    use_reentrant=use_reentrant,
-                    preserve_rng_state=preserve_rng_state,
-                )
-                state["non_linear_node"] += 1
-            elif class_name == "NonLinearExpertUpdateEdge" and checkpoint_edge_tp and hasattr(module, "expert_tp"):
-                _set_activation_recompute_flags(
-                    module,
-                    use_reentrant=use_reentrant,
-                    preserve_rng_state=preserve_rng_state,
-                )
-                state["non_linear_edge"] += 1
-
     log.info(
         "activation_recompute enabled: targets=%s node_tp=%s edge_tp=%s "
         "non_linear_node=%s non_linear_edge=%s use_reentrant=%s preserve_rng_state=%s",
