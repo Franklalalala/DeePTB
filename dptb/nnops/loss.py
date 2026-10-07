@@ -918,6 +918,34 @@ class HamilLossAbs(nn.Module):
             else:
                 total_loss = 0.5 * (onsite_loss + hopping_loss)
 
+            if AtomicDataDict.NODE_SHIFT_DELTA_KEY in data:
+                # Same orbital/distance masks and L1+RMSE reduction as this loss.
+                # Signed difference: negative means the correction helps this batch.
+                with torch.no_grad():
+                    base_losses, base_abs, base_sq, stats = [], [], [], {}
+                    for part, diff, mask, count, key in (
+                        ("node", diff_node, final_node_mask, onsite_cnt, AtomicDataDict.NODE_SHIFT_DELTA_KEY),
+                        ("edge", diff_edge, final_edge_mask, hopping_cnt, AtomicDataDict.EDGE_SHIFT_DELTA_KEY),
+                    ):
+                        delta = data[key] * mask
+                        base_diff = diff.detach() - delta
+                        a, q = base_diff.abs().sum(), base_diff.square().sum()
+                        base_abs.append(a)
+                        base_sq.append(q)
+                        base_losses.append(_l1_rmse_loss_from_sums(abs_sum=a, square_sum=q, count=count))
+                        stats[part + "_delta_mae"] = delta.abs().sum() / count.clamp_min(1)
+                        stats[part + "_delta_rms"] = (delta.square().sum() / count.clamp_min(1)).sqrt()
+                    if self.onsite_boost:
+                        base_loss = w_onsite * base_losses[0] + base_losses[1]
+                    elif self.element_average:
+                        base_loss = _l1_rmse_loss_from_sums(
+                            abs_sum=sum(base_abs), square_sum=sum(base_sq), count=onsite_cnt + hopping_cnt)
+                    else:
+                        base_loss = 0.5 * sum(base_losses)
+                    stats["task_loss_change"] = total_loss.detach() - base_loss
+                    self.last_shift_stats = stats
+                    log.info("shift_loss %s", " ".join(f"{k}={float(v):.7g}" for k, v in stats.items()))
+
             if self.z_loss_coef > 0 and isinstance(raw_z_loss, torch.Tensor):
                 total_loss = total_loss + self.z_loss_coef * raw_z_loss
 

@@ -36,16 +36,6 @@ _ALIAS_REMOVAL_VERSION = "2.3"
 # checkpoints.  Consequently a user-provided alias could be stored next to an
 # injected canonical default (and vice versa).  Keep this table deliberately
 # narrow: raw/new configuration canonicalization remains strictly fail-closed.
-_LEGACY_CHECKPOINT_FLOW_ALIAS_DEFAULTS = (
-    ("huckel_k", "overlap_huckel_k", 1.75),
-    (
-        "huckel_edge_channel_scale",
-        "overlap_huckel_edge_channel_scale",
-        None,
-    ),
-    ("prior_skdata", "dftb_skdata", ""),
-    ("physical_prior_jitter_sigma", "prior_jitter_sigma", 0.0),
-)
 
 
 @dataclass(frozen=True)
@@ -280,75 +270,34 @@ def resolve_init_scope(
     }
 
 
-# ---------------------------------------------------------------------------
-# flow_options registry rows.
-# ---------------------------------------------------------------------------
-def _flow_meanflow_subtree(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    meanflow = out.get("meanflow", {}) or {}
-    if not isinstance(meanflow, Mapping):
-        raise TypeError("flow_options.meanflow must be a mapping.")
-    meanflow = deepcopy(dict(meanflow))
-    _merge_aliases(meanflow, "du_dt_backend", ("jvp_backend",), rv, changes=changes)
-    _merge_aliases(
-        meanflow, "jvp_fallback", ("jvp_fallback_to_finite_difference",), rv, changes=changes
-    )
-    _merge_aliases(meanflow, "objective", ("loss_objective",), rv, changes=changes)
-    for dead_flag in (
-        "log_compatible_loss",
-        "log_train_compatible_loss",
-        "log_validation_compatible_loss",
-        "compatible_loss_to_legacy_keys",
-    ):
-        if dead_flag in meanflow:
-            _require_bool(
-                meanflow.pop(dead_flag),
-                option_name=f"flow_options.meanflow.{dead_flag}",
-            )
-            changes.append(_AliasHit(f"meanflow.{dead_flag}", "always_on", rv))
-
-    top_profile = out.pop("meanflow_profile", _MISSING)
-    if top_profile is not _MISSING:
-        if "profile" in meanflow and _normalized_name(meanflow["profile"]) != _normalized_name(
-            top_profile
-        ):
-            raise ValueError("Conflicting flow_options.meanflow.profile and meanflow_profile.")
-        meanflow["profile"] = top_profile
-        changes.append(_AliasHit("meanflow_profile", "meanflow.profile", rv))
-    aggressive_values = []
-    if "meanflow_aggressive" in out:
-        aggressive_values.append(
-            (
-                "meanflow_aggressive",
-                _require_bool(
-                    out.pop("meanflow_aggressive"),
-                    option_name="flow_options.meanflow_aggressive",
-                ),
-            )
-        )
-    if "aggressive" in meanflow:
-        aggressive_values.append(
-            (
-                "meanflow.aggressive",
-                _require_bool(
-                    meanflow.pop("aggressive"),
-                    option_name="flow_options.meanflow.aggressive",
-                ),
-            )
-        )
-    if len({value for _name, value in aggressive_values}) > 1:
-        raise ValueError(
-            "Conflicting flow_options.meanflow_aggressive and "
-            "flow_options.meanflow.aggressive."
-        )
-    if any(value for _name, value in aggressive_values):
-        if "profile" in meanflow and _normalized_name(meanflow["profile"]) != "aggressive":
-            raise ValueError("Aggressive MeanFlow flag conflicts with meanflow.profile.")
-        meanflow["profile"] = "aggressive"
-    for name, _value in aggressive_values:
-        changes.append(_AliasHit(name, "meanflow.profile", rv))
-    out["meanflow"] = meanflow
+# Inactive historical fields are discarded when loading supervised checkpoints.
+_ARCHIVED_FLOW_OPTIONS = frozenset({
+    'log_compatible_loss',
+    'allow_complex_prior_real_projection', 'apply_to_reference', 'basis_onsite_edge_value',
+    'basis_onsite_missing_value', 'basis_onsite_mode', 'basis_onsite_scale',
+    'block_export_final_full_h', 'block_input_adapter', 'block_inverse_atol', 'block_inverse_mode',
+    'block_ode', 'compatible_loss_to_legacy_keys', 'component_reduction', 'dftb_prior_overlap',
+    'dftb_prior_require_geometry', 'dftb_prior_strict', 'dftb_skdata', 'edge_block_shape_key',
+    'edge_block_target_key', 'edge_output_key', 'edge_weight', 'endpoint_weight_cap',
+    'endpoint_weight_power', 'external_prior_strict', 'flow_time_h_key', 'flow_time_r_key',
+    'flow_time_t_key', 'h0_condition_space', 'haar_candidate_index', 'haar_dm_strict',
+    'haar_edge_key', 'haar_node_key', 'huckel_edge_channel_scale', 'huckel_edge_energy_fallback',
+    'huckel_edge_length_decay', 'huckel_edge_overlap_key', 'huckel_energy_mode', 'huckel_k',
+    'huckel_node_overlap_key', 'huckel_scale_global', 'huckel_scale_mode', 'huckel_strict_basis',
+    'huckel_strict_overlap', 'log_train_compatible_loss', 'log_validation_compatible_loss',
+    'log_validation_flow_euler_loss', 'log_validation_random_t_loss', 'log_validation_t0_loss',
+    'loss_type', 'meanflow', 'meanflow_aggressive', 'meanflow_profile', 'node_block_shape_key',
+    'node_block_target_key', 'node_output_key', 'node_weight', 'objective', 'omit_time_scaling',
+    'overlap_huckel_edge_channel_scale', 'overlap_huckel_k', 'overwrite_feature_keys',
+    'physical_prior_fallback', 'physical_prior_jitter_edge_decay',
+    'physical_prior_jitter_reference_scale', 'physical_prior_jitter_sigma', 'pixel_meanflow',
+    'prediction_add_h0', 'prior_calibration', 'prior_edge', 'prior_edge_key', 'prior_jitter_sigma',
+    'prior_key_prefixes', 'prior_node', 'prior_node_key', 'prior_skdata', 'sample_prior_scale',
+    'skdata', 'state_space', 'strict_certification', 't_eps', 'target_semantics',
+    'te_prior_validation_seed', 'tied_irrep_irreps', 'tied_irrep_mode', 'tied_irrep_sigma',
+    'tied_irrep_validation_seed', 'time_conditioning_required', 'time_logit_mean', 'time_logit_std',
+    'time_sampling', 'type', 'validation_flow_metrics', 'validation_ode_steps', 'z_loss_coef',
+})
 
 
 def _flow_missing_h0_policy(
@@ -394,298 +343,28 @@ def _flow_missing_h0_policy(
         out["missing_h0_policy"] = policy
 
 
-def _flow_prediction_reconstruction_marker(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    """Remove the feature-branch duplicate of prediction.reconstruction.
-
-    ``prediction_add_h0`` was only a declarative block-ODE marker and was
-    required to be false.  Keeping it in dargs would create a second source of
-    truth beside ``model_options.prediction.reconstruction``.  Accept the only
-    historically valid value as a deprecated no-op and reject true instead of
-    guessing at a cross-tree reconstruction change.
-    """
-
-    if "prediction_add_h0" not in out:
-        return
-    value = out.pop("prediction_add_h0")
-    if not isinstance(value, bool):
-        raise TypeError("flow_options.prediction_add_h0 must be a boolean.")
-    if value:
-        raise ValueError(
-            "flow_options.prediction_add_h0=true is not a valid canonical "
-            "route; set model_options.prediction.reconstruction explicitly."
-        )
-    changes.append(
-        _AliasHit(
-            "prediction_add_h0",
-            "model_options.prediction.reconstruction='direct'",
-            rv,
-        )
-    )
-
-
-def _flow_validation_metrics(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    metric_order = ("random_t", "one_step", "trajectory")
-    metric_aliases = {"t0": "one_step", "euler": "trajectory"}
-    configured_metrics = out.get("validation_flow_metrics", _MISSING)
-    if configured_metrics is not _MISSING:
-        if not isinstance(configured_metrics, (list, tuple, set)):
-            raise TypeError("flow_options.validation_flow_metrics must be a list.")
-        if any(not isinstance(value, str) for value in configured_metrics):
-            raise TypeError(
-                "flow_options.validation_flow_metrics must contain strings."
-            )
-        normalized_metrics = {
-            metric_aliases.get(_normalized_name(value), _normalized_name(value))
-            for value in configured_metrics
-        }
-        unknown = normalized_metrics.difference(metric_order)
-        if unknown:
-            raise ValueError(
-                "flow_options.validation_flow_metrics contains unknown values: "
-                f"{sorted(unknown)}."
-            )
-    else:
-        normalized_metrics = set(metric_order)
-
-    legacy_metric_flags = {
-        "log_validation_random_t_loss": "random_t",
-        "log_validation_t0_loss": "one_step",
-        "log_validation_flow_euler_loss": "trajectory",
-    }
-    present_legacy_metrics = {}
-    for flag, metric in legacy_metric_flags.items():
-        if flag in out:
-            present_legacy_metrics[metric] = _require_bool(
-                out.pop(flag), option_name=f"flow_options.{flag}"
-            )
-    if present_legacy_metrics:
-        legacy_metrics = {
-            metric
-            for metric in metric_order
-            if present_legacy_metrics.get(metric, True)
-        }
-        if configured_metrics is not _MISSING and normalized_metrics != legacy_metrics:
-            raise ValueError(
-                "flow_options.validation_flow_metrics conflicts with deprecated "
-                "validation logging flags."
-            )
-        normalized_metrics = legacy_metrics
-        for flag, metric in legacy_metric_flags.items():
-            if metric in present_legacy_metrics:
-                changes.append(_AliasHit(flag, "validation_flow_metrics", rv))
-    if configured_metrics is not _MISSING or present_legacy_metrics:
-        out["validation_flow_metrics"] = [
-            metric for metric in metric_order if metric in normalized_metrics
-        ]
-
-
-def _flow_validation_ode_steps(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    if "validation_ode_steps" in out:
-        raw_steps = out["validation_ode_steps"]
-        if not isinstance(raw_steps, (list, tuple, set)):
-            raise TypeError("flow_options.validation_ode_steps must be a list.")
-        if not raw_steps:
-            block_ode = out.get("block_ode", False)
-            if "block_ode" in out:
-                block_ode = _require_bool(
-                    block_ode, option_name="flow_options.block_ode"
-                )
-            output_space = out.get("output_space", "")
-            normalized_output_space = (
-                _normalized_name(output_space)
-                if isinstance(output_space, str)
-                else ""
-            )
-            block_output_spaces = {
-                "ao_block_ode",
-                "block_ode",
-                "ao_blocks_ode",
-                "uureal_block_ode",
-                "spatial_uureal_residual_block_ode",
-                "uureal_residual_block_ode",
-                "residual_ao_block_ode",
-            }
-            # Preserve an explicit empty list only for a requested block ODE so
-            # its cross-tree contract can reject the malformed production
-            # configuration.  Generic flows retain the 0715 invariant that
-            # canonicalization always inserts the Euler-1 endpoint.
-            out["validation_ode_steps"] = (
-                []
-                if block_ode or normalized_output_space in block_output_spaces
-                else [1]
-            )
-            return
-        if any(
-            isinstance(value, bool) or not isinstance(value, Integral)
-            for value in raw_steps
-        ):
-            raise ValueError(
-                "flow_options.validation_ode_steps must contain positive integers."
-            )
-        if any(value <= 0 for value in raw_steps):
-            raise ValueError(
-                "flow_options.validation_ode_steps must contain positive integers."
-            )
-        steps = {int(value) for value in raw_steps}
-        steps.add(1)
-        out["validation_ode_steps"] = sorted(steps)
-
-
-# output_space spellings whose block-ODE route parametrizes the rollout as
-# D_t = t * D1, so the exact t=0, D=0 inference boundary only receives
-# training mass when t0_probability > 0 (dptb.nnops.flow's uureal_block_ode /
-# residual_ao_block_ode branches, mirrored by
-# dptb.utils.argcheck.validate_block_ode_contract's uureal_mode /
-# residual_spatial_mode checks).  The plain ao_block_ode route is deliberately
-# excluded: it keeps the schema-wide t0_probability default of 0.0.
-_BLOCK_ODE_T0_BOUNDARY_OUTPUT_SPACES = frozenset(
-    (
-        "uureal_block_ode",
-        "spatial_uureal_residual_block_ode",
-        "uureal_residual_block_ode",
-        "residual_ao_block_ode",
-    )
-)
-
-
-def _flow_t0_probability_boundary_default(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    """Give uureal/residual block-ODE routes their documented 0.15 default.
-
-    dargs' schema-wide default for ``t0_probability`` is 0.0 (it has no way to
-    know these two routes need a different one), and ``normalize()`` runs
-    dargs' ``normalize_value`` immediately after this canonicalization pass.
-    By the time ``validate_block_ode_contract`` inspects the config, "omitted"
-    and "explicit 0.0" would already be indistinguishable -- both read back as
-    0.0 -- unless resolved here, before dargs ever sees the dict.  That made
-    the "omitting t0_probability lets the runtime default 0.15 apply" comments
-    in ``dptb.nnops.flow`` and ``validate_block_ode_contract`` unreachable in
-    the real ``normalize()`` pipeline: any uureal_block_ode/residual_ao_block_ode
-    config that didn't set t0_probability explicitly failed config-time
-    validation, even though the identical dict validated fine when those
-    validators were called directly (bypassing dargs' default injection), and
-    even though the flow constructor's own ``options.get("t0_probability", 0.15)``
-    fallback works correctly in that direct-call context.
-
-    Only fill the key in when it is genuinely absent; an explicit value
-    (including an explicit 0.0) is left completely untouched and still fails
-    the positive-probability contract check downstream, exactly as documented.
-    """
-
-    if "t0_probability" in out:
-        return
-    output_space = out.get("output_space", "")
-    normalized_output_space = (
-        _normalized_name(output_space) if isinstance(output_space, str) else ""
-    )
-    if normalized_output_space in _BLOCK_ODE_T0_BOUNDARY_OUTPUT_SPACES:
-        out["t0_probability"] = 0.15
-
-
-def _flow_omit_time_scaling(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    if "omit_time_scaling" in out:
-        omit = _require_bool(
-            out.pop("omit_time_scaling"),
-            option_name="flow_options.omit_time_scaling",
-        )
-        if omit:
-            # This reproduces the legacy short-circuit exactly, including when
-            # endpoint_weight_power was configured to a non-zero value.
-            out["endpoint_weight_power"] = 0.0
-        changes.append(_AliasHit("omit_time_scaling", "endpoint_weight_power", rv))
-
-
-def _flow_dead_top_flags(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    # These switches have been hard invariants since the endpoint-compatible
-    # logging fix.  Accept and discard them so old configs keep loading without
-    # pretending that ``false`` changes runtime behavior.
-    for dead_flag in (
-        "log_compatible_loss",
-        "log_train_compatible_loss",
-        "log_validation_compatible_loss",
-        "compatible_loss_to_legacy_keys",
-    ):
-        if dead_flag in out:
-            _require_bool(
-                out.pop(dead_flag), option_name=f"flow_options.{dead_flag}"
-            )
-            changes.append(_AliasHit(dead_flag, "always_on", rv))
-
-
-def _flow_final_normalize(
-    out: MutableMapping[str, Any], changes: List[_AliasHit], rv: str
-) -> None:
-    # Normalize every route-bearing enum before dargs injects defaults.  The
-    # block-ODE validator and runtime must see one spelling (not a mix of
-    # hyphenated and underscored values), while semantic aliases such as
-    # uureal_residual_block_ode remain distinct and are rejected at the strict
-    # contract boundary rather than silently redirected.
-    for key in (
-        "objective",
-        "mode",
-        "prior",
-        "te_prior_mode",
-        "tied_irrep_mode",
-        "output_space",
-        "state_space",
-        "target_semantics",
-        "block_input_adapter",
-        "h0_condition_space",
-        "block_inverse_mode",
-        "strict_certification",
-        "component_reduction",
-    ):
-        if key in out and isinstance(out[key], str):
-            out[key] = _normalized_name(out[key])
-
-
-# Ordered registry for ``flow_options``.  Order is load-bearing: pixel_meanflow
-# must be merged onto ``meanflow`` before the meanflow subtree is processed, and
-# the final normalization must run last.
-_FLOW_REGISTRY: Tuple[_AliasRule, ...] = (
-    _Rename("objective", ("type",)),
-    _Rename("meanflow", ("pixel_meanflow",)),
-    _Rename("huckel_k", ("overlap_huckel_k",)),
-    _Rename("huckel_edge_channel_scale", ("overlap_huckel_edge_channel_scale",)),
-    _Rename("prior_skdata", ("dftb_skdata", "skdata")),
-    _Rename("physical_prior_jitter_sigma", ("prior_jitter_sigma",)),
-    _Transform(_flow_meanflow_subtree),
-    _Transform(_flow_missing_h0_policy),
-    _Transform(_flow_prediction_reconstruction_marker),
-    _Transform(_flow_validation_metrics),
-    _Transform(_flow_validation_ode_steps),
-    _Transform(_flow_t0_probability_boundary_default),
-    _Transform(_flow_omit_time_scaling),
-    _Transform(_flow_dead_top_flags),
-    _Transform(_flow_final_normalize),
-)
-
-
-def canonicalize_flow_options(
-    options: Optional[Mapping[str, Any]],
-    *,
-    warn_deprecated: bool = True,
-) -> Dict[str, Any]:
-    """Return one fail-closed representation of ``train_options.flow_options``."""
-
+def canonicalize_flow_options(options, *, warn_deprecated=True):
+    """Resolve prior-noise options saved under the historical flow name."""
     if options is None:
         return {}
     if not isinstance(options, Mapping):
         raise TypeError("train_options.flow_options must be a mapping.")
-    out: Dict[str, Any] = deepcopy(dict(options))
-    changes: List[_AliasHit] = []
-    _apply_alias_registry(out, _FLOW_REGISTRY, changes=changes)
+    out = deepcopy(dict(options))
+    if _require_bool(out.get("enabled", False), option_name="flow_options.enabled"):
+        raise ValueError("Flow training is available only in archived models")
+    if out.get("block_ode", False):
+        raise ValueError("Block ODE objectives are available only in archived models")
+    if "prediction_add_h0" in out and _require_bool(
+        out["prediction_add_h0"], option_name="flow_options.prediction_add_h0"
+    ):
+        raise ValueError("flow_options.prediction_add_h0=true is not a valid canonical option")
+    changes = []
+    _flow_missing_h0_policy(out, changes, _ALIAS_REMOVAL_VERSION)
+    for key in _ARCHIVED_FLOW_OPTIONS:
+        out.pop(key, None)
+    for key in ("mode", "prior", "te_prior_mode", "output_space"):
+        if key in out and isinstance(out[key], str):
+            out[key] = _normalized_name(out[key])
     _emit_alias_warnings(changes, enabled=warn_deprecated)
     return out
 
@@ -765,45 +444,9 @@ _TRAIN_ENDPOINT_REGISTRY: Tuple[_AliasRule, ...] = (
 )
 
 
-def migrate_legacy_checkpoint_flow_options(
-    options: Optional[Mapping[str, Any]],
-    *,
-    warn_deprecated: bool = True,
-) -> Dict[str, Any]:
-    """Canonicalize flow options saved by the pre-0714 checkpoint schema.
-
-    The old schema inserted defaults for both a canonical key and its alias.
-    Only that recognizable default/custom collision is relaxed here.  Two
-    distinct non-default values are passed to the normal canonicalizer and
-    therefore still fail closed.
-    """
-
-    if options is None:
-        return {}
-    if not isinstance(options, Mapping):
-        raise TypeError("checkpoint train_options.flow_options must be a mapping.")
-    out: Dict[str, Any] = deepcopy(dict(options))
-    changes: List[_AliasHit] = []
-    for canonical, alias, old_default in _LEGACY_CHECKPOINT_FLOW_ALIAS_DEFAULTS:
-        if canonical not in out or alias not in out:
-            continue
-        canonical_value = out[canonical]
-        alias_value = out[alias]
-        canonical_is_default = _same_value(canonical_value, old_default)
-        alias_is_default = _same_value(alias_value, old_default)
-        if canonical_is_default and not alias_is_default:
-            out[canonical] = alias_value
-            out.pop(alias)
-            changes.append(_AliasHit(alias, canonical, _ALIAS_REMOVAL_VERSION))
-        elif alias_is_default or _same_value(canonical_value, alias_value):
-            out.pop(alias)
-            changes.append(_AliasHit(alias, canonical, _ALIAS_REMOVAL_VERSION))
-
-    # This retains the strict conflict check for all unrecognized collisions
-    # and also migrates aliases that were not populated by the old schema.
-    migrated = canonicalize_flow_options(out, warn_deprecated=warn_deprecated)
-    _emit_alias_warnings(changes, enabled=warn_deprecated)
-    return migrated
+def migrate_legacy_checkpoint_flow_options(options, *, warn_deprecated=True):
+    """Load inactive flow dictionaries and retain prior-noise sampling keys."""
+    return canonicalize_flow_options(options, warn_deprecated=warn_deprecated)
 
 
 def migrate_legacy_checkpoint_train_options(
@@ -831,7 +474,7 @@ def migrate_legacy_checkpoint_train_options(
 # ---------------------------------------------------------------------------
 # model_options.embedding registry rows.
 # ---------------------------------------------------------------------------
-_H0_METHODS = {"lem_moe_v3_h0", "lem_pair", "lem_moe_v3_edge_h0", "lem_non_linear_h0"}
+_H0_METHODS = {"lem_moe_v3_h0", "lem_moe_v3_edge_h0"}
 
 _SOFT_EDGE_MEMORY_ALIASES = {
     "use_soft_edge_memory": "enabled",

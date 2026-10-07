@@ -1,17 +1,10 @@
 from typing import List, Callable, Dict, Any, Union
 from dargs import dargs, Argument, Variant, ArgumentEncoder
 import logging
+import math
 from numbers import Number
 
 from dptb.configuration import canonicalize_training_config
-# Also dependency-free (no torch, no e3nn): see
-# dptb/nnops/tied_irrep_constants.py's module docstring. flow_options()'s
-# tied_irrep_irreps schema default (below) needs the literal;
-# validate_block_ode_contract's own use of it (which also lazily imports
-# e3nn/torch, to compare tied_irrep_irreps by o3.Irreps equivalence without
-# paying that import weight for every argcheck caller) now lives in
-# dptb.utils.block_ode_contract, re-exported below.
-from dptb.nnops.tied_irrep_constants import TIED_IRREP_CANONICAL_IRREPS
 
 
 log = logging.getLogger(__name__)
@@ -174,15 +167,9 @@ def dynamic_batch_options():
 
 
 def flow_options():
-    doc = (
-        "Trainer-side conditional flow matching for Hamiltonian prediction. "
-        "When enabled, DeePTB replaces node_h0/edge_h0 by an interpolated "
-        "Hamiltonian state H_t and trains the existing model to predict the "
-        "clean target Hamiltonian, following a QHFlow2-style residual CFM path."
-    )
+    """Historical option name for supervised prior-noise sampling."""
     args = [
         Argument("enabled", bool, optional=True, default=False),
-        Argument("objective", str, optional=True, default="cfm"),
         Argument("mode", str, optional=True, default="residual"),
         Argument("prior", str, optional=True, default="zero"),
         Argument("node_h0_key", str, optional=True, default="node_h0"),
@@ -190,124 +177,17 @@ def flow_options():
         Argument("node_target_key", str, optional=True, default="node_features"),
         Argument("edge_target_key", str, optional=True, default="edge_features"),
         Argument("output_space", str, optional=True, default="rme"),
-        Argument("state_space", str, optional=True, default=""),
-        Argument("target_semantics", str, optional=True, default=""),
-        Argument("block_input_adapter", str, optional=True, default=""),
-        Argument("h0_condition_space", str, optional=True, default=""),
-        Argument("block_export_final_full_h", bool, optional=True, default=False),
-        Argument("block_ode", bool, optional=True, default=False),
-        Argument("time_conditioning_required", bool, optional=True, default=False),
-        Argument("block_inverse_mode", str, optional=True, default="strict"),
-        Argument("block_inverse_atol", [int, float, None], optional=True, default=None),
-        Argument("strict_certification", str, optional=True, default="always"),
-        Argument("node_output_key", str, optional=True, default="node_hamil_blocks"),
-        Argument("edge_output_key", str, optional=True, default="edge_hamil_blocks"),
-        Argument("node_block_target_key", str, optional=True, default="node_delta_hamil_blocks"),
-        Argument("edge_block_target_key", str, optional=True, default="edge_delta_hamil_blocks"),
-        Argument("node_block_shape_key", str, optional=True, default="node_delta_hamil_block_shape"),
-        Argument("edge_block_shape_key", str, optional=True, default="edge_delta_hamil_block_shape"),
         Argument("flow_time_key", str, optional=True, default="flow_time"),
-        Argument("flow_time_r_key", str, optional=True, default="flow_time_r"),
-        Argument("flow_time_t_key", str, optional=True, default="flow_time_t"),
-        Argument("flow_time_h_key", str, optional=True, default="flow_time_h"),
-        Argument("meanflow", dict, optional=True, default={}),
-        Argument("time_sampling", str, optional=True, default="uniform"),
         Argument("t_min", (int, float), optional=True, default=0.0),
         Argument("t_max", (int, float), optional=True, default=0.999),
         Argument("t0_probability", (int, float), optional=True, default=0.0),
-        Argument("t_eps", (int, float), optional=True, default=1.0e-3),
-        Argument("time_logit_mean", (int, float), optional=True, default=-0.4),
-        Argument("time_logit_std", (int, float), optional=True, default=1.0),
         Argument("node_sigma", (int, float), optional=True, default=1.0),
         Argument("edge_sigma", (int, float), optional=True, default=1.0),
         Argument("residual_sigma_floor", (int, float), optional=True, default=1.0e-6),
         Argument("te_prior_sigma", (int, float), optional=True, default=1.0),
         Argument("te_prior_mode", str, optional=True, default="auto"),
         Argument("te_prior_per_graph", bool, optional=True, default=True),
-        Argument("te_prior_validation_seed", int, optional=True, default=None),
-        Argument("tied_irrep_sigma", (int, float), optional=True, default=1.0),
-        Argument("tied_irrep_mode", str, optional=True, default=""),
-        Argument("tied_irrep_irreps", str, optional=True, default=TIED_IRREP_CANONICAL_IRREPS),
-        Argument("tied_irrep_validation_seed", int, optional=True, default=None),
-        Argument("prior_node_key", str, optional=True, default=""),
-        Argument("prior_edge_key", str, optional=True, default=""),
-        Argument("prior_key_prefixes", list, optional=True, default=[]),
-        Argument("external_prior_strict", bool, optional=True, default=True),
-        Argument("allow_complex_prior_real_projection", bool, optional=True, default=False),
-        Argument("prior_skdata", str, optional=True, default=""),
-        Argument("dftb_prior_overlap", bool, optional=True, default=False),
-        Argument("dftb_prior_strict", bool, optional=True, default=True),
-        Argument("dftb_prior_require_geometry", bool, optional=True, default=True),
-        Argument("physical_prior_fallback", str, optional=True, default="basis_onsite"),
-        Argument("basis_onsite_scale", (int, float), optional=True, default=1.0),
-        Argument("basis_onsite_missing_value", (int, float), optional=True, default=0.0),
-        Argument("basis_onsite_edge_value", (int, float), optional=True, default=0.0),
-        Argument("huckel_k", (int, float), optional=True, default=1.75),
-        Argument("huckel_node_overlap_key", str, optional=True, default="node_overlap"),
-        Argument("huckel_edge_overlap_key", str, optional=True, default="edge_overlap"),
-        Argument("huckel_strict_overlap", bool, optional=True, default=True),
-        Argument("huckel_strict_basis", bool, optional=True, default=True),
-        Argument("huckel_edge_energy_fallback", (int, float), optional=True, default=0.0),
-        Argument("huckel_edge_length_decay", (int, float), optional=True, default=0.0),
-        # Hueckel v2: orbital-pair endpoint energies and offline scale calibration.
-        Argument("huckel_energy_mode", str, optional=True, default="type_mean",
-                 doc="'type_mean' (legacy: one scalar per edge) or 'orbital_pair' "
-                     "(Wolfsberg-Helmholz 0.5*(eps_mu+eps_nu) per orbpair slice, "
-                     "indexed by edge_type)."),
-        Argument("huckel_scale_mode", str, optional=True, default="none",
-                 doc="'none' | 'global' (multiply huckel_scale_global) | 'pair_block' "
-                     "(per bond-type x orbpair-slice signed scales from prior_calibration)."),
-        Argument("huckel_scale_global", (int, float), optional=True, default=1.0),
-        Argument("huckel_edge_channel_scale", (str, list, int, float, type(None)),
-                 optional=True, default=None,
-                 doc="Manual scalar or per-edge-channel overlap-Hueckel scale. "
-                     "Non-scalar vectors must be constant within each orbpair slice; "
-                     "prefer huckel_scale_mode='pair_block' with prior_calibration for "
-                     "fingerprinted train-fit calibration."),
-        Argument("prior_calibration", str, optional=True, default="",
-                 doc="Path to a calibration artifact from tools/calibrate_huckel_scales.py "
-                     "(edge_scale + node_table). Verified fail-closed against the idp basis."),
-        Argument("basis_onsite_mode", str, optional=True, default="table",
-                 doc="'table' (free-atom onsite DB diagonal) or 'calibrated' "
-                     "(per-type onsite rows from prior_calibration's node_table)."),
-        Argument("prior_node", str, optional=True, default="",
-                 doc="Split prior: family for the node/onsite prior (basis_onsite / "
-                     "overlap_huckel / external / dftbsk). Must be set together with prior_edge."),
-        Argument("prior_edge", str, optional=True, default="",
-                 doc="Split prior: family for the edge/hopping prior (e.g. 'external' with "
-                     "prior_edge_key=edge_h0 for the hybrid H0-hopping oracle)."),
-        Argument("haar_node_key", str, optional=True, default="haar_node_features"),
-        Argument("haar_edge_key", str, optional=True, default="haar_edge_features"),
-        Argument("haar_candidate_index", int, optional=True, default=-1),
-        Argument("haar_dm_strict", bool, optional=True, default=True),
-        Argument("physical_prior_jitter_sigma", (int, float), optional=True, default=0.0),
-        Argument("physical_prior_jitter_reference_scale", bool, optional=True, default=True),
-        Argument("physical_prior_jitter_edge_decay", (int, float), optional=True, default=0.0),
-        Argument("loss_type", str, optional=True, default="mse"),
-        Argument("node_weight", (int, float), optional=True, default=1.0,
-                 doc="Finite non-negative node loss multiplier. CFM global_elements "
-                     "requires 1.0; use equal_components for node/edge multipliers."),
-        Argument("edge_weight", (int, float), optional=True, default=1.0,
-                 doc="Finite non-negative edge loss multiplier. CFM global_elements "
-                     "requires 1.0; use equal_components for node/edge multipliers."),
-        Argument("z_loss_coef", (int, float), optional=True, default=0.0),
-        Argument("endpoint_weight_power", (int, float), optional=True, default=0.0),
-        Argument("endpoint_weight_cap", (int, float), optional=True, default=100.0),
-        Argument("component_reduction", str, optional=True, default="global_elements",
-                 doc="global_elements performs one true reduction over all valid elements "
-                     "and is unit-weight-only for CFM; equal_components sums independently "
-                     "reduced node/edge losses and applies node_weight/edge_weight."),
-        Argument("validation_ode_steps", list, optional=True, default=[1, 3]),
-        Argument("apply_to_reference", bool, optional=True, default=False),
-        Argument(
-            "validation_flow_metrics",
-            list,
-            optional=True,
-            default=["random_t", "one_step", "trajectory"],
-            doc="Optional flow-objective validation diagnostics. The Euler-1 "
-                "endpoint triplet is always evaluated separately.",
-        ),
-        Argument("overwrite_feature_keys", bool, optional=True, default=True),
+        Argument("te_prior_scale_reference", str, optional=True, default="residual", doc="TE typewise scale reference: residual (target - base, historical) or target (the endpoint target itself). ropt_0924_v9fl1."),
         Argument("detach_interpolated_h0", bool, optional=True, default=True),
         Argument(
             "missing_h0_policy",
@@ -318,35 +198,14 @@ def flow_options():
                 "strict_h0/warn_missing_h0 boolean pair.",
         ),
     ]
-    return Argument(
-        "flow_options",
-        dict,
-        optional=True,
-        default={"enabled": False},
-        sub_fields=args,
-        sub_variants=[],
-        doc=doc,
-    )
-
-
-# validate_flow_loss_contract / validate_block_ode_contract now live in
-# dptb.utils.block_ode_contract (moved verbatim; see that module for the
-# implementation, including the P1-2 _validate_block_ode_loss_endpoint_metric_space
-# helper and the dptb.nnops.blockwise_metric_space import it needs).
-# Re-exported here, at their original line position immediately before the
-# normalize() call site, so every existing
-# ``from dptb.utils.argcheck import validate_block_ode_contract`` (etc.)
-# import keeps resolving to the exact same function object -- see
-# test_block_ode_contract_reexport.py for the identity pin.
-from dptb.utils.block_ode_contract import (
-    validate_flow_loss_contract,
-    validate_block_ode_contract,
-)
+    return Argument("flow_options", dict, optional=True, default={"enabled": False},
+                    sub_fields=args, sub_variants=[],
+                    doc="Structured noise on training prior inputs; flow objectives are archived.")
 
 
 def self_consistency_options():
     doc = (
-        "WS4-C training-period self-consistency loss (see F:\\claude\\0702_nextham_dm_plan and "
+        "Training-period self-consistency loss (see "
         "dptb/nnops/self_consistency.py). Every `every_n_steps` steps, a `sample_frac` slice of the "
         "batch's predicted Hamiltonians is sent to an ABACUS restart_dh hrebuild endpoint "
         "(dptb.postprocess.hrebuild_server) for one-shot repair; the (stop-gradient) repaired H is used "
@@ -390,9 +249,8 @@ def self_consistency_options():
 def activation_recompute_options():
     doc = (
         "Train-time activation recomputation/checkpointing for memory hot paths. "
-        "Supported targets are lem_moe_v3_tp and lem_non_linear_expert_block. "
-        "The nonlinear target checkpoints gather/cat, full expert TP, expert activation, "
-        "and 0e post-activation mixing without changing state_dict keys."
+        "The lem_moe_v3_tp target checkpoints node and edge SO2 tensor products "
+        "without changing state_dict keys."
     )
     args = [
         Argument("enabled", bool, optional=True, default=False),
@@ -400,7 +258,7 @@ def activation_recompute_options():
             "targets",
             list,
             optional=True,
-            default=["lem_moe_v3_tp", "lem_non_linear_expert_block"],
+            default=["lem_moe_v3_tp"],
         ),
         Argument("checkpoint_node_tp", bool, optional=True, default=True),
         Argument("checkpoint_edge_tp", bool, optional=True, default=True),
@@ -750,7 +608,9 @@ def train_options():
         Argument("monitor_param_dynamics_grad_eps", float, optional=True, default=0.0, doc="Absolute gradient threshold used for grad_nonzero_fraction."),
         Argument("monitor_param_dynamics_delta_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Deprecated compatibility option. DEAD detection is gradient-norm based; delta metrics are diagnostic only."),
         Argument("monitor_param_dynamics_grad_norm_dead_threshold", float, optional=True, default=1.0e-12, doc="Gradient norm threshold used by parameter dynamics DEAD detection; groups below this value count as no-gradient."),
-        Argument("monitor_gated_edge_attention", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention),
+        Argument("monitor_gated_edge_attention", bool, optional=True, default=False,
+                 extra_check=lambda value: not value,
+                 extra_check_errmsg="Gated attention monitoring is only available in archived models"),
         Argument("monitor_gated_edge_attention_freq", int, optional=True, default=0, doc=doc_monitor_gated_edge_attention_freq),
         Argument("monitor_gated_edge_attention_tensorboard", bool, optional=True, default=None, doc="Write gated edge aggregation diagnostics to TensorBoard when the monitor is enabled. Default follows use_tensorboard."),
         Argument("monitor_gated_edge_attention_heatmap", bool, optional=True, default=False, doc=doc_monitor_gated_edge_attention_heatmap),
@@ -869,6 +729,12 @@ def train_options():
         flow_options(),
         loss_options(),
         self_consistency_options(),
+        symmetry_projection_options(),
+        Argument("prior_noise_augmentation", bool, optional=True, default=False,
+                 doc="Add zero-time structured noise to training prior inputs; supervised targets and validation inputs remain unchanged."),
+        Argument("init_seed", int, optional=True, default=0,
+                 doc="Model initialisation seed block: shifts every expert's fixed initialisation seed by 1000*init_seed. "
+                     "0 keeps the historical initialisation bitwise; common_options.seed controls only data order."),
     ]
 
     # ================= typed nested input groups (PR-F) =================
@@ -890,6 +756,13 @@ def train_options():
     doc_train_options = "Options that define the training behaviour of DeePTB, including optimizer/scheduler, expert split, distributed expert-parallel execution, debugging and profiling."
 
     return Argument("train_options", dict, sub_fields=args, sub_variants=[], optional=True, doc=doc_train_options)
+
+
+def symmetry_projection_options():
+    return Argument("symmetry_projection", dict, optional=True,
+                    extra_check=lambda value: not value.get("enabled", False),
+                    extra_check_errmsg="Training projection is available only in archived models",
+                    doc="Inactive legacy training option; inference projection uses SymmetryProjector.")
 
 
 # Membership of the typed nested train_options groups (PR-F). Every name must
@@ -1132,7 +1005,7 @@ def HybridMuon():
                  doc="Per-expert factor on the final Muon update of routed-expert parameters (expert_name_patterns), applied after orthogonalisation and clipping: `const` = c (uniform attenuation), `sqrt_load` = c * clamp(sqrt(load EMA / mean load), expert_update_scale_min, 1) from the training router (imbalance correction; balanced experts get c), with c = expert_update_scale_const. Default: none."),
         Argument("expert_update_scale_min", float, optional=True, default=0.1, doc="Lower clamp of the sqrt_load factor. Default: 0.1."),
         Argument("expert_update_scale_const", float, optional=True, default=1.0, doc="Uniform factor c of expert_update_scale (const and sqrt_load). Default: 1."),
-        Argument("expert_name_patterns", list, optional=True, default=["*weight_experts*", "*bias_experts*"], doc="Name patterns of routed-expert parameters (leading dimension = expert)."),
+        Argument("expert_name_patterns", list, optional=True, default=["*weight_experts*", "*bias_experts*", "*core_experts*"], doc="Name patterns of routed-expert parameters (leading dimension = expert)."),
         Argument("expert_weight_decay_mult", float, optional=True, default=1.0, doc="Weight-decay multiplier for routed-expert parameters. Default: 1."),
         Argument("adamw_name_patterns", list, optional=True, default=[], doc="Parameters whose names match go to AdamW whatever their shape (the 1-D exclude list cannot move 2-D parameters off Muon)."),
         Argument("adamw_pattern_lr_scale", float, optional=True, default=1.0, doc="Learning-rate multiplier for the parameters matched by adamw_name_patterns. Default: 1. (No option name may contain 'force', 'stress' or 'virial': MultiTrainer reads such train_options keys as geometry-gradient losses.)"),
@@ -1364,6 +1237,7 @@ def train_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
@@ -1412,6 +1286,7 @@ def validation_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
@@ -1460,6 +1335,7 @@ def reference_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("separator", str, optional=True, default='.', doc=doc_separator),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
@@ -1508,6 +1384,7 @@ def test_data_sub():
     args = [
         Argument("type", str, optional=True, default="DefaultDataset", doc="The type of dataset."),
         Argument("root", str, optional=False, doc=doc_root),
+        Argument("overlap_sidecar_root", [str, type(None)], optional=True, default=None),
         Argument("prefix", str, optional=True, default=None, doc=doc_prefix),
         Argument("get_Hamiltonian", bool, optional=True, default=False, doc=doc_ham),
         Argument("get_H0", bool, optional=True, default=False, doc=doc_h0),
@@ -1577,48 +1454,18 @@ def embedding():
     return Variant("method", [
             Argument("se2", dict, se2()),
             Argument("deeph-e3", dict, deephe3()),
-            Argument("slem", dict, slem()),
-            Argument("lem_high_order", dict, slem()),
-            Argument("lem", dict, slem()),
-            Argument("lem_full_tp_oeq", dict, slem()),
-            Argument("lem_frame", dict, slem()),
-            Argument("emoles", dict, slem()),
-            Argument("emoles_openequi", dict, slem()),
-            Argument("emoles_openequi_norm", dict, slem()),
-            Argument("emoles_openequi_norm_v2", dict, slem()),
-            Argument("emoles_openequi_eqv3", dict, slem()),
-            Argument("emoles_openequi_eqv3_ffn", dict, slem()),
-            Argument("emoles_openequi_nodeffn", dict, slem()),
-            Argument("lem_light", dict, slem()),
-            Argument("lem_light_v2", dict, slem()),
-            Argument("lem_charge", dict, slem()),
-            Argument("lem_cutoff", dict, slem_cutoff()),
-            Argument("lem_moe_openequi", dict, slem()),
-            Argument("lem_in_frame_moe", dict, slem()),
-            Argument("lem_full_tp", dict, slem()),
-            Argument("lem_in_frame_e3nn", dict, slem()),
-            Argument("lem_wo_ln", dict, slem()),
-            Argument("lem_in_frame", dict, slem()),
-            Argument("lem_in_frame_openequi", dict, slem()),
-            Argument("lem_in_frame_heavy", dict, slem()),
-            Argument("lem_moe_charge", dict, slem()),
-            Argument("lem_moe_topk", dict, slem()),
+            Argument("slem", dict, baseline_embedding_options()),
+            Argument("slem_prior", dict, baseline_prior_options()),
+            Argument("lem", dict, baseline_embedding_options()),
+            Argument("lem_prior", dict, baseline_prior_options()),
+            Argument("unitb", dict, unitb()),
             Argument("lem_moe_v3", dict, slem()),
             Argument("lem_moe_v3_edge", dict, slem_edge()),
             Argument("lem_moe_v3_h0", dict, slem_h0()),
-            Argument("lem_pair", dict, slem_pair()),
             Argument("lem_moe_v3_prior", dict, slem_prior()),
             Argument("lem_moe_v3_prior_2b", dict, slem_prior_2b()),
             Argument("lem_moe_v3_edge_prior_2b", dict, slem_prior_2b()),
             Argument("lem_moe_v3_edge_h0", dict, slem_edge_h0()),
-            Argument("lem_non_linear", dict, slem()),
-            Argument("lem_non_linear_h0", dict, slem_h0()),
-            Argument("lem_moe", dict, slem()),
-            Argument("lem_so2", dict, slem()),
-            Argument("lem_so2_local", dict, slem()),
-            Argument("lem_local", dict, slem()),
-            Argument("lem_global", dict, slem()),
-            Argument("lem_so2_global", dict, slem()),
             Argument("trinity", dict, slem()+[Argument("only2b", bool, optional=True, default=False, doc=doc_only2b)],),
         ],optional=True, default_tag="se2", doc=doc_method)
 
@@ -1764,7 +1611,7 @@ def slem():
     doc_env_embed_multiplicity = ""
     doc_universal = "Set true to activate universal model related features. Currently, this will create a broader onehot embedding for the transfer learning into unseen elements. Other features are on the way. Default: `False`"
     doc_use_interpolation_out = "Set true to activate SO2 interpolation layer in the final output layer. Default: `False`"
-    doc_so2_attn_aggressive = "Set true to activate SO2 attention radical mode. Default: `False`"
+    doc_so2_attn_aggressive = "Legacy configuration key retained for checkpoint compatibility; no attention branch is selected."
 
     doc_norm_build_node_condition_branch = "Whether to build the conditioned branch for node layer norm. Default: `True`"
     doc_norm_use_node_onehot = "Whether to use node one-hot as conditioning in node layer norm. Default: `True`"
@@ -1779,10 +1626,10 @@ def slem():
     doc_ffn_apply_to_last = "Whether to also attach the node-wise FFN to the final layer. Default: `False`."
     doc_so2_wigner_apply_mode = "Wigner rotation application mode for SO2 TP. Supported: `compact_blocks`, `full_dense`. Default uses compact per-l Wigner blocks to reduce peak memory; set `full_dense` to restore the previous dense Wigner path."
     doc_mole_full_expert_fast_path = "When `top_k >= num_experts`, skip top-k/one-hot/scatter router work and directly use dense normalized expert weights. This is mathematically equivalent to selecting all routed experts. Default: `True`."
-    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. The 0425-stable branch defaults to `streamed_m_major_cueq`; `streamed_m_major_fused_p0` is an opt-in trainable prototype that treats Wigner/R as constants and falls back on unsupported shapes."
-    doc_mole_linear_mode = "MoLELinear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. The 0422-cueq-fastest branch defaults to `cueq_indexed_linear`."
-    doc_so2_m_linear_mode = "SO2 m-linear backend for non-MoE SO2 TP. Supported values are `standard`, `indexed_sandwich_multi`, or null; `cublas_grouped` is accepted only as a legacy alias. Triton experiment modes remain unsupported."
-    doc_so2_expert_mixing_mode = "Expert mixing placement for SO2 MoE TP. `pre_activation` keeps the existing fused-weight path; `post_activation` evaluates raw expert TP outputs, applies equivariant activation, routes from 0e output scalars, and mixes activated outputs; `post_activation_slot` (per-edge prior_activate routing) runs each top-k slot through the activation-space route with its own expert (shared expert folded in), applies the activation per slot and mixes the activated slots with the router coefficients."
+    doc_so2_fusion_mode = "SO2_Linear fusion mode. Supported: `staged`, `streamed_m_major_ref`, `streamed_m_major_cueq`, `streamed_m_major_fused_p0`. CUDA routes use the optional SO2CUDA backend and fall back to the PyTorch reference for unsupported inputs."
+    doc_mole_linear_mode = "PDQ-MoE linear backend. Supported: `split_loop`, `indexed_ref`, `cueq_indexed_linear`, `cublas_grouped`. UniTB defaults to `cublas_grouped`; legacy methods retain their original default."
+    doc_so2_m_linear_mode = "Compatibility option for the embedding SO2 m-linear blocks. Accepted values are `standard` or null; CUDA dispatch is selected by so2_fusion_mode."
+    doc_so2_expert_mixing_mode = "Expert mixing placement for SO2 MoE TP. `pre_activation` keeps the existing fused-weight path; `post_activation` evaluates raw expert TP outputs, applies equivariant activation, routes from 0e output scalars, and mixes activated outputs; `post_activation_slot` (per-edge prior_activate routing) runs each top-k slot through the activation-space route with its own expert (shared expert folded in), applies the activation per slot and mixes the activated slots with the router coefficients; `post_activation_shared` (per-edge prior_activate routing) keeps the shared expert (with every non-MoLE block) as its own activated branch and adds each routed slot activated alone: act(shared) + sum_j g_j [act(expert_j) - act(0)] (DPA3-MoE, Liu et al., npj Artif. Intell. 2026, eq. 4); k + 1 SO2 passes."
     doc_so2_expert_route_chunk_size = "Maximum original SO2 rows processed per post-activation expert-mixing chunk. Null or non-positive means process all rows in one chunk."
     doc_so2_expert_route_checkpoint = "Whether to activation-checkpoint each post-activation expert-route chunk. This recomputes TP/activation/router during backward to reduce saved route activations."
     doc_so2_output_router_hidden_dim = "Hidden size for the 0e router used by `so2_expert_mixing_mode=post_activation`."
@@ -1875,7 +1722,7 @@ def slem():
         Argument("universal", bool, optional=True, default=False, doc=doc_universal),
         Argument("in_frame_flag", bool, optional=True, default=True),
         Argument("ln_flag", bool, optional=True, default=True),
-        Argument("use_angle", bool, optional=True, default=False, doc="Whether to use angle."),
+        Argument("use_angle", bool, optional=True, default=False, doc="Legacy configuration key retained for checkpoint compatibility."),
         Argument("norm_eps", float, optional=True, default=1e-8, doc="eps in SeperableLayerNorm."),
         Argument("equivariant_norm_type", str, optional=True, default="none", doc=doc_equivariant_norm_type),
         Argument("hidden_edge_activation_type", str, optional=True, default="gate", doc=doc_hidden_edge_activation_type),
@@ -1887,8 +1734,20 @@ def slem():
         Argument("so2_wigner_apply_mode", str, optional=True, default="compact_blocks", doc=doc_so2_wigner_apply_mode),
         Argument("so2_fusion_mode", str, optional=True, default="streamed_m_major_cueq", doc=doc_so2_fusion_mode),
         Argument("mole_linear_mode", [str, None], optional=True, default="cueq_indexed_linear", doc=doc_mole_linear_mode),
+        Argument("mole_expert_parameterization", str, optional=True, default="full",
+                 doc="Routed SO2 weights: full (legacy bank) or shared_core (P D_e Q^T, shared P/Q and expert cores). Shared affine weights remain separate. Changes checkpoint parameter layout; no automatic full-bank conversion."),
+        Argument("mole_expert_rank", int, optional=True, default=64,
+                 doc="Positive shared_core rank, capped at min(in_features, out_features) in each MoLE block. Bank materialization reuses existing CUDA; this does not imply low-rank execution speed."),
         Argument("so2_m_linear_mode", [str, None], optional=True, default=None, doc=doc_so2_m_linear_mode),
         Argument("so2_expert_mixing_mode", str, optional=True, default="pre_activation", doc=doc_so2_expert_mixing_mode),
+        Argument("so2_parity", str, optional=True, default="none",
+                 doc="SO2 parity: `none` preserves legacy checkpoints bitwise; `enforce` masks A/B, m=0 weights and biases by O(3) parity at every backend weight read. Requires linear m blocks (use_interpolation_out=false), gate activations and no grid FFN. This qualifies the background, not SymPE frame construction."),
+        Argument("so2_moe_layers", [str, list], optional=True, default="all",
+                 doc="Indices of LEM layers with routed SO2 experts, or 'all' (legacy default). "
+                     "Other layers retain only shared SO2 parameters, use a single activation, and keep "
+                     "the same interpolation, radial and residual paths. A subset requires per-edge "
+                     "prior-activate routing and num_shared_experts >= 1. For a three-layer model, "
+                     "[1] routes only the last hidden layer; indices are zero-based."),
         Argument("so2_expert_route_chunk_size", [int, None], optional=True, default=None, doc=doc_so2_expert_route_chunk_size),
         Argument("so2_expert_route_checkpoint", bool, optional=True, default=False, doc=doc_so2_expert_route_checkpoint),
         Argument("so2_output_router_hidden_dim", int, optional=True, default=32, doc=doc_so2_output_router_hidden_dim),
@@ -1913,6 +1772,67 @@ def slem():
         Argument("norm_use_node_onehot", bool, optional=True, default=True, doc=doc_norm_use_node_onehot),
         Argument("norm_build_edge_condition_branch", bool, optional=True, default=True, doc=doc_norm_build_edge_condition_branch),
         Argument("norm_use_edge_onehot", bool, optional=True, default=True, doc=doc_norm_use_edge_onehot),
+    ]
+
+
+def baseline_embedding_options():
+    """Options consumed by the upstream LEM and SLEM constructors."""
+    supported = {
+        "irreps_hidden", "avg_num_neighbors", "r_max", "n_layers",
+        "n_radial_basis", "PolynomialCutoff_p", "cutoff_type",
+        "env_embed_multiplicity", "tp_radial_emb", "tp_radial_channels",
+        "latent_channels", "latent_dim", "res_update", "res_update_ratios",
+        "res_update_ratios_learnable", "universal",
+    }
+    args = [arg for arg in slem() if arg.name in supported]
+    # Keep the upstream configuration defaults; the broader shared schema
+    # above belongs to the other embedding families.
+    defaults = {"n_radial_basis": 10, "env_embed_multiplicity": 10}
+    for arg in args:
+        if arg.name in defaults:
+            arg.default = defaults[arg.name]
+    args += [
+        Argument("r_start_cos_ratio", [float, int], optional=True, default=0.8,
+                 doc="Fraction of r_max at which the cosine cutoff starts."),
+        Argument("sh_normalized", bool, optional=True, default=True,
+                 doc="Normalize edge vectors before evaluating spherical harmonics."),
+        Argument("sh_normalization", str, optional=True, default="component",
+                 doc="Spherical-harmonic normalization convention."),
+    ]
+    return args
+
+
+def baseline_prior_options():
+    """Shared explicit-prior interface for the LEM and SLEM baselines."""
+    return baseline_embedding_options() + [
+        Argument("h0_init_scope", str, optional=True, default="both",
+                 doc="Prior initialization scope: both, node, edge, auxiliary, or none. With no prior options the baseline stays geometry-only."),
+        Argument("use_h0_init", [bool, None], optional=True,
+                 doc="Legacy initialization switch; prefer h0_init_scope."),
+        Argument("use_h0_node_init", [bool, None], optional=True,
+                 doc="Legacy node initialization switch; prefer h0_init_scope."),
+        Argument("use_h0_edge_init", [bool, None], optional=True,
+                 doc="Legacy edge initialization switch; prefer h0_init_scope."),
+        Argument("h0_node_key", str, optional=True, default="node_h0",
+                 doc="Node prior field, such as node_h0, node_p2, or node_p23."),
+        Argument("h0_edge_key", str, optional=True, default="edge_h0",
+                 doc="Edge prior field, such as edge_h0, edge_p2, or edge_p23."),
+        Argument("h0_node_mode", str, optional=True, default="direct",
+                 doc="Node initialization from direct node rows or self_edge rows."),
+        Argument("h0_merge_mode", str, optional=True, default="replace",
+                 doc="Merge projected priors with geometric initialization: replace or add."),
+        Argument("h0_self_edge_tol", [float, int], optional=True, default=1e-8,
+                 doc="Tolerance for zero-length edges in self_edge node mode."),
+        Argument("h0_ao_cg", bool, optional=True, default=True,
+                 doc="Convert packed AO prior rows to coupled irreps."),
+        Argument("fallback_to_hamiltonian", bool, optional=True, default=True,
+                 doc="Use Hamiltonian/feature fallback when explicit prior rows are absent, with the production training guard."),
+        Argument("h0_fallback_to_hamiltonian", [bool, None], optional=True,
+                 doc="Legacy alias for fallback_to_hamiltonian."),
+        Argument("fallback_node_key", str, optional=True, default="node_features"),
+        Argument("fallback_edge_key", str, optional=True, default="edge_features"),
+        Argument("allow_target_fallback_in_training", bool, optional=True, default=False,
+                 doc="Explicitly allow target-derived fallback inputs during training."),
     ]
 
 
@@ -1990,46 +1910,6 @@ def slem_h0():
     ]
 
 
-def slem_pair():
-    """LEM H0 schema plus pair-topology, norm, and refinement controls."""
-    return slem_h0() + [
-        Argument("mp_cutoff", [float, int, dict], optional=True),
-        Argument("mp_avg_num_neighbors", [int, float, None], optional=True, default=None),
-        Argument("res_update_additive", bool, optional=True, default=False,
-                 doc="Use unscaled x + delta residual updates in the pair backbone."),
-        Argument("latents_layernorm", bool, optional=True, default=True,
-                 doc="Apply LayerNorm before pair-backbone latent updates."),
-        Argument("pair_refine_enable", bool, optional=True, default=False),
-        Argument("pair_refine_rank", int, optional=True, default=16),
-        Argument("pair_refine_condition", str, optional=True, default="scalar_0e"),
-        Argument("pair_refine_internal_weights", bool, optional=True, default=True),
-        Argument("pair_refine_init", [int, float], optional=True, default=0.0),
-        Argument(
-            "pair_refine_weight_mode",
-            str,
-            optional=True,
-            default="full",
-            extra_check=lambda value: value in {"full", "per_path", "qhflow"},
-            extra_check_errmsg=(
-                "pair_refine_weight_mode must be one of: full, per_path, qhflow."
-            ),
-            doc=(
-                "Dynamic TP weights: legacy `full`, instruction-gated "
-                "`per_path`, or channel-diagonal `qhflow`."
-            ),
-        ),
-        Argument("pair_refine_max_weight_numel", [int, None], optional=True, default=None,
-                 doc="Optional constructor guard on the full FCTP weight count."),
-        Argument("pair_refine_identity_init", bool, optional=True, default=False,
-                 doc="Zero dynamic and static refinement weights at initialization."),
-    ]
-
-
-def slem_cutoff():
-    """Legacy LemCutoff schema; it independently consumes ``mp_cutoff``."""
-    return slem() + [
-        Argument("mp_cutoff", [float, int, dict], optional=True),
-    ]
 
 
 def _edge_router_arguments():
@@ -2041,13 +1921,24 @@ def _edge_router_arguments():
     doc_edge_router_prior_stats = "Path to a frozen per-channel mean/std file for the prior descriptor (torch.save of {'mean': ..., 'std': ...}). Empty means identity. Never trained. Default: `\"\"`."
 
     return [
+        Argument("structure_mole", dict, optional=True, default={}),
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
         Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
         Argument("edge_moe_compact_min_edges", int, optional=True, default=16384, doc=doc_edge_moe_compact_min_edges),
         Argument("edge_router_prior_activate", bool, optional=True, default=False, doc=doc_edge_router_prior_activate),
         Argument("edge_router_prior_stats", str, optional=True, default="", doc=doc_edge_router_prior_stats),
+        Argument("edge_router_prior_cg", bool, optional=True, default=False,
+                 doc="Convert AO-product priors to coupled RME before the legacy edge-router Gram descriptor; respect _h0_coupled_rme. Default false preserves checkpoint behavior. Recalibrate prior stats and retrain when enabled."),
         Argument("edge_router_top1_mode", str, optional=True, default="legacy", doc="Top-1 prior routing: legacy or switch (global softmax, argmax, retained probability, no shared experts)."),
+        Argument("edge_router_route_drop_p", (int, float), optional=True, default=0.0,
+                 extra_check=lambda v: not isinstance(v, bool) and 0.0 <= v <= 1.0,
+                 extra_check_errmsg="edge_router_route_drop_p must be finite and in [0, 1]",
+                 doc="Training-only structure-wise route dropout, shared across all layers. Requires per-edge pre_activation routing, top_k >= 2 and shared experts."),
+        Argument("edge_router_route_drop_scale", str, optional=True, default="inverted",
+                 extra_check=lambda v: v in {"inverted", "none"},
+                 extra_check_errmsg="edge_router_route_drop_scale must be inverted or none",
+                 doc="inverted scales surviving routed coefficients by 1/(1-p); none leaves them unchanged. p=1 is shared-only training. Eval never drops or scales."),
         Argument("edge_router_temperature", (int, float), optional=True, default=1.0, doc="Temperature T of the softmax that mixes the selected experts of the edge router (weights = softmax(logits / T) over the top-k); T > 1 keeps the mixing soft for a given logit gap, selection is unchanged. Not for the switch mode. Default: `1.0`."),
         Argument("edge_router_logit", str, optional=True, default="raw",
                  extra_check=lambda v: v in {"raw", "cosine"}, extra_check_errmsg="edge_router_logit must be raw or cosine",
@@ -2064,13 +1955,74 @@ def _edge_router_arguments():
                  doc="Bias step over training: `const`, `follow_lr` (times lr / peak lr) or `freeze_decay` (no bias updates once lr falls below its peak). Needs HybridMuon for the lr ratio; other optimizers leave the ratio at 1."),
         Argument("edge_router_select_noise", float, optional=True, default=0.0, doc="Std of Gaussian noise added to the selection scores in training only (noisy top-k); mixing weights stay noise-free. Default: 0."),
         Argument("edge_router_bias_freeze_after_step", int, optional=True, default=0, doc="No load-balancing bias updates from this committed optimizer step on (0 = never); the frozen bias keeps acting in the selection. Needs HybridMuon for the step count."),
+        Argument("edge_router_gate", str, optional=True, default="renorm",
+                 extra_check=lambda v: v in {"renorm", "full_softmax"}, extra_check_errmsg="edge_router_gate must be renorm or full_softmax",
+                 doc="Mixing weights of the selected experts: `renorm` = softmax over the selected logits (sums to one; the shared expert may be folded into every slot); `full_softmax` = softmax over every routed expert, the selected entries kept without renormalisation (DPA3-MoE, Liu et al., npj Artif. Intell. 2026), so the routed branch carries the router's probability mass next to the shared expert. `full_softmax` needs so2_expert_mixing_mode `pre_activation` or `post_activation_shared`. Default: `renorm`."),
+        Argument("edge_router_type_support", int, optional=True, default=0, doc="Per-edge routing only: every bond type may use a fixed, hashed set of this many experts (>= top_k); the router picks its top-k inside the set (chemistry fixes the candidates, the prior descriptor chooses among them). 0 = off. Default: 0."),
+        Argument("edge_router_type_support_seed", int, optional=True, default=0, doc="Seed of the hash that draws the per-bond-type expert sets of edge_router_type_support. Default: 0."),
         Argument("edge_router_input", str, optional=True, default="onehot_prior",
                  extra_check=lambda v: v in {"onehot_prior", "onehot_r", "onehot"},
                  extra_check_errmsg="edge_router_input must be onehot_prior, onehot_r or onehot",
                  doc="Per-edge router input with prior_activate: bond-type embedding + prior Gram descriptor (`onehot_prior`, production), bond-type embedding + Gaussian radial basis of the edge length (`onehot_r`, control) or the embedding alone (`onehot`)."),
         Argument("edge_router_rbf", int, optional=True, default=16, doc="Number of Gaussian radial features for edge_router_input=onehot_r. Default: 16."),
         Argument("edge_router_rbf_rmax", float, optional=True, default=10.0, doc="Largest radial centre (Angstrom) for edge_router_input=onehot_r. Default: 10."),
+        _disabled_embedding_option("sympe"),
+        _disabled_embedding_option("latent_irrep_dot"),
+        _disabled_embedding_option("node_bilinear"),
     ]
+
+
+
+
+
+
+
+
+def _disabled_embedding_option(name):
+    """Read inactive legacy dictionaries without advertising archived options."""
+    return Argument(name, dict, optional=True, default={"enabled": False},
+                    extra_check=lambda value: not value.get("enabled", False),
+                    extra_check_errmsg=f"{name} is only available in archived models")
+
+
+def unitb():
+    """UniTB architecture and paper-control options with production defaults."""
+    from dptb.nn.embedding.unitb_options import X1_DEFAULTS, DENSE_DEFAULTS, ALIASES
+
+    names = set(X1_DEFAULTS) | {
+        "PolynomialCutoff_p", "cutoff_type", "norm_eps", "r_start_cos_ratio",
+        "sh_normalized", "sh_normalization", "res_update", "res_update_ratios_learnable",
+        "use_out_onehot_tp", "use_layer_onehot_tp", "so2_wigner_apply_mode",
+        "so2_expert_mixing_mode", "so2_moe_layers", "so2_parity",
+        "hidden_edge_activation_type", "hidden_node_activation_type",
+        "h0_ao_cg", "h0_node_key", "h0_edge_key", "h0_init_scope", "h0_node_mode",
+        "h0_merge_mode", "h0_self_edge_tol", "fallback_to_hamiltonian",
+        "h0_fallback_to_hamiltonian", "allow_target_fallback_in_training",
+        "fallback_node_key", "fallback_edge_key", "use_h0_init",
+        "use_h0_node_init", "use_h0_edge_init", "flow_time_key", "flow_time_keys",
+        "flow_time_key_weights", "flow_time_condition_edges", "flow_time_max_positions",
+        "flow_time_allow_missing", "flow_time_missing_value",
+        "edge_router_in_features", "edge_router_unique_types", "edge_moe_compact_dispatch",
+        "edge_router_prior_stats", "edge_router_temperature", "edge_router_bias_speed",
+        "edge_router_gate", "edge_router_input", "edge_router_rbf", "edge_router_rbf_rmax",
+        "edge_router_top1_mode", "edge_router_route_drop_p", "edge_router_route_drop_scale",
+        "so2_m_linear_mode", "mole_linear_m0_mode", "cg_head_impl", "structure_mole",
+    }
+    result = [arg for arg in slem_edge_h0() if arg.name in names]
+    for arg in result:
+        if arg.name in X1_DEFAULTS:
+            arg.optional = True
+            arg.default = X1_DEFAULTS[arg.name]
+        if arg.name in DENSE_DEFAULTS or arg.name in ALIASES.values():
+            # Preserve omission for constructor-dependent defaults and aliases.
+            arg.optional = True
+            arg.default = Argument(arg.name, arg.dtype, optional=True).default
+        if arg.name == "mole_expert_parameterization":
+            arg.extra_check = lambda value: value in {"pdq_moe", "shared_core", "full"}
+            arg.extra_check_errmsg = "Expected pdq_moe, shared_core (compatibility), or full"
+    result += [Argument(key, int if key == "expert_rank" else str, optional=True)
+               for key in ALIASES]
+    return result
 
 
 def slem_edge():
@@ -2284,6 +2236,39 @@ def model_options():
     return Argument("model_options", dict, sub_fields=[
         Argument("embedding", dict, optional=True, sub_fields=[], sub_variants=[embedding()], doc=doc_embedding),
         Argument("prediction", dict, optional=True, sub_fields=[], sub_variants=[prediction()], doc=doc_prediction),
+        Argument("shift_head", [dict, type(None)], optional=True, default=None, sub_fields=[
+            Argument("mode", str, optional=True, default="off"),
+            Argument("hidden", int, optional=True, default=64),
+            Argument("layers", int, optional=True, default=2),
+            Argument("element_dim", int, optional=True, default=0),
+            Argument("freeze_backbone", bool, optional=True, default=False),
+            Argument("init_from", [str, type(None)], optional=True, default=None),
+            Argument("overlap_input", str, optional=True, default="physical"),
+            Argument("input_norm", str, optional=True, default="none"),
+            Argument("capture", str, optional=True, default="output"),
+            Argument("detach_input", bool, optional=True, default=False),
+            Argument("output_scale", [int, float], optional=True, default=1.0),
+            Argument("response", [dict, type(None)], optional=True, default=None, sub_fields=[
+                Argument("kind", str, optional=True, default="context"),
+                Argument("hidden", int, optional=True, default=64),
+                Argument("element_dim", int, optional=True, default=8),
+                Argument("local_only", bool, optional=True, default=False),
+                Argument("canonical_onsite", bool, optional=True, default=True),
+                Argument("auxiliary_weight", [int, float], optional=True, default=0.05),
+                Argument("auxiliary_beta", [int, float], optional=True, default=0.05),
+                Argument("sigma", [int, float], optional=True, default=1.2),
+                Argument("g_cut", [int, float], optional=True, default=4.0),
+                Argument("hardness_min", [int, float], optional=True, default=5.0),
+                Argument("hardness_max", [int, float], optional=True, default=40.0),
+                Argument("max_atoms", int, optional=True, default=512),
+                Argument("max_modes", int, optional=True, default=30000),
+                Argument("detach_features", bool, optional=True, default=False),
+                Argument("context", str, optional=True, default="auto"),
+                Argument("output_scale", [int, float], optional=True, default=1.0),
+                Argument("aux_weighting", str, optional=True, default="graph_equal"),
+                Argument("qeq_local", bool, optional=True, default=False),
+            ]),
+        ]),
         nnsk(),
         dftbsk(),
         ], sub_variants=[], optional=True, doc=doc_model_options)
@@ -2566,7 +2551,7 @@ def loss_options():
         Argument("optimization", str, optional=True, default="block_mae", doc="Supported: block_mae, block_l1_rmse, block_mae_mse, feature_compatible."),
         Argument("block_reduction", str, optional=True, default="global", doc="Supported: global or equal_onsite_hopping."),
         Argument("complex_reduction", str, optional=True, default="modulus", doc="Supported: modulus or real_imag."),
-        Argument("log_feature_compatible", bool, optional=True, default=False, doc="Expensive opt-in: report exact old-RME-compatible endpoint metrics instead of native AO-block metrics. Enable selectively (for example validation only), not on every block-native train step. Forbidden under block_ode (any output_space in ao_block_ode/uureal_block_ode/residual_ao_block_ode): block-ODE flows only publish block-space endpoint statistics, so a criterion that logs 'rme' here is rejected at configuration time by validate_block_ode_contract."),
+        Argument("log_feature_compatible", bool, optional=True, default=False, doc="Expensive opt-in: report exact old-RME-compatible endpoint metrics instead of native AO-block metrics. Enable selectively (for example validation only), not on every block-native train step."),
         Argument("log_feature_compatible_interval", int, optional=True, default=1, doc="Cadence, counted in forward() calls, for the logging-only feature-compatible onsite/hopping metric. The expensive host-sync feature branch fires only when call_index % interval == 0, where call_index is a 0-based per-criterion counter, so the FIRST call always fires (smoke runs and first-batch logs still see the metric). interval=1 (default) reproduces the legacy every-step behavior byte-for-byte; larger values throttle the logging metric only and never change the optimization/gradient loss. Rank-synchronous: every DDP rank calls forward() the same number of times, so the feature branch (which contains collective all-reduces) fires on all ranks or none and cannot deadlock. Must be an int >= 1."),
         Argument("feature_log_no_grad", bool, optional=True, default=True),
         Argument("distributed_log_reduce", bool, optional=True, default=False),
@@ -3006,6 +2991,29 @@ def _validate_p2_prior_full_h_contract(data):
 #     #         raise ValueError
 
 #     return data
+
+def _resolve_legacy_baseline_methods(data):
+    """Resolve baseline aliases and preserve opt-in prior construction."""
+    model = data.get("model_options")
+    if not isinstance(model, dict):
+        return data
+    options = model.get("embedding")
+    if not isinstance(options, dict):
+        return data
+    method = options.get("method")
+    if method in {"lem", "slem", "lem_prior", "slem_prior"}:
+        from copy import deepcopy
+        from dptb.nn.embedding.prior_inputs import PRIOR_INPUT_KEYS, resolve_legacy_prior_method
+
+        resolved = resolve_legacy_prior_method(method, options)
+        geometry_only = resolved.endswith("_prior") and not PRIOR_INPUT_KEYS.intersection(options)
+        if resolved != method or geometry_only:
+            data = deepcopy(data)
+            data["model_options"]["embedding"]["method"] = resolved
+            if geometry_only:
+                data["model_options"]["embedding"]["h0_init_scope"] = "none"
+    return data
+
 
 def normalize_test(data):
 
@@ -3671,7 +3679,7 @@ def get_cutoffs_from_model_options(model_options):
         embedding = model_options.get("embedding")
         if embedding["method"] == "se2":
             er_max = embedding["rc"]
-        elif embedding["method"] in ["slem", "lem", "lem_moe", "lem_moe_topk", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_pair", "lem_moe_v3_prior", "lem_moe_v3_prior_2b", "lem_moe_v3_edge_prior_2b", "lem_moe_v3_edge_h0", "lem_non_linear", "lem_non_linear_h0", "lem_charge", "emoles", "emoles_openequi_norm", "emoles_openequi_norm_v2", "emoles_openequi_eqv3", "emoles_openequi_eqv3_ffn", "emoles_openequi_nodeffn", "emoles_openequi", "lem_cutoff", "lem_full_tp_oeq", "lem_moe_openequi", "lem_in_frame_moe", "lem_full_tp", "lem_in_frame_e3nn", "lem_in_frame_openequi", "lem_wo_ln", "lem_in_frame", "lem_in_frame_heavy", "lem_light_v2", "lem_light", "lem_moe_charge", "lem_frame", "lem_high_order", "lem_so2_local", "lem_so2_global", "lem_local", "lem_global", "lem_so2", "trinity"]:
+        elif embedding["method"] in ["unitb", "slem", "lem", "slem_prior", "lem_prior", "lem_moe_v3", "lem_moe_v3_edge", "lem_moe_v3_h0", "lem_moe_v3_prior", "lem_moe_v3_prior_2b", "lem_moe_v3_edge_prior_2b", "lem_moe_v3_edge_h0", "trinity"]:
             r_max = embedding["r_max"]
         else:
             log.error("The method of embedding have not been defined in get cutoff functions")
@@ -3772,10 +3780,20 @@ def normalize(data):
     # Resolve aliases and mutually dependent route switches before dargs inserts
     # defaults.  Doing this afterwards silently hides alias values behind the
     # canonical defaults (for example overlap_huckel_k behind huckel_k=1.75).
+    data = _resolve_legacy_baseline_methods(data)
     data = canonicalize_training_config(data)
     embedding = data.get("model_options", {}).get("embedding", {})
     if embedding.get("method") in {"lem_moe_v3_edge", "lem_moe_v3_edge_h0", "lem_moe_v3_edge_prior_2b"}:
         embedding.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
+    if embedding.get("method") == "unitb":
+        from dptb.nn.embedding.unitb_options import unitb_options
+        embedding.update(unitb_options(embedding))
+        shift = data.get("model_options", {}).get("shift_head")
+        if shift is not None and shift.get("mode", "atom") != "off":
+            from dptb.nn.charge_head import normalize_charge_options
+            data["model_options"]["shift_head"] = normalize_charge_options(shift)
+        for alias in ("expert_parameterization", "expert_rank", "expert_mixing", "router_input", "router_gate"):
+            embedding.pop(alias, None)
     co = common_options()
     tr = train_options()
     da = data_options()
@@ -3786,8 +3804,6 @@ def normalize(data):
     # data = base.normalize_value(data, trim_pattern="_*")
     base.check_value(data, strict=True)
     _validate_p2_prior_full_h_contract(data)
-    validate_flow_loss_contract(data)
-    validate_block_ode_contract(data)
 
     # add check loss and use wannier:
 

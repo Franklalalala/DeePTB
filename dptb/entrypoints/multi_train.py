@@ -23,7 +23,6 @@ from pathlib import Path
 
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
-from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
 from dptb.configuration import (
     migrate_legacy_checkpoint_model_options,
     migrate_legacy_checkpoint_train_options,
@@ -46,7 +45,7 @@ from dptb.nnops.expert_parallel_layout import (
 from dptb.plugins.monitor import (
     Validationer, TensorBoardMonitor,
     DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, CUDAModuleMemoryMonitor,
-    ScalarFieldMonitor, CUDAMemoryMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
+    ScalarFieldMonitor, CUDAMemoryMonitor, ParamDynamicsMonitor
 )
 from dptb.plugins.training_monitor import register_core_training_monitors
 from dptb.plugins.train_logger import Logger
@@ -411,7 +410,6 @@ def _multi_train_impl(
     # jvp du/dt backend needs eager e3nn before ANY dataset/model-side module is
     # imported or constructed (review finding 6). Do it here, before
     # collect_cutoffs / dataset / model build, not after the monitor config.
-    configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
     cutoff_options = collect_cutoffs(jdata)
     build_common_options = copy.deepcopy(jdata["common_options"])
     if distributed_expert:
@@ -554,13 +552,6 @@ def _multi_train_impl(
     with entry_tagger.tag("trainer/register_plugins"):
         train_options = jdata["train_options"]
         log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]
-        # Legacy validation_onsite/hopping keys are only produced when the
-        # resolved flow object maps the endpoint-compatible euler-1 loss to
-        # legacy keys (or when flow is disabled and the plain criterion fills
-        # them); registering them otherwise prints misleading constant zeros.
-        _, register_legacy_validation = resolve_flow_log_fields(
-            getattr(trainer, "flow_cfm", None)
-        )
         train_endpoint_capable = trainer._supports_endpoint_triplet(
             trainer.train_lossfunc
         )
@@ -568,9 +559,7 @@ def _multi_train_impl(
             validation_datasets
             and trainer._supports_endpoint_triplet(trainer.validation_lossfunc)
         )
-        register_legacy_validation = bool(
-            register_legacy_validation and validation_endpoint_capable
-        )
+        register_legacy_validation = validation_endpoint_capable
 
         if validation_datasets:
             validation_intervals = []
@@ -648,30 +637,6 @@ def _multi_train_impl(
                     grad_norm_dead_threshold=train_options.get(
                         "monitor_param_dynamics_grad_norm_dead_threshold", 1.0e-12
                     ),
-                )
-            )
-
-        gated_edge_enabled = bool(train_options.get("monitor_gated_edge_attention", False))
-        if gated_edge_enabled:
-            gated_edge_freq = int(
-                train_options.get("monitor_gated_edge_attention_freq") or train_options["display_freq"]
-            )
-            gated_edge_freq = max(1, gated_edge_freq)
-            gated_edge_tb_opt = train_options.get("monitor_gated_edge_attention_tensorboard", None)
-            if gated_edge_tb_opt is None:
-                gated_edge_tb = bool(train_options.get("use_tensorboard", False))
-            else:
-                gated_edge_tb = bool(gated_edge_tb_opt)
-            gated_edge_output = output or "monitor_logs"
-            if distributed_expert:
-                gated_edge_output = os.path.join(gated_edge_output, f"rank{rank}")
-            trainer.register_plugin(
-                GatedEdgeAggregationMonitor(
-                    gated_edge_output,
-                    interval=[(gated_edge_freq, 'iteration')],
-                    tensorboard=gated_edge_tb,
-                    heatmap=bool(train_options.get("monitor_gated_edge_attention_heatmap", False)),
-                    heatmap_max_nodes=train_options.get("monitor_gated_edge_attention_heatmap_size", 64),
                 )
             )
 

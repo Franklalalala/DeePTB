@@ -1,3 +1,4 @@
+from dptb.nn.shift_head import optimizer_named_parameters
 import contextlib
 import time
 import logging
@@ -35,7 +36,7 @@ from dptb.nnops.metric_pack import (
 )
 from dptb.nnops.metric_reducer import MetricReducer
 from dptb.nnops.dynamic_batch_controller import DynamicBatchController
-from dptb.nnops.objective import Objective, FlowObjective
+from dptb.nnops.objective import Objective
 from dptb.nnops.training_state import (
     CHECKPOINT_KIND_EPOCH,
     CHECKPOINT_KIND_ITERATION,
@@ -311,22 +312,6 @@ class MultiTrainer(Trainer):
 
         self.distance_ranges = distance_ranges
         self.num_experts = len(distance_ranges)
-        if bool(getattr(getattr(self, "flow_cfm", None), "block_ode", False)):
-            valid_full_graph_range = (
-                self.num_experts == 1
-                and isinstance(distance_ranges[0], (list, tuple))
-                and len(distance_ranges[0]) == 2
-                and not isinstance(distance_ranges[0][0], bool)
-                and isinstance(distance_ranges[0][0], (int, float))
-                and math.isfinite(float(distance_ranges[0][0]))
-                and float(distance_ranges[0][0]) <= 0.0
-            )
-            if not valid_full_graph_range:
-                raise ValueError(
-                    "Block-space ODE v1 cannot use distance-partitioned experts: "
-                    "H-B0 must predict every graph edge. MultiTrainer is allowed "
-                    "only with one full-graph distance range whose lower bound is <= 0."
-                )
 
         self.distributed_expert = bool(distributed_expert)
         self.rank = int(rank)
@@ -1056,7 +1041,7 @@ class MultiTrainer(Trainer):
         return self._expert_module(expert_idx).parameters()
 
     def _expert_optimizer_parameters(self, expert_idx: int):
-        return self._expert_module(expert_idx).named_parameters()
+        return optimizer_named_parameters(self._expert_module(expert_idx))
 
     def _maybe_wrap_local_expert_ddp(self):
         if (
@@ -2067,104 +2052,8 @@ class MultiTrainer(Trainer):
 
         return out
 
-    def _flow_state_with_prefix(self, state: Dict[str, Any], prefix: str) -> Dict[str, Any]:
-        if prefix == "train":
-            return dict(state)
-        out = {}
-        for key, value in state.items():
-            if key.startswith("train_"):
-                out[f"{prefix}_{key[len('train_'):]}"] = value
-            else:
-                out[key] = value
-        return out
 
-    def _flow_state_scalar(
-        self,
-        state: Dict[str, Any],
-        *names,
-        default=0.0,
-        allow_none=False,
-        missing_is_none=True,
-    ):
-        for name in names:
-            if name not in state:
-                continue
-            if state[name] is None and allow_none:
-                return None
-            if state[name] is not None:
-                return self._as_scalar_tensor(state[name], default=default, allow_none=allow_none)
-        return self._as_scalar_tensor(
-            None,
-            default=default,
-            allow_none=bool(allow_none and missing_is_none),
-        )
 
-    def _payload_metrics_from_flow_state(
-        self,
-        state: Dict[str, Any],
-        *,
-        prefix: str,
-    ) -> Dict[str, Any]:
-        compatible_stats = state.get("_compatible_clean_stats", {})
-        if not isinstance(compatible_stats, dict):
-            compatible_stats = {}
-
-        return {
-            "onsite": self._flow_state_scalar(
-                state,
-                f"{prefix}_compatible_onsite_loss",
-                f"{prefix}_onsite_loss",
-                default=0.0,
-                allow_none=True,
-                missing_is_none=False,
-            ),
-            "hopping": self._flow_state_scalar(
-                state,
-                f"{prefix}_compatible_hopping_loss",
-                f"{prefix}_hopping_loss",
-                default=0.0,
-                allow_none=True,
-                missing_is_none=False,
-            ),
-            "z_loss": self._flow_state_scalar(
-                state,
-                "mean_max_prob",
-                f"{prefix}_mean_max_prob",
-                default=0.0,
-                allow_none=True,
-            ),
-            "expert_load_cv": self._flow_state_scalar(
-                state,
-                "expert_load_cv",
-                f"{prefix}_expert_load_cv",
-                default=0.0,
-                allow_none=True,
-            ),
-            "last_onsite_l1_sum": self._as_scalar_tensor(
-                compatible_stats.get("onsite_l1_sum", None),
-                allow_none=True,
-            ),
-            "last_onsite_mse_sum": self._as_scalar_tensor(
-                compatible_stats.get("onsite_mse_sum", None),
-                allow_none=True,
-            ),
-            "last_onsite_count": self._as_scalar_tensor(
-                compatible_stats.get("onsite_count", None),
-                allow_none=True,
-            ),
-            "last_hopping_l1_sum": self._as_scalar_tensor(
-                compatible_stats.get("hopping_l1_sum", None),
-                allow_none=True,
-            ),
-            "last_hopping_mse_sum": self._as_scalar_tensor(
-                compatible_stats.get("hopping_mse_sum", None),
-                allow_none=True,
-            ),
-            "last_hopping_count": self._as_scalar_tensor(
-                compatible_stats.get("hopping_count", None),
-                allow_none=True,
-            ),
-        }
 
     def _pack_component_state(
         self,
@@ -2197,13 +2086,6 @@ class MultiTrainer(Trainer):
             self.__dict__["_objective_obj"] = obj
         return obj
 
-    @property
-    def _flow_objective(self) -> FlowObjective:
-        obj = self.__dict__.get("_flow_objective_obj")
-        if obj is None:
-            obj = FlowObjective(self)
-            self.__dict__["_flow_objective_obj"] = obj
-        return obj
 
     def _run_one_expert_loss(
         self,
@@ -2227,24 +2109,11 @@ class MultiTrainer(Trainer):
         active_nodes = expert_node_mask.sum().detach()
         active_edges = expert_edge_mask.sum().detach()
 
-        configured_flow = bool(
-            getattr(getattr(self, "flow_cfm", None), "enabled", False)
-        )
-        flow_enabled = configured_flow if use_flow is None else (
-            configured_flow and bool(use_flow)
-        )
-        if flow_enabled:
-            return self._flow_objective.run(
-                batch_copy=batch_copy,
-                batch_info=batch_info,
-                criterion=criterion,
-                expert_idx=expert_idx,
-                expert_edge_mask=expert_edge_mask,
-                expert_node_mask=expert_node_mask,
-                active_nodes=active_nodes,
-                active_edges=active_edges,
-                flow_prefix=flow_prefix,
-            )
+        prior_noise = getattr(self, "prior_noise_augmentation", None)
+        if prior_noise is not None and flow_prefix == "train" and self.model.training:
+            # Expert masks are set above; an inactive head receives no noise.
+            with self._tagger.tag("expert/prior_noise", it=self.iter, expert=expert_idx):
+                batch_copy = prior_noise(batch_copy, training=True)
 
         return self._objective.run(
             batch_copy=batch_copy,
@@ -3369,214 +3238,7 @@ class MultiTrainer(Trainer):
         endpoint_loss = endpoint_state["validation_loss"]
         return endpoint_loss if endpoint_loss is not None else optimization_loss.detach()
 
-    def _build_validation_euler_payload(
-        self,
-        batch_dict,
-        batch_info,
-        criterion,
-        expert_idx,
-        range_dis,
-        *,
-        num_steps: int,
-        prior_seed=None,
-    ):
-        with self._tagger.tag("validation/prepare_euler_masks", it=self.iter, expert=expert_idx):
-            expert_edge_mask, expert_node_mask = self._prepare_expert_masks(
-                batch_dict, range_dis, expert_idx
-            )
 
-        batch_copy = batch_dict.copy()
-        batch_copy["expert_edge_mask"] = expert_edge_mask
-        batch_copy["expert_node_mask"] = expert_node_mask
-        batch_copy["expert_idx"] = int(expert_idx)
-
-        active_nodes = expert_node_mask.sum().detach()
-        active_edges = expert_edge_mask.sum().detach()
-        with self._tagger.tag(
-            "validation/flow_sample_euler",
-            it=self.iter,
-            expert=expert_idx,
-            extra=f"steps={int(num_steps)}",
-        ):
-            sample_kwargs = {"num_steps": int(num_steps)}
-            if prior_seed is not None:
-                sample_kwargs["prior_seed"] = prior_seed
-            sampled = self.flow_cfm.sample(
-                self.model,
-                batch_copy,
-                **sample_kwargs,
-            )
-
-        sampled["global_step"] = int(self.iter)
-        sampled["expert_edge_mask"] = expert_edge_mask
-        sampled["expert_node_mask"] = expert_node_mask
-        sampled["expert_idx"] = int(expert_idx)
-        sampled.update(batch_info)
-
-        batch_for_loss = batch_copy.copy()
-        batch_for_loss.update(batch_info)
-
-        if bool(getattr(self.flow_cfm, "block_ode", False)):
-            # Block-ODE residual sampling returns the physical full-H state,
-            # while its configured criterion target remains dH. Reconstruct
-            # the t=0 flow context and let the flow scorer perform the exact
-            # residual-to-full adaptation once; feeding ``sampled`` directly
-            # to the criterion would count physical H0 as prediction error.
-            num_graphs = self.flow_cfm._num_graphs(batch_copy)
-            sample_node = sampled.get(
-                getattr(self.flow_cfm, "node_output_key", "node_hamil_blocks")
-            )
-            zero_device = (
-                sample_node.device if torch.is_tensor(sample_node) else self._device_obj()
-            )
-            zero_t = torch.zeros(num_graphs, device=zero_device, dtype=self.dtype)
-            prepare_kwargs = {"t": zero_t}
-            if prior_seed is not None:
-                prepare_kwargs["prior_seed"] = prior_seed
-            _flow_batch, flow_ref, flow_ctx = self.flow_cfm.prepare_batch(
-                batch_copy,
-                batch_for_loss,
-                **prepare_kwargs,
-            )
-            flow_ref.update(batch_info)
-            log_flow_euler = self._validation_flow_metric_enabled(
-                self.flow_cfm, "trajectory"
-            )
-            score_sample = (
-                self.flow_cfm.loss_on_sample
-                if log_flow_euler
-                else self.flow_cfm.compatible_loss_on_sample
-            )
-            with self._tagger.tag(
-                "validation/euler_flow_loss"
-                if log_flow_euler
-                else "validation/euler_compatible_loss",
-                it=self.iter,
-                expert=expert_idx,
-                extra=f"steps={int(num_steps)}",
-            ):
-                loss, flow_state = score_sample(sampled, flow_ref, flow_ctx)
-            compatible_state = Trainer._compatible_loss_state_from_flow_stats(
-                criterion,
-                flow_state,
-                source_prefix="train",
-                prefix="train_compatible",
-                legacy_prefix="train",
-                global_step=getattr(self, "iter", None),
-                # This branch (block_ode) has no raw-batch recompute fallback --
-                # the euler-rolled sample is not directly re-scoreable by the
-                # criterion's forward(), see the immediate RuntimeError below.
-                # Fail fast with a diagnostic on a metric_space mismatch instead
-                # of letting it collapse into that generic message (P1-1).
-                fail_on_metric_space_mismatch=True,
-            )
-            if compatible_state is None:
-                raise RuntimeError(
-                    "Block-ODE validation scoring could not reconstruct the "
-                    "criterion-compatible endpoint triplet from flow-owned stats."
-                )
-            flow_state.update(compatible_state)
-            metrics = self._payload_metrics_from_flow_state(
-                flow_state,
-                prefix="train",
-            )
-        else:
-            with self._tagger.tag(
-                "validation/euler_compatible_loss",
-                it=self.iter,
-                expert=expert_idx,
-                extra=f"steps={int(num_steps)}",
-            ):
-                loss = criterion(sampled, batch_for_loss)
-            metrics = self._snapshot_loss_metrics(criterion)
-
-        # Gate the onsite/hopping denominator the same way as the training path:
-        # a euler payload scored through the plain criterion snapshot can report a
-        # throttled (None) onsite/hopping metric, which must drop out of both the
-        # numerator and the denominator.  The flow-state branch never yields None,
-        # so this stays byte-identical there.
-        onsite_weighted_sum, onsite_weight = self._gated_metric_weighted_sum(
-            metrics["onsite"], active_nodes
-        )
-        hopping_weighted_sum, hopping_weight = self._gated_metric_weighted_sum(
-            metrics["hopping"], active_edges
-        )
-        zero_scalar = torch.zeros((), dtype=self.dtype, device=self.device)
-
-        return {
-            "loss": loss,
-            "loss_detached": loss.detach() if torch.is_tensor(loss) else loss,
-            "expert_onsite": metrics["onsite"].detach() if torch.is_tensor(metrics["onsite"]) else zero_scalar,
-            "expert_hopping": metrics["hopping"].detach() if torch.is_tensor(metrics["hopping"]) else zero_scalar,
-            "onsite_weighted_sum": onsite_weighted_sum.detach(),
-            "hopping_weighted_sum": hopping_weighted_sum.detach(),
-            "onsite_weight": onsite_weight.detach(),
-            "hopping_weight": hopping_weight.detach(),
-            "active_nodes": active_nodes.detach(),
-            "active_edges": active_edges.detach(),
-            "onsite_l1_sum": metrics["last_onsite_l1_sum"].detach()
-            if torch.is_tensor(metrics["last_onsite_l1_sum"])
-            else None,
-            "onsite_mse_sum": metrics["last_onsite_mse_sum"].detach()
-            if torch.is_tensor(metrics["last_onsite_mse_sum"])
-            else None,
-            "onsite_cnt": metrics["last_onsite_count"].detach()
-            if torch.is_tensor(metrics["last_onsite_count"])
-            else None,
-            "hopping_l1_sum": metrics["last_hopping_l1_sum"].detach()
-            if torch.is_tensor(metrics["last_hopping_l1_sum"])
-            else None,
-            "hopping_mse_sum": metrics["last_hopping_mse_sum"].detach()
-            if torch.is_tensor(metrics["last_hopping_mse_sum"])
-            else None,
-            "hopping_cnt": metrics["last_hopping_count"].detach()
-            if torch.is_tensor(metrics["last_hopping_count"])
-            else None,
-            "z_values": [metrics["z_loss"].detach()]
-            if torch.is_tensor(metrics["z_loss"])
-            else ([] if metrics["z_loss"] is None else [metrics["z_loss"]]),
-            "load_cv_values": [metrics["expert_load_cv"].detach()]
-            if torch.is_tensor(metrics["expert_load_cv"])
-            else ([] if metrics["expert_load_cv"] is None else [metrics["expert_load_cv"]]),
-        }
-
-    def _validation_euler_state_from_pack(
-        self,
-        pack: torch.Tensor,
-        criterion,
-        *,
-        num_steps: int,
-    ) -> Dict[str, torch.Tensor]:
-        state: Dict[str, torch.Tensor] = {}
-        if (
-            bool(getattr(self.flow_cfm, "block_ode", False))
-            and self._validation_flow_metric_enabled(self.flow_cfm, "trajectory")
-        ):
-            mp = MetricPack.from_tensor(pack)
-            state[f"validation_flow_euler_{int(num_steps)}_loss"] = (
-                mp.loss_opt_sum / mp.step_count.clamp_min(1.0)
-            ).detach()
-        compatible_prefix = f"validation_compatible_euler_{int(num_steps)}"
-        compatible_state = self._compute_compatible_state_from_pack(
-            pack,
-            criterion=criterion,
-            prefix=compatible_prefix,
-            global_step=getattr(self, "iter", None),
-        )
-        if compatible_state is not None:
-            state.update(compatible_state)
-
-        if int(num_steps) == 1:
-            legacy_state = self._compute_compatible_state_from_pack(
-                pack,
-                criterion=criterion,
-                prefix="validation",
-                global_step=getattr(self, "iter", None),
-            )
-            if legacy_state is not None:
-                state.update(legacy_state)
-
-        return state
 
     def validation(self, fast=True):
         with torch.no_grad():
@@ -3607,139 +3269,40 @@ class MultiTrainer(Trainer):
                 with self._tagger.tag("validation/prepare_batch", it=self.iter):
                     batch_dict, batch_info = self._prepare_batch_bundle(batch, with_lengths=True)
 
-                flow_euler_validation = bool(getattr(getattr(self, "flow_cfm", None), "enabled", False))
-                validation_prior_seed = (
-                    self._validation_prior_seed(self.flow_cfm)
-                    if flow_euler_validation
-                    else None
-                )
-
                 if self.distributed_expert:
                     local_idx = self.local_expert_idx
-                    if flow_euler_validation:
-                        loss_i = None
-                        sampled_loss_fallback = None
-                        for num_steps in self.flow_cfm.validation_ode_steps:
-                            payload = self._build_validation_euler_payload(
-                                batch_dict=batch_dict,
-                                batch_info=batch_info,
-                                criterion=self.validation_lossfunc,
-                                expert_idx=local_idx,
-                                range_dis=self.distance_ranges[local_idx],
-                                num_steps=int(num_steps),
-                                prior_seed=validation_prior_seed,
-                            )
-                            with self._tagger.tag(
-                                "validation/reduce_euler_metrics_dist",
-                                it=self.iter,
-                                extra=f"steps={int(num_steps)}",
-                            ):
-                                reduced_pack = self._make_step_pack(payload)
-                                self._all_reduce_(
-                                    reduced_pack,
-                                    name=f"dist/all_reduce(validation_euler_{int(num_steps)}_metrics_packed)",
-                                )
-                            reduced_mp = MetricPack.from_tensor(reduced_pack)
-                            if sampled_loss_fallback is None:
-                                sampled_loss_fallback = (
-                                    reduced_mp.loss_opt_sum
-                                    / reduced_mp.step_count.clamp_min(1.0)
-                                ).detach()
-                            state = self._validation_euler_state_from_pack(
-                                reduced_pack,
-                                self.validation_lossfunc,
-                                num_steps=int(num_steps),
-                            )
-                            _accumulate(state)
-                            if loss_i is None:
-                                loss_i = state.get(
-                                    "validation_loss",
-                                    state.get(
-                                        f"validation_compatible_euler_{int(num_steps)}_loss",
-                                        None,
-                                    ),
-                                )
-                        if loss_i is None:
-                            if sampled_loss_fallback is None:
-                                raise RuntimeError(
-                                    "Flow validation produced no Euler payload or endpoint metric."
-                                )
-                            loss_i = sampled_loss_fallback
-                    else:
-                        payload = self._build_train_payload(
-                            batch_dict=batch_dict,
-                            batch_info=batch_info,
-                            expert_idx=local_idx,
-                            range_dis=self.distance_ranges[local_idx],
-                            ref_batch_dict=None,
-                            ref_batch_info=None,
+                    payload = self._build_train_payload(
+                        batch_dict=batch_dict,
+                        batch_info=batch_info,
+                        expert_idx=local_idx,
+                        range_dis=self.distance_ranges[local_idx],
+                        ref_batch_dict=None,
+                        ref_batch_info=None,
+                        criterion=self.validation_lossfunc,
+                        flow_prefix="validation",
+                    )
+
+                    payload["loss_detached"] = payload["loss"].detach()
+
+                    with self._tagger.tag("validation/reduce_packed_metrics_dist", it=self.iter):
+                        reduced_pack = self._make_step_pack(payload)
+                        self._all_reduce_(reduced_pack, name="dist/all_reduce(validation_metrics_packed)")
+
+                    with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
+                        loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
+                    if loss_i is None:
+                        loss_i = MetricPack.from_tensor(reduced_pack).loss_opt_sum.detach() / max(self.world_size, 1)
+
+                    _accumulate(
+                        self._pack_component_state(
+                            reduced_pack,
+                            prefix="validation",
                             criterion=self.validation_lossfunc,
-                            flow_prefix="validation",
                         )
-
-                        payload["loss_detached"] = payload["loss"].detach()
-
-                        with self._tagger.tag("validation/reduce_packed_metrics_dist", it=self.iter):
-                            reduced_pack = self._make_step_pack(payload)
-                            self._all_reduce_(reduced_pack, name="dist/all_reduce(validation_metrics_packed)")
-
-                        with self._tagger.tag("validation/compute_reduce_loss_dist_packed", it=self.iter):
-                            loss_i = self._compute_compatible_loss_from_pack(reduced_pack, self.validation_lossfunc)
-                        if loss_i is None:
-                            loss_i = MetricPack.from_tensor(reduced_pack).loss_opt_sum.detach() / max(self.world_size, 1)
-
-                        _accumulate(
-                            self._pack_component_state(
-                                reduced_pack,
-                                prefix="validation",
-                                criterion=self.validation_lossfunc,
-                            )
-                        )
+                    )
 
                 else:
-                    if flow_euler_validation:
-                        loss_i = None
-                        sampled_loss_fallback = None
-                        for num_steps in self.flow_cfm.validation_ode_steps:
-                            local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
-                            for expert_idx, range_dis in enumerate(self.distance_ranges):
-                                payload = self._build_validation_euler_payload(
-                                    batch_dict=batch_dict,
-                                    batch_info=batch_info,
-                                    criterion=self.validation_lossfunc,
-                                    expert_idx=expert_idx,
-                                    range_dis=range_dis,
-                                    num_steps=int(num_steps),
-                                    prior_seed=validation_prior_seed,
-                                )
-                                local_pack = local_pack + self._make_step_pack(payload)
-                            local_mp = MetricPack.from_tensor(local_pack)
-                            if sampled_loss_fallback is None:
-                                sampled_loss_fallback = (
-                                    local_mp.loss_opt_sum
-                                    / local_mp.step_count.clamp_min(1.0)
-                                ).detach()
-                            state = self._validation_euler_state_from_pack(
-                                local_pack,
-                                self.validation_lossfunc,
-                                num_steps=int(num_steps),
-                            )
-                            _accumulate(state)
-                            if loss_i is None:
-                                loss_i = state.get(
-                                    "validation_loss",
-                                    state.get(
-                                        f"validation_compatible_euler_{int(num_steps)}_loss",
-                                        None,
-                                    ),
-                                )
-                        if loss_i is None:
-                            if sampled_loss_fallback is None:
-                                raise RuntimeError(
-                                    "Flow validation produced no Euler payload or endpoint metric."
-                                )
-                            loss_i = sampled_loss_fallback
-                    elif getattr(self, "endpoint_loss_mode", "stitch") == "reduce":
+                    if getattr(self, "endpoint_loss_mode", "stitch") == "reduce":
                         payloads = []
                         local_pack = torch.zeros(MetricPack.LENGTH, device=self.device, dtype=self.dtype)
                         for expert_idx, range_dis in enumerate(self.distance_ranges):
@@ -3768,31 +3331,20 @@ class MultiTrainer(Trainer):
                             loss_i = self._compute_stitched_loss_by_reduce(payloads, self.validation_lossfunc)
 
                         if loss_i is None:
-                            if bool(getattr(getattr(self, "flow_cfm", None), "enabled", False)):
-                                local_mp = MetricPack.from_tensor(local_pack)
-                                loss_i = local_mp.loss_opt_sum.detach() / local_mp.step_count.clamp_min(1.0)
-                                _accumulate(
-                                    self._pack_component_state(
-                                        local_pack,
-                                        prefix="validation",
-                                        criterion=self.validation_lossfunc,
-                                    )
-                                )
-                            else:
-                                with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
-                                    loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
-                                    if Trainer._supports_endpoint_triplet(
+                            with self._tagger.tag("validation/fallback_full_forward", it=self.iter):
+                                loss_i = self._run_full_batch_loss(batch_dict, batch_info, self.validation_lossfunc)
+                                if Trainer._supports_endpoint_triplet(
+                                    self.validation_lossfunc
+                                ):
+                                    fallback_metrics = self._snapshot_loss_metrics(
                                         self.validation_lossfunc
-                                    ):
-                                        fallback_metrics = self._snapshot_loss_metrics(
-                                            self.validation_lossfunc
-                                        )
-                                        _accumulate(
-                                            {
-                                                "validation_onsite_loss": fallback_metrics["onsite"],
-                                                "validation_hopping_loss": fallback_metrics["hopping"],
-                                            }
-                                        )
+                                    )
+                                    _accumulate(
+                                        {
+                                            "validation_onsite_loss": fallback_metrics["onsite"],
+                                            "validation_hopping_loss": fallback_metrics["hopping"],
+                                        }
+                                    )
                         else:
                             _accumulate(
                                 self._pack_component_state(
@@ -4017,5 +3569,3 @@ class MultiTrainer(Trainer):
                     )
 
         return trainer
-
-

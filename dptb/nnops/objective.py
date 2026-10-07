@@ -1,40 +1,10 @@
-"""Per-expert training objectives for :class:`MultiTrainer`.
-
-``MultiTrainer._run_one_expert_loss`` runs one expert's forward + loss and can
-take two very different routes: a **standard** supervised route (model forward
-then criterion) and a **flow / CFM** route (conditional flow-matching, with an
-endpoint-triplet reconstruction in the criterion's metric space). This module
-splits those two routes into ``Objective`` (standard) and ``FlowObjective``
-(flow), plus the ``Objective.build_train_payload`` aggregation that stitches a
-main batch with an optional reference batch.
-
-Both are *behaviour objects* holding a trainer back-reference (``self._t``) and
-reaching into the trainer for the tagger, model, ``flow_cfm``, ``iter``, dtype,
-and the flow-state helpers. State lives on the trainer; nothing is duplicated.
-They are lazily attached (``MultiTrainer._objective`` / ``._flow_objective``) so
-trainers built via ``object.__new__`` in unit tests get them without ``__init__``.
-
-Contract preserved verbatim
----------------------------
-* ``MultiTrainer._run_one_expert_loss`` keeps its signature and does the common
-  prep (masks, ``batch_copy``, active-node/edge counts, ``flow_enabled``
-  decision) then dispatches to one of these objectives. It stays monkeypatchable
-  — several tests replace ``trainer._run_one_expert_loss`` wholesale.
-* ``Objective.build_train_payload`` calls ``self._t._run_one_expert_loss(...)``
-  (never a private objective method) so that a monkeypatched
-  ``_run_one_expert_loss`` is still what the payload builder invokes, and the
-  reference call keeps passing ``use_flow=flow_cfm.apply_to_reference``.
-
-The tagger context names, ``cuda_cache_memory_context`` args, error text, and
-metric keys are moved unchanged; pinned by ``test_hamiltonian_flow.py``.
-"""
+"""Supervised per-expert objectives and reference-batch aggregation."""
 
 from typing import Any, Dict
 
 import torch
 
 from dptb.utils.cuda_cache_memory import cuda_cache_memory_context
-from dptb.nnops.trainer import Trainer
 
 
 class Objective:
@@ -163,9 +133,7 @@ class Objective:
                 range_dis=range_dis,
                 capture_metrics=True,
                 flow_prefix=flow_prefix,
-                use_flow=bool(
-                    getattr(getattr(t, "flow_cfm", None), "apply_to_reference", False)
-                ),
+                use_flow=False,
             )
 
             total_loss = total_loss + ref_res["loss"]
@@ -198,124 +166,3 @@ class Objective:
             "z_values": [z.detach() for z in z_values],
             "load_cv_values": [cv.detach() for cv in load_cv_values],
         }
-
-
-class FlowObjective:
-    """Conditional-flow-matching per-expert objective (the ``flow_enabled`` route)."""
-
-    def __init__(self, trainer):
-        self._t = trainer
-
-    def run(
-        self,
-        *,
-        batch_copy,
-        batch_info,
-        criterion,
-        expert_idx,
-        expert_edge_mask,
-        expert_node_mask,
-        active_nodes,
-        active_edges,
-        flow_prefix,
-    ) -> Dict[str, Any]:
-        t = self._t
-        batch_for_loss = batch_copy.copy()
-        if getattr(t.flow_cfm, "model_in_loss", False):
-            with t._tagger.tag("expert/flow_loss_with_model", it=t.iter, expert=expert_idx):
-                loss, flow_state = t.flow_cfm.loss_with_model(
-                    t.model,
-                    batch_copy,
-                    batch_for_loss,
-                )
-            flow_state = t._flow_state_with_prefix(flow_state, flow_prefix)
-            flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
-            compatible_prefix = f"{flow_prefix}_compatible"
-            compatible_state = Trainer._compatible_loss_state_from_flow_stats(
-                criterion,
-                flow_state,
-                source_prefix=flow_prefix,
-                prefix=compatible_prefix,
-                legacy_prefix=flow_prefix,
-                global_step=t.iter,
-                # model_in_loss branch: unlike the `else` branch below, there is
-                # no raw-batch criterion-recompute fallback here, so a
-                # metric_space mismatch must fail fast with a diagnostic instead
-                # of silently falling through to the generic RuntimeError at the
-                # bottom of this method (P1-1).
-                fail_on_metric_space_mismatch=True,
-            )
-            if compatible_state is not None:
-                flow_state.update(compatible_state)
-        else:
-            with t._tagger.tag("expert/flow_prepare_batch", it=t.iter, expert=expert_idx):
-                flow_batch, flow_ref, flow_ctx = t.flow_cfm.prepare_batch(
-                    batch_copy,
-                    batch_for_loss,
-                )
-
-            with t._tagger.tag("expert/model_forward", it=t.iter, expert=expert_idx):
-                with cuda_cache_memory_context(
-                    iteration=t.iter,
-                    stage="expert/model_forward",
-                    expert=expert_idx,
-                ):
-                    pred_batch = t.model(flow_batch)
-
-            pred_batch["global_step"] = int(t.iter)
-            pred_batch.setdefault("expert_edge_mask", expert_edge_mask)
-            pred_batch.setdefault("expert_node_mask", expert_node_mask)
-            pred_batch.setdefault("expert_idx", int(expert_idx))
-            pred_batch.update(batch_info)
-            flow_ref.update(batch_info)
-
-            with t._tagger.tag("expert/flow_loss", it=t.iter, expert=expert_idx):
-                loss, flow_state = t.flow_cfm.loss(pred_batch, flow_ref, flow_ctx)
-
-            flow_state = t._flow_state_with_prefix(flow_state, flow_prefix)
-            flow_state.setdefault(f"{flow_prefix}_loss_opt", loss.detach())
-            compatible_prefix = f"{flow_prefix}_compatible"
-            compatible_state = Trainer._compatible_loss_state_from_flow_stats(
-                criterion,
-                flow_state,
-                source_prefix=flow_prefix,
-                prefix=compatible_prefix,
-                legacy_prefix=flow_prefix,
-                global_step=t.iter,
-            )
-            if compatible_state is None:
-                compatible_state = Trainer._compatible_loss_state(
-                    criterion,
-                    pred_batch,
-                    flow_ref,
-                    prefix=compatible_prefix,
-                    legacy_prefix=flow_prefix,
-                    include_raw_stats=True,
-                )
-                fallback_stats = compatible_state.pop("_endpoint_stats", None)
-                if fallback_stats is not None:
-                    flow_state["_compatible_clean_stats"] = fallback_stats
-            if compatible_state is not None:
-                flow_state.update(compatible_state)
-
-        if compatible_state is None:
-            raise RuntimeError(
-                "Enabled flow could not reconstruct an endpoint triplet in "
-                "the criterion's metric space. Check that flow target keys "
-                "and the configured Hamiltonian loss use the same block/RME "
-                "representation."
-            )
-        Trainer._require_endpoint_triplet(
-            flow_state,
-            prefix=flow_prefix,
-            route="MultiTrainer flow training",
-        )
-
-        out = {
-            "loss": loss,
-            "active_nodes": active_nodes,
-            "active_edges": active_edges,
-        }
-        out.update(t._payload_metrics_from_flow_state(flow_state, prefix=flow_prefix))
-        flow_state.pop("_compatible_clean_stats", None)
-        return out

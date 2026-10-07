@@ -1,5 +1,4 @@
 from dptb.nnops.trainer import Trainer
-from dptb.nnops.flow import configure_jvp_friendly_backends, resolve_flow_log_fields
 from dptb.configuration import (
     canonicalize_training_config,
     migrate_legacy_checkpoint_model_options,
@@ -8,7 +7,7 @@ from dptb.configuration import (
 from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.nn.build import build_model
 from dptb.data.build import build_dataset
-from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, ScalarFieldMonitor, ParamDynamicsMonitor, GatedEdgeAggregationMonitor
+from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, ScalarFieldMonitor, ParamDynamicsMonitor
 from dptb.plugins.training_monitor import register_core_training_monitors
 from dptb.plugins.train_logger import Logger
 from dptb.utils.argcheck import normalize, collect_cutoffs, chk_avg_per_iter
@@ -497,7 +496,6 @@ def train(
 
     cutoff_options =collect_cutoffs(jdata)
     # jvp du/dt backend needs eager e3nn before any module is instantiated.
-    configure_jvp_friendly_backends(jdata["train_options"].get("flow_options", None))
     # setup seed
     setup_seed(seed=jdata["common_options"]["seed"])
 
@@ -554,14 +552,6 @@ def train(
     # register the plugin in trainer, to tract training info
     train_options = jdata["train_options"]
     log_field = ["train_loss", "train_loss_opt", "lr", "total_grad_norm"]
-    # Register scalar fields from the *effective* flow flags on the resolved
-    # flow object. Re-deriving them from raw flow_options keys drifts for
-    # pixel meanflow (meanflow.* overrides, no raw-batch train_compatible
-    # path, one_step instead of t0/euler flow keys), and every
-    # registered-but-never-updated field prints a misleading constant 0.
-    flow_log_fields, register_legacy_validation = resolve_flow_log_fields(
-        getattr(trainer, "flow_cfm", None)
-    )
     train_endpoint_capable = trainer._supports_endpoint_triplet(
         trainer.train_lossfunc
     )
@@ -569,11 +559,7 @@ def train(
         validation_datasets
         and trainer._supports_endpoint_triplet(trainer.validation_lossfunc)
     )
-    register_legacy_validation = bool(
-        register_legacy_validation and validation_endpoint_capable
-    )
-    log_field.extend(flow_log_fields)
-    flow_scalar_fields = list(flow_log_fields)
+    register_legacy_validation = validation_endpoint_capable
     if validation_datasets:
         validation_intervals = []
         validation_freq = int(jdata["train_options"].get("validation_freq", 10) or 0)
@@ -600,22 +586,14 @@ def train(
         sliding_win_size=jdata["train_options"]["sliding_win_size"],
         avg_per_iter=avg_per_iter,
     )
-    for flow_stat_name in flow_scalar_fields:
-        trainer.register_plugin(
-            ScalarFieldMonitor(
-                stat_name=flow_stat_name,
-                interval=[(1, 'iteration'), (1, 'epoch')],
-            )
-        )
     if validation_datasets and register_legacy_validation:
         for validation_stat_name in ("validation_onsite_loss", "validation_hopping_loss"):
-            if validation_stat_name not in flow_scalar_fields:
-                trainer.register_plugin(
-                    ScalarFieldMonitor(
-                        stat_name=validation_stat_name,
-                        interval=[(1, 'iteration'), (1, 'epoch')],
-                    )
+            trainer.register_plugin(
+                ScalarFieldMonitor(
+                    stat_name=validation_stat_name,
+                    interval=[(1, 'iteration'), (1, 'epoch')],
                 )
+            )
     log_field.append("mean_max_prob")
     log_field.append("expert_load_cv")
     if train_endpoint_capable:
@@ -653,26 +631,6 @@ def train(
             )
         )
 
-    if bool(train_options.get("monitor_gated_edge_attention", False)):
-        gated_edge_freq = int(
-            train_options.get("monitor_gated_edge_attention_freq") or train_options["display_freq"]
-        )
-        gated_edge_freq = max(1, gated_edge_freq)
-        gated_edge_tb_opt = train_options.get("monitor_gated_edge_attention_tensorboard", None)
-        if gated_edge_tb_opt is None:
-            gated_edge_tb = bool(train_options.get("use_tensorboard", False))
-        else:
-            gated_edge_tb = bool(gated_edge_tb_opt)
-        trainer.register_plugin(
-            GatedEdgeAggregationMonitor(
-                output,
-                interval=[(gated_edge_freq, 'iteration')],
-                tensorboard=gated_edge_tb,
-                tensorboard_log_dir=os.path.join(output, "tensorboard_logs") if output else None,
-                heatmap=bool(train_options.get("monitor_gated_edge_attention_heatmap", False)),
-                heatmap_max_nodes=train_options.get("monitor_gated_edge_attention_heatmap_size", 64),
-            )
-        )
 
     monitor_flag = train_options["monitor_flag"]
     if monitor_flag:
