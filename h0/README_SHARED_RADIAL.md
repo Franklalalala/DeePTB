@@ -1,47 +1,23 @@
-# Shared radial tables and anchored projector search
+# 共享径向表与投影子搜索
 
-The shared store removes exact duplicate S/T/Q curves across compositions and
-stores uniform cubic Hermite endpoints plus tail coefficients and sparse bit
-corrections. It preserves the original numerical grid, coefficients, species,
-complex SOC D matrices, index maps, and generator contract. Not-a-knot AO splines
-are retained as originally stored, not converted with the Hermite codec.
+共享 store 去除不同组合中完全相同的 S/T/Q 曲线，以 uniform cubic Hermite endpoints、尾部系数及稀疏位修正保存。原网格、系数、物种、SOC 复数 D 矩阵、索引和生成器契约保持一致；not-a-knot AO spline 按原格式保存，不转换到 Hermite codec。
 
-Use the installed H0 environment and explicitly prepare a new directory:
+在已配置的 H0 环境中显式准备新目录：
 
-```sh
-python -B compact_tables.py /path/to/original/offline_tables /path/to/new/shared_tables
+```bash
+python -B h0/compact_tables.py /path/to/original/offline_tables /path/to/new/shared_tables
 ```
 
-The original store is never modified. A runtime-discoverable manifest is published
-only after every reconstructed composition passes its original state checksum.
-An incomplete destination is retained for diagnosis; retry with a new directory.
-The runtime detects a completed shared store via `shared_radial.json` and expands
-the original FP64 tensors on load. It never generates missing tables or compiles.
-SQLite is opened read-only. Decoded coefficient bytes are hashed, so incompatible
-floating-point arithmetic or damaged records fail rather than silently diverge.
+原 store 不变。每个组合的解码结果通过原状态 checksum 后才发布可发现的 manifest；不完整输出保留用于诊断，重试使用新目录。运行时通过 `shared_radial.json` 发现完整 store，加载后展开原 FP64 张量。SQLite 只读，解码系数字节参与 hash 检查，损坏记录或不相容浮点算术会报错。
 
 ```python
-result = assemble_h0(..., offline_table_dir='/path/to/new/shared_tables',
-                     projector_reuse_max_mb=256,
-                     projector_search='anchor', spatial_backend='indexed')
+result = assemble_h0(
+    ..., offline_table_dir='/path/to/new/shared_tables',
+    projector_reuse_max_mb=256,
+    projector_search='anchor', spatial_backend='indexed',
+)
 ```
 
-`projector_search='midpoint'` remains the default and provides the A/B reference.
-The anchor route queries around `ci` with radius `orbital_cutoff_i + max_projector_cutoff`.
-Every contributing projector must lie in this ball because it must overlap AO i.
-All outgoing pairs of i reuse the sorted candidate superset. The original two
-per-species distance tests and native contraction still determine actual
-contributions, including repeated periodic images. Atom-major / translation order
-is unchanged. Only one atom's candidate list is retained, so the search cache does
-not grow with the full edge list. Reference spatial mode is unaffected.
+默认搜索为 `projector_search='midpoint'`。`anchor` 以原子 `ci` 为中心、`orbital_cutoff_i + max_projector_cutoff` 为半径；贡献投影子必须与 AO i 重叠，因此处于此候选球内。原子 i 的所有出边复用排序后的候选集，原两次物种距离判断和原生收缩确定实际贡献，包括重复周期镜像。原子与 translation 顺序保持一致，仅缓存当前原子的候选集。
 
-Scope: this is shared storage of already generated curves, not a new universal
-grid or a generator that skips all repeated pair integrals. New numerical grids or
-unseen compositions still need explicit preparation. CUDA still holds expanded
-four-coefficient tables; the disk reduction is not a claim of reduced GPU memory.
-The Q cache budget still covers retained Q tensors only, not the complete assembly
-working set. `kernel_nonlocal_seconds` on the reuse route now measures the wrapper
-through the completed CPU result; S/T timing and call counts remain visible.
-
-Validation and run-specific performance numbers belong in the dated evidence
-bundle, not in this API contract. Native binaries are unchanged.
+共享格式只压缩已生成曲线；新网格与未见组合仍需显式准备。CUDA 使用展开后的四系数表，磁盘压缩不代表 GPU 内存等比例减少。Q cache 预算只覆盖保留的 Q 张量，不是完整组装工作集；`kernel_nonlocal_seconds` 包括 wrapper 到已完成 CPU 结果的范围，S/T 调用数和计时单独报告。

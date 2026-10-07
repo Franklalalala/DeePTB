@@ -53,9 +53,9 @@ the environment's `bin` plus `$CUDA_HOME/bin` on PATH. Keep compiler/cache paths
 on the intended workspace filesystem using `TORCH_EXTENSIONS_DIR`, `TEMP`,
 `TMP`, and `TMPDIR`. Limit build parallelism with `MAX_JOBS=2` when sharing a host.
 Use `TORCH_CUDA_ARCH_LIST` appropriate to the installed compiler and device.
-The verified PRO6000 host has CUDA 12.4 nvcc and a CUDA 12.8 PyTorch runtime;
-`TORCH_CUDA_ARCH_LIST='8.9+PTX'` supplies forward-compatible PTX for Blackwell.
-This kernel uses no architecture-specific tensor-core instructions.
+Choose a toolkit that supports the device's compute capability and set
+`TORCH_CUDA_ARCH_LIST` accordingly. This kernel uses no architecture-specific
+tensor-core instructions.
 
 One CUDA block owns each displacement query. It locates the nonuniform interval
 once, computes real harmonics and small rotation matrices in shared memory, and

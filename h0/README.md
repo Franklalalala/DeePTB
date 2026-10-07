@@ -1,111 +1,56 @@
-# H0 reconstruction
+# H0 重建
 
-This is the maintained standalone H0 subsystem in `0921-stable`. It retains
-the reviewed numerical implementation through `4a069aec`; NACF is maintained
-separately in `../dptb/nacf`, without an overlay copy.
+`h0` 是 `1006-stable` 的独立物理 H0 子系统；NACF 在 `dptb/nacf` 维护。H0 对应原子初始电荷的 `T + Vnl + Vion + VH[rho0] + Vxc[rho0]`，需要与相同物理输入的初始算符比较。
 
-Activate a matching Linux Python/PyTorch/CUDA environment with pyabacus, NumPy,
-SciPy and the selected field backend installed, then from the repository root:
+## 安装与离线准备
+
+配置相容的 Linux Python、PyTorch、CUDA、pyabacus、NumPy、SciPy 和势场后端，从仓库根目录执行：
 
 ```bash
 source h0/env.sh
 export ABACUS_SOURCE_DIR=/path/to/matching/abacus/source
-# If headers such as OpenBLAS are outside the environment include directory:
 export H0_EXTRA_INCLUDE_DIRS=/path/to/extra/include
 bash h0/build_once.sh
 python h0/precompile.py --check
 ```
 
-The build discovers ModuleNAO libraries from the imported pyabacus and uses the
-active Python environment's include/lib directories. CUDA_HOME and library
-search paths must already select that matching environment. Native builds are
-explicit installation work; normal inference never invokes a compiler. The
-repository contains source, not installed binaries or prepared data. A new
-installation must create its own manifests; never relabel an old manifest.
+构建从当前导入的 pyabacus 发现 ModuleNAO 库，并使用当前 Python 环境的 include/lib；`CUDA_HOME` 和动态库搜索路径需要匹配。原生构建由用户显式执行，正常推理不调用编译器。仓库只提供源码；二进制、离线表及安装 manifest 需要按实际环境建立，不能给旧 manifest 改名。
 
-`h0/env.sh` selects this checkout and puts temporary files and caches under
-`H0_WORK_ROOT` (default `h0/work`). It does not select a GPU or activate a conda
-environment. Choose CUDA_VISIBLE_DEVICES for the host before execution.
+`h0/env.sh` 选择当前 checkout，并将临时文件与缓存放在 `H0_WORK_ROOT`，默认 `h0/work`。它不选择 GPU 或激活环境；执行前显式配置 `CUDA_VISIBLE_DEVICES`。
 
-Prepare species and two-center data with `prepare_tables.py RAW STORE` or the
-APIs in `h0rebuild.offline`. Source, spin, radial-grid, dependency and binary
-identities remain mandatory. A changed store identity requires explicit
-preparation in a new namespace. `compact_tables.py` converts an existing store
-to the lossless shared-curve representation; see README_SHARED_RADIAL.md.
+`prepare_tables.py RAW STORE` 和 `h0rebuild.offline` API 准备物种及两中心数据。源文件、自旋、径向网格、依赖及二进制身份必须匹配；改变身份后在新目录显式准备。无损共享径向表见 [README_SHARED_RADIAL.md](README_SHARED_RADIAL.md)。
 
-The geometry API is `h0rebuild.assemble.assemble_h0`, with the physical cutoff,
-FFT shape, spin and species explicitly supplied. `h0rebuild.deeptb` validates
-AO-block provenance and packing conventions for DeePTB. `production_io.py`
-reads reference ABACUS output for validation only; it is not an inference input
-requirement. The assembly reports its actual backend and timing scope.
+## 组装接口
 
-For complete H0 block reproduction, explicitly set
-`pair_support='nonlocal_complete'`. The default `orbital_overlap` limits output
-to overlapping orbital supports and can omit nonzero third-center nonlocal
-blocks. `strict_reproduction=True` checks other numerical settings but does not
-change this support selection; see [the hot-path example](README_HOT_PATH.md).
+`h0rebuild.assemble.assemble_h0` 接收结构、物种、物理 cutoff、精确 FFT 网格、自旋和初始磁矩。`h0rebuild.deeptb` 验证 AO block 来源与特征打包约定。`production_io.py` 可读取 ABACUS 参考结果用于验证；实际推理可以直接提供结构和物理输入。
 
-Use focused tests under `tests_h0fast` for a changed boundary. Dataset-dependent
-verification scripts and the finite `acceptance.py` runner are opt-in and need
-the original external reference inputs; historical Liyue fixture paths in those
-tests are not bundled assets. `new100.py` provides the shared case worker and
-compatibility CLI; `new100_v3.py` delegates to the same acceptance runner.
+完整非局域 block 支持须显式选择 `pair_support='nonlocal_complete'`。默认 `orbital_overlap` 仅输出轨道支持重叠的原子对，可能遗漏非零的第三中心非局域贡献。`strict_reproduction=True` 不改变此支持选择。运行和内存边界见 [热路径说明](README_HOT_PATH.md)。
 
-The previous full-cohort receipts apply to their frozen sources and stores.
-The signed-density PBE correction and pair/projector optimizations are included.
-The later radial-grid alignment experiment is not enabled by changing defaults;
-it has only a limited-case qualification. See ../docs/0917-stable.md.
+`output_atom_cell_shifts` 指定输出坐标的整数晶格偏移。若 `r_out_i = r_in_i + q_i @ cell`，H0/S 及分项 block 的键按 `R_out = R_in + q_i - q_j` 变换，同时更新序列化坐标和 fingerprint；矩阵值与周期势场保持一致。默认保留输入坐标。`h0rebuild.cell_gauge` 提供整数偏移校验和结果 rebasing；参考输入读取器使用明确记录的原子坐标，拒绝真实位移或原子顺序变化。
 
-## Explicit SOC reference alignment
+## 显式 SOC 参考对齐
 
-For the qualified `USE_NEW_TWO_CENTER` reference, import
-`h0rebuild.soc_reference.align_soc_projectors` and `SOC_REFERENCE_DR_BOHR`.
-The reference uses `cutoff=2*rmax` and `nr=int(rmax/0.01)+1`, giving about
-0.02 Bohr spacing, together with ABACUS's odd projector sample-count rule.
-This is a numerical reference convention, not a change to the H0 formula or
-a general recommendation to coarsen integration grids.
+`h0rebuild.soc_reference.align_soc_projectors` 与 `SOC_REFERENCE_DR_BOHR` 对应 ABACUS 的 `USE_NEW_TWO_CENTER` 参考规则。参考两中心网格采用 `cutoff=2*rmax`、`nr=int(rmax/0.01)+1`，约为 0.02 Bohr 间距，并采用奇数投影子 sample-count 规则。
 
-`SOC_REFERENCE_DR_BOHR = 0.02` does not guarantee an identical grid for every
-cutoff. The reference's actual spacing is `2*rmax/(nr-1)`, whereas the CUDA
-table builder uses `nr=ceil(2*rmax/requested_dr)+1`. At `rmax=9` both give
-901 points; at `rmax=5.005` the reference gives 501 points (0.02002 Bohr) and
-the current 0.02 request gives 502 points (about 0.01998004 Bohr). Check the
-actual grid and reference for each new cutoff before extending qualification.
+参考为 [ABACUS ee99e3ca](https://github.com/deepmodeling/abacus-develop/tree/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f)。[投影子截断](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_cell/setup_nonlocal.cpp#L111-L142) 将偶数 `cut_mesh` 向上取奇数，只复制 `ir < cut_mesh` 的样本。它与 UPF reader 的 inclusive support-count 约定不同。
 
-The reference is ABACUS commit
-[`ee99e3ca`](https://github.com/deepmodeling/abacus-develop/tree/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f).
-[`setup_nonlocal.cpp:111–142`](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_cell/setup_nonlocal.cpp#L111-L142)
-sets `cut_mesh = ir`, rounds an even value up, and copies `ir < cut_mesh`.
-An odd last nonzero index is therefore excluded intentionally; the UPF reader's
-inclusive support-count convention is different. The
-[`USE_NEW_TWO_CENTER` entry](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_hamilt_lcao/hamilt_lcaodft/LCAO_init_basis.cpp#L56-L71)
-passes those projectors to the
-[`two-center grid`](https://github.com/deepmodeling/abacus-develop/blob/ee99e3ca7f64f7c3b33cc6b68bc0bb99ef16599f/source/module_basis/module_nao/two_center_bundle.cpp#L62-L91).
+常量 `SOC_REFERENCE_DR_BOHR=0.02` 不保证所有 cutoff 的实际网格一致。参考间距是 `2*rmax/(nr-1)`，CUDA 表生成器采用 `nr=ceil(2*rmax/requested_dr)+1`。例如 `rmax=9` 时均为 901 点；`rmax=5.005` 时参考为 501 点，0.02 请求产生 502 点。每个新 cutoff 都要核对实际网格。
 
-The helper retains the original `cutoff_radius` as a conservative support and
-grid envelope; resetting it to the new endpoint could change the universal
-grid as well as neighbor selection. After alignment it need not equal
-`r[cutoff_index - 1]`. For an all-below-threshold projector, the sample count
-is bounded by the available mesh, including an even mesh. This safe fallback
-does not reproduce the reference's out-of-range count.
-
-Apply the helper **once to original species**, after loading geometry and
-physics options. Use the same corrected species and spacing in both stages:
+辅助函数保留原 `cutoff_radius` 作为保守支持和网格边界，转换后不必等于 `r[cutoff_index-1]`；全低于阈值的投影子按可用 mesh 限定 sample-count。对齐只对原始物种应用一次，并在表准备和组装中使用相同物种与间距：
 
 ```python
 from h0rebuild.soc_reference import align_soc_projectors, SOC_REFERENCE_DR_BOHR
 from h0rebuild.offline import prepared_two_center
 from h0rebuild.assemble import assemble_h0
 
-# structure, original_species, physics_options are already loaded; nspin=4.
 assert physics_options['nspin'] == 4
 species = align_soc_projectors(original_species)
 table = prepared_two_center(
     species, store=new_store, dr_bohr=SOC_REFERENCE_DR_BOHR,
     nspin=4, device='cuda:0', prepare=True,
 )
-print(table.metadata)  # actual radial spacing and table identity
-del table  # preparation is outside assembly timing
+print(table.metadata)
+del table
 result = assemble_h0(
     structure, species, **physics_options,
     two_center_backend='pyabacus', two_center_dr_bohr=SOC_REFERENCE_DR_BOHR,
@@ -113,27 +58,10 @@ result = assemble_h0(
 )
 ```
 
-Keep the existing CUDA/FFT runtime options and use a **new store**; old table
-keys describe different projector samples and spacing. Defaults, the generic
-`prepare_tables.py` CLI and existing frozen stores retain their legacy route.
-The input species are not mutated. Keep raw inputs for future preparations;
-do not repeatedly apply the cutoff transformation to corrected species.
+使用新 store，保留原 CUDA/FFT 运行参数。旧表键对应原投影子样本与间距；默认行为、通用表准备 CLI 和已冻结 store 不自动切换。保留原始物种，避免重复应用转换。
 
-The original worst SOC case, `SOC_mp-754958`, was rechecked with four separately
-prepared stores in the same installed CUDA reconstruction runtime. Against the
-original ABACUS initial-H0/S CSR, the maximum matrix errors were:
+## 验证
 
-| Two-center spacing | Projector alignment | H0 max error (meV) | S max error |
-|---|---|---:|---:|
-| 0.01 Bohr | Original | 0.272390 | 1.25393e-8 |
-| 0.02 Bohr | Original | 0.012519 | 4.99835e-10 |
-| 0.01 Bohr | ABACUS sample rule | 0.028457 | 1.25393e-8 |
-| 0.02 Bohr | ABACUS sample rule | 0.012519 | 4.99835e-10 |
+修改边界时运行 `tests_h0fast` 中对应的行为测试。`acceptance.py` 是显式真实数据验收入口；`new100.py` 提供共享 case worker 和兼容 CLI，`new100_v3.py` 委托同一验收器。参考输入需外部提供，不是仓库内资产。
 
-For this case, spacing alone reaches the reported combined maximum error;
-the combined number does not establish an additional gain from alignment at
-0.02 Bohr. Alignment also reduces the error at 0.01 Bohr and reproduces the
-specified reference's projector rule. These are single-case implementation
-checks, not full-cohort precision acceptance, quadrature convergence, speedup,
-or the stored-H0 prior's MAE against the final converged Hamiltonian. Convert
-H from Ry to eV before reporting errors.
+数值比较覆盖 H0、S 及各物理分项、block 键、形状、dtype 和晶胞规范；报告实际后端、误差和计时范围。H0 以 Ry 存储时先转换为 eV 再报告能量误差。参考网格对齐是特定参考契约，不能据此推断全数据集精度、积分收敛、训练先验误差或端到端模型加速。

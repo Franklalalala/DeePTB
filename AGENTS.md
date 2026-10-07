@@ -1,16 +1,11 @@
-# Maintained development branch
+# 维护规范
 
-Use `0924-stable` as the single integration and maintenance branch for new DeePTB
-features and fixes. Historical branches and immutable deployed releases are
-compatibility references; do not continue separate feature release lines unless
-the user explicitly requests one. Do not rewrite or delete historical branches
-as part of ordinary integration work.
+`1006-stable` 是功能集成、修复和日常维护的统一分支。历史分支及不可变部署版本用于兼容性参考；常规维护不得重写或删除这些历史。
 
-Keep one authoritative implementation per module. NACF lives in `dptb/nacf`;
-the standalone H0 reconstruction subsystem lives in `h0`. Do not add review
-overlays, copied source trees, production logs, checkpoints, or generated tables.
+每个模块保留一份权威实现。UniTB 位于 `dptb/nn/embedding/unitb.py`，NACF 位于 `dptb/nacf`，独立 H0 重建子系统位于 `h0`。SO2 CUDA 加速由外部 SO2CUDA 提供；LoopSCF 在独立仓库维护，依赖本分支；SO2CUDA 0.2.0 的稳定入口为 `so2_cuda_ops.deeptb`。跨仓库改动应同时更新接口与版本说明。不要加入源码副本、审查覆盖层、生产日志、检查点、生成表或一次性运行脚本。
 
-Use the focused behavioral testing policy in `TESTING.md`. Validate changed
-interfaces and numerical behavior, and reuse relevant unchanged GPU evidence.
-Keep scientific scope, prior/target semantics and checkpoint compatibility
-explicit. Do not change or restart live production runs merely to update code.
+保留标准 embedding、通用模型构建、LMDB 与侧车、先验、训练、评测和后处理接口。修改模型结构或先验布局时，应明确输入、目标、单位、数学语义及检查点兼容策略；不得通过手工修改用户检查点解决兼容问题。
+
+按 [TESTING.md](TESTING.md) 选择覆盖受影响行为的测试。生产模型重构需要验证既有检查点的推理结果与确定性短训练等价性；无关硬件基准和未修改的研究实验可以复用既有证据。不要因代码维护改变或重启正在运行的生产任务。
+
+用户说明使用中文；代码、注释和提交信息使用英文。文档描述当前可用接口，不保留内部部署路径、运行编号、账号、凭据或审查过程。

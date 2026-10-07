@@ -34,7 +34,7 @@ extensions = [
         'myst_nb',
         'deepmodeling_sphinx',
 ]
-nb_execute_notebooks = "off"  # 不执行notebooks
+nb_execute_notebooks = "off"  # Do not execute notebooks during documentation builds.
 
 myst_enable_extensions = [
     "amsmath",

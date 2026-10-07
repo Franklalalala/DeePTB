@@ -1,40 +1,27 @@
-.. DeePTB documentation master file.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+=================
+DeePTB 文档
+=================
 
-=================================================
-DeePTB Documentation
-=================================================
+DeePTB 提供 Slater–Koster 模型与等变原子轨道算符预测，支持哈密顿量、密度矩阵、重叠矩阵、自旋轨道耦合以及电子结构后处理。
 
-DeePTB is an innovative Python package that uses deep learning to accelerate *ab initio* electronic structure simulations. It offers versatile, accurate, and efficient simulations for a wide range of materials and phenomena. Trained on small systems, DeePTB can predict electronic structures of large systems, handle structural perturbations, and integrate with molecular dynamics for finite temperature simulations, providing comprehensive insights into atomic and electronic behavior.
-
---------------
-Key Features:
---------------
-
-DeePTB contains two main components: 
-
-1. **DeePTB-SK**: deep learning based local environment dependent Slater-Koster TB.
-
-   - Customizable Slater-Koster parameterization with neural network corrections.
-   - Flexible basis and exchange-correlation functional choices.
-   - Handle systems with strong spin-orbit coupling (SOC) effects.
-
-2. **DeePTB-E3**: E3-equivariant neural networks for representing quantum operators.
-
-   - Construct DFT Hamiltonians/density and overlap matrices under full LCAO basis.
-   - Utilize (**S**\ trictly) **L**\ ocalized **E**\ quivariant **M**\ essage-passing (**(S)LEM**) model for high data-efficiency and accuracy.
-   - Employs SO(2) convolution for efficient handling of higher-order orbitals in LCAO basis.
-
-
-For more details, see our papers:
-
-* `DeePTB-SK: Nat Commun 15, 6772 (2024) <https://doi.org/10.1038/s41467-024-51006-4>`_
-* `DeePTB-E3: arXiv:2407.06053 <https://arxiv.org/pdf/2407.06053>`_
+``1006-stable`` 是本仓库的维护分支。UniTB 支持 dense 与 X1 配置；上游无先验 ``lem`` / ``slem`` 与带先验基线独立维护。SO2CUDA 是可选加速组件，LoopSCF 在独立仓库中使用 DeePTB 的通用接口。
 
 .. toctree::
    :maxdepth: 2
-   :caption: Quick Start
+   :caption: 维护版本与数据契约
+
+   1006-stable
+   advanced/prior_inputs
+   nacf_candidate_prior
+   nacf_compact_packing
+   nacf_native_assembly
+   nacf_edge_vna
+   nacf_prepared_store
+   advanced/dynamic_batch_oom_fallback
+
+.. toctree::
+   :maxdepth: 2
+   :caption: 快速开始
    
 
    quick_start/easy_install
@@ -45,14 +32,14 @@ For more details, see our papers:
 
 .. toctree::
    :maxdepth: 2
-   :caption: INPUT TAG
+   :caption: 输入字段
    
    input_params/index
 
 
 .. toctree::
    :maxdepth: 2
-   :caption: Advanced
+   :caption: 进阶用法
    
    advanced/sktb/index
    advanced/e3tb/index
@@ -61,19 +48,19 @@ For more details, see our papers:
 
 .. toctree::
    :maxdepth: 2
-   :caption: Citing DeePTB
+   :caption: 引用
 
    CITATIONS
 
 .. toctree::
    :maxdepth: 2
-   :caption: Developing Team
+   :caption: 开发团队
 
    DevelopingTeam
 
 .. toctree::
    :maxdepth: 2
-   :caption: Community
+   :caption: 社区
 
    community/contribution_guide
    CONTRIBUTING

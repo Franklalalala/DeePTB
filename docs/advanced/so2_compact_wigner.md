@@ -1,70 +1,16 @@
-# SO2 Compact Wigner Apply
+# SO2 Wigner 表示
 
-This note records the validation data for the SO2 Wigner apply memory
-optimization introduced by `so2_wigner_apply_mode`.
+`so2_wigner_apply_mode` 控制旋转矩阵的存储方式，不改变 Wigner 旋转的数学定义。
 
-## Behavior
+- `compact_blocks`：按角动量阶保存独立的小矩阵，形状依次为 `[E,1,1]`、`[E,3,3]`、…、`[E,2*lmax+1,2*lmax+1]`，是默认选项。
+- `full_dense`：保存完整分块对角矩阵，形状为 `[E,(lmax+1)^2,(lmax+1)^2]`，供兼容与参考计算使用。
 
-`SO2_Linear` previously materialized the full block-diagonal Wigner matrix as
-`[num_edges, D, D]`, where `D = (lmax + 1)^2`. For `lmax=6`, this is
-`[num_edges, 49, 49]`.
-
-The default mode is now:
+这里 `E` 是边数。配置写在 `model_options.embedding`：
 
 ```json
-"so2_wigner_apply_mode": "compact_blocks"
+{
+  "so2_wigner_apply_mode": "compact_blocks"
+}
 ```
 
-`compact_blocks` stores only the per-degree Wigner blocks:
-
-```text
-[E,1,1], [E,3,3], [E,5,5], ..., [E,13,13]
-```
-
-The previous dense path remains available with:
-
-```json
-"so2_wigner_apply_mode": "full_dense"
-```
-
-## Production-like Smoke Data
-
-Environment summary:
-
-- GPU: 2x NVIDIA L40S
-- Model: `lem_moe_v3_h0`
-- DDP: enabled on 2 GPUs
-- Dataset scale: production-like internal smoke set
-- CUDA memory monitor: enabled
-
-### Batch Size 32
-
-| mode | result | train wall time | peak allocated | peak reserved |
-| --- | --- | ---: | ---: | ---: |
-| `full_dense` | pass | 54.675 s | 28716.0 MB | 41348.0 MB |
-| `compact_blocks` | pass | 55.642 s | 28430.6 MB | 39396.0 MB |
-| default config, field omitted | pass | 55.829 s | 28430.6 MB | 39396.0 MB |
-
-Delta for explicit `compact_blocks` at batch size 32:
-
-- `peak allocated`: -285.4 MB
-- `peak reserved`: -1952.0 MB
-- training wall time: +0.967 s for this one-epoch smoke
-
-### Batch Size 48
-
-| mode | result | train wall time | peak allocated | peak reserved |
-| --- | --- | ---: | ---: | ---: |
-| `compact_blocks` | pass | 56.482 s | 41094.9 MB | 44628.0 MB |
-| `full_dense` | OOM during backward | n/a | 41525.0 MB before OOM | 44032.0 MB before OOM |
-
-The `full_dense` run failed during backward while trying to allocate another
-5.26 GiB. At failure time, PyTorch reported 24.26 GiB allocated and 14.85 GiB
-reserved but unallocated.
-
-## Interpretation
-
-`compact_blocks` does not dramatically reduce global `peak allocated` at batch
-size 32 because the whole training step has other large live activations.
-However, it reduces allocator pressure enough that batch size 48 completes in
-the production-like smoke where `full_dense` fails.
+CUDA 加速由可选 SO2CUDA 提供。安装与测试入口见[安装说明](../quick_start/easy_install.md)和[测试说明](../../TESTING.md)。显存与速度取决于模型、图规模和设备，应以实际配置的测量为准。

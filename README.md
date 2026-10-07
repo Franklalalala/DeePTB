@@ -1,142 +1,73 @@
 <p align="center">
-    <img src="docs/deeptb-logo.png" alt="DeePTB Logo" style="width: 80vw; height: auto;" />
-</p>
-<!-- <h1 align="center">DeePTB</h1> -->
-
-<!--# DeePTB -->
-<p align="center">
- <a href="https://github.com/deepmodeling"><img src="https://img.shields.io/badge/DeepModeling-Incubating_Project-blue" alt="DeepModeling"></a>
- <a href="https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml"><img src="https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml/badge.svg" alt="Build"></a>
- <a href="https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml"><img src="https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml/badge.svg" alt="Test"></a>
- <a href="https://pypi.org/project/dptb/"><img src="https://img.shields.io/pypi/v/dptb.svg" alt="PyPI version"></a>
- <a href="https://github.com/deepmodeling/DeePTB/blob/main/LICENSE"><img src="https://img.shields.io/github/license/deepmodeling/DeePTB.svg" alt="License"></a>
+  <img src="docs/deeptb-logo.png" alt="DeePTB Logo" width="640" />
 </p>
 
-<!--
-[![DeepModeling](https://img.shields.io/badge/DeepModeling-Incubating_Project-blue)](https://github.com/deepmodeling)
-[![Build](https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml/badge.svg)](https://github.com/deepmodeling/DeePTB/actions/workflows/image.yml)
-[![Test](https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml/badge.svg)](https://github.com/deepmodeling/DeePTB/actions/workflows/unit_test.yml)
--->
+# DeePTB
 
-## Maintained branch: `0924-stable`
+DeePTB 用深度学习构建紧束缚模型及原子轨道基下的哈密顿量、密度矩阵和重叠矩阵，支持材料电子结构预测、能带分析和自旋轨道耦合。
 
-Recent H0/NACF, two-stage Edge-MoE, Switch top-1 CUDA, S2 TE-flow and the SO2CUDA routes of
-activation-space Edge-MoE are consolidated in `0924-stable`. See [0924-stable](docs/0924-stable.md),
-which continues [0921-stable](docs/0921-stable.md) and [0917-stable](docs/0917-stable.md),
-and the [H0 setup](h0/README.md). New fixes and features are maintained on this branch.
+本仓库的维护分支是 **`1006-stable`**。版本结构和接口约定见 [维护版本说明](docs/1006-stable.md)。
 
-## 🚀 About DeePTB
-DeePTB is an innovative Python package that uses deep learning to accelerate *ab initio* electronic structure simulations. It offers versatile, accurate, and efficient simulations for a wide range of materials and phenomena. Trained on small systems, DeePTB can predict electronic structures of large systems, handle structural perturbations, and integrate with molecular dynamics for finite temperature simulations, providing comprehensive insights into atomic and electronic behavior.
+## 模型与接口
 
-- **Key Features**
-DeePTB contains two main components: 
-  1. **DeePTB-SK**: deep learning based local environment dependent Slater-Koster TB.
-      - Customizable Slater-Koster parameterization with neural network corrections for . 
-      - Flexible basis and exchange-correlation functional choices.
-      - Handle systems with strong spin-orbit coupling (SOC) effects.
+| 模块 | 用途 |
+| --- | --- |
+| DeePTB-SK | Slater–Koster 参数化及局域环境修正 |
+| DeePTB-E3 | 等变原子轨道算符预测；保留上游标准 embedding 接口 |
+| UniTB | `unitb` embedding；包含 UniTB-dense 与 UniTB-X1 配置，X1 使用 PDQ-MoE，兼容既有生产检查点 |
+| `lem`、`slem` | 上游不接受先验输入的基线 |
+| `lem_prior`、`slem_prior` | 接受先验输入的基线 |
+| `h0`、`dptb.nacf` | 物理 H0 与 NACF 先验构建、缓存和推理 |
 
-  2. **DeePTB-E3**: E3-equivariant neural networks for representing quantum operators.
-      - Construct DFT Hamiltonians/density and overlap matrices under full LCAO basis.
-      - Utilize (**S**trictly) **L**ocalized **E**quivariant **M**essage-passing (**(S)LEM**) model for high data-efficiency and accuracy.
-      - Employs SO(2) convolution for efficient handling of higher-order orbitals in LCAO basis.
+UniTB-X1 使用 **H₀-routed shared-basis mixture of experts (PDQ-MoE)**，即 H₀ 先验路由的共享基底专家混合。新配置用 `{"method":"unitb"}` 选择 X1 默认 embedding，增加 `"num_experts":1` 选择 dense；电荷平衡头与训练先验加噪单独配置。详见 [UniTB](docs/unitb.md) 与 [配置示例](examples/unitb/README.md)。
 
+`lem` / `slem` 与固定上游版本的实现保持原样，不接受先验；需要先验时使用 `lem_prior` / `slem_prior`。先验来源、缺失行为和旧检查点兼容约定见 [基线说明](docs/embedding_baselines.md)。
 
-For more details, see our papers:
-- [DeePTB-SK: Nat Commun 15, 6772 (2024)](https://doi.org/10.1038/s41467-024-51006-4)
-- [DeePTB-E3: ICLR 2025 Spotlight](https://openreview.net/forum?id=kpq3IIjUD3)
+训练与评测保留 LMDB、重叠矩阵及先验侧车、`multi_train`、HybridMuon、谱裁剪和能带后处理。模型、数据及优化设置由输入配置明确指定。
 
+[SO2CUDA](https://github.com/Franklalalala/SO2CUDA) 提供可选 CUDA 加速，DeePTB 保留接口和 PyTorch 参考实现；不安装也可运行，安装后由后端自动判断 CUDA 加速资格。该版本配合 SO2CUDA 0.2.0，路线与开关见 [后端说明](docs/so2_backend.md)。[LoopSCF](https://github.com/Franklalalala/loopscf) 在独立仓库维护，通过 DeePTB 的通用模型及数据接口使用本版本。
 
-## 📚 Documentation
+## 安装
 
-- **Online documentation**
-  
-    For a comprehensive guide and usage tutorials, visit [Documentation website](https://deeptb.readthedocs.io/en/latest/).
+使用独立环境，Python 版本范围见 [pyproject.toml](pyproject.toml)。先安装适合当前设备的 [PyTorch](https://pytorch.org/get-started/locally)，再安装与它匹配的 `torch-scatter`：
 
-- **Contributing**
-
-    We welcome contributions to DeePTB. Please refer to our [contributing guidelines](https://deeptb.readthedocs.io/en/latest/community/contribution_guide.html) for details.
-
-
-
-## 🛠️ Installation
-
-Installing **DeePTB** is straightforward. We recommend using a virtual environment for dependency management.
-
-- **Requirements**
-  - Git
-  - Python 3.9 to 3.12.
-  - Torch 2.0.0 to 2.5.1 ([PyTorch Installation](https://pytorch.org/get-started/locally)).
-  - ifermi (optional, for 3D fermi-surface plotting).
-  - TBPLaS (optional).
-
-- **From Source** 
-  
-    Highly recommended to install DeePTB from source to get the latest features and bug fixes.
-  1. **Setup Python environment**:
-        Using conda (recommended, python >=3.9, <=3.12 ), e.g.,
-        ```bash
-        conda create -n dptb_venv python=3.10
-        conda activate dptb_venv
-        ```
-        or using venv (make sure python >=3.9,<=3.12)
-    
-        ```bash
-        python -m venv dptb_venv
-        source dptb_venv/bin/activate
-        ```
-
-  2. **Clone DeePTB and  Navigate to the root directory**:
-        ```bash
-        git clone https://github.com/deepmodeling/DeePTB.git
-        cd DeePTB
-        ```
-
-  3. **Install `torch`**:
-        ```bash
-        pip install "torch>=2.0.0,<=2.5.0"
-        ```
-  4. **Install `torch-scatter`** (two ways):
-        - **Recommended**: Install torch and torch-scatter using the following commands:
-            ```bash
-            python docs/auto_install_torch_scatter.py
-            ```
-        - **Manual**: Install torch and torch-scatter manually:
-            ```bash
-            pip install torch-scatter -f https://data.pyg.org/whl/torch-${version}+${CUDA}.html
-            ```
-            where `${version}` is the version of torch, e.g., 2.5.0, and `${CUDA}` is the CUDA version, e.g., cpu, cu118, cu121, cu124. See [torch_scatter doc](https://github.com/rusty1s/pytorch_scatter) for more details.   
-
-  5. **Install DeePTB**:
-        ```bash
-        pip install .
-        ```
-
-- **Easy Installation**
-  
-  note: not fully tested, please use the source installation for a stable version.
-  1. Using PyPi
-  2. Ensure you have Python 3.9 to 3.12 and Torch installed.
-  3. Install DeePTB with pip:
-        ```bash
-        pip install dptb
-        ```
-
-## Test code 
-
-To ensure the code is correctly installed, please run the unit tests first:
 ```bash
-pytest ./dptb/tests/
+git clone --branch 1006-stable https://github.com/Franklalalala/DeePTB.git
+cd DeePTB
+python docs/auto_install_torch_scatter.py
+python -m pip install -e .
 ```
-Be careful if not all tests pass!
 
-## 🤝 How to Cite
+需要 CUDA 加速时，通过可选依赖安装 SO2CUDA，并使用与 PyTorch 匹配的 CUDA 工具链：
 
-The following references are required to be cited when using DeePTB. Specifically:
+```bash
+python -m pip install -e '.[so2]'
+```
 
-- **For DeePTB-SK:**
+NACF 的原生先验构建是独立组件，其编译和使用方法见 [NACF 几何推理](examples/nacf_gpu/README.md)。
 
-    Q. Gu, Z. Zhouyin, S. K. Pandey, P. Zhang, L. Zhang, and W. E, Deep Learning Tight-Binding Approach for Large-Scale Electronic Simulations at Finite Temperatures with Ab Initio Accuracy, Nat Commun 15, 6772 (2024).
-  
-- **For DeePTB-E3:**
-  
-    Z. Zhouyin, Z. Gan, S. K. Pandey, L. Zhang, and Q. Gu, Learning Local Equivariant Representations for Quantum Operators, In The 13th International Conference on Learning Representations (ICLR) 2025. 
+## 使用与验证
+
+通过 `dptb` 命令训练、评测和运行后处理；各子命令的参数可用 `dptb --help` 查看。Python 接口见 [基本 API](docs/quick_start/basic_api.md)，输入字段见 [配置说明](docs/quick_start/input.md)。
+
+```bash
+python tools/test.py
+python tools/test.py dptb/tests/test_record_codec.py
+```
+
+测试范围、可选依赖和完整测试方法见 [TESTING.md](TESTING.md)。上述短测试用于安装检查；它不替代模型检查点与数值等价性验证。
+
+## English
+
+`1006-stable` provides UniTB dense and X1 embeddings, upstream LEM/SLEM, and separate prior-aware baselines. X1 uses an H₀-routed shared-basis mixture of experts (PDQ-MoE). Legacy checkpoints retain their original parameter names and effective configurations. SO2CUDA 0.2.0 is optional: eligible CUDA inputs use its kernels automatically; the PyTorch reference path remains available. LoopSCF is maintained in its own repository and depends on this DeePTB branch.
+
+## 文档与引用
+
+在线教程见 [DeePTB 文档](https://deeptb.readthedocs.io/en/latest/)。本维护分支的 UniTB、先验和组件拆分约定以仓库内文档为准。贡献规则见 [AGENTS.md](AGENTS.md) 和 [贡献指南](docs/CONTRIBUTING.md)。
+
+使用 DeePTB 时请引用对应工作：
+
+- **DeePTB-SK**：Q. Gu et al., *Deep Learning Tight-Binding Approach for Large-Scale Electronic Simulations at Finite Temperatures with Ab Initio Accuracy*, [Nature Communications 15, 6772 (2024)](https://doi.org/10.1038/s41467-024-51006-4)。
+- **DeePTB-E3**：Z. Zhouyin et al., *Learning Local Equivariant Representations for Quantum Operators*, [ICLR 2025](https://openreview.net/forum?id=kpq3IIjUD3)。
+
+完整引用条目见 [CITATIONS.md](docs/CITATIONS.md)。
