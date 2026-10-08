@@ -112,6 +112,7 @@ class Trainer(BaseTrainer):
             batch_size=train_options["batch_size"],
             shuffle=True,
             dynamic_batch=train_options.get("dynamic_batch", None),
+            **self._train_loader_worker_kwargs(train_options),
         )
 
         if self.use_reference:
@@ -915,15 +916,37 @@ class Trainer(BaseTrainer):
         return int(plan.get("skip_batches", 0)), plan.get("rng_state")
 
     @staticmethod
+    def _train_loader_worker_kwargs(train_options):
+        """Worker options for the train loader, read like MultiTrainer reads them.
+
+        Without ``train_num_workers`` the loader keeps its in-process defaults.
+        Workers only decode items in parallel; the batch sampler stays in the
+        main process, so batch order and content are unchanged.
+        """
+        workers = int(train_options.get("train_num_workers", 0) or 0)
+        if workers <= 0:
+            return {}
+        return {
+            "num_workers": workers,
+            "pin_memory": bool(train_options.get("data_pin_memory", torch.cuda.is_available())),
+            "persistent_workers": bool(train_options.get("data_persistent_workers", True)),
+            "prefetch_factor": int(train_options.get("data_prefetch_factor", 2)),
+        }
+
+    @staticmethod
     def _loader_exact_replay_status(loader):
         """Return ``(is_exact, reason)`` for one loader's replay boundary.
 
-        This deliberately covers only deterministic batch *order*. It does not
-        capture worker RNG state or arbitrary random dataset transforms, so any
-        ``num_workers > 0`` loader is conservatively inexact.
+        This deliberately covers only deterministic batch *order*. Worker RNG
+        state and random dataset transforms are not captured, so a
+        ``num_workers > 0`` loader is exact only when its dataset declares
+        ``deterministic_items`` (item decoding uses no randomness).
         """
         if int(getattr(loader, "num_workers", 0) or 0) > 0:
-            return False, "num_workers>0 worker RNG/random transforms are not replayed"
+            dataset = getattr(loader, "dataset", None)
+            dataset = getattr(dataset, "dataset", dataset)
+            if not getattr(dataset, "deterministic_items", False):
+                return False, "num_workers>0 worker RNG/random transforms are not replayed"
         batch_sampler = getattr(loader, "batch_sampler", None)
         if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
             return True, "per-epoch-seeded batch sampler"

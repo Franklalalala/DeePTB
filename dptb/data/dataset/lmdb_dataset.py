@@ -1094,6 +1094,9 @@ def _reconcile_prior_alias(new_value, old_value, *, default, new_name, old_name)
 
 class LMDBDataset(AtomicDataset):
     prefer_loaded_dynamic_batch_cost_parts = True
+    # Item decoding uses no random transforms, so loader workers reproduce the
+    # in-process batch stream and exact resume stays valid with workers.
+    deterministic_items = True
     # Class defaults keep lightweight ``__new__``-based tooling and historical
     # tests backward compatible; normal construction always sets instances.
     # The public surface was renamed to the prior_*/get_prior family so that a
