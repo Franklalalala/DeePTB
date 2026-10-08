@@ -22,6 +22,8 @@ state_dict。启用先验可显式设置 `h0_init_scope: both`；已配置先验
 检查点缺少先验权重时严格报错。UniTB 是独立的生产 embedding，与这两类基线区分；其接口
 说明随 UniTB 模块提供。最小 CPU 示例见 `examples/baselines/README.md`。
 
+四个基线的 SO2 层默认走 SO2CUDA 快路径，与 PyTorch 参考实现数值等价，精度和训练 loss 不变；切回参考实现的开关见 [SO2 后端](so2_backend.md#lem--slem)。
+
 `lem` and `slem` retain the upstream geometry-based implementations and do not
 read prior inputs. With no prior options, or scope `none`, `lem_prior` and
 `slem_prior` create no adapter state and strictly load their original geometry
@@ -41,6 +43,11 @@ new prior checkpoints with missing prior weights fail strict restoration.
 UniTB is the separate production
 embedding, whose interface is documented with that module. The CPU examples in
 `examples/baselines` demonstrate the baseline input and optimization interfaces.
+
+The SO2 layers of all four baselines take the SO2CUDA route by default. It is
+numerically equivalent to the PyTorch reference, with the same accuracy and
+training loss; [SO2 backend](so2_backend.md#lem--slem) lists the switches that
+select the reference.
 
 启用先验新增 `prior_inputs.node_projector.{weight,bias}` 与
 `prior_inputs.edge_projector.{weight,bias}`。e3nn `Linear` 的 weight 为标准正态

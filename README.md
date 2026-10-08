@@ -25,7 +25,7 @@ UniTB 使用 **H₀-routed shared-basis mixture of experts (PDQ-MoE)**，即 H�
 
 训练与评测保留 LMDB、重叠矩阵及先验侧车、`multi_train`、HybridMuon、谱裁剪和能带后处理。模型、数据及优化设置由输入配置明确指定。
 
-[SO2CUDA](https://github.com/Franklalalala/SO2CUDA) 提供可选 CUDA 加速，DeePTB 保留接口和 PyTorch 参考实现；不安装也可运行，安装后由后端自动判断 CUDA 加速资格。该版本配合 SO2CUDA 0.2.0，路线与开关见 [后端说明](docs/so2_backend.md)。[LoopSCF](https://github.com/Franklalalala/loopscf) 在独立仓库维护，通过 DeePTB 的通用模型及数据接口使用本版本。
+[SO2CUDA](https://github.com/Franklalalala/SO2CUDA) 提供可选 CUDA 加速，DeePTB 保留接口和 PyTorch 参考实现；不安装也可运行，安装后由后端自动判断 CUDA 加速资格。LEM / SLEM 及其 `_prior` 基线默认走 SO2CUDA 快路径，与 PyTorch 参考实现数值等价，精度、训练 loss 和旋转等变性不变；设 `DPTB_SO2_M_LINEAR_MODE=standard` 或 `SO2_CUDA_BACKEND=off` 即切回参考实现。该版本配合 SO2CUDA 0.2.0，路线与开关见 [后端说明](docs/so2_backend.md)。[LoopSCF](https://github.com/Franklalalala/loopscf) 在独立仓库维护，通过 DeePTB 的通用模型及数据接口使用本版本。
 
 ## 安装
 
@@ -59,7 +59,7 @@ python tools/test.py dptb/tests/test_record_codec.py
 
 ## English
 
-`1006-stable` provides the UniTB embedding, upstream LEM/SLEM, and separate prior-aware baselines. UniTB uses an H₀-routed shared-basis mixture of experts (PDQ-MoE); its single-expert configuration is UniTB-dense. Legacy checkpoints retain their original parameter names and effective configurations. SO2CUDA 0.2.0 is optional: eligible CUDA inputs use its kernels automatically; the PyTorch reference path remains available. LoopSCF is maintained in its own repository and depends on this DeePTB branch.
+`1006-stable` provides the UniTB embedding, upstream LEM/SLEM, and separate prior-aware baselines. UniTB uses an H₀-routed shared-basis mixture of experts (PDQ-MoE); its single-expert configuration is UniTB-dense. Legacy checkpoints retain their original parameter names and effective configurations. SO2CUDA 0.2.0 is optional: eligible CUDA inputs use its kernels automatically; the PyTorch reference path remains available. LEM/SLEM and their prior variants take the SO2CUDA route by default; it is numerically equivalent to the PyTorch reference, with the same accuracy, training loss and rotation equivariance. Set `DPTB_SO2_M_LINEAR_MODE=standard` or `SO2_CUDA_BACKEND=off` to use the reference. LoopSCF is maintained in its own repository and depends on this DeePTB branch.
 
 ## 文档与引用
 

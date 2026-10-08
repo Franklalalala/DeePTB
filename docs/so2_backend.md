@@ -28,6 +28,29 @@ UniTB-dense 通过 `so2_backend.dense_forward` 调用 SO2CUDA 的 `dense_pairs`�
 
 SO2CUDA 的构建目录和精度变量由该包维护，例如 `SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR`、`SO2_CUDA_FAST_TF32`。严格 FP32 使用 `SO2_CUDA_FAST_TF32=0`。
 
+## LEM / SLEM
+
+`lem`、`slem`、`lem_prior`、`slem_prior` 的 SO2 层都是 `tensor_product.SO2_Linear`。安装 SO2CUDA 后，它们默认走 true-dense 快路径（`so2_m_linear_mode=indexed_sandwich_cuda_multi`）。快路径只替换 m>0 的成对运算，参数、Wigner 旋转和 m=0 计算与 PyTorch 参考实现相同，精度和训练 loss 不变。
+
+切回参考实现任选其一：
+
+| 设置 | 范围 |
+|---|---|
+| `DPTB_SO2_M_LINEAR_MODE=standard` | 构建模型时设置；true-dense SO2 层使用 PyTorch 参考实现 |
+| `SO2_CUDA_BACKEND=off` | 所有 SO2CUDA 调用使用参考实现 |
+
+两种设置只改变计算路线，不改变参数名或检查点，旧检查点可直接加载。
+
+H200、严格 FP32、真实训练批次上的核对结果：
+
+| 项目 | LEM | SLEM |
+|---|---|---|
+| 输出相对 L2 差（快路径对参考） | 5e-7 | 8e-7 |
+| 参考实现自身两次运行的差 | 4e-7 | 5e-7 |
+| 两步优化后的 loss | 相同 | 相同 |
+| 逐层旋转等变误差 | 与参考相同（1e-6 量级） | 与参考相同（1e-6 量级） |
+| 单步前向 + 反向加速 | 1.34× | 1.41× |
+
 ## 张量积调用
 
 上游 LEM / SLEM 使用固定的张量返回值：
