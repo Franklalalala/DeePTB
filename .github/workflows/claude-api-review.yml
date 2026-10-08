@@ -85,6 +85,11 @@ jobs:
           if results:
               result = results[-1]
               receipt['is_error'] = bool(result.get('is_error'))
+              if result.get('is_error'):
+                  message = str(result.get('result', result.get('errors', 'No error detail')))
+                  message = re.sub(r'sk-ant-[A-Za-z0-9_-]+', '[REDACTED]', message)
+                  message = re.sub(r'(?:ghp_|github_pat_)[A-Za-z0-9_]+', '[REDACTED]', message)
+                  receipt['failure_message'] = message[:1200]
               cost = result.get('total_cost_usd')
               if isinstance(cost, (int, float)):
                   receipt['cli_estimated_cost_usd'] = cost
