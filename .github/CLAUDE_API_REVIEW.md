@@ -16,10 +16,12 @@ effort 为 `max`，在 GitHub Actions 中运行 Claude Code CLI 的 `--bare -p` 
 
 每次审查设置 CLI 预算 `$2`、最多 30 轮及 20 分钟超时。预算由 CLI 在请求之间检查，
 不是 API 账户的硬消费上限；最后一个请求可能使实际费用略超预算。工作流的运行摘要
-记录 CLI 估算费用及返回的模型，最终费用以 Anthropic Console 的 API 账单为准。
+记录 CLI 估算费用及返回的模型；超时时标记费用未知。最终费用以 Anthropic Console
+的 API 账单为准。
 
-工作流固定 CLI 版本，关闭仓库钩子、插件和 MCP 的自动发现，只开放读取及 Git 查看
-工具。API 推理步骤不提供 GitHub 写入 token；单独的发布步骤核对 PR 的提交未变化后，
+工作流固定 CLI 版本，关闭仓库钩子、插件和 MCP 的自动发现，只开放文件读取和搜索
+工具，不向模型开放 Bash。补丁和 head 文件副本由工作流预先生成。
+API 推理步骤不提供 GitHub 写入 token；单独的发布步骤核对 PR 的提交未变化后，
 再由 GitHub Actions 机器人写入 PR 评论。它只做静态代码审查，不替代测试、
 科学验证或人工合并决策，不具有推送代码的权限。测试应在不携带 API 密钥的独立任务
 中运行。
