@@ -1,10 +1,14 @@
 """Single-GPU Trainer loader workers keep the in-process batch stream."""
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+import dptb.nnops.trainer as trainer_mod
 from dptb.data.dataloader import DataLoader
 from dptb.nnops.trainer import Trainer
+from dptb.plugins.saver import Saver
+from dptb.tests._trainer_probes import ProbeModel, ProbeTrainer
 from dptb.utils.torch_geometric import Data
 
 
@@ -68,3 +72,104 @@ def test_workers_stay_inexact_without_deterministic_items():
                              batch_sampler=SimpleNamespace(set_epoch=lambda epoch: None))
     exact, reason = Trainer._loader_exact_replay_status(loader)
     assert not exact and "num_workers" in reason
+
+
+class DeterministicIntegers:
+    deterministic_items = True
+
+    def __len__(self):
+        return 5
+
+    def __getitem__(self, index):
+        return range(5)[index]
+
+
+class WorkerRestartTrainer(ProbeTrainer):
+    """Real restart/epoch/Saver flow with stochastic SGD and real workers."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        options = self._train_loader_worker_kwargs(self.train_options)
+        self.train_loader = torch.utils.data.DataLoader(
+            self.train_datasets, batch_size=1,
+            shuffle=self.train_options.get("_test_shuffle", False), **options,
+        )
+        if self.use_reference:
+            self.reference_loader = torch.utils.data.DataLoader(
+                kwargs["reference_datasets"], batch_size=1, **options,
+            )
+        self.optimizer.param_groups[0]["momentum"] = 0.9
+        self.loss_trace = []
+
+    def iteration(self, ibatch, ref_batch=None):
+        target = ibatch.to(torch.float32) + torch.rand(1)
+        if ref_batch is not None:
+            target = target + ref_batch.to(torch.float32)
+        self.optimizer.zero_grad()
+        loss = (self.model.weight - target).square().sum()
+        loss.backward()
+        self.loss_trace.append(float(loss.detach()))
+        return super().iteration(ibatch, ref_batch)
+
+
+@pytest.mark.parametrize("workers,persistent", [(0, False), (2, False), (2, True)])
+@pytest.mark.parametrize("with_reference", [False, True])
+@pytest.mark.parametrize("checkpoint_kind", ["epoch", "iteration"])
+def test_worker_checkpoint_replays_stochastic_training(
+    tmp_path, monkeypatch, workers, persistent, with_reference, checkpoint_kind,
+):
+    _check_worker_restart(
+        tmp_path, monkeypatch, workers, persistent, with_reference, checkpoint_kind,
+    )
+
+
+def test_persistent_worker_epoch_restart_preserves_shuffled_batches(tmp_path, monkeypatch):
+    _check_worker_restart(tmp_path, monkeypatch, 2, True, True, "epoch", shuffle=True)
+
+
+def _check_worker_restart(
+    tmp_path, monkeypatch, workers, persistent, with_reference, checkpoint_kind,
+    shuffle=False,
+):
+    dataset = DeterministicIntegers()
+    options = {
+        "max_ckpt": 50, "update_lr_per_iter": False,
+        "train_num_workers": workers, "data_pin_memory": False,
+        "data_persistent_workers": persistent, "_test_shuffle": shuffle,
+    }
+    common = {"device": "cpu", "dtype": "float32"}
+    reference = dataset if with_reference else None
+    torch.manual_seed(20261008)
+    original = WorkerRestartTrainer(
+        model=ProbeModel(), train_datasets=dataset, reference_datasets=reference,
+        train_options=options, common_options=common,
+    )
+    original.register_plugin(
+        Saver(interval=[(1, checkpoint_kind)]), checkpoint_path=str(tmp_path),
+    )
+    original.run(epochs=3)
+    checkpoint = tmp_path / ("probe.ep1.pth" if checkpoint_kind == "epoch" else "probe.iter3.pth")
+    committed = len(dataset) if checkpoint_kind == "epoch" else 3
+
+    def load_probe(path, *args, **kwargs):
+        model = ProbeModel()
+        model.load_state_dict(torch.load(path, weights_only=False)["model_state_dict"], strict=True)
+        return model
+
+    monkeypatch.setattr(trainer_mod, "build_model", load_probe)
+    torch.manual_seed(999)  # process startup must not determine resumed training
+    resumed = WorkerRestartTrainer.restart(
+        str(checkpoint), train_datasets=dataset, reference_datasets=reference,
+        train_options=options, common_options=common,
+    )
+    resumed.run(epochs=3)
+    assert resumed.processed == original.processed[committed:]
+    assert resumed.ref_seen == original.ref_seen[committed:]
+    assert resumed.rng_trace == original.rng_trace[committed:]
+    assert resumed.loss_trace == original.loss_trace[committed:]
+    assert torch.equal(resumed.model.weight, original.model.weight)
+    assert torch.equal(
+        resumed.optimizer.state[resumed.model.weight]["momentum_buffer"],
+        original.optimizer.state[original.model.weight]["momentum_buffer"],
+    )
+    assert resumed.lr_scheduler.state_dict() == original.lr_scheduler.state_dict()

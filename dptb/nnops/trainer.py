@@ -786,6 +786,7 @@ class Trainer(BaseTrainer):
             trainer.ep = int(resume.epoch) + 1
             if own_rng is not None:
                 restore_rng_state(own_rng)
+                trainer._prepare_epoch_restart_worker_rng()
             if resume.epoch_scheduler_step_pending and not trainer.update_lr_per_iter:
                 try:
                     trainer._lr_step_on_epoch_end()
@@ -794,6 +795,28 @@ class Trainer(BaseTrainer):
                         "Failed to replay epoch-end LR step on restart: %s", exc
                     )
         return trainer
+
+    def _prepare_epoch_restart_worker_rng(self):
+        """Keep replacement persistent workers off the restored training RNG.
+
+        An uninterrupted loader reuses its workers after the first epoch. A
+        restarted loader instead draws a new worker base seed when its first
+        iterator is created. Give that extra draw a private copy of the CPU
+        RNG, leaving the sampler and model on the checkpoint's original stream.
+        Assigning the loader generator after construction deliberately leaves
+        a RandomSampler's generator unchanged. Non-persistent loaders still
+        consume their usual base-seed draw on every epoch in both paths.
+
+        This does not restore random per-item transforms in worker processes.
+        """
+        loaders = [self.train_loader]
+        if self.use_reference:
+            loaders.append(self.reference_loader)
+        for loader in loaders:
+            if (getattr(loader, "num_workers", 0) > 0
+                    and getattr(loader, "persistent_workers", False)
+                    and getattr(loader, "generator", None) is None):
+                loader.generator = torch.Generator().set_state(torch.get_rng_state())
 
     def epoch(self) -> None:
         # Reset the per-epoch committed-batch cursor; consume any one-shot
