@@ -592,3 +592,38 @@ def test_reconstruct_full_h_rejects_shape_mismatch():
     data[AtomicDataDict.EDGE_H0_KEY] = data[AtomicDataDict.EDGE_H0_KEY][:, :-1]
     with pytest.raises(ValueError, match="shape"):
         TargetDecoder().reconstruct_full_h(SimpleNamespace(target_spec=build_target_spec("fullh")), data)
+
+
+def test_e3statistics_builds_its_transformer_from_the_model_mapper(monkeypatch):
+    """The statistics transformer must see the model's target layout (e.g. SOC uu_real 729 slots)."""
+    import dptb.data.dataset.lmdb_dataset as lmdb_module
+
+    captured = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_e3hamiltonian(**kwargs):
+        captured.update(kwargs)
+        raise Stop
+
+    monkeypatch.setattr(lmdb_module, "E3Hamiltonian", fake_e3hamiltonian)
+    ds = LMDBDataset.__new__(LMDBDataset)
+    ds.get_Hamiltonian, ds.get_DM, ds.transform = True, False, object()
+    idp = SimpleNamespace(has_soc=True)
+    model = SimpleNamespace(node_prediction_h=torch.nn.Identity(), embedding=SimpleNamespace(idp=idp))
+    with pytest.raises(Stop):
+        LMDBDataset.E3statistics(ds, model=model)
+    assert captured["idp"] is idp and "basis" not in captured
+    assert captured["decompose"] is True and captured["soc"] is True
+
+
+def test_uureal_mapper_keeps_its_rme_width_in_the_statistics_transformer():
+    from dptb.nn.hamiltonian import E3Hamiltonian
+
+    mapper = OrbitalMapper({"Si": "1s1p1d"}, method="e3tb", has_soc=True, nextham_uureal_mask=True)
+    e3h = E3Hamiltonian(idp=mapper, decompose=True, soc=True)
+    assert e3h.idp is mapper
+    assert e3h.idp.reduced_matrix_element == mapper.reduced_matrix_element
+    legacy = E3Hamiltonian(basis=mapper.basis, decompose=True, soc=True)
+    assert legacy.idp.reduced_matrix_element != mapper.reduced_matrix_element

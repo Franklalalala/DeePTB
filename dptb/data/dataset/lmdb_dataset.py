@@ -1865,7 +1865,9 @@ class LMDBDataset(AtomicDataset):
         idp = model.embedding.idp
         has_soc = model.embedding.idp.has_soc
 
-        e3h = E3Hamiltonian(basis=idp.basis, decompose=True, soc=has_soc)
+        # Reuse the model mapper: it carries the SOC target layout (e.g. nextham_uureal_mask)
+        # that the stored RME features already use.
+        e3h = E3Hamiltonian(idp=idp, decompose=True, soc=has_soc)
         idp.get_irreps()
 
         # [FIX] Correctly count n_scalar for both SOC (0e+0o) and non-SOC (0e) cases.
