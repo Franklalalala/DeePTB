@@ -35,6 +35,9 @@ NONSOC_P23_RESIDUAL_RME_SAMPLE_SCHEMA = (
 RAW_HAMILTONIAN_SAMPLE_SCHEMA = "deeptb.raw_hamiltonian_training_sample/v1"
 ABSOLUTE_FULL_H_SEMANTICS = "absolute_full_h"
 H0_RESIDUAL_SEMANTICS = "h0_residual"
+# Full H rebuilt at load time from a stored H-H0 residual plus the stored H0 of
+# the same record; the dataset itself is not rewritten.
+H0_RECONSTRUCTED_FULL_H_SEMANTICS = "full_h_from_h0_residual_plus_h0"
 NACF_RESIDUAL_RME_SCHEMA = "deeptb.nonsoc_na_cf_residual_rme_training_sample/v1"
 H0_RESIDUAL_RME_SCHEMA = "deeptb.nonsoc_h0_residual_rme_training_sample/v1"
 NAMED_SLOTS_RME_SCHEMA = "deeptb.named_slots_rme_training_sample/v1"
@@ -320,6 +323,9 @@ class TargetSpec:
     ``named_*`` keys are preferred when present (one-record dual residual).
     Otherwise a view schema may keep the target in ``node_features`` /
     ``edge_features`` — that is the old two-directory layout.
+
+    ``add_h0_prior`` turns the selected H-H0 residual into full H by adding the
+    record's precomputed ``node_h0`` / ``edge_h0`` after decoding.
     """
 
     kind: str
@@ -328,6 +334,7 @@ class TargetSpec:
     named_edge_key: str
     view_schemas: tuple[str, ...]
     allowed_sample_schemas: tuple[str, ...]
+    add_h0_prior: bool = False
 
 
 TARGET_FIELD_SPECS = {
@@ -348,6 +355,25 @@ TARGET_FIELD_SPECS = {
             NAMED_SLOTS_RME_SCHEMA,
             SOC_NAMED_SLOTS_RME_SCHEMA,
         ),
+    ),
+    "fullh": TargetSpec(
+        kind="fullh",
+        semantics=H0_RECONSTRUCTED_FULL_H_SEMANTICS,
+        named_node_key="node_delta_h0",
+        named_edge_key="edge_delta_h0",
+        view_schemas=(
+            H0_RESIDUAL_RME_SCHEMA,
+            SOC_H0_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+        ),
+        allowed_sample_schemas=(
+            H0_RESIDUAL_RME_SCHEMA,
+            SOC_H0_RESIDUAL_RME_SCHEMA,
+            NAMED_SLOTS_RME_SCHEMA,
+            SOC_NAMED_SLOTS_RME_SCHEMA,
+        ),
+        add_h0_prior=True,
     ),
     "nacfres": TargetSpec(
         kind="nacfres",
@@ -447,9 +473,21 @@ def apply_target_slot(record: dict, target_kind: Any) -> tuple[str, str]:
     """Point ``node_features``/``edge_features`` at the selected residual.
 
     The rest of the training stack still reads those two keys.  Named-slot
-    records keep the unused residual under its own name.
+    records keep the unused residual under its own name.  A target with
+    ``add_h0_prior`` writes the residual plus the record's ``node_h0`` /
+    ``edge_h0``.
     """
     node_key, edge_key = resolve_target_keys(record, target_kind)
+    if build_target_spec(target_kind).add_h0_prior:
+        missing = [key for key in ("node_h0", "edge_h0") if key not in record]
+        if missing:
+            raise ValueError(
+                f"target_kind={target_kind!r} adds H0 to the residual; record "
+                f"lacks {missing}."
+            )
+        record["node_features"] = record[node_key] + record["node_h0"]
+        record["edge_features"] = record[edge_key] + record["edge_h0"]
+        return node_key, edge_key
     if node_key != "node_features":
         record["node_features"] = record[node_key]
         record["edge_features"] = record[edge_key]
@@ -1050,6 +1088,7 @@ __all__ = [
     "DUAL_PRIOR_SAMPLE_SCHEMA",
     "EDGE_GRAPH_FINGERPRINT_KEY",
     "FULL_H_TARGET_FINGERPRINT_KEY",
+    "H0_RECONSTRUCTED_FULL_H_SEMANTICS",
     "H0_RESIDUAL_SEMANTICS",
     "H0_RESIDUAL_RME_SCHEMA",
     "NACF_RESIDUAL_RME_SCHEMA",

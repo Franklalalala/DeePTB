@@ -1429,6 +1429,30 @@ class LMDBDataset(AtomicDataset):
                 )
         if self.require_prior_blocks and not self.get_prior:
             raise ValueError("require_prior_blocks=True requires get_prior=True.")
+        if self.target_spec is not None and self.target_spec.add_h0_prior:
+            if not (self.get_Hamiltonian and self.get_H0 and self.prefer_precomputed_h0):
+                raise ValueError(
+                    f"target_kind={self.target_kind!r} rebuilds full H from the "
+                    "stored H-H0 residual and the precomputed node/edge H0; set "
+                    "get_Hamiltonian, get_H0 and prefer_precomputed_h0 to true."
+                )
+            conflicting = [
+                name
+                for name, value in (
+                    ("residual_hamiltonian", self.residual_hamiltonian),
+                    ("require_full_h_target", self.require_full_h_target),
+                    ("require_residual_h_target", self.require_residual_h_target),
+                    ("require_prior_residual_rme_target", self.require_prior_residual_rme_target),
+                    ("require_uureal_block_ode", self.require_uureal_block_ode),
+                    ("require_residual_from_full_h_target", self.require_residual_from_full_h_target),
+                )
+                if value
+            ]
+            if conflicting:
+                raise ValueError(
+                    f"target_kind={self.target_kind!r} cannot be combined with "
+                    f"{conflicting}."
+                )
         assert not get_Hamiltonian * get_DM, "Hamiltonian and Density Matrix can only loaded one at a time, for which will occupy the same attribute in the AtomicData."
 
         self.num_graphs = 0

@@ -687,6 +687,30 @@ class TargetDecoder:
                 keep_mask=ctx.soc_uureal_keep_mask,
             )
 
+    def reconstruct_full_h(self, dataset: Any, atomicdata: Any) -> None:
+        """Add the decoded H0 to the decoded H-H0 target for ``add_h0_prior`` targets."""
+        spec = getattr(dataset, "target_spec", None)
+        if spec is None or not spec.add_h0_prior:
+            return
+        for feature_key, h0_key in (
+            (AtomicDataDict.NODE_FEATURES_KEY, AtomicDataDict.NODE_H0_KEY),
+            (AtomicDataDict.EDGE_FEATURES_KEY, AtomicDataDict.EDGE_H0_KEY),
+        ):
+            if feature_key not in atomicdata or h0_key not in atomicdata:
+                raise ValueError(
+                    f"target_kind={spec.kind!r} needs both {feature_key} and "
+                    f"{h0_key} in the decoded record."
+                )
+            residual = atomicdata[feature_key]
+            h0 = atomicdata[h0_key]
+            if tuple(residual.shape) != tuple(h0.shape):
+                raise ValueError(
+                    f"target_kind={spec.kind!r}: {feature_key} shape "
+                    f"{tuple(residual.shape)} differs from {h0_key} shape "
+                    f"{tuple(h0.shape)}."
+                )
+            atomicdata[feature_key] = residual + h0.to(dtype=residual.dtype)
+
     def decode_physical_h0(
         self, ctx: SampleContext, atomicdata: Any, num_nodes: int, num_edges: int
     ) -> None:
@@ -1579,6 +1603,7 @@ class RecordPipeline:
 
         self.target_decoder.decode_main_features(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.decode_h0(ctx, atomicdata, num_nodes, num_edges)
+        self.target_decoder.reconstruct_full_h(dataset, atomicdata)
         self.prior_decoder.decode_features(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.decode_physical_h0(ctx, atomicdata, num_nodes, num_edges)
         self.target_decoder.decode_haar(ctx, atomicdata, num_nodes, num_edges)

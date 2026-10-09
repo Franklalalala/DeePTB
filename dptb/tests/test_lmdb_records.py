@@ -529,3 +529,66 @@ def test_schema_gate_accepts_na_cf_on_h0res_and_nacfres():
     validator.validate_schema_and_basis(
         _stub_dataset(prior_kind="na_cf", target_kind="nacfres"), {SAMPLE_SCHEMA_KEY: NACF_RESIDUAL_RME_SCHEMA}
     )
+
+
+# ===========================================================================
+# fullh: full H rebuilt at load time from the stored H-H0 residual plus H0
+# ===========================================================================
+def test_fullh_reads_the_h0_residual_slot_and_only_it_adds_h0():
+    fullh, h0res = build_target_spec("fullh"), build_target_spec("h0res")
+    assert fullh.add_h0_prior
+    assert not any(build_target_spec(k).add_h0_prior for k in ("h0res", "nacfres", "p2res", "p23res"))
+    assert (fullh.named_node_key, fullh.named_edge_key) == (h0res.named_node_key, h0res.named_edge_key)
+    assert fullh.view_schemas == h0res.view_schemas
+    assert fullh.allowed_sample_schemas == h0res.allowed_sample_schemas
+    assert resolve_target_keys(_named_record(), "fullh") == ("node_features", "edge_features")
+
+
+def test_apply_target_slot_fullh_writes_residual_plus_h0():
+    rec = _named_record()
+    apply_target_slot(rec, "fullh")
+    assert np.all(rec["node_features"] == 3.0) and np.all(rec["edge_features"] == 3.0)
+    rec = _named_record()
+    del rec["edge_h0"]
+    with pytest.raises(ValueError, match="edge_h0"):
+        apply_target_slot(rec, "fullh")
+
+
+def _decoded(n=3, e=5, w=6):
+    g = torch.Generator().manual_seed(0)
+    return {
+        AtomicDataDict.NODE_FEATURES_KEY: torch.randn(n, w, generator=g),
+        AtomicDataDict.EDGE_FEATURES_KEY: torch.randn(e, w, generator=g),
+        AtomicDataDict.NODE_H0_KEY: torch.randn(n, w, generator=g),
+        AtomicDataDict.EDGE_H0_KEY: torch.randn(e, w, generator=g),
+    }
+
+
+def test_reconstruct_full_h_adds_decoded_h0_only_for_fullh():
+    data = _decoded()
+    before = {k: v.clone() for k, v in data.items()}
+    TargetDecoder().reconstruct_full_h(SimpleNamespace(target_spec=build_target_spec("fullh")), data)
+    for feat, h0 in ((AtomicDataDict.NODE_FEATURES_KEY, AtomicDataDict.NODE_H0_KEY),
+                     (AtomicDataDict.EDGE_FEATURES_KEY, AtomicDataDict.EDGE_H0_KEY)):
+        assert torch.equal(data[feat], before[feat] + before[h0])
+        assert torch.equal(data[h0], before[h0])
+    for spec in (None, build_target_spec("h0res")):
+        data = _decoded()
+        before = {k: v.clone() for k, v in data.items()}
+        TargetDecoder().reconstruct_full_h(SimpleNamespace(target_spec=spec), data)
+        assert all(torch.equal(data[k], before[k]) for k in data)
+
+
+@pytest.mark.parametrize("drop", [AtomicDataDict.NODE_H0_KEY, AtomicDataDict.EDGE_H0_KEY])
+def test_reconstruct_full_h_fails_closed_without_h0(drop):
+    data = _decoded()
+    del data[drop]
+    with pytest.raises(ValueError, match=drop):
+        TargetDecoder().reconstruct_full_h(SimpleNamespace(target_spec=build_target_spec("fullh")), data)
+
+
+def test_reconstruct_full_h_rejects_shape_mismatch():
+    data = _decoded()
+    data[AtomicDataDict.EDGE_H0_KEY] = data[AtomicDataDict.EDGE_H0_KEY][:, :-1]
+    with pytest.raises(ValueError, match="shape"):
+        TargetDecoder().reconstruct_full_h(SimpleNamespace(target_spec=build_target_spec("fullh")), data)
