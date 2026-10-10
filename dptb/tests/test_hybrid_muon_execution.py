@@ -89,3 +89,32 @@ def test_sparse_gradient_is_rejected_and_closure_remains_differentiable():
     param.grad = torch.sparse_coo_tensor([[0]], [1.0], (4,))
     with pytest.raises(RuntimeError, match="sparse"):
         optimizer.step()
+
+
+@pytest.mark.parametrize("magma_lite", [False, True])
+def test_batched_execution_preserves_per_parameter_states_and_diagnostics(magma_lite):
+    left = _parameters()
+    right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
+    options = dict(lr=0.01, magma_lite=magma_lite, adamw_name_patterns=("*router*",),
+                   expert_update_scale="const", expert_update_scale_const=0.4)
+    reference = HybridMuon(left, **options)
+    reference.execution_mode = "legacy"
+    batched = HybridMuon(right, **options)
+    batched.execution_mode = "batched"
+    generator = torch.Generator().manual_seed(13)
+    for step in range(20):
+        for index, ((_, a), (_, b)) in enumerate(zip(left, right)):
+            grad = torch.randn(a.shape, generator=generator)
+            if index == 3:
+                grad[1].zero_()
+            a.grad = None if step == 4 and index == 1 else grad
+            b.grad = None if a.grad is None else grad.clone()
+        reference.step()
+        batched.step()
+        for (_, a), (_, b) in zip(left, right):
+            torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+        _assert_state_equal(reference.state_dict()["state"], batched.state_dict()["state"], exact=False)
+        a, b = reference.get_diagnostics(), batched.get_diagnostics()
+        assert a.keys() == b.keys()
+        for key in a:
+            assert a[key] == pytest.approx(b[key], rel=3e-5, abs=2e-6), key

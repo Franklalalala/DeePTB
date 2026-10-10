@@ -441,7 +441,7 @@ class HybridMuon(Optimizer):
         )
         params, self._param_names = _normalize_named_parameters(params)
         # Execution caches are deliberately absent from optimizer checkpoints.
-        self.execution_mode = "cached"
+        self.execution_mode = "batched"
         self._route_cache = {}
         self._route_signature = None
         self._use_route_cache = False
@@ -721,6 +721,13 @@ class HybridMuon(Optimizer):
         if transposed:
             x = x.transpose(-2, -1)
 
+        x = self._newton_schulz(x)
+        if transposed:
+            x = x.transpose(-2, -1)
+        return x.reshape(original_shape).to(dtype=update.dtype)
+
+    def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
+
         # Additive epsilon, matching the reference Muon implementation
         # (KellerJordan/Muon: ``X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)``).
         #
@@ -748,9 +755,21 @@ class HybridMuon(Optimizer):
             poly = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
             x = torch.baddbmm(x, poly, x, beta=a, alpha=1.0)
 
+        return x
+
+    def _orthogonalize_bucket(self, entries, group):
+        matrices = [self._reshape_to_matrix_batch_for_param(update.float(), param, group)
+                    for param, update in entries]
+        counts = [matrix.shape[0] for matrix in matrices]
+        x = torch.cat(matrices, dim=0)
+        transposed = x.shape[-2] > x.shape[-1]
         if transposed:
             x = x.transpose(-2, -1)
-        return x.reshape(original_shape).to(dtype=update.dtype)
+        x = self._newton_schulz(x)
+        if transposed:
+            x = x.transpose(-2, -1)
+        return [part.reshape(update.shape).to(update.dtype)
+                for part, (_, update) in zip(x.split(counts, dim=0), entries)]
 
     def _reset_step_stats(self) -> None:
         if self._last_step_diagnostics_cache is not None:
@@ -836,8 +855,8 @@ class HybridMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self.execution_mode not in {"legacy", "cached"}:
-            raise ValueError("execution_mode must be legacy or cached")
+        if self.execution_mode not in {"legacy", "cached", "batched"}:
+            raise ValueError("execution_mode must be legacy, cached or batched")
         if self.execution_mode != "legacy":
             self._refresh_route_cache()
             self._use_route_cache = True
@@ -852,6 +871,9 @@ class HybridMuon(Optimizer):
             self._ensure_group_defaults(group)
             lr = group["lr"]
             weight_decay = group["weight_decay"]
+            if self.execution_mode == "batched":
+                self._batched_group_step(group, lr, weight_decay)
+                continue
             for param in group["params"]:
                 if param.grad is None:
                     continue
@@ -867,7 +889,39 @@ class HybridMuon(Optimizer):
         self._publish_lr_ratio()
         return loss
 
+    def _batched_group_step(self, group, lr, weight_decay):
+        buckets = {}
+        updates = {}
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                raise RuntimeError("HybridMuon does not support sparse gradients")
+            if self._uses_muon(param, group):
+                update = self._muon_prepare(param, param.grad, group, lr, weight_decay)
+                shape = self._effective_shape_for_param(param, group)
+                key = (tuple(shape[-2:]), param.dtype, param.device)
+                buckets.setdefault(key, []).append((param, update))
+                updates[id(param)] = update
+        orthogonalized = {}
+        for entries in buckets.values():
+            for (param, _), ortho in zip(entries, self._orthogonalize_bucket(entries, group)):
+                orthogonalized[id(param)] = ortho
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+            if id(param) in updates:
+                self._muon_apply(param, param.grad, updates[id(param)], orthogonalized[id(param)],
+                                 group, lr, weight_decay)
+            else:
+                self._adamw_step(param, param.grad, group, lr, weight_decay)
+
     def _muon_step(self, param, grad, group, lr, weight_decay):
+        update = self._muon_prepare(param, grad, group, lr, weight_decay)
+        ortho_update = self._orthogonalize(update, param, group)
+        self._muon_apply(param, grad, update, ortho_update, group, lr, weight_decay)
+
+    def _muon_prepare(self, param, grad, group, lr, weight_decay):
         state = self.state[param]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros_like(param, memory_format=torch.preserve_format)
@@ -882,7 +936,14 @@ class HybridMuon(Optimizer):
         beta = group["muon_beta"]
         momentum.mul_(beta).add_(grad, alpha=1.0 - beta)
         update = momentum.mul(beta).add(grad, alpha=1.0 - beta)
-        ortho_update = self._orthogonalize(update, param, group)
+        return update
+
+    def _muon_apply(self, param, grad, update, ortho_update, group, lr, weight_decay):
+        state = self.state[param]
+        momentum = state["momentum_buffer"]
+        is_expert = self._is_expert_param(param, group)
+        if is_expert:
+            weight_decay = weight_decay * group["expert_weight_decay_mult"]
         if group["magma_lite"]:
             ortho_update = ortho_update * self._magma_lite_scale(param, grad, update, group, state)
         effective_shape = self._effective_shape_for_param(param, group)
