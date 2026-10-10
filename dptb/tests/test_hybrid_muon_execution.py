@@ -145,6 +145,33 @@ def test_batched_modes_preserve_aliased_parameter_updates(duplicate):
     _assert_state_equal(reference.state_dict()["state"], batched.state_dict()["state"])
 
 
+@pytest.mark.parametrize("execution_mode", ["batched", "foreach", "fast"])
+@pytest.mark.parametrize("inactive_second", [False, True])
+def test_batched_modes_preserve_gradients_aliasing_parameter_storage(execution_mode, inactive_second):
+    initial = [torch.tensor([[1.0, 2.0], [3.0, 5.0]]), torch.tensor([[2.0, -1.0], [4.0, 3.0]])]
+    left = [torch.nn.Parameter(value.clone()) for value in initial]
+    right = [torch.nn.Parameter(value.clone()) for value in initial]
+    options = dict(lr=0.1, weight_decay=0.1, magma_lite=False, muon_clip=False)
+    reference, batched = HybridMuon(left, **options), HybridMuon(right, **options)
+    reference.execution_mode = "legacy"
+    batched.execution_mode = execution_mode
+    for params in (left, right):
+        params[0].grad = params[1].detach()
+        params[1].grad = None if inactive_second else params[0].detach()
+    for step in range(2):
+        reference.step()
+        batched.step()
+        for a, b in zip(left, right):
+            assert torch.equal(a, b)
+        _assert_state_equal(reference.state_dict()["state"], batched.state_dict()["state"])
+        assert reference.get_diagnostics() == batched.get_diagnostics()
+        if step == 0:
+            # Replacing aliasing gradients must make batching safe again.
+            for a, b in zip(left, right):
+                a.grad = torch.ones_like(a)
+                b.grad = a.grad.clone()
+
+
 def test_foreach_execution_supports_mixed_parameter_dtypes_and_group_options():
     left = _parameters()
     left[0][1].data = left[0][1].double()

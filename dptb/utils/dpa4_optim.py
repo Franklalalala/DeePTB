@@ -524,11 +524,13 @@ class HybridMuon(Optimizer):
         self._bucket_graphs = {}
         self._graph_lrs = {}
         self._batch_safe_groups = set()
+        self._batch_param_storages = {}
         for group in self.param_groups:
             pointers = [p.untyped_storage().data_ptr() for p in group["params"]
                         if p.layout == torch.strided and p.numel()]
             if len(pointers) == len(set(pointers)) and all(p.layout == torch.strided for p in group["params"]):
                 self._batch_safe_groups.add(id(group))
+            self._batch_param_storages[id(group)] = frozenset(pointers)
             for param in group["params"]:
                 flat = self._flat_1d_matrix_shape(param, group)
                 shape = flat or self._effective_shape(param)
@@ -544,6 +546,19 @@ class HybridMuon(Optimizer):
 
     def _cached_route(self, param, group):
         return self._route_cache.get((id(group), id(param))) if self._use_route_cache else None
+
+    def _can_batch_group(self, group):
+        if id(group) not in self._batch_safe_groups:
+            return False
+        # Gradients can legally be views of parameter storage. Preparing all
+        # parameters before applying updates would then change the values read
+        # by subsequent parameters, so preserve sequential update order.
+        # Include inactive parameters: an active gradient may reference one.
+        pointers = self._batch_param_storages[id(group)]
+        return not any(param.grad is not None and (
+            param.grad.layout != torch.strided
+            or param.grad.untyped_storage().data_ptr() in pointers
+        ) for param in group["params"])
 
     def _ensure_group_defaults(self, group) -> None:
         """Fill new options when loading checkpoints written by older versions."""
@@ -925,10 +940,11 @@ class HybridMuon(Optimizer):
             self._ensure_group_defaults(group)
             lr = group["lr"]
             weight_decay = group["weight_decay"]
-            if self.execution_mode in {"foreach", "fast"} and id(group) in self._batch_safe_groups:
+            can_batch = self.execution_mode in {"batched", "foreach", "fast"} and self._can_batch_group(group)
+            if self.execution_mode in {"foreach", "fast"} and can_batch:
                 self._foreach_group_step(group, lr, weight_decay)
                 continue
-            if self.execution_mode == "batched" and id(group) in self._batch_safe_groups:
+            if self.execution_mode == "batched" and can_batch:
                 self._batched_group_step(group, lr, weight_decay)
                 continue
             for param in group["params"]:
