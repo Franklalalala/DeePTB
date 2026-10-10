@@ -440,6 +440,11 @@ class HybridMuon(Optimizer):
             adamw_pattern_lr_scale=float(adamw_pattern_lr_scale),
         )
         params, self._param_names = _normalize_named_parameters(params)
+        # Execution caches are deliberately absent from optimizer checkpoints.
+        self.execution_mode = "cached"
+        self._route_cache = {}
+        self._route_signature = None
+        self._use_route_cache = False
         super().__init__(params, defaults)
         self._last_step_stat_tensors: List[ClipStatTensors] = []
         self._pending_diagnostics_tensor: Optional[torch.Tensor] = None
@@ -452,8 +457,11 @@ class HybridMuon(Optimizer):
         self.last_expert_stats: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def add_param_group(self, param_group) -> None:
-        super().add_param_group(param_group)
+        groups, names = _normalize_named_parameters(param_group)
+        self._param_names.update(names)
+        super().add_param_group(groups[0])
         self._route_summary_cache = None
+        self._route_signature = None
 
     def load_state_dict(self, state_dict):
         result = super().load_state_dict(state_dict)
@@ -462,10 +470,60 @@ class HybridMuon(Optimizer):
             if torch.is_tensor(step):
                 state["step"] = int(step.item())
         self._route_summary_cache = None
+        self._route_signature = None
         return result
+
+    _ROUTE_OPTIONS = (
+        "matrix_min_dim", "muon_1d_route_mode", "muon_1d_include_name_patterns",
+        "muon_1d_exclude_name_patterns", "muon_1d_min_numel", "muon_1d_max_aspect_ratio",
+        "muon_1d_allow_degenerate_matrix", "muon_force_name_patterns",
+        "adamw_name_patterns", "expert_name_patterns",
+    )
+
+    def _refresh_route_cache(self) -> None:
+        was_cached = self._use_route_cache
+        self._use_route_cache = False
+        try:
+            self._refresh_route_cache_impl()
+        finally:
+            self._use_route_cache = was_cached
+
+    def _refresh_route_cache_impl(self) -> None:
+        # LR schedules and clipping options do not change routes; the execution
+        # path reads these live from the group rather than caching them.
+        signature = []
+        for group in self.param_groups:
+            self._ensure_group_defaults(group)
+            options = tuple(tuple(group[k]) if isinstance(group[k], (list, tuple)) else group[k]
+                            for k in self._ROUTE_OPTIONS)
+            params = tuple((id(p), tuple(p.shape), p.dtype, p.device, p.layout,
+                            self._param_names.get(id(p), "")) for p in group["params"])
+            signature.append((id(group), options, params))
+        signature = tuple(signature)
+        if signature == self._route_signature:
+            return
+        self._route_cache = {}
+        for group in self.param_groups:
+            for param in group["params"]:
+                flat = self._flat_1d_matrix_shape(param, group)
+                shape = flat or self._effective_shape(param)
+                forced = self._is_forced_adamw(param, group)
+                muon = not forced and (self._uses_native_muon_shape(param, group["matrix_min_dim"])
+                                       or flat is not None)
+                self._route_cache[id(group), id(param)] = dict(
+                    shape=shape, flat=flat, muon=muon, forced=forced,
+                    expert=self._is_expert_param(param, group),
+                )
+        self._route_signature = signature
+        self._route_summary_cache = None
+
+    def _cached_route(self, param, group):
+        return self._route_cache.get((id(group), id(param))) if self._use_route_cache else None
 
     def _ensure_group_defaults(self, group) -> None:
         """Fill new options when loading checkpoints written by older versions."""
+        if self._use_route_cache:
+            return
         for key, value in self.defaults.items():
             group.setdefault(key, value)
 
@@ -504,6 +562,9 @@ class HybridMuon(Optimizer):
         return [1, numel] if allow_degenerate else None
 
     def _flat_1d_matrix_shape(self, param: torch.Tensor, group) -> Optional[List[int]]:
+        cached = self._cached_route(param, group)
+        if cached is not None:
+            return cached["flat"]
         self._ensure_group_defaults(group)
         if group["muon_1d_route_mode"] == "off":
             return None
@@ -530,6 +591,9 @@ class HybridMuon(Optimizer):
         )
 
     def _uses_muon(self, param: torch.Tensor, group) -> bool:
+        cached = self._cached_route(param, group)
+        if cached is not None:
+            return cached["muon"]
         if self._is_forced_adamw(param, group):
             return False
         return self._uses_native_muon_shape(param, group["matrix_min_dim"]) or (
@@ -537,11 +601,17 @@ class HybridMuon(Optimizer):
         )
 
     def _is_forced_adamw(self, param: torch.Tensor, group) -> bool:
+        cached = self._cached_route(param, group)
+        if cached is not None:
+            return cached["forced"]
         self._ensure_group_defaults(group)
         patterns = group["adamw_name_patterns"]
         return bool(patterns) and self._matches_any(self._param_names.get(id(param), ""), patterns)
 
     def _is_expert_param(self, param: torch.Tensor, group) -> bool:
+        cached = self._cached_route(param, group)
+        if cached is not None:
+            return cached["expert"]
         self._ensure_group_defaults(group)
         return param.dim() >= 2 and self._matches_any(
             self._param_names.get(id(param), ""), group["expert_name_patterns"]
@@ -586,6 +656,9 @@ class HybridMuon(Optimizer):
         moe_registry.publish_lr_scale(lr / peak if peak > 0.0 else 1.0, step=group["committed_steps"])
 
     def _effective_shape_for_param(self, param: torch.Tensor, group) -> List[int]:
+        cached = self._cached_route(param, group)
+        if cached is not None:
+            return cached["shape"]
         return self._flat_1d_matrix_shape(param, group) or self._effective_shape(param)
 
     def _compute_route_summary(self) -> Dict[str, Union[int, float]]:
@@ -619,6 +692,7 @@ class HybridMuon(Optimizer):
         }
 
     def route_summary(self) -> Dict[str, Union[int, float]]:
+        self._refresh_route_cache()
         if self._route_summary_cache is None:
             self._route_summary_cache = self._compute_route_summary()
         return dict(self._route_summary_cache)
@@ -762,6 +836,17 @@ class HybridMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        if self.execution_mode not in {"legacy", "cached"}:
+            raise ValueError("execution_mode must be legacy or cached")
+        if self.execution_mode != "legacy":
+            self._refresh_route_cache()
+            self._use_route_cache = True
+        try:
+            return self._step_impl(loss)
+        finally:
+            self._use_route_cache = False
+
+    def _step_impl(self, loss):
         self._reset_step_stats()
         for group in self.param_groups:
             self._ensure_group_defaults(group)
