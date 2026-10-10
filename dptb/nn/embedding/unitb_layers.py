@@ -610,6 +610,15 @@ class UpdateNode(torch.nn.Module):
 
 
 class UpdateEdge(torch.nn.Module):
+    """SO(2) update of an edge state from ``[h_i, m_ij, h_j]``.
+
+    The LEM edge update reads its own edge state as the message ``m_ij`` and
+    updates the edge latents. The SLEM edge update reads the hidden state
+    ``x_ij`` instead (``message_irreps_in``) and leaves the latents unchanged
+    (``update_latents=False``). Without ``h_j`` (``use_neighbor_node=False``)
+    this is the SLEM hidden-state update, :class:`UpdateHidden`.
+    """
+
     def __init__(
             self,
             num_types,
@@ -645,11 +654,19 @@ class UpdateEdge(torch.nn.Module):
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
             num_shared_experts: int = 1,
+            message_irreps_in: Optional[o3.Irreps] = None,
+            use_neighbor_node: bool = True,
+            update_latents: bool = True,
     ):
         super(UpdateEdge, self).__init__()
         self.irreps_in = irreps_in
         self.irreps_out = irreps_out
         self.node_irreps_in = node_irreps_in
+        # Irreps of the edge message entering the SO(2) map; the residual stream
+        # keeps irreps_in.
+        self.message_irreps_in = irreps_in if message_irreps_in is None else o3.Irreps(message_irreps_in)
+        self.use_neighbor_node = bool(use_neighbor_node)
+        self.update_latents = bool(update_latents)
         self.dtype = dtype
         self.device = device
         self.res_update = res_update
@@ -668,7 +685,8 @@ class UpdateEdge(torch.nn.Module):
             mlp_output_dimension=self._edge_weighter.weight_numel,
         )
 
-        self.ln = torch.nn.LayerNorm(latent_dim)
+        if self.update_latents:
+            self.ln = torch.nn.LayerNorm(latent_dim)
 
         self.node_norm = build_equivariant_norm(
             equivariant_norm_type,
@@ -679,7 +697,7 @@ class UpdateEdge(torch.nn.Module):
         )
         self.edge_norm = build_equivariant_norm(
             equivariant_norm_type,
-            self.irreps_in,
+            self.message_irreps_in,
             norm_eps,
             dtype,
             device,
@@ -689,8 +707,11 @@ class UpdateEdge(torch.nn.Module):
             raise ValueError("Only gate activation is supported; grid activations belong to archived models")
         self.activation = build_gate_activation(self.irreps_out)
 
+        tp_irreps_in = self.node_irreps_in + self.message_irreps_in
+        if self.use_neighbor_node:
+            tp_irreps_in = tp_irreps_in + self.node_irreps_in
         self.tp = SO2_Linear(
-            irreps_in=self.node_irreps_in + self.irreps_in + self.node_irreps_in,
+            irreps_in=tp_irreps_in,
             irreps_out=self.activation.irreps_in,
             latent_dim=latent_dim,
             radial_emb=radial_emb,
@@ -706,21 +727,22 @@ class UpdateEdge(torch.nn.Module):
             mole_expert_rank=mole_expert_rank,
         )
 
-        self.latents_mlp_1 = ScalarMLPFunction(
-            mlp_input_dimension=latent_dim + self.irreps_out[0].dim,
-            mlp_output_dimension=latent_dim,
-            mlp_latent_dimensions=latent_channels,
-            mlp_nonlinearity="silu",
-            mlp_initialization="uniform",
-        )
+        if self.update_latents:
+            self.latents_mlp_1 = ScalarMLPFunction(
+                mlp_input_dimension=latent_dim + self.irreps_out[0].dim,
+                mlp_output_dimension=latent_dim,
+                mlp_latent_dimensions=latent_channels,
+                mlp_nonlinearity="silu",
+                mlp_initialization="uniform",
+            )
 
-        self.latents_mlp_2 = ScalarMLPFunction(
-            mlp_input_dimension=latent_dim + edge_one_hot_dim,
-            mlp_output_dimension=latent_dim,
-            mlp_latent_dimensions=latent_channels,
-            mlp_nonlinearity="silu",
-            mlp_initialization="uniform",
-        )
+            self.latents_mlp_2 = ScalarMLPFunction(
+                mlp_input_dimension=latent_dim + edge_one_hot_dim,
+                mlp_output_dimension=latent_dim,
+                mlp_latent_dimensions=latent_channels,
+                mlp_nonlinearity="silu",
+                mlp_initialization="uniform",
+            )
 
         self.lin_post = Linear(
             self.activation.irreps_out,
@@ -818,23 +840,20 @@ class UpdateEdge(torch.nn.Module):
         return coefficient_old, coefficient_new
 
     def forward(self, latents, node_features, node_onehot, edge_features, edge_index, edge_vector, cutoff_coeffs,
-                active_edges, edge_one_hot, wigner_D_all, mole_globals):  # Accept globals
+                active_edges, edge_one_hot, wigner_D_all, mole_globals, message_features=None):  # Accept globals
         edge_center = edge_index[0]
         edge_neighbor = edge_index[1]
 
         new_node_features = node_features
         node_in = self.node_norm(new_node_features) if self.node_norm is not None else new_node_features
-        edge_in = self.edge_norm(edge_features) if self.edge_norm is not None else edge_features
+        message = edge_features if message_features is None else message_features
+        edge_in = self.edge_norm(message) if self.edge_norm is not None else message
 
         edge_latents = latents[active_edges]
-        tp_input = torch.cat(
-            [
-                node_in[edge_center[active_edges]],
-                edge_in,
-                node_in[edge_neighbor[active_edges]],
-            ],
-            dim=-1,
-        )
+        tp_parts = [node_in[edge_center[active_edges]], edge_in]
+        if self.use_neighbor_node:
+            tp_parts.append(node_in[edge_neighbor[active_edges]])
+        tp_input = torch.cat(tp_parts, dim=-1)
         new_edge_features, wigner_D_all = _apply_so2_tp_or_post_activation_mixer(
             self,
             tp_input,
@@ -851,21 +870,20 @@ class UpdateEdge(torch.nn.Module):
         weights = self.edge_embed_mlps(edge_latents)
         new_edge_features = self._edge_weighter(new_edge_features, weights)
 
-        # update latent
+        if self.update_latents:
+            new_latents = self.latents_mlp_1(torch.cat(
+                [
+                    self.ln(edge_latents),
+                    scalars,
+                ], dim=-1))
 
-        new_latents = self.latents_mlp_1(torch.cat(
-            [
-                self.ln(edge_latents),
-                scalars,
-            ], dim=-1))
+            new_latents = self.latents_mlp_2(torch.cat(
+                [
+                    new_latents,
+                    edge_one_hot,
+                ], dim=-1))
 
-        new_latents = self.latents_mlp_2(torch.cat(
-            [
-                new_latents,
-                edge_one_hot,
-            ], dim=-1))
-
-        new_latents = cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
+            new_latents = cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
 
         if self.res_update:
             coefficient_old, coefficient_new = self._residual_coefficients()
@@ -876,16 +894,18 @@ class UpdateEdge(torch.nn.Module):
                 # Different representations require an equivariant residual projection.
                 edge_features = coefficient_old * self.linear_res(edge_features) + coefficient_new * new_edge_features
 
-            latents = torch.index_copy(
-                latents, 0, active_edges,
-                coefficient_new * new_latents + coefficient_old * edge_latents
-            )
+            if self.update_latents:
+                latents = torch.index_copy(
+                    latents, 0, active_edges,
+                    coefficient_new * new_latents + coefficient_old * edge_latents
+                )
         else:
             edge_features = new_edge_features
-            latents = torch.index_copy(
-                latents, 0, active_edges,
-                new_latents
-            )
+            if self.update_latents:
+                latents = torch.index_copy(
+                    latents, 0, active_edges,
+                    new_latents
+                )
         if self.use_layer_onehot_tp:
             onehot_tune_edge_feat = _apply_onehot_tp(
                 self.edge_onehot_tp, edge_features, edge_one_hot, self.onehot_tp_mode
@@ -895,7 +915,23 @@ class UpdateEdge(torch.nn.Module):
         return edge_features, latents, wigner_D_all
 
 
+class UpdateHidden(UpdateEdge):
+    """SLEM hidden-state update: SO(2) on ``[h_i, x_ij]`` -> ``x_ij``.
+
+    It owns the edge-latent update of a SLEM layer. Neither input depends on a
+    neighbor's node state, so ``x_ij`` and the latents stay within the cutoff
+    sphere of atom ``i``.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(use_neighbor_node=False, **kwargs)
+
+
 class Layer(torch.nn.Module):
+    """LEM interaction layer: edge update, then node update from the new edges."""
+
+    layer_topology = "lem"
+
     @staticmethod
     def _edge_update_type():
         return UpdateEdge
@@ -955,6 +991,8 @@ class Layer(torch.nn.Module):
             device: Union[str, torch.device] = torch.device("cpu"),
             num_experts: int = 8,
             num_shared_experts: int = 1,
+            hidden_irreps_in: Optional[o3.Irreps] = None,
+            hidden_irreps_out: Optional[o3.Irreps] = None,
     ):
         super(Layer, self).__init__()
 
@@ -966,11 +1004,15 @@ class Layer(torch.nn.Module):
         self.device = device
         self.num_types = num_types
 
-        self.edge_update = self._edge_update_type()(
-            node_irreps_in=self.irreps_in,
+        slem = self.layer_topology == "slem"
+        hidden_given = (hidden_irreps_in is not None, hidden_irreps_out is not None)
+        if hidden_given != (slem, slem):
+            raise ValueError("hidden_irreps_in and hidden_irreps_out are required by the SLEM layer "
+                             "and not accepted by the LEM layer")
+
+        # Options shared by every edge-shaped SO(2) update of this layer.
+        edge_options = dict(
             num_types=num_types,
-            irreps_in=self.irreps_in,
-            irreps_out=self.irreps_out,
             latent_dim=latent_dim,
             latent_channels=latent_channels,
             radial_emb=tp_radial_emb,
@@ -986,7 +1028,6 @@ class Layer(torch.nn.Module):
             swiglu_s2_compat_mode=swiglu_s2_compat_mode,
             dtype=dtype,
             device=device,
-            use_interpolation_tp=use_interpolation_tp,
             norm_eps=norm_eps,
             num_experts=num_experts,
             num_shared_experts=num_shared_experts,
@@ -1001,9 +1042,32 @@ class Layer(torch.nn.Module):
             so2_output_router_hidden_dim=so2_output_router_hidden_dim,
             onehot_tp_mode=onehot_tp_mode,
         )
+        edge_message = {}
+        node_message_irreps = None
+        if slem:
+            # The hidden state stays inside the stack; the output interpolation
+            # block applies only to the final edge and node maps.
+            self.hidden_update = UpdateHidden(
+                node_irreps_in=self.irreps_in,
+                irreps_in=hidden_irreps_in,
+                irreps_out=hidden_irreps_out,
+                use_interpolation_tp=False,
+                **edge_options,
+            )
+            edge_message = dict(message_irreps_in=hidden_irreps_out, update_latents=False)
+            node_message_irreps = hidden_irreps_out
+
+        self.edge_update = self._edge_update_type()(
+            node_irreps_in=self.irreps_in,
+            irreps_in=self.irreps_in,
+            irreps_out=self.irreps_out,
+            use_interpolation_tp=use_interpolation_tp,
+            **edge_options,
+            **edge_message,
+        )
 
         self.node_update = self._node_update_type()(
-            edge_irreps_in=self.edge_update.irreps_out,
+            edge_irreps_in=self.edge_update.irreps_out if node_message_irreps is None else node_message_irreps,
             irreps_in=self.irreps_in,
             irreps_out=self.irreps_out,
             latent_dim=latent_dim,
@@ -1060,5 +1124,32 @@ class Layer(torch.nn.Module):
                                          node_batch=node_batch)
 
         return latents, node_features, edge_features, wigner_D_all
+
+
+class SlemLayer(Layer):
+    """SLEM interaction layer: hidden-state update, edge update, node update.
+
+    The hidden update maps ``[h_i, x_ij]`` to ``x_ij`` and updates the edge
+    latents; the edge update maps ``[h_i, x_ij, h_j]`` to ``e_ij`` without
+    changing the latents; the node update aggregates ``[h_i, x_ij]`` over
+    ``j``. All three read the node features entering the layer. Edge features
+    feed only the next edge residual and the edge output head, so node features
+    depend only on atoms within one cutoff sphere.
+    """
+
+    layer_topology = "slem"
+
+    def forward(self, latents, node_features, edge_features, hidden_features, node_onehot, edge_index, edge_vector,
+                atom_type, cutoff_coeffs, active_edges, edge_one_hot, wigner_D_all, mole_globals, node_batch=None):
+        hidden_features, latents, wigner_D_all = self.hidden_update(
+            latents, node_features, node_onehot, hidden_features, edge_index, edge_vector, cutoff_coeffs,
+            active_edges, edge_one_hot, wigner_D_all, mole_globals)
+        edge_features, _, wigner_D_all = self.edge_update(
+            latents, node_features, node_onehot, edge_features, edge_index, edge_vector, cutoff_coeffs,
+            active_edges, edge_one_hot, wigner_D_all, mole_globals, message_features=hidden_features)
+        node_features = self.node_update(latents, node_features, hidden_features, atom_type, node_onehot, edge_index,
+                                         edge_vector, cutoff_coeffs, active_edges, wigner_D_all, mole_globals,
+                                         node_batch=node_batch)
+        return latents, node_features, edge_features, hidden_features, wigner_D_all
 
 

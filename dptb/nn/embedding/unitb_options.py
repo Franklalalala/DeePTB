@@ -49,6 +49,26 @@ ARCHIVE_DEFAULTS = {
     "two_stage_pair_enable": False, "use_uureal_residual_block_input": False,
     "use_spatial_residual_block_input": False,
 }
+# "lem": edge update -> node update per layer. "slem": hidden-state update ->
+# edge update -> node update, with node features local to one cutoff sphere.
+LAYER_TOPOLOGIES = ("lem", "slem")
+
+
+def _archived_option_active(key, value):
+    default = ARCHIVE_DEFAULTS[key]
+    return bool(value.get("enabled", False)) if isinstance(default, dict) else value != default
+
+
+def check_layer_topology(topology, options):
+    """Validate ``layer_topology``; the SLEM layers accept no archived option."""
+    if topology not in LAYER_TOPOLOGIES:
+        raise ValueError(f"layer_topology must be one of {list(LAYER_TOPOLOGIES)}, got {topology!r}")
+    if topology == "slem":
+        for key in ARCHIVE_DEFAULTS:
+            if key in options and _archived_option_active(key, options[key]):
+                raise ValueError(f"{key} belongs to an archived model and is not available "
+                                 "with layer_topology='slem'")
+    return topology
 
 
 def unitb_options(options, *, legacy=False):
@@ -62,12 +82,8 @@ def unitb_options(options, *, legacy=False):
                 raise ValueError(f"Conflicting UniTB options: {new} and {old}")
             options[old] = value
     if not legacy:
-        for key, default in ARCHIVE_DEFAULTS.items():
-            if key not in options:
-                continue
-            value = options[key]
-            active = bool(value.get("enabled", False)) if isinstance(default, dict) else value != default
-            if active:
+        for key in ARCHIVE_DEFAULTS:
+            if key in options and _archived_option_active(key, options[key]):
                 raise ValueError(f"{key} belongs to an archived model, not UniTB")
         defaults = deepcopy(UNITB_DEFAULTS)
         if options.get("num_experts", 4) == 1:

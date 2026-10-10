@@ -41,9 +41,14 @@ log = logging.getLogger(__name__)
 
 
 from .unitb_ops import _normalize_node_message_aggregation, _normalize_edge_attention_key_source, _normalize_onehot_tp_mode, _normalize_stable_standard_compat_mode, _normalize_so2_expert_mixing_mode, _normalize_so2_moe_layers, _normalize_cg_head_impl, ScalarOnehotTP, _capture_shift_hidden, _apply_onehot_tp
-from .unitb_layers import InitLayer, Layer
+from .unitb_layers import InitLayer, Layer, SlemLayer
+from .unitb_options import check_layer_topology
 
 class UniTBBackbone(torch.nn.Module):
+    # SLEM layers carry a hidden edge state through the layer loop; only the
+    # edge-routed forward (UniTBEdge._edge_layers_and_heads) implements it.
+    _slem_topology_supported = False
+
     @staticmethod
     def _init_layer_type():
         """Extension point for embeddings that reuse the LEM v3 backbone."""
@@ -139,11 +144,20 @@ class UniTBBackbone(torch.nn.Module):
             num_shared_experts: int = 1,
             top_k: Optional[int] = 1,
             mole_full_expert_fast_path: bool = True,
+            layer_topology: str = "lem",
             **kwargs,
     ):
 
         super(UniTBBackbone, self).__init__()
 
+        self.layer_topology = check_layer_topology(layer_topology, dict(
+            kwargs, num_focus=num_focus, node_message_aggregation=node_message_aggregation,
+            edge_aggregation_gated_attention=edge_aggregation_gated_attention,
+            ffn_hidden_factor=ffn_hidden_factor, ffn_apply_to_last=ffn_apply_to_last,
+        ))
+        if self.layer_topology == "slem" and not self._slem_topology_supported:
+            raise ValueError(f"layer_topology='slem' requires the edge-routed UniTB forward; "
+                             f"{type(self).__name__} keeps the LEM layer interface")
         irreps_hidden = o3.Irreps(irreps_hidden)
         self.so2_parity = normalize_so2_parity(so2_parity)
         if self.so2_parity == "enforce":
@@ -211,6 +225,9 @@ class UniTBBackbone(torch.nn.Module):
         self.rme_head_mode = self.output_route_spec.legacy_mode
         self.use_block_native_output = self.output_route_spec.is_block_native
         self.output_head_contract = self.output_route_spec.output_contract
+        if self.layer_topology == "slem" and self.use_block_native_output:
+            raise ValueError(f"layer_topology='slem' writes RME features; block-native output_route="
+                             f"{self.output_route_name!r} is not available")
         self.rme_fusion_rank = int(rme_fusion_rank)
         self.rme_fusion_init = float(rme_fusion_init)
         self.rme_fusion_condition = str(rme_fusion_condition)
@@ -408,7 +425,15 @@ class UniTBBackbone(torch.nn.Module):
 
             routed_layer = i in self.so2_moe_layers
 
-            self.layers.append(self._layer_type()(
+            layer_type, hidden_irreps = self._layer_type(), {}
+            if self.layer_topology == "slem":
+                # x^0 = e^0 enters with the edge irreps; every hidden update
+                # emits irreps_hidden, including the last layer.
+                layer_type = SlemLayer
+                hidden_irreps = dict(hidden_irreps_in=irreps_in, hidden_irreps_out=irreps_hidden)
+
+            self.layers.append(layer_type(
+                **hidden_irreps,
                 num_types=self.n_atom,
                 avg_num_neighbors=avg_num_neighbors,
                 irreps_in=irreps_in,

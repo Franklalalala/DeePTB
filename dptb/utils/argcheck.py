@@ -1920,8 +1920,21 @@ def _edge_router_arguments():
     doc_edge_router_prior_activate = "Route every active edge individually on a frozen Gram descriptor of the edge prior, dispatched in activation space. Widens the router input and disables bond-type dedup. Requires the lem_moe_v3_edge_h0 variant and top_k < num_experts. Default: `False`."
     doc_edge_router_prior_stats = "Path to a frozen per-channel mean/std file for the prior descriptor (torch.save of {'mean': ..., 'std': ...}). Empty means identity. Never trained. Default: `\"\"`."
 
+    doc_layer_topology = (
+        "Interaction-layer topology of the edge-routed UniTB backbone. `lem` (default) runs an edge "
+        "update, then a node update that reads the new edge features, so node features reach beyond "
+        "one cutoff sphere. `slem` (UniTB-SLEM) adds a hidden edge state x_ij (x^0 = initial edge "
+        "features): a hidden-state update maps [h_i, x_ij] to x_ij and updates the edge latents, the "
+        "edge update maps [h_i, x_ij, h_j] to e_ij, and the node update aggregates [h_i, x_ij]; node "
+        "features then depend only on atoms within one cutoff sphere. The three SO(2) maps of a layer "
+        "share its PDQ-MoE routing. `slem` adds parameters and changes the checkpoint layout."
+    )
+
     return [
         Argument("structure_mole", dict, optional=True, default={}),
+        Argument("layer_topology", str, optional=True, default="lem",
+                 extra_check=lambda v: v in {"lem", "slem"},
+                 extra_check_errmsg="layer_topology must be lem or slem", doc=doc_layer_topology),
         Argument("edge_router_in_features", [int, None], optional=True, default=None, doc=doc_edge_router_in_features),
         Argument("edge_router_unique_types", bool, optional=True, default=True, doc=doc_edge_router_unique_types),
         Argument("edge_moe_compact_dispatch", bool, optional=True, default=True, doc=doc_edge_moe_compact_dispatch),
@@ -2007,6 +2020,7 @@ def unitb():
         "edge_router_gate", "edge_router_input", "edge_router_rbf", "edge_router_rbf_rmax",
         "edge_router_top1_mode", "edge_router_route_drop_p", "edge_router_route_drop_scale",
         "so2_m_linear_mode", "mole_linear_m0_mode", "cg_head_impl", "structure_mole",
+        "layer_topology",
     }
     result = [arg for arg in slem_edge_h0() if arg.name in names]
     for arg in result:

@@ -27,6 +27,8 @@ class EdgeRouting:
 
 
 class UniTBEdge(UniTBRouter, UniTBBackbone):
+    _slem_topology_supported = True
+
     def __init__(self, **kwargs):
         from .unitb_structure import StructureRouting, options, validate_embedding
 
@@ -173,22 +175,41 @@ class UniTBEdge(UniTBRouter, UniTBBackbone):
         num_nodes_total: int,
     ):
         wigner_D_all = None
+        # SLEM carries a hidden edge state x_ij beside e_ij, starting at x^0 = e^0.
+        hidden_features = edge_features if getattr(self, "layer_topology", "lem") == "slem" else None
         for idx, layer in enumerate(self.layers):
             _capture_shift_hidden(self, data, idx, node_features, num_nodes_total, active_edges)
-            latents, node_features, edge_features, wigner_D_all = layer(
-                latents,
-                node_features,
-                edge_features,
-                safe_node_one_hot,
-                edge_index,
-                edge_vector,
-                atom_type,
-                cutoff_coeffs,
-                active_edges,
-                active_edge_one_hot,
-                wigner_D_all,
-                mole_globals,
-            )
+            if hidden_features is None:
+                latents, node_features, edge_features, wigner_D_all = layer(
+                    latents,
+                    node_features,
+                    edge_features,
+                    safe_node_one_hot,
+                    edge_index,
+                    edge_vector,
+                    atom_type,
+                    cutoff_coeffs,
+                    active_edges,
+                    active_edge_one_hot,
+                    wigner_D_all,
+                    mole_globals,
+                )
+            else:
+                latents, node_features, edge_features, hidden_features, wigner_D_all = layer(
+                    latents,
+                    node_features,
+                    edge_features,
+                    hidden_features,
+                    safe_node_one_hot,
+                    edge_index,
+                    edge_vector,
+                    atom_type,
+                    cutoff_coeffs,
+                    active_edges,
+                    active_edge_one_hot,
+                    wigner_D_all,
+                    mole_globals,
+                )
 
         if node_features.shape[0] < num_nodes_total:
             pad_num = num_nodes_total - node_features.shape[0]
