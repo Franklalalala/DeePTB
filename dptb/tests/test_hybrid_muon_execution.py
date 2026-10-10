@@ -1,5 +1,6 @@
 """Execution modes preserve routing, per-parameter state and checkpoint reuse."""
 import copy
+import threading
 
 import pytest
 import torch
@@ -256,3 +257,45 @@ def test_fast_cuda_buckets_keep_separate_outputs_for_equal_shapes_in_different_g
     _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)
     for key, value in reference.get_diagnostics().items():
         assert value == pytest.approx(fast.get_diagnostics()[key], rel=3e-5, abs=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fast_cuda_graph_capture_tolerates_cuda_calls_from_other_threads(monkeypatch):
+    # A DataLoader pin-memory thread keeps allocating page-locked memory while the optimizer
+    # captures, and each allocation first queries the events of freed pinned blocks (the NCCL
+    # watchdog queries events too). Make such a query happen inside every capture.
+    begin = torch.cuda.CUDAGraph.capture_begin
+    errors = []
+
+    def allocate_pinned():
+        try:
+            torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)
+        except RuntimeError as error:
+            errors.append(error)
+
+    def capture_begin(self, *args, **kwargs):
+        staged = torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)
+        staged.to("cuda", non_blocking=True)
+        del staged  # the freed block now waits on an event of the copy
+        begin(self, *args, **kwargs)
+        worker = threading.Thread(target=allocate_pinned)
+        worker.start()
+        worker.join()
+
+    monkeypatch.setattr(torch.cuda.CUDAGraph, "capture_begin", capture_begin)
+    left = [(name, torch.nn.Parameter(param.detach().cuda())) for name, param in _parameters()]
+    right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
+    reference, fast = HybridMuon(left), HybridMuon(right)
+    reference.execution_mode = "legacy"
+    generator = torch.Generator().manual_seed(16)
+    for _ in range(8):
+        for (_, a), (_, b) in zip(left, right):
+            grad = torch.randn(a.shape, generator=generator).cuda()
+            a.grad = grad
+            b.grad = grad.clone()
+        reference.step()
+        fast.step()
+    assert not errors
+    assert fast._bucket_graphs
+    for (_, a), (_, b) in zip(left, right):
+        torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)

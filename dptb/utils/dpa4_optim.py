@@ -261,6 +261,11 @@ class WarmupThenReduceLROnPlateau:
         self.plateau.load_state_dict(state_dict["plateau_state_dict"])
 
 
+# DataLoader pin-memory and NCCL watchdog threads keep issuing CUDA calls during training;
+# global capture mode would let any of them invalidate a capture in progress.
+_CAPTURE_MODE = "thread_local"
+
+
 class HybridMuon(Optimizer):
     """Hybrid Muon/AdamW optimizer with generic flattened-weight routing.
 
@@ -785,7 +790,7 @@ class HybridMuon(Optimizer):
                     self._newton_schulz_eager(static_input)
                 torch.cuda.current_stream(x.device).wait_stream(stream)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream):
+                with torch.cuda.graph(graph, stream=stream, capture_error_mode=_CAPTURE_MODE):
                     output = self._newton_schulz_eager(static_input)
                 self._ns_graphs[key] = (static_input, output, graph)
         static_input, output, graph = self._ns_graphs[key]
@@ -1134,7 +1139,7 @@ class HybridMuon(Optimizer):
                     self._muon_bucket_math(*static_inputs, lr_tensor, params[0].dtype, group, first_ratio, warmed)
                 torch.cuda.current_stream(update.device).wait_stream(stream)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream):
+                with torch.cuda.graph(graph, stream=stream, capture_error_mode=_CAPTURE_MODE):
                     outputs = self._muon_bucket_math(*static_inputs, lr_tensor, params[0].dtype,
                                                      group, first_ratio, warmed)
                 self._bucket_graphs[key] = (static_inputs, outputs, graph)
