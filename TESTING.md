@@ -21,7 +21,7 @@ python -m pytest h0/tests_h0fast
 
 可选依赖的测试在依赖缺失时说明原因并跳过。`dptb/tests/_requires.py` 提供 `requires_cuda`、`requires_multi_gpu`、`requires_so2_cuda`、`requires_module(name)`，NACF 原生依赖由 `conftest.py` 延迟检查。真实参考数据测试由各测试说明的环境变量启用；数据和生成结果放在仓库外。
 
-安装 SO2CUDA 0.2.0 后，可以运行受影响的 CUDA 测试：
+安装 SO2CUDA 0.3.0 后，可以运行受影响的 CUDA 测试：
 
 ```bash
 python -m pytest dptb/tests/test_so2_kernels_cuda.py

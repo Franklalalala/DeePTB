@@ -179,7 +179,7 @@ PDQ-MoE。历史图路由 `LemMoEV3`/`LemMoEV3H0` 保留自己的 forward 与层
 
 ## 可选 CUDA 后端
 
-DeePTB 不依赖 SO2CUDA 才能运行。安装 SO2CUDA 0.2.0 后，默认 `SO2_CUDA_BACKEND=auto` 对受支持的 CUDA/FP32 输入自动使用加速；`SO2_CUDA_BACKEND=off` 选择 PyTorch 参考路径。完整开关和限制见 [SO2 后端](so2_backend.md)，UniTB 与 UniTB-dense 的加速测试见 [SO2CUDA README](https://github.com/Franklalalala/SO2CUDA#readme)。
+DeePTB 不依赖 SO2CUDA 才能运行。安装 SO2CUDA 0.3.0 后，默认 `SO2_CUDA_BACKEND=auto` 对受支持的 CUDA/FP32 输入自动使用加速；`SO2_CUDA_BACKEND=off` 选择 PyTorch 参考路径。完整开关和限制见 [SO2 后端](so2_backend.md)，UniTB 与 UniTB-dense 的加速测试见 [SO2CUDA README](https://github.com/Franklalalala/SO2CUDA#readme)。
 
 UniTB-dense 通过 `so2_backend.dense_forward` 使用 `dense_pairs`；UniTB 使用 activation fused-P0 与分组 GEMM。旧接口名保留用于兼容，不能据名称推断已执行的路线。CPU 与 CUDA 在 cutoff 边界附近的活动边选择可能不同，个别边输出不等价；检查点等价性按同设备验证。
 
