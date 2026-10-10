@@ -92,7 +92,7 @@ def test_sparse_gradient_is_rejected_and_closure_remains_differentiable():
 
 
 @pytest.mark.parametrize("magma_lite", [False, True])
-@pytest.mark.parametrize("execution_mode", ["batched", "foreach"])
+@pytest.mark.parametrize("execution_mode", ["batched", "foreach", "fast"])
 def test_batched_execution_preserves_per_parameter_states_and_diagnostics(magma_lite, execution_mode):
     left = _parameters()
     right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
@@ -162,3 +162,44 @@ def test_foreach_execution_supports_mixed_parameter_dtypes_and_group_options():
     for (_, a), (_, b) in zip(left, right):
         torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
     _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)
+
+
+@pytest.mark.parametrize("temperature", [1e-20, 0.5, 2.0, 4.0])
+def test_fast_magma_constants_match_tensor_formula(temperature):
+    left = _parameters()
+    right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
+    reference = HybridMuon(left, magma_temperature=temperature)
+    fast = HybridMuon(right, magma_temperature=temperature)
+    reference.execution_mode = "legacy"
+    fast.execution_mode = "fast"
+    for (_, a), (_, b) in zip(left, right):
+        a.grad = torch.ones_like(a)
+        b.grad = a.grad.clone()
+    reference.step()
+    fast.step()
+    for (_, a), (_, b) in zip(left, right):
+        torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+    _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fast_cuda_graph_preserves_clocks_and_checkpoint_continuation():
+    left = [(name, torch.nn.Parameter(param.detach().cuda())) for name, param in _parameters()]
+    right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
+    reference, fast = HybridMuon(left), HybridMuon(right)
+    reference.execution_mode = "legacy"
+    generator = torch.Generator().manual_seed(14)
+    for step in range(8):
+        for index, ((_, a), (_, b)) in enumerate(zip(left, right)):
+            grad = torch.randn(a.shape, generator=generator).cuda()
+            a.grad = None if step == 3 and index == 1 else grad
+            b.grad = None if a.grad is None else grad.clone()
+        reference.step()
+        fast.step()
+        for (_, a), (_, b) in zip(left, right):
+            torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+        _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)
+        if step == 4:
+            fast.load_state_dict(copy.deepcopy(reference.state_dict()))
+    for key, value in reference.get_diagnostics().items():
+        assert value == pytest.approx(fast.get_diagnostics()[key], rel=3e-5, abs=2e-6)

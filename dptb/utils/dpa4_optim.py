@@ -1,5 +1,6 @@
 import logging
 import math
+import struct
 from fnmatch import fnmatchcase
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -261,7 +262,13 @@ class WarmupThenReduceLROnPlateau:
 
 
 class HybridMuon(Optimizer):
-    """Hybrid Muon/AdamW optimizer with generic flattened-weight routing."""
+    """Hybrid Muon/AdamW optimizer with generic flattened-weight routing.
+
+    ``execution_mode`` selects ``fast`` (default), ``foreach``, ``batched``,
+    ``cached`` or ``legacy`` without changing the checkpoint format.
+    Set ``use_cuda_graph=False`` to disable the fast mode's Newton--Schulz
+    graph cache. Graph capture is lazy; timing requires a warmup step.
+    """
 
     _FAST_COEFF = (3.4445, -4.7750, 2.0315)
     _POLISH_COEFF = (2.0, -1.5, 0.5)
@@ -441,7 +448,10 @@ class HybridMuon(Optimizer):
         )
         params, self._param_names = _normalize_named_parameters(params)
         # Execution caches are deliberately absent from optimizer checkpoints.
-        self.execution_mode = "foreach"
+        self.execution_mode = "fast"
+        self.use_cuda_graph = True
+        self._ns_graphs = {}
+        self._magma_constants = {}
         self._route_cache = {}
         self._route_signature = None
         self._use_route_cache = False
@@ -471,6 +481,7 @@ class HybridMuon(Optimizer):
                 state["step"] = int(step.item())
         self._route_summary_cache = None
         self._route_signature = None
+        self._ns_graphs = {}
         return result
 
     _ROUTE_OPTIONS = (
@@ -504,6 +515,7 @@ class HybridMuon(Optimizer):
         if signature == self._route_signature:
             return
         self._route_cache = {}
+        self._ns_graphs = {}
         self._batch_safe_groups = set()
         for group in self.param_groups:
             pointers = [p.untyped_storage().data_ptr() for p in group["params"]
@@ -733,6 +745,35 @@ class HybridMuon(Optimizer):
         return x.reshape(original_shape).to(dtype=update.dtype)
 
     def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
+        if self.execution_mode != "fast" or not self.use_cuda_graph or not x.is_cuda:
+            return self._newton_schulz_eager(x)
+        if torch.cuda.is_current_stream_capturing():
+            return self._newton_schulz_eager(x)
+        key = (x.device, x.dtype, tuple(x.shape), tuple(x.stride()),
+               torch.are_deterministic_algorithms_enabled(), torch.backends.cuda.matmul.allow_tf32)
+        if key not in self._ns_graphs:
+            # Only the fixed tensor computation is captured. Optimizer clocks,
+            # routing and diagnostics still advance on every Python step.
+            with torch.cuda.device(x.device):
+                static_input = torch.empty_like(x)
+                static_input.copy_(x)
+                stream = torch.cuda.Stream(device=x.device)
+                stream.wait_stream(torch.cuda.current_stream(x.device))
+                with torch.cuda.stream(stream):
+                    self._newton_schulz_eager(static_input)
+                torch.cuda.current_stream(x.device).wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = self._newton_schulz_eager(static_input)
+                self._ns_graphs[key] = (static_input, output, graph)
+        static_input, output, graph = self._ns_graphs[key]
+        static_input.copy_(x)
+        graph.replay()
+        # This is a borrowed buffer. The fast bucket path consumes it before
+        # calling this function again; the deferred batched path stays eager.
+        return output
+
+    def _newton_schulz_eager(self, x: torch.Tensor) -> torch.Tensor:
 
         # Additive epsilon, matching the reference Muon implementation
         # (KellerJordan/Muon: ``X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)``).
@@ -861,8 +902,8 @@ class HybridMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self.execution_mode not in {"legacy", "cached", "batched", "foreach"}:
-            raise ValueError("execution_mode must be legacy, cached, batched or foreach")
+        if self.execution_mode not in {"legacy", "cached", "batched", "foreach", "fast"}:
+            raise ValueError("execution_mode must be legacy, cached, batched, foreach or fast")
         if self.execution_mode != "legacy":
             self._refresh_route_cache()
             self._use_route_cache = True
@@ -877,7 +918,7 @@ class HybridMuon(Optimizer):
             self._ensure_group_defaults(group)
             lr = group["lr"]
             weight_decay = group["weight_decay"]
-            if self.execution_mode == "foreach" and id(group) in self._batch_safe_groups:
+            if self.execution_mode in {"foreach", "fast"} and id(group) in self._batch_safe_groups:
                 self._foreach_group_step(group, lr, weight_decay)
                 continue
             if self.execution_mode == "batched" and id(group) in self._batch_safe_groups:
@@ -996,9 +1037,7 @@ class HybridMuon(Optimizer):
             denom = (grads.norm(dim=(-2, -1)) * update.norm(dim=(-2, -1))).clamp_min(1.0e-30)
             chi = (numerator / denom).clamp(-1.0, 1.0)
             tau = group["magma_temperature"]
-            lo = torch.sigmoid(chi.new_tensor(-1.0 / tau))
-            hi = torch.sigmoid(chi.new_tensor(1.0 / tau))
-            score = ((torch.sigmoid(chi / tau) - lo) / (hi - lo)).clamp(0.0, 1.0)
+            score = self._magma_score(chi, tau)
             for state, part in zip(states, score.split(counts)):
                 if "magma_ema" not in state or state["magma_ema"].shape != part.shape:
                     state["magma_ema"] = torch.zeros_like(part)
@@ -1155,9 +1194,7 @@ class HybridMuon(Optimizer):
         chi = (numerator / denom).clamp(min=-1.0, max=1.0)
 
         tau = group["magma_temperature"]
-        lo = torch.sigmoid(chi.new_tensor(-1.0 / tau))
-        hi = torch.sigmoid(chi.new_tensor(1.0 / tau))
-        score = ((torch.sigmoid(chi / tau) - lo) / (hi - lo)).clamp(min=0.0, max=1.0)
+        score = self._magma_score(chi, tau)
 
         if "magma_ema" not in state or state["magma_ema"].shape != score.shape:
             state["magma_ema"] = torch.zeros_like(score)
@@ -1171,6 +1208,30 @@ class HybridMuon(Optimizer):
         else:
             scale_view = scale.reshape(*effective_shape[:-2], 1, 1)
         return scale_view.expand(effective_shape).reshape(param.shape).to(dtype=param.dtype)
+
+    @staticmethod
+    def _float32(value):
+        try:
+            return struct.unpack("f", struct.pack("f", value))[0]
+        except OverflowError:
+            return math.copysign(math.inf, value)
+
+    def _magma_score(self, chi, tau):
+        if self.execution_mode == "fast":
+            if tau not in self._magma_constants:
+                # Match the FP32 scalar input and subtraction rounding. The
+                # stable sigmoid form also handles arbitrarily small tau.
+                z = self._float32(1.0 / tau)
+                exponential = math.exp(-z)
+                lo = self._float32(exponential / (1.0 + exponential))
+                hi = self._float32(1.0 / (1.0 + exponential))
+                self._magma_constants[tau] = (lo, self._float32(hi - lo))
+            lo, span = self._magma_constants[tau]
+        else:
+            lo = torch.sigmoid(chi.new_tensor(-1.0 / tau))
+            hi = torch.sigmoid(chi.new_tensor(1.0 / tau))
+            span = hi - lo
+        return ((torch.sigmoid(chi / tau) - lo) / span).clamp(0.0, 1.0)
 
     def _clip_muon_update(self, param, update, group, state, lr):
         blocks = self._reshape_to_matrix_batch_for_param(update.float(), param, group)
