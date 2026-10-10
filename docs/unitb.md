@@ -80,6 +80,48 @@ Switch 需要 `top_k=1`、`num_shared_experts=0`，并使用其自己的原始�
 `core_experts` 视为专家参数，`basis_left/right` 视为普通共享参数。
 `full` 与 `pdq_moe` 的参数结构不同，不能通过改配置强行互载。
 
+## UniTB-SLEM
+
+`layer_topology` 选择交互层拓扑，默认 `"lem"`：每层先更新边、再由新边特征更新节点，
+节点特征因此能感知截断球以外的原子。设 `"layer_topology": "slem"` 得到 UniTB-SLEM，
+其余配置（PDQ-MoE、先验路由、归一化、one-hot 增益、时间条件、电荷头）保持不变：
+
+```json
+{"method": "unitb", "layer_topology": "slem"}
+```
+
+UniTB-SLEM 在每条边上增加隐藏态 \(x_{ij}\)，初值 \(x^{0}_{ij}=e^{0}_{ij}\)
+（先验初始化与时间条件之后的初始边特征）。每层依次执行三个 SO(2) 映射，
+三者都读取本层输入的节点特征 \(h\)，\(\tilde{\cdot}\) 表示等变 RMS 归一化：
+
+\[
+\begin{aligned}
+x_{ij} &\leftarrow \mathrm{Res}(x_{ij}) + W_x(z_{ij})\,\mathrm{SO2}_x\big[\tilde h_i,\tilde x_{ij}\big],\\
+e_{ij} &\leftarrow \mathrm{Res}(e_{ij}) + W_e(z_{ij})\,\mathrm{SO2}_e\big[\tilde h_i,\tilde x_{ij},\tilde h_j\big],\\
+h_i &\leftarrow \mathrm{Res}(h_i) + \tfrac{1}{\sqrt{\bar N}}\textstyle\sum_j W_h(z_{ij})\,\mathrm{SO2}_h\big[\tilde h_i,\tilde x_{ij}\big].
+\end{aligned}
+\]
+
+隐藏态与边更新之后接键型 one-hot 增益，节点更新之后接元素 one-hot 增益，残差系数同 UniTB。
+边潜变量 \(z_{ij}\) 只在隐藏态更新中更新（输入为旧潜变量、新 \(x_{ij}\) 的标量与键型
+one-hot，乘截断函数后按残差系数混合），随后的边、节点更新使用更新后的潜变量。
+边特征只进入下一层的边残差和边输出头，不回流到节点或隐藏态，所以节点特征只依赖
+原子 \(i\) 截断球内的原子。三个映射使用同一种 SO2_Linear、同一组路由系数和 Wigner
+旋转；`so2_moe_layers` 的层号同时作用于该层三个映射，专家混合模式与 UniTB 相同。
+每层隐藏态输出 `irreps_hidden`（含最后一层），边、节点输出 irreps 与 UniTB 相同；
+`use_interpolation_out` 只作用于末层的边、节点映射。
+
+UniTB 与 UniTB-dense（`num_experts: 1`）都可使用该选项；旧方法名
+`lem_moe_v3_edge_h0`、`lem_moe_v3_edge` 走同一前向，也接受它。图路由的历史接口、
+block-native 输出路由和归档选项与 `"slem"` 组合时构建报错。逐边路由与 dense 下节点特征
+严格局域；`structure_mole` 的路由系数来自整图描述子，本身依赖整个结构。
+
+UniTB-SLEM 参数更多（UniTB 与 UniTB-dense 默认配置约增加 40%–50%，随基组与输出头变化），
+每层多一次 SO(2) 映射，训练显存与单步时间也相应增加。检查点布局不同：新增
+`layers.*.hidden_update.*`，`layers.*.edge_update` 不再含潜变量更新的 `ln`、
+`latents_mlp_1/2`。`"lem"` 的模块、参数、初始化随机数消耗与输出都不变，
+已有检查点照常严格加载。训练入口示例见 [examples/unitb/slem](../examples/unitb/slem/input.json)。
+
 ## 先验与电荷平衡头
 
 数据提供 `node_h0`、`edge_h0`；也可以用 `h0_node_key`、`h0_edge_key`
@@ -151,7 +193,11 @@ and four independent cores. Bond-type and H₀ CG Gram features select two exper
 renormalized gates mix linear outputs before activation.
 
 Use `{"method":"unitb"}` for the UniTB defaults or add `"num_experts":1` for UniTB-dense.
-Explicit options override defaults. Charge equilibration and training-only prior
+Explicit options override defaults. `"layer_topology": "slem"` selects UniTB-SLEM: each
+layer adds a hidden edge state updated from `[h_i, x_ij]` (which also owns the edge-latent
+update), the edge update reads `[h_i, x_ij, h_j]`, and node messages read `[h_i, x_ij]`, so
+node features depend only on atoms within one cutoff sphere. It adds parameters and a
+`hidden_update` module per layer; the default `"lem"` keeps every existing checkpoint layout. Charge equilibration and training-only prior
 noise are configured separately. The charge solve is neutral per structure;
 `qeq_local` controls local readout plus electrostatic response, and the
 `context/local_only` control removes that response. Physical overlap must be

@@ -1,6 +1,7 @@
 # UniTB 训练入口示例
 
 `input.json`（UniTB）与 `dense/input.json`（UniTB-dense）通过仓库的标准训练配置入口读取。
+`slem/input.json`（UniTB-SLEM）只比 `input.json` 多 `"layer_topology": "slem"`。
 embedding 只列出与默认不同的选项。示例是 H/O、compact uu-real、H−H0 监督，
 请把 basis 改成数据的真实轨道基组，保留其 SOC 与表示约定；不要只替换元素名称。
 

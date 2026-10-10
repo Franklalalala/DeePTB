@@ -1,0 +1,83 @@
+{
+  "common_options": {
+    "basis": {
+      "H": "2s1p",
+      "O": "2s2p1d"
+    },
+    "device": "cuda:0",
+    "has_soc": true,
+    "nextham_uureal_mask": true
+  },
+  "model_options": {
+    "embedding": {
+      "method": "unitb",
+      "layer_topology": "slem"
+    },
+    "prediction": {
+      "method": "e3tb",
+      "scale_type": "no_scale",
+      "scales_trainable": false,
+      "shifts_trainable": false
+    },
+    "shift_head": {
+      "mode": "atom",
+      "response": {
+        "kind": "qeq"
+      }
+    }
+  },
+  "train_options": {
+    "num_epoch": 1,
+    "batch_size": 1,
+    "optimizer": {
+      "type": "Adam",
+      "lr": 0.001
+    },
+    "loss_options": {
+      "train": {
+        "method": "hamil_abs"
+      }
+    },
+    "prior_noise_augmentation": true,
+    "flow_options": {
+      "enabled": false,
+      "t_max": 0.0,
+      "prior": "te",
+      "te_prior_mode": "typewise",
+      "te_prior_per_graph": true,
+      "te_prior_scale_reference": "target",
+      "te_prior_sigma": 0.5
+    },
+    "distance_ranges": [
+      [
+        0.0,
+        1e-06
+      ]
+    ],
+    "clip_last_expert_range": true
+  },
+  "data_options": {
+    "train": {
+      "type": "LMDBDataset",
+      "root": "DATA_ROOT/train",
+      "prefix": "data",
+      "get_Hamiltonian": true,
+      "get_H0": true,
+      "h0_key": "hamiltonian_0",
+      "prefer_precomputed_h0": true,
+      "target_kind": "h0res",
+      "overlap_sidecar_root": "OVERLAP_ROOT/train"
+    },
+    "validation": {
+      "type": "LMDBDataset",
+      "root": "DATA_ROOT/validation",
+      "prefix": "data",
+      "get_Hamiltonian": true,
+      "get_H0": true,
+      "h0_key": "hamiltonian_0",
+      "prefer_precomputed_h0": true,
+      "target_kind": "h0res",
+      "overlap_sidecar_root": "OVERLAP_ROOT/validation"
+    }
+  }
+}

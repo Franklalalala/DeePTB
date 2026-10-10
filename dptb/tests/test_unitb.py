@@ -79,15 +79,19 @@ def _batch(model, dtype=torch.float32):
     }
 
 
+@pytest.mark.parametrize("topology", ["lem", "slem"])
 @pytest.mark.parametrize("kind", ["dense", "x1"])
 @pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64], indirect=True)
-def test_minimal_models_use_production_defaults_and_train(kind, default_dtype):
+def test_minimal_models_use_production_defaults_and_train(kind, topology, default_dtype):
     dtype = default_dtype
     torch.manual_seed(81)
-    model = _model(_options(kind), dtype=str(dtype).removeprefix("torch."))
+    overrides = {} if topology == "lem" else {"layer_topology": topology}
+    model = _model(_options(kind, **overrides), dtype=str(dtype).removeprefix("torch."))
     embedding = model.embedding
     assert isinstance(embedding, UniTB)
     assert isinstance(embedding.init_layer, H0InitLayer)
+    assert embedding.layer_topology == topology
+    assert all(hasattr(layer, "hidden_update") == (topology == "slem") for layer in embedding.layers)
     linears = [module for module in embedding.modules() if isinstance(module, PDQMoE)]
     assert linears
     if kind == "dense":
@@ -113,6 +117,145 @@ def test_minimal_models_use_production_defaults_and_train(kind, default_dtype):
         assert any(layer.core_experts.grad is not None and torch.count_nonzero(layer.core_experts.grad)
                    for layer in linears)
         assert torch.count_nonzero(embedding.router.net[0].weight.grad)
+    if topology == "slem":
+        # Every SO(2) map is trained, and the edge latents now come from the hidden-state update.
+        for layer in embedding.layers:
+            for module in (layer.hidden_update.tp, layer.edge_update.tp, layer.node_update.tp,
+                           layer.hidden_update.latents_mlp_2):
+                assert any(p.grad is not None and torch.count_nonzero(p.grad) for p in module.parameters())
+
+
+@pytest.mark.parametrize("kind", ["dense", "x1"])
+def test_lem_topology_is_the_default_model(kind):
+    torch.manual_seed(86)
+    default = _model(_options(kind)).eval()
+    torch.manual_seed(86)
+    explicit = _model(_options(kind, layer_topology="lem")).eval()
+    assert default.state_dict().keys() == explicit.state_dict().keys()
+    assert all(torch.equal(value, explicit.state_dict()[key]) for key, value in default.state_dict().items())
+    data = _batch(default)
+    with torch.no_grad():
+        expected, actual = default(copy.deepcopy(data)), explicit(copy.deepcopy(data))
+    for key in (_keys.NODE_FEATURES_KEY, _keys.EDGE_FEATURES_KEY):
+        assert torch.equal(actual[key], expected[key])
+
+
+@pytest.mark.parametrize("kind", ["dense", "x1"])
+def test_slem_checkpoint_layout_moves_latent_update_to_hidden_state(kind):
+    lem = set(_model(_options(kind)).state_dict())
+    slem = set(_model(_options(kind, layer_topology="slem")).state_dict())
+    latent_update = (".edge_update.ln.", ".edge_update.latents_mlp_1.", ".edge_update.latents_mlp_2.")
+    assert lem - slem and all(any(part in key for part in latent_update) for key in lem - slem)
+    assert slem - lem and all(".hidden_update." in key for key in slem - lem)
+    assert any(".hidden_update.latents_mlp_2." in key for key in slem - lem)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"so2_expert_mixing_mode": "post_activation_slot"},
+    {"so2_expert_mixing_mode": "post_activation_shared", "edge_router_gate": "full_softmax"},
+    {"so2_moe_layers": [1]},
+])
+def test_slem_shares_routing_options_across_its_three_maps(overrides):
+    torch.manual_seed(89)
+    model = _model(_options("x1", layer_topology="slem", **overrides))
+    routed = set(model.embedding.so2_moe_layers)
+    for index, layer in enumerate(model.embedding.layers):
+        updates = (layer.hidden_update, layer.edge_update, layer.node_update)
+        assert {update.tp.num_experts for update in updates} == {4 if index in routed else 0}
+        assert len({update.so2_expert_mixing_mode for update in updates}) == 1
+    output = model(_batch(model))
+    loss = sum(output[key].square().mean() for key in (_keys.NODE_FEATURES_KEY, _keys.EDGE_FEATURES_KEY))
+    loss.backward()
+    gradients = [p.grad for p in model.parameters() if p.grad is not None]
+    assert gradients and all(torch.isfinite(g).all() for g in gradients)
+
+
+def _locality_batch(model, positions, k_prior_scale):
+    """O(i) H(j) O(k) H(l): |r_ik| > r_max, j within r_max of i and k, l only near i and j."""
+    h = model.idp.chemical_symbol_to_type["H"]
+    o = model.idp.chemical_symbol_to_type["O"]
+    symbols, types = ["O", "H", "O", "H"], torch.tensor([[o], [h], [o], [h]])
+    pairs = [(a, b) for a in range(4) for b in range(4)
+             if a != b and torch.linalg.norm(positions[a] - positions[b]) < 4.0]
+    generator = torch.Generator().manual_seed(87)
+    dim = model.idp.reduced_matrix_element
+    node_h0 = torch.randn(4, dim, generator=generator)
+    edge_h0 = torch.randn(len(pairs), dim, generator=generator)
+    node_h0[2] *= k_prior_scale
+    for row, pair in enumerate(pairs):
+        if 2 in pair:
+            edge_h0[row] *= k_prior_scale
+    return pairs, {
+        _keys.POSITIONS_KEY: positions.clone(),
+        _keys.EDGE_INDEX_KEY: torch.tensor(pairs).T.contiguous(),
+        _keys.ATOM_TYPE_KEY: types,
+        _keys.EDGE_TYPE_KEY: torch.tensor(
+            [model.idp.bond_to_type[f"{symbols[a]}-{symbols[b]}"] for a, b in pairs]),
+        _keys.NODE_H0_KEY: node_h0,
+        _keys.EDGE_H0_KEY: edge_h0,
+    }
+
+
+@pytest.mark.parametrize("topology", ["lem", "slem"])
+@pytest.mark.parametrize("kind", ["dense", "x1"])
+def test_slem_node_features_stay_within_one_cutoff_sphere(kind, topology):
+    torch.manual_seed(88)
+    model = _model(_options(kind, layer_topology=topology)).eval()
+    if kind == "x1":
+        # Let the routes depend on the H0 blocks of each edge.
+        with torch.no_grad():
+            model.embedding.router.net[0].weight[:, model.embedding.edge_one_hot_dim:].normal_(std=0.1)
+    captured = []
+    model.embedding.out_node.register_forward_pre_hook(lambda module, args: captured.append(args[0].clone()))
+    positions = torch.tensor([[0.0, 0.0, 0.0], [2.5, 0.0, 0.0], [5.2, 0.6, 0.0], [-1.0, 1.2, 0.3]])
+    moved = positions.clone()
+    moved[2] = torch.tensor([5.4, -0.5, 0.7])
+    pairs, data = _locality_batch(model, positions, 1.0)
+    # Only k moves; its own H0 blocks change as well, all other blocks stay.
+    moved_pairs, moved_data = _locality_batch(model, moved, 1.7)
+    assert moved_pairs == pairs and (0, 2) not in pairs and (1, 2) in pairs
+    with torch.no_grad():
+        model(data)
+        model(moved_data)
+    before, after = captured
+    i, j, l = 0, 1, 3
+    assert not torch.equal(after[j], before[j])
+    if topology == "slem":
+        assert torch.equal(after[i], before[i]) and torch.equal(after[l], before[l])
+    else:
+        assert not torch.equal(after[i], before[i])
+
+
+@pytest.mark.parametrize("method", ["unitb", "lem_moe_v3_edge_h0"])
+def test_layer_topology_option_is_validated(method):
+    from dargs.dargs import ArgumentValueError
+    from dptb.utils.argcheck import model_options
+
+    schema = model_options()
+    required = {} if method == "unitb" else dict(
+        irreps_hidden="4x0e+4x1o", avg_num_neighbors=2.0, r_max=4.0, n_layers=2)
+
+    def normalized(**extra):
+        config = {"embedding": dict(method=method, **required, **extra), "prediction": {"method": "e3tb"}}
+        value = schema.normalize_value(config)
+        schema.check_value(value, strict=True)
+        return value["embedding"]["layer_topology"]
+
+    assert normalized() == "lem"
+    assert normalized(layer_topology="slem") == "slem"
+    with pytest.raises(ArgumentValueError):
+        normalized(layer_topology="ring")
+
+
+def test_slem_rejects_unsupported_backbones_and_options():
+    with pytest.raises(ValueError, match="layer_topology must be one of"):
+        _model(_options("dense", layer_topology="ring"))
+    with pytest.raises(ValueError, match="edge-routed UniTB forward"):
+        _model(_options("dense", layer_topology="slem"), method="lem_moe_v3_h0")
+    with pytest.raises(ValueError, match="archived model"):
+        _model(dict(_options("dense", layer_topology="slem"), only2b=True), method="lem_moe_v3_edge_h0")
+    with pytest.raises(ValueError, match="block-native"):
+        _model(_options("dense", layer_topology="slem", output_route="h_b0"))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -262,10 +405,12 @@ def test_old_h0_marker_mapping_is_strict_and_preserves_legacy_math():
         _model(_options("dense", h0_ao_cg=True)).load_state_dict(state, strict=True)
 
 
+@pytest.mark.parametrize("topology", ["lem", "slem"])
 @pytest.mark.parametrize("kind", ["dense", "x1"])
-def test_float64_rotation_with_ao_priors(default_dtype, kind):
+def test_float64_rotation_with_ao_priors(default_dtype, kind, topology):
     torch.manual_seed(83)
-    model = _model(_options(kind), dtype="float64").eval()
+    overrides = {} if topology == "lem" else {"layer_topology": topology}
+    model = _model(_options(kind, **overrides), dtype="float64").eval()
     data = _batch(model, torch.float64)
     if kind == "x1":
         # Give the H0 descriptor an active role; its columns start at zero when

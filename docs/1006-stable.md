@@ -6,7 +6,7 @@
 
 | 位置 | 功能 |
 | --- | --- |
-| `dptb/nn/embedding/unitb.py` | UniTB 与 UniTB-dense；既有生产名称由兼容接口解析 |
+| `dptb/nn/embedding/unitb.py` | UniTB 与 UniTB-dense，`layer_topology` 可选 SLEM 交互层（UniTB-SLEM）；既有生产名称由兼容接口解析 |
 | `dptb/nn/embedding/lem.py`、`slem.py` | 上游无先验基线 |
 | `dptb/nn/embedding/lem_prior.py`、`slem_prior.py` | 带先验输入的基线 |
 | `dptb/data` | 图、LMDB 记录、侧车、AO block 与特征转换 |

@@ -14,7 +14,8 @@ from dptb.nn.embedding.unitb_structure import (
 from dptb.nn.pdq_moe import PDQMoELinear, PDQMoERouting
 
 
-def _model(scope, execution="merged_core"):
+def _model(scope, execution="merged_core", topology="lem"):
+    topology_option = {} if topology == "lem" else {"layer_topology": topology}
     return build_model(
         common_options=dict(basis={"H": "1s", "O": "1s1p"}, overlap=False,
                             dtype="float32", device="cpu"),
@@ -27,6 +28,7 @@ def _model(scope, execution="merged_core"):
             mole_linear_mode="split_loop", so2_fusion_mode="streamed_m_major_ref",
             mole_expert_rank=2, use_interpolation_out=False,
             structure_mole=dict(enabled=True, route_scope=scope, execution=execution),
+            **topology_option,
         ), prediction=dict(method="e3tb", scale_type="no_scale")),
         train_options={}, no_check=True,
     )
@@ -46,14 +48,15 @@ def _data(model, scale=1.0):
     }
 
 
+@pytest.mark.parametrize("topology", ["lem", "slem"])
 @pytest.mark.parametrize("scope,execution", [
     ("constant", "merged_core"), ("structure", "merged_core"), ("structure", "reference"),
 ])
-def test_structure_checkpoint_and_gradients(scope, execution, monkeypatch):
+def test_structure_checkpoint_and_gradients(scope, execution, topology, monkeypatch):
     monkeypatch.delenv("DPTB_SO2_FUSION_MODE", raising=False)
     monkeypatch.delenv("DPTB_SO2_FUSE_M_CUBLAS", raising=False)
     torch.manual_seed(42)
-    model = _model(scope, execution)
+    model = _model(scope, execution, topology)
     data = _data(model)
     if scope == "structure":
         with pytest.raises(RuntimeError, match="uncalibrated"):
@@ -64,7 +67,7 @@ def test_structure_checkpoint_and_gradients(scope, execution, monkeypatch):
     else:
         assert model.embedding.router is None
         assert model.embedding.structure_stats is None
-    restored = _model(scope, execution)
+    restored = _model(scope, execution, topology)
     restored.load_state_dict(model.state_dict(), strict=True)
     expected = model(copy.deepcopy(data))
     actual = restored(copy.deepcopy(data))
