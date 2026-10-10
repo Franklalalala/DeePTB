@@ -112,6 +112,7 @@ class Trainer(BaseTrainer):
             batch_size=train_options["batch_size"],
             shuffle=True,
             dynamic_batch=train_options.get("dynamic_batch", None),
+            **self._train_loader_worker_kwargs(train_options),
         )
 
         if self.use_reference:
@@ -785,6 +786,7 @@ class Trainer(BaseTrainer):
             trainer.ep = int(resume.epoch) + 1
             if own_rng is not None:
                 restore_rng_state(own_rng)
+                trainer._prepare_epoch_restart_worker_rng()
             if resume.epoch_scheduler_step_pending and not trainer.update_lr_per_iter:
                 try:
                     trainer._lr_step_on_epoch_end()
@@ -793,6 +795,28 @@ class Trainer(BaseTrainer):
                         "Failed to replay epoch-end LR step on restart: %s", exc
                     )
         return trainer
+
+    def _prepare_epoch_restart_worker_rng(self):
+        """Keep replacement persistent workers off the restored training RNG.
+
+        An uninterrupted loader reuses its workers after the first epoch. A
+        restarted loader instead draws a new worker base seed when its first
+        iterator is created. Give that extra draw a private copy of the CPU
+        RNG, leaving the sampler and model on the checkpoint's original stream.
+        Assigning the loader generator after construction deliberately leaves
+        a RandomSampler's generator unchanged. Non-persistent loaders still
+        consume their usual base-seed draw on every epoch in both paths.
+
+        This does not restore random per-item transforms in worker processes.
+        """
+        loaders = [self.train_loader]
+        if self.use_reference:
+            loaders.append(self.reference_loader)
+        for loader in loaders:
+            if (getattr(loader, "num_workers", 0) > 0
+                    and getattr(loader, "persistent_workers", False)
+                    and getattr(loader, "generator", None) is None):
+                loader.generator = torch.Generator().set_state(torch.get_rng_state())
 
     def epoch(self) -> None:
         # Reset the per-epoch committed-batch cursor; consume any one-shot
@@ -915,15 +939,37 @@ class Trainer(BaseTrainer):
         return int(plan.get("skip_batches", 0)), plan.get("rng_state")
 
     @staticmethod
+    def _train_loader_worker_kwargs(train_options):
+        """Worker options for the train loader, read like MultiTrainer reads them.
+
+        Without ``train_num_workers`` the loader keeps its in-process defaults.
+        Workers only decode items in parallel; the batch sampler stays in the
+        main process, so batch order and content are unchanged.
+        """
+        workers = int(train_options.get("train_num_workers", 0) or 0)
+        if workers <= 0:
+            return {}
+        return {
+            "num_workers": workers,
+            "pin_memory": bool(train_options.get("data_pin_memory", torch.cuda.is_available())),
+            "persistent_workers": bool(train_options.get("data_persistent_workers", True)),
+            "prefetch_factor": int(train_options.get("data_prefetch_factor", 2)),
+        }
+
+    @staticmethod
     def _loader_exact_replay_status(loader):
         """Return ``(is_exact, reason)`` for one loader's replay boundary.
 
-        This deliberately covers only deterministic batch *order*. It does not
-        capture worker RNG state or arbitrary random dataset transforms, so any
-        ``num_workers > 0`` loader is conservatively inexact.
+        This deliberately covers only deterministic batch *order*. Worker RNG
+        state and random dataset transforms are not captured, so a
+        ``num_workers > 0`` loader is exact only when its dataset declares
+        ``deterministic_items`` (item decoding uses no randomness).
         """
         if int(getattr(loader, "num_workers", 0) or 0) > 0:
-            return False, "num_workers>0 worker RNG/random transforms are not replayed"
+            dataset = getattr(loader, "dataset", None)
+            dataset = getattr(dataset, "dataset", dataset)
+            if not getattr(dataset, "deterministic_items", False):
+                return False, "num_workers>0 worker RNG/random transforms are not replayed"
         batch_sampler = getattr(loader, "batch_sampler", None)
         if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
             return True, "per-epoch-seeded batch sampler"
