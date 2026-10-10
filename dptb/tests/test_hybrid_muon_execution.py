@@ -92,7 +92,8 @@ def test_sparse_gradient_is_rejected_and_closure_remains_differentiable():
 
 
 @pytest.mark.parametrize("magma_lite", [False, True])
-def test_batched_execution_preserves_per_parameter_states_and_diagnostics(magma_lite):
+@pytest.mark.parametrize("execution_mode", ["batched", "foreach"])
+def test_batched_execution_preserves_per_parameter_states_and_diagnostics(magma_lite, execution_mode):
     left = _parameters()
     right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
     options = dict(lr=0.01, magma_lite=magma_lite, adamw_name_patterns=("*router*",),
@@ -100,7 +101,7 @@ def test_batched_execution_preserves_per_parameter_states_and_diagnostics(magma_
     reference = HybridMuon(left, **options)
     reference.execution_mode = "legacy"
     batched = HybridMuon(right, **options)
-    batched.execution_mode = "batched"
+    batched.execution_mode = execution_mode
     generator = torch.Generator().manual_seed(13)
     for step in range(20):
         for index, ((_, a), (_, b)) in enumerate(zip(left, right)):
@@ -118,3 +119,46 @@ def test_batched_execution_preserves_per_parameter_states_and_diagnostics(magma_
         assert a.keys() == b.keys()
         for key in a:
             assert a[key] == pytest.approx(b[key], rel=3e-5, abs=2e-6), key
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_batched_modes_preserve_aliased_parameter_updates(duplicate):
+    a = torch.nn.Parameter(torch.arange(32.0).reshape(4, 8) / 32)
+    b = torch.nn.Parameter(a.detach().clone())
+    left = [a, a if duplicate else torch.nn.Parameter(a.detach())]
+    right = [b, b if duplicate else torch.nn.Parameter(b.detach())]
+    if duplicate:
+        with pytest.warns(UserWarning, match="duplicate"):
+            reference = HybridMuon(left)
+        with pytest.warns(UserWarning, match="duplicate"):
+            batched = HybridMuon(right)
+    else:
+        reference, batched = HybridMuon(left), HybridMuon(right)
+    reference.execution_mode = "legacy"
+    batched.execution_mode = "foreach"
+    for p, q in zip(left, right):
+        p.grad = torch.ones_like(p)
+        q.grad = p.grad.clone()
+    reference.step()
+    batched.step()
+    assert torch.equal(a, b)
+    _assert_state_equal(reference.state_dict()["state"], batched.state_dict()["state"])
+
+
+def test_foreach_execution_supports_mixed_parameter_dtypes_and_group_options():
+    left = _parameters()
+    left[0][1].data = left[0][1].double()
+    right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
+    reference, fast = HybridMuon(left), HybridMuon(right)
+    reference.execution_mode = "legacy"
+    fast.execution_mode = "foreach"
+    for optimizer in (reference, fast):
+        optimizer.param_groups[0].update(muon_clip_mode="fixed", magma_temperature=0.5)
+    for (_, a), (_, b) in zip(left, right):
+        a.grad = torch.ones_like(a)
+        b.grad = a.grad.clone()
+    reference.step()
+    fast.step()
+    for (_, a), (_, b) in zip(left, right):
+        torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+    _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)

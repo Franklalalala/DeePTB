@@ -441,7 +441,7 @@ class HybridMuon(Optimizer):
         )
         params, self._param_names = _normalize_named_parameters(params)
         # Execution caches are deliberately absent from optimizer checkpoints.
-        self.execution_mode = "batched"
+        self.execution_mode = "foreach"
         self._route_cache = {}
         self._route_signature = None
         self._use_route_cache = False
@@ -497,13 +497,19 @@ class HybridMuon(Optimizer):
             options = tuple(tuple(group[k]) if isinstance(group[k], (list, tuple)) else group[k]
                             for k in self._ROUTE_OPTIONS)
             params = tuple((id(p), tuple(p.shape), p.dtype, p.device, p.layout,
+                            p.untyped_storage().data_ptr() if p.layout == torch.strided else None,
                             self._param_names.get(id(p), "")) for p in group["params"])
             signature.append((id(group), options, params))
         signature = tuple(signature)
         if signature == self._route_signature:
             return
         self._route_cache = {}
+        self._batch_safe_groups = set()
         for group in self.param_groups:
+            pointers = [p.untyped_storage().data_ptr() for p in group["params"]
+                        if p.layout == torch.strided and p.numel()]
+            if len(pointers) == len(set(pointers)) and all(p.layout == torch.strided for p in group["params"]):
+                self._batch_safe_groups.add(id(group))
             for param in group["params"]:
                 flat = self._flat_1d_matrix_shape(param, group)
                 shape = flat or self._effective_shape(param)
@@ -855,8 +861,8 @@ class HybridMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self.execution_mode not in {"legacy", "cached", "batched"}:
-            raise ValueError("execution_mode must be legacy, cached or batched")
+        if self.execution_mode not in {"legacy", "cached", "batched", "foreach"}:
+            raise ValueError("execution_mode must be legacy, cached, batched or foreach")
         if self.execution_mode != "legacy":
             self._refresh_route_cache()
             self._use_route_cache = True
@@ -871,7 +877,10 @@ class HybridMuon(Optimizer):
             self._ensure_group_defaults(group)
             lr = group["lr"]
             weight_decay = group["weight_decay"]
-            if self.execution_mode == "batched":
+            if self.execution_mode == "foreach" and id(group) in self._batch_safe_groups:
+                self._foreach_group_step(group, lr, weight_decay)
+                continue
+            if self.execution_mode == "batched" and id(group) in self._batch_safe_groups:
                 self._batched_group_step(group, lr, weight_decay)
                 continue
             for param in group["params"]:
@@ -915,6 +924,170 @@ class HybridMuon(Optimizer):
                                  group, lr, weight_decay)
             else:
                 self._adamw_step(param, param.grad, group, lr, weight_decay)
+
+    def _foreach_group_step(self, group, lr, weight_decay):
+        muon_params = []
+        adam_params = []
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                raise RuntimeError("HybridMuon does not support sparse gradients")
+            (muon_params if self._uses_muon(param, group) else adam_params).append(param)
+        if muon_params:
+            momenta = []
+            decay_factors = []
+            for param in muon_params:
+                state = self.state[param]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                momenta.append(state["momentum_buffer"])
+                decay = weight_decay * (group["expert_weight_decay_mult"]
+                                        if self._is_expert_param(param, group) else 1.0)
+                decay_factors.append(1.0 - lr * decay)
+            if any(factor != 1.0 for factor in decay_factors):
+                torch._foreach_mul_(muon_params, decay_factors)
+            grads = [param.grad for param in muon_params]
+            beta = group["muon_beta"]
+            torch._foreach_mul_(momenta, beta)
+            torch._foreach_add_(momenta, grads, alpha=1.0 - beta)
+            updates = torch._foreach_mul(momenta, beta)
+            torch._foreach_add_(updates, grads, alpha=1.0 - beta)
+            buckets = {}
+            for param, update in zip(muon_params, updates):
+                shape = self._effective_shape_for_param(param, group)
+                state = self.state[param]
+                # Missing gradients can leave individual clipping clocks behind.
+                # Keep the original first-observation and warmup rules per state.
+                first_ratio = "muon_step_ratio_ema" not in state
+                warmed = int(state.get("muon_clip_step", 0)) + 1 > group["muon_clip_warmup_steps"]
+                key = (tuple(shape[-2:]), param.dtype, param.device, first_ratio, warmed)
+                buckets.setdefault(key, []).append((param, update))
+            applied = {}
+            stats = {}
+            expert_scales = {}
+            for entries in buckets.values():
+                self._foreach_muon_bucket(entries, group, lr, weight_decay, applied, stats, expert_scales)
+            # Preserve the original diagnostic reduction order.
+            for param in muon_params:
+                self._accumulate_clip_stats(*stats[id(param)])
+                if id(param) in expert_scales:
+                    self.last_expert_scale = expert_scales[id(param)]
+            torch._foreach_add_(muon_params, [applied[id(param)] for param in muon_params], alpha=-lr)
+        self._foreach_adamw(adam_params, group, lr, weight_decay)
+
+    def _foreach_muon_bucket(self, entries, group, lr, weight_decay, applied, stats, expert_scales):
+        params = [param for param, _ in entries]
+        matrices = [self._reshape_to_matrix_batch_for_param(update.float(), param, group)
+                    for param, update in entries]
+        counts = [matrix.shape[0] for matrix in matrices]
+        update = torch.cat(matrices)
+        transposed = update.shape[-2] > update.shape[-1]
+        x = update.transpose(-2, -1) if transposed else update
+        x = self._newton_schulz(x)
+        if transposed:
+            x = x.transpose(-2, -1)
+        x = x.to(params[0].dtype)
+        states = [self.state[param] for param in params]
+        if group["magma_lite"]:
+            grads = torch.cat([self._reshape_to_matrix_batch_for_param(param.grad.float(), param, group)
+                               for param in params])
+            numerator = (grads * update).sum(dim=(-2, -1))
+            denom = (grads.norm(dim=(-2, -1)) * update.norm(dim=(-2, -1))).clamp_min(1.0e-30)
+            chi = (numerator / denom).clamp(-1.0, 1.0)
+            tau = group["magma_temperature"]
+            lo = torch.sigmoid(chi.new_tensor(-1.0 / tau))
+            hi = torch.sigmoid(chi.new_tensor(1.0 / tau))
+            score = ((torch.sigmoid(chi / tau) - lo) / (hi - lo)).clamp(0.0, 1.0)
+            for state, part in zip(states, score.split(counts)):
+                if "magma_ema" not in state or state["magma_ema"].shape != part.shape:
+                    state["magma_ema"] = torch.zeros_like(part)
+            ema = torch.cat([state["magma_ema"] for state in states])
+            ema.mul_(group["magma_ema_beta"]).add_(score, alpha=1.0 - group["magma_ema_beta"])
+            for state, part in zip(states, ema.split(counts)):
+                state["magma_ema"] = part
+            scale = group["magma_min_scale"] + (1.0 - group["magma_min_scale"]) * ema
+            x = x * scale.to(params[0].dtype).reshape(-1, 1, 1)
+        rows, cols = update.shape[-2:]
+        scaled = x * (group["muon_scale"] * math.sqrt(max(rows, cols)))
+        rms = scaled.float().pow(2).mean(dim=(-2, -1)).sqrt()
+        clip_scale = torch.ones_like(rms)
+        step_ratio = torch.zeros_like(rms)
+        if group["muon_clip"]:
+            hard_scale = group["muon_clip_rms"] / rms.clamp_min(1.0e-30)
+            clip_scale = torch.minimum(clip_scale, hard_scale.clamp(max=1.0))
+            if group["muon_clip_mode"] == "auto":
+                param_blocks = torch.cat([self._reshape_to_matrix_batch_for_param(param.float(), param, group)
+                                          for param in params])
+                param_rms = param_blocks.pow(2).mean(dim=(-2, -1)).sqrt().clamp_min(
+                    group["muon_clip_param_rms_floor"])
+                step_ratio = (lr * rms / param_rms).detach()
+                for state in states:
+                    state["muon_clip_step"] = int(state.get("muon_clip_step", 0)) + 1
+                if "muon_step_ratio_ema" not in states[0]:
+                    ema = step_ratio.clone()
+                    sq_ema = step_ratio.square().clone()
+                else:
+                    ema = torch.cat([state["muon_step_ratio_ema"] for state in states])
+                    sq_ema = torch.cat([state["muon_step_ratio_sq_ema"] for state in states])
+                    beta = group["muon_clip_auto_beta"]
+                    ema.mul_(beta).add_(step_ratio, alpha=1.0 - beta)
+                    sq_ema.mul_(beta).addcmul_(step_ratio, step_ratio, value=1.0 - beta)
+                for state, mean, square in zip(states, ema.split(counts), sq_ema.split(counts)):
+                    state["muon_step_ratio_ema"] = mean
+                    state["muon_step_ratio_sq_ema"] = square
+                if states[0]["muon_clip_step"] > group["muon_clip_warmup_steps"]:
+                    std = (sq_ema - ema.square()).clamp_min(0.0).sqrt()
+                    limit = (ema * group["muon_clip_auto_mult"] + std * group["muon_clip_auto_std_mult"]).clamp(
+                        group["muon_clip_min_ratio"], group["muon_clip_max_ratio"])
+                    clip_scale = torch.minimum(clip_scale, (limit / step_ratio.clamp_min(1.0e-30)).clamp(max=1.0))
+        clipped = scaled * clip_scale.reshape(-1, 1, 1)
+        parts = zip(entries, clipped.split(counts), rms.split(counts), clip_scale.split(counts),
+                    step_ratio.split(counts))
+        for (param, _), part, part_rms, part_scale, part_ratio in parts:
+            state = self.state[param]
+            state["muon_clip_scale"] = part_scale.detach()
+            stats[id(param)] = (part_rms, part_scale, part_ratio)
+            value = part.reshape(param.shape)
+            is_expert = self._is_expert_param(param, group)
+            expert_scale = self._expert_scale(param, group) if is_expert else None
+            if expert_scale is not None:
+                expert_scales[id(param)] = self.last_expert_scale
+            if is_expert and self.record_expert_stats:
+                decay = weight_decay * group["expert_weight_decay_mult"]
+                self._record_expert_stats(param, param.grad, state["momentum_buffer"], value, expert_scale, lr, decay)
+            if expert_scale is not None:
+                value = value * expert_scale.reshape(-1, *([1] * (param.dim() - 1)))
+            applied[id(param)] = value
+
+    def _foreach_adamw(self, params, group, lr, weight_decay):
+        buckets = {}
+        for param in params:
+            state = self.state[param]
+            if "exp_avg" not in state:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+            rate = lr * group["adamw_pattern_lr_scale"] if self._is_forced_adamw(param, group) else lr
+            decay = weight_decay * group["expert_weight_decay_mult"] if self._is_expert_param(param, group) else weight_decay
+            state["step"] += 1
+            key = (param.dtype, param.device, rate, decay, state["step"])
+            buckets.setdefault(key, []).append(param)
+        beta1, beta2 = group["adam_betas"]
+        for (_, _, rate, decay, step), values in buckets.items():
+            grads = [param.grad for param in values]
+            means = [self.state[param]["exp_avg"] for param in values]
+            squares = [self.state[param]["exp_avg_sq"] for param in values]
+            if decay != 0.0:
+                torch._foreach_mul_(values, 1.0 - rate * decay)
+            torch._foreach_mul_(means, beta1)
+            torch._foreach_add_(means, grads, alpha=1.0 - beta1)
+            torch._foreach_mul_(squares, beta2)
+            torch._foreach_addcmul_(squares, grads, grads, value=1.0 - beta2)
+            denom = torch._foreach_sqrt(squares)
+            torch._foreach_div_(denom, math.sqrt(1.0 - beta2 ** step))
+            torch._foreach_add_(denom, group["adam_eps"])
+            torch._foreach_addcdiv_(values, means, denom, value=-rate / (1.0 - beta1 ** step))
 
     def _muon_step(self, param, grad, group, lr, weight_decay):
         update = self._muon_prepare(param, grad, group, lr, weight_decay)
