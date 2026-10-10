@@ -32,7 +32,7 @@
 
 HybridMuon 默认使用缓存路由、同形状矩阵分桶和多张量更新；CUDA 上对纯张量桶运算进行延迟 CUDA Graph 捕获。Newton–Schulz 的轮数与系数、MAGMA、裁剪时钟、学习率、专家缩放及检查点字段保持原语义。捕获有首次运行开销，并会保留图所需显存，因此性能与显存比较应分别记录预热和稳态。直接操作优化器对象时可设置 `optimizer.execution_mode = "legacy"` 回到顺序实现，或设置 `optimizer.use_cuda_graph = False` 关闭图缓存；这些是运行时属性，不是训练配置字段。加载优化器状态会清除执行缓存，无需修改旧检查点。
 
-SO2CUDA 0.2.0 的兼容接口可使用后续块布局内核优化；更新后仍需在相同设备与 FP32 设置下核验实际派发、输出、梯度及续训状态。该后端优化不改变 UniTB/SLEM 的参数布局。
+SO2CUDA 的块布局内核更新不改变 DeePTB 的调用接口，也不改变 UniTB、UniTB-SLEM 的参数布局，已有检查点照常加载。
 
 - [先验输入与检查点](advanced/prior_inputs.md)
 - [NACF 候选先验](nacf_candidate_prior.md)
