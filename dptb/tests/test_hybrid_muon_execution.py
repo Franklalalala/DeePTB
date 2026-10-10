@@ -190,6 +190,10 @@ def test_fast_cuda_graph_preserves_clocks_and_checkpoint_continuation():
     reference.execution_mode = "legacy"
     generator = torch.Generator().manual_seed(14)
     for step in range(8):
+        for optimizer in (reference, fast):
+            optimizer.param_groups[0]["lr"] = 0.01 / (step + 1)
+            if step == 2:
+                optimizer.param_groups[0].update(magma_temperature=0.7, muon_clip_auto_mult=2.0)
         for index, ((_, a), (_, b)) in enumerate(zip(left, right)):
             grad = torch.randn(a.shape, generator=generator).cuda()
             a.grad = None if step == 3 and index == 1 else grad
@@ -201,5 +205,27 @@ def test_fast_cuda_graph_preserves_clocks_and_checkpoint_continuation():
         _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)
         if step == 4:
             fast.load_state_dict(copy.deepcopy(reference.state_dict()))
+    for key, value in reference.get_diagnostics().items():
+        assert value == pytest.approx(fast.get_diagnostics()[key], rel=3e-5, abs=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fast_cuda_buckets_keep_separate_outputs_for_equal_shapes_in_different_groups():
+    generator = torch.Generator().manual_seed(15)
+    left = [(f"weight{index}", torch.nn.Parameter(torch.randn(4, 8, generator=generator).cuda()))
+            for index in range(4)]
+    right = [(name, torch.nn.Parameter(param.detach().clone())) for name, param in left]
+    reference = HybridMuon([{"params": left[:2]}, {"params": left[2:]}], lr=0.01)
+    fast = HybridMuon([{"params": right[:2]}, {"params": right[2:]}], lr=0.01)
+    reference.execution_mode = "legacy"
+    for step in range(3):
+        for index, ((_, a), (_, b)) in enumerate(zip(left, right)):
+            a.grad = None if step == 1 and index == 0 else torch.full_like(a, index + 1 + step)
+            b.grad = None if a.grad is None else a.grad.clone()
+        reference.step()
+        fast.step()
+    for (_, a), (_, b) in zip(left, right):
+        torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-6)
+    _assert_state_equal(reference.state_dict()["state"], fast.state_dict()["state"], exact=False)
     for key, value in reference.get_diagnostics().items():
         assert value == pytest.approx(fast.get_diagnostics()[key], rel=3e-5, abs=2e-6)

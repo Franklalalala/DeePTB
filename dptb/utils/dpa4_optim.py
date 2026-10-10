@@ -266,8 +266,9 @@ class HybridMuon(Optimizer):
 
     ``execution_mode`` selects ``fast`` (default), ``foreach``, ``batched``,
     ``cached`` or ``legacy`` without changing the checkpoint format.
-    Set ``use_cuda_graph=False`` to disable the fast mode's Newton--Schulz
-    graph cache. Graph capture is lazy; timing requires a warmup step.
+    Set ``use_cuda_graph=False`` to disable the fast mode's pure tensor bucket
+    graph cache. Graph capture is lazy; steady timing requires warming through
+    the clipping warmup phase.
     """
 
     _FAST_COEFF = (3.4445, -4.7750, 2.0315)
@@ -451,6 +452,8 @@ class HybridMuon(Optimizer):
         self.execution_mode = "fast"
         self.use_cuda_graph = True
         self._ns_graphs = {}
+        self._bucket_graphs = {}
+        self._graph_lrs = {}
         self._magma_constants = {}
         self._route_cache = {}
         self._route_signature = None
@@ -482,6 +485,8 @@ class HybridMuon(Optimizer):
         self._route_summary_cache = None
         self._route_signature = None
         self._ns_graphs = {}
+        self._bucket_graphs = {}
+        self._graph_lrs = {}
         return result
 
     _ROUTE_OPTIONS = (
@@ -516,6 +521,8 @@ class HybridMuon(Optimizer):
             return
         self._route_cache = {}
         self._ns_graphs = {}
+        self._bucket_graphs = {}
+        self._graph_lrs = {}
         self._batch_safe_groups = set()
         for group in self.param_groups:
             pointers = [p.untyped_storage().data_ptr() for p in group["params"]
@@ -1007,8 +1014,17 @@ class HybridMuon(Optimizer):
             applied = {}
             stats = {}
             expert_scales = {}
+            learning_rates = {}
+            if self.execution_mode == "fast" and self.use_cuda_graph:
+                for param in muon_params:
+                    if param.is_cuda and param.device not in learning_rates:
+                        key = (id(group), param.device)
+                        if key not in self._graph_lrs:
+                            self._graph_lrs[key] = torch.empty((), dtype=torch.float32, device=param.device)
+                        learning_rates[param.device] = self._graph_lrs[key].fill_(lr)
             for entries in buckets.values():
-                self._foreach_muon_bucket(entries, group, lr, weight_decay, applied, stats, expert_scales)
+                self._foreach_muon_bucket(entries, group, lr, weight_decay, applied, stats, expert_scales,
+                                          learning_rates.get(entries[0][0].device, lr))
             # Preserve the original diagnostic reduction order.
             for param in muon_params:
                 self._accumulate_clip_stats(*stats[id(param)])
@@ -1017,70 +1033,48 @@ class HybridMuon(Optimizer):
             torch._foreach_add_(muon_params, [applied[id(param)] for param in muon_params], alpha=-lr)
         self._foreach_adamw(adam_params, group, lr, weight_decay)
 
-    def _foreach_muon_bucket(self, entries, group, lr, weight_decay, applied, stats, expert_scales):
+    def _foreach_muon_bucket(self, entries, group, lr, weight_decay, applied, stats, expert_scales, math_lr):
         params = [param for param, _ in entries]
         matrices = [self._reshape_to_matrix_batch_for_param(update.float(), param, group)
                     for param, update in entries]
         counts = [matrix.shape[0] for matrix in matrices]
         update = torch.cat(matrices)
-        transposed = update.shape[-2] > update.shape[-1]
-        x = update.transpose(-2, -1) if transposed else update
-        x = self._newton_schulz(x)
-        if transposed:
-            x = x.transpose(-2, -1)
-        x = x.to(params[0].dtype)
         states = [self.state[param] for param in params]
+        empty = update.new_empty(0)
+        grads = empty
+        magma_ema = empty
         if group["magma_lite"]:
             grads = torch.cat([self._reshape_to_matrix_batch_for_param(param.grad.float(), param, group)
                                for param in params])
-            numerator = (grads * update).sum(dim=(-2, -1))
-            denom = (grads.norm(dim=(-2, -1)) * update.norm(dim=(-2, -1))).clamp_min(1.0e-30)
-            chi = (numerator / denom).clamp(-1.0, 1.0)
-            tau = group["magma_temperature"]
-            score = self._magma_score(chi, tau)
-            for state, part in zip(states, score.split(counts)):
-                if "magma_ema" not in state or state["magma_ema"].shape != part.shape:
-                    state["magma_ema"] = torch.zeros_like(part)
-            ema = torch.cat([state["magma_ema"] for state in states])
-            ema.mul_(group["magma_ema_beta"]).add_(score, alpha=1.0 - group["magma_ema_beta"])
-            for state, part in zip(states, ema.split(counts)):
+            magma_ema = torch.cat([
+                state["magma_ema"] if "magma_ema" in state and state["magma_ema"].shape == (count,)
+                else update.new_zeros(count) for state, count in zip(states, counts)])
+        param_blocks = empty
+        ratio_ema = empty
+        sq_ema = empty
+        auto_clip = group["muon_clip"] and group["muon_clip_mode"] == "auto"
+        first_ratio = auto_clip and "muon_step_ratio_ema" not in states[0]
+        warmed = auto_clip and int(states[0].get("muon_clip_step", 0)) + 1 > group["muon_clip_warmup_steps"]
+        if auto_clip:
+            param_blocks = torch.cat([self._reshape_to_matrix_batch_for_param(param.float(), param, group)
+                                      for param in params])
+            if not first_ratio:
+                ratio_ema = torch.cat([state["muon_step_ratio_ema"] for state in states])
+                sq_ema = torch.cat([state["muon_step_ratio_sq_ema"] for state in states])
+        arguments = (update, param_blocks, grads, magma_ema, ratio_ema, sq_ema)
+        if torch.is_tensor(math_lr) and not torch.cuda.is_current_stream_capturing():
+            result = self._graph_muon_bucket(arguments, math_lr, params, group, first_ratio, warmed)
+        else:
+            result = self._muon_bucket_math(*arguments, math_lr, params[0].dtype, group, first_ratio, warmed)
+        clipped, rms, clip_scale, step_ratio, magma_ema, ratio_ema, sq_ema = result
+        if group["magma_lite"]:
+            for state, part in zip(states, magma_ema.split(counts)):
                 state["magma_ema"] = part
-            scale = group["magma_min_scale"] + (1.0 - group["magma_min_scale"]) * ema
-            x = x * scale.to(params[0].dtype).reshape(-1, 1, 1)
-        rows, cols = update.shape[-2:]
-        scaled = x * (group["muon_scale"] * math.sqrt(max(rows, cols)))
-        rms = scaled.float().pow(2).mean(dim=(-2, -1)).sqrt()
-        clip_scale = torch.ones_like(rms)
-        step_ratio = torch.zeros_like(rms)
-        if group["muon_clip"]:
-            hard_scale = group["muon_clip_rms"] / rms.clamp_min(1.0e-30)
-            clip_scale = torch.minimum(clip_scale, hard_scale.clamp(max=1.0))
-            if group["muon_clip_mode"] == "auto":
-                param_blocks = torch.cat([self._reshape_to_matrix_batch_for_param(param.float(), param, group)
-                                          for param in params])
-                param_rms = param_blocks.pow(2).mean(dim=(-2, -1)).sqrt().clamp_min(
-                    group["muon_clip_param_rms_floor"])
-                step_ratio = (lr * rms / param_rms).detach()
-                for state in states:
-                    state["muon_clip_step"] = int(state.get("muon_clip_step", 0)) + 1
-                if "muon_step_ratio_ema" not in states[0]:
-                    ema = step_ratio.clone()
-                    sq_ema = step_ratio.square().clone()
-                else:
-                    ema = torch.cat([state["muon_step_ratio_ema"] for state in states])
-                    sq_ema = torch.cat([state["muon_step_ratio_sq_ema"] for state in states])
-                    beta = group["muon_clip_auto_beta"]
-                    ema.mul_(beta).add_(step_ratio, alpha=1.0 - beta)
-                    sq_ema.mul_(beta).addcmul_(step_ratio, step_ratio, value=1.0 - beta)
-                for state, mean, square in zip(states, ema.split(counts), sq_ema.split(counts)):
-                    state["muon_step_ratio_ema"] = mean
-                    state["muon_step_ratio_sq_ema"] = square
-                if states[0]["muon_clip_step"] > group["muon_clip_warmup_steps"]:
-                    std = (sq_ema - ema.square()).clamp_min(0.0).sqrt()
-                    limit = (ema * group["muon_clip_auto_mult"] + std * group["muon_clip_auto_std_mult"]).clamp(
-                        group["muon_clip_min_ratio"], group["muon_clip_max_ratio"])
-                    clip_scale = torch.minimum(clip_scale, (limit / step_ratio.clamp_min(1.0e-30)).clamp(max=1.0))
-        clipped = scaled * clip_scale.reshape(-1, 1, 1)
+        if auto_clip:
+            for state, mean, square in zip(states, ratio_ema.split(counts), sq_ema.split(counts)):
+                state["muon_clip_step"] = int(state.get("muon_clip_step", 0)) + 1
+                state["muon_step_ratio_ema"] = mean
+                state["muon_step_ratio_sq_ema"] = square
         parts = zip(entries, clipped.split(counts), rms.split(counts), clip_scale.split(counts),
                     step_ratio.split(counts))
         for (param, _), part, part_rms, part_scale, part_ratio in parts:
@@ -1098,6 +1092,89 @@ class HybridMuon(Optimizer):
             if expert_scale is not None:
                 value = value * expert_scale.reshape(-1, *([1] * (param.dim() - 1)))
             applied[id(param)] = value
+
+    _BUCKET_MATH_OPTIONS = (
+        "magma_lite", "magma_temperature", "magma_ema_beta", "magma_min_scale", "muon_scale",
+        "muon_clip", "muon_clip_mode", "muon_clip_rms", "muon_clip_param_rms_floor",
+        "muon_clip_auto_beta", "muon_clip_auto_mult", "muon_clip_auto_std_mult",
+        "muon_clip_min_ratio", "muon_clip_max_ratio",
+    )
+
+    def _graph_muon_bucket(self, arguments, lr_tensor, params, group, first_ratio, warmed):
+        update = arguments[0]
+        options = tuple(group[key] for key in self._BUCKET_MATH_OPTIONS)
+        key = (id(group), tuple(id(param) for param in params), params[0].dtype,
+               tuple((value.device, value.dtype, tuple(value.shape)) for value in arguments),
+               options, first_ratio, warmed, torch.are_deterministic_algorithms_enabled(),
+               torch.backends.cuda.matmul.allow_tf32)
+        if key not in self._bucket_graphs:
+            with torch.cuda.device(update.device):
+                static_inputs = tuple(torch.empty_like(value) for value in arguments)
+                for target, value in zip(static_inputs, arguments):
+                    target.copy_(value)
+                stream = torch.cuda.Stream(device=update.device)
+                stream.wait_stream(torch.cuda.current_stream(update.device))
+                with torch.cuda.stream(stream):
+                    self._muon_bucket_math(*static_inputs, lr_tensor, params[0].dtype, group, first_ratio, warmed)
+                torch.cuda.current_stream(update.device).wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    outputs = self._muon_bucket_math(*static_inputs, lr_tensor, params[0].dtype,
+                                                     group, first_ratio, warmed)
+                self._bucket_graphs[key] = (static_inputs, outputs, graph)
+        static_inputs, outputs, graph = self._bucket_graphs[key]
+        for target, value in zip(static_inputs, arguments):
+            target.copy_(value)
+        graph.replay()
+        # A bucket key includes its parameter identities: separate buckets never
+        # overwrite borrowed state/diagnostic outputs within an optimizer step.
+        # Next-step inputs are copied before the same graph output is replaced.
+        return outputs
+
+    def _muon_bucket_math(self, update, param_blocks, grads, magma_ema, ratio_ema, sq_ema,
+                          lr, dtype, group, first_ratio, warmed):
+        """Pure tensor computation: capture never mutates live optimizer state."""
+        transposed = update.shape[-2] > update.shape[-1]
+        x = update.transpose(-2, -1) if transposed else update
+        x = self._newton_schulz_eager(x)
+        if transposed:
+            x = x.transpose(-2, -1)
+        x = x.to(dtype)
+        if group["magma_lite"]:
+            numerator = (grads * update).sum(dim=(-2, -1))
+            denom = (grads.norm(dim=(-2, -1)) * update.norm(dim=(-2, -1))).clamp_min(1.0e-30)
+            chi = (numerator / denom).clamp(-1.0, 1.0)
+            tau = group["magma_temperature"]
+            score = self._magma_score(chi, tau)
+            magma_ema = magma_ema.mul(group["magma_ema_beta"]).add_(score, alpha=1.0 - group["magma_ema_beta"])
+            scale = group["magma_min_scale"] + (1.0 - group["magma_min_scale"]) * magma_ema
+            x = x * scale.to(dtype).reshape(-1, 1, 1)
+        rows, cols = update.shape[-2:]
+        scaled = x * (group["muon_scale"] * math.sqrt(max(rows, cols)))
+        rms = scaled.float().pow(2).mean(dim=(-2, -1)).sqrt()
+        clip_scale = torch.ones_like(rms)
+        step_ratio = torch.zeros_like(rms)
+        if group["muon_clip"]:
+            hard_scale = group["muon_clip_rms"] / rms.clamp_min(1.0e-30)
+            clip_scale = torch.minimum(clip_scale, hard_scale.clamp(max=1.0))
+            if group["muon_clip_mode"] == "auto":
+                param_rms = param_blocks.pow(2).mean(dim=(-2, -1)).sqrt().clamp_min(
+                    group["muon_clip_param_rms_floor"])
+                step_ratio = (lr * rms / param_rms).detach()
+                if first_ratio:
+                    ratio_ema = step_ratio.clone()
+                    sq_ema = step_ratio.square().clone()
+                else:
+                    beta = group["muon_clip_auto_beta"]
+                    ratio_ema = ratio_ema.mul(beta).add_(step_ratio, alpha=1.0 - beta)
+                    sq_ema = sq_ema.mul(beta).addcmul_(step_ratio, step_ratio, value=1.0 - beta)
+                if warmed:
+                    std = (sq_ema - ratio_ema.square()).clamp_min(0.0).sqrt()
+                    limit = (ratio_ema * group["muon_clip_auto_mult"] + std * group["muon_clip_auto_std_mult"]).clamp(
+                        group["muon_clip_min_ratio"], group["muon_clip_max_ratio"])
+                    clip_scale = torch.minimum(clip_scale, (limit / step_ratio.clamp_min(1.0e-30)).clamp(max=1.0))
+        clipped = scaled * clip_scale.reshape(-1, 1, 1)
+        return clipped, rms, clip_scale, step_ratio, magma_ema, ratio_ema, sq_ema
 
     def _foreach_adamw(self, params, group, lr, weight_decay):
         buckets = {}
