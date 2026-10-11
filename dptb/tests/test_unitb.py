@@ -492,6 +492,18 @@ def test_prior_router_without_h0_input_requires_the_prior_not_labels(training):
             _model(_options("x1", h0_init_scope="none", h0_edge_key=target))
 
 
+def test_prior_noise_must_reach_the_router_without_h0_input():
+    from dptb.nnops.prior_noise import PriorNoiseAugmentation, assert_prior_noise_keys_reach_model
+    model = _model(_options("x1", h0_init_scope="none", h0_edge_key=_keys.EDGE_P2_KEY))
+
+    def noise(**options):
+        return PriorNoiseAugmentation(dict(prior="te", te_prior_mode="typewise", **options), idp=model.idp)
+
+    with pytest.raises(ValueError):
+        assert_prior_noise_keys_reach_model(noise(), model)
+    assert_prior_noise_keys_reach_model(noise(edge_h0_key=_keys.EDGE_P2_KEY), model)
+
+
 @pytest.mark.parametrize("topology", ["lem", "slem"])
 @pytest.mark.parametrize("kind", ["dense", "x1"])
 def test_float64_rotation_with_ao_priors(default_dtype, kind, topology):

@@ -39,3 +39,13 @@ def test_noise_input_keys_must_reach_the_embedding():
     assert_prior_noise_keys_reach_model(sampler(), Consumer())
     with pytest.raises(ValueError):
         assert_prior_noise_keys_reach_model(sampler(node_h0_key="unused_prior"), Consumer())
+
+
+def test_noise_edge_key_must_reach_a_router_only_prior_consumer():
+    class RouterOnly(torch.nn.Module):
+        h0_edge_key = "edge_p2"
+    with pytest.raises(ValueError):
+        assert_prior_noise_keys_reach_model(sampler(), RouterOnly())
+    # Only the edge prior is read, so the node key is not compared.
+    assert_prior_noise_keys_reach_model(
+        sampler(edge_h0_key="edge_p2", node_h0_key="unused_prior"), RouterOnly())

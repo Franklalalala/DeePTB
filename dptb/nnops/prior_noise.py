@@ -23,10 +23,14 @@ def assert_prior_noise_keys_reach_model(noise, model):
     for module in model.modules():
         node_key = getattr(module, "h0_node_key", None)
         edge_key = getattr(module, "h0_edge_key", None)
-        if not (isinstance(node_key, str) and isinstance(edge_key, str)):
+        if not isinstance(edge_key, str):
             continue
-        for label, source, target in (("node", noise.node_h0_key, node_key),
-                                      ("edge", noise.edge_h0_key, edge_key)):
+        # A router that reads the edge prior without an H0 input embedding
+        # names only the edge key; its node side has no consumer to check.
+        sides = [("edge", noise.edge_h0_key, edge_key)]
+        if isinstance(node_key, str):
+            sides.insert(0, ("node", noise.node_h0_key, node_key))
+        for label, source, target in sides:
             if source != target:
                 mismatches.add((label, source, target))
     if mismatches:
