@@ -405,6 +405,93 @@ def test_old_h0_marker_mapping_is_strict_and_preserves_legacy_math():
         _model(_options("dense", h0_ao_cg=True)).load_state_dict(state, strict=True)
 
 
+# State of the H0 input embedding, relative to embedding.init_layer.
+_H0_INPUT_STATE = ("node_projector.", "edge_projector.", "h0_ao_cg_version")
+
+
+@pytest.mark.parametrize("topology", ["lem", "slem"])
+def test_prior_router_trains_without_h0_input_embedding(topology):
+    overrides = {} if topology == "lem" else {"layer_topology": topology}
+    torch.manual_seed(87)
+    embedded = _model(_options("x1", **overrides))
+    torch.manual_seed(87)
+    model = _model(_options("x1", h0_init_scope="none", **overrides))
+    embedding = model.embedding
+    assert not isinstance(embedding.init_layer, H0InitLayer)
+    assert embedding.edge_router_prior_activate and embedding.edge_router_input == "onehot_prior"
+    # The geometry initialization keeps its state; only the H0 input projections go.
+    geometry = {key.replace("init_layer.base_init.", "init_layer.") for key in embedded.state_dict()}
+    assert set(model.state_dict()) <= geometry
+    removed = geometry - set(model.state_dict())
+    assert removed and all(key.removeprefix("embedding.init_layer.").startswith(_H0_INPUT_STATE)
+                           for key in removed)
+    output = model(_batch(model))
+    values = [output[key] for key in (_keys.NODE_FEATURES_KEY, _keys.EDGE_FEATURES_KEY)]
+    assert all(torch.isfinite(value).all() for value in values)
+    sum(value.square().mean() for value in values).backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
+    # The prior-descriptor columns start at zero and still receive gradient.
+    assert torch.count_nonzero(embedding.router.net[0].weight.grad[:, embedding.edge_one_hot_dim:])
+
+
+@pytest.mark.parametrize("router_input", ["onehot_prior", "onehot"])
+def test_without_h0_input_only_the_prior_router_reads_edge_h0(router_input):
+    torch.manual_seed(88)
+    model = _model(_options("x1", h0_init_scope="none", edge_router_input=router_input)).eval()
+    embedding = model.embedding
+    with torch.no_grad():
+        embedding.router.net[0].weight[:, embedding.edge_one_hot_dim:].normal_(std=0.1)
+    router_inputs = []
+    hook = embedding.router.register_forward_hook(
+        lambda module, args, output: router_inputs.append(args[0].detach().clone()))
+    data = _batch(model)
+    generator = torch.Generator().manual_seed(92)
+    # Labels travel in the batch, as in training.
+    for key in (_keys.NODE_FEATURES_KEY, _keys.EDGE_FEATURES_KEY):
+        data[key] = torch.randn(data[_keys.NODE_H0_KEY if key == _keys.NODE_FEATURES_KEY else _keys.EDGE_H0_KEY].shape,
+                                generator=generator)
+
+    def run(*moved):
+        batch = copy.deepcopy(data)
+        for key in moved:
+            batch[key] = batch[key] + torch.randn(batch[key].shape, generator=generator)
+        with torch.no_grad():
+            output = model(batch)
+        return router_inputs[-1], [output[key] for key in (_keys.NODE_FEATURES_KEY, _keys.EDGE_FEATURES_KEY)]
+
+    base_input, base_output = run()
+    node_input, node_output = run(_keys.NODE_H0_KEY)
+    label_input, label_output = run(_keys.NODE_FEATURES_KEY, _keys.EDGE_FEATURES_KEY)
+    edge_input, edge_output = run(_keys.EDGE_H0_KEY)
+    hook.remove()
+    # Neither node_h0 nor the labels are read once the H0 input embedding is gone.
+    for moved_input, moved_output in ((node_input, node_output), (label_input, label_output)):
+        assert torch.equal(moved_input, base_input)
+        assert all(torch.equal(a, b) for a, b in zip(moved_output, base_output))
+    reads_prior = router_input == "onehot_prior"
+    assert torch.equal(edge_input, base_input) is not reads_prior
+    assert all(torch.equal(a, b) for a, b in zip(edge_output, base_output)) is not reads_prior
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_prior_router_without_h0_input_requires_the_prior_not_labels(training):
+    torch.manual_seed(89)
+    model = _model(_options("x1", h0_init_scope="none")).train(training)
+    data = _batch(model)
+    del data[_keys.EDGE_H0_KEY]
+    # Supervised targets in the batch are never a fallback for routing.
+    rows, width = data[_keys.NODE_H0_KEY].shape[0], model.idp.reduced_matrix_element
+    data[_keys.EDGE_FEATURES_KEY] = torch.randn(6, width)
+    data[_keys.EDGE_HAMILTONIAN_KEY] = torch.randn(6, width)
+    data[_keys.NODE_FEATURES_KEY] = torch.randn(rows, width)
+    with pytest.raises(KeyError):
+        model(data)
+    for target in (_keys.EDGE_FEATURES_KEY, _keys.EDGE_HAMILTONIAN_KEY):
+        with pytest.raises(ValueError):
+            _model(_options("x1", h0_init_scope="none", h0_edge_key=target))
+
+
 @pytest.mark.parametrize("topology", ["lem", "slem"])
 @pytest.mark.parametrize("kind", ["dense", "x1"])
 def test_float64_rotation_with_ao_priors(default_dtype, kind, topology):

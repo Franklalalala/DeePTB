@@ -9,6 +9,9 @@ from dptb.data import _keys
 
 from .prior_common import H0InitLayer
 
+# Frozen prior fields the edge router may read when no H0 input embedding names one.
+_ROUTER_PRIOR_KEYS = frozenset({_keys.EDGE_H0_KEY, _keys.EDGE_P2_KEY, _keys.EDGE_P23_KEY})
+
 
 class UniTBPrior:
     @staticmethod
@@ -104,6 +107,17 @@ class UniTBPrior:
                 dtype=self.dtype,
                 device=self.device,
             )
+        elif self._routes_on_prior():
+            # h0_init_scope='none' removes only the H0 input embedding. The
+            # router still reads the frozen edge prior from the batch, by the
+            # name the embedding would have used, and never a target field.
+            if h0_edge_key not in _ROUTER_PRIOR_KEYS:
+                raise ValueError(
+                    "Prior routing without an H0 input embedding reads "
+                    f"data[{h0_edge_key!r}]; h0_edge_key must name a frozen prior "
+                    f"field ({', '.join(sorted(_ROUTER_PRIOR_KEYS))})."
+                )
+            self.h0_edge_key = h0_edge_key
 
 
     def _initialize_prior(self, data, edge_index, atom_type, bond_type, edge_sh,

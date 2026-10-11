@@ -58,6 +58,10 @@ W(e)=W_s+\sum_{k\in\operatorname{top-2}(e)}g_k(e)P D_k Q^\mathsf{T}.
 | `so2_moe_layers` | `all` | 指定使用路由专家的零起始层索引 |
 | `edge_router_route_drop_p` | 0 | 训练时按结构丢弃路由分支，验证关闭 |
 
+`h0_init_scope: none` 只去掉 H₀ 输入嵌入，`router_input: onehot_prior` 的门控仍读取
+`h0_edge_key`（默认 `edge_h0`）指向的冻结边先验。该键只能是 `edge_h0`、`edge_p2` 或
+`edge_p23`；数据需提供该字段（`edge_h0` 对应 `get_H0: true`），缺失时报错，不回退到标签。
+
 全专家软门控可设 `top_k=num_experts`。`full_softmax` 的选中权重和不保证为 1，
 不能把共享专家重复折进每个槽；`post_activation_shared` 保持单独共享分支。
 Switch 需要 `top_k=1`、`num_shared_experts=0`，并使用其自己的原始门控设置。

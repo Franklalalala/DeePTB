@@ -290,6 +290,11 @@ class UniTBRouter:
         return self._router_input_strategy(self, data, bond_type, active_edges,
                                            active_edge_one_hot, edge_vector)
 
+    def _routes_on_prior(self) -> bool:
+        """Whether the per-edge router reads the frozen edge prior."""
+        from .unitb_router_inputs import PriorGramInput
+        return isinstance(getattr(self, "_router_input_strategy", None), PriorGramInput)
+
     def _raw_prior_source(
         self,
         data: AtomicDataDict.Type,
@@ -307,9 +312,10 @@ class UniTBRouter:
             key = getattr(self, "h0_edge_key", None)
         if key is None or key not in data:
             raise KeyError(
-                "edge_router_prior_activate needs the frozen edge prior at "
-                f"data[{key!r}]; it exists only on lem_moe_v3_edge_h0 with a "
-                "dataset that carries edge_h0."
+                "edge_router_input='onehot_prior' routes on the frozen edge prior "
+                f"data[{key!r}], which this batch does not provide. Load the prior "
+                "(for edge_h0, set get_H0=true in data_options), or route on bond "
+                "type alone with edge_router_input='onehot'."
             )
         source = data[key].to(dtype=self.dtype)
         mask = self.idp.mask_to_erme.to(source.device)[bond_type.flatten()]
