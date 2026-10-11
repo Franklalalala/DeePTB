@@ -492,6 +492,61 @@ def test_prior_router_without_h0_input_requires_the_prior_not_labels(training):
             _model(_options("x1", h0_init_scope="none", h0_edge_key=target))
 
 
+def test_prior_router_without_h0_input_takes_an_optimizer_step():
+    torch.manual_seed(90)
+    model = _model(_options("x1", h0_init_scope="none"))
+    embedding = model.embedding
+    columns = embedding.router.net[0].weight[:, embedding.edge_one_hot_dim:]
+    assert not torch.count_nonzero(columns)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    output = model(_batch(model))
+    (output[_keys.NODE_FEATURES_KEY].square().mean() + output[_keys.EDGE_FEATURES_KEY].square().mean()).backward()
+    optimizer.step()
+    assert torch.count_nonzero(columns) and all(torch.isfinite(p).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("fallback", [True, False])
+def test_prior_router_without_h0_input_reads_only_its_named_prior(fallback):
+    torch.manual_seed(91)
+    common = dict(h0_init_scope="none", fallback_to_hamiltonian=fallback)
+    model = _model(_options("x1", h0_edge_key=_keys.EDGE_P2_KEY, **common)).eval()
+    with torch.no_grad():
+        model.embedding.router.net[0].weight[:, model.embedding.edge_one_hot_dim:].normal_(std=0.1)
+    data = _batch(model)
+    data[_keys.EDGE_P2_KEY] = data.pop(_keys.EDGE_H0_KEY)
+    with torch.no_grad():
+        expected = model(copy.deepcopy(data))[_keys.EDGE_FEATURES_KEY]
+        # edge_h0 is not its prior; moving it changes nothing.
+        moved = dict(data, **{_keys.EDGE_H0_KEY: torch.randn_like(data[_keys.EDGE_P2_KEY])})
+        torch.testing.assert_close(model(copy.deepcopy(moved))[_keys.EDGE_FEATURES_KEY], expected, rtol=0, atol=0)
+        missing = dict(data)
+        del missing[_keys.EDGE_P2_KEY]
+        with pytest.raises(KeyError):
+            model(missing)
+    # Routing on bond type, or bond type and distance, needs no prior at all.
+    for router_input in ("onehot", "onehot_r"):
+        geometry_only = _model(_options("x1", edge_router_input=router_input, **common)).eval()
+        batch = _batch(geometry_only)
+        del batch[_keys.EDGE_H0_KEY]
+        with torch.no_grad():
+            assert torch.isfinite(geometry_only(batch)[_keys.EDGE_FEATURES_KEY]).all()
+
+
+@pytest.mark.parametrize("scope", ["both", "none"])
+@pytest.mark.parametrize("shape", ["one_row", "one_column", "extra_row"])
+def test_prior_router_rejects_a_misshaped_edge_prior(scope, shape):
+    torch.manual_seed(92)
+    model = _model(_options("x1", h0_init_scope=scope)).eval()
+    data = _batch(model)
+    prior = data[_keys.EDGE_H0_KEY]
+    data[_keys.EDGE_H0_KEY] = {"one_row": prior[:1], "one_column": prior[:, :1],
+                               "extra_row": torch.cat([prior, prior[:1]])}[shape]
+    # The H0 input embedding may reject the field first; the router never broadcasts it.
+    with pytest.raises((ValueError, RuntimeError)):
+        with torch.no_grad():
+            model(data)
+
+
 def test_prior_noise_must_reach_the_router_without_h0_input():
     from dptb.nnops.prior_noise import PriorNoiseAugmentation, assert_prior_noise_keys_reach_model
     model = _model(_options("x1", h0_init_scope="none", h0_edge_key=_keys.EDGE_P2_KEY))

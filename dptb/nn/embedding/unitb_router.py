@@ -319,6 +319,14 @@ class UniTBRouter:
             )
         source = data[key].to(dtype=self.dtype)
         mask = self.idp.mask_to_erme.to(source.device)[bond_type.flatten()]
+        if source.shape != mask.shape:
+            # Checked before masking, which would otherwise broadcast a
+            # [1, D] or [E, 1] field into a full per-edge prior.
+            raise ValueError(
+                f"edge prior data[{key!r}] must have one row per edge and one "
+                f"column per reduced matrix element, {tuple(mask.shape)}; got "
+                f"{tuple(source.shape)}."
+            )
         source = source * mask.to(dtype=source.dtype)
         if self.edge_router_prior_cg:
             from .prior_common import _h0_is_coupled_rme
