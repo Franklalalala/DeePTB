@@ -18,6 +18,7 @@ Inference only, CUDA FP64 only. Nothing here chooses physics: densities, potenti
 quadrature objects and neighbour lists are supplied by the caller.
 """
 import itertools
+import os
 from types import SimpleNamespace
 import numpy as np
 import torch
@@ -148,6 +149,14 @@ def onsite_neighbor_lists_native(g, radius=LEGACY_RADIUS_BOHR, *, library=None, 
                 grouped[s] = delta[a + bounds[k]:a + bounds[k + 1]]
         result.append(grouped)
     return result
+
+
+def _neighbour_key(g, radius):
+    """Exact content key of the inputs that determine the onsite neighbour lists of ``g``."""
+    pos = np.ascontiguousarray(g['positions_bohr'], dtype=np.float64)
+    cell = np.ascontiguousarray(g['cell_bohr'], dtype=np.float64)
+    pbc = tuple(bool(x) for x in g.get('pbc', (True, True, True)))
+    return float(radius), tuple(g['symbols']), pos.shape, pos.tobytes(), cell.tobytes(), pbc
 
 
 # ----------------------------------------------------------------------------- density bank packing
@@ -489,6 +498,7 @@ class OnsiteXCEvaluator:
         self.topology_library = topology_library                   # native accepted-order enumeration when set
         self.density_policy = density_policy
         self._bank = None
+        self._neighbours = None                                    # (key, lists) of the last geometry
         self.bank_rebuilds = 0
         self.last_stats = None
 
@@ -507,10 +517,26 @@ class OnsiteXCEvaluator:
             self.bank_rebuilds += 1
         return self._bank
 
-    def neighbors(self, g):
+    def neighbors(self, g, *, library=None):
+        """Onsite neighbour lists of ``g``; the lists of the last geometry are reused while it is unchanged.
+
+        ``topology_library`` selects the native cell-list enumeration as before. Without it, a library passed
+        here or named by ``DPTB_NACF_TOPOLOGY_LIBRARY`` is used when it provides onsite support, so the
+        enumeration costs O(neighbours); otherwise the NumPy enumerator runs. Both return identical lists.
+        """
+        key = _neighbour_key(g, self.radius)
+        if self._neighbours is not None and self._neighbours[0] == key:
+            return self._neighbours[1]
         if self.topology_library is not None:
-            return onsite_neighbor_lists_native(g, self.radius, library=self.topology_library)
-        return onsite_neighbor_lists(g, self.radius)
+            lists = onsite_neighbor_lists_native(g, self.radius, library=self.topology_library)
+        else:
+            from .topology import native_capabilities
+            native = next((path for path in (library, os.environ.get('DPTB_NACF_TOPOLOGY_LIBRARY'))
+                           if path and 'onsite' in native_capabilities(path)), None)
+            lists = (onsite_neighbor_lists_native(g, self.radius, library=native) if native
+                     else onsite_neighbor_lists(g, self.radius))
+        self._neighbours = (key, lists)
+        return lists
 
     def blocks(self, quadrature, neighbors, *, return_density=False, stats=None):
         if self.engine == 'fused':

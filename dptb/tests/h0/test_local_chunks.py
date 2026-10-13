@@ -38,3 +38,16 @@ def test_chunk_equals_separate_native_pairs_with_images_and_eviction(budget,spin
         if spin:assert z.tobytes()==rz.tobytes() and z.flags.owndata
     assert combined.resident<=budget
     assert combined.stats()['result_transfer_batches']==1
+
+
+@pytest.mark.h0_extension('_cuda_local_grid')
+def test_full_cell_field_is_validated_once_at_upload():
+    """A non-finite field is rejected when the cache uploads it; atom supports then read it without rechecking."""
+    from dptb.priors.h0.cuda_local_grid import CudaPeriodicFFTGridAOCache as Cache
+    cell=np.eye(3)*4.;shape=(8,8,8);g,_=reciprocal_grid(cell,shape)
+    zero=np.zeros(shape);v=np.ones(shape);v[3,2,1]=np.nan
+    with pytest.raises(RuntimeError,match='nonfinite local-grid data'):
+        Cache(PeriodicField(cell,v,zero,zero,zero,zero,zero.astype(complex),g,{}))
+    finite=PeriodicField(cell,np.ones(shape),zero,zero,zero,zero,zero.astype(complex),g,{})
+    with pytest.raises(RuntimeError,match='nonfinite local-grid data'):
+        Cache(finite,spin_z_field=replace(finite,values_ry=v))

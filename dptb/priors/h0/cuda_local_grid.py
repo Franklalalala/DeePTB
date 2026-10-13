@@ -66,6 +66,13 @@ class CudaSpeciesCache:
         self._tables.clear()
 
 
+def _require_finite_fields(*fields: torch.Tensor) -> None:
+    """Validate each uploaded full-cell field once; the per-atom support kernel reads it without rechecking."""
+    for field in fields:
+        if field.numel() and not bool(torch.isfinite(field).all()):
+            raise RuntimeError("nonfinite local-grid data")
+
+
 @dataclass
 class CudaAtomSupport:
     """Non-zero orbital support and 3D lookup tensor for one atom on GPU."""
@@ -118,6 +125,7 @@ class CudaGeometrySupports:
             torch.tensor(spin_z_field.values_ry, device=self.device, dtype=torch.float64)
             if self.has_spin_z else torch.empty(0, device=self.device, dtype=torch.float64)
         )
+        _require_finite_fields(self.field_values_t, self.spin_z_values_t)
 
         self.supports: list[CudaAtomSupport] = []
         self.total_bytes = 0
@@ -218,6 +226,7 @@ class CudaPeriodicFFTGridAOCache:
             torch.tensor(spin_z_field.values_ry, device=self.device, dtype=torch.float64)
             if self.has_spin_z else torch.empty(0, device=self.device, dtype=torch.float64)
         )
+        _require_finite_fields(self.field_values_t, self.spin_z_values_t)
 
         self._species_cache: dict[int, dict[str, Any]] = {}
         self._anchors: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()

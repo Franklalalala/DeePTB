@@ -3,8 +3,14 @@
 `NACFTableBank.prepare(..., topology='native')` moves the geometry-dependent
 projector and onsite VNA neighbourhood joins to the vendored C++ core. Build
 `tools/build_nacf_topology.py --output /path/libnacf_topology.so` explicitly and
-set `DPTB_NACF_TOPOLOGY_LIBRARY`, or pass `library=` to `prepare`. The default
-remains `topology='python'`; inference never starts a compiler.
+set `DPTB_NACF_TOPOLOGY_LIBRARY`, or pass `library=` to `prepare`.
+`NACFTableBank.prepare` keeps `topology='python'` as its default. The
+geometry-only entry points (`prepare_geometry`, `NACFGeometryPredictor` and
+`load_soc_predictor`) and the onsite neighbour search of
+`OnsiteXCEvaluator` use the native library whenever one is configured and
+provides the required entry point, and fall back to Python otherwise. A
+prepared candidate prior enumerates its onsite neighbours once and reuses
+them in every forward call. Inference never starts a compiler.
 
 The selected backend changes preparation only. Both paths evaluate the same
 radial tables, projector matrices, P23 factors, overlap and AO gauge, using

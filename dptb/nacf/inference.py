@@ -6,9 +6,11 @@ enumeration on CPU. Numerical prior assembly and the model execute on device.
 """
 from __future__ import annotations
 
-import torch
 import copy
+import os
 from pathlib import Path
+
+import torch
 
 from dptb.data import AtomicData
 from dptb.data.dataloader import Collater
@@ -23,7 +25,7 @@ from .assembly import NACFTableBank
 
 class NACFGeometryPredictor:
     def __init__(self, model, table_bank, model_options, *, target,
-                 expected_p2_source_fingerprint):
+                 expected_p2_source_fingerprint, topology_library=None):
         if target != 'full_h_minus_nacf':
             raise ValueError('geometry NACF inference requires explicit full_h_minus_nacf target')
         if not expected_p2_source_fingerprint or expected_p2_source_fingerprint != table_bank.p2_manifest_sha256:
@@ -45,22 +47,31 @@ class NACFGeometryPredictor:
         self.device, self.dtype = parameter.device, parameter.dtype
         if self.device != table_bank._anchor.device:
             raise ValueError('model and table bank must share a device')
+        self.topology_library = topology_library
 
     def prepare(self, structures):
         """Prepare a geometry or list of geometries; call again after any edit."""
-        plan, geometry = prepare_geometry(self.bank, self.idp, structures, self.cutoffs, output_dtype=self.dtype)
+        plan, geometry = prepare_geometry(self.bank, self.idp, structures, self.cutoffs, output_dtype=self.dtype,
+                                          library=self.topology_library)
         return PreparedNACFInference(self.model, plan, geometry)
 
     def __call__(self, structures):
         return self.prepare(structures)()
 
 
-def prepare_geometry(bank, idp, structures, cutoffs, *, output_dtype=torch.float32):
+def prepare_geometry(bank, idp, structures, cutoffs, *, output_dtype=torch.float32, topology=None, library=None):
     """Prepare NACF/S inputs independently of a learned model, including full SOC.
 
     Returns a callable feature plan and the geometry graph on the bank's device.
     Only species, coordinates, cell and PBC are read from the ASE objects.
+    ``topology=None`` selects the native preparation, which costs O(neighbours), whenever the
+    topology library ``library`` or ``DPTB_NACF_TOPOLOGY_LIBRARY`` provides it, and the Python
+    preparation otherwise; both give the same plan. Pass ``topology`` to force one of them.
     """
+    from .topology import native_capabilities
+    library = library or os.environ.get('DPTB_NACF_TOPOLOGY_LIBRARY')
+    if topology is None:
+        topology = 'native' if 'assembly' in native_capabilities(library) else 'python'
     if hasattr(structures, 'get_positions'):
         structures = [structures]
     structures = list(structures)
@@ -74,7 +85,8 @@ def prepare_geometry(bank, idp, structures, cutoffs, *, output_dtype=torch.float
                                        r_max=rmax, er_max=ermax, oer_max=oermax)
         assembly = bank.prepare(atoms.get_chemical_symbols(), atoms.get_positions() / Bohr2Ang,
                                 atoms.cell.array / Bohr2Ang, graph['edge_index'].numpy(),
-                                graph['edge_cell_shift'].numpy(), pbc=atoms.pbc)
+                                graph['edge_cell_shift'].numpy(), pbc=atoms.pbc,
+                                topology=topology, library=library)
         assemblies.append(assembly)
         data.append(idp(graph))
     batch = Collater()(data).to(bank._anchor.device)

@@ -334,6 +334,9 @@ class PreparedCandidate:
                             for (a, b, rev), ids in groups.items()]
         volume = abs(float(np.linalg.det(cell)))
         self.c_ev = 4.0 * math.pi * sum(plan.moments.m2_bohr2(s) for s in symbols) * bank.ry_to_ev / (3.0 * volume)
+        # Onsite neighbour lists depend only on the geometry: enumerate them once, with the native library of the
+        # assembly when it supports onsite search, and reuse them in the order selection and in every forward.
+        self.onsite_neighbors = plan.onsite.neighbors(self.geometry, library=plan.library)
         self.orders, self.order_checks = r.order_policy.select(plan.onsite, self.geometry, self.width)
         # The onsite engine pads to the structure's largest AO count. A smaller species with the wrong
         # number of basis columns would otherwise still fit and be added silently in an incompatible AO layout.
@@ -368,7 +371,7 @@ class PreparedCandidate:
         b = self.assembly()
         vna = self.edge_vna()["edge_vna_ao_ev"]
         pair = self.pair_xc_blocks()
-        site = self.plan.onsite(self.geometry, self.width, self.orders)
+        site = self.plan.onsite(self.geometry, self.width, self.orders, neighbors=self.onsite_neighbors)
         env = self.envxc(edge_overlap_ao=b["edge_overlap_ao"])
         node = b["node_p23_ao_ev"] + site + self.c_ev * b["node_overlap_ao"]
         edge = b["edge_p2_ao_ev"] + vna + pair + self.c_ev * b["edge_overlap_ao"] + env[arm]
