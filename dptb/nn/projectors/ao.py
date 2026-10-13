@@ -138,7 +138,7 @@ def export_projector_bank(
     """Write a v1 reference-Wigner fixture.
 
     This exporter deliberately cannot produce ICT provenance.  Use
-    :func:`cartesian_ict_bank.export_cartesian_ict_projector_bank` for the
+    :func:`dptb.nn.projectors.ict.export_cartesian_ict_projector_bank` for the
     explicit STF/Cartesian-3j generation route.
     """
     source = str(source).strip().lower()

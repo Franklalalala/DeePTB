@@ -82,3 +82,5 @@ import paths moved. Old paths are not kept as aliases.
 | `dptb.nn.so2_activation_routes` | `dptb.nn.so2_backend` |
 | `h0/h0rebuild`, `h0/*.py` scripts | `dptb.priors.h0`, `dptb h0 <command>` |
 | `h0/tests_h0fast` | `dptb/tests/h0` |
+| `configs/route_*.yaml` | `examples/output_routes/` |
+| `scripts/export_*_projector_bank.py` | `tools/` |

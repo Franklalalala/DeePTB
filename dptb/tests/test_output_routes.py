@@ -347,7 +347,7 @@ def test_six_canonical_route_configs_pass_strict_argcheck():
     assert tuple(ROUTE_CONFIGS) == OFFICIAL_OUTPUT_ROUTES
     model_arg = model_options()
     for route, filename in ROUTE_CONFIGS.items():
-        payload = yaml.safe_load((CONFIG_ROOT / "configs" / filename).read_text())
+        payload = yaml.safe_load((CONFIG_ROOT / "examples" / "output_routes" / filename).read_text())
         normalized = model_arg.normalize_value(payload["model_options"])
         model_arg.check_value(normalized, strict=True)
         assert normalized["embedding"]["output_route"] == route
