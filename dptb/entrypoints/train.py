@@ -6,6 +6,7 @@ from dptb.configuration import (
 )
 from dptb.nnops.ddp_utils import merge_restart_train_options
 from dptb.nn.build import build_model
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.data.build import build_dataset
 from dptb.plugins.monitor import Validationer, TensorBoardMonitor, DeepDoctorMonitor, SO2ModuleMonitor, PreTPBlockMonitor, ScalarFieldMonitor, ParamDynamicsMonitor
 from dptb.plugins.training_monitor import register_core_training_monitors
@@ -434,7 +435,7 @@ def train(
         if f.split(".")[-1] == "json":
             assert not restart, "json model can not be used as restart! should be a checkpoint file"
         else:
-            f = torch.load(f, map_location="cpu", weights_only=False)
+            f = load_checkpoint(f)
             checkpoint_train_options = migrate_legacy_checkpoint_train_options(
                 f["config"].get("train_options", {})
             )

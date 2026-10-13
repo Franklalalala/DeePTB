@@ -9,6 +9,7 @@ import torch
 from dptb.utils.constants import h_all_types, anglrMId
 from typing import Tuple, Union, Dict
 from dptb.data.transforms import OrbitalMapper
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.data import AtomicDataDict
 import numpy as np
 import torch.nn as nn
@@ -602,7 +603,7 @@ class NNSK(torch.nn.Module):
                     log.warning("CUDA is not available. The model will be loaded on CPU.")
                     common_options.update({"device": device})
 
-            f = torch.load(checkpoint, map_location=device, weights_only=False)
+            f = load_checkpoint(checkpoint, map_location=device)
             for k,v in common_options.items():
                 if v is None:
                     common_options[k] = f["config"]["common_options"][k]

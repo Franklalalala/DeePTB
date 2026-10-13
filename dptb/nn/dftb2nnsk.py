@@ -1,3 +1,4 @@
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.nn.dftb.sk_param import SKParam
 from dptb.nn.dftb.hopping_dftb import HoppingIntp
 import torch
@@ -188,7 +189,7 @@ class DFTB2NNSK(nn.Module):
         if not os.path.exists(ckpt):
             raise FileNotFoundError(f"No file found at {ckpt}")
 
-        state = torch.load(ckpt, weights_only=False)
+        state = load_checkpoint(ckpt, map_location=None)
         config = state['config']
         model = cls(skdata=skdata, train_options=train_options, output=output, **config)
         model.load_state_dict(state['model_state_dict'])

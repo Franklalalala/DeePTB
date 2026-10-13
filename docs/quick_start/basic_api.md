@@ -6,13 +6,17 @@ registration.
 
 ## Build a model
 
-Restore a checkpoint:
+Restore a checkpoint, including one written by an earlier release:
 
 ~~~python
-from dptb.nn import build_model
+from dptb.nn import build_model, load_checkpoint
 
 model = build_model(checkpoint="checkpoint.pth")
+config = load_checkpoint("checkpoint.pth")["config"]
 ~~~
+
+Read checkpoint files with `load_checkpoint` rather than `torch.load`; it maps
+tensors to CPU and resolves objects saved under former module paths.
 
 Or construct a complete model from a configuration:
 

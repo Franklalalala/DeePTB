@@ -133,8 +133,9 @@ def load_predictor(checkpoint, p2, p23, overlap, expected_p2_sha256, device='cud
     if model_backend not in ('checkpoint', 'reference'):
         raise ValueError("model_backend must be 'checkpoint' or 'reference'")
     from dptb.nn import build_model
+    from dptb.nn.checkpoint import load_checkpoint
     checkpoint = Path(checkpoint)
-    payload = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    payload = load_checkpoint(checkpoint)
     state = payload['model_state_dict']
     for name, tensor in state.items():
         if torch.is_tensor(tensor) and (tensor.is_floating_point() or tensor.is_complex()):

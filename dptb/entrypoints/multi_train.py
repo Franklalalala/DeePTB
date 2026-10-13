@@ -22,6 +22,7 @@ import torch.multiprocessing as mp
 from pathlib import Path
 
 from dptb.nn.build import build_model
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.data.build import build_dataset
 from dptb.configuration import (
     migrate_legacy_checkpoint_model_options,
@@ -350,7 +351,7 @@ def _multi_train_impl(
             if f.split(".")[-1] == "json":
                 assert not restart, "json model can not be used as restart! should be a checkpoint file"
             else:
-                f = torch.load(f, map_location="cpu", weights_only=False)
+                f = load_checkpoint(f)
                 checkpoint_train_options = migrate_legacy_checkpoint_train_options(
                     f["config"].get("train_options", {})
                 )

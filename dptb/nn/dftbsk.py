@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple, Union, Dict
 from dptb.data.transforms import OrbitalMapper
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.data import AtomicDataDict
 from .sktb import OnsiteFormula
 from dptb.nn.dftb.hopping_dftb import HoppingIntp
@@ -165,7 +166,7 @@ class DFTBSK(torch.nn.Module):
         }
 
         assert checkpoint.split(".")[-1] == "pth", "The checkpoint should be a pth file." 
-        f = torch.load(checkpoint, map_location=device, weights_only=False)
+        f = load_checkpoint(checkpoint, map_location=device)
 
         for k,v in common_options.items():
             if v is None:

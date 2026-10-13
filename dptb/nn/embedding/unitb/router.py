@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from dptb.data import AtomicDataDict
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.nn.route_drop import (validate_route_drop, sample_structure_routes,
                                 apply_structure_routes, record_route_drop)
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLERouterV3
@@ -227,7 +228,7 @@ class UniTBRouter:
             mean = torch.zeros(desc_dim, dtype=self.dtype, device=self.device)
             std = torch.ones(desc_dim, dtype=self.dtype, device=self.device)
             if self.edge_router_prior_stats:
-                blob = torch.load(self.edge_router_prior_stats, map_location="cpu")
+                blob = load_checkpoint(self.edge_router_prior_stats)
                 loaded_mean = blob["mean"].reshape(-1)
                 loaded_std = blob["std"].reshape(-1)
                 if loaded_mean.numel() != desc_dim or loaded_std.numel() != desc_dim:

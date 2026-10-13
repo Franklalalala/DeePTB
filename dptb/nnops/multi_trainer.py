@@ -1,3 +1,4 @@
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.nn.heads.shift import optimizer_named_parameters
 import contextlib
 import time
@@ -3412,7 +3413,7 @@ class MultiTrainer(Trainer):
     @classmethod
     def restart(cls, checkpoint, train_datasets, train_options={}, common_options={}, reference_datasets=None,
                 validation_datasets=None, distributed_expert=False, rank=0, world_size=1):
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ckpt = load_checkpoint(checkpoint)
         validate_checkpoint_invariants(ckpt)
         validate_checkpoint_world_size(
             ckpt,

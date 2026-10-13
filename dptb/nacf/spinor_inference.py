@@ -202,7 +202,8 @@ def load_soc_predictor(onsite_checkpoint, hopping_checkpoint, *, p2, p23, overla
     models, configs, conditioning = [], [], []
     for checkpoint,sidecar in zip((onsite_checkpoint, hopping_checkpoint),(onsite_config,hopping_config)):
         path = Path(checkpoint)
-        payload = torch.load(path, map_location='cpu', weights_only=False)
+        from dptb.nn.checkpoint import load_checkpoint
+        payload = load_checkpoint(path)
         config = copy.deepcopy(payload['config'])
         training_config = _training_contract_config(config,sidecar)
         conditioning.append(_residual_contract(training_config))

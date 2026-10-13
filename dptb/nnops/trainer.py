@@ -1,3 +1,4 @@
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.nn.heads.shift import optimizer_named_parameters
 import torch
 import logging
@@ -705,11 +706,7 @@ class Trainer(BaseTrainer):
                 validation_datasets=None):
         train_options = {} if train_options is None else train_options
         common_options = {} if common_options is None else common_options
-        ckpt = torch.load(
-            checkpoint,
-            map_location="cpu",
-            weights_only=False,
-        )
+        ckpt = load_checkpoint(checkpoint)
         validate_checkpoint_invariants(ckpt)
         validate_checkpoint_world_size(ckpt)
         preflight_restart_checkpoint(checkpoint, ckpt, trainer_kind="trainer")

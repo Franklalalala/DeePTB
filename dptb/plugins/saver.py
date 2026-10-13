@@ -175,7 +175,8 @@ class Saver(Plugin, StatefulPlugin):
             best_path = os.path.join(self.checkpoint_path, model_name + ".best.pth")
             try:
                 if os.path.lexists(best_path):
-                    prev = torch.load(best_path, map_location="cpu", weights_only=False)
+                    from dptb.nn.checkpoint import load_checkpoint
+                    prev = load_checkpoint(best_path)
                     seed = self._loss_from_stats(prev.get("stats", {}))
                     if seed is not None:
                         self.best_loss = seed

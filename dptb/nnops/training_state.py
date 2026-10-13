@@ -396,10 +396,8 @@ def preflight_restart_checkpoint(
                 break
         if alternative_step is None:
             try:
-                import torch
-                alternative_ckpt = torch.load(
-                    alternative, map_location="cpu", weights_only=False
-                )
+                from dptb.nn.checkpoint import load_checkpoint
+                alternative_ckpt = load_checkpoint(alternative)
                 alternative_step = read_resume_metadata(alternative_ckpt).global_step
             except Exception:
                 alternative_step = None

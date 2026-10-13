@@ -8,6 +8,7 @@ from dptb.configuration import (
     migrate_legacy_checkpoint_model_options,
     resolve_reconstruction_mode,
 )
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.nn.embedding import Embedding
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.base import AtomicFFN, AtomicResNet, AtomicLinear, Identity
@@ -571,7 +572,7 @@ class NNENV(nn.Module):
                 device = 'cpu'
                 log.warning("CUDA is not available. The model will be loaded on CPU.")
 
-        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+        ckpt = load_checkpoint(checkpoint, map_location=device)
         checkpoint_model_options = migrate_legacy_checkpoint_model_options(
             ckpt["config"]["model_options"]
         )
@@ -723,7 +724,7 @@ class MIX(nn.Module):
                 device = 'cpu'
                 log.warning("CUDA is not available. The model will be loaded on CPU.")
 
-        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+        ckpt = load_checkpoint(checkpoint, map_location=device)
         common_options = {
             "dtype": dtype,
             "device": device,

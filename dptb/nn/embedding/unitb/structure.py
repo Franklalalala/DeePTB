@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from dptb.data import AtomicDataDict, _keys
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.data.interfaces.blockwise_tensor import strict_reverse_edge_index
 
 log = logging.getLogger(__name__)
@@ -327,7 +328,7 @@ def svd_split_state(model, source):
 def initialize_fresh(model, cfg):
     """Fresh build only; checkpoint reload does not consult either source file."""
     if cfg.get("init_from"):
-        ckpt = torch.load(cfg["init_from"], map_location="cpu", weights_only=False)
+        ckpt = load_checkpoint(cfg["init_from"])
         source_cfg = ckpt["config"]["model_options"]
         source_emb = source_cfg["embedding"]
         if (source_emb.get("num_experts") != 1 or source_emb.get("num_shared_experts", 0) != 0
@@ -357,7 +358,7 @@ def initialize_fresh(model, cfg):
             raise ValueError("dense conversion requires the same distance wrapper")
         svd_split_state(model, ckpt["model_state_dict"])
     if cfg.get("stats_path"):
-        bundle = torch.load(cfg["stats_path"], map_location="cpu", weights_only=False)
+        bundle = load_checkpoint(cfg["stats_path"])
         if bundle.get("split") != "train":
             raise ValueError("statistics must come from the training split")
         if bundle.get("descriptor_contract") != descriptor_contract(model):

@@ -6,6 +6,7 @@ import os
 import time
 from pathlib import Path
 from dptb.nn.build import build_model
+from dptb.nn.checkpoint import load_checkpoint
 from dptb.data.build import build_dataset
 from typing import Optional
 from dptb.utils.loggers import set_log_handles
@@ -59,7 +60,7 @@ def _test(
     # setup seed
     setup_seed(seed=jdata["common_options"]["seed"])
 
-    f = torch.load(init_model, weights_only=False)
+    f = load_checkpoint(init_model)
     # update basis
     basis = f["config"]["common_options"]["basis"]
     for asym, orb in jdata["common_options"]["basis"].items():
@@ -70,7 +71,7 @@ def _test(
 
     set_log_handles(log_level, Path(log_path) if log_path else None)
 
-    f = torch.load(run_opt["init_model"], weights_only=False)
+    f = load_checkpoint(run_opt["init_model"])
     jdata["model_options"] = f["config"]["model_options"]
     del f
     

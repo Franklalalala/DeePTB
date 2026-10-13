@@ -181,3 +181,21 @@ def test_new_prior_checkpoint_missing_adapter_state_is_an_error(tmp_path, method
     normalized = _normalize(common, options)
     with pytest.raises(RuntimeError, match="Missing key"):
         build_model(checkpoint=str(checkpoint), model_options=normalized["model_options"])
+
+
+def test_load_checkpoint_resolves_former_module_paths(tmp_path):
+    import importlib
+    import io
+
+    from dptb.nn import checkpoint
+    from dptb.nn.conditioning.projection import H0InitLayer
+
+    for module in checkpoint.MOVED_MODULES.values():
+        importlib.import_module(module)
+    old_pickle = b"cdptb.nn.embedding.prior_common\nH0InitLayer\n."
+    assert checkpoint._Unpickler(io.BytesIO(old_pickle)).load() is H0InitLayer
+
+    path = tmp_path / "ckpt.pth"
+    torch.save({"config": {"model_options": {}}, "model_state_dict": {"w": torch.ones(2)}}, path)
+    loaded = checkpoint.load_checkpoint(path)
+    assert torch.equal(loaded["model_state_dict"]["w"], torch.ones(2))

@@ -5,6 +5,7 @@
 | Location | Responsibility |
 | --- | --- |
 | `dptb/nn/build.py` | `build_model`: model-family selection, configuration, and checkpoint restoration |
+| `dptb/nn/checkpoint.py` | `load_checkpoint` and the adapters that keep checkpoints from earlier releases loading |
 | `dptb/nn/ensemble.py` | Distance-expert composition and deterministic expert initialization |
 | `dptb/nn/embedding/registry.py` | `Embedding`: method-name registry and factory |
 | `dptb/nn/embedding/unitb/` | UniTB: `model.py` public class, backbone, layers, routing, and options |
@@ -65,7 +66,10 @@ CLI use, add its options to the configuration schema.
 ## Module moves in `1013-stable`
 
 Configuration method names and `state_dict` keys are unchanged; only Python
-import paths moved. Old paths are not kept as aliases.
+import paths moved. Old paths are not kept as import aliases. Checkpoints from
+earlier releases load unchanged: every checkpoint read goes through
+`dptb.nn.checkpoint.load_checkpoint`, which also resolves objects pickled under
+a former module path (`MOVED_MODULES`).
 
 | Former location | Current location |
 | --- | --- |

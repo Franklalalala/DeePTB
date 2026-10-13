@@ -2,11 +2,15 @@
 
 import copy
 import logging
-import warnings
 
 import torch
 
 from dptb.configuration import migrate_legacy_checkpoint_model_options
+from dptb.nn.checkpoint import (
+    load_checkpoint,
+    _maybe_enable_legacy_swiglu_s2_compat,
+    _maybe_preserve_legacy_baseline_checkpoint,
+)
 from dptb.nn.deeptb import NNENV, MIX
 from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
@@ -89,108 +93,6 @@ def _is_multi_expert_state_dict(state_dict: dict):
     return _count_experts_in_state_dict(state_dict) > 0
 
 
-def _has_legacy_swiglu_s2_state(state_dict: dict) -> bool:
-    if not state_dict:
-        return False
-    return any(".activation.mul." in key for key in state_dict.keys())
-
-
-def _baseline_checkpoint_options_equal(checkpoint_options: dict, model_options: dict):
-    """Recognize schema defaults and aliases without dropping caller overrides."""
-    if model_options == checkpoint_options:
-        return True
-
-    # Use the same preprocessing and model schema as the training entrypoint.
-    # Unknown options remain in the comparison rather than being trimmed away.
-    from dptb.configuration import canonicalize_training_config
-    from dptb.utils.argcheck import _resolve_legacy_baseline_methods, model_options as model_schema
-
-    schema = model_schema()
-
-    def normalized(options):
-        config = _resolve_legacy_baseline_methods({"model_options": copy.deepcopy(options)})
-        config = canonicalize_training_config(config, warn_deprecated=False)
-        return schema.normalize_value(config["model_options"])
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        return normalized(model_options) == normalized(checkpoint_options)
-
-
-def _maybe_preserve_legacy_baseline_checkpoint(
-        model_options: dict, state_dict: dict, *, checkpoint_options: dict = None):
-    """Preserve geometry-only legacy baselines whose prior options were ignored.
-
-    Apply only to unchanged checkpoint options, including equivalent aliases
-    and schema defaults. The saved method determines legacy provenance; a new
-    prior checkpoint with missing adapter weights retains strict state loading.
-    """
-    if state_dict is None or not model_options:
-        return model_options
-    saved_options = model_options if checkpoint_options is None else checkpoint_options
-    embedding = saved_options.get("embedding")
-    if not isinstance(embedding, dict) or embedding.get("method") not in {"lem", "slem"}:
-        return model_options
-    from dptb.nn.conditioning.inputs import PRIOR_INPUT_KEYS
-
-    if not PRIOR_INPUT_KEYS.intersection(embedding):
-        return model_options
-    if any(".prior_inputs." in key or key.startswith("prior_inputs.") for key in state_dict):
-        return model_options
-    if not _baseline_checkpoint_options_equal(saved_options, model_options):
-        return model_options
-
-    # Equivalent normalized options can still alter incidental state shapes
-    # (for example an injected scalar residual-update ratio). Reconstruct from
-    # the saved options so historical constructor defaults remain intact.
-    patched = copy.deepcopy(saved_options)
-    options = patched["embedding"]
-    method = embedding["method"]
-    options["method"] = method + "_prior"
-    options["h0_init_scope"] = "none"
-    for key in ("use_h0_init", "use_h0_node_init", "use_h0_edge_init"):
-        options.pop(key, None)
-    warnings.warn(
-        f"Legacy {method!r} checkpoint contains no prior adapter weights: the "
-        "original embedding was geometry-only and historically ignored prior "
-        f"options. Loading as {options['method']!r} with h0_init_scope='none' "
-        "to preserve its learned behavior. Changed embedding overrides retain "
-        "strict checkpoint loading.",
-        FutureWarning,
-        stacklevel=3,
-    )
-    return patched
-
-
-def _maybe_enable_legacy_swiglu_s2_compat(model_options: dict, state_dict: dict):
-    if not state_dict or not model_options:
-        return model_options
-
-    embedding = model_options.get("embedding", None)
-    if not isinstance(embedding, dict):
-        return model_options
-    if embedding.get("method") not in {
-        "lem_moe_v3",
-        "lem_moe_v3_h0",
-        "lem_moe_v3_prior",
-        "lem_moe_v3_prior_2b",
-    }:
-        return model_options
-    if embedding.get("swiglu_s2_compat_mode", "modern") != "modern":
-        return model_options
-    if not _has_legacy_swiglu_s2_state(state_dict):
-        return model_options
-
-    patched = copy.deepcopy(model_options)
-    patched.setdefault("embedding", {})
-    patched["embedding"]["swiglu_s2_compat_mode"] = "legacy_uniform_only"
-    log.warning(
-        "Detected legacy flat SwiGLU-S2 checkpoint layout; forcing "
-        "embedding.swiglu_s2_compat_mode='legacy_uniform_only' for compatibility."
-    )
-    return patched
-
-
 def _build_ensemble_from_wrapper_state(wrapper_state_dict, distance_ranges, init_nnenv, init_nnsk, init_mixed,
                                        init_dftbsk, model_options, common_options, clip_last_expert_range=False,
                                        seed_offset=0):
@@ -244,7 +146,7 @@ def build_model(
         if checkpoint.split(".")[-1] == "json":
             ckptconfig = j_loader(checkpoint)
         else:
-            f = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            f = load_checkpoint(checkpoint)
             ckptconfig = f['config']
             ckpt_state_dict = f.get("model_state_dict", None)
             moe_init_metadata = copy.deepcopy(f.get("moe_init"))
