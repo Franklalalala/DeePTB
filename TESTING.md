@@ -6,7 +6,7 @@ Use a configured DeePTB environment and select tests for the behavior affected b
 python tools/test.py dptb/tests/test_record_codec.py
 ```
 
-`python tools/test.py` and `bash ut.sh` run the same short suite, covering public APIs, embedding discovery and compatibility, spectral losses, record decoding, prior-aware models, and expert masks. This suite checks installation and common interfaces. It does not cover every feature.
+`python tools/test.py` and `bash ut.sh` run the same short suite, covering the embedding registry, the training loop, spectral losses, record decoding, prior-aware models, and expert masks. This suite checks installation and common interfaces. It does not cover every feature.
 
 Request the full suites explicitly when needed:
 
@@ -33,7 +33,7 @@ When SO2CUDA is unavailable, validate the corresponding PyTorch reference path. 
 
 ## Validation principles
 
-Keep tests of observable behavior: small independent numerical references, data/graph alignment, checkpoint restoration, finite and correctly routed gradients, and rejection of corrupt inputs. A bug usually needs one minimal regression case; parameterize related boundary cases.
+Keep the suite small. Keep tests of observable behavior: small independent numerical references, data/graph alignment, checkpoint restoration, finite and correctly routed gradients, and rejection of corrupt inputs. A bug usually needs one minimal regression case; parameterize related boundary cases. Do not add tests for import paths, packaging, review rounds, or one-off investigations, and delete tests together with the feature they cover.
 
 Avoid assertions on source spelling, comments, private call order, frozen implementation copies, or incidental error wording. Configuration tests should exercise actual acceptance or rejection.
 
