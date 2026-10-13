@@ -29,7 +29,7 @@ S1C_OPT = dict(lr=1.0e-2, weight_decay=0.01, muon_beta=0.95, muon_scale=0.2, mag
 def _pristine(relpath, modname):
     try:
         src = subprocess.run(["git", "-C", str(REPO), "show", f"{BASE_COMMIT}:{relpath}"], check=True,
-                             capture_output=True, text=True).stdout
+                             capture_output=True, text=True, encoding="utf-8").stdout
     except Exception as exc:  # pragma: no cover
         pytest.skip(f"pristine source unavailable: {exc}")
     mod = types.ModuleType(modname)
