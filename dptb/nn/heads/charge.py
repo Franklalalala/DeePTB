@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from dptb.nn.response_shift_head import ResponseShiftHead
-from dptb.nn.shift_head import normalize_shift_options
+from dptb.nn.heads.response_shift import ResponseShiftHead
+from dptb.nn.heads.shift import normalize_shift_options
 
 
 def normalize_charge_options(options):

@@ -5,10 +5,10 @@ import pytest
 import torch
 
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.charge_head import ChargeHead, normalize_charge_options
-from dptb.nn.charge_response import isolated_gamma
-from dptb.nn.response_shift_head import ResponseShiftHead
-from dptb.nn.shift_head import normalize_shift_options
+from dptb.nn.heads.charge import ChargeHead, normalize_charge_options
+from dptb.nn.heads.charge_response import isolated_gamma
+from dptb.nn.heads.response_shift import ResponseShiftHead
+from dptb.nn.heads.shift import normalize_shift_options
 from dptb.nnops.prior_noise import PriorNoiseAugmentation
 from dptb.tests._requires import requires_cuda
 from dptb.tests.prior_noise_helpers import FakeIDP, make_batch

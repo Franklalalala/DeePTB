@@ -52,7 +52,7 @@ def normalize_shift_options(options):
     if cfg["response"] is not None:
         if cfg["mode"] != "atom":
             raise ValueError("shift_head.response requires mode=atom; use response=null to disable")
-        from dptb.nn.response_shift_head import normalize_response_options
+        from dptb.nn.heads.response_shift import normalize_response_options
         cfg["response"] = normalize_response_options(cfg["response"])
     return cfg
 

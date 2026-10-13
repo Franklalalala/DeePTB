@@ -1,4 +1,4 @@
-from dptb.nn.shift_head import optimizer_named_parameters
+from dptb.nn.heads.shift import optimizer_named_parameters
 import contextlib
 import time
 import logging

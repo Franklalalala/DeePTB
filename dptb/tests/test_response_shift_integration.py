@@ -12,7 +12,7 @@ pytest.importorskip("e3nn", reason="full DeePTB/e3nn environment required")
 pytest.importorskip("ase", reason="full DeePTB data environment required")
 
 from dptb.nn.build import build_model
-from dptb.nn.shift_head import PotentialShiftHead
+from dptb.nn.heads.shift import PotentialShiftHead
 from dptb.tests.shift_head_helpers import config, batch
 from dptb.tests.shift_head_helpers import bitwise
 

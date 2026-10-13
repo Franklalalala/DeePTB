@@ -5,8 +5,8 @@ import torch
 from e3nn import o3
 
 from dptb.data import AtomicDataDict as K
-from dptb.nn.shift_head import PotentialShiftHead, add_compact_delta
-from dptb.nn.charge_response import (
+from dptb.nn.heads.shift import PotentialShiftHead, add_compact_delta
+from dptb.nn.heads.charge_response import (
     ResponseNetwork, graph_index, onsite_coordinate, weighted_center,
 )
 from dptb.nnops.layout import normalize_idp_mask_layout

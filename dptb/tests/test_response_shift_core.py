@@ -11,7 +11,7 @@ import torch
 
 
 def load_core(name):
-    path = Path(__file__).resolve().parents[1] / "nn" / (name + ".py")
+    path = Path(__file__).resolve().parents[1] / "nn" / "heads" / (name + ".py")
     spec = importlib.util.spec_from_file_location("_test_" + name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

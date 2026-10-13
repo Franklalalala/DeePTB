@@ -469,8 +469,8 @@ class NNENV(nn.Module):
         elif self.method == "block_native":
             pass
 
-        from dptb.nn.shift_head import normalize_shift_options
-        from dptb.nn.charge_head import ChargeHead, normalize_charge_options
+        from dptb.nn.heads.shift import normalize_shift_options
+        from dptb.nn.heads.charge import ChargeHead, normalize_charge_options
         shift_options = (normalize_charge_options(shift_head) if embedding["method"] == "unitb"
                          else normalize_shift_options(shift_head))
         self.shift_head = None
@@ -479,7 +479,7 @@ class NNENV(nn.Module):
                 raise ValueError("shift_head requires transformed e3tb feature outputs")
             if embedding["method"] not in {"unitb", "lem", "lem_moe_v3", "lem_moe_v3_h0", "lem_moe_v3_edge", "lem_moe_v3_edge_h0"}:
                 raise ValueError("shift_head is supported on LEM and LEM MoE v3/H0/edge backbones")
-            from dptb.nn.response_shift_head import ResponseShiftHead
+            from dptb.nn.heads.response_shift import ResponseShiftHead
             if shift_options["response"] is None:
                 raise ValueError("shift_head requires an atom response; additive heads are archived")
             if embedding["method"] not in {"unitb", "lem_moe_v3", "lem_moe_v3_h0", "lem_moe_v3_edge", "lem_moe_v3_edge_h0"}:
@@ -500,7 +500,7 @@ class NNENV(nn.Module):
         ):
             # LEM overwrites edge_overlap with latents. Snapshot physical inputs
             # BEFORE that write, but only under the explicit new input contract.
-            from dptb.nn.shift_overlap import prepare_shift_overlap
+            from dptb.nn.heads.shift_overlap import prepare_shift_overlap
             prepare_shift_overlap(data, self.idp.reduced_matrix_element,
                                   standard=self.shift_head.options.get("overlap_input") == "standard", dtype=self.dtype)
         data = self.embedding(data)

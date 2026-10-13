@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.shift_head import add_compact_delta, normalize_shift_options, optimizer_named_parameters
+from dptb.nn.heads.shift import add_compact_delta, normalize_shift_options, optimizer_named_parameters
 from dptb.nnops.layout import project_uureal_to_like
 from dptb.nnops.loss import HamilLossAbs
 from dptb.tests.shift_head_helpers import make_model, batch, bitwise

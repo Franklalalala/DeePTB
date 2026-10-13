@@ -11,7 +11,7 @@
 | `dptb/nn/embedding/legacy/` | Historical `lem_moe_v3*` methods and their distinct mathematical contracts |
 | `dptb/nn/embedding/{lem,slem,lem_prior,slem_prior}.py` | Upstream and prior-aware baselines |
 | `dptb/nn/conditioning/` | Prior projection/input adapters, time conditioning, and edge memory |
-| `dptb/nn/heads/` | Output-route selection and AO-block/RME output heads |
+| `dptb/nn/heads/` | Output-route selection, AO-block/RME output heads, and charge/potential shift heads |
 | `dptb/nn/projectors/` | Shared AO, Cartesian, and ICT projector implementations |
 | `dptb/nn/pdq_moe.py` | Shared expert banks and routing metadata |
 | `dptb/nn/so2_backend.py` | Optional SO2CUDA dispatch and PyTorch fallback |
@@ -78,6 +78,7 @@ import paths moved. Old paths are not kept as aliases.
 | `dptb.nn.embedding.output_routes` | `dptb.nn.heads.routes` |
 | `dptb.nn.embedding.{late_*,ao_angular_projector,block_native_head,rme_nocg_fusion_head}` | `dptb.nn.heads.*` |
 | `dptb.nn.embedding.{ao_projector_bank,cartesian_projector,cartesian_ict_bank}` | `dptb.nn.projectors.{ao,cartesian,ict}` |
+| `dptb.nn.{charge_head,charge_response,response_shift_head,shift_head,shift_overlap}` | `dptb.nn.heads.{charge,charge_response,response_shift,shift,shift_overlap}` |
 | `dptb.nn.so2_activation_routes` | `dptb.nn.so2_backend` |
 | `h0/h0rebuild`, `h0/*.py` scripts | `dptb.priors.h0`, `dptb h0 <command>` |
 | `h0/tests_h0fast` | `dptb/tests/h0` |

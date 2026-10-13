@@ -2,12 +2,12 @@
 
 The local readout carries element-dependent relative levels, while the charge-equilibration
 term adds the nonlocal correction v = local readout + kappa * Gamma q.
-Pure-torch tests of dptb.nn.charge_response (no e3nn needed) plus option validation with e3nn.
+Pure-torch tests of dptb.nn.heads.charge_response (no e3nn needed) plus option validation with e3nn.
 """
 import pytest
 import torch
 
-from dptb.nn.charge_response import ResponseNetwork, graph_mean, isolated_gamma
+from dptb.nn.heads.charge_response import ResponseNetwork, graph_mean, isolated_gamma
 
 
 def _net(seed=0, **kw):
@@ -167,7 +167,7 @@ def test_qeq_local_option_validation():
     with pytest.raises(ValueError):
         ResponseNetwork(6, 4, kind="qeq", qeq_local=1)
     pytest.importorskip("e3nn")
-    from dptb.nn.response_shift_head import normalize_response_options
+    from dptb.nn.heads.response_shift import normalize_response_options
     assert normalize_response_options({"kind": "qeq"})["qeq_local"] is False
     with pytest.raises(ValueError):
         normalize_response_options({"kind": "qeq", "qeq_local": True, "context": "sublattice"})

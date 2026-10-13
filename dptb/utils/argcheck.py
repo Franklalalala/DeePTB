@@ -3804,7 +3804,7 @@ def normalize(data):
         embedding.update(unitb_options(embedding))
         shift = data.get("model_options", {}).get("shift_head")
         if shift is not None and shift.get("mode", "atom") != "off":
-            from dptb.nn.charge_head import normalize_charge_options
+            from dptb.nn.heads.charge import normalize_charge_options
             data["model_options"]["shift_head"] = normalize_charge_options(shift)
         for alias in ("expert_parameterization", "expert_rank", "expert_mixing", "router_input", "router_gate"):
             embedding.pop(alias, None)
