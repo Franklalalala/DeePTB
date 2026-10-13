@@ -3,8 +3,8 @@ import torch
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.data.AtomicDataDict import with_batch, with_edge_vectors
-from .emb import Embedding
-from .prior_inputs import PriorInputs
+from dptb.nn.embedding.registry import Embedding
+from dptb.nn.conditioning.inputs import PriorInputs
 from .slem import Slem
 
 

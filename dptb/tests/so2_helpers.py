@@ -2,7 +2,7 @@
 import torch
 from e3nn import o3
 
-from dptb.nn.embedding.unitb_activations import build_gate_activation
+from dptb.nn.embedding.unitb.activations import build_gate_activation
 from dptb.nn.tensor_product_moe_v3 import SO2_Linear
 
 IRREPS_IN = "4x0e + 3x1o + 2x2e"

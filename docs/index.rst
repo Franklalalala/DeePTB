@@ -1,16 +1,21 @@
-=================
-DeePTB 文档
-=================
+=====================
+DeePTB documentation
+=====================
 
-DeePTB 提供 Slater–Koster 模型与等变原子轨道算符预测，支持哈密顿量、密度矩阵、重叠矩阵、自旋轨道耦合以及电子结构后处理。
+DeePTB provides Slater–Koster models and equivariant atomic-orbital operator prediction, including Hamiltonian, density, and overlap matrices, spin-orbit coupling, and electronic-structure postprocessing.
 
-``1006-stable`` 是本仓库的维护分支。UniTB 默认使用 PDQ-MoE，并支持单专家的 UniTB-dense 配置；上游无先验 ``lem`` / ``slem`` 与带先验基线独立维护。SO2CUDA 是可选加速组件，LoopSCF 在独立仓库中使用 DeePTB 的通用接口。
+``1006-stable`` is the maintenance branch. UniTB defaults to PDQ-MoE and supports a single-expert UniTB-dense configuration. Upstream ``lem`` / ``slem`` and prior-aware baselines have separate interfaces. SO2CUDA provides optional acceleration; LoopSCF uses DeePTB from its own repository.
 
 .. toctree::
    :maxdepth: 2
-   :caption: 维护版本与数据契约
+   :caption: Architecture and data contracts
 
+   architecture
    1006-stable
+   unitb
+   embedding_baselines
+   so2_backend
+   advanced/so2_compact_wigner
    advanced/prior_inputs
    nacf_candidate_prior
    nacf_compact_packing
@@ -21,26 +26,23 @@ DeePTB 提供 Slater–Koster 模型与等变原子轨道算符预测，支持�
 
 .. toctree::
    :maxdepth: 2
-   :caption: 快速开始
-   
+   :caption: Quick start
 
    quick_start/easy_install
    quick_start/input
    quick_start/hands_on/index
    quick_start/basic_api
 
-
 .. toctree::
    :maxdepth: 2
-   :caption: 输入字段
-   
+   :caption: Input fields
+
    input_params/index
 
-
 .. toctree::
    :maxdepth: 2
-   :caption: 进阶用法
-   
+   :caption: Advanced usage
+
    advanced/sktb/index
    advanced/e3tb/index
    advanced/elec_properties/index
@@ -48,20 +50,19 @@ DeePTB 提供 Slater–Koster 模型与等变原子轨道算符预测，支持�
 
 .. toctree::
    :maxdepth: 2
-   :caption: 引用
+   :caption: Citations
 
    CITATIONS
 
 .. toctree::
    :maxdepth: 2
-   :caption: 开发团队
+   :caption: Development team
 
    DevelopingTeam
 
 .. toctree::
    :maxdepth: 2
-   :caption: 社区
+   :caption: Community
 
    community/contribution_guide
    CONTRIBUTING
-

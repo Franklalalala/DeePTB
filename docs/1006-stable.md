@@ -1,43 +1,82 @@
-# `1006-stable` 维护版本
+# `1006-stable` maintenance release
 
-本版本提供 UniTB（含单专家的 UniTB-dense 配置）和上游标准 embedding，统一保留模型构建、训练、评测及电子结构后处理接口。
+This release provides UniTB, including its single-expert UniTB-dense configuration,
+and upstream embeddings through shared model-building, training, evaluation, and
+electronic-structure postprocessing interfaces.
 
-## 模块结构
+## Component layout
 
-| 位置 | 功能 |
+| Location | Purpose |
 | --- | --- |
-| `dptb/nn/embedding/unitb.py` | UniTB 与 UniTB-dense，`layer_topology` 可选 SLEM 交互层（UniTB-SLEM）；既有生产名称由兼容接口解析 |
-| `dptb/nn/embedding/lem.py`、`slem.py` | 上游无先验基线 |
-| `dptb/nn/embedding/lem_prior.py`、`slem_prior.py` | 带先验输入的基线 |
-| `dptb/data` | 图、LMDB 记录、侧车、AO block 与特征转换 |
-| `dptb/nnops`、`dptb/entrypoints` | 单模型及 `multi_train` 训练、验证和推理入口 |
-| `dptb/nacf`、`h0` | NACF 与物理 H0 先验构建及重建 |
-| `dptb/postprocess` | 能带、态密度、算符导出及其他后处理 |
+| `dptb/nn/embedding/unitb/` | UniTB and UniTB-dense; `layer_topology` selects optional SLEM interactions (UniTB-SLEM); compatibility interfaces resolve historical names |
+| `dptb/nn/embedding/lem.py`, `slem.py` | Upstream baselines without priors |
+| `dptb/nn/embedding/lem_prior.py`, `slem_prior.py` | Prior-aware baselines |
+| `dptb/data` | Graphs, LMDB records, sidecars, AO blocks, and feature conversion |
+| `dptb/nnops`, `dptb/entrypoints` | Single-model and `multi_train` training, validation, and inference |
+| `dptb/nacf`, `dptb/priors/h0` | NACF and physical H0 prior construction and reconstruction |
+| `dptb/postprocess` | Bands, density of states, operator export, and other postprocessing |
 
-新配置采用 `model_options.embedding.method = "unitb"`。UniTB 与 UniTB-dense 是同一实现的不同配置；专家数、路由、隐藏 irreps、先验和电荷响应设置由配置决定。加载已有检查点应保留它的有效配置、参数布局及先验语义。
+New configurations use `model_options.embedding.method = "unitb"`.
+UniTB and UniTB-dense are configurations of the same implementation. Options
+select expert counts, routing, hidden irreps, priors, and charge response.
+Loading an existing checkpoint must preserve its effective configuration,
+parameter layout, and prior semantics.
 
-上游 `baseline`、`deephe3`、`e3baseline_local6`、`e3baseline_nonlocal`、`identity`、`mpnn`、`se2`、`trinity` 等标准 embedding 继续通过原接口使用。
+Upstream methods such as `baseline`, `deeph-e3`, `e3baseline_6`,
+`e3baseline_nonlocal`, `none`, `mpnn`, `se2`, and `trinity` remain
+available through their original interfaces.
 
-## 组件与依赖
+See the [architecture guide](architecture.md) for canonical ownership, import
+migration, embedding discovery, and extension registration. H0 offline commands
+use `dptb h0`; its [guide](../dptb/priors/h0/README.md) documents the external
+work/table directories and preparation lifecycle.
 
-[SO2CUDA](https://github.com/Franklalalala/SO2CUDA) 的 DeePTB 接口提供 SO2 张量积、MoE GEMM 和 pack/scatter CUDA 加速。DeePTB 的 PyTorch 参考路径用于不具备相应 CUDA 组件的环境；基准与安装方法见 SO2CUDA 仓库。
+## Components and dependencies
 
-[LoopSCF](https://github.com/Franklalalala/loopscf) 使用独立仓库，依赖本版本的模型构建、图数据、AO block 转换、LMDB、优化器及分布式辅助接口。EMolStudio 通过 `build_model`、`AtomicData`、`AtomicDataDict`、`DataLoader`、`build_dataset` 和 `HR2HK` 系列接口调用 DeePTB。
+[SO2CUDA](https://github.com/Franklalalala/SO2CUDA) provides SO2 tensor products,
+MoE GEMM, and pack/scatter CUDA kernels through its DeePTB interface. DeePTB's
+PyTorch reference routes support environments without the required CUDA
+components. See the SO2CUDA repository for installation and benchmarks.
 
-## 数据与训练
+[LoopSCF](https://github.com/Franklalalala/loopscf) is maintained separately.
+It depends on this release's model building, graph data, AO-block conversion,
+LMDB, optimizers, and distributed helpers. EMolStudio uses `build_model`,
+`AtomicData`, `AtomicDataDict`, `DataLoader`, `build_dataset`, and the
+`HR2HK` interfaces.
 
-数据需要明确完整算符、残差和先验字段的含义。H0、NACF、重叠矩阵及其他侧车必须与原图的原子、边、周期位移和基组排序对齐；先验只在相应重建路径中加回一次。
+## Data and training
 
-训练保留距离专家掩码、LMDB 加载、动态批次、HybridMuon/WSD、先验噪声、谱裁剪及检查点恢复。配置不同的实验不能仅凭同名 loss 判断数值可比较性；必须同时核对目标、单位、约化空间和掩码。
+Data must define the meaning of full-operator, residual, and prior fields.
+H0, NACF, overlap, and other sidecars must align with the original graph's atoms,
+edges, periodic shifts, and basis ordering. Add priors back exactly once in the
+corresponding reconstruction path.
 
-HybridMuon 默认使用缓存路由、同形状矩阵分桶和多张量更新；CUDA 上对纯张量桶运算进行延迟 CUDA Graph 捕获。Newton–Schulz 的轮数与系数、MAGMA、裁剪时钟、学习率、专家缩放及检查点字段保持原语义。捕获有首次运行开销，并会保留图所需显存，因此性能与显存比较应分别记录预热和稳态。直接操作优化器对象时可设置 `optimizer.execution_mode = "legacy"` 回到顺序实现，或设置 `optimizer.use_cuda_graph = False` 关闭图缓存；这些是运行时属性，不是训练配置字段。加载优化器状态会清除执行缓存，无需修改旧检查点。
+Training supports distance-expert masks, LMDB, dynamic batches, HybridMuon/WSD,
+prior noise, spectral clipping, and checkpoint restoration. Matching loss names
+do not establish comparability between different configurations: also check
+targets, units, reduced spaces, and masks.
 
-SO2CUDA 的块布局内核更新不改变 DeePTB 的调用接口，也不改变 UniTB、UniTB-SLEM 的参数布局，已有检查点照常加载。
+HybridMuon defaults to cached routing, same-shape matrix buckets, and multi-tensor
+updates. CUDA lazily captures pure tensor-bucket operations with CUDA Graphs.
+Newton–Schulz iteration counts and coefficients, MAGMA, clipping clocks, learning
+rates, expert scaling, and checkpoint fields retain their semantics. Capture adds
+first-use overhead and retains graph memory; report warm-up and steady-state
+timing and memory separately. Direct optimizer users may set
+`optimizer.execution_mode = "legacy"` for sequential execution or
+`optimizer.use_cuda_graph = False` to disable graph caching. These are runtime
+attributes, not training configuration fields. Loading optimizer state clears
+execution caches without editing old checkpoints.
 
-- [先验输入与检查点](advanced/prior_inputs.md)
-- [NACF 候选先验](nacf_candidate_prior.md)
-- [NACF 紧凑映射](nacf_compact_packing.md)
-- [NACF prepared store](nacf_prepared_store.md)
-- [动态批次 OOM 行为](advanced/dynamic_batch_oom_fallback.md)
+SO2CUDA block-layout kernel updates retain the DeePTB call interface and the
+UniTB/UniTB-SLEM parameter layouts. Checkpoint loading and numerical behavior
+must still be validated for affected execution routes.
 
-测试策略见仓库根目录的 `TESTING.md`。发布验证分别覆盖接口、CPU 行为、可选 CUDA 路径、既有检查点推理和确定性短训练等价性。
+- [Prior inputs and checkpoints](advanced/prior_inputs.md)
+- [NACF candidate priors](nacf_candidate_prior.md)
+- [NACF compact mapping](nacf_compact_packing.md)
+- [NACF prepared stores](nacf_prepared_store.md)
+- [Dynamic-batch OOM behavior](advanced/dynamic_batch_oom_fallback.md)
+
+See [TESTING.md](../TESTING.md) for the testing strategy. Release validation
+covers interfaces, CPU behavior, affected optional CUDA routes, existing
+checkpoint inference, and deterministic short-training comparisons separately.

@@ -10,9 +10,9 @@ from torch.nn import functional as F
 
 from dptb.data import _keys
 from dptb.nn.build import build_model
-from dptb.nn.embedding.prior_common import H0InitLayer
-from dptb.nn.embedding.unitb import UniTB
-from dptb.nn.embedding.unitb_options import unitb_options
+from dptb.nn.conditioning.projection import H0InitLayer
+from dptb.nn.embedding.unitb.model import UniTB
+from dptb.nn.embedding.unitb.options import unitb_options
 from dptb.nn.pdq_moe import PDQMoE, PDQMoERouting
 from dptb.tests._requires import requires_cuda, requires_module
 from dptb.tests.sym_helpers import wigner

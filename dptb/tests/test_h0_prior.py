@@ -12,7 +12,7 @@ from dptb.data import AtomicDataDict, _keys
 from dptb.data.interfaces.h0rebuild_adapter import PHYSICAL_H0_SIDECAR_SCHEMA, array_sha256, build_physical_h0_meta
 from dptb.data.transforms import OrbitalMapper
 from dptb.data.transforms_upper_triangle import OrbitalMapper as UpperTriangleOrbitalMapper
-from dptb.nn.embedding.prior_common import H0InitLayer
+from dptb.nn.conditioning.projection import H0InitLayer
 from tools.materialize_h0rebuild_lmdb import _validated_roots
 
 

@@ -11,7 +11,7 @@ import torch
 from e3nn import o3
 from torch.nn import functional as F
 
-from dptb.nn.embedding.unitb_activations import build_gate_activation
+from dptb.nn.embedding.unitb.activations import build_gate_activation
 from dptb.nn.tensor_product_moe_v3 import (MOLEGlobals, MOLELinear, MOLERouterV3, SO2_Linear,
                                            SO2SharedPostActivationMixer)
 

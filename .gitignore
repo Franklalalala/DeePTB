@@ -181,11 +181,5 @@ _version.py
 /.idea/
 
 # Prepared priors, native binaries and acceptance campaigns are external assets.
-/h0/work/
-/h0/tmp/
-/h0/cache/
-/h0/prebuilt/
-/h0/offline_tables/
-/h0/new100/
-/h0/acceptance_v4/
+/dptb/priors/h0/prebuilt/
 /dptb/nacf/prebuilt.json

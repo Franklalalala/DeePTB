@@ -42,7 +42,7 @@ from dptb.data.interfaces.p2_contract import (
     schema_requires_prior_table_provenance,
 )
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.embedding.lem_moe_v3_prior_2b import resolve_prior_2b_keys
+from dptb.nn.embedding.legacy.prior_2b import resolve_prior_2b_keys
 
 
 # ===========================================================================

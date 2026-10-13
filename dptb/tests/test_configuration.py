@@ -275,7 +275,7 @@ def test_p2_auxiliary_scope_preserves_memory_only_legacy_route():
 
 
 def test_edge_h0_embedding_consumes_canonical_scope(monkeypatch):
-    from dptb.nn.embedding import lem_moe_v3_edge as edge_module
+    from dptb.nn.embedding.legacy import edge as edge_module
 
     base_init = object()
 
@@ -335,7 +335,7 @@ def test_prediction_reconstruction_replaces_mutually_exclusive_flags(legacy, exp
     [(None, True), ("", True), ("standard", True), ("triton_complex_exact_grouped_linear", False)],
 )
 def test_stable_route_mode_guard_accepts_only_standard(mode, accepted):
-    from dptb.nn.embedding.lem_moe_v3 import _normalize_stable_standard_compat_mode
+    from dptb.nn.embedding.legacy.graph import _normalize_stable_standard_compat_mode
 
     if accepted:
         assert _normalize_stable_standard_compat_mode("so2_m_linear_mode", mode) == "standard"

@@ -28,7 +28,7 @@ def _build_pair(task):
 
 
 def main():
-    from h0rebuild.orb import read_abacus_orb
+    from dptb.priors.h0.orb import read_abacus_orb
 
     ap = argparse.ArgumentParser()
     ap.add_argument('--p2-manifest', required=True)

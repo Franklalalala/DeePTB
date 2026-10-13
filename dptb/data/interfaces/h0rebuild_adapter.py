@@ -142,15 +142,15 @@ def materialize_h0rebuild_features(
     complex SOC blocks never enter the flow prior directly.
     """
     try:
-        from h0rebuild.deeptb import (
+        from dptb.priors.h0.deeptb import (
             load_deeptb_artifact,
             preflight_deeptb_graph,
             validate_structure_against_artifact,
         )
     except ImportError as exc:
         raise ImportError(
-            "Materializing physical H0 features requires a compatible h0rebuild "
-            "installation; install it in the preprocessing environment."
+            "Materializing physical H0 features requires the packaged dptb.priors.h0 "
+            "artifact bridge and NumPy in the preprocessing environment."
         ) from exc
 
     if target_energy_unit not in _SUPPORTED_ENERGY_UNITS:

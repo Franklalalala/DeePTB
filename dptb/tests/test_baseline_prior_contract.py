@@ -19,7 +19,7 @@ from e3nn import o3
 from dptb.data import _keys
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.embedding.lem_prior import InitLayer
-from dptb.nn.embedding.prior_inputs import PriorInputs
+from dptb.nn.conditioning.inputs import PriorInputs
 
 
 PRIOR_KEYS = {

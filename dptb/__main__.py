@@ -1,13 +1,14 @@
 from dptb.entrypoints.main import main as entry_main
 import logging
-import pyfiglet
 from dptb import __version__
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 log = logging.getLogger(__name__)
 
 def print_logo():
-    f = pyfiglet.Figlet(font='dos_rebel')  # 您可以选择您喜欢的字体
+    import pyfiglet
+
+    f = pyfiglet.Figlet(font='dos_rebel')
     logo = f.renderText("DeePTB")
     log.info(" ")
     log.info(" ")
@@ -15,7 +16,7 @@ def print_logo():
     log.info("#" + " "*79 + "#")
     log.info("#" + " "*79 + "#")
     for line in logo.split('\n'):
-        if line.strip():  # 避免记录空行
+        if line.strip():
             log.info('#     '+line+ '     #')
     log.info("#" + " "*79 + "#")
     version_info = f"Version: {__version__}"
@@ -27,13 +28,16 @@ def print_logo():
     log.info("#"*81)
     log.info(" ")
     log.info(" ")
-def main() -> None:
+def main(argv=None):
     """
     The main entry point for the dptb package.
     """
-    print_logo()
-    entry_main()
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] not in {'models', 'h0', '-h', '--help', '-v', '--version'}:
+        print_logo()
+    return entry_main(args)
 
 if __name__ == '__main__':
-    #print_logo()
-    main()
+    raise SystemExit(main())

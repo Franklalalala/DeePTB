@@ -9,8 +9,8 @@ import pytest
 import torch
 from e3nn import o3
 
-from dptb.nn.embedding.ao_angular_projector import AOAngularProjectorHead
-from dptb.nn.embedding.ao_projector_bank import (
+from dptb.nn.heads.angular import AOAngularProjectorHead
+from dptb.nn.projectors.ao import (
     build_ao_decoder_irreps,
     export_projector_bank,
     load_projector_bank_with_provenance,
@@ -18,10 +18,10 @@ from dptb.nn.embedding.ao_projector_bank import (
     reference_projector,
     shell_l,
 )
-from dptb.nn.embedding.block_native_head import apply_ao_basis_mask
-from dptb.nn.embedding.cartesian_ict_bank import cartesian_ict_projector, export_cartesian_ict_projector_bank
-from dptb.nn.embedding.output_routes import OutputHeadContext, build_output_heads, resolve_output_route
-from dptb.nn.embedding.rme_nocg_fusion_head import RMENoCGFusionHead, normalize_rme_head_mode
+from dptb.nn.heads.block_native import apply_ao_basis_mask
+from dptb.nn.projectors.ict import cartesian_ict_projector, export_cartesian_ict_projector_bank
+from dptb.nn.heads.routes import OutputHeadContext, build_output_heads, resolve_output_route
+from dptb.nn.heads.rme_fusion import RMENoCGFusionHead, normalize_rme_head_mode
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +301,8 @@ def test_route_matrix_modes_are_normalized():
 
 
 def test_ordinary_hidden_rme_heads_keep_rme_contract():
-    from dptb.nn.embedding.late_rme_cartesian_hybrid import LateRMECartesianHybridHead
-    from dptb.nn.embedding.late_rme_expansion_nocg import LateRMEExpansionNoCGHead
+    from dptb.nn.heads.rme_cartesian import LateRMECartesianHybridHead
+    from dptb.nn.heads.rme_expansion import LateRMEExpansionNoCGHead
 
     irreps_in = o3.Irreps("4x0e+3x1o+3x1e+2x2e")
     irreps_out = o3.Irreps("2x0e+1x1o+1x1e+1x2e")
@@ -322,8 +322,8 @@ def test_ordinary_hidden_rme_heads_keep_rme_contract():
 
 
 def test_ordinary_hidden_block_heads_bypass_rme_and_e3hamiltonian():
-    from dptb.nn.embedding.late_block_cartesian_projector import LateBlockCartesianProjectorHead
-    from dptb.nn.embedding.late_block_expansion_cg import LateBlockExpansionCGHead
+    from dptb.nn.heads.block_cartesian import LateBlockCartesianProjectorHead
+    from dptb.nn.heads.block_expansion import LateBlockExpansionCGHead
 
     irreps_in = o3.Irreps("4x0e+4x1o+4x1e+4x2e")
     full_basis = ("s", "p")

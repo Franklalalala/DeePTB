@@ -26,10 +26,10 @@ from dptb.data.interfaces.blockwise_tensor import (
     infer_block_shapes,
 )
 from dptb.nn.build import build_model
-from dptb.nn.embedding.ao_projector_bank import export_projector_bank
-from dptb.nn.embedding.cartesian_ict_bank import export_cartesian_ict_projector_bank
-from dptb.nn.embedding.cartesian_projector import ao_shell_layout
-from dptb.nn.embedding.output_routes import (
+from dptb.nn.projectors.ao import export_projector_bank
+from dptb.nn.projectors.ict import export_cartesian_ict_projector_bank
+from dptb.nn.projectors.cartesian import ao_shell_layout
+from dptb.nn.heads.routes import (
     OFFICIAL_OUTPUT_ROUTES,
     effective_product_scope,
     get_output_route_spec,

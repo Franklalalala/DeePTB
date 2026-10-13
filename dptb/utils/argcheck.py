@@ -2000,7 +2000,7 @@ def _disabled_embedding_option(name):
 
 def unitb():
     """UniTB architecture and paper-control options with production defaults."""
-    from dptb.nn.embedding.unitb_options import UNITB_DEFAULTS, DENSE_DEFAULTS, ALIASES
+    from dptb.nn.embedding.unitb.options import UNITB_DEFAULTS, DENSE_DEFAULTS, ALIASES
 
     names = set(UNITB_DEFAULTS) | {
         "PolynomialCutoff_p", "cutoff_type", "norm_eps", "r_start_cos_ratio",
@@ -3017,7 +3017,7 @@ def _resolve_legacy_baseline_methods(data):
     method = options.get("method")
     if method in {"lem", "slem", "lem_prior", "slem_prior"}:
         from copy import deepcopy
-        from dptb.nn.embedding.prior_inputs import PRIOR_INPUT_KEYS, resolve_legacy_prior_method
+        from dptb.nn.conditioning.inputs import PRIOR_INPUT_KEYS, resolve_legacy_prior_method
 
         resolved = resolve_legacy_prior_method(method, options)
         geometry_only = resolved.endswith("_prior") and not PRIOR_INPUT_KEYS.intersection(options)
@@ -3800,7 +3800,7 @@ def normalize(data):
     if embedding.get("method") in {"lem_moe_v3_edge", "lem_moe_v3_edge_h0", "lem_moe_v3_edge_prior_2b"}:
         embedding.setdefault("so2_fusion_mode", "streamed_m_major_fused_p0")
     if embedding.get("method") == "unitb":
-        from dptb.nn.embedding.unitb_options import unitb_options
+        from dptb.nn.embedding.unitb.options import unitb_options
         embedding.update(unitb_options(embedding))
         shift = data.get("model_options", {}).get("shift_head")
         if shift is not None and shift.get("mode", "atom") != "off":

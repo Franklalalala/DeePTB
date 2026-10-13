@@ -80,7 +80,7 @@ def test_ao_product_batch_equals_the_same_h0_supplied_coupled():
 
 
 def test_collated_flags_must_agree():
-    from dptb.nn.embedding.prior_common import _h0_is_coupled_rme
+    from dptb.nn.conditioning.projection import _h0_is_coupled_rme
 
     key = _keys.H0_COUPLED_RME_KEY
     assert _h0_is_coupled_rme({key: torch.tensor([True, True])})

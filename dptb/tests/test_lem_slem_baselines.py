@@ -17,10 +17,10 @@ from e3nn import o3
 
 from dptb.data import _keys
 from dptb.nn.build import build_model
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from dptb.nn.embedding.lem import Lem
 from dptb.nn.embedding.lem_prior import LemPrior
-from dptb.nn.embedding.prior_inputs import PriorInputs
+from dptb.nn.conditioning.inputs import PriorInputs
 from dptb.nn.embedding.slem import Slem
 from dptb.nn.embedding.slem_prior import SlemPrior
 from dptb.nn.tensor_product import SO2LinearCached
@@ -246,7 +246,7 @@ def _build_options(method="lem", **extra):
 
 @pytest.mark.parametrize("method", ["lem_prior", "slem_prior"])
 def test_normalization_preserves_unconfigured_geometry_state(method):
-    from dptb.nn.embedding.prior_inputs import PRIOR_INPUT_KEYS
+    from dptb.nn.conditioning.inputs import PRIOR_INPUT_KEYS
     from dptb.utils.argcheck import normalize
 
     common, options = _build_options(method)

@@ -5,7 +5,7 @@ import e3nn.o3 as o3
 from dptb.data.transforms import OrbitalMapper
 from dptb.data import AtomicData, AtomicDataDict
 from dptb.data.AtomicDataDict import with_edge_vectors, with_env_vectors, with_batch
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from typing import Dict, Union, List, Tuple, Optional, Any
 
 

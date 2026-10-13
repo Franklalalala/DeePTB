@@ -2,7 +2,7 @@ from torch_geometric.nn.conv import MessagePassing
 import torch
 from typing import Optional, Tuple, Union
 from dptb.data import AtomicDataDict
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from ..base import ResNet, FFN
 from torch.nn import Linear
 import torch.nn as nn

@@ -1,101 +1,105 @@
 # Basic API
-Instead of commandline, we provide many function interfaced that enable you to build and use the DeePTB model, data module. Here are some quick examples:
 
-## build the DeePTB model:
-We can quickly build a deeptb model using `build_model` function in `dptb.nn`:
-```Python
+The Python API provides the same model construction used by the CLI. See the
+[architecture guide](../architecture.md) for component ownership and embedding
+registration.
+
+## Build a model
+
+Restore a checkpoint:
+
+~~~python
 from dptb.nn import build_model
 
-model = build_model(checkpoint="Your trained checkpoint path")
-```
+model = build_model(checkpoint="checkpoint.pth")
+~~~
 
-or, we can also build a model from sratch, using a setted model_options and common_options:
-```Python
+Or construct a complete model from a configuration:
+
+~~~python
+import json
+from dptb.nn import build_model
+
+with open("input.json", encoding="utf-8") as handle:
+    config = json.load(handle)
+
 model = build_model(
-    model_options=Dict[Your model options], 
-    common_options=Dict[Your common options]
-    )
-```
+    model_options=config["model_options"],
+    common_options=config["common_options"],
+)
+~~~
 
-## get a atomicdata
-The data to represent a atomic structure are named AtomicData in DeePTB (following the convension in nequip). We can get a atomicdata class from ase Atoms class using `AtomicData.from_ase()`, or simply by inserting the necessary variables using `AtomicData.from_points()`:
-```Python
+Discover embeddings with `list_embeddings()` or construct one directly with
+`build_embedding(method, **options)`. Direct embedding construction does not
+include the prediction head or dataset pipeline.
+
+~~~python
+from dptb.nn import build_embedding, list_embeddings
+
+methods = list_embeddings()
+~~~
+
+## Prepare graph data
+
+`AtomicData` represents an atomic structure and its graph. Build it from ASE
+atoms or explicit positions:
+
+~~~python
+from ase import Atoms
 from dptb.data import AtomicData
-atomicdata = AtomicData.from_ase(
-    atoms=ase.Atoms[Your ase Atoms structure class],
-    r_max=float[some cutoff radius],
-    er_max: Optional[float], # work in sk mode, ignore in e3
-    oer_max: Optional[float] # work in sk mode, ignore in e3
-)
 
-atomicdata.from_points(
-    pos=pos, # positions of atoms
-    r_max=r_max, # your bond cutoff radius
-    atomic_numbers=atomic_numbers, # your atomic numbers of the structure
-)
-```
+atoms = Atoms("H2", positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.74]])
+graph = AtomicData.from_ase(atoms=atoms, r_max=2.0)
+~~~
 
-In addition, we can also get the data from well-structured dataset files, using `dptb.data.build_dataset`:
-```Python
-from dptb.data import build_dataset
+The graph cutoff, atom types, basis, dtype, and device must match the model's
+data contract. SK models may also require `er_max` and `oer_max`.
+`AtomicData.from_points` accepts explicit positions and atomic numbers.
+For stored datasets, use `dptb.data.build_dataset` with the data options and
+basis from the training configuration; index the resulting dataset to get a
+graph.
 
-dataset = build_dataset(
-    root: str, # your dataset root dir
-    prefix: str, # your prefix of datafile folders
-    get_eigenvalues: bool, # whether to get eigenvalues when build the dataset
-    basis: dict # the basis defined in the common_options
-)
+Prior-aware models require explicit, correctly aligned prior fields. Charge
+heads also require physical overlap. Supply those fields before calling the
+model; a geometry-only graph does not satisfy every model's input contract.
+See [prior inputs](../advanced/prior_inputs.md) and [UniTB](../unitb.md).
 
-# Then, you can get the atomicdata from built dataset as:
-atomicdata = dataset[0] # dataset contains a list of atomicdata, you can get any of then by simply indexing the dataset
-```
+## Predict operators
 
-## make prediction
+Convert a prepared graph to the tensor dictionary consumed by models:
 
-### SKTB
+~~~python
+import torch
+from dptb.data import AtomicData
 
-The prediction can be simply performed once we have a AtomicData class and a model:
-```Python
-atomicdata = model(AtomicData.to_AtomicDataDict(atomicdata))
-```
-Here we call `AtomicData.to_AtomicDataDict` to transcript the AtomicData class into dict where its key are strings and values are torch.Tensor. After calling the `model()`, the atomicdata output will contrains the parameters infered on this atomic structure using the deeptb model, and can be further use to compute the Hamiltonian:
+model.eval()
+with torch.no_grad():
+    prediction = model(AtomicData.to_AtomicDataDict(graph))
+~~~
 
-```Python
-from dptb.nn import SKHamiltonian
+The prediction representation depends on the configured model family and output
+route. SK outputs contain Slater–Koster parameters; use `SKHamiltonian` when an
+explicit conversion to AO features is needed. E3 models produce node/edge
+operator features in the configured mapper representation. Overlap outputs are
+available only when configured and must not be confused with latent overlap
+features. For residual models, follow the configured prior reconstruction path
+and add the prior back exactly once.
 
-skham = SKHamiltonian(basis=model.idp.basis)
-```
+For compatible AO-feature output, convert to `(i,j,R) -> H_ij(R)` blocks:
 
-The SKTB hamiltonian can be constructed from the infered atomicdata:
-```Python
-atomicdata = skham(atomicdata)
-```
-
-### E3TB
-For E3 model, the hamiltonian and overlap can be predict at one shot, by:
-```Python
-atomicdata = model(AtomicData.to_AtomicDataDict(atomicdata))
-```
-Then the "edge_features", "node_features", "edge_overlap", "node_overlap" would be the Hamiltonian and Overlap features.
-
-
-After this step, we have attained the Hamiltonian and/or Overlap stored in atomicdata class. The hamiltonian is arranged as the edge(bond)-wide hopping block and node(atom)-wise onsite block, which is then reshaped as a 1-D array. We doing this to save memory and help to perform batchlized operations. You can simply recover this format to a conventional `H(R)` with $(i,j,R)->H_{ij}(R)$ block with a transcript function:
-
-```Python
+~~~python
 from dptb.data import feature_to_block
 
-H_block = feature_to_block(data=atomicdata, idp=model.idp)
-S_block = feature_to_block(data=atomicdata, idp=model.idp, overlap=True)
-```
-H_block and S_block is a dictionary of python.
+h_blocks = feature_to_block(data=prediction, idp=model.idp)
+# Only when prediction contains physical overlap features:
+s_blocks = feature_to_block(data=prediction, idp=model.idp, overlap=True)
+~~~
 
-## compute properties
-The DeePTB package provide many tools to compute physical quantities from the predicted `H(R)`, here we make a list of the functions and their importing method.
-```Python
-from dptb.nn import HR2HK, Eigenvalues
-from dptb.postprocess import Band
+These functions return dictionaries of real-space blocks.
 
-HR2HR # converting the atomicdata with HR to Hamiltonian in K space
-Eigenvalues # compute eigenvalues with given kpoint and HR
-Band # compute and ploting band structure with a given deeptb model, structure and k-path information
-```
+## Electronic properties
+
+`dptb.nn.HR2HK` converts real-space operators to reciprocal-space matrices.
+`dptb.nn.Eigenvalues` computes spectra, and `dptb.postprocess.Band` evaluates
+and plots band structures. See the [band guide](../advanced/elec_properties/band.md)
+for model, structure, and k-path configuration.

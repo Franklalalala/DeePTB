@@ -16,7 +16,7 @@ import torch
 
 from dptb.data import _keys
 from dptb.nn.build import build_model
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from dptb.nn.embedding.slem import Slem
 from dptb.utils.argcheck import normalize
 

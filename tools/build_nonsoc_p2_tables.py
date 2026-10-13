@@ -207,7 +207,7 @@ def _vna_weighted(orbital: OrbitalLike, r_vna: np.ndarray, vna_ry: np.ndarray) -
 
 
 def _projector_orbital(symbol: str, upf: Any, source: Path) -> OrbitalLike:
-    from h0rebuild.radial import projector_beta_values
+    from dptb.priors.h0.radial import projector_beta_values
 
     r = np.asarray(upf.r, dtype=np.float64)
     channels = []

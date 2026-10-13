@@ -12,7 +12,7 @@ from e3nn.o3 import Linear, SphericalHarmonics
 from e3nn.math import normalize2mom
 from e3nn.util.jit import compile_mode
 from dptb.data import AtomicDataDict
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from ..radial_basis import BesselBasis
 from dptb.nn.embedding.from_deephe3.deephe3 import tp_path_exists
 from dptb.data import _keys

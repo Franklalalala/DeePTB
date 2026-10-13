@@ -33,10 +33,14 @@ def _pristine(relpath, modname):
     except Exception as exc:  # pragma: no cover
         pytest.skip(f"pristine source unavailable: {exc}")
     mod = types.ModuleType(modname)
-    mod.__file__ = f"<{BASE_COMMIT}:{relpath}>"
+    # The historical source loads packaged resources relative to __file__.
+    # Keep that directory valid while identifying the immutable source in
+    # tracebacks independently of its resource path.
+    mod.__file__ = str(REPO / relpath)
+    source_name = f"<{BASE_COMMIT}:{relpath}>"
     mod.__package__ = ".".join(Path(relpath).with_suffix("").parts[:-1])   # relative imports resolve in the live package
     sys.modules[modname] = mod
-    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    exec(compile(src, source_name, "exec"), mod.__dict__)
     return mod
 
 

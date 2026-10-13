@@ -2,18 +2,9 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
-from dptb.entrypoints.train import train
-from dptb.entrypoints.config import config
-from dptb.entrypoints.test import _test
-from dptb.entrypoints.run import run
-from dptb.entrypoints.bond import bond
-from dptb.entrypoints.nrl2json import nrl2json
-from dptb.entrypoints.pth2json import pth2json
-from dptb.entrypoints.data import data
-from dptb.utils.loggers import set_log_handles
-from dptb.utils.config_check import check_config_train
-from dptb.entrypoints.collectskf import skf2pth, skf2nnsk
-from dptb.entrypoints.emp_sk import to_empsk
+from importlib import import_module
+import json
+import sys
 
 from dptb import __version__
 
@@ -440,6 +431,18 @@ def main_parser() -> argparse.ArgumentParser:
         default="poly2",
         help="The base model type can be poly2 or poly4."
     )
+    parser_models = subparsers.add_parser(
+        "models", parents=[parser_log], help="List available embedding methods",
+    )
+    parser_models.add_argument("--all", dest="include_legacy", action="store_true",
+                               help="Include historical checkpoint methods")
+    parser_models.add_argument("--json", dest="as_json", action="store_true",
+                               help="Print a JSON array of method names")
+    parser_h0 = subparsers.add_parser(
+        "h0", add_help=False, help="Build offline physical H0 priors (h0 --help)",
+    )
+    parser_h0.add_argument("h0_args", nargs=argparse.REMAINDER)
+
     return parser
 
 def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
@@ -460,53 +463,54 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parsed_args = parser.parse_args(args=args)
     if parsed_args.command is None:
         parser.print_help()
-    else:
+    elif hasattr(parsed_args, "log_level"):
         parsed_args.log_level = get_ll(parsed_args.log_level)
 
     return parsed_args
 
-def main():
-    args = parse_args()
 
-    if args.command not in (None, "train", "multi-train", "test", "run"):
+# Each command owns its dependencies. Help and model discovery must work
+# without importing trainers, electronic-structure postprocessors or CUDA.
+_COMMANDS = {
+    "config": ("dptb.entrypoints.config", "config"),
+    "bond": ("dptb.entrypoints.bond", "bond"),
+    "train": ("dptb.entrypoints.train", "train"),
+    "multi-train": ("dptb.entrypoints.multi_train", "multi_train"),
+    "test": ("dptb.entrypoints.test", "_test"),
+    "run": ("dptb.entrypoints.run", "run"),
+    "n2j": ("dptb.entrypoints.nrl2json", "nrl2json"),
+    "p2j": ("dptb.entrypoints.pth2json", "pth2json"),
+    "data": ("dptb.entrypoints.data", "data"),
+    "cskf": ("dptb.entrypoints.collectskf", "skf2pth"),
+    "skf2nn": ("dptb.entrypoints.collectskf", "skf2nnsk"),
+    "esk": ("dptb.entrypoints.emp_sk", "to_empsk"),
+}
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Let the H0 parser own its subcommands and options, including --help.
+    if argv and argv[0] == "h0":
+        from dptb.priors.h0.cli import main as h0_main
+        return h0_main(argv[1:])
+
+    args = parse_args(argv)
+    if args.command is None:
+        return
+    if args.command == "models":
+        from dptb.nn import list_embeddings
+        methods = list_embeddings(include_legacy=args.include_legacy)
+        print(json.dumps(list(methods)) if args.as_json else "\n".join(methods))
+        return
+
+    if args.command not in ("train", "multi-train", "test", "run"):
+        from dptb.utils.loggers import set_log_handles
         set_log_handles(args.log_level, Path(args.log_path) if args.log_path else None)
-
     dict_args = vars(args)
-    
-    if args.command == 'config':
-        config(**dict_args)
-
-    elif args.command == 'bond':
-        bond(**dict_args)
-
-    elif args.command == 'train':
+    if args.command == "train":
+        from dptb.utils.config_check import check_config_train
         check_config_train(**dict_args)
-        train(**dict_args)
-
-    elif args.command == 'multi-train':
-        from dptb.entrypoints.multi_train import multi_train
-        multi_train(**dict_args)
-
-    elif args.command == 'test':
-        _test(**dict_args)
-
-    elif args.command == 'run':
-        run(**dict_args)
-
-    elif args.command == 'n2j':
-        nrl2json(**dict_args)
-    
-    elif args.command == 'p2j':
-        pth2json(**dict_args)
-
-    elif args.command == 'data':
-        data(**dict_args)
-        
-    elif args.command == 'cskf':
-        skf2pth(**dict_args)
-
-    elif args.command == 'skf2nn':
-        skf2nnsk(**dict_args)
-
-    elif args.command == 'esk':
-        to_empsk(**dict_args)
+    module, function = _COMMANDS[args.command]
+    # Legacy commands may return data (for example, bond returns its report).
+    # Their payload is not a process exit status; preserve successful dispatch.
+    getattr(import_module(module), function)(**dict_args)

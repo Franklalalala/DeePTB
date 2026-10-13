@@ -120,7 +120,7 @@ def test_p1_three_layer_shared_only_and_eval_ignores_p(parameterization, top_k, 
 
 @pytest.mark.parametrize("method", ["lem_moe_v3_prior_2b", "lem_moe_v3_edge_prior_2b", "lem_moe_v3_edge_h0"])
 def test_one_mask_shared_by_every_module_and_three_layers(method, monkeypatch, caplog):
-    from dptb.nn.embedding import lem_moe_v3_edge as edge_module
+    from dptb.nn.embedding.legacy import edge as edge_module
     opts = dict(method=method, edge_router_route_drop_p=0.5)
     if method == "lem_moe_v3_edge_h0":
         # Plain H0's prior keys differ from the pairwise/GNN model.

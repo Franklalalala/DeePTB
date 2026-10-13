@@ -6,7 +6,7 @@ import torch
 from e3nn import o3
 
 from dptb.nn.build import build_model
-from dptb.nn.embedding.prior_common import (
+from dptb.nn.conditioning.projection import (
     _build_uureal_cg_change_of_basis, _sorted_irrep_coordinate_index,
 )
 from dptb.tests.shift_head_helpers import config, batch

@@ -8,7 +8,7 @@ import torch
 from e3nn import o3
 
 from dptb.data import _keys
-from dptb.nn.embedding.ao_projector_bank import shell_l
+from dptb.nn.projectors.ao import shell_l
 
 _XYZ_TO_YZX = torch.tensor(
     [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], dtype=torch.float64

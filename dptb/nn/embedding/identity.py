@@ -1,7 +1,7 @@
 import torch
 from typing import Optional, Tuple, Union
 from dptb.data import AtomicDataDict
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 
 @Embedding.register("none")
 class Identity(torch.nn.Module):

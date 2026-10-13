@@ -9,7 +9,7 @@ from e3nn.nn import Gate
 from torch_scatter import scatter_mean
 from e3nn.o3 import Linear, SphericalHarmonics
 from dptb.data import AtomicDataDict
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from ..radial_basis import BesselBasis
 from ..base import ScalarMLPFunction
 from dptb.nn.embedding.from_deephe3.deephe3 import tp_path_exists
@@ -23,7 +23,7 @@ from dptb.nn.norm import SeperableLayerNorm
 from dptb.data.AtomicDataDict import with_edge_vectors, with_batch
 
 from math import ceil
-from .prior_inputs import PRIOR_INPUT_KEYS, PriorInputs
+from dptb.nn.conditioning.inputs import PRIOR_INPUT_KEYS, PriorInputs
 
 import torch
 import e3nn.o3 as o3

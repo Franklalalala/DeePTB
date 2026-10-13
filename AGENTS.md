@@ -1,11 +1,11 @@
-# 维护规范
+# Maintenance guidelines
 
-`1006-stable` 是功能集成、修复和日常维护的统一分支。历史分支及不可变部署版本用于兼容性参考；常规维护不得重写或删除这些历史。
+`1006-stable` is the shared branch for feature integration, fixes, and routine maintenance. Historical branches and immutable deployments remain compatibility references; routine maintenance must not rewrite or delete them.
 
-每个模块保留一份权威实现。UniTB 位于 `dptb/nn/embedding/unitb.py`，NACF 位于 `dptb/nacf`，独立 H0 重建子系统位于 `h0`。SO2 CUDA 加速由外部 SO2CUDA 提供；LoopSCF 在独立仓库维护，依赖本分支；SO2CUDA 0.3.0 的稳定入口为 `so2_cuda_ops.deeptb`。跨仓库改动应同时更新接口与版本说明。不要加入源码副本、审查覆盖层、生产日志、检查点、生成表或一次性运行脚本。
+Keep one authoritative implementation per module. UniTB is in `dptb/nn/embedding/unitb`, historical MoE methods in `dptb/nn/embedding/legacy`, shared conditioning in `dptb/nn/conditioning`, output heads in `dptb/nn/heads`, and projector implementations in `dptb/nn/projectors`. NACF is in `dptb/nacf`; H0 reconstruction is in `dptb/priors/h0`, with explicit offline commands under `dptb h0`. Use the shared construction APIs and exact compatibility aliases; see [docs/architecture.md](docs/architecture.md). SO2 CUDA acceleration is provided by the external SO2CUDA package; its stable 0.3.0 entry point is `so2_cuda_ops.deeptb`. LoopSCF is maintained in a separate repository and depends on this branch. Update interface and version documentation for changes spanning repositories. Do not add source copies, review overlays, production logs, checkpoints, generated tables, or one-off run scripts.
 
-保留标准 embedding、通用模型构建、LMDB 与侧车、先验、训练、评测和后处理接口。修改模型结构或先验布局时，应明确输入、目标、单位、数学语义及检查点兼容策略；不得通过手工修改用户检查点解决兼容问题。
+Preserve the standard embedding, model-building, LMDB, sidecar, prior, training, evaluation, and postprocessing interfaces. Changes to model structure or prior layout must specify inputs, targets, units, mathematical semantics, and checkpoint compatibility. Do not resolve compatibility by manually editing user checkpoints.
 
-按 [TESTING.md](TESTING.md) 选择覆盖受影响行为的测试。生产模型重构需要验证既有检查点的推理结果与确定性短训练等价性；无关硬件基准和未修改的研究实验可以复用既有证据。不要因代码维护改变或重启正在运行的生产任务。
+Choose tests for the affected behavior using [TESTING.md](TESTING.md). Production model refactors require existing-checkpoint inference and deterministic short-training comparisons. Existing evidence may be reused for unaffected hardware benchmarks and research experiments. Do not alter or restart running production jobs for code maintenance.
 
-用户说明使用中文；代码、注释和提交信息使用英文。文档描述当前可用接口，不保留内部部署路径、运行编号、账号、凭据或审查过程。
+Use English for public documentation, code, comments, and commit messages. Document currently available interfaces; keep internal deployment paths, run identifiers, accounts, credentials, and review history out of public documentation.

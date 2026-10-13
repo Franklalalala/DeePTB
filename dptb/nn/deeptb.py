@@ -26,7 +26,7 @@ from dptb.nn.nnsk import NNSK
 from dptb.nn.dftbsk import DFTBSK
 from e3nn.o3 import Linear
 from dptb.nn.rescale import E3PerSpeciesScaleShift, E3PerEdgeSpeciesScaleShift
-from dptb.nn.embedding.output_routes import resolve_output_route, validate_prediction_route
+from dptb.nn.heads.routes import resolve_output_route, validate_prediction_route
 from dptb.utils.soc_target import resolve_nextham_uureal_mask
 import logging
 

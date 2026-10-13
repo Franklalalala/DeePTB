@@ -6,7 +6,7 @@ from e3nn import o3
 from dptb.data import _keys
 from dptb.nn.activation_recompute import checkpoint_function_call
 from dptb.nn.cutoff import cosine_cutoff, polynomial_cutoff
-from dptb.nn.embedding.lem_moe_v3 import (
+from dptb.nn.embedding.legacy.graph import (
     UpdateNode,
     _cosine_cutoff_per_edge,
     _polynomial_cutoff_per_edge,

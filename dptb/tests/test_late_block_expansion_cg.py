@@ -31,7 +31,7 @@ import torch
 from e3nn import o3
 
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.embedding.late_block_expansion_cg import (
+from dptb.nn.heads.block_expansion import (
     LateBlockExpansionCGHead,
     _FUSED_CG_HEAD_ENV,
     _LEGACY_CG_HEAD_ENV,

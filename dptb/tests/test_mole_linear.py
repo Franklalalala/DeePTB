@@ -339,7 +339,7 @@ class _EchoRouter:
 
 
 def _edge_route(coefficients, bond_type, *, unique_types, compact_min_edges):
-    from dptb.nn.embedding.lem_moe_v3_edge import LemMoEV3Edge
+    from dptb.nn.embedding.legacy.edge import LemMoEV3Edge
 
     owner = types.SimpleNamespace(
         edge_router_in_features=coefficients.shape[1], edge_router_top1_mode="legacy",

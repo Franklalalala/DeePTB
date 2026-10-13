@@ -3,7 +3,7 @@ from torch_geometric.nn import Aggregation
 import torch
 from typing import Optional, Tuple, Union
 from dptb.data import AtomicDataDict
-from dptb.nn.embedding.emb import Embedding
+from dptb.nn.embedding.registry import Embedding
 from ..base import ResNet
 from dptb.utils.constants import dtype_dict
 from ..type_encode.one_hot import OneHotAtomEncoding

@@ -6,7 +6,7 @@ import pytest
 import torch
 from e3nn import o3
 
-from dptb.nn.embedding.unitb_activations import build_gate_activation
+from dptb.nn.embedding.unitb.activations import build_gate_activation
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, MOLELinear, SO2_Linear, SO2SlotPostActivationMixer
 from dptb.tests._requires import requires_so2_cuda
 from dptb.tests.model_helpers import _build, _data

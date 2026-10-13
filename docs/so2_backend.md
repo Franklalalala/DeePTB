@@ -1,75 +1,90 @@
-# SO2 后端
+# SO2 backend
 
-SO2 参数、路由和纯 PyTorch 参考计算保留在 DeePTB。可选的 SO2CUDA 包通过 `dptb.nn.so2_backend` 提供加速；DeePTB 不编译 SO2 CUDA 扩展。
+SO2 parameters, routing, and PyTorch reference computation remain in DeePTB.
+The optional SO2CUDA package provides acceleration through
+`dptb.nn.so2_backend`; DeePTB does not compile SO2 CUDA extensions.
 
-安装 SO2CUDA 后，符合 CUDA FP32、布局与路由条件的层自动调用 `so2_cuda_ops.deeptb`。CPU、其他 dtype、autocast、几何求导、非线性插值块、`torch.func` 或缺少可选包时使用参考实现，并按原因记录一次回退日志。原生执行错误会直接抛出，便于发现配置或工具链问题。
+With SO2CUDA installed, layers meeting the CUDA FP32, layout, and routing
+requirements call `so2_cuda_ops.deeptb` automatically. CPU, other dtypes,
+autocast, geometry gradients, nonlinear interpolation blocks, `torch.func`,
+or an unavailable optional package select the reference implementation, with a
+fallback reason logged once. Native execution errors propagate so configuration
+and toolchain problems remain visible.
 
-UniTB-dense 通过 `so2_backend.dense_forward` 调用 SO2CUDA 的 `dense_pairs`，保持 m=0 与逐 m 的累加次序；UniTB（PDQ-MoE）使用激活空间融合和分组 GEMM，保留每个 top-k 槽的非线性与加权顺序。true-dense 层使用 SO2CUDA 的 `true_dense_pairs` 接口；没有该接口的旧包会回退。
+UniTB-dense calls SO2CUDA's `dense_pairs` through
+`so2_backend.dense_forward`, preserving the m=0 and per-m accumulation order.
+UniTB (PDQ-MoE) uses activation-space fusion and grouped GEMM, preserving each
+top-k slot's nonlinear and weighting order. True-dense layers use
+`true_dense_pairs`; older packages lacking this interface fall back.
 
-## 配置
+## Configuration
 
-| 设置 | 作用 |
-|---|---|
-| `SO2_CUDA_BACKEND=auto` | 默认自动选择；设为 `off` 强制参考实现。 |
-| `so2_fusion_mode=streamed_m_major_fused_p0` | UniTB 默认；没有可用加速时使用分组 PyTorch 实现，`staged`、`streamed_m_major_ref` 为可选的 PyTorch 参考路线。 |
-| `mole_linear_mode=cublas_grouped` | 专家线性层通过同一可选后端调用分组 GEMM。 |
-| `so2_m_linear_mode=indexed_sandwich_cuda_multi` | 扩展 true-dense 层的默认路线；`standard` 使用 PyTorch。 |
+| Setting | Effect |
+| --- | --- |
+| `SO2_CUDA_BACKEND=auto` | Default automatic selection; `off` forces reference execution |
+| `so2_fusion_mode=streamed_m_major_fused_p0` | UniTB default; uses grouped PyTorch without acceleration; `staged` and `streamed_m_major_ref` are alternative PyTorch routes |
+| `mole_linear_mode=cublas_grouped` | Expert linear layers call grouped GEMM through the same optional backend |
+| `so2_m_linear_mode=indexed_sandwich_cuda_multi` | Default route for extended true-dense layers; `standard` uses PyTorch |
 
-以下环境变量可在不改配置时选择路线，均可不设：
+These optional environment variables select routes without editing configuration:
 
-| 变量 | 作用 |
-|---|---|
-| `DPTB_SO2_FUSION_MODE` | 在未显式给出模型选项时选择 MoE SO2 路线。 |
-| `DPTB_MOLE_LINEAR_MODE` | 在未显式给出模型选项时选择专家线性路线。 |
-| `DPTB_SO2_M_LINEAR_MODE` | 在未显式给出参数时选择 true-dense 路线。 |
-| `DPTB_SO2_ACTIVATION_FUSED_P0` | 值为 `0` 时关闭激活空间融合。 |
-| `DPTB_SO2_ACTIVATION_FUSED_P0_GEMM` | SO2CUDA 激活空间调度，默认 `per_slot`。 |
-| `DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES` / `MAX_EDGES` | true-dense 加速边数范围；优先于 `SO2_CUDA_MIN_EDGES` / `MAX_EDGES`，`0` 不设限。 |
+| Variable | Effect |
+| --- | --- |
+| `DPTB_SO2_FUSION_MODE` | Selects the MoE SO2 route when no explicit model option is supplied |
+| `DPTB_MOLE_LINEAR_MODE` | Selects the expert-linear route when no explicit model option is supplied |
+| `DPTB_SO2_M_LINEAR_MODE` | Selects the true-dense route when no explicit argument is supplied |
+| `DPTB_SO2_ACTIVATION_FUSED_P0` | `0` disables activation-space fusion |
+| `DPTB_SO2_ACTIVATION_FUSED_P0_GEMM` | SO2CUDA activation-space scheduling; defaults to `per_slot` |
+| `DPTB_SO2_INDEXED_SANDWICH_CUDA_MIN_EDGES` / `MAX_EDGES` | True-dense acceleration edge-count limits; override `SO2_CUDA_MIN_EDGES` / `MAX_EDGES`; `0` means no limit |
 
-SO2CUDA 的构建目录和精度变量由该包维护，例如 `SO2_CUDA_PACK_SCATTER_BUILD_DIR`、`SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR`、`SO2_CUDA_FAST_TF32`。严格 FP32 使用 `SO2_CUDA_FAST_TF32=0`。
+SO2CUDA manages its build-directory and precision variables, including
+`SO2_CUDA_PACK_SCATTER_BUILD_DIR`, `SO2_CUDA_CUBLAS_GROUPED_BUILD_DIR`, and
+`SO2_CUDA_FAST_TF32`. Set `SO2_CUDA_FAST_TF32=0` for strict FP32.
 
 ## LEM / SLEM
 
-`lem`、`slem`、`lem_prior`、`slem_prior` 的 SO2 层都是 `tensor_product.SO2_Linear`。安装 SO2CUDA 后，它们默认走 true-dense 快路径（`so2_m_linear_mode=indexed_sandwich_cuda_multi`）。快路径只替换 m>0 的成对运算，参数、Wigner 旋转和 m=0 计算与 PyTorch 参考实现相同，精度和训练 loss 不变。
+`lem`, `slem`, `lem_prior`, and `slem_prior` use
+`tensor_product.SO2_Linear`. With SO2CUDA installed, eligible layers default
+to the true-dense route (`so2_m_linear_mode=indexed_sandwich_cuda_multi`).
+It replaces only the paired m>0 operations; parameter layouts, Wigner rotations,
+and m=0 computation retain the reference contract.
 
-切回参考实现任选其一：
+Select the reference with either setting:
 
-| 设置 | 范围 |
-|---|---|
-| `DPTB_SO2_M_LINEAR_MODE=standard` | 构建模型时设置；true-dense SO2 层使用 PyTorch 参考实现 |
-| `SO2_CUDA_BACKEND=off` | 所有 SO2CUDA 调用使用参考实现 |
+| Setting | Scope |
+| --- | --- |
+| `DPTB_SO2_M_LINEAR_MODE=standard` | Set before model construction; true-dense SO2 layers use PyTorch |
+| `SO2_CUDA_BACKEND=off` | All SO2CUDA calls use reference execution |
 
-两种设置只改变计算路线，不改变参数名或检查点，旧检查点可直接加载。
+These settings change execution routes without changing parameter names or
+checkpoint layouts. Floating-point differences depend on device, precision,
+input, and dispatch. Validate outputs, gradients, optimizer steps, and rotation
+equivariance for the intended workload. Record actual dispatch, warm-up,
+synchronized forward/backward timings, and memory use before reporting speedups.
+Backend selection alone does not guarantee unchanged accuracy or training loss.
 
-H200、严格 FP32、真实训练批次上的核对结果：
+## Tensor-product calls
 
-| 项目 | LEM | SLEM |
-|---|---|---|
-| 输出相对 L2 差（快路径对参考） | 5e-7 | 8e-7 |
-| 参考实现自身两次运行的差 | 4e-7 | 5e-7 |
-| 两步优化后的 loss | 相同 | 相同 |
-| 逐层旋转等变误差 | 与参考相同（1e-6 量级） | 与参考相同（1e-6 量级） |
-| 单步前向 + 反向加速 | 1.34× | 1.41× |
+Upstream LEM/SLEM use a fixed tensor return type:
 
-## 张量积调用
-
-上游 LEM / SLEM 使用固定的张量返回值：
-
-```python
+~~~python
 from dptb.nn.tensor_product import SO2_Linear
 layer = SO2_Linear(irreps_in, irreps_out)
 features = layer(features, edge_vectors, latents)
-```
+~~~
 
-需要旋转缓存、插值或后端参数时使用独立类：
+Use the separate class for rotation caching, interpolation, or backend options:
 
-```python
+~~~python
 from dptb.nn.tensor_product import SO2LinearCached
 layer = SO2LinearCached(irreps_in, irreps_out)
 features, rotation = layer(features, edge_vectors, latents)
 features, rotation = layer(features, edge_vectors, latents, rotation)
-```
+~~~
 
-两者不按参数猜测返回类型。MoE 模块 `tensor_product_moe_v3.SO2_Linear` 的原有元组返回合同保持不变。后端不添加模型参数或 buffer，既有检查点仍按原参数名加载。
+Neither class infers its return type from arguments. The existing tuple contract
+of `tensor_product_moe_v3.SO2_Linear` is retained. The backend adds no model
+parameters or buffers; existing checkpoints load under their original names.
 
-晶体对称投影和 H0 / NACF 的独立数值核不属于 SO2 后端。
+Crystal-symmetry projection and the independent H0/NACF numerical kernels are
+outside this backend.

@@ -1,48 +1,48 @@
-# 测试
+# Testing
 
-使用已配置的 DeePTB 环境，按修改影响的行为选择测试。一次有效的针对性检查即可；文档修改无需重跑数值实验。
+Use a configured DeePTB environment and select tests for the behavior affected by your change. One effective targeted check is sufficient for an isolated change; documentation edits do not require numerical experiments.
 
 ```bash
 python tools/test.py dptb/tests/test_record_codec.py
 ```
 
-`python tools/test.py` 和 `bash ut.sh` 使用同一组短测试，覆盖谱损失、记录解码、先验模型和专家掩码。它们适合检查安装和通用接口，不覆盖全部功能。
+`python tools/test.py` and `bash ut.sh` run the same short suite, covering public APIs, embedding discovery and compatibility, spectral losses, record decoding, prior-aware models, and expert masks. This suite checks installation and common interfaces. It does not cover every feature.
 
-需要完整检查时显式指定：
+Request the full suites explicitly when needed:
 
 ```bash
 python tools/test.py dptb/tests
-python -m pytest h0/tests_h0fast
+python -m pytest dptb/tests/h0
 ```
 
-## 目录与可选组件
+## Test layout and optional components
 
-`dptb/tests` 按模块家族和行为组织；公共构造器放在辅助模块中，测试文件之间不互相导入。`h0/tests_h0fast` 单独运行。LoopSCF 的测试在独立仓库运行，并使用已安装的 DeePTB。
+`dptb/tests` is organized by module family and behavior; H0 tests are in `dptb/tests/h0`. Shared constructors belong in helper modules; test files must not import one another. LoopSCF tests run in its own repository against installed DeePTB.
 
-可选依赖的测试在依赖缺失时说明原因并跳过。`dptb/tests/_requires.py` 提供 `requires_cuda`、`requires_multi_gpu`、`requires_so2_cuda`、`requires_module(name)`，NACF 原生依赖由 `conftest.py` 延迟检查。真实参考数据测试由各测试说明的环境变量启用；数据和生成结果放在仓库外。
+Tests requiring missing optional dependencies skip with an explanation. `dptb/tests/_requires.py` provides `requires_cuda`, `requires_multi_gpu`, `requires_so2_cuda`, and `requires_module(name)`; `conftest.py` checks native NACF dependencies lazily. Each real-reference-data test documents the environment variables that enable it. Keep data and generated results outside the repository.
 
-安装 SO2CUDA 0.3.0 后，可以运行受影响的 CUDA 测试：
+With SO2CUDA 0.3.0 installed, run the affected CUDA tests, for example:
 
 ```bash
 python -m pytest dptb/tests/test_so2_kernels_cuda.py
 ```
 
-未安装 SO2CUDA 时，应验证对应的 PyTorch 参考路径；也可通过 `SO2_CUDA_BACKEND=off` 明确禁用加速。后端选择、设备、精度和实际运行路径需要写入验证记录；不能仅凭配置开关认定 CUDA 已执行。
+When SO2CUDA is unavailable, validate the corresponding PyTorch reference path. `SO2_CUDA_BACKEND=off` explicitly disables acceleration. Record the backend selection, device, precision, and actual execution route; a configuration flag alone does not establish that CUDA kernels ran.
 
-`conftest.py` 检查测试导入和执行后的默认 dtype 及确定性设置，并在 CUDA 初始化前设置 `CUBLAS_WORKSPACE_CONFIG`。CPU 并行度和 GPU 资源由运行环境明确配置。
+`conftest.py` checks the default dtype and deterministic settings after test import and execution, and sets `CUBLAS_WORKSPACE_CONFIG` before CUDA initialization. Configure CPU parallelism and GPU resources explicitly in the execution environment.
 
-## 验证原则
+## Validation principles
 
-保留能验证可观察行为的测试：小型独立数值参考、数据与图的对齐、检查点恢复、有限且正确路由的梯度，以及损坏输入的拒绝。复现缺陷通常只需一个最小回归用例；边界情况优先参数化。
+Keep tests of observable behavior: small independent numerical references, data/graph alignment, checkpoint restoration, finite and correctly routed gradients, and rejection of corrupt inputs. A bug usually needs one minimal regression case; parameterize related boundary cases.
 
-不测试源码拼写、注释、私有调用顺序、实现的冻结副本或偶然的错误文本。配置测试应验证真实的接受或拒绝行为。
+Avoid assertions on source spelling, comments, private call order, frozen implementation copies, or incidental error wording. Configuration tests should exercise actual acceptance or rejection.
 
-UniTB 与 UniTB-dense 的重构应使用相同输入、检查点、严格 FP32 设置和确定性模式，比较推理输出以及四步短训练的 loss 和参数。报告差异量级、运行环境和检查点加载结果，不以全量测试通过代替数值等价性。
+For UniTB and UniTB-dense refactors, use identical inputs, checkpoints, strict FP32 settings, and deterministic execution. Compare inference outputs and the losses and parameters from four training steps. Report difference magnitudes, environment details, and checkpoint-loading results. Passing the full suite does not establish numerical equivalence.
 
-只有受影响的内核、设备路径、数据契约或未解决的数值问题需要新的 GPU 或真实数据检查。硬件基准和预测精度研究使用独立资产；不开展种子重复或同配置重复训练。
+New GPU or real-data checks are needed for affected kernels, device paths, data contracts, or unresolved numerical issues. Hardware benchmarks and predictive-accuracy studies use separate assets. Routine maintenance does not require repeated seeds or duplicate training with the same configuration.
 
-提交可复用代码、当前功能文档和针对性的行为回归测试。运行日志、作业清单、基准快照、源码副本及一次性诊断产物保存在仓库外，变更说明概括验证范围与结果。
+Commit reusable code, current feature documentation, and targeted behavioral regression tests. Keep run logs, job inventories, benchmark snapshots, source copies, and one-off diagnostics outside the repository. Describe validation scope and results in the change summary.
 
-数值对照使用严格 FP32：设置 `NVIDIA_TF32_OVERRIDE=0`、`SO2_CUDA_FAST_TF32=0`、`DPTB_CUBLAS_GROUPED_FAST_TF32=0`，并关闭 PyTorch matmul/cuDNN 的 TF32。CPU 与 CUDA 在 cutoff 边界附近可能选择不同活动边，因此同设备检查点回归与跨设备比较应分别报告。缺少旧设备参考的可运行项只证明可运行，不声明数值等价。
+Use strict FP32 for numerical comparisons: set `NVIDIA_TF32_OVERRIDE=0`, `SO2_CUDA_FAST_TF32=0`, and `DPTB_CUBLAS_GROUPED_FAST_TF32=0`, and disable PyTorch matmul/cuDNN TF32. CPU and CUDA can select different active edges near cutoff boundaries, so report same-device checkpoint regressions separately from cross-device comparisons. A runnable case without an old-device reference establishes execution only.
 
-独立 LoopSCF 的包测试和 checkpoint 回归应安装本分支后在 loopscf 仓库执行。性能测试使用 SO2CUDA 提供的 UniTB / UniTB-dense 示例，记录实际后端、预热与计时次数、前向/反向中位数和四分位、显存以及数值差；随机模型的合成结构基准不代表物理精度。
+Install this branch before running the standalone LoopSCF package tests and checkpoint regressions in the LoopSCF repository. For performance checks, use the UniTB/UniTB-dense examples provided by SO2CUDA. Record the actual backend, warm-up and timed iteration counts, forward/backward medians and quartiles, device memory, and numerical differences. Synthetic structures with random models do not establish physical accuracy.

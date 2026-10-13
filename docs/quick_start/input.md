@@ -139,7 +139,7 @@ spicify the training procedure.
         "display_freq": 10
     }
 ```
-The `loss_options` section is used to specify the loss function used in training. The `method` key is used to specify the loss function, which can be `eigvals`, `hamil_abs`, and `hamil_blas`. The `eigvals` loss is used for **DeePTB-SK** model, while `hamil_abs` and `hamil_blas` are used for **DeePTB-E3** model. Here `Adam` optimizer is always preferred for better convergence speed. While the `lr_scheduler` are recommended to use "rop", as:
+The `loss_options.method` field selects the training loss. Examples include `eigvals` for **DeePTB-SK**, and `hamil_abs` or `hamil_blas` for **DeePTB-E3**. Choose the optimizer and learning-rate schedule for the model, target, and training recipe; convergence speed depends on those settings and the data. The following example uses the reduce-on-plateau scheduler (`rop`):
 ```json
     "lr_scheduler": {
             "type": "rop",

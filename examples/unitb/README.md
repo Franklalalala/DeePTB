@@ -1,30 +1,49 @@
-# UniTB 训练入口示例
+# UniTB training configurations
 
-`input.json`（UniTB）与 `dense/input.json`（UniTB-dense）通过仓库的标准训练配置入口读取。
-`slem/input.json`（UniTB-SLEM）只比 `input.json` 多 `"layer_topology": "slem"`。
-embedding 只列出与默认不同的选项。示例是 H/O、compact uu-real、H−H0 监督，
-请把 basis 改成数据的真实轨道基组，保留其 SOC 与表示约定；不要只替换元素名称。
+`input.json` (UniTB), `dense/input.json` (UniTB-dense), and `slem/input.json`
+(UniTB-SLEM) use the standard training configuration. The SLEM example differs
+from `input.json` only by `"layer_topology": "slem"`.
+Embedding sections list options differing from defaults. The examples use H/O,
+compact uu-real output, and H−H0 supervision. Replace the basis with the data's
+actual atomic orbitals while preserving its SOC and representation conventions;
+changing element names alone is insufficient.
 
-这里的一轮训练、小批次和 Adam 设置用于检查入口，不是完整生产训练配方。
+The single epoch, small batch, and Adam settings exercise the training entry
+point. Full training hyperparameters and batching depend on the experiment.
 
-将 `DATA_ROOT/train`、`DATA_ROOT/validation` 换为 LMDB 数据目录。
-主记录须包含保存的边图、Hamiltonian 监督目标和 `hamiltonian_0` 物理先验，
-加载后得到 `node_h0/edge_h0`。示例 target_kind=h0res，监督对象是 ΔH。
-逐元素截断半径须与数据配方相符，可在 embedding.r_max 中提供字典。
+Replace `DATA_ROOT/train` and `DATA_ROOT/validation` with LMDB directories.
+Primary records must include the saved edge graph, Hamiltonian targets, and the
+physical `hamiltonian_0` prior, loaded as `node_h0/edge_h0`.
+`target_kind=h0res` supervises ΔH. Per-element cutoffs must match the data recipe;
+`embedding.r_max` accepts a dictionary.
 
-UniTB 示例还需将 `OVERLAP_ROOT` 换为物理 overlap sidecar 根目录。每个 split 的
-shard/key、结构身份和边顺序须与主数据对应；侧车提供物理 `S`，不是网络 latent。
-两份示例通过 distance_ranges 只监督 onsite。UniTB 示例启用 QEq 局部电荷头和
-onsite 尺度的训练加噪。hopping 配方把
-`te_prior_sigma` 改为 5，并使用主训练入口已有的距离/标签掩码；不要靠加噪配置
-代替距离专家的监督掩码。完整训练超参数与批次设置由实验配方决定。
+For UniTB and UniTB-SLEM, replace `OVERLAP_ROOT` with the physical overlap
+sidecar root. Each split's shards, keys, structure identities, and edge ordering
+must match the primary data. Sidecars contain physical `S`, not network latents.
 
-纯先验加噪固定在 `t=0`：例子显式设置 `flow_options.t_max=0`，
-`t_min` 与 `t0_probability` 沿用默认的 0。仅关闭 flow 不会把其默认
-`t_max=0.999` 改成 0；加噪采样器会检查这三个值。
+All three examples supervise onsite terms through `distance_ranges`.
+UniTB and UniTB-SLEM enable the local QEq charge head and onsite-scale prior
+noise. For hopping, set `te_prior_sigma` to 5 and use the standard training
+entry point's distance/label masks. Noise configuration does not replace
+distance-expert supervision masks.
 
-可用标准 CLI 运行 `dptb train input.json -o output`。CPU 参考检查需选择
-`common_options.device=cpu` 与可用的参考 SO2 配置；CUDA 使用可选 SO2CUDA。
-这些数据路径是占位符，仓库不附带训练数据或已训练权重。
+Training-only prior noise uses `t=0`. The examples explicitly set
+`flow_options.t_max=0`; `t_min` and `t0_probability` retain their defaults of 0.
+Disabling flow alone does not change its default `t_max=0.999`.
+The noise sampler checks all three values.
 
-结构、兼容名称与选项见 [docs/unitb.md](../../docs/unitb.md)。
+Run from this example directory, after setting the data paths:
+
+~~~bash
+dptb train input.json -o output
+dptb train dense/input.json -o dense-output
+dptb train slem/input.json -o slem-output
+~~~
+
+For CPU reference checks, select `common_options.device=cpu` and a supported
+reference SO2 configuration. CUDA acceleration uses optional SO2CUDA.
+Data paths are placeholders; training data and trained weights are not included.
+
+See [the UniTB guide](../../docs/unitb.md) for structure, compatibility names,
+and options, and [the architecture guide](../../docs/architecture.md) for shared
+construction APIs.

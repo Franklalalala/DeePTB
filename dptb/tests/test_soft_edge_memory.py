@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from dptb.nn.embedding.soft_edge_memory import EquivariantSoftEdgeMemory
+from dptb.nn.conditioning.memory import EquivariantSoftEdgeMemory
 
 
 IRREPS = "3x0e + 2x1o + 1x0o + 1x2e"

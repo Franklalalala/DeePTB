@@ -9,9 +9,9 @@ import torch
 
 from dptb.data import _keys
 from dptb.data.transforms import OrbitalMapper
-from dptb.nn.embedding.lem_moe_v3_edge import LemMoEV3EdgeH0
-from dptb.nn.embedding.prior_common import H0InitLayer
-from dptb.nn.embedding.lem_moe_v3_prior_2b import _Prior2bMixin
+from dptb.nn.embedding.legacy.edge import LemMoEV3EdgeH0
+from dptb.nn.conditioning.projection import H0InitLayer
+from dptb.nn.embedding.legacy.prior_2b import _Prior2bMixin
 from dptb.tests.model_helpers import _build, _data, _has_grad, _params_equal
 
 EDGE = dict(method="lem_moe_v3_edge_prior_2b", num_experts=4, top_k=2, num_shared_experts=1,

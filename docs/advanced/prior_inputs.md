@@ -1,9 +1,9 @@
-# 先验输入与检查点
+# Prior inputs and checkpoints
 
-先验输入需要明确 AO product、耦合 CG irreps 和特征排列三个空间。H0 与其他接受该布局的先验模型，在 sorted-irrep permutation 和 e3nn Linear 之前按 `h0_ao_cg` 转换 AO product 字段；输入生产者与模型必须采用同一约定。
+Prior inputs distinguish three spaces: AO products, coupled CG irreps, and feature ordering. H0 and other prior-aware models accepting this layout transform AO-product fields according to `h0_ao_cg` before the sorted-irrep permutation and e3nn Linear projection. Input producers and models must use the same convention.
 
-`h0_ao_cg` 在构造器与配置边界默认启用。检查点保存 `h0_ao_cg_version`；历史未标记权重可通过显式 `h0_ao_cg=false` 保留原 sorted-AO 行为。版本不匹配时应报错，不能静默改变已有权重的科学输入语义。先验表的旋转约定属于数据生产者契约，需要单独验证。
+`h0_ao_cg` defaults to enabled at the constructor and configuration boundaries. Checkpoints store `h0_ao_cg_version`; explicitly setting `h0_ao_cg=false` preserves the original sorted-AO behavior of historical unmarked weights. Version mismatches must raise rather than silently change the scientific meaning of inputs to existing weights. Prior-table rotation conventions are a separate producer contract and require their own validation.
 
-`skip_nonfinite_batch` 默认启用。优化器更新前检查所有专家和 rank；非有限批次清空梯度、记录已消费的数据游标，并跳过成功步指标及逐步调度器推进。它不修复已损坏的优化器状态，也不会回滚 forward 内部的修改。显式设为 `false` 时使用对应配置行为。
+`skip_nonfinite_batch` defaults to enabled. All experts and ranks are checked before the optimizer update. A nonfinite batch clears gradients, records the consumed data cursor, and skips successful-step metrics and per-step scheduler advancement. It does not repair corrupted optimizer state or roll back mutations made during forward. Explicitly setting it to `false` selects the configured alternative behavior.
 
-数据或检查点的兼容性不能仅凭先验加回恒等式确定。验证应覆盖真实输入与目标的对齐、先验转换、检查点版本、双阶段初始化及冻结行为、有限梯度和非有限批次处理。测试权重不能用于初始化正式训练。
+The identity used to add a prior back does not establish data or checkpoint compatibility. Validation must cover real-input/target alignment, prior conversion, checkpoint versions, two-stage initialization and freezing, finite gradients, and nonfinite-batch handling. Do not use test weights to initialize production training.

@@ -7,8 +7,8 @@ from torch.nn import functional as F
 
 from dptb.data import _keys
 from dptb.nn.build import build_model
-from dptb.nn.embedding.unitb_options import unitb_options
-from dptb.nn.embedding.unitb_structure import (
+from dptb.nn.embedding.unitb.options import unitb_options
+from dptb.nn.embedding.unitb.structure import (
     StructureStats, fit_structure_stats, initialize_fresh, merged_linear,
 )
 from dptb.nn.pdq_moe import PDQMoELinear, PDQMoERouting

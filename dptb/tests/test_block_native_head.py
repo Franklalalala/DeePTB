@@ -3,12 +3,12 @@ import pytest
 import torch
 from e3nn import o3
 
-from dptb.nn.embedding.block_native_head import (
+from dptb.nn.heads.block_native import (
     BlockNativeLinearHead,
     compact_blocks_to_species_layout,
     species_compact_index,
 )
-from dptb.nn.embedding.rme_nocg_fusion_head import normalize_rme_head_mode
+from dptb.nn.heads.rme_fusion import normalize_rme_head_mode
 
 # H-like species skips the union 3s slot (water 2s1p inside 3s2p1d); O uses the full basis.
 _SPECIES_MASK = torch.tensor([[1, 1, 0, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=torch.bool)
