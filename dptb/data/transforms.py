@@ -404,7 +404,6 @@ from e3nn import o3
 anglrMId = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}
 
 # ================== Logging ==================
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s', stream=sys.stdout, force=True)
 log = logging.getLogger("OrbitalMapper")
 
 

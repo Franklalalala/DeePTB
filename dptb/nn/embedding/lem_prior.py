@@ -30,16 +30,9 @@ import e3nn.o3 as o3
 from dptb.data import AtomicData, AtomicDataDict
 from typing import Dict, Optional, Union, List
 import logging
-import sys
 
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True
-)
 log = logging.getLogger(__name__)
 
 

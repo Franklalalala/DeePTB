@@ -12,7 +12,6 @@ from torch_runstats.scatter import scatter
 
 from dptb.data import AtomicDataDict, _keys
 from dptb.nn.e3nn_fast import Linear
-from dptb.data.AtomicData import register_fields
 from dptb.data.interfaces.blockwise_tensor import (
     edge_feature_slices,
     ensure_non_soc_mapper,
@@ -23,26 +22,6 @@ from dptb.data.interfaces.blockwise_tensor import (
     onsite_feature_slices,
 )
 from dptb.utils.constants import anglrMId
-
-
-# Keep H0 tensors as first-class node/edge fields once the dataset starts
-# emitting them. This is a no-op for the current fallback-only workflow.
-register_fields(
-    node_fields=[
-        _keys.NODE_H0_KEY,
-        _keys.NODE_UUREAL_RESIDUAL_BLOCKS_KEY,
-        _keys.NODE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
-        _keys.NODE_SPATIAL_RESIDUAL_BLOCKS_KEY,
-        _keys.NODE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY,
-    ],
-    edge_fields=[
-        _keys.EDGE_H0_KEY,
-        _keys.EDGE_UUREAL_RESIDUAL_BLOCKS_KEY,
-        _keys.EDGE_UUREAL_RESIDUAL_BLOCK_SHAPE_KEY,
-        _keys.EDGE_SPATIAL_RESIDUAL_BLOCKS_KEY,
-        _keys.EDGE_SPATIAL_RESIDUAL_BLOCK_SHAPE_KEY,
-    ],
-)
 
 
 log = logging.getLogger(__name__)

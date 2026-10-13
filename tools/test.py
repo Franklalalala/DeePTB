@@ -7,6 +7,7 @@ import sys
 SMOKE = [
     "dptb/tests/test_public_api.py",
     "dptb/tests/test_embedding_registry.py",
+    "dptb/tests/test_import_boundaries.py",
     "dptb/tests/test_trainer_loop.py",
     "dptb/tests/test_band_losses.py",
     "dptb/tests/test_record_codec.py",
