@@ -363,3 +363,26 @@ def test_fused_density_channel_clipping_support_and_empty():
     got = density_sum_cuda(points, neighbors, bank)
     torch.testing.assert_close(got, ref, atol=1e-12, rtol=0)
     assert density_sum_cuda(points[:0], neighbors, bank).shape == (0,)
+
+
+def test_evaluator_reuses_the_neighbour_lists_of_an_unchanged_geometry(monkeypatch):
+    """Neighbour lists depend only on species, positions, cell, PBC and radius: an unchanged geometry reuses them,
+    and any change enumerates again."""
+    import dptb.nacf.onsite as onsite
+    monkeypatch.delenv('DPTB_NACF_TOPOLOGY_LIBRARY', raising=False)
+    calls = []
+    real = onsite.onsite_neighbor_lists
+    monkeypatch.setattr(onsite, 'onsite_neighbor_lists', lambda g, radius: calls.append(1) or real(g, radius))
+    ev = OnsiteXCEvaluator(lambda s, o: None, {'X': synthetic_density('cpu')}, potential=lambda n: n, radius=4.0,
+                           device='cpu', engine='reference')
+    pos = np.array([[.1, .2, .3], [1., .2, .5]])
+    g = dict(symbols=['X', 'X'], positions_bohr=pos, cell_bohr=np.eye(3) * 3., pbc=[True] * 3)
+    first = ev.neighbors(g)
+    assert ev.neighbors(dict(g, positions_bohr=pos.copy())) is first and len(calls) == 1
+    moved = dict(g, positions_bohr=pos + [[0., 0., 0.], [.1, 0., 0.]])
+    second = ev.neighbors(moved)
+    assert len(calls) == 2 and second is not first
+    for got, want in zip(second, real(moved, 4.0)):
+        assert list(got) == list(want) and all(np.array_equal(got[s], want[s]) for s in want)
+    ev.neighbors(dict(g, pbc=[True, True, False]))
+    assert len(calls) == 3

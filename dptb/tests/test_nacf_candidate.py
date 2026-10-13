@@ -478,3 +478,24 @@ def test_pair_coverage_uses_actual_edges_and_geometry_is_snapshotted(world):
     for key in before:
         g[key].flat[0] += 1
         np.testing.assert_array_equal(prepared.geometry[key], before[key])
+
+
+@requires_nacf_topology
+def test_prepared_candidate_enumerates_onsite_neighbours_once(world, monkeypatch):
+    """Onsite neighbour lists depend only on the geometry: preparation enumerates them once, every forward reuses
+    them, and the onsite blocks equal a fresh evaluation on the NumPy lists."""
+    import dptb.nacf.onsite as onsite
+    calls = []
+    for name in ("onsite_neighbor_lists", "onsite_neighbor_lists_native"):
+        real = getattr(onsite, name)
+        monkeypatch.setattr(onsite, name, lambda *a, _real=real, **k: calls.append(1) or _real(*a, **k))
+    cut = {s: kw["rcut"] for s, kw in SPECIES.items()}
+    g = make_structure(["Xa", "Yb", "Xa"], [[0.4, 0.1, 0.2], [2.7, 0.5, 1.9], [0.9, 3.1, 2.4]], np.diag([7.1, 7.4, 8.2]), cut)
+    prepared = make_plan(world).prepare(g)
+    assert len(calls) == 1
+    first, second = prepared(), prepared()
+    assert len(calls) == 1
+    for key in ("node_ao_ev", "edge_ao_ev"):
+        torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
+    fresh = world["onsite"](g, prepared.width, prepared.orders, neighbors=onsite.onsite_neighbor_lists(g, world["onsite"].radius))
+    torch.testing.assert_close(first["components"]["onsite_xc_ao_ev"], fresh, rtol=0, atol=0)

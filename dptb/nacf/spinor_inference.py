@@ -73,7 +73,7 @@ class SOCGeometryPredictor:
     """
 
     def __init__(self, model, bank, model_options, *, prior_kind, target_kind,
-                 expected_p2_source_fingerprint, conditioning_keys):
+                 expected_p2_source_fingerprint, conditioning_keys, topology_library=None):
         if prior_kind != 'na_cf' or target_kind != 'full_h_minus_nacf':
             raise ValueError('SOC completion requires NACF input and Full-H minus NACF residual')
         if not expected_p2_source_fingerprint or bank.p2_manifest_sha256 != expected_p2_source_fingerprint:
@@ -98,10 +98,11 @@ class SOCGeometryPredictor:
         self.completion = SOCUURealCompletion(self.compact_mapper,self.full_mapper,device=self.device)
         self.conditioning_keys = tuple(conditioning_keys)
         self.cutoffs = get_cutoffs_from_model_options(model_options)
+        self.topology_library = topology_library
 
     def prepare(self, structures):
         plan,geometry = prepare_geometry(self.bank,self.full_mapper,structures,self.cutoffs,
-                                         output_dtype=self.dtype)
+                                         output_dtype=self.dtype,library=self.topology_library)
         return PreparedSOCInference(self.model,plan,geometry,self.completion,self.conditioning_keys)
 
     def __call__(self, structures):
@@ -177,7 +178,7 @@ def _training_contract_config(embedded, sidecar_path):
 def load_soc_predictor(onsite_checkpoint, hopping_checkpoint, *, p2, p23, overlap,
                        soc, expected_p2_sha256, device='cuda:0', backend='cuda',
                        ry_to_ev=13.605693122994, onsite_config=None, hopping_config=None,
-                       p23_missing_policy='error', expected_p23_sha256=None):
+                       p23_missing_policy='error', expected_p23_sha256=None, topology_library=None):
     """Load two separately trained NACF residual arms and complete spinor H/S.
 
     ``expected_p2_sha256`` must come from a verified training-source audit. The
@@ -189,6 +190,7 @@ def load_soc_predictor(onsite_checkpoint, hopping_checkpoint, *, p2, p23, overla
     If a checkpoint omits dataset configuration, its same-run training sidecar
     is required. The caller must establish checkpoint/sidecar provenance; common
     basis and conditioning semantics are cross-checked here before model load.
+    ``topology_library`` (or ``DPTB_NACF_TOPOLOGY_LIBRARY``) enables the native geometry preparation.
     """
     from dptb.nn import build_model
     from dptb.data.interfaces.p2_table import P2TableStore
@@ -230,7 +232,7 @@ def load_soc_predictor(onsite_checkpoint, hopping_checkpoint, *, p2, p23, overla
     predictor = SOCGeometryPredictor(pair, bank, configs[0]['model_options'],
         prior_kind='na_cf', target_kind='full_h_minus_nacf',
         expected_p2_source_fingerprint=expected_p2_sha256,
-        conditioning_keys=conditioning[0])
+        conditioning_keys=conditioning[0], topology_library=topology_library)
     predictor.checkpoint_paths = tuple(str(Path(p).resolve()) for p in (onsite_checkpoint,hopping_checkpoint))
     predictor.runtime_model_overrides = {}
     return predictor

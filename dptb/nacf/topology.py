@@ -61,6 +61,24 @@ def _library(path):
     return lib
 
 
+def native_capabilities(library=None):
+    """Optional entry points of the topology library ``library`` or ``DPTB_NACF_TOPOLOGY_LIBRARY``.
+
+    Returns the subset of ``{'assembly', 'onsite'}`` that the library provides; empty when no library is
+    configured or it cannot be loaded. Callers that pick a backend automatically use this to fall back to
+    the Python enumeration instead of failing on an older build.
+    """
+    path = library or os.environ.get('DPTB_NACF_TOPOLOGY_LIBRARY')
+    if not path:
+        return frozenset()
+    try:
+        lib = _library(str(Path(path).resolve(strict=True)))
+    except (OSError, RuntimeError, AttributeError):
+        return frozenset()
+    names = {'assembly': 'nacf_topology_build_mode', 'onsite': 'nacf_onsite_neighbours'}
+    return frozenset(name for name, symbol in names.items() if hasattr(lib, symbol))
+
+
 def onsite_neighbour_rows(positions, cell, pbc, radius, species_rank, *, library=None, max_pairs=200_000_000):
     """Native fixed-radius onsite candidate rows ``(i, j, tx, ty, tz)`` in the accepted order.
 

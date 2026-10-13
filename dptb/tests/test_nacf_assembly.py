@@ -423,3 +423,26 @@ def test_loader_keeps_the_checkpoint_model_backend_unless_reference_is_explicit(
 def test_loader_rejects_unknown_model_backend_before_loading_checkpoint():
     with pytest.raises(ValueError, match='model_backend'):
         inference.load_predictor('absent.pth', 'p2', 'p23', 'overlap', 'pinned', model_backend='automatic_fallback')
+
+
+@requires_nacf_topology
+def test_geometry_inference_prepares_natively_when_a_library_is_available(monkeypatch):
+    """Geometry-only inference uses the native preparation whenever the configured library provides it and the
+    Python preparation otherwise; both give the same features."""
+    from ase import Atoms
+    from dptb.nacf.inference import prepare_geometry
+    p2, p23 = stores()
+    p2.species = {s: p2.species['X'] for s in ('H', 'C')}
+    p23.species = {s: p23.species['X'] for s in ('H', 'C')}
+    bank = NACFTableBank(p2, p23, device='cpu')
+    idp = OrbitalMapper({'H': '1s', 'C': '1s'}, method='e3tb')
+    atoms = Atoms('HCH', positions=[[0, 0, 0], [.7, .1, 0], [1.3, .6, .2]])
+    cutoffs = (2., None, None)
+    native, _ = prepare_geometry(bank, idp, atoms, cutoffs)
+    python, _ = prepare_geometry(bank, idp, atoms, cutoffs, topology='python')
+    assert native.assembly.topology_backend == 'native' and python.assembly.topology_backend == 'python'
+    want = python()
+    for key, value in native().items():
+        torch.testing.assert_close(value, want[key], atol=1e-12, rtol=0)
+    monkeypatch.delenv('DPTB_NACF_TOPOLOGY_LIBRARY')
+    assert prepare_geometry(bank, idp, atoms, cutoffs)[0].assembly.topology_backend == 'python'

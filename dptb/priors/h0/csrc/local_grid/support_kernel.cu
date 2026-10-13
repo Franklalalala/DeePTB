@@ -183,9 +183,11 @@ std::vector<torch::Tensor> build_atom_support_cuda(
     auto channels=descriptors.select(1,0);auto ls=descriptors.select(1,1);auto ms=descriptors.select(1,2);
     TORCH_CHECK(((channels>=0)&(channels<num_channels)).all().item<bool>(), "descriptor channel out of range");
     TORCH_CHECK(((ls>=0)&(ls<=4)).all().item<bool>() && ((ms>=-ls)&(ms<=ls)).all().item<bool>(), "invalid harmonic descriptor");
-    tensor(field_values,device,torch::kFloat64,3);finite(field_values);
+    // The full-cell fields are validated once when the caller uploads them; checking every element again for
+    // each atom support would add O(atoms x grid points) work. Only their layout is checked here.
+    tensor(field_values,device,torch::kFloat64,3);
     tensor(spin_z_values,device,torch::kFloat64,has_spin_z?3:1);
-    if(has_spin_z) {TORCH_CHECK(spin_z_values.sizes()==field_values.sizes(), "spin field shape mismatch");finite(spin_z_values);}
+    if(has_spin_z) {TORCH_CHECK(spin_z_values.sizes()==field_values.sizes(), "spin field shape mismatch");}
     else TORCH_CHECK(spin_z_values.numel()==0, "unused spin field must be empty");
 
     auto nmin_cpu = nmin.to(torch::kCPU).contiguous();
