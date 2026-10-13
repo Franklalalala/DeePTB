@@ -112,3 +112,26 @@ def test_legacy_command_payload_is_not_a_process_exit_status(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "Bond Type" in result.stdout and "0.74" in result.stdout
+
+
+@pytest.mark.parametrize("order", ["submodule_first", "export_first"])
+def test_command_exports_remain_functions_after_submodule_imports(order):
+    _isolated(f'''
+import importlib
+import dptb.entrypoints as entrypoints
+
+exports = {{'train': 'train', 'test': '_test', 'config': 'config', 'bond': 'bond'}}
+for name, attribute in exports.items():
+    if {order!r} == 'export_first':
+        assert callable(getattr(entrypoints, name))
+    module = importlib.import_module('dptb.entrypoints.' + name)
+    exported = getattr(entrypoints, name)
+    assert callable(exported), (name, exported)
+    assert exported is getattr(module, attribute)
+
+namespace = {{}}
+exec('from dptb.entrypoints import *', namespace)
+for name, attribute in exports.items():
+    module = importlib.import_module('dptb.entrypoints.' + name)
+    assert namespace[name] is getattr(module, attribute)
+''')
