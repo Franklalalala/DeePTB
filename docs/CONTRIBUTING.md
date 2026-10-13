@@ -1,6 +1,6 @@
 # Contributing to DeePTB
 
-Use `1006-stable` for maintenance changes to this repository. Read
+Use `1013-stable` for maintenance changes to this repository. Read
 [AGENTS.md](../AGENTS.md), [the architecture guide](architecture.md), and
 [TESTING.md](../TESTING.md) before changing interfaces or numerical code.
 
@@ -42,10 +42,10 @@ numerical reruns.
 
 ## Pull requests
 
-1. Create a branch from `1006-stable` in this repository or a fork.
+1. Create a branch from `1013-stable` in this repository or a fork.
 2. Make the change with current documentation and relevant behavioral tests.
 3. Run required validation and describe its scope and results.
-4. Push the branch and open a PR targeting `Franklalalala/DeePTB:1006-stable`.
+4. Push the branch and open a PR targeting `Franklalalala/DeePTB:1013-stable`.
 
 Use a draft PR while implementation or required validation is incomplete.
 Explain the concrete problem, resulting behavior, compatibility implications,

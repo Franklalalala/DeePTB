@@ -9,15 +9,9 @@ from dptb.data.transforms import OrbitalMapper
 from dptb.nn.shift_head import add_compact_delta, normalize_shift_options, optimizer_named_parameters
 from dptb.nnops.layout import project_uureal_to_like
 from dptb.nnops.loss import HamilLossAbs
-from dptb.tests.shift_head_helpers import make_model, batch
+from dptb.tests.shift_head_helpers import make_model, batch, bitwise
 
-DEVICES = [os.environ.get("R12B_TEST_DEVICE", "cpu")]
-
-
-def bitwise(a,b):
-    assert a.shape == b.shape and a.dtype == b.dtype
-    # reshape(-1): torch>=2.8 refuses to view a 0-dim float tensor as bytes.
-    assert torch.equal(a.detach().contiguous().reshape(-1).view(torch.uint8), b.detach().contiguous().reshape(-1).view(torch.uint8))
+DEVICES = [os.environ.get("DPTB_TEST_DEVICE", "cpu")]
 
 
 @pytest.mark.parametrize("device", DEVICES)

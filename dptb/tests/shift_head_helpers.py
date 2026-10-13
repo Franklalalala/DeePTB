@@ -69,3 +69,9 @@ def mini_dataset(root, sidecar=True, r_max=8.0):
         get_Hamiltonian=True,get_H0=True,target_kind='h0res',basis=json.loads((root/'basis.json').read_text()),
         has_soc=True,nextham_uureal_mask=True,
         overlap_sidecar_root=str(root/'ovl_test') if sidecar else None)
+
+
+def bitwise(a, b):
+    assert a.shape == b.shape and a.dtype == b.dtype
+    # reshape(-1): torch>=2.8 refuses to view a 0-dim float tensor as bytes.
+    assert torch.equal(a.detach().contiguous().reshape(-1).view(torch.uint8), b.detach().contiguous().reshape(-1).view(torch.uint8))

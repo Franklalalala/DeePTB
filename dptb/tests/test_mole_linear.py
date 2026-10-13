@@ -326,7 +326,7 @@ def test_full_expert_fast_path_matches_the_top_k_route(top_k):
 
 
 # ---------------------------------------------------------------------------
-# edge-MoE route rows (dptb.nn.embedding.lem_moe_v3_edge)
+# edge-MoE route rows (dptb.nn.embedding.legacy.edge)
 # ---------------------------------------------------------------------------
 class _EchoRouter:
     """Routing coefficients = the router input; dense routing, no top-k metadata."""

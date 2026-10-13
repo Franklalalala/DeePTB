@@ -1,11 +1,4 @@
-"""UniTB embeddings and their shared message-passing implementation."""
+"""UniTB embedding (``method: unitb``) and its building blocks."""
+from .model import UniTB
 
 __all__ = ["UniTB"]
-
-
-def __getattr__(name):
-    if name == "UniTB":
-        from .model import UniTB
-        globals()[name] = UniTB
-        return UniTB
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1103,7 +1103,7 @@ class PDQMoE(ParityWeightMixin, nn.Module):
                 "would materialise one [out_features, in_features] weight per "
                 "route token -- exactly what per-edge routing cannot afford. "
                 "Reach every PDQMoE through PDQMoE.forward or the "
-                "SO2CUDA routes of so2_activation_routes."
+                "SO2CUDA routes of dptb.nn.so2_backend."
             )
         coefficients = mole_globals.coefficients
         topk_indices = getattr(mole_globals, "topk_indices", None)

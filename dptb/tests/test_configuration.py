@@ -335,7 +335,7 @@ def test_prediction_reconstruction_replaces_mutually_exclusive_flags(legacy, exp
     [(None, True), ("", True), ("standard", True), ("triton_complex_exact_grouped_linear", False)],
 )
 def test_stable_route_mode_guard_accepts_only_standard(mode, accepted):
-    from dptb.nn.embedding.legacy.graph import _normalize_stable_standard_compat_mode
+    from dptb.nn.embedding.unitb.ops import _normalize_stable_standard_compat_mode
 
     if accepted:
         assert _normalize_stable_standard_compat_mode("so2_m_linear_mode", mode) == "standard"

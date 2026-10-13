@@ -1,16 +1,20 @@
-# `1006-stable` maintenance release
+# `1013-stable` maintenance release
 
 This release provides UniTB, including its single-expert UniTB-dense configuration,
 and upstream embeddings through shared model-building, training, evaluation, and
-electronic-structure postprocessing interfaces.
+electronic-structure postprocessing interfaces. Compared with `1006-stable`, it
+reorganizes the package layout (see the [architecture guide](architecture.md));
+configuration method names, checkpoint formats, and numerical behavior are unchanged.
 
 ## Component layout
 
 | Location | Purpose |
 | --- | --- |
-| `dptb/nn/embedding/unitb/` | UniTB and UniTB-dense; `layer_topology` selects optional SLEM interactions (UniTB-SLEM); compatibility interfaces resolve historical names |
+| `dptb/nn/embedding/unitb/` | UniTB and UniTB-dense; `layer_topology` selects optional SLEM interactions (UniTB-SLEM) |
+| `dptb/nn/embedding/legacy/` | Historical `lem_moe_v3*` methods, kept for existing checkpoints |
 | `dptb/nn/embedding/lem.py`, `slem.py` | Upstream baselines without priors |
 | `dptb/nn/embedding/lem_prior.py`, `slem_prior.py` | Prior-aware baselines |
+| `dptb/nn/conditioning/`, `heads/`, `projectors/` | Prior input projection, output heads, AO/Cartesian projectors |
 | `dptb/data` | Graphs, LMDB records, sidecars, AO blocks, and feature conversion |
 | `dptb/nnops`, `dptb/entrypoints` | Single-model and `multi_train` training, validation, and inference |
 | `dptb/nacf`, `dptb/priors/h0` | NACF and physical H0 prior construction and reconstruction |
@@ -26,9 +30,7 @@ Upstream methods such as `baseline`, `deeph-e3`, `e3baseline_6`,
 `e3baseline_nonlocal`, `none`, `mpnn`, `se2`, and `trinity` remain
 available through their original interfaces.
 
-See the [architecture guide](architecture.md) for canonical ownership, import
-migration, embedding discovery, and extension registration. H0 offline commands
-use `dptb h0`; its [guide](../dptb/priors/h0/README.md) documents the external
+H0 offline commands use `dptb h0`; the [H0 guide](h0.md) documents the external
 work/table directories and preparation lifecycle.
 
 ## Components and dependencies

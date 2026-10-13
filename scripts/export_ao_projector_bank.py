@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dptb.nn.embedding.ao_projector_bank import export_projector_bank
+from dptb.nn.projectors.ao import export_projector_bank
 
 
 def main() -> int:

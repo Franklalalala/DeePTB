@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dptb.nn.embedding.cartesian_ict_bank import (
+from dptb.nn.projectors.ict import (
     export_cartesian_ict_projector_bank,
 )
 

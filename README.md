@@ -6,7 +6,7 @@
 
 DeePTB uses deep learning to build tight-binding models and predict Hamiltonian, density, and overlap matrices in an atomic-orbital basis. It supports electronic-structure prediction, band analysis, and spin-orbit coupling.
 
-The maintenance branch is **`1006-stable`**. See the [architecture guide](docs/architecture.md) for component ownership and construction APIs, and the [maintenance release guide](docs/1006-stable.md) for interface contracts.
+The maintenance branch is **`1013-stable`**. See the [architecture guide](docs/architecture.md) for component ownership and construction APIs, and the [maintenance release guide](docs/1013-stable.md) for interface contracts.
 
 ## Models and interfaces
 
@@ -32,7 +32,7 @@ Training and evaluation support LMDB, overlap and prior sidecars, `multi_train`,
 Use a separate environment; the supported Python range is specified in [pyproject.toml](pyproject.toml). Install [PyTorch](https://pytorch.org/get-started/locally) for your device, then a matching `torch-scatter` and DeePTB:
 
 ```bash
-git clone --branch 1006-stable https://github.com/Franklalalala/DeePTB.git
+git clone --branch 1013-stable https://github.com/Franklalalala/DeePTB.git
 cd DeePTB
 python docs/auto_install_torch_scatter.py
 python -m pip install -e .
@@ -51,13 +51,12 @@ Native NACF prior construction is a separate component. See the [NACF geometry i
 Use `dptb` for training, evaluation, and postprocessing; `dptb --help` lists the commands. See the [basic API](docs/quick_start/basic_api.md) and [input configuration guide](docs/quick_start/input.md).
 
 ```bash
-dptb models
 dptb h0 --help
 python tools/test.py
 python tools/test.py dptb/tests/test_record_codec.py
 ```
 
-Python callers use `dptb.nn.build_model` for complete models, `build_embedding(method, **options)` for embeddings, and `list_embeddings()` for discovery. The standard training commands apply across model families. H0 reconstruction and table preparation use `dptb h0`; see the [H0 guide](dptb/priors/h0/README.md).
+Python callers use `dptb.nn.build_model` for complete models; `dptb.nn.embedding.Embedding(method, **options)` builds a single embedding. The standard training commands apply across model families. H0 reconstruction and table preparation use `dptb h0`; see the [H0 guide](docs/h0.md).
 
 [TESTING.md](TESTING.md) describes test coverage, optional dependencies, and full-suite commands. The short suite checks installation and common interfaces. Checkpoint and numerical regression checks are required separately for changes affecting model behavior.
 

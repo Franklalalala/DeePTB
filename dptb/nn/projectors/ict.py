@@ -109,7 +109,7 @@ def export_cartesian_ict_projector_bank(
             "kind": "irreducible_cartesian_tensor",
             "algorithm": "symmetric_monomial_stf_cartesian_3j",
             "implementation": (
-                "dptb.nn.embedding.cartesian_projector."
+                "dptb.nn.projectors.cartesian."
                 "CartesianShellPairCoupling"
             ),
             "coupling_seed": "e3nn.o3.wigner_3j",

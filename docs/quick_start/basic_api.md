@@ -29,14 +29,13 @@ model = build_model(
 )
 ~~~
 
-Discover embeddings with `list_embeddings()` or construct one directly with
-`build_embedding(method, **options)`. Direct embedding construction does not
-include the prediction head or dataset pipeline.
+Construct a single embedding with `Embedding(method, **options)`. Direct
+embedding construction does not include the prediction head or dataset pipeline.
 
 ~~~python
-from dptb.nn import build_embedding, list_embeddings
+from dptb.nn.embedding import Embedding
 
-methods = list_embeddings()
+embedding = Embedding("unitb", **embedding_options)
 ~~~
 
 ## Prepare graph data

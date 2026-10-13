@@ -1,39 +1,28 @@
-"""Public construction API for every DeePTB model family.
+"""Neural tight-binding models.
 
-Use ``build_model`` for a complete Hamiltonian model and ``build_embedding``
-for a descriptor. Imports are resolved on demand so inspecting the catalogue
-does not initialize unrelated model families or optional backends.
+``build_model`` constructs a complete model (NNENV, NNSK, MIX or DFTBSK) from
+``model_options`` and ``common_options``, or restores one from a checkpoint.
+The embedding selected by ``model_options.embedding.method`` is constructed
+through :class:`dptb.nn.embedding.Embedding`.
 """
+from .build import build_model
+from .deeptb import NNENV, MIX
+from .nnsk import NNSK
+from .dftbsk import DFTBSK
+from .hamiltonian import E3Hamiltonian, SKHamiltonian
+from .hr2hk import HR2HK, HR2HK_Gamma_Only
+from .energy import Eigenvalues, Eigh
 
-from importlib import import_module
-
-_EXPORTS = {
-    "build_model": (".build", "build_model"),
-    "build_embedding": (".embedding", "build_embedding"),
-    "list_embeddings": (".embedding", "list_embeddings"),
-    "NNENV": (".deeptb", "NNENV"),
-    "MIX": (".deeptb", "MIX"),
-    "NNSK": (".nnsk", "NNSK"),
-    "DFTBSK": (".dftbsk", "DFTBSK"),
-    "E3Hamiltonian": (".hamiltonian", "E3Hamiltonian"),
-    "SKHamiltonian": (".hamiltonian", "SKHamiltonian"),
-    "HR2HK": (".hr2hk", "HR2HK"),
-    "HR2HK_Gamma_Only": (".hr2hk", "HR2HK_Gamma_Only"),
-    "Eigenvalues": (".energy", "Eigenvalues"),
-    "Eigh": (".energy", "Eigh"),
-}
-
-__all__ = list(_EXPORTS)
-
-
-def __getattr__(name):
-    if name not in _EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module, attribute = _EXPORTS[name]
-    value = getattr(import_module(module, __name__), attribute)
-    globals()[name] = value
-    return value
-
-
-def __dir__():
-    return sorted(set(globals()) | set(__all__))
+__all__ = [
+    "build_model",
+    "NNENV",
+    "MIX",
+    "NNSK",
+    "DFTBSK",
+    "E3Hamiltonian",
+    "SKHamiltonian",
+    "HR2HK",
+    "HR2HK_Gamma_Only",
+    "Eigenvalues",
+    "Eigh",
+]

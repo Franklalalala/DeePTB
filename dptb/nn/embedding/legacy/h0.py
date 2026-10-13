@@ -16,7 +16,8 @@ from dptb.data.interfaces.blockwise_tensor import (
 from dptb.nn.embedding.registry import Embedding
 from dptb.nn.tensor_product_moe_v3 import MOLEGlobals, write_router_regularizers
 
-from dptb.nn.embedding.legacy.graph import LemMoEV3, _capture_shift_hidden
+from dptb.nn.embedding.legacy.graph import LemMoEV3
+from dptb.nn.embedding.unitb.ops import _capture_shift_hidden
 from dptb.nn.conditioning.projection import H0InitLayer
 from dptb.nn.conditioning.time import FlowTimeConditioner
 from dptb.nn.heads.block_expansion import LateBlockExpansionCGHead

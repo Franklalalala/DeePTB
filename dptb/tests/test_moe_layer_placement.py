@@ -118,7 +118,7 @@ def test_shared_only_so2_matches_shared_reference_and_ignores_routed_ids(interpo
 
 @requires_so2_cuda
 def test_shared_only_interpolation_reference_forward_backward(monkeypatch):
-    from dptb.nn import so2_activation_routes as routes
+    from dptb.nn import so2_backend as routes
 
     monkeypatch.setenv("DPTB_SO2_ACTIVATION_FUSED_P0", "1")
     torch.manual_seed(7)
@@ -131,10 +131,10 @@ def test_shared_only_interpolation_reference_forward_backward(monkeypatch):
     x = torch.randn(11, fused.irreps_in.dim, device="cuda", requires_grad=True)
     xr = x.detach().clone().requires_grad_(True)
     r = torch.randn(11, 3, device="cuda")
-    before = routes.STATS.calls.get(routes.FUSED_P0, 0)
+    before = routes.STATS.calls.get("fused_p0", 0)
     actual, _ = fused(x, r, _routing(11, device="cuda"))
     expected, _ = reference(xr, r, _routing(11, device="cuda"))
-    assert routes.STATS.calls.get(routes.FUSED_P0, 0) == before
+    assert routes.STATS.calls.get("fused_p0", 0) == before
     torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-5)
     actual.square().sum().backward()
     expected.square().sum().backward()

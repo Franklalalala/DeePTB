@@ -6,7 +6,7 @@ from e3nn import o3
 
 from dptb.nn import e3nn_fast
 from dptb.nn.embedding.unitb.normalization import EquivariantMergedRMSNormFlat, _get_grid_mats
-from dptb.nn.embedding.legacy.graph import ScalarOnehotTP, _apply_onehot_tp, _scalar_onehot_tp_fast
+from dptb.nn.embedding.unitb.ops import ScalarOnehotTP, _apply_onehot_tp, _scalar_onehot_tp_fast
 from dptb.nn.embedding.unitb.activations import build_gate_activation
 from dptb.nn.rescale import E3ElementLinear
 from dptb.nn.tensor_product_moe_v3 import permute_rows

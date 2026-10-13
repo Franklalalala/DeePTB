@@ -3,7 +3,6 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 from importlib import import_module
-import json
 import sys
 
 from dptb import __version__
@@ -431,13 +430,6 @@ def main_parser() -> argparse.ArgumentParser:
         default="poly2",
         help="The base model type can be poly2 or poly4."
     )
-    parser_models = subparsers.add_parser(
-        "models", parents=[parser_log], help="List available embedding methods",
-    )
-    parser_models.add_argument("--all", dest="include_legacy", action="store_true",
-                               help="Include historical checkpoint methods")
-    parser_models.add_argument("--json", dest="as_json", action="store_true",
-                               help="Print a JSON array of method names")
     parser_h0 = subparsers.add_parser(
         "h0", add_help=False, help="Build offline physical H0 priors (h0 --help)",
     )
@@ -469,8 +461,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     return parsed_args
 
 
-# Each command owns its dependencies. Help and model discovery must work
-# without importing trainers, electronic-structure postprocessors or CUDA.
+# Command name -> (module, function), imported when the command runs.
 _COMMANDS = {
     "config": ("dptb.entrypoints.config", "config"),
     "bond": ("dptb.entrypoints.bond", "bond"),
@@ -497,12 +488,6 @@ def main(argv=None):
     args = parse_args(argv)
     if args.command is None:
         return
-    if args.command == "models":
-        from dptb.nn import list_embeddings
-        methods = list_embeddings(include_legacy=args.include_legacy)
-        print(json.dumps(list(methods)) if args.as_json else "\n".join(methods))
-        return
-
     if args.command not in ("train", "multi-train", "test", "run"):
         from dptb.utils.loggers import set_log_handles
         set_log_handles(args.log_level, Path(args.log_path) if args.log_path else None)

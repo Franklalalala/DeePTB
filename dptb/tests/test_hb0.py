@@ -18,7 +18,7 @@ from dptb.data import _keys
 from dptb.data.interfaces.blockwise_tensor import strict_reverse_edge_index
 from dptb.data.transforms import OrbitalMapper
 from dptb.nn.heads.block_expansion import LateBlockExpansionCGHead
-from dptb.nn.embedding.legacy.graph import UpdateNode
+from dptb.nn.embedding.unitb.layers import UpdateNode
 from dptb.nn.embedding.legacy.h0 import LemMoEV3H0
 from dptb.tests.pair_helpers import ao_wigner, clone_data, fp64_default, model_options, molecule_data, rotate_data
 

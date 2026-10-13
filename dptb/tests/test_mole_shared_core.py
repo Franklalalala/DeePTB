@@ -190,7 +190,7 @@ def test_default_cuda_device_preserves_shared_initialization_and_rng():
 
 @requires_so2_cuda
 def test_shared_core_fused_p0_matches_staged_gradients():
-    from dptb.nn import so2_activation_routes as routes
+    from dptb.nn import so2_backend as routes
     opts = dict(irreps_in="4x0e+3x1o+2x2e", irreps_out="3x0e+2x1o+2x2e",
                 num_experts=4, num_shared_experts=1, mole_expert_parameterization="shared_core",
                 mole_expert_rank=2, mole_linear_mode="cublas_grouped")
@@ -202,10 +202,10 @@ def test_shared_core_fused_p0_matches_staged_gradients():
     logits = torch.randn(17, 4, device="cuda")
     val, idx = logits.topk(2, -1)
     val = val.softmax(-1).detach().requires_grad_(True)
-    before = routes.STATS.calls[routes.FUSED_P0]
+    before = routes.STATS.calls["fused_p0"]
     ya = ref(x, r, _globals(idx, val))[0]
     yb = fused(x, r, _globals(idx, val))[0]
-    assert routes.STATS.calls[routes.FUSED_P0] > before
+    assert routes.STATS.calls["fused_p0"] > before
     torch.testing.assert_close(ya, yb, atol=3e-4, rtol=3e-4)
     ga = torch.autograd.grad(ya.square().sum(), [x, val, *ref.parameters()])
     gb = torch.autograd.grad(yb.square().sum(), [x, val, *fused.parameters()])

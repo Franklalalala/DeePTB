@@ -14,7 +14,7 @@ pytest.importorskip("ase", reason="full DeePTB data environment required")
 from dptb.nn.build import build_model
 from dptb.nn.shift_head import PotentialShiftHead
 from dptb.tests.shift_head_helpers import config, batch
-from dptb.tests.test_r12b_shift_head import bitwise
+from dptb.tests.shift_head_helpers import bitwise
 
 
 def response_config(kind="context", scope="onsite"):

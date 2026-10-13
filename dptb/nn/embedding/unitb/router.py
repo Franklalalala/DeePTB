@@ -15,7 +15,7 @@ from dptb.nn.conditioning.projection import _sorted_irrep_coordinate_index
 # SO2 routes that apply activation-space (per-edge) dispatch without building a weight
 # per edge: 'staged' and the grouped streaming route reach every MOLELinear through
 # MOLELinear.forward; fused_p0 segments its grouped GEMM by expert id
-# (dptb.nn.so2_activation_routes).  The other SO2CUDA fused routes consume
+# (dptb.nn.so2_backend.activation_forward).  The other SO2CUDA fused routes consume
 # fc._mix_expert_parameters() and would build one [out_features, in_features]
 # weight per edge.
 _PRIOR_ACTIVATE_ROUTES = ("staged", "streamed_m_major_cueq", "streamed_m_major_fused_p0")

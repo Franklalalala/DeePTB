@@ -35,7 +35,7 @@ def main(argv=None):
     import sys
 
     args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] not in {'models', 'h0', '-h', '--help', '-v', '--version'}:
+    if args and args[0] not in {'h0', '-h', '--help', '-v', '--version'}:
         print_logo()
     return entry_main(args)
 

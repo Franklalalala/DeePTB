@@ -5,7 +5,6 @@ license = "LGPL-3.0"
 description = "A unified deep learning package for electronic structure models including tight-binding, KS Hamiltonian and density matrix models"
 readme = "README.md"
 repository = "https://github.com/deepmodeling/DeePTB"
-packages = [{ include = "dptb" }, { include = "h0rebuild" }]
 include = [{ path = "dptb/nacf/csrc/**/*", format = ["sdist", "wheel"] },
            { path = "dptb/nacf/THIRD_PARTY.md", format = ["sdist", "wheel"] },
            { path = "dptb/priors/h0/csrc/**/*", format = ["sdist", "wheel"] }]
@@ -79,7 +78,6 @@ pybinding = "*"
 [tool.poetry.scripts]
 dptb = 'dptb.__main__:main'
 dptb-qm9 = 'dptb.data.interfaces.pyscf:main'
-h0rebuild = 'dptb.priors.h0.cli.reconstruct:main'
 
 [build-system]
 requires = ["poetry-core", "poetry-dynamic-versioning"]
