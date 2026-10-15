@@ -430,10 +430,10 @@ def main_parser() -> argparse.ArgumentParser:
         default="poly2",
         help="The base model type can be poly2 or poly4."
     )
-    parser_h0 = subparsers.add_parser(
-        "h0", add_help=False, help="Build offline physical H0 priors (h0 --help)",
+    parser_prior = subparsers.add_parser(
+        "prior", add_help=False, help="Build prior tables on the GPU (prior build --help)",
     )
-    parser_h0.add_argument("h0_args", nargs=argparse.REMAINDER)
+    parser_prior.add_argument("prior_args", nargs=argparse.REMAINDER)
 
     return parser
 
@@ -480,10 +480,10 @@ _COMMANDS = {
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    # Let the H0 parser own its subcommands and options, including --help.
-    if argv and argv[0] == "h0":
-        from dptb.priors.h0.cli import main as h0_main
-        return h0_main(argv[1:])
+    # Let the prior parser own its subcommands and options, including --help.
+    if argv and argv[0] == "prior":
+        from dptb.prior.build import main as prior_main
+        return prior_main(argv[1:])
 
     args = parse_args(argv)
     if args.command is None:
