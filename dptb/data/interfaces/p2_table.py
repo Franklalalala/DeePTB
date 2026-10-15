@@ -561,7 +561,7 @@ def rotation_z_to(direction: np.ndarray) -> np.ndarray:
         ]
     )
     # 1/(1+cos) cancels catastrophically near the south pole; for cos < 0 use the
-    # identical (1-cos)/|z x n|^2 (the form of dptb.nacf.radial._rotation_z_to).
+    # identical (1-cos)/|z x n|^2 (the form of dptb.prior.common.harmonics.rotation_z_to).
     factor = 1.0 / (1.0 + cosine) if cosine >= 0.0 else (1.0 - cosine) / float(cross @ cross)
     return np.eye(3) + skew + (skew @ skew) * factor
 

@@ -14,10 +14,7 @@ dptb/scripts/*
 dptb/codex*/*
 *.dat
 *log*
-!dptb/nacf/topology.py
-!dptb/nacf/assembly_topology.py
-!dptb/nacf/csrc/topology.cpp
-!tools/build_nacf_topology.py
+!dptb/prior/gf/topology.py
 dptb/tests/data/**/out*/config_*.json
 bandstructure.npy
 dptb/tests/data/hBN/data/set.0/xdat2.traj
@@ -179,7 +176,3 @@ dmypy.json
 _date.py
 _version.py
 /.idea/
-
-# Prepared priors, native binaries and acceptance campaigns are external assets.
-/dptb/priors/h0/prebuilt/
-/dptb/nacf/prebuilt.json
