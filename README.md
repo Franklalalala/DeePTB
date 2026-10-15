@@ -17,7 +17,8 @@ The maintenance branch is **`1013-stable`**. See the [architecture guide](docs/a
 | UniTB | `unitb` embedding with PDQ-MoE by default; a single expert selects UniTB-dense; legacy checkpoint compatibility |
 | `lem`, `slem` | Upstream baselines without prior inputs |
 | `lem_prior`, `slem_prior` | Baselines with prior inputs |
-| `dptb.priors.h0`, `dptb.nacf` | Physical H0 and NACF prior construction, caching, and inference |
+| `dptb.prior` | Physical priors on the GPU: `prior.h0` (UniTB H0), `prior.gf` (Flash GF), shared operators in `prior.common`, table builders behind `dptb prior build` |
+| `dptb.inference` | Fused inference engine: geometry to H, S (and the UniTB residual) on the device for both routes |
 
 UniTB uses an **H₀-routed shared-basis mixture of experts (PDQ-MoE)**. Select it with `{"method":"unitb"}`; add `"num_experts":1` for UniTB-dense. Charge equilibration and training-only prior noise are configured separately. See the [UniTB guide](docs/unitb.md) and [configuration examples](examples/unitb/README.md).
 
@@ -32,7 +33,7 @@ Training and evaluation support LMDB, overlap and prior sidecars, `multi_train`,
 Use a separate environment; the supported Python range is specified in [pyproject.toml](pyproject.toml). Install [PyTorch](https://pytorch.org/get-started/locally) for your device, then a matching `torch-scatter` and DeePTB:
 
 ```bash
-git clone --branch 1013-stable https://github.com/Franklalalala/DeePTB.git
+git clone --branch 1015-stable https://github.com/Franklalalala/DeePTB.git
 cd DeePTB
 python docs/auto_install_torch_scatter.py
 python -m pip install -e .
@@ -44,14 +45,14 @@ For CUDA acceleration, install the optional SO2CUDA dependency with a CUDA toolc
 python -m pip install -e '.[so2]'
 ```
 
-Native NACF prior construction is a separate component. See the [NACF geometry inference example](examples/nacf_gpu/README.md) for its build and usage instructions.
+The priors and the inference engine are pure PyTorch and Triton (no compiled extension). See [1015-stable](docs/1015-stable.md) for the layout, the inference engine and table building (`dptb prior build`).
 
 ## Usage and validation
 
 Use `dptb` for training, evaluation, and postprocessing; `dptb --help` lists the commands. See the [basic API](docs/quick_start/basic_api.md) and [input configuration guide](docs/quick_start/input.md).
 
 ```bash
-dptb h0 --help
+dptb prior --help
 python tools/test.py
 python tools/test.py dptb/tests/test_record_codec.py
 ```

@@ -19,7 +19,7 @@ python -m pytest dptb/tests/h0
 
 `dptb/tests` is organized by module family and behavior; H0 tests are in `dptb/tests/h0`. Shared constructors belong in helper modules; test files must not import one another. LoopSCF tests run in its own repository against installed DeePTB.
 
-Tests requiring missing optional dependencies skip with an explanation. `dptb/tests/_requires.py` provides `requires_cuda`, `requires_multi_gpu`, `requires_so2_cuda`, and `requires_module(name)`; `conftest.py` checks native NACF dependencies lazily. Each real-reference-data test documents the environment variables that enable it. Keep data and generated results outside the repository.
+Tests requiring missing optional dependencies skip with an explanation. `dptb/tests/_requires.py` provides `requires_cuda`, `requires_multi_gpu`, `requires_so2_cuda`, and `requires_module(name)`. Each real-reference-data test documents the environment variables that enable it. Keep data and generated results outside the repository.
 
 With SO2CUDA 0.3.0 installed, run the affected CUDA tests, for example:
 

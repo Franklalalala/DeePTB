@@ -4,24 +4,21 @@ DeePTB documentation
 
 DeePTB provides Slater–Koster models and equivariant atomic-orbital operator prediction, including Hamiltonian, density, and overlap matrices, spin-orbit coupling, and electronic-structure postprocessing.
 
-``1006-stable`` is the maintenance branch. UniTB defaults to PDQ-MoE and supports a single-expert UniTB-dense configuration. Upstream ``lem`` / ``slem`` and prior-aware baselines have separate interfaces. SO2CUDA provides optional acceleration; LoopSCF uses DeePTB from its own repository.
+``1015-stable`` is the maintenance branch; its physical priors (``dptb.prior``) and inference (``dptb.inference``) run on the GPU. UniTB defaults to PDQ-MoE and supports a single-expert UniTB-dense configuration. Upstream ``lem`` / ``slem`` and prior-aware baselines have separate interfaces. SO2CUDA provides optional acceleration; LoopSCF uses DeePTB from its own repository.
 
 .. toctree::
    :maxdepth: 2
    :caption: Architecture and data contracts
 
    architecture
-   1006-stable
+   1015-stable
+   1013-stable
    unitb
    embedding_baselines
    so2_backend
    advanced/so2_compact_wigner
    advanced/prior_inputs
-   nacf_candidate_prior
-   nacf_compact_packing
-   nacf_native_assembly
-   nacf_edge_vna
-   nacf_prepared_store
+   h0
    advanced/dynamic_batch_oom_fallback
 
 .. toctree::

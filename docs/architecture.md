@@ -17,8 +17,11 @@
 | `dptb/nn/pdq_moe.py` | Shared expert banks and routing metadata |
 | `dptb/nn/so2_backend.py` | Optional SO2CUDA dispatch and PyTorch fallback |
 | `dptb/data/` | Graphs, LMDB, sidecars, AO ordering, and feature conversion |
-| `dptb/nacf/` | NACF tables, preparation, packing, and prior inference |
-| `dptb/priors/h0/` | Physical H0 reconstruction and explicit offline preparation ([guide](h0.md)) |
+| `dptb/prior/common/` | Operators shared by both priors: neighbour enumeration, block tables and gauge, real harmonics, radial splines and the fused table kernel, two-centre integrals, spherical Bessel transforms, Gaunt, KB, ORB/UPF reading, XC, table store |
+| `dptb/prior/gf/` | Flash GF prior on the device (topology, assembly, environment XC, onsite XC) and its table builders |
+| `dptb/prior/h0/` | UniTB H0 prior on the device (pair bank, field, local and nonlocal parts), its pair-bank builder, and the h0rebuild data readers ([guide](h0.md)) |
+| `dptb/prior/build.py` | `dptb prior build`: one entry point for every table family |
+| `dptb/inference/` | Fused inference engine: graph, prior, features, both heads, H = prior + delta, S, residual on the device ([1015-stable](1015-stable.md)) |
 | `dptb/nnops/`, `dptb/entrypoints/` | Training, evaluation, and CLI orchestration |
 | `dptb/postprocess/` | Electronic-structure postprocessing |
 
@@ -38,7 +41,7 @@ configuration and parameter state.
 ~~~bash
 dptb train input.json -o output
 dptb multi-train input.json -o output
-dptb h0 --help
+dptb prior --help
 ~~~
 
 Input configurations select the family and training recipe. See the
@@ -84,7 +87,8 @@ a former module path (`MOVED_MODULES`).
 | `dptb.nn.embedding.{ao_projector_bank,cartesian_projector,cartesian_ict_bank}` | `dptb.nn.projectors.{ao,cartesian,ict}` |
 | `dptb.nn.{charge_head,charge_response,response_shift_head,shift_head,shift_overlap}` | `dptb.nn.heads.{charge,charge_response,response_shift,shift,shift_overlap}` |
 | `dptb.nn.so2_activation_routes` | `dptb.nn.so2_backend` |
-| `h0/h0rebuild`, `h0/*.py` scripts | `dptb.priors.h0`, `dptb h0 <command>` |
-| `h0/tests_h0fast` | `dptb/tests/h0` |
+| `h0/h0rebuild`, `h0/*.py` scripts | `dptb.prior.h0`, `dptb prior <command>` |
+| `dptb.nacf.*` (1013-stable) | `dptb.prior.gf.*` ([module table](1015-stable.md)) |
+| `dptb.priors.h0.*` (1013-stable) | `dptb.prior.h0.*` |
 | `configs/route_*.yaml` | `examples/output_routes/` |
 | `scripts/export_*_projector_bank.py` | `tools/` |

@@ -86,5 +86,5 @@ Neither class infers its return type from arguments. The existing tuple contract
 of `tensor_product_moe_v3.SO2_Linear` is retained. The backend adds no model
 parameters or buffers; existing checkpoints load under their original names.
 
-Crystal-symmetry projection and the independent H0/NACF numerical kernels are
+Crystal-symmetry projection and the independent H0/GF prior kernels (`dptb.prior`) are
 outside this backend.
