@@ -53,8 +53,8 @@ def _shell_m(shells):
 
 
 @requires_cuda
-@pytest.mark.parametrize("left", [(0, 1, 2), (3, 3, 3, 3, 2, 1)])     # square kernel; row-tiled kernel (nL = 36)
-def test_fused_radial_kernel_matches_the_per_degree_path(left):
+@pytest.mark.parametrize("left, off", [((0, 1, 2), False), ((3, 3, 3, 3, 2, 1), False), ((0, 1, 2), True)])
+def test_fused_radial_kernel_matches_the_per_degree_path(left, off):     # one and three row tiles; off the m-diagonal
     pytest.importorskip("triton")
     from dptb.prior.common.harmonics import rotation_matrices
     from dptb.prior.common.radial import RadialTable, rotation_pack, rotation_pack_of
@@ -67,7 +67,10 @@ def test_fused_radial_kernel_matches_the_per_degree_path(left):
         for b in range(len(mr)):
             if ml[a] == mr[b]:
                 vals[:, a, b] = np.exp(-knots / g.uniform(1, 3)) * g.normal()
+    if off:
+        vals[:, 1, 2] = np.exp(-knots)
     t = RadialTable(knots, vals, left, right, support=9.5)
+    assert (t._mdiag is None) == off
     lmax = max(left)
     v = torch.as_tensor(g.normal(size=(500, 3)) * 4, device="cuda")
     v[0] = 0.0

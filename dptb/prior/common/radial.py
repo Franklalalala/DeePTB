@@ -89,39 +89,44 @@ _PACK_PLAN = {}
 
 
 def _pack_plan(lmax, device):
-    """Per pack element e = (l, row, column a): degree, harmonic index, column, offsets of the collocation directions
-    and of the inverse (``harmonics._collocation``), and the normalisation of every (l, |m|)."""
+    """Per pack row (l, row): degree, harmonic index, pack offset of its first column, offsets of the collocation
+    directions and of the inverse (``harmonics._collocation``); the normalisation of every (l, |m|); pack width."""
     key = (lmax, str(device))
     if key not in _PACK_PLAN:
         from dptb.prior.common.harmonics import _collocation
-        dirs, inv, elems, norm = [], [], [], np.zeros((lmax + 1, lmax + 1))
+        dirs, inv, rows, norm, e = [], [], [], np.zeros((lmax + 1, lmax + 1)), 0
         for l in range(lmax + 1):
             d, v = _collocation(l)
             n = 2 * l + 1
             for mi in range(n):
-                for a in range(n):
-                    elems.append((l, mi, a, len(dirs), len(inv)))
+                rows.append((l, mi, e, len(dirs), len(inv)))
+                e += n
             dirs += list(d)
             inv += list(v.reshape(-1))
             for m in range(l + 1):
                 norm[l, m] = math.sqrt((2 * l + 1) / (4 * math.pi) * math.factorial(l - m) / math.factorial(l + m))
         t = lambda x, dt: torch.as_tensor(np.asarray(x), dtype=dt, device=device).contiguous()  # noqa: E731
-        _PACK_PLAN[key] = (t(elems, torch.int32), t(dirs, torch.float64), t(inv, torch.float64), t(norm, torch.float64))
+        _PACK_PLAN[key] = (t(rows, torch.int32), t(dirs, torch.float64), t(inv, torch.float64), t(norm, torch.float64),
+                           e)
     return _PACK_PLAN[key]
 
 
 @triton.jit(do_not_specialize=['Q', 'RS', 'LM1'])
-def _pack_kernel(out, vec, elems, dirs, inv, norm, Q, RS, LM1, sign, BQ: tl.constexpr):
-    """out[q, e] = D^l[row, a] = sum_c inv_l[a, c] Y_l,row(R_q u_c) for pack element e (program axis 1), R_q the
-    rotation taking +z to sign * vec[q] (``harmonics.rotation_z_to``), u_c the collocation directions of degree l."""
-    e = tl.program_id(1)
+def _pack_kernel(out, vec, prow, dirs, inv, norm, Q, RS, LM1, sign, BQ: tl.constexpr, BA: tl.constexpr):
+    """out[q, e0 + a] = D^l[row, a] = sum_c inv_l[a, c] Y_l,row(R_q u_c) for every column a of pack row (l, row)
+    (program axis 1; e0 its first pack element), R_q the rotation taking +z to sign * vec[q]
+    (``harmonics.rotation_z_to``), u_c the collocation directions of degree l: Y_l,row(R_q u_c) is formed once per
+    direction for all columns."""
+    w = tl.program_id(1)
     q = tl.program_id(0) * BQ + tl.arange(0, BQ)
     mq = q < Q
-    l = tl.load(elems + e * 5 + 0)
-    mi = tl.load(elems + e * 5 + 1)
-    a = tl.load(elems + e * 5 + 2)
-    od = tl.load(elems + e * 5 + 3)
-    oi = tl.load(elems + e * 5 + 4)
+    l = tl.load(prow + w * 5 + 0)
+    mi = tl.load(prow + w * 5 + 1)
+    e0 = tl.load(prow + w * 5 + 2)
+    od = tl.load(prow + w * 5 + 3)
+    oi = tl.load(prow + w * 5 + 4)
+    a = tl.arange(0, BA)
+    ma = a < 2 * l + 1
     vx = sign * tl.load(vec + q * 3 + 0, mask=mq, other=0.0)
     vy = sign * tl.load(vec + q * 3 + 1, mask=mq, other=0.0)
     vz = sign * tl.load(vec + q * 3 + 2, mask=mq, other=1.0)
@@ -152,7 +157,7 @@ def _pack_kernel(out, vec, elems, dirs, inv, norm, Q, RS, LM1, sign, BQ: tl.cons
     r21 = tl.where(zero, 0.0, r21)
     m = (mi + 1) // 2                           # ABACUS order: 0, +1, -1, +2, -2, ...
     nrm = tl.load(norm + l * LM1 + m)
-    acc = tl.zeros([BQ], dtype=tl.float64)
+    acc = tl.zeros([BQ, BA], dtype=tl.float64)
     for c in range(2 * l + 1):
         dx = tl.load(dirs + (od + c) * 3 + 0)
         dy = tl.load(dirs + (od + c) * 3 + 1)
@@ -179,124 +184,91 @@ def _pack_kernel(out, vec, elems, dirs, inv, norm, Q, RS, LM1, sign, BQ: tl.cons
                 prev, p = p, ((2 * deg - 1) * uz * p - (deg + m - 1) * prev) / (deg - m)
         val = tl.where(m == 0, nrm * p, tl.where(mi % 2 == 1, 1.4142135623730951 * nrm * p * re,
                                                   1.4142135623730951 * nrm * p * im))
-        acc += tl.load(inv + oi + a * (2 * l + 1) + c) * val
-    tl.store(out + q * RS + e, acc, mask=mq)
+        acc += tl.load(inv + oi + a * (2 * l + 1) + c, mask=ma, other=0.0)[None, :] * val[:, None]
+    tl.store(out + q[:, None] * RS + e0 + a[None, :], acc, mask=mq[:, None] & ma[None, :])
 
 
 def rotation_pack_of(vectors, lmax, sign=1.0):
     """``rotation_pack(rotation_matrices(sign * vectors, range(lmax + 1)), lmax)`` in one Triton launch."""
-    elems, dirs, inv, norm = _pack_plan(lmax, vectors.device)
-    n = len(elems)
+    prow, dirs, inv, norm, n = _pack_plan(lmax, vectors.device)
     out = torch.empty((len(vectors), n), dtype=torch.float64, device=vectors.device)
     if len(vectors):
         BQ = 64
-        _pack_kernel[(triton.cdiv(len(vectors), BQ), n)](out, vectors.contiguous(), elems, dirs, inv, norm,
-                                                         len(vectors), n, lmax + 1, float(sign), BQ=BQ, num_warps=2)
+        _pack_kernel[(triton.cdiv(len(vectors), BQ), len(prow))](
+            out, vectors.contiguous(), prow, dirs, inv, norm, len(vectors), n, lmax + 1, float(sign), BQ=BQ,
+            BA=triton.next_power_of_2(2 * lmax + 1), num_warps=2)
     return out
 
 
-def _rot_map(shells, n):
-    """[n, n] int32: offset of D^l[a - o, i - o] in a rotation pack row for AOs a, i of one shell (o its first AO),
-    -1 elsewhere."""
-    out = np.full((n, n), -1, dtype=np.int32)
-    o = 0
-    for l in shells:
-        base = sum((2 * m + 1) ** 2 for m in range(l))
-        for a in range(2 * l + 1):
-            out[o + a, o:o + 2 * l + 1] = base + a * (2 * l + 1) + np.arange(2 * l + 1)
-        o += 2 * l + 1
-    return out
+TILE_ROWS = 8
+MDIAG_WARPS = 2
 
 
-TALL_ROWS = 16
+def tiles_per_program(rows, tiles):
+    """Tiles of one displacement row per ``_mdiag_kernel`` program (measured on H200: 2, or 4 for calls with at least
+    2^15 rows; one row per program leaves small calls without enough programs)."""
+    return min(tiles, 4 if rows >= 1 << 15 else 2)
 
 
-def _tall_maps(left, right, active, br):
-    """Maps of the row-tiled kernel: canonical (k, j) -> channel [nL, br]; left rotation map [nL, nL]; right map
-    [br, br]; per tile of TALL_ROWS rows the range [klo, khi) of canonical rows sharing a shell with the tile."""
-    nl, nr = sum(2 * l + 1 for l in left), sum(2 * l + 1 for l in right)
-    cmap = np.full((nl, br), -1, dtype=np.int32)
-    cmap[active // nr, active % nr] = np.arange(len(active), dtype=np.int32)
-    rmap = np.full((br, br), -1, dtype=np.int32)
-    rmap[:nr, :nr] = _rot_map(right, nr)
-    first, end, o = [], [], 0
-    for l in left:
-        first += [o] * (2 * l + 1)
-        end += [o + 2 * l + 1] * (2 * l + 1)
-        o += 2 * l + 1
-    tiles = range(0, nl, TALL_ROWS)
-    klo = np.asarray([first[t] for t in tiles], dtype=np.int32)
-    khi = np.asarray([end[min(t + TALL_ROWS, nl) - 1] for t in tiles], dtype=np.int32)
-    return cmap, _rot_map(left, nl), rmap, klo, khi
+def _mdiag_plan(left, right, active, nr, br):
+    """Plan of ``_mdiag_kernel``, or None when an active channel (k, j) is off the m-diagonal (k, j at different
+    positions in their shells; two-centre blocks never are). On the diagonal, row k of the lab block's right factor
+    is z_k[b] = C[k, o2(b) + p(k)] D^l2(b)[b - o2(b), p(k)] (p = position in the shell: one channel per column), so
+
+        B[a, b] = sum_k D^l1[a - o1, p(k)] z_k[b]   over the rows k of a's shell.
+
+    Maps: zmap [nL, br] channel of (k, o2(b) + p(k)) (-1: none); dmap [nL, br] pack offset of D^l2(b)[., p(k)];
+    lmap [nL, nL] pack offset of D^l1[a - o, k - o] at [k, a] (-1 outside the shell); pos [nL] p(k); cpos [br] p(b)
+    (-1: padding); per tile of TILE_ROWS rows the range [klo, khi) of rows sharing a shell with the tile."""
+    def shells(ls):
+        out, o = [], 0
+        for l in ls:
+            out.append((o, 2 * l + 1, sum((2 * m + 1) ** 2 for m in range(l))))
+            o += 2 * l + 1
+        return out
+    sl, sr = shells(left), shells(right)
+    nl = sum(n for _, n, _ in sl)
+    rsh = [s for s, (_, n, _) in enumerate(sl) for _ in range(n)]
+    csh = [s for s, (_, n, _) in enumerate(sr) for _ in range(n)]
+    pos = np.asarray([k - sl[rsh[k]][0] for k in range(nl)], dtype=np.int32)
+    chan = {}
+    for c, a in enumerate(np.asarray(active).tolist()):
+        k, j = divmod(int(a), nr)
+        if j - sr[csh[j]][0] != pos[k]:
+            return None
+        chan[(k, j)] = c
+    zmap = np.full((nl, br), -1, dtype=np.int32)
+    dmap = np.full((nl, br), -1, dtype=np.int32)
+    for k in range(nl):
+        for b in range(nr):
+            o2, n2, b2 = sr[csh[b]]
+            if pos[k] < n2 and (k, o2 + pos[k]) in chan:
+                zmap[k, b] = chan[(k, o2 + pos[k])]
+                dmap[k, b] = b2 + (b - o2) * n2 + pos[k]
+    lmap = np.full((nl, nl), -1, dtype=np.int32)
+    for o, n, b1 in sl:
+        for a in range(n):
+            lmap[o:o + n, o + a] = b1 + a * n + np.arange(n)
+    cpos = np.full(br, -1, dtype=np.int32)
+    cpos[:nr] = [b - sr[csh[b]][0] for b in range(nr)]
+    tiles = range(0, nl, TILE_ROWS)
+    klo = np.asarray([sl[rsh[t]][0] for t in tiles], dtype=np.int32)
+    khi = np.asarray([sum(sl[rsh[min(t + TILE_ROWS, nl) - 1]][:2]) for t in tiles], dtype=np.int32)
+    return zmap, dmap, lmap, pos, cpos, klo, khi
 
 
-def _block_maps(left, right, active, bw):
-    """Maps of the square kernel, each [bw, bw] int32 (-1 = zero): canonical (i, j) -> active channel; left and right
-    rotation maps (``_rot_map``) padded to bw."""
-    nl, nr = sum(2 * l + 1 for l in left), sum(2 * l + 1 for l in right)
-    cmap = np.full((bw, bw), -1, dtype=np.int32)
-    cmap[active // nr, active % nr] = np.arange(len(active), dtype=np.int32)
-    lmap = np.full((bw, bw), -1, dtype=np.int32)
-    rmap = np.full((bw, bw), -1, dtype=np.int32)
-    lmap[:nl, :nl] = _rot_map(left, nl)
-    rmap[:nr, :nr] = _rot_map(right, nr)
-    return cmap, lmap, rmap
-
-
-@triton.jit(do_not_specialize=['NA', 'K', 'RS', 'OS0', 'OS1', 'OS2', 'LOGK', 'NL', 'NR'])
-def _into_kernel(out, rows, vec, rpack, knots, coef, cmap, lmap, rmap, consts, NA, K, NL, NR, RS, OS0, OS1, OS2, LOGK,
-                 sign, FLIP: tl.constexpr, BW: tl.constexpr):
-    """out[q] = D_L(d) C(|d|) D_R(d)^T for the displacement row q = rows[program] (transposed when FLIP): C the
-    spline of the canonical block gathered row by row through ``cmap``, D_L, D_R gathered from the rotation pack
-    through ``lmap``, ``rmap``; zero beyond the support (consts[0]); C itself at |d| <= 1e-14."""
-    q = tl.load(rows + tl.program_id(0))
-    x = sign * tl.load(vec + q * 3 + 0)
-    y = sign * tl.load(vec + q * 3 + 1)
-    z = sign * tl.load(vec + q * 3 + 2)
-    r = tl.sqrt(x * x + y * y + z * z)
-    lo = 0
-    hi = K
-    for _ in range(LOGK):                       # searchsorted(knots, r, right=True)
-        mid = (lo + hi) // 2
-        kv = tl.load(knots + tl.minimum(mid, K - 1))
-        go = (lo < hi) & (kv <= r)
-        stay = (lo < hi) & (kv > r)
-        lo = tl.where(go, mid + 1, lo)
-        hi = tl.where(stay, mid, hi)
-    i = tl.minimum(tl.maximum(lo, 1), K - 1) - 1
-    d = r - tl.load(knots + i)
-    a = tl.arange(0, BW)
-    inside = r < tl.load(consts)
-    centre = r <= 1e-14
-    cb = coef + i.to(tl.int64) * 4 * NA
-    rp = rpack + q * RS
-    rm = tl.load(rmap + a[None, :] * BW + a[:, None])          # D_R^T [j, b]
-    dr = tl.where(centre, (a[:, None] == a[None, :]).to(tl.float64), tl.load(rp + rm, mask=rm >= 0, other=0.0))
-    acc = tl.zeros([BW, BW], dtype=tl.float64)
-    for k in range(NL):                         # acc += D_L[:, k] (C[k, :] D_R^T)
-        cm = tl.load(cmap + k * BW + a)
-        mk = cm >= 0
-        c = ((tl.load(cb + cm, mask=mk, other=0.0) * d + tl.load(cb + NA + cm, mask=mk, other=0.0)) * d +
-             tl.load(cb + 2 * NA + cm, mask=mk, other=0.0)) * d + tl.load(cb + 3 * NA + cm, mask=mk, other=0.0)
-        c = tl.where(inside, c, 0.0)
-        zr = tl.sum(c[:, None] * dr, axis=0)
-        lm = tl.load(lmap + a * BW + k)
-        dl = tl.where(centre, (a == k).to(tl.float64), tl.load(rp + lm, mask=lm >= 0, other=0.0))
-        acc += dl[:, None] * zr[None, :]
-    if FLIP:
-        ptr = out + q * OS0 + a[:, None] * OS2 + a[None, :] * OS1
-    else:
-        ptr = out + q * OS0 + a[:, None] * OS1 + a[None, :] * OS2
-    tl.store(ptr, acc, mask=(a < NL)[:, None] & (a < NR)[None, :])
-
-
-@triton.jit(do_not_specialize=['NA', 'K', 'RS', 'OS0', 'OS1', 'OS2', 'LOGK', 'NL', 'NR'])
-def _into_tall_kernel(out, rows, vec, rpack, knots, coef, cmap, lmap, rmap, klo, khi, consts, NA, K, NL, NR, RS, OS0,
-                      OS1, OS2, LOGK, sign, FLIP: tl.constexpr, BT: tl.constexpr, BR: tl.constexpr):
-    """``_into_kernel`` for tables with more than 32 rows: program (q, t) writes rows [t BT, t BT + BT) of block q,
-    contracting only the canonical rows [klo[t], khi[t]) that share a shell with them."""
-    q = tl.load(rows + tl.program_id(0))
-    t = tl.program_id(1)
+@triton.jit(do_not_specialize=['NA', 'K', 'RS', 'OS0', 'OS1', 'OS2', 'LOGK', 'NL', 'NR', 'NT', 'TP'])
+def _mdiag_kernel(out, rows, vec, rpack, knots, coef, zmap, dmap, lmap, pos, cpos, klo, khi, consts, NA, K, NL, NR,
+                  NT, TP, RS, OS0, OS1, OS2, LOGK, sign, FLIP: tl.constexpr, BT: tl.constexpr, BR: tl.constexpr):
+    """Tiles [g TP, g TP + TP) of BT rows (of NT) of out[q] = D_L(d) C(|d|) D_R(d)^T (transposed when FLIP) for the
+    displacement row q = rows[p // G], g = p % G, G = cdiv(NT, TP) (p the program), for m-diagonal tables
+    (``_mdiag_plan``): one channel per (row, column), so each row k of C costs BR products and one rank-1 update; zero
+    beyond the support (consts[0]); C at |d| <= 1e-14. The tiles of a row run in consecutive programs (or in one), so
+    the coefficients of its knot interval are read once from memory."""
+    G = (NT + TP - 1) // TP
+    p = tl.program_id(0)
+    q = tl.load(rows + p // G)
+    g = p % G
     x = sign * tl.load(vec + q * 3 + 0)
     y = sign * tl.load(vec + q * 3 + 1)
     z = sign * tl.load(vec + q * 3 + 2)
@@ -313,30 +285,31 @@ def _into_tall_kernel(out, rows, vec, rpack, knots, coef, cmap, lmap, rmap, klo,
     i = tl.minimum(tl.maximum(lo, 1), K - 1) - 1
     d = r - tl.load(knots + i)
     j = tl.arange(0, BR)
-    a = t * BT + tl.arange(0, BT)
-    ma = a < NL
     inside = r < tl.load(consts)
     centre = r <= 1e-14
     cb = coef + i.to(tl.int64) * 4 * NA
     rp = rpack + q * RS
-    rm = tl.load(rmap + j[None, :] * BR + j[:, None])          # D_R^T [j, b]
-    dr = tl.where(centre, (j[:, None] == j[None, :]).to(tl.float64), tl.load(rp + rm, mask=rm >= 0, other=0.0))
-    acc = tl.zeros([BT, BR], dtype=tl.float64)
-    for k in range(tl.load(klo + t), tl.load(khi + t)):
-        cm = tl.load(cmap + k * BR + j)
-        mk = cm >= 0
-        c = ((tl.load(cb + cm, mask=mk, other=0.0) * d + tl.load(cb + NA + cm, mask=mk, other=0.0)) * d +
-             tl.load(cb + 2 * NA + cm, mask=mk, other=0.0)) * d + tl.load(cb + 3 * NA + cm, mask=mk, other=0.0)
-        c = tl.where(inside, c, 0.0)
-        zr = tl.sum(c[:, None] * dr, axis=0)
-        lm = tl.load(lmap + a * NL + k, mask=ma, other=-1)
-        dl = tl.where(centre, (a == k).to(tl.float64), tl.load(rp + lm, mask=lm >= 0, other=0.0))
-        acc += dl[:, None] * zr[None, :]
-    if FLIP:
-        ptr = out + q * OS0 + a[:, None] * OS2 + j[None, :] * OS1
-    else:
-        ptr = out + q * OS0 + a[:, None] * OS1 + j[None, :] * OS2
-    tl.store(ptr, acc, mask=ma[:, None] & (j < NR)[None, :])
+    cp = tl.load(cpos + j)
+    for t in range(g * TP, tl.minimum(g * TP + TP, NT)):
+        a = t * BT + tl.arange(0, BT)
+        ma = a < NL
+        acc = tl.zeros([BT, BR], dtype=tl.float64)
+        for k in range(tl.load(klo + t), tl.load(khi + t)):
+            cm = tl.load(zmap + k * BR + j)
+            mk = cm >= 0
+            c = ((tl.load(cb + cm, mask=mk, other=0.0) * d + tl.load(cb + NA + cm, mask=mk, other=0.0)) * d +
+                 tl.load(cb + 2 * NA + cm, mask=mk, other=0.0)) * d + tl.load(cb + 3 * NA + cm, mask=mk, other=0.0)
+            c = tl.where(inside, c, 0.0)
+            dm = tl.load(dmap + k * BR + j)
+            dr = tl.where(centre, (cp == tl.load(pos + k)).to(tl.float64), tl.load(rp + dm, mask=dm >= 0, other=0.0))
+            lm = tl.load(lmap + k * NL + a, mask=ma, other=-1)
+            dl = tl.where(centre, (a == k).to(tl.float64), tl.load(rp + lm, mask=lm >= 0, other=0.0))
+            acc += dl[:, None] * (c * dr)[None, :]
+        if FLIP:
+            ptr = out + q * OS0 + a[:, None] * OS2 + j[None, :] * OS1
+        else:
+            ptr = out + q * OS0 + a[:, None] * OS1 + j[None, :] * OS2
+        tl.store(ptr, acc, mask=ma[:, None] & (j < NR)[None, :])
 
 
 class RadialTable:
@@ -363,15 +336,10 @@ class RadialTable:
         self.left_index = {l: torch.as_tensor(v, device=dev) for l, v in li.items()}
         self.right_index = {l: torch.as_tensor(v, device=dev) for l, v in ri.items()}
         self.degrees = sorted(set(self.left) | set(self.right))
-        self._bw = max(16, triton.next_power_of_2(max(self.shape)))
-        self._br = max(16, triton.next_power_of_2(self.shape[1]))
         act = active.cpu().numpy()
-        if self._bw <= 32:
-            self._maps = tuple(torch.as_tensor(m, device=dev) for m in _block_maps(self.left, self.right, act, self._bw))
-        elif self._br <= 32:
-            self._maps = tuple(torch.as_tensor(m, device=dev) for m in _tall_maps(self.left, self.right, act, self._br))
-        else:
-            self._maps = None
+        self._br = max(8, triton.next_power_of_2(nr))
+        plan = _mdiag_plan(self.left, self.right, act, nr, self._br)
+        self._mdiag = None if plan is None else tuple(torch.as_tensor(m, device=dev).contiguous() for m in plan)
         self._consts = torch.tensor([self.support - 1e-12], dtype=torch.float64, device=dev)
 
     @property
@@ -391,35 +359,30 @@ class RadialTable:
 
     def into(self, out, rows, vectors, rpack, flip=False):
         """out[rows] = blocks at ``vectors[rows]`` (bohr; at -vectors[rows], transposed, when ``flip``) in one fused
-        kernel; ``rpack`` the rotation pack of the vectors used (``rotation_pack``; of -vectors when ``flip``). out
-        is FP64 [Q, >= nL, >= nR] (>= nR, >= nL when ``flip``); entries outside the block are left untouched.
-        Blocks up to 32 x 32 take the fused kernel, taller ones (up to 32 columns) its row-tiled variant, wider ones
-        the per-degree einsum path."""
+        kernel over the active channels only (``_mdiag_plan``); ``rpack`` the rotation pack of the vectors used
+        (``rotation_pack``; of -vectors when ``flip``). out is FP64 [Q, >= nL, >= nR] (>= nR, >= nL when ``flip``);
+        entries outside the block are left untouched."""
         if not len(rows):
             return
         K = len(self.knots)
-        if self._bw > 32 and self._maps is not None:      # tall tables (projector, VNA and density factors)
-            _into_tall_kernel[(len(rows), len(self._maps[3]))](
-                out, rows, vectors, rpack, self.knots, self.coefficients, *self._maps, self._consts,
-                self.coefficients.shape[-1], K, self.shape[0], self.shape[1], rpack.stride(0), out.stride(0),
-                out.stride(1), out.stride(2), int(K).bit_length() + 1, -1.0 if flip else 1.0, FLIP=bool(flip),
-                BT=TALL_ROWS, BR=self._br, num_warps=2)
+        if self._mdiag is not None:
+            nt = len(self._mdiag[5])
+            tp = tiles_per_program(len(rows), nt)
+            _mdiag_kernel[(len(rows) * triton.cdiv(nt, tp),)](
+                out, rows, vectors, rpack, self.knots, self.coefficients, *self._mdiag, self._consts,
+                self.coefficients.shape[-1], K, self.shape[0], self.shape[1], nt, tp, rpack.stride(0),
+                out.stride(0), out.stride(1), out.stride(2), int(K).bit_length() + 1, -1.0 if flip else 1.0,
+                FLIP=bool(flip), BT=TILE_ROWS, BR=self._br, num_warps=MDIAG_WARPS)
             return
-        if self._bw > 32:       # wide tables: per-degree path
-            v = vectors[rows]
-            rot, o = {}, 0
-            for l in range(max(self.degrees) + 1):
-                n = (2 * l + 1) ** 2
-                rot[l] = rpack[rows, o:o + n].reshape(-1, 2 * l + 1, 2 * l + 1)
-                o += n
-            v = self(-v if flip else v, rot=rot)
-            v = v.transpose(1, 2) if flip else v
-            out[rows, :v.shape[1], :v.shape[2]] = v
-            return
-        _into_kernel[(len(rows),)](out, rows, vectors, rpack, self.knots, self.coefficients, *self._maps, self._consts,
-                                   self.coefficients.shape[-1], K, self.shape[0], self.shape[1], rpack.stride(0),
-                                   out.stride(0), out.stride(1), out.stride(2), int(K).bit_length() + 1,
-                                   -1.0 if flip else 1.0, FLIP=bool(flip), BW=self._bw, num_warps=4)
+        v = vectors[rows]          # off the m-diagonal (no two-centre table is): per-degree path
+        rot, o = {}, 0
+        for l in range(max(self.degrees) + 1):
+            n = (2 * l + 1) ** 2
+            rot[l] = rpack[rows, o:o + n].reshape(-1, 2 * l + 1, 2 * l + 1)
+            o += n
+        v = self(-v if flip else v, rot=rot)
+        v = v.transpose(1, 2) if flip else v
+        out[rows, :v.shape[1], :v.shape[2]] = v
 
     def __call__(self, vectors, rot=None, chunk=None):
         """Lab-frame blocks [Q, nL, nR] at displacements ``vectors`` [Q, 3] (bohr).

@@ -45,7 +45,7 @@ For CUDA acceleration, install the optional SO2CUDA dependency with a CUDA toolc
 python -m pip install -e '.[so2]'
 ```
 
-The priors and the inference engine are pure PyTorch and Triton (no compiled extension). See [1015-stable](docs/1015-stable.md) for the layout, the inference engine and table building (`dptb prior build`).
+The priors and the inference engine are PyTorch and Triton; the GF prior's three-centre sums use a small CUDA extension on FP64 tensor cores when a CUDA toolkit is available (compiled on first use, Triton otherwise). See [1015-stable](docs/1015-stable.md) for the layout, the inference engine and table building (`dptb prior build`), and [1016-gf](docs/1016-gf.md) for the GF prior.
 
 ## Usage and validation
 

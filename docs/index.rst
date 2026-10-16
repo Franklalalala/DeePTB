@@ -11,6 +11,7 @@ DeePTB provides Slater–Koster models and equivariant atomic-orbital operator p
    :caption: Architecture and data contracts
 
    architecture
+   1016-gf
    1015-stable
    1013-stable
    unitb
