@@ -19,7 +19,6 @@ import triton.language as tl
 
 BR, BJ = 16, 64     # rows x atoms per program of the fused pair test
 PROGRAMS = 512      # translation chunks per call: enough programs for about four per SM
-FUSED = True        # use the fused kernel on CUDA (False: the torch row-chunk path everywhere)
 
 
 def key_codes(i, j, shift, n_atoms, span):
@@ -101,6 +100,20 @@ def _pairs_kernel(pos, shift, rad_r, rad_j, rows, offsets, counts, oi, oj, ot, o
         tl.store(counts + pid, cnt)
 
 
+@triton.jit
+def inside(d2, lim2, mask):
+    """Exact support test of a set of points: squared distances d2 to a centre within the squared radius lim2 (points
+    of ``mask``). The grid kernels of both priors use it to decide which centres reach which points (H0: atom images
+    and FFT-grid tiles; GF: density neighbours and onsite quadrature tiles)."""
+    return (d2 <= lim2) & mask
+
+
+@triton.jit
+def any_of(m):
+    """True when some point of the boolean set m is set (a tile reached by a centre)."""
+    return tl.max(m.to(tl.int32)) > 0
+
+
 def _pairs_cuda(pos, shift, T, radius, rj, rows, margin, strict, self_interaction, limit_dtype, with_vectors):
     """Fused pair test (see ``_pairs_kernel``): i, j, S and optionally the vectors, unsorted."""
     dev = pos.device
@@ -171,7 +184,7 @@ def image_pairs(pos, cell, radius, *, margin=0.0, strict=False, self_interaction
     shift = T.to(pos.dtype) @ cell
     same_lim = limit_dtype == torch.float32 or (radius.dtype == rj.dtype == torch.float64
                                                  and limit_dtype in (None, torch.float64))
-    if FUSED and pos.is_cuda and pos.dtype == torch.float64 and same_lim:
+    if pos.is_cuda and pos.dtype == torch.float64 and same_lim:
         parts = [_pairs_cuda(pos, shift, T, radius, rj, rows, margin, strict, self_interaction, limit_dtype,
                              with_vectors)]
         rows = rows[:0]
@@ -239,3 +252,66 @@ def span_of(shift):
     """Smallest span with |S| < span for every row of ``shift``."""
     return int(shift.abs().max()) + 1 if shift.numel() else 1
 
+
+class Queries:
+    """Queries (a, k, T) of one centre family: AO atom a (home cell) and the centre atom k at image T, grouped by k
+    (rows sorted by k); vec = x_a - (x_k + T.cell), the argument of the centre|AO tables; ptr [n + 1] the row range of
+    each centre. Two queries of the same centre, (a1, k, T1) and (a2, k, T2), see the same centre image for the block
+    (a1, a2, T1 - T2): a three-centre term of that block (``threecentre.three_centre_terms``)."""
+
+    def __init__(self, a, k, T, pos, cell):
+        order = torch.argsort(k, stable=True)
+        self.a, self.k, self.T = a[order], k[order], T[order]
+        self.vec = pos[self.a] - pos[self.k] - self.T.to(pos.dtype) @ cell
+        self.ptr = torch.searchsorted(self.k, torch.arange(len(pos) + 1, device=pos.device))
+
+    def __len__(self):
+        return len(self.a)
+
+    def pairs(self, chunk=1 << 24):
+        """All ordered query pairs (q1, q2) sharing the centre atom, in chunks of centres: yields (q1, q2)."""
+        dev = self.a.device
+        g = self.ptr[1:] - self.ptr[:-1]
+        sq = g * g
+        k = 0
+        n = len(g)
+        csum = torch.cumsum(sq, 0)
+        total = int(csum[-1]) if n else 0
+        if total <= chunk:          # one chunk (one host sync): the usual case below a few hundred atoms
+            if total:
+                cent = torch.repeat_interleave(torch.arange(n, device=dev), sq, output_size=total)
+                local = torch.arange(total, device=dev) - (csum - sq)[cent]
+                gk = g[cent]
+                yield self.ptr[cent] + local // gk, self.ptr[cent] + local % gk
+            return
+        csum = csum.tolist()
+        while k < n:
+            # centres k .. k_end-1 with at most ``chunk`` pairs (at least one centre)
+            limit = (csum[k - 1] if k else 0) + chunk
+            k_end = k + 1
+            while k_end < n and csum[k_end] <= limit:
+                k_end += 1
+            gs = g[k:k_end]
+            total = int(sq[k:k_end].sum())
+            if total:
+                cent = torch.repeat_interleave(torch.arange(k, k_end, device=dev), gs * gs)
+                off = torch.repeat_interleave(torch.cumsum(gs * gs, 0) - gs * gs, gs * gs)
+                local = torch.arange(total, device=dev) - off
+                gk = g[cent]
+                q1 = self.ptr[cent] + local // gk
+                q2 = self.ptr[cent] + local % gk
+                yield q1, q2
+            k = k_end
+
+
+def centre_queries(pos, cell, centre_radius, ao_radius, *, strict, margin, include_self=False, base=None):
+    """Queries (a, k, T) with |x_a - x_k - T.cell| below ao_radius[a] + centre_radius[k] (+ margin; strict: '<').
+
+    Centres with a negative radius have no queries. include_self keeps (k, k, 0). base: a ``PairBase`` of the
+    structure that covers this query (the same pairs, without a new search).
+    """
+    centres = torch.nonzero(centre_radius >= 0, as_tuple=True)[0]
+    kw = dict(targets_radius=ao_radius, margin=margin, strict=strict, self_interaction=include_self, centres=centres)
+    k, a, S = image_pairs(pos, cell, centre_radius, **kw) if base is None else base.select(centre_radius, **kw)
+    # image_pairs gives x_a + S.cell - x_k; the query displacement x_a - (x_k + T.cell) uses T = -S
+    return Queries(a, k, -S, pos, cell)

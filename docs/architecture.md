@@ -17,7 +17,7 @@
 | `dptb/nn/pdq_moe.py` | Shared expert banks and routing metadata |
 | `dptb/nn/so2_backend.py` | Optional SO2CUDA dispatch and PyTorch fallback |
 | `dptb/data/` | Graphs, LMDB, sidecars, AO ordering, and feature conversion |
-| `dptb/prior/common/` | Operators shared by both priors: neighbour enumeration, block tables and gauge, real harmonics, radial splines and the fused table kernel, two-centre integrals, spherical Bessel transforms, Gaunt, KB, ORB/UPF reading, XC, table store |
+| `dptb/prior/common/` | Operators shared by both priors ([prior pipelines](prior_pipeline.md)): neighbour enumeration, block keys and gauge, real harmonics, radial splines and the fused table kernel, two-centre integrals, three-centre sums (the nonlocal step) on FP64 tensor cores, the finish kernel, step timing and checks, units, spherical Bessel transforms, Gaunt, KB, ORB/UPF reading, XC, table store |
 | `dptb/prior/gf/` | Flash GF prior on the device (topology, assembly, environment XC, onsite XC) and its table builders |
 | `dptb/prior/h0/` | UniTB H0 prior on the device (pair bank, field, local and nonlocal parts), its pair-bank builder, and the h0rebuild data readers ([guide](h0.md)) |
 | `dptb/prior/build.py` | `dptb prior build`: one entry point for every table family |

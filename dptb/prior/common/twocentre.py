@@ -8,7 +8,8 @@ R - r_p) of S_L(R) / R^L. For orbitals mu1 = (l1, z1, m1), mu2 = (l2, z2, m2) at
 with L = |l1 - l2|, |l1 - l2| + 2, ..., l1 + l2 (so the phase is real), G the real Gaunt table indexed l (l + 1) + m and
 R^L Y_LM the solid harmonics (``harmonics.solid_harmonics``); zero beyond rmax. ``index`` maps
 [s1, l1, z1, s2, l2, z2, L] to a table row (-1 when absent); ``left`` / ``right`` list the (l, zeta, m) of every
-function of each species, which also fixes the block layout.
+function of each species, which also fixes the block layout. The displacements of one evaluation set are prepared
+once (``Displacements``: |d|, grid interval, solid harmonics, species-pair groups) for every table evaluated on them.
 """
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ import triton
 import triton.language as tl
 
 from dptb.prior.common.harmonics import solid_harmonics
+from dptb.prior.common.radial import horner, pair_groups
 
 
 @triton.jit(do_not_specialize=['NS', 'P', 'N2', 'NOUT', 'NI', 'NT', 'W1', 'W2'])
@@ -43,7 +45,7 @@ def _accumulate(out, sel, coeffs, iv, wv, ok, Y, row, ycol, coef, NS, P, N2, NOU
         c2 = tl.load(base + 2, mask=m, other=0.0)
         c3 = tl.load(base + 3, mask=m, other=0.0)
         yv = tl.load(Y + y[None, :] * P + q[:, None], mask=m, other=0.0)
-        acc += f[None, :] * (((c3 * w + c2) * w + c1) * w + c0) * yv
+        acc += f[None, :] * horner(c3, c2, c1, c0, w) * yv
     keep = tl.load(ok + q, mask=im, other=0) != 0
     a = c // N2
     b = c % N2
@@ -52,6 +54,9 @@ def _accumulate(out, sel, coeffs, iv, wv, ok, Y, row, ycol, coef, NS, P, N2, NOU
 
 
 class TwoCentre:
+    """One L-expanded two-centre table of a pair bank (S, T or the projector overlaps Q; see the module docstring):
+    ``displacements`` prepares an evaluation set, calling the table on it gives the blocks B(d)."""
+
     def __init__(self, index, coeffs, gaunt, left, right, dr, nr, rmax):
         self.index, self.coeffs, self.gaunt = index, coeffs, gaunt
         self.left, self.right = left, right
@@ -60,7 +65,9 @@ class TwoCentre:
         self._terms = {}
 
     def terms(self, s1, s2):
-        """Per species pair: output column, table rows used, row of each term, solid-harmonic column, coefficient."""
+        """Terms of the species pair (s1, s2): (nt, row, ylm, coef), each [n1 n2, nt] for the output columns
+        c = a n2 + b (a, b the functions of s1, s2): table row, solid-harmonic column and coefficient
+        i^(l1 - l2 - L) G(l1 m1, l2 m2, L M) of every (L, M) term, padded to nt terms per column with coefficient 0."""
         key = (s1, s2)
         if key not in self._terms:
             idx = self.index[s1, :, :, s2].cpu().numpy()                     # [l1, z1, l2, z2, L]
@@ -104,32 +111,39 @@ class TwoCentre:
             self._terms[key] = (nt, T(R, torch.int32), T(Yc, torch.int32), T(Cf, torch.float64))
         return self._terms[key]
 
-    def __call__(self, sp1, sp2, d, width1, width2):
-        """Blocks [P, width1, width2] (zero padded) for per-pair species indices sp1, sp2 and displacements d [P, 3]."""
-        P = len(d)
-        out = d.new_zeros((P, width1, width2))
-        if not P:
-            return out
-        R = torch.linalg.vector_norm(d, dim=-1)
-        k = torch.clamp((R / self.dr).to(torch.int64), 0, self.nr - 2)
-        w = (R - k.to(R.dtype) * self.dr).contiguous()
-        ok = (R <= self.rmax).to(torch.int8)
-        Y = solid_harmonics(self.lmax, d).T.contiguous()                         # [(lmax + 1)^2, P]
-        k = k.to(torch.int32)
-        ns = max(len(self.left), len(self.right))
-        code = sp1 * ns + sp2
-        order = torch.argsort(code)
-        counts = torch.bincount(code, minlength=ns * ns).tolist()
-        start = 0
-        for c, cnt in enumerate(counts):
-            if not cnt:
-                continue
-            s1, s2 = divmod(c, ns)
+    def displacements(self, sp1, sp2, d, lmax=None):
+        """``Displacements`` of the rows (species sp1, sp2 [P], displacements d [P, 3]) for this bank's grid."""
+        return Displacements(sp1, sp2, d, max(len(self.left), len(self.right)), self.dr, self.nr, self.rmax,
+                             self.lmax if lmax is None else lmax)
+
+    def __call__(self, disp, width1, width2):
+        """Blocks [P, width1, width2] (zero padded) at the prepared displacements ``disp``."""
+        if disp.lmax < self.lmax:
+            raise ValueError('displacements prepared below the degree of the table')
+        out = disp.w.new_zeros((disp.P, width1, width2))
+        ns = disp.ns
+        for p, sel in disp.groups:
+            s1, s2 = divmod(p, ns)
             n1, n2 = len(self.left[s1]), len(self.right[s2])
             nt, row, ylm, coef = self.terms(s1, s2)
-            sel = order[start:start + cnt]
+            cnt = len(sel)
             grid = (triton.cdiv(cnt, 32), triton.cdiv(n1 * n2, 32))
-            _accumulate[grid](out, sel, self.coeffs, k, w, ok, Y, row, ylm, coef, cnt, P, n2, n1 * n2, self.nr - 1, nt,
-                              width1, width2, BP=32, BC=32)
-            start += cnt
+            _accumulate[grid](out, sel, self.coeffs, disp.k, disp.w, disp.ok, disp.Y, row, ylm, coef, cnt, disp.P, n2,
+                              n1 * n2, self.nr - 1, nt, width1, width2, BP=32, BC=32)
         return out
+
+
+class Displacements:
+    """One evaluation set of a pair bank: |d| = R, grid interval k = floor(R / dr) (clamped; as
+    ``radial.interval_uniform``) and offset R - k dr, the
+    support flag R <= rmax, the solid harmonics up to ``lmax`` and the rows grouped by species pair."""
+
+    def __init__(self, sp1, sp2, d, ns, dr, nr, rmax, lmax):
+        self.P, self.ns, self.lmax = len(d), ns, lmax
+        R = torch.linalg.vector_norm(d, dim=-1)
+        k = torch.clamp(torch.floor(R * (1.0 / dr)), 0, nr - 2)          # radial.interval_uniform
+        self.w = (R - k * dr).contiguous()
+        self.k = k.to(torch.int32)
+        self.ok = (R <= rmax).to(torch.int8)
+        self.Y = solid_harmonics(lmax, d).T.contiguous()                        # [(lmax + 1)^2, P]
+        self.groups = pair_groups(sp1, sp2, ns) if self.P else []

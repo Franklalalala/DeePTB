@@ -11,14 +11,15 @@ to d^ (``harmonics.rotation_matrices``). C is the not-a-knot cubic spline of the
 tridiagonal system depends on the knots only and is factorised once per grid.
 """
 import hashlib
-import math
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
-from dptb.prior.common.harmonics import rotation_matrices
+from dptb.prior.common.blocks import search_sorted
+from dptb.prior.common.harmonics import harmonic_norm, real_ylm, rotation_matrices
 
 _LU = {}
 
@@ -71,6 +72,41 @@ def spline_coefficients(x, y, interpolation='cubic', grid_key=None):
     return c
 
 
+def spline_eval(knots, coef, r):
+    """Values [len(r), M] of the piecewise cubics ``coef`` [K - 1, 4, M] (``spline_coefficients``) at r: the interval
+    by ``torch.searchsorted`` and the cubic in ``horner`` order; points outside the knots take the end intervals
+    (callers mask them). The tensor twin of the kernels' spline evaluation."""
+    i = (torch.searchsorted(knots, r.contiguous(), right=True) - 1).clamp(0, len(knots) - 2)
+    h = (r - knots[i])[:, None]
+    c = coef[i]
+    return ((c[:, 0] * h + c[:, 1]) * h + c[:, 2]) * h + c[:, 3]
+
+
+@triton.jit
+def horner(c3, c2, c1, c0, h):
+    """c3 h^3 + c2 h^2 + c1 h + c0: the cubic piece of every radial spline of both priors (Horner, highest power
+    first)."""
+    return ((c3 * h + c2) * h + c1) * h + c0
+
+
+@triton.jit
+def interval_uniform(r, inv_dr, dr, n_int):
+    """Interval k = min(max(floor(r / dr), 0), n_int - 1) of a uniform knot grid (as floor(r * inv_dr)) and the offset
+    h = r - k dr, k as a float of r's dtype. Non-uniform knots use ``blocks.search_sorted``."""
+    k = tl.minimum(tl.maximum(libdevice.floor(r * inv_dr), 0.0), (n_int - 1).to(r.dtype))
+    return k, r - k * dr
+
+
+def pair_groups(left, right, ns):
+    """Rows grouped by species pair for table evaluation: [(p, rows)] over the nonempty pairs p = left * ns + right
+    (left, right [Q]: species index of each row; one host read of the group sizes). Both priors' two-centre steps
+    group their displacements this way."""
+    pair = left * ns + right
+    order = torch.argsort(pair)
+    bounds = torch.searchsorted(pair[order], torch.arange(ns * ns + 1, device=pair.device)).tolist()
+    return [(p, order[bounds[p]:bounds[p + 1]]) for p in range(ns * ns) if bounds[p + 1] > bounds[p]]
+
+
 def _shell_index(shells):
     """{l: AO indices [n_shells_l, 2l + 1]} of a shell list."""
     out, o = {}, 0
@@ -104,7 +140,7 @@ def _pack_plan(lmax, device):
             dirs += list(d)
             inv += list(v.reshape(-1))
             for m in range(l + 1):
-                norm[l, m] = math.sqrt((2 * l + 1) / (4 * math.pi) * math.factorial(l - m) / math.factorial(l + m))
+                norm[l, m] = harmonic_norm(l, m)
         t = lambda x, dt: torch.as_tensor(np.asarray(x), dtype=dt, device=device).contiguous()  # noqa: E731
         _PACK_PLAN[key] = (t(rows, torch.int32), t(dirs, torch.float64), t(inv, torch.float64), t(norm, torch.float64),
                            e)
@@ -155,7 +191,7 @@ def _pack_kernel(out, vec, prow, dirs, inv, norm, Q, RS, LM1, sign, BQ: tl.const
     r12 = tl.where(zero, 0.0, r12)
     r20 = tl.where(zero, 0.0, r20)
     r21 = tl.where(zero, 0.0, r21)
-    m = (mi + 1) // 2                           # ABACUS order: 0, +1, -1, +2, -2, ...
+    m = (mi + 1) // 2                           # ABACUS order: 0, +1, -1, +2, -2, ... (|m|)
     nrm = tl.load(norm + l * LM1 + m)
     acc = tl.zeros([BQ, BA], dtype=tl.float64)
     for c in range(2 * l + 1):
@@ -169,21 +205,7 @@ def _pack_kernel(out, vec, prow, dirs, inv, norm, Q, RS, LM1, sign, BQ: tl.const
         ux = ux / un
         uy = uy / un
         uz = uz / un
-        re = tl.full([BQ], 1.0, tl.float64)
-        im = tl.zeros([BQ], dtype=tl.float64)
-        dfac = 1.0
-        for k in range(m):                      # (x + i y)^m and (2m - 1)!!
-            re, im = re * ux - im * uy, im * ux + re * uy
-            dfac = dfac * (2 * k + 1)
-        sgn = 1.0 - 2.0 * (m % 2)
-        p = tl.full([BQ], 1.0, tl.float64) * (sgn * dfac)
-        if l > m:
-            prev = p
-            p = (2 * m + 1) * uz * p
-            for deg in range(m + 2, l + 1):
-                prev, p = p, ((2 * deg - 1) * uz * p - (deg + m - 1) * prev) / (deg - m)
-        val = tl.where(m == 0, nrm * p, tl.where(mi % 2 == 1, 1.4142135623730951 * nrm * p * re,
-                                                  1.4142135623730951 * nrm * p * im))
+        val = real_ylm(l, tl.where(mi % 2 == 1, m, -m), ux, uy, uz, nrm)
         acc += tl.load(inv + oi + a * (2 * l + 1) + c, mask=ma, other=0.0)[None, :] * val[:, None]
     tl.store(out + q[:, None] * RS + e0 + a[None, :], acc, mask=mq[:, None] & ma[None, :])
 
@@ -273,16 +295,7 @@ def _mdiag_kernel(out, rows, vec, rpack, knots, coef, zmap, dmap, lmap, pos, cpo
     y = sign * tl.load(vec + q * 3 + 1)
     z = sign * tl.load(vec + q * 3 + 2)
     r = tl.sqrt(x * x + y * y + z * z)
-    lo = 0
-    hi = K
-    for _ in range(LOGK):                       # searchsorted(knots, r, right=True)
-        mid = (lo + hi) // 2
-        kv = tl.load(knots + tl.minimum(mid, K - 1))
-        go = (lo < hi) & (kv <= r)
-        stay = (lo < hi) & (kv > r)
-        lo = tl.where(go, mid + 1, lo)
-        hi = tl.where(stay, mid, hi)
-    i = tl.minimum(tl.maximum(lo, 1), K - 1) - 1
+    i = tl.maximum(search_sorted(knots, K, r, LOGK, r == r, RIGHT=True), 1) - 1     # knot interval of r
     d = r - tl.load(knots + i)
     j = tl.arange(0, BR)
     inside = r < tl.load(consts)
@@ -297,8 +310,8 @@ def _mdiag_kernel(out, rows, vec, rpack, knots, coef, zmap, dmap, lmap, pos, cpo
         for k in range(tl.load(klo + t), tl.load(khi + t)):
             cm = tl.load(zmap + k * BR + j)
             mk = cm >= 0
-            c = ((tl.load(cb + cm, mask=mk, other=0.0) * d + tl.load(cb + NA + cm, mask=mk, other=0.0)) * d +
-                 tl.load(cb + 2 * NA + cm, mask=mk, other=0.0)) * d + tl.load(cb + 3 * NA + cm, mask=mk, other=0.0)
+            c = horner(tl.load(cb + cm, mask=mk, other=0.0), tl.load(cb + NA + cm, mask=mk, other=0.0),
+                       tl.load(cb + 2 * NA + cm, mask=mk, other=0.0), tl.load(cb + 3 * NA + cm, mask=mk, other=0.0), d)
             c = tl.where(inside, c, 0.0)
             dm = tl.load(dmap + k * BR + j)
             dr = tl.where(centre, (cp == tl.load(pos + k)).to(tl.float64), tl.load(rp + dm, mask=dm >= 0, other=0.0))
@@ -348,10 +361,7 @@ class RadialTable:
 
     def canonical(self, r):
         """Bond-frame blocks C(r) [Q, nL, nR] (zero beyond the support)."""
-        i = (torch.searchsorted(self.knots, r.contiguous(), right=True).clamp(1, len(self.knots) - 1) - 1)
-        d = (r - self.knots[i])[:, None]
-        c = self.coefficients[i]
-        v = ((c[:, 0] * d + c[:, 1]) * d + c[:, 2]) * d + c[:, 3]
+        v = spline_eval(self.knots, self.coefficients, r)
         v = torch.where((r < self.support - 1e-12)[:, None], v, torch.zeros_like(v))
         out = v.new_zeros((len(r), self.shape[0] * self.shape[1]))
         out[:, self.active] = v

@@ -10,8 +10,6 @@
                   q(G) = sum_r q(r) sinc(G r) w,   c(G) likewise for the NLCC core charge 4 pi r^2 rho_c(r),
                   v(G) = 4 pi / Omega [sum_r (r V(r) + Z e^2 erf(r)) sin(G r) / G w - Z e^2 exp(-G^2 / 4) / G^2],
                   v(0) = 4 pi / Omega sum_r r (r V(r) + Z e^2) w        (alpha term kept).
-              Optionally (``RadialTable``) the smooth parts are tabulated per species on a uniform |G| grid with exact
-              derivatives and interpolated by cubic Hermite polynomials (a switchable approximation, off by default).
     density   rho(G) = sum_s S_s(G) q_s(|G|) / Omega cut to |G|^2 <= ecutrho and scaled to the electron count;
               S_s(G) = sum_{a in s} exp(-i G.x_a) is a type-1 NUFFT (cuFINUFFT, eps 1e-12; S(0) exact).
     potential V = V_loc + V_H + V_xc with V_loc(G) = sum_s S_s(G) v_s(|G|) (sphere), V_H = 4 pi e^2 rho(G) / G^2 (0 at
@@ -139,50 +137,6 @@ class RadialSpecies:
         return qg, vg, cg
 
 
-class RadialTable:
-    """The smooth parts of the transforms of one species, tabulated on G_k = k h and interpolated (cubic Hermite).
-
-    q(G), core(G) and I(G) = sum_r (r V + Z e^2 erf(r)) sin(G r) / G w are all F(G) = sum_r a_r sinc(G r); the table
-    holds F and F'(G) = sum_r a_r (cos(G r) - sinc(G r)) / G at the knots (exact derivatives, F'(0) = 0), so the
-    interpolant is C1 and its error is at most h^4 max|F^(4)| / 384 <= (h r_max)^4 / 384 sum|a|. The singular part of v
-    and the alpha term stay exact: v(G) = 4 pi / Omega (I(G) - Z e^2 exp(-G^2 / 4) / G^2), v(0) = alpha / Omega. Valid
-    for |G| <= gmax (the charge sphere); beyond it the last interval is extended (those G are cut from every quantity).
-    """
-
-    def __init__(self, species, gmax, step=5e-4, chunk=2048):
-        self.sp, self.step = species, float(step)
-        k = int(math.ceil(gmax / self.step)) + 2
-        g = torch.arange(k + 1, dtype=torch.float64, device=species.r.device) * self.step
-        r = species.r
-        core = species.core if species.core is not None else torch.zeros_like(r)
-        a = torch.stack([species.q, species.comp * r, core], 0) * species.w           # [3, nr]
-        F = torch.empty((len(g), 3), dtype=torch.float64, device=r.device)
-        D = torch.empty_like(F)
-        for s in range(0, len(g), chunk):
-            gg = g[s:s + chunk]
-            x = gg[:, None] * r[None, :]
-            sinc = torch.sinc(x / np.pi)
-            F[s:s + chunk] = sinc @ a.T
-            safe = torch.where(gg > 0, gg, torch.ones_like(gg))[:, None]
-            D[s:s + chunk] = torch.where(gg[:, None] > 0, ((torch.cos(x) - sinc) / safe) @ a.T, 0.)
-        self.F, self.D, self.gmax = F, D, float(g[-1])
-
-    def _interp(self, x):
-        h = self.step
-        i = torch.clamp((x / h).to(torch.int64), 0, len(self.F) - 2)
-        t = (x / h - i.to(x.dtype))[:, None]
-        t2, t3 = t * t, t * t * t
-        return ((2 * t3 - 3 * t2 + 1) * self.F[i] + (t3 - 2 * t2 + t) * h * self.D[i]
-                + (-2 * t3 + 3 * t2) * self.F[i + 1] + (t3 - t2) * h * self.D[i + 1])
-
-    def transforms(self, g, volume):
-        f = self._interp(g)
-        zero = g < 1e-13
-        safe = torch.where(zero, torch.ones_like(g), g)
-        v = FOUR_PI * (f[:, 1] - self.sp.ze * torch.exp(-safe ** 2 / 4) / safe ** 2) / volume
-        return f[:, 0], torch.where(zero, self.sp.alpha_integral / volume, v), f[:, 2]
-
-
 class Field:
     def __init__(self, values, cell, shape, metadata):
         self.values, self.cell, self.shape, self.metadata = values, cell, shape, metadata
@@ -230,11 +184,10 @@ def structure_factor(frac, shape, eps=1e-12, plan=None):
     return out
 
 
-def build_field(radial, symbols, frac, cell, shape, *, ecutrho=480., total_electrons=None, tables=None):
+def build_field(radial, symbols, frac, cell, shape, *, ecutrho=480., total_electrons=None):
     """Total local potential (Ry) on the FFT grid ``shape`` of the cell rows ``cell`` (bohr, host array).
 
-    radial: {symbol: RadialSpecies}; frac: fractional coordinates [n, 3] (device); tables: optional
-    {symbol: RadialTable} used instead of the direct transforms.
+    radial: {symbol: RadialSpecies}; frac: fractional coordinates [n, 3] (device).
     """
     dev = frac.device
     volume = float(abs(np.linalg.det(cell)))
@@ -258,8 +211,7 @@ def build_field(radial, symbols, frac, cell, shape, *, ecutrho=480., total_elect
         plan = _nufft_plan(shape, 1e-12, dev, torch.cuda.current_stream(dev))
         for s, ids in species:
             sf = structure_factor(frac[ids], shape, plan=plan)
-            src = radial[s] if tables is None else tables[s]
-            q, v, c = src.transforms(gm, volume)
+            q, v, c = radial[s].transforms(gm, volume)
             rg += sf * q[inverse].reshape(shape) / volume
             vg += sf * v[inverse].reshape(shape)
             cg += sf * c[inverse].reshape(shape) / volume

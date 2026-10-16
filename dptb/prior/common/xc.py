@@ -14,21 +14,26 @@ local part LDA_X + LDA_C_PW where n > 1e-10; the gradient correction (GGA value 
 |n| > 1e-6 and sigma >= 1e-10. The potential is v = 2 (vrho - div(2 vsigma grad n)) Ry, the divergence taken as a
 plane-wave derivative restricted to the charge sphere (``plane_wave_derivative``).
 
-LDA (GF onsite exchange-correlation and tables; eV): Slater exchange plus Perdew-Zunger 81 correlation,
+LDA (GF onsite and environment XC, GF table builders; eV): Slater exchange plus Perdew-Zunger 81 correlation,
 
     eps_x = -3/4 (3 n / pi)^(1/3),   v_x = -(3 n / pi)^(1/3)
     eps_c = A ln rs + B + C rs ln rs + D rs  (rs < 1),   -gamma / (1 + beta1 sqrt(rs) + beta2 rs)  (rs >= 1)
     v_c = eps_c - rs/3 d eps_c / d rs
 
 (Hartree, A = 0.0311, B = -0.048, C = 0.002, D = -0.0116, gamma = 0.1423, beta1 = 1.0529, beta2 = 0.3334), converted
-with 2 Ry per Hartree and zero where n <= 1e-20; the constants are those of the GF onsite kernel.
+with 2 Ry per Hartree and zero where n <= 1e-20, and its density derivative dv/dn (environment XC). One expression
+serves the device kernels (``pz81``, FP64 or FP32 by the dtype of ``pz81_consts``) and the tensor code (``lda_pz81``).
 """
 import math
 
 import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+
+from dptb.prior.common.units import RY
 
 PI = math.pi
-RY = 13.605693122994
 RS_FACTOR = (3.0 / (4.0 * PI)) ** (1.0 / 3.0)
 PW = dict(a=0.031091, alpha1=0.21370, beta1=7.5957, beta2=3.5876, beta3=1.6382, beta4=0.49294, pp=1.0)
 PW_MOD = dict(a=0.0310907, alpha1=0.21370, beta1=7.5957, beta2=3.5876, beta3=1.6382, beta4=0.49294, pp=1.0)
@@ -143,10 +148,58 @@ def pbe_potential(rho, grad, gvec, mask):
 
 
 # -------------------------------------------------------------------------------------------------------- LDA (PZ81)
-def lda_pz81(rho):
-    """(eps_xc, v_xc) in eV of Slater exchange + PZ81 correlation for densities rho (bohr^-3); 0 where rho <= 1e-20.
+_PZ81_CONSTS = {}
 
-    eps_xc is the energy per electron; v_xc = d(rho eps_xc)/d rho.
+
+def pz81_consts(device, dtype=torch.float64):
+    """Constants of ``pz81`` in the dtype of the kernel's density (literal exponents would be FP32 in libdevice)."""
+    key = (str(device), dtype)
+    if key not in _PZ81_CONSTS:
+        p = PZ81
+        _PZ81_CONSTS[key] = torch.tensor([3.0 / (4.0 * PI), 1.0 / 3.0, 3.0 / PI, p['a'], p['b'], p['c'], p['d'],
+                                          p['gamma'], p['beta1'], p['beta2'], 2.0 * RY, LDA_FLOOR, 1.5],
+                                         dtype=dtype, device=device)
+    return _PZ81_CONSTS[key]
+
+
+@triton.jit
+def pz81(rho, consts):
+    """v_xc (eV) and dv_xc/drho (eV bohr^3) of Slater exchange + PZ81 correlation, elementwise; zero for
+    rho <= consts[11]. The precision is that of rho and ``consts`` (``pz81_consts``)."""
+    k34pi = tl.load(consts + 0)
+    third = tl.load(consts + 1)
+    k3pi = tl.load(consts + 2)
+    a = tl.load(consts + 3)
+    b = tl.load(consts + 4)
+    c = tl.load(consts + 5)
+    d = tl.load(consts + 6)
+    g = tl.load(consts + 7)
+    b1 = tl.load(consts + 8)
+    b2 = tl.load(consts + 9)
+    two_ry = tl.load(consts + 10)
+    floor_ = tl.load(consts + 11)
+    three_halves = tl.load(consts + 12)
+    ok = rho > floor_
+    n = tl.where(ok, rho, 1.0)
+    rs = libdevice.pow(k34pi / n, third)
+    lr = libdevice.log(rs)
+    sr = tl.sqrt(rs)
+    hi = rs < 1.0
+    den = 1.0 + b1 * sr + b2 * rs
+    dp = b1 / (2.0 * sr) + b2
+    e = tl.where(hi, a * lr - b + c * rs * lr - d * rs, -g / den)
+    ep = tl.where(hi, a / rs + c * (lr + 1.0) - d, g * dp / (den * den))
+    dpp = -b1 / (4.0 * libdevice.pow(rs, three_halves))
+    epp = tl.where(hi, c / rs - a / (rs * rs), g * dpp / (den * den) - 2.0 * g * dp * dp / (den * den * den))
+    vx = -libdevice.pow(k3pi * n, third)
+    v = two_ry * (vx + e - rs * ep / 3.0)
+    dv = two_ry * (vx / (3.0 * n) - (2.0 * ep - rs * epp) * rs / (9.0 * n))
+    return tl.where(ok, v, 0.0), tl.where(ok, dv, 0.0)
+
+
+def lda_pz81(rho):
+    """(eps_xc, v_xc, dv_xc/drho) in eV (eV bohr^3) of Slater exchange + PZ81 correlation for densities rho (bohr^-3);
+    0 where rho <= 1e-20. eps_xc is the energy per electron; v_xc = d(rho eps_xc)/d rho; the tensor form of ``pz81``.
     """
     p = PZ81
     ok = rho > LDA_FLOOR
@@ -155,12 +208,16 @@ def lda_pz81(rho):
     lr = torch.log(rs)
     sr = torch.sqrt(rs)
     den = 1.0 + p['beta1'] * sr + p['beta2'] * rs
+    dp = p['beta1'] / (2.0 * sr) + p['beta2']
     hi = rs < 1.0
     e = torch.where(hi, p['a'] * lr - p['b'] + p['c'] * rs * lr - p['d'] * rs, -p['gamma'] / den)
-    ep = torch.where(hi, p['a'] / rs + p['c'] * (lr + 1.0) - p['d'],
-                     p['gamma'] * (p['beta1'] / (2.0 * sr) + p['beta2']) / (den * den))
+    ep = torch.where(hi, p['a'] / rs + p['c'] * (lr + 1.0) - p['d'], p['gamma'] * dp / (den * den))
+    dpp = -p['beta1'] / (4.0 * rs ** 1.5)
+    epp = torch.where(hi, p['c'] / rs - p['a'] / (rs * rs),
+                      p['gamma'] * dpp / (den * den) - 2.0 * p['gamma'] * dp * dp / den ** 3)
     vx = -torch.pow(3.0 / PI * n, 1.0 / 3.0)
     zero = torch.zeros_like(rho)
     exc = torch.where(ok, 2.0 * RY * (0.75 * vx + e), zero)
     vxc = torch.where(ok, 2.0 * RY * (vx + e - rs * ep / 3.0), zero)
-    return exc, vxc
+    dv = torch.where(ok, 2.0 * RY * (vx / (3.0 * n) - (2.0 * ep - rs * epp) * rs / (9.0 * n)), zero)
+    return exc, vxc, dv

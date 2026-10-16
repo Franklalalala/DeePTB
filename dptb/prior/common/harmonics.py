@@ -4,12 +4,17 @@ Order within a degree l is m = 0, +1, -1, +2, -2, ...; m > 0 is sqrt(2) Re Y_l^m
 the Condon-Shortley phase. ``rotation_matrices`` gives the matrices D^l(Q) with Y_l(Q^T x) = D^l(Q) Y_l(x) for the
 rotation Q taking +z to a bond direction, which turns a bond-frame (Slater-Koster) block into the lab frame:
 block_lab = D^l1 block_bond (D^l2)^T.
+
+``real_harmonics`` (tensors) and ``real_ylm`` (Triton device function, used by the GF rotation-pack kernel and the H0
+AO kernel) evaluate the same expression: (x + i y)^|m| and the Legendre recursion in z from (-1)^|m| (2|m| - 1)!!.
 """
 import math
 from functools import lru_cache
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 
 def real_harmonics(l, vectors):
@@ -26,12 +31,40 @@ def real_harmonics(l, vectors):
             prev, q = q, (2 * m + 1) * z * q
             for degree in range(m + 2, l + 1):
                 prev, q = q, ((2 * degree - 1) * z * q - (degree + m - 1) * prev) / (degree - m)
-        norm = math.sqrt((2 * l + 1) / (4 * math.pi) * math.factorial(l - m) / math.factorial(l + m))
+        norm = harmonic_norm(l, m)
         if m == 0:
             out.append(norm * q)
         else:
             out.extend((math.sqrt(2) * norm * q * real, math.sqrt(2) * norm * q * imag))
     return torch.stack(out, dim=-1)
+
+
+@triton.jit
+def real_ylm(l, m, x, y, z, nrm):
+    """Y_lm at the unit vectors (x, y, z) (tensors of one shape; l and the signed ABACUS m are scalars):
+    nrm P(z) Re / Im (x + i y)^|m| (sqrt(2) for m != 0) with P(z) = d^|m| P_l / dz^|m| times (-1)^|m| (the recursion of
+    ``real_harmonics``); nrm = sqrt((2l + 1) / (4 pi) (l - |m|)! / (l + |m|)!)."""
+    am = tl.where(m >= 0, m, -m)
+    re = tl.zeros_like(x) + 1.0
+    im = tl.zeros_like(x)
+    dfac = 1.0
+    for k in range(am):                         # (x + i y)^|m| and (2|m| - 1)!!
+        re, im = re * x - im * y, im * x + re * y
+        dfac = dfac * (2 * k + 1)
+    p = tl.zeros_like(x) + (1.0 - 2.0 * (am % 2)) * dfac
+    if l > am:
+        prev = p
+        p = (2 * am + 1) * z * p
+        for deg in range(am + 2, l + 1):
+            prev, p = p, ((2 * deg - 1) * z * p - (deg + am - 1) * prev) / (deg - am)
+    return tl.where(m == 0, nrm * p, tl.where(m > 0, 1.4142135623730951 * nrm * p * re,
+                                              1.4142135623730951 * nrm * p * im))
+
+
+def harmonic_norm(l, m):
+    """nrm of ``real_ylm``: sqrt((2l + 1) / (4 pi) (l - |m|)! / (l + |m|)!)."""
+    m = abs(m)
+    return math.sqrt((2 * l + 1) / (4 * math.pi) * math.factorial(l - m) / math.factorial(l + m))
 
 
 def solid_harmonics(lmax, vectors):

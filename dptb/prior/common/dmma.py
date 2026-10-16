@@ -1,7 +1,7 @@
 """FP64 tensor-core (DMMA) kernel of the three-centre row sums, built on first use.
 
-``pair_sum`` computes what ``assembly._pair_sum`` computes: for every output row r (block), out[row_r] += sum over the
-row's terms t of X[q1_t]^T Z[q2_t] (X, Z [Q, NQ, W] FP64, W <= 32). Warp w of a thread block owns output rows
+``pair_sum`` computes what ``threecentre._pair_sum`` computes: for every output row r (block), out[row_r] += sum over
+the row's terms t of X[q1_t]^T Z[q2_t] (X, Z [Q, NQ, W] FP64, W <= 32). Warp w of a thread block owns output rows
 [8w, 8w + 8) and accumulates its 8 x W strip in ``mma.sync.m8n8k4.f64`` fragments over the terms and channels (four
 channels per step). With enough rows to fill the device (``splits``) there is one thread block per row, which sums the
 row in registers and writes it once. With fewer rows (small cells: hundreds of terms per row) the terms of a row are
@@ -130,7 +130,7 @@ def _ext():
         try:
             from torch.utils.cpp_extension import load_inline
             major, minor = torch.cuda.get_device_capability()
-            name = f'dptb_gf_dmma_split_sm{major}{minor}'
+            name = f'dptb_prior_dmma_sm{major}{minor}'
             kw = {}
             if os.environ.get('DPTB_PRIOR_BUILD_DIR'):     # one subdirectory per extension (sources are file-named)
                 kw['build_directory'] = os.path.join(os.environ['DPTB_PRIOR_BUILD_DIR'], name)
@@ -143,7 +143,7 @@ def _ext():
         except Exception as e:          # noqa: BLE001 - no toolkit or compiler: keep the Triton kernel
             _FAILED = True
             _EXT = None
-            print(f'dptb.prior.gf.dmma: extension unavailable ({type(e).__name__}: {str(e)[:200]})', flush=True)
+            print(f'dptb.prior.common.dmma: extension unavailable ({type(e).__name__}: {str(e)[:200]})', flush=True)
     return _EXT
 
 

@@ -3,7 +3,10 @@
     graph    model neighbour graph on the device (graph.py)
     prior    GF (Flash) or H0 (UniTB) prior blocks over its support, DeePTB gauge, eV, FP64 (dptb.prior.gf / .h0)
     model    prior features of the model graph -> node and edge heads -> compact delta (heads.py, features.py)
-    finish   delta blocks, HR2HK symmetrisation, H = prior + delta, complex64 / float32 tables
+    finish   delta blocks, HR2HK symmetrisation of the delta, H = prior + delta, complex64 / float32 tables
+
+The prior blocks come out as exact Hermitian pairs (``dptb.prior.common.finish``) with their block keys
+(``prior.blocks``, ``dptb.prior.common.blocks.BlockKeys``), so they are used as they are.
 
 Outputs follow the W1 block contract: H complex64 full SOC (up orbitals, then down), S float32, the residual (UniTB)
 float32 uu-real H - H0; keys i_j_Rx_Ry_Rz over the prior support. Nothing leaves the device unless asked for.
@@ -16,7 +19,7 @@ from dptb.inference.features import FeatureMaps
 from dptb.inference.graph import build_graph, species_cutoffs
 from dptb.inference.heads import HeadPair
 from dptb.nn.so2_backend import STATS as SO2_STATS
-from dptb.prior.common.blocks import BlockTable, KeyIndex, symmetrise
+from dptb.prior.common.blocks import BlockKeys, BlockTable
 
 
 class Result:
@@ -66,12 +69,8 @@ class InferenceEngine:
         tm['prior_detail'] = prior.timing
 
         t = time.perf_counter()
-        index = KeyIndex(prior.keys, n)
-        rev = index.reverse(prior.keys)
-        if bool((rev < 0).any()):
-            raise ValueError('prior support is not closed under (i, j, R) -> (j, i, -R)')
-        H0 = symmetrise(prior.H, rev, True)
-        S0 = symmetrise(prior.S, rev, False)
+        index = prior.blocks.index
+        H0, S0 = prior.H, prior.S
         node_keys = torch.zeros((n, 5), dtype=torch.int64, device=dev)
         node_keys[:, 0] = node_keys[:, 1] = torch.arange(n, device=dev)
         edge_keys = torch.cat([ei.T, es], 1)
@@ -91,11 +90,7 @@ class InferenceEngine:
         t = time.perf_counter()
         wh = S0.shape[-1]
         D = self.maps.decode(prior.species, prior.spec, mkeys, torch.cat([dn, de]), wh)
-        mindex = KeyIndex(mkeys, n, index.span)
-        mrev = mindex.reverse(mkeys)
-        if bool((mrev < 0).any()):
-            raise ValueError('model graph is not closed under (i, j, R) -> (j, i, -R)')
-        D = symmetrise(D, mrev, True)
+        D = BlockKeys(pos, cell, edge_keys).herm(D)       # the model graph: nodes, then its sorted edges
         Hb = H0.to(torch.complex64)
         H = Hb.clone()
         H[mrows] = H[mrows] + D

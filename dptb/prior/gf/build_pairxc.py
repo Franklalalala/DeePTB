@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dptb.prior.common.radial import spline_coefficients
+from dptb.prior.common.radial import spline_coefficients, spline_eval
 from dptb.prior.common.store import TableStore, npz_bytes, sha256_file
 from dptb.prior.common.xc import lda_pz81
 
@@ -313,10 +313,7 @@ def _spline_at(knots, values, at):
     x = torch.as_tensor(knots, device=values.device)
     c = spline_coefficients(x, values.reshape(len(knots), -1))
     q = torch.as_tensor(np.asarray(at, dtype=np.float64), device=values.device)
-    i = (torch.searchsorted(x, q, right=True) - 1).clamp(0, len(x) - 2)
-    t = (q - x[i])[:, None]
-    g = c[i]
-    return (((g[:, 0] * t + g[:, 1]) * t + g[:, 2]) * t + g[:, 3]).reshape(len(at), *values.shape[1:])
+    return spline_eval(x, c, q).reshape(len(at), *values.shape[1:])
 
 
 def converge(pxc, variant='standard'):

@@ -1,16 +1,17 @@
 """GF prior (Flash route): geometry -> prior blocks on the device.
 
     support   direct AO pairs, model graph edges and pairs sharing a projector centre (topology.support)
-    scalar    node = Ry herm(onsite_base + proj) + sym(V_node) + onsite_xc + c S_node
-              edge = Ry herm(base + proj) + edge_vna + pair_xc + c S_edge + envxc
+    scalar    C = herm(C'), node C' = Ry herm(onsite_base + proj) + sym(V_node) + onsite_xc + c S_node
+                                edge C' = Ry herm(base + proj) + edge_vna + pair_xc + c S_edge + envxc
               c = 4 pi sum_a M2_a Ry / (3 Omega)
     spinor    H = [[C + i Im X_uu, X_ud], [X_du, C + i Im X_dd]] with X = Ry herm(sum_k P^T D_spinor P), C the scalar block
     gauge     ABACUS -> DeePTB (per-species signed permutation), spin blocks contiguous (up orbitals, then down)
 
-The onsite XC (density kernel) runs in a worker thread on a low-priority stream while the assembly and
-environment-XC kernels (latency- and memory-bound) run on a high-priority stream, so the two overlap on the device.
-Hermitisation of the spinor part, insertion of the scalar block, spin layout and the signed gauge permutation are one
-fused kernel on CUDA (``_finish_kernel``), with the operation order of the tensor expression used elsewhere.
+Steps (``steps.Steps`` names; shared steps use the operators of ``dptb.prior.common`` as the H0 prior does):
+    tables, neighbours (one pair search, ``blocks.BlockKeys``), two_centre, nonlocal (``threecentre.projector``),
+    vna, pair_xc, envxc, onsite (``onsite_wait``: time the main stream waited for it), finish (``finish.finish``).
+The onsite XC (density kernel) runs in a worker thread on a low-priority stream while the other steps (latency- and
+memory-bound) run on a high-priority stream, so the two overlap on the device.
 
 Returns ``PriorBlocks``: keys [m, 5] (nodes, then edges), H complex128 [m, 2w, 2w] (eV), S float64 [m, w, w],
 per-atom orbital counts, species sorted by atomic number with each atom's index, valence electron count.
@@ -19,80 +20,18 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import torch
-import triton
-import triton.language as tl
 from ase.data import atomic_numbers as Z_OF, chemical_symbols
 
-from dptb.prior.common.blocks import abacus_gauge
+from dptb.prior.common.blocks import BlockKeys, gauge_tables
+from dptb.prior.common.finish import finish
+from dptb.prior.common.neighbors import PairBase
+from dptb.prior.common.steps import Checks, Steps
 from dptb.prior.gf import assembly as A
 from dptb.prior.gf.envxc import envxc
 from dptb.prior.gf.onsite import OnsiteXC
 from dptb.prior.gf.tables import GFTables
-from dptb.prior.common.neighbors import PairBase
-from dptb.prior.gf.topology import BOHR, EPS, Topology, support
-
-
-FINISH_ROWS = 8
-
-
-@triton.jit(do_not_specialize=['W'])
-def _finish_kernel(H, S, C, spin, S_in, rev, si, sj, hidx, hsg, sidx, ssg, W, ry, B2: tl.constexpr, BP: tl.constexpr,
-                   B1: tl.constexpr):
-    """Rows [t BP, t BP + BP) (program 1) of output block b (program 0), in one pass:
-        X = RY * (Xs[b] + Xs[rev b]^H) / 2,  Xs = spin [4, w, w] laid out spin-major ([[uu, ud], [du, dd]], [2w, 2w]),
-        X[:w, :w] = C[b] + i Im X[:w, :w],  X[w:, w:] = C[b] + i Im X[w:, w:],
-        H[b, r, c] = sign_i[r] sign_j[c] X[hidx_i[r], hidx_j[c]],
-        S[b, r, c] = sign_i[r] sign_j[c] S_in[b, sidx_i[r], sidx_j[c]]
-    (H, spin as interleaved real/imaginary FP64), with the operation order of the unfused tensor expression. Xs[rev b]
-    is read as the slab [columns, rows] (consecutive rows contiguous in memory) and transposed on chip."""
-    b = tl.program_id(0).to(tl.int64)
-    t = tl.program_id(1)
-    RY = tl.load(ry)                                # FP64 (a Python float argument would be FP32)
-    rb = tl.load(rev + b).to(tl.int64)
-    qi = tl.load(si + b)
-    qj = tl.load(sj + b)
-    r = t * BP + tl.arange(0, BP)
-    k = tl.arange(0, B2)
-    mr = r < 2 * W
-    mk = k < 2 * W
-    rs = tl.load(hidx + qi * 2 * W + r, mask=mr, other=0)
-    cs = tl.load(hidx + qj * 2 * W + k, mask=mk, other=0)
-    sr = tl.load(hsg + qi * 2 * W + r, mask=mr, other=0.0)
-    sc = tl.load(hsg + qj * 2 * W + k, mask=mk, other=0.0)
-    s1 = (rs // W)[:, None]
-    a = (rs % W)[:, None]
-    s2 = (cs // W)[None, :]
-    c = (cs % W)[None, :]
-    m2 = mr[:, None] & mk[None, :]
-    x = spin + (((b * 4 + s1 * 2 + s2) * W + a) * W + c) * 2
-    xr = tl.load(x, mask=m2, other=0.0)
-    xi = tl.load(x + 1, mask=m2, other=0.0)
-    y = spin + (((rb * 4 + (cs // W)[:, None] * 2 + (rs // W)[None, :]) * W + (cs % W)[:, None]) * W +
-                (rs % W)[None, :]) * 2
-    mt = mk[:, None] & mr[None, :]
-    yr = tl.trans(tl.load(y, mask=mt, other=0.0))
-    yi = tl.trans(tl.load(y + 1, mask=mt, other=0.0))
-    hr = ((xr + yr) * 0.5) * RY
-    hi = ((xi - yi) * 0.5) * RY
-    cv = tl.load(C + (b * W + a) * W + c, mask=m2 & (s1 == s2), other=0.0)
-    hr = tl.where(s1 == s2, cv, hr)
-    sg = sr[:, None] * sc[None, :]
-    o = H + ((b * 2 * W + r[:, None]) * 2 * W + k[None, :]) * 2
-    tl.store(o, hr * sg, mask=m2)
-    tl.store(o + 1, hi * sg, mask=m2)
-    r1 = t * BP + tl.arange(0, BP)
-    k1 = tl.arange(0, B1)
-    m1r = r1 < W
-    m1k = k1 < W
-    ri = tl.load(sidx + qi * W + r1, mask=m1r, other=0)
-    ci = tl.load(sidx + qj * W + k1, mask=m1k, other=0)
-    g = tl.load(ssg + qi * W + r1, mask=m1r, other=0.0)[:, None] * tl.load(ssg + qj * W + k1, mask=m1k,
-                                                                           other=0.0)[None, :]
-    mm = m1r[:, None] & m1k[None, :]
-    sv = tl.load(S_in + (b * W + ri[:, None]) * W + ci[None, :], mask=mm, other=0.0)
-    tl.store(S + (b * W + r1[:, None]) * W + k1[None, :], sv * g, mask=mm)
+from dptb.prior.gf.topology import BOHR, EPS, support
 
 
 class PriorBlocks:
@@ -124,14 +63,11 @@ class GFPrior:
             self._side = torch.cuda.Stream(self.device, priority=lo)
             self._main = torch.cuda.Stream(self.device, priority=hi)
             self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='gf-onsite')
+        self._kb = {}
 
     def prefetch(self, numbers):
         """Read the tables of a composition in the background (call for the next structure)."""
         self.tables.prefetch([chemical_symbols[int(z)] for z in numbers])
-
-    def _sync(self):
-        if self.device.type == 'cuda':
-            torch.cuda.current_stream(self.device).synchronize()
 
     def _onsite_job(self, symbols, pos, cell, w):
         t = time.perf_counter()
@@ -143,106 +79,77 @@ class GFPrior:
 
     def __call__(self, z, pos, cell, ei, es):
         """z [n], pos [n, 3], cell [3, 3] (Angstrom, device tensors); model edges ei [2, E], es [E, 3]."""
-        tm = {}
-        t0 = time.perf_counter()
+        steps = Steps(self.device)
         symbols = [chemical_symbols[int(x)] for x in z.tolist()]
         self.tables.load(symbols)
-        self._sync(); tm['tables_s'] = time.perf_counter() - t0
+        steps('tables')
         pos = pos.to(torch.float64) / BOHR
         cell = cell.to(torch.float64) / BOHR
         sp = {s: self.tables.species(s) for s in set(symbols)}
         if not self.concurrent:
-            return self._blocks(symbols, sp, pos, cell, ei, es, tm, t0, None)
+            return self._blocks(symbols, sp, pos, cell, ei, es, steps, None)
         caller = torch.cuda.current_stream(self.device)
         self._side.wait_stream(caller)
         self._main.wait_stream(caller)
         job = self._pool.submit(self._onsite_job, symbols, pos, cell, max(sp[s].norb for s in sp))
         with torch.cuda.stream(self._main):
-            out = self._blocks(symbols, sp, pos, cell, ei, es, tm, t0, job)
+            out = self._blocks(symbols, sp, pos, cell, ei, es, steps, job)
         caller.wait_stream(self._main)
         for x in (out.keys, out.H, out.S, out.norb, out.spec):
             x.record_stream(caller)
         return out
 
-    def _blocks(self, symbols, sp, pos, cell, ei, es, tm, t0, job):
-        t = time.perf_counter()
+    def _blocks(self, symbols, sp, pos, cell, ei, es, steps, job):
+        checks = Checks()
         rc = torch.as_tensor([sp[s].rc for s in symbols], dtype=torch.float64, device=self.device)
         beta = torch.as_tensor([sp[s].proj_max for s in symbols], dtype=torch.float64, device=self.device)
         # one pair search for the support and the projector, VNA and density-centre queries (margins <= 1e-9)
         cut = torch.as_tensor([max(sp[s].vna_cut, sp[s].q_cut) for s in symbols], dtype=torch.float64,
                               device=self.device)
         base = PairBase(pos, cell, torch.maximum(torch.maximum(rc + EPS, beta), cut), rc + EPS, 1e-9)
-        topo = Topology(pos, cell, support(pos, cell, rc, beta, (ei[0], ei[1], es), base=base))
-        ctx = A.Context(self.tables, symbols, pos, cell, topo)
+        bk = BlockKeys(pos, cell, support(pos, cell, rc, beta, (ei[0], ei[1], es), base=base), checks)
+        ctx = A.Context(self.tables, symbols, pos, cell, bk, self._kb)
         ctx.base = base
         n, w = ctx.n, ctx.w
-        self._sync(); tm['topology_s'] = time.perf_counter() - t
-        t = time.perf_counter()
+        steps('neighbours')
         base, ovl = A.two_centre(ctx)
-        real, spin = A.projector(ctx)
-        p2 = A.herm(base + real, topo) * A.RY
-        S = A.herm(ovl, topo)
-        del base, ovl, real
-        vnode, vedge = A.vna(ctx)
+        S = bk.herm(ovl)
+        del ovl
+        steps('two_centre')
+        real, spin, nstats = A.projector(ctx)
+        p2 = bk.herm(base + real) * A.RY
+        del base, real
+        steps('nonlocal')
+        v, vstats = A.vna(ctx)
+        steps('vna')
         px = A.pair_xc(ctx)
-        self._sync(); tm['assembly_s'] = time.perf_counter() - t
-        t = time.perf_counter()
-        env = envxc(ctx, S[n:])
-        self._sync(); tm['envxc_s'] = time.perf_counter() - t
-        t = time.perf_counter()
+        steps('pair_xc')
+        env, estats = envxc(ctx, S)
+        steps('envxc')
         if job is None:
             site, orders = self.onsite(symbols, pos, cell, w)
-            self._sync(); tm['onsite_s'] = time.perf_counter() - t
+            steps('onsite')
         else:
-            site, orders, done, tm['onsite_s'] = job.result()
+            site, orders, done, onsite_s = job.result()
             torch.cuda.current_stream(self.device).wait_event(done)
             site.record_stream(torch.cuda.current_stream(self.device))
-            tm['onsite_wait_s'] = time.perf_counter() - t
-        t = time.perf_counter()
+            steps('onsite_wait')
+            steps.add('onsite', onsite_s)
         c = 4.0 * math.pi * sum(sp[s].m2 for s in symbols) * A.RY / (3.0 * abs(float(torch.linalg.det(cell))))
         C = p2
-        C[:n] += vnode + site + c * S[:n]
-        C[n:] += vedge + px + c * S[n:] + env
-        del vnode, vedge, px, env, site
-        # ABACUS -> DeePTB gauge, contiguous spin blocks
+        C[:n] += v[:n] + site + c * S[:n]
+        C[n:] += v[n:] + px[n:] + c * S[n:] + env[n:]
+        del v, px, env, site
+        C = bk.herm(C)              # pair-XC (both directions) and onsite XC are not exact Hermitian pairs
         names = sorted(set(symbols), key=lambda x: Z_OF[x])
         spec = torch.as_tensor([names.index(s) for s in symbols], device=self.device)
-        hidx = torch.zeros((len(names), 2 * w), dtype=torch.int64, device=self.device)
-        hsg = torch.zeros((len(names), 2 * w), dtype=torch.float64, device=self.device)
-        sidx = torch.zeros((len(names), w), dtype=torch.int64, device=self.device)
-        ssg = torch.zeros((len(names), w), dtype=torch.float64, device=self.device)
-        for q, s in enumerate(names):
-            m = sp[s].norb
-            perm, sign = abacus_gauge(sp[s].shells, w)
-            hidx[q, :2 * m] = torch.as_tensor(np.r_[perm[:m], w + perm[:m]])
-            hsg[q, :2 * m] = torch.as_tensor(np.r_[sign[:m], sign[:m]])
-            sidx[q, :m] = torch.as_tensor(perm[:m])
-            ssg[q, :m] = torch.as_tensor(sign[:m])
-        si, sj = spec[topo.keys[:, 0]], spec[topo.keys[:, 1]]
-        nb = len(topo.keys)
-        if spin.is_cuda:
-            H = torch.empty((nb, 2 * w, 2 * w), dtype=torch.complex128, device=self.device)
-            S_out = torch.empty_like(S)
-            _finish_kernel[(nb, triton.cdiv(2 * w, FINISH_ROWS))](
-                torch.view_as_real(H), S_out, C.contiguous(), torch.view_as_real(spin.contiguous()), S.contiguous(),
-                topo.reverse.contiguous(), si.contiguous(), sj.contiguous(), hidx, hsg, sidx, ssg, w,
-                torch.tensor([A.RY], dtype=torch.float64, device=self.device), B2=triton.next_power_of_2(2 * w),
-                BP=FINISH_ROWS, B1=triton.next_power_of_2(w), num_warps=2)
-            S = S_out
-        else:
-            X = A.herm(spin.reshape(-1, 2, 2, w, w).transpose(2, 3).reshape(-1, 2 * w, 2 * w), topo) * A.RY
-            X[:, :w, :w] = C + 1j * X[:, :w, :w].imag
-            X[:, w:, w:] = C + 1j * X[:, w:, w:].imag
-            H = X.gather(1, hidx[si][:, :, None].expand(nb, 2 * w, 2 * w))
-            H = H.gather(2, hidx[sj][:, None, :].expand(nb, 2 * w, 2 * w)) * (hsg[si][:, :, None] * hsg[sj][:, None, :])
-            del X
-            S = S.gather(1, sidx[si][:, :, None].expand(nb, w, w))
-            S = S.gather(2, sidx[sj][:, None, :].expand(nb, w, w)) * (ssg[si][:, :, None] * ssg[sj][:, None, :])
+        H, S = finish(bk, spec, gauge_tables([sp[s].shells for s in names], w, self.device), C, spin, S, A.RY, checks)
         del spin, C
-        self._sync(); tm['finish_s'] = time.perf_counter() - t
-        tm['total_s'] = time.perf_counter() - t0
+        stats = checks.read()
+        steps('finish')
         nelec = float(sum(sp[s].z_valence for s in symbols))
-        info = dict(n_blocks=nb, width=w, c_ev=c, orders=[list(o) for o in orders],
-                    fine_atoms=sum(o != (128, 24, 48) for o in orders), onsite=dict(self.onsite.stats))
-        return PriorBlocks(keys=topo.keys, H=H, S=S, norb=ctx.norb, species=names, spec=spec, nelec=nelec,
-                           timing=tm, info=info)
+        info = dict(n_blocks=len(bk), width=w, c_ev=c, nonlocal_=nstats, vna=vstats, envxc=estats,
+                    orders=[list(o) for o in orders],
+                    fine_atoms=sum(o != (128, 24, 48) for o in orders), onsite=dict(self.onsite.stats), **stats)
+        return PriorBlocks(keys=bk.keys, blocks=bk, H=H, S=S, norb=ctx.norb, species=names, spec=spec, nelec=nelec,
+                           timing=steps.done(), info=info)

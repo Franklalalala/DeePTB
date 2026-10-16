@@ -41,7 +41,6 @@ v_xc alone, two pow and a log per point, cost more than the ~30 neighbour rows o
 is far inside the margin between SCREEN_LO and the smallest indicator of an atom at the threshold (0.75 x 1e-3 eV).
 """
 import hashlib
-import math
 from collections import OrderedDict
 from pathlib import Path
 
@@ -49,23 +48,16 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from dptb.prior.common.harmonics import real_harmonics
-from dptb.prior.common.neighbors import image_pairs
-from dptb.prior.common.radial import spline_coefficients
+from dptb.prior.common.neighbors import image_pairs, inside
+from dptb.prior.common.radial import horner, interval_uniform, spline_coefficients, spline_eval
+from dptb.prior.common.xc import pz81, pz81_consts
 
-RY = 13.605693122994
 RADIUS = 27.0
 MEDIUM, FINE, FINER = (128, 24, 48), (256, 40, 80), (384, 56, 112)
 EXTRA = ((512, 72, 144), (640, 88, 176), (768, 104, 208))
 TOLERANCE = 1e-3
-
-
-def _consts(device):
-    v = [3.0 / (4.0 * math.pi), 1.0 / 3.0, 3.0 / math.pi, 0.0311, 0.048, 0.002, 0.0116, 0.1423, 1.0529, 0.3334,
-         2.0 * RY, 1e-20]
-    return torch.tensor(v, dtype=torch.float64, device=device)
 
 
 TM, TP, WARPS = 4, 16, 1    # angular tile (mu x phi) and warps of the density kernel
@@ -82,119 +74,32 @@ SCREEN_TILE, SCREEN_WARPS = (8, 16), 1  # angular tile and warps of the indicato
 
 
 @triton.jit
-def _density_add(rho, d2, s, idr_t, dr_t, kn_t, knl_t, coef, KM, inr):
-    """rho + max(spline_val, 0) + max(spline_nlcc, 0) at the distance sqrt(d2) for the points with ``inr``;
-    coefficients [species, channel, interval, 4] are read as 16-byte pairs, the NLCC ones only up to the species' last
-    significant NLCC interval (most points see only the valence table, four intervals per cache line)."""
+def _density_add(rho, d2, s, idr_t, dr_t, kn_t, knl_t, coef, KM, inr, NLCC: tl.constexpr):
+    """rho + max(spline_val, 0) + max(spline_nlcc, 0) at the distance sqrt(d2) for the points with ``inr``, in the
+    precision of rho and the tables (FP64, or the FP32 copies for far neighbours, see ``MIXED``); coefficients
+    [species, channel, interval, 4] are read four at a time, the NLCC ones only up to the species' last significant
+    NLCC interval. NLCC = False leaves out the NLCC term, for neighbours whose tile lies beyond that interval (the term
+    is then exactly zero)."""
     idr = tl.load(idr_t + s)
     dr = tl.load(dr_t + s)
     nk = tl.load(kn_t + s)
     knl = tl.load(knl_t + s)
     d = tl.sqrt(d2)
-    kf = tl.minimum(tl.maximum(libdevice.floor(d * idr), 0.0), (nk - 2).to(tl.float64))
-    h = d - kf * dr
-    base = coef + ((s * 2 * KM + kf.to(tl.int32)) * 4)[:, :, None] + tl.arange(0, 2)[None, None, :]
-    m = inr[:, :, None]
-    c0, c1 = tl.split(tl.load(base, mask=m, other=0.0))
-    c2, c3 = tl.split(tl.load(base + 2, mask=m, other=0.0))
-    v = tl.maximum(((c0 * h + c1) * h + c2) * h + c3, 0.0)
-    m = (inr & (kf <= knl))[:, :, None]
-    base = base + KM * 4
-    c0, c1 = tl.split(tl.load(base, mask=m, other=0.0))
-    c2, c3 = tl.split(tl.load(base + 2, mask=m, other=0.0))
-    return rho + v + tl.maximum(((c0 * h + c1) * h + c2) * h + c3, 0.0)
-
-
-@triton.jit
-def _density_add32(rho, d2, s, idr_t, dr_t, kn_t, knl_t, coef, KM, inr, NLCC: tl.constexpr):
-    """FP32 twin of ``_density_add`` for far neighbours (the FP32 copy of the same tables; see ``MIXED``).
-    NLCC = False leaves out the NLCC term, for neighbours whose tile lies beyond its last significant interval (the
-    term is then exactly zero)."""
-    idr = tl.load(idr_t + s)
-    dr = tl.load(dr_t + s)
-    nk = tl.load(kn_t + s)
-    knl = tl.load(knl_t + s)
-    d = tl.sqrt(d2)
-    kf = tl.minimum(tl.maximum(libdevice.floor(d * idr), 0.0), (nk - 2).to(tl.float32))
-    h = d - kf * dr
+    kf, h = interval_uniform(d, idr, dr, nk - 1)
     base = coef + ((s * 2 * KM + kf.to(tl.int32)) * 4)[:, :, None] + tl.arange(0, 4)[None, None, :]
     m = inr[:, :, None]
     c02, c13 = tl.split(tl.reshape(tl.load(base, mask=m, other=0.0), [base.shape[0], base.shape[1], 2, 2]))
     c0, c2 = tl.split(c02)
     c1, c3 = tl.split(c13)
-    v = tl.maximum(((c0 * h + c1) * h + c2) * h + c3, 0.0)
+    out = rho + tl.maximum(horner(c0, c1, c2, c3, h), 0.0)
     if NLCC:
         m = (inr & (kf <= knl))[:, :, None]
         base = base + KM * 4
         c02, c13 = tl.split(tl.reshape(tl.load(base, mask=m, other=0.0), [base.shape[0], base.shape[1], 2, 2]))
         c0, c2 = tl.split(c02)
         c1, c3 = tl.split(c13)
-        out = rho + v + tl.maximum(((c0 * h + c1) * h + c2) * h + c3, 0.0)
-    else:
-        out = rho + v
+        out = out + tl.maximum(horner(c0, c1, c2, c3, h), 0.0)
     return out
-
-
-@triton.jit
-def _vxc(rho, consts):
-    """LDA exchange + PZ81 correlation potential (eV) of the FP64 density rho, zero for rho <= consts[11]."""
-    k34pi = tl.load(consts + 0)
-    third = tl.load(consts + 1)
-    k3pi = tl.load(consts + 2)
-    a1 = tl.load(consts + 3)
-    b1 = tl.load(consts + 4)
-    c1_ = tl.load(consts + 5)
-    d1 = tl.load(consts + 6)
-    g1 = tl.load(consts + 7)
-    be1 = tl.load(consts + 8)
-    be2 = tl.load(consts + 9)
-    two_ry = tl.load(consts + 10)
-    floor_ = tl.load(consts + 11)
-    ok = rho > floor_
-    n = tl.where(ok, rho, 1.0)
-    rs = libdevice.pow(k34pi / n, third)
-    lr = libdevice.log(rs)
-    e_hi = a1 * lr - b1 + c1_ * rs * lr - d1 * rs
-    ep_hi = a1 / rs + c1_ * (lr + 1.0) - d1
-    sr = tl.sqrt(rs)
-    den = 1.0 + be1 * sr + be2 * rs
-    dp = be1 / (2.0 * sr) + be2
-    e = tl.where(rs < 1.0, e_hi, -g1 / den)
-    ep = tl.where(rs < 1.0, ep_hi, g1 * dp / (den * den))
-    vx = -libdevice.pow(k3pi * n, third)
-    v = two_ry * (vx + e - rs * ep / 3.0)
-    return tl.where(ok, v, 0.0)
-
-
-@triton.jit
-def _vxc32(rho, consts):
-    """FP32 twin of ``_vxc`` (constants from the FP32 copy of ``_consts``)."""
-    k34pi = tl.load(consts + 0)
-    third = tl.load(consts + 1)
-    k3pi = tl.load(consts + 2)
-    a1 = tl.load(consts + 3)
-    b1 = tl.load(consts + 4)
-    c1_ = tl.load(consts + 5)
-    d1 = tl.load(consts + 6)
-    g1 = tl.load(consts + 7)
-    be1 = tl.load(consts + 8)
-    be2 = tl.load(consts + 9)
-    two_ry = tl.load(consts + 10)
-    floor_ = tl.load(consts + 11)
-    ok = rho > floor_
-    n = tl.where(ok, rho, 1.0)
-    rs = libdevice.pow(k34pi / n, third)
-    lr = libdevice.log(rs)
-    e_hi = a1 * lr - b1 + c1_ * rs * lr - d1 * rs
-    ep_hi = a1 / rs + c1_ * (lr + 1.0) - d1
-    sr = tl.sqrt(rs)
-    den = 1.0 + be1 * sr + be2 * rs
-    dp = be1 / (2.0 * sr) + be2
-    e = tl.where(rs < 1.0, e_hi, -g1 / den)
-    ep = tl.where(rs < 1.0, ep_hi, g1 * dp / (den * den))
-    vx = -libdevice.pow(k3pi * n, third)
-    v = two_ry * (vx + e - rs * ep / 3.0)
-    return tl.where(ok, v, 0.0)
 
 
 @triton.jit(do_not_specialize=['P', 'NOM', 'NPHI', 'NT', 'NTP', 'KM', 'NR'])
@@ -261,15 +166,15 @@ def _potential_kernel(out, rad, dirs, ptr, ends, nd, ns, atoms, idr_t, dr_t, kn_
                 fz = z32 - cz.to(tl.float32)
                 f2 = fx * fx + fy * fy + fz * fz
                 if b2 >= nl * nl:
-                    rho32 = _density_add32(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, gm, NLCC=False)
+                    rho32 = _density_add(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, gm, NLCC=False)
                 else:
-                    rho32 = _density_add32(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, gm, NLCC=True)
+                    rho32 = _density_add(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, gm, NLCC=True)
             else:
                 dx = x - cx
                 dy = y - cy
                 dz = z - cz
                 rho = _density_add(rho, dx * dx + dy * dy + dz * dz, tl.load(ns + q), idr_t, dr_t, kn_t, knl_t, coef,
-                                   KM, gm)
+                                   KM, gm, NLCC=True)
         for q in range(full, end):
             cx = tl.load(nd + q * 4 + 0)
             cy = tl.load(nd + q * 4 + 1)
@@ -287,19 +192,20 @@ def _potential_kernel(out, rad, dirs, ptr, ends, nd, ns, atoms, idr_t, dr_t, kn_
                     fy = y32 - cy.to(tl.float32)
                     fz = z32 - cz.to(tl.float32)
                     f2 = fx * fx + fy * fy + fz * fz
-                    in32 = (f2 <= k32 * k32) & gm
+                    in32 = inside(f2, k32 * k32, gm)
                     sq = tl.load(ns + q)
                     nl = tl.load(nlr_t + sq) + rad_b
                     if b2 >= nl * nl:
-                        rho32 = _density_add32(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, in32, NLCC=False)
+                        rho32 = _density_add(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, in32, NLCC=False)
                     else:
-                        rho32 = _density_add32(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, in32, NLCC=True)
+                        rho32 = _density_add(rho32, f2, sq, idr32, dr32, kn_t, knl32, coef32, KM, in32, NLCC=True)
                 else:
                     dx = x - cx
                     dy = y - cy
                     dz = z - cz
                     e2 = dx * dx + dy * dy + dz * dz
-                    rho = _density_add(rho, e2, tl.load(ns + q), idr_t, dr_t, kn_t, knl_t, coef, KM, (e2 <= kl * kl) & gm)
+                    rho = _density_add(rho, e2, tl.load(ns + q), idr_t, dr_t, kn_t, knl_t, coef, KM,
+                                       inside(e2, kl * kl, gm), NLCC=True)
         rho += rho32.to(tl.float64)
     else:
         for q in range(start, full):
@@ -307,7 +213,7 @@ def _potential_kernel(out, rad, dirs, ptr, ends, nd, ns, atoms, idr_t, dr_t, kn_
             dy = y - tl.load(nd + q * 4 + 1)
             dz = z - tl.load(nd + q * 4 + 2)
             rho = _density_add(rho, dx * dx + dy * dy + dz * dz, tl.load(ns + q), idr_t, dr_t, kn_t, knl_t, coef, KM,
-                               gm)
+                               gm, NLCC=True)
         if full < end:
             cnt = tl.sum(tl.sum(gm.to(tl.float64), 1), 0)
             mx = tl.sum(tl.sum(tl.where(gm, x, 0.0), 1), 0) / cnt
@@ -332,9 +238,9 @@ def _potential_kernel(out, rad, dirs, ptr, ends, nd, ns, atoms, idr_t, dr_t, kn_
                     dz = z - cz
                     e2 = dx * dx + dy * dy + dz * dz
                     rho = _density_add(rho, e2, tl.load(ns + q), idr_t, dr_t, kn_t, knl_t, coef, KM,
-                                       (e2 <= kl * kl) & gm)
+                                       inside(e2, kl * kl, gm), NLCC=True)
     g = i.to(tl.int64) * NOM + j
-    tl.store(out + a.to(tl.int64) * P + g, _vxc(rho, consts), mask=gm)
+    tl.store(out + a.to(tl.int64) * P + g, pz81(rho, consts)[0], mask=gm)
 
 
 @triton.jit(do_not_specialize=['P', 'NOM', 'NPHI', 'NT', 'NTP', 'KM', 'NR'])
@@ -384,9 +290,9 @@ def _indicator_kernel(out, rad, dirs, ptr, ends, nd, ns, atoms, idr_t, dr_t, kn_
         fz = z - cz
         f2 = fx * fx + fy * fy + fz * fz
         if bx * bx + by * by + bz * bz >= nl * nl:
-            rho = _density_add32(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, gm, NLCC=False)
+            rho = _density_add(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, gm, NLCC=False)
         else:
-            rho = _density_add32(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, gm, NLCC=True)
+            rho = _density_add(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, gm, NLCC=True)
     for q in range(full, end):
         cx = tl.load(nd + q * 4 + 0)
         cy = tl.load(nd + q * 4 + 1)
@@ -402,15 +308,15 @@ def _indicator_kernel(out, rad, dirs, ptr, ends, nd, ns, atoms, idr_t, dr_t, kn_
             fy = y - cy
             fz = z - cz
             f2 = fx * fx + fy * fy + fz * fz
-            inr = (f2 <= kl * kl) & gm
+            inr = inside(f2, kl * kl, gm)
             sq = tl.load(ns + q)
             nl = tl.load(nlr_t + sq) + rad_b
             if b2 >= nl * nl:
-                rho = _density_add32(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, inr, NLCC=False)
+                rho = _density_add(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, inr, NLCC=False)
             else:
-                rho = _density_add32(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, inr, NLCC=True)
+                rho = _density_add(rho, f2, sq, idr_t, dr_t, kn_t, knl_t, coef, KM, inr, NLCC=True)
     g = i.to(tl.int64) * NOM + j
-    tl.store(out + a.to(tl.int64) * P + g, _vxc32(rho, consts).to(tl.float64), mask=gm)
+    tl.store(out + a.to(tl.int64) * P + g, pz81(rho, consts)[0].to(tl.float64), mask=gm)
 
 
 class _Atom:
@@ -458,10 +364,7 @@ class _Atom:
     def radial(self, r):
         """R_ch(r) [len(r), nch] (not-a-knot spline, zero outside the mesh)."""
         k = self.orb_knots
-        i = (torch.searchsorted(k, r, right=True).clamp(1, len(k) - 1) - 1)
-        h = (r - k[i])[:, None]
-        c = self.orb_coef[i]
-        v = ((c[:, 0] * h + c[:, 1]) * h + c[:, 2]) * h + c[:, 3]
+        v = spline_eval(k, self.orb_coef, r)
         return torch.where(((r >= k[0]) & (r <= k[-1]))[:, None], v, torch.zeros_like(v))
 
 
@@ -520,8 +423,8 @@ class OnsiteXC:
         self.atoms = {}
         self.grids = OrderedDict()
         self.grid_bytes = grid_bytes
-        self.consts = _consts(self.device)
-        self.consts32 = self.consts.to(torch.float32)
+        self.consts = pz81_consts(self.device)
+        self.consts32 = pz81_consts(self.device, torch.float32)
 
     def atom(self, s):
         if s not in self.atoms:
@@ -675,8 +578,8 @@ class OnsiteXC:
                 continue
             bad, fin = check[sel], fin[sel]
             site[ids[bad], :norb, :norb] = fin
-            for k in bad.tolist():
-                orders[int(ids[k])] = FINE
+            for a in ids[bad].tolist():
+                orders[a] = FINE
             if near is not None:
                 est = (fine_near[bad] - self.blocks(s, FINER, ids[bad], near, all32=True)).abs()
                 keep = torch.nonzero(est.flatten(1).amax(1) >= SCREEN_LO, as_tuple=True)[0]
