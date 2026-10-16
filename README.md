@@ -33,7 +33,7 @@ Training and evaluation support LMDB, overlap and prior sidecars, `multi_train`,
 Use a separate environment; the supported Python range is specified in [pyproject.toml](pyproject.toml). Install [PyTorch](https://pytorch.org/get-started/locally) for your device, then a matching `torch-scatter` and DeePTB:
 
 ```bash
-git clone --branch 1015-stable https://github.com/Franklalalala/DeePTB.git
+git clone --branch 1016-stable https://github.com/Franklalalala/DeePTB.git
 cd DeePTB
 python docs/auto_install_torch_scatter.py
 python -m pip install -e .
@@ -45,7 +45,7 @@ For CUDA acceleration, install the optional SO2CUDA dependency with a CUDA toolc
 python -m pip install -e '.[so2]'
 ```
 
-The priors and the inference engine are PyTorch and Triton; the GF prior's three-centre sums use a small CUDA extension on FP64 tensor cores when a CUDA toolkit is available (compiled on first use, Triton otherwise). See [1015-stable](docs/1015-stable.md) for the layout, the inference engine and table building (`dptb prior build`), [1016-gf](docs/1016-gf.md) for the GF prior and [1016-h0](docs/1016-h0.md) for the H0 prior.
+The priors and the inference engine are PyTorch and Triton; the GF prior's three-centre sums use a small CUDA extension on FP64 tensor cores when a CUDA toolkit is available (compiled on first use, Triton otherwise). See [prior pipelines](docs/prior_pipeline.md) for the steps both priors share, their timings and constants, [1015-stable](docs/1015-stable.md) for the layout, the inference engine and table building (`dptb prior build`), [1016-gf](docs/1016-gf.md) for the GF prior and [1016-h0](docs/1016-h0.md) for the H0 prior.
 
 ## Usage and validation
 
