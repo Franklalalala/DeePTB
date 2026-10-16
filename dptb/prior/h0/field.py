@@ -5,7 +5,8 @@
               of the cutoff are re-tested on the host with the expressions of the reference loop.
     species   field view of the UPF (ABACUS): mesh cut at the first odd length beyond 15 bohr (the last sample of an
               even mesh dropped first), PP_RHOATOM extrapolated to r = 0 and scaled to Z_val.
-    radial    at every distinct |G| (``torch.unique`` over the grid), with the Simpson/PP_RAB weights w of the mesh:
+    radial    at every distinct |G| of the charge sphere (``torch.unique``; the points beyond it, cut from every quantity,
+              are mapped to |G| = 0), with the Simpson/PP_RAB weights w of the mesh:
                   q(G) = sum_r q(r) sinc(G r) w,   c(G) likewise for the NLCC core charge 4 pi r^2 rho_c(r),
                   v(G) = 4 pi / Omega [sum_r (r V(r) + Z e^2 erf(r)) sin(G r) / G w - Z e^2 exp(-G^2 / 4) / G^2],
                   v(0) = 4 pi / Omega sum_r r (r V(r) + Z e^2) w        (alpha term kept).
@@ -190,20 +191,28 @@ class Field:
 
 _PLAN = {}
 PLAN_CACHE_POINTS = 1 << 24      # keep the plan of grids up to 256^3 points (2 GiB upsampled work array)
+PLAN_BYTES = (256, 1 << 28)      # device memory of a plan per grid point and in total: the 2x upsampled grid (8 points,
+                                 # complex128) and a cuFFT work area of its size, plus small arrays (measured on H200:
+                                 # 256.0-257.6 bytes per point for 270^3-640^3 grids, 0.27 GiB at 108^3)
 
 
 def _nufft_plan(shape, eps, dev, stream):
     """Type-1 cufinufft plan of the grid ``shape``; plan creation (about 0.1 s) is paid once per grid shape: the most
-    recent plan of a grid up to PLAN_CACHE_POINTS points is kept and reused with new points (``setpts``)."""
+    recent plan of a grid up to PLAN_CACHE_POINTS points is kept and reused with new points (``setpts``). cufinufft
+    allocates the plan outside PyTorch; when the free device memory is less than PLAN_BYTES (from about 600^3 points
+    on one H200, after an earlier call), the PyTorch cache is released first."""
     import cufinufft
     key = (dev.index, tuple(shape), eps, stream.cuda_stream)
     plan = _PLAN.get(key)
     if plan is None:
         _PLAN.clear()
+        points = int(np.prod(shape))
+        if torch.cuda.mem_get_info(dev)[0] < PLAN_BYTES[0] * points + PLAN_BYTES[1]:
+            torch.cuda.empty_cache()
         plan = cufinufft.Plan(1, tuple(shape), n_trans=1, eps=eps, isign=-1, dtype='complex128', modeord=1,
                               upsampfac=2.0, gpu_device_id=dev.index if dev.index is not None else
                               torch.cuda.current_device(), gpu_stream=stream.cuda_stream)
-        if int(np.prod(shape)) <= PLAN_CACHE_POINTS:
+        if points <= PLAN_CACHE_POINTS:
             _PLAN[key] = plan
     return plan
 
@@ -213,13 +222,11 @@ def structure_factor(frac, shape, eps=1e-12, plan=None):
     ``plan``: a plan of this grid (``_nufft_plan``) shared by the species of a structure."""
     dev = frac.device
     angles = (torch.remainder(frac + 0.5, 1.0) - 0.5) * (2 * np.pi)
-    stream = torch.cuda.current_stream(dev)
     if plan is None:
-        plan = _nufft_plan(shape, eps, dev, stream)
+        plan = _nufft_plan(shape, eps, dev, torch.cuda.current_stream(dev))
     plan.setpts(*(angles[:, d].contiguous() for d in range(3)))
     out = plan.execute(torch.ones(len(frac), dtype=torch.complex128, device=dev)).reshape(tuple(shape))
     out.reshape(-1)[0] = len(frac)
-    stream.synchronize()
     return out
 
 
@@ -235,21 +242,21 @@ def build_field(radial, symbols, frac, cell, shape, *, ecutrho=480., total_elect
     with torch.no_grad():
         b = torch.as_tensor(2.0 * np.pi * np.linalg.inv(cell).T, device=dev)
         freq = [torch.as_tensor(np.fft.fftfreq(n, d=1.0 / n), device=dev) for n in shape]
+        species = [(s, torch.as_tensor(np.where(labels == s)[0], device=dev)) for s in sorted(radial)
+                   if (labels == s).any()]
         h, k, l = torch.meshgrid(*freq, indexing='ij')
         gvec = h[..., None] * b[0] + k[..., None] * b[1] + l[..., None] * b[2]
         g2 = torch.einsum('...i,...i->...', gvec, gvec)
-        flat = torch.sqrt(torch.clamp_min(g2.reshape(-1), 0.0))
-        gm, inverse = torch.unique(flat, sorted=True, return_inverse=True)
-        del flat, h, k, l
+        del h, k, l
         mask = g2 <= float(ecutrho) + 1e-12
+        flat = torch.where(mask, torch.sqrt(torch.clamp_min(g2, 0.0)), 0.0).reshape(-1)
+        gm, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+        del flat
         rg = torch.zeros(shape, dtype=torch.complex128, device=dev)
         cg = torch.zeros_like(rg)
         vg = torch.zeros_like(rg)
         plan = _nufft_plan(shape, 1e-12, dev, torch.cuda.current_stream(dev))
-        for s in sorted(radial):
-            ids = torch.as_tensor(np.where(labels == s)[0], device=dev)
-            if not len(ids):
-                continue
+        for s, ids in species:
             sf = structure_factor(frac[ids], shape, plan=plan)
             src = radial[s] if tables is None else tables[s]
             q, v, c = src.transforms(gm, volume)
@@ -267,24 +274,22 @@ def build_field(radial, symbols, frac, cell, shape, *, ecutrho=480., total_elect
         scale = float(total_electrons) / raw
         rg *= scale
         vg = torch.where(mask, vg, 0.)
-        hg = torch.zeros_like(rg)
         nz = g2 > 1e-14
-        hg[nz] = FOUR_PI * E2 * rg[nz] / g2[nz]
+        hg = torch.where(nz, FOUR_PI * E2 * rg / torch.where(nz, g2, 1.0), 0.)
         n = math.prod(shape)
 
         def ifft(c):
             return (torch.fft.ifftn(c) * n).real
 
-        rho = ifft(rg)
         vloc = ifft(vg)
         vh = ifft(hg)
         tot = rg + cg
         grad = tuple(ifft(1j * gvec[..., axis] * tot) for axis in range(3))
         vxc = pbe_potential(ifft(tot), grad, gvec, mask)
         total = vloc + vh + vxc
-        for a in (rho, rg, total):
-            if not bool(torch.isfinite(a).all()):
-                raise FloatingPointError('non-finite periodic field')
+        finite, gmax = torch.stack([(torch.isfinite(rg).all() & torch.isfinite(total).all()).double(), gm[-1]]).tolist()
+        if not finite:
+            raise FloatingPointError('non-finite periodic field')
     meta = dict(fft_shape=list(shape), target_electrons=float(total_electrons), raw_superposed_electrons=raw,
-                density_normalization_scale=scale, distinct_g=int(len(gm)), gmax=float(gm[-1]))
+                density_normalization_scale=scale, distinct_g=int(len(gm)), gmax=gmax)
     return Field(total, np.asarray(cell, dtype=np.float64), tuple(int(x) for x in shape), meta)

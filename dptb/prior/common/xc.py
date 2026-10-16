@@ -87,12 +87,12 @@ def _derivatives(fn, n, sigma=None, chunk=1 << 22):
     vsf = vs.reshape(-1) if vs is not None else None
     with torch.enable_grad():
         for a in range(0, nf.numel(), chunk):
-            x = nf[a:a + chunk].detach().clone().requires_grad_(True)
+            x = nf[a:a + chunk].detach().requires_grad_(True)
             if sf is None:
                 (g,) = torch.autograd.grad(fn(x).sum(), [x])
                 vrf[a:a + chunk] = g
                 continue
-            s = sf[a:a + chunk].detach().clone().requires_grad_(True)
+            s = sf[a:a + chunk].detach().requires_grad_(True)
             g, h = torch.autograd.grad(fn(x, s).sum(), [x, s])
             vrf[a:a + chunk] = g
             vsf[a:a + chunk] = h
@@ -134,10 +134,11 @@ def plane_wave_derivative(values, gvec, mask, axis):
 def pbe_potential(rho, grad, gvec, mask):
     """PBE potential (Ry) on the FFT grid from the density rho and its gradient components grad (bohr^-3, bohr^-4)."""
     sigma = sum(g * g for g in grad)
-    if not (bool(torch.isfinite(rho).all()) and bool(torch.isfinite(sigma).all())):
+    if not bool(torch.isfinite(rho).all() & torch.isfinite(sigma).all()):
         raise ValueError('non-finite density or gradient in the PBE potential')
     vrho, vsigma = pbe_derivatives(rho.to(torch.float64), sigma.to(torch.float64))
-    div = sum(plane_wave_derivative(2 * vsigma * grad[axis], gvec, mask, axis) for axis in range(3))
+    v2 = 2 * vsigma
+    div = sum(plane_wave_derivative(v2 * grad[axis], gvec, mask, axis) for axis in range(3))
     return 2 * (vrho - div)
 
 

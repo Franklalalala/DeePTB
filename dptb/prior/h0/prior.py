@@ -180,7 +180,7 @@ class H0Prior:
         del d
         self._sync(); tm['two_center_s'] = time.perf_counter() - t
         t = time.perf_counter()
-        V, lstats = local_blocks(field, tab, sp, P, frac, cb, index, nk, phi_bytes=self.phi_bytes)
+        V, lstats = local_blocks(field, tab, sp, P, frac, cb, index, keys, phi_bytes=self.phi_bytes)
         self._sync(); tm['local_s'] = time.perf_counter() - t
         t = time.perf_counter()
         mp = max(comp.nproj)
@@ -188,42 +188,50 @@ class H0Prior:
         H, nstats = nonlocal_blocks(comp.Q, D, sp, P, frac, cb, pcut, rcut, index, nk, w)
         self._sync(); tm['nonlocal_s'] = time.perf_counter() - t
         t = time.perf_counter()
+        # ABACUS -> DeePTB gauge, contiguous spin blocks; output species sorted by atomic number
+        species = sorted(names, key=lambda x: Z_OF[x])
+        hidx = np.zeros((len(species), 2 * w), dtype=np.int64)
+        hsg = np.zeros((len(species), 2 * w))
+        sidx = np.zeros((len(species), w), dtype=np.int64)
+        ssg = np.zeros((len(species), w))
+        norb_s = []
+        for q, s in enumerate(species):
+            m = sd[s].orb.norb
+            perm, sign = abacus_gauge([c.l for c in sd[s].orb.channels], w)
+            hidx[q, :2 * m] = np.r_[perm[:m], w + perm[:m]]
+            hsg[q, :2 * m] = np.r_[sign[:m], sign[:m]]
+            sidx[q, :m] = perm[:m]
+            ssg[q, :m] = sign[:m]
+            norb_s.append(m)
+        hidx, hsg, sidx, ssg = (torch.as_tensor(a, device=dev) for a in (hidx, hsg, sidx, ssg))
+        spec = torch.as_tensor([species.index(s) for s in symbols], device=dev)
+        norb = torch.as_tensor(norb_s, dtype=torch.int64, device=dev)[spec]
         TV = (T2 + V).to(torch.complex128)
         H[:, :w, :w] += TV
         H[:, w:, w:] += TV
         del TV, V, T2
         rev = index.reverse(keys)
-        if bool((rev < 0).any()):
-            raise ValueError('pair support is not closed under (i, j, R) -> (j, i, -R)')
-        pre = dict(hamiltonian_max_abs=float((H - H[rev].transpose(1, 2).conj()).abs().max()),
-                   overlap_max_abs=float((S2 - S2[rev].transpose(1, 2)).abs().max()))
-        H = 0.5 * (H + H[rev].transpose(1, 2).conj())
-        S2 = 0.5 * (S2 + S2[rev].transpose(1, 2))
-        # ABACUS -> DeePTB gauge, contiguous spin blocks; output species sorted by atomic number
-        species = sorted(names, key=lambda x: Z_OF[x])
-        spec = torch.as_tensor([species.index(s) for s in symbols], device=dev)
-        hidx = torch.zeros((len(species), 2 * w), dtype=torch.int64, device=dev)
-        hsg = torch.zeros((len(species), 2 * w), dtype=torch.float64, device=dev)
-        sidx = torch.zeros((len(species), w), dtype=torch.int64, device=dev)
-        ssg = torch.zeros((len(species), w), dtype=torch.float64, device=dev)
-        norb_s = []
-        for q, s in enumerate(species):
-            m = sd[s].orb.norb
-            perm, sign = abacus_gauge([c.l for c in sd[s].orb.channels], w)
-            hidx[q, :2 * m] = torch.as_tensor(np.r_[perm[:m], w + perm[:m]])
-            hsg[q, :2 * m] = torch.as_tensor(np.r_[sign[:m], sign[:m]])
-            sidx[q, :m] = torch.as_tensor(perm[:m])
-            ssg[q, :m] = torch.as_tensor(sign[:m])
-            norb_s.append(m)
+        Hr = H[rev].transpose(1, 2).conj()
+        pre_h = (H - Hr).abs().max()
+        H = 0.5 * (H + Hr)
+        del Hr
+        Sr = S2[rev].transpose(1, 2)
+        pre_s = (S2 - Sr).abs().max()
+        S2 = 0.5 * (S2 + Sr)
+        del Sr
         si, sj = spec[i], spec[j]
         H = H.gather(1, hidx[si][:, :, None].expand(nk, 2 * w, 2 * w))
         H = H.gather(2, hidx[sj][:, None, :].expand(nk, 2 * w, 2 * w))
         H = (H * RY) * (hsg[si][:, :, None] * hsg[sj][:, None, :])
         S2 = S2.gather(1, sidx[si][:, :, None].expand(nk, w, w)).gather(2, sidx[sj][:, None, :].expand(nk, w, w))
         S2 = S2 * (ssg[si][:, :, None] * ssg[sj][:, None, :])
-        if not (bool(torch.isfinite(torch.view_as_real(H)).all()) and bool(torch.isfinite(S2).all())):
+        finite = torch.isfinite(torch.view_as_real(H)).all() & torch.isfinite(S2).all()
+        closed, pre_h, pre_s, finite = torch.stack([(rev >= 0).all().double(), pre_h, pre_s, finite.double()]).tolist()
+        if not closed:
+            raise ValueError('pair support is not closed under (i, j, R) -> (j, i, -R)')
+        if not finite:
             raise ValueError('non-finite H0 or S')
-        norb = torch.as_tensor(norb_s, dtype=torch.int64, device=dev)[spec]
+        pre = dict(hamiltonian_max_abs=pre_h, overlap_max_abs=pre_s)
         self._sync(); tm['finish_s'] = time.perf_counter() - t
         tm['total_s'] = time.perf_counter() - t0
         nelec = float(sum(sd[s].upf.z_valence for s in symbols))
