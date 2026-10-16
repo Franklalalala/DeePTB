@@ -51,6 +51,24 @@ out = engine.run(numbers, positions, cell, prefetch=next_numbers)   # out.H, out
 `prefetch` reads the tables of the next structure's composition in a background
 thread, so a cold composition costs no table I/O on the critical path.
 
+Periodic QEq uses the Ewald direct solver by default in inference and training.
+Set `DPTB_QEQ_SOLVER=dense` before importing the model to use the reciprocal
+reference solver. Ewald preserves the Gaussian kernel, neutral charge constraint,
+FP64 charge solve and gradients through learned electronegativity and hardness.
+Small cells and kernel cutoffs unsuitable for splitting use the reciprocal sum.
+Geometry derivatives apply within a fixed mode and periodic-image set.
+
+Paired-head inference shares a periodic QEq matrix by default. Set
+`DPTB_INFERENCE_SHARE_QEQ=0` before constructing the engine to disable sharing.
+Sharing requires identical geometry values, precision, device and kernel options;
+different inputs build separate matrices. Each head solves for its own charges
+with its own hardness and electronegativity. The shared matrix belongs to one
+`run` call, uses CUDA events to order readers across streams and is discarded
+before the next structure. Sharing requires inference mode and never retains an
+autograd graph. Independent training processes build their own kernels on each
+forward; they do not share matrices across batches or trainers. Checkpoint
+layouts and model parameters are unchanged.
+
 ## Device execution
 
 Every step from geometry to the block tables stays on the GPU; nothing returns

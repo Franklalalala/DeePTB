@@ -7,6 +7,7 @@ evaluates. float32, eval mode, no TF32. The model input carries the prior featur
 named prior slots, the physical overlap packet for the charge-balance head, and flow time 0 for the noise shell.
 """
 import copy
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from dptb.data import AtomicDataDict as K
 from dptb.nn import so2_backend
 from dptb.nn.build import build_model
 from dptb.nn.checkpoint import load_checkpoint
+from dptb.nn.heads.charge_response import PeriodicGammaCache, periodic_gamma_scope
 
 
 def flow_time_keys(model):
@@ -59,6 +61,7 @@ class HeadPair:
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='dptb-head') \
             if self.device.type == 'cuda' else None
         self._stream = torch.cuda.Stream(self.device) if self._pool else None
+        self.share_qeq_geometry = os.environ.get('DPTB_INFERENCE_SHARE_QEQ', '1') == '1'
 
     @property
     def so2(self):
@@ -67,7 +70,9 @@ class HeadPair:
 
     def forward(self, base, prior_node, prior_edge, s_node, s_edge):
         """Compact deltas (node [n, width], edge [E, width], float32) of both heads for one structure."""
-        args = (base, prior_node, prior_edge, s_node, s_edge)
+        # Scope the shared geometry to this fresh call, including concurrent heads.
+        gamma_cache = PeriodicGammaCache() if self.share_qeq_geometry else None
+        args = (base, prior_node, prior_edge, s_node, s_edge, gamma_cache)
         if self._pool is None:
             return self._head('on', *args), self._head('hp', *args)
         caller = torch.cuda.current_stream(self.device)
@@ -87,7 +92,7 @@ class HeadPair:
         edge.record_stream(caller)
         return node, edge
 
-    def _head(self, head, base, prior_node, prior_edge, s_node, s_edge):
+    def _head(self, head, base, prior_node, prior_edge, s_node, s_edge, gamma_cache=None):
         model, meta = self.heads[head]
         data = self.idp({k: v.clone() for k, v in base.items()})
         for k in (K.NODE_FEATURES_KEY, 'node_h0', 'node_p23', K.NODE_H0_KEY, meta['nk']):
@@ -103,6 +108,6 @@ class HeadPair:
             data[K.BATCH_KEY] = torch.zeros(len(data[K.POSITIONS_KEY]), dtype=torch.long, device=self.device)
         for k in meta['flow_time_keys']:
             data[k] = torch.zeros(1, dtype=torch.float32, device=self.device)
-        with torch.inference_mode():
+        with torch.inference_mode(), periodic_gamma_scope(gamma_cache):
             pred = model(data)
         return pred[K.NODE_FEATURES_KEY if head == 'on' else K.EDGE_FEATURES_KEY].detach().float()
